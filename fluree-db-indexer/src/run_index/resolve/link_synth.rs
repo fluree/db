@@ -418,7 +418,7 @@ mod tests {
             o: RawObject::DecimalStr("1.50"),
             op: true,
             lang: None,
-            i: None,
+            place: None,
         };
         let record = RunRecord {
             s_id: SubjectId::from_u64(0),

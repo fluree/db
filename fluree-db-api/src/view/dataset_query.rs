@@ -7,7 +7,7 @@ use crate::query::helpers::{
     parse_jsonld_query_for_dataset, parse_sparql_to_ir, prepare_for_execution,
     sparql_ast_has_dataset, tracked_query_tracker, tracker_for_input_limits,
 };
-use crate::view::{DataSetDb, QueryInput};
+use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
     ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
     TrackingOptions,
@@ -755,6 +755,8 @@ impl Fluree {
                 .named
                 .values()
                 .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+        reject_rdf_lists_beyond_one_snapshot(dataset, primary, executable)
+            .map_err(ApiError::invalid_query)?;
 
         let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
@@ -770,8 +772,9 @@ impl Fluree {
         if !is_single_ledger_dataset {
             prepare_config = prepare_config.without_binary_scans();
         }
-        let prepare_config =
-            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepare_config = prepare_config
+            .for_request(Some(tracker), options.cancellation.as_ref())
+            .with_dataset(&runtime_dataset);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
@@ -942,6 +945,8 @@ impl Fluree {
                 .named
                 .values()
                 .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+        reject_rdf_lists_beyond_one_snapshot(dataset, primary, executable)
+            .map_err(fluree_db_query::QueryError::InvalidQuery)?;
 
         let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
@@ -956,8 +961,9 @@ impl Fluree {
         if !is_single_ledger_dataset {
             prepare_config = prepare_config.without_binary_scans();
         }
-        let prepare_config =
-            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepare_config = prepare_config
+            .for_request(Some(tracker), options.cancellation.as_ref())
+            .with_dataset(&runtime_dataset);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;
@@ -1077,6 +1083,32 @@ fn reject_reasoning_in_history_mode(
              (a from–to time range); remove the reasoning mode or query a \
              single point in time"
             .to_string());
+    }
+    Ok(())
+}
+
+/// Refuse a query that reads lists as RDF (`rdf-lists`) over a dataset whose
+/// graphs are not one ledger at one time: the view reads the lists of the
+/// primary graph's ledger and time, which another ledger's subjects, or the
+/// same ledger at another time, do not hold.
+fn reject_rdf_lists_beyond_one_snapshot(
+    dataset: &DataSetDb,
+    primary: &GraphDb,
+    executable: &ExecutableQuery,
+) -> std::result::Result<(), String> {
+    let same = |v: &GraphDb| v.ledger_id == primary.ledger_id && v.t == primary.t;
+    if executable.query.rdf_list_view
+        && !dataset
+            .default
+            .iter()
+            .chain(dataset.named.values())
+            .all(same)
+    {
+        return Err(
+            "rdf-lists reads the lists of one ledger at one point in time; this \
+             dataset reads several ledgers or several points in time"
+                .to_string(),
+        );
     }
     Ok(())
 }

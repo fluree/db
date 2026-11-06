@@ -22,6 +22,7 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::BranchManifest;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{
     resolve_overlay_ops, sort_overlay_ops, BinaryCursor, BinaryFilter, BinaryGraphView,
@@ -194,7 +195,7 @@ impl GeoSearchOperator {
                 p_id,
                 o_type: geo_otype,
                 o_key: max_o_key,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: u32::MAX,
                 g_id,
             };

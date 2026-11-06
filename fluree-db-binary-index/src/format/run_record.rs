@@ -9,22 +9,35 @@
 
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::{DatatypeDictId, LangId, ListIndex, ObjPair, PredicateId};
+use fluree_db_core::{DatatypeDictId, LangId, ObjPair, PredicateId};
 use std::cmp::Ordering;
 
 /// Wire format size of a single RunRecord in **run files**, in bytes.
 ///
 /// Does NOT include `g_id` (graph is implicit from the file path).
-/// The in-memory struct is 40 bytes due to `#[repr(C)]` alignment.
-pub const RECORD_WIRE_SIZE: usize = 34;
+/// The in-memory struct is 48 bytes due to `#[repr(C)]` alignment.
+pub const RECORD_WIRE_SIZE: usize = 38;
 
 /// Wire format size of a single record in **spool files**, in bytes.
 ///
 /// Includes `g_id` as `u32` (spool records are pre-graph-partition).
-pub const SPOOL_RECORD_WIRE_SIZE: usize = 38;
+pub const SPOOL_RECORD_WIRE_SIZE: usize = 42;
 
-/// Sentinel value for "not a list member" in the `u32` `i` field.
-pub const LIST_INDEX_NONE: u32 = u32::MAX;
+/// The list place of a value that is no list member: a record's `i` (and a
+/// V2 record's `o_i`) is a list place as [`fluree_db_core::list_index`]
+/// packs it — the list in the high 32 bits, the position in the low 32.
+pub const LIST_INDEX_NONE: u64 = fluree_db_core::list_index::NONE;
+
+/// The list place a v4 artifact stores in 32 bits: a position of list 0,
+/// with `u32::MAX` for none.
+#[inline]
+pub fn widen_list_index(narrow: u32) -> u64 {
+    if narrow == u32::MAX {
+        LIST_INDEX_NONE
+    } else {
+        u64::from(narrow)
+    }
+}
 
 /// 40-byte fixed-width record for external sort.
 ///
@@ -36,33 +49,33 @@ pub const LIST_INDEX_NONE: u32 = u32::MAX;
 /// ObjKey)` but different XSD types (e.g., `xsd:integer 3` vs `xsd:long 3`)
 /// remain distinguishable.
 ///
-/// ## Run wire layout (34 bytes, little-endian, no g_id)
+/// ## Run wire layout (38 bytes, little-endian, no g_id)
 ///
 /// ```text
 /// s_id:    u64   [0..8]     subject ID (sid64: ns_code << 48 | local_id)
 /// o_key:   u64   [8..16]    object key payload
 /// p_id:    u32   [16..20]
 /// t:       u32   [20..24]
-/// i:       u32   [24..28]   list index (u32::MAX = none)
-/// dt:      u16   [28..30]   datatype dict index (tie-breaker)
-/// lang_id: u16   [30..32]   language tag id (0 = none)
-/// o_kind:  u8    [32]       object kind discriminant
-/// op:      u8    [33]       assert (1) / retract (0)
+/// i:       u64   [24..32]   list place (LIST_INDEX_NONE = none)
+/// dt:      u16   [32..34]   datatype dict index (tie-breaker)
+/// lang_id: u16   [34..36]   language tag id (0 = none)
+/// o_kind:  u8    [36]       object kind discriminant
+/// op:      u8    [37]       assert (1) / retract (0)
 /// ```
 ///
-/// ## Spool wire layout (36 bytes, little-endian, includes g_id)
+/// ## Spool wire layout (42 bytes, little-endian, includes g_id)
 ///
 /// ```text
-/// g_id:    u16   [0..2]     graph ID
-/// s_id:    u64   [2..10]    (NB: unaligned)
-/// o_key:   u64   [10..18]
-/// p_id:    u32   [18..22]
-/// t:       u32   [22..26]
-/// i:       u32   [26..30]
-/// dt:      u16   [30..32]
-/// lang_id: u16   [32..34]
-/// o_kind:  u8    [34]
-/// op:      u8    [35]
+/// g_id:    u32   [0..4]     graph ID
+/// s_id:    u64   [4..12]
+/// o_key:   u64   [12..20]
+/// p_id:    u32   [20..24]
+/// t:       u32   [24..28]
+/// i:       u64   [28..36]
+/// dt:      u16   [36..38]
+/// lang_id: u16   [38..40]
+/// o_kind:  u8    [40]
+/// op:      u8    [41]
 /// ```
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(C)]
@@ -75,8 +88,8 @@ pub struct RunRecord {
     pub p_id: u32,
     /// Transaction number (non-negative, fits in u32).
     pub t: u32,
-    /// List index (u32::MAX = none).
-    pub i: u32,
+    /// List place (`LIST_INDEX_NONE` = none).
+    pub i: u64,
     /// Graph ID (0 = default graph). In-memory only; not in run wire format.
     pub g_id: fluree_db_core::GraphId,
     /// Datatype dict index (for sort-key tie-breaking).
@@ -89,7 +102,7 @@ pub struct RunRecord {
     pub op: u8,
 }
 
-const _: () = assert!(std::mem::size_of::<RunRecord>() == 40);
+const _: () = assert!(std::mem::size_of::<RunRecord>() == 48);
 
 impl RunRecord {
     /// Create a new RunRecord with all fields.
@@ -104,7 +117,7 @@ impl RunRecord {
         op: bool,
         dt: u16,
         lang_id: u16,
-        i: Option<u32>,
+        i: Option<u64>,
     ) -> Self {
         Self {
             s_id,
@@ -120,7 +133,7 @@ impl RunRecord {
         }
     }
 
-    /// Serialize to [`RECORD_WIRE_SIZE`] (34) bytes, little-endian.
+    /// Serialize to [`RECORD_WIRE_SIZE`] (38) bytes, little-endian.
     ///
     /// Does NOT include `g_id` — run files are graph-scoped.
     pub fn write_le(&self, buf: &mut [u8; RECORD_WIRE_SIZE]) {
@@ -128,14 +141,14 @@ impl RunRecord {
         buf[8..16].copy_from_slice(&self.o_key.to_le_bytes());
         buf[16..20].copy_from_slice(&self.p_id.to_le_bytes());
         buf[20..24].copy_from_slice(&self.t.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.i.to_le_bytes());
-        buf[28..30].copy_from_slice(&self.dt.to_le_bytes());
-        buf[30..32].copy_from_slice(&self.lang_id.to_le_bytes());
-        buf[32] = self.o_kind;
-        buf[33] = self.op;
+        buf[24..32].copy_from_slice(&self.i.to_le_bytes());
+        buf[32..34].copy_from_slice(&self.dt.to_le_bytes());
+        buf[34..36].copy_from_slice(&self.lang_id.to_le_bytes());
+        buf[36] = self.o_kind;
+        buf[37] = self.op;
     }
 
-    /// Deserialize from [`RECORD_WIRE_SIZE`] (34) bytes, little-endian.
+    /// Deserialize from [`RECORD_WIRE_SIZE`] (38) bytes, little-endian.
     ///
     /// `g_id` is set to 0; caller should set it from run file header context.
     pub fn read_le(buf: &[u8; RECORD_WIRE_SIZE]) -> Self {
@@ -144,16 +157,16 @@ impl RunRecord {
             o_key: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             p_id: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
             t: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            i: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            i: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
             g_id: 0,
-            dt: u16::from_le_bytes(buf[28..30].try_into().unwrap()),
-            lang_id: u16::from_le_bytes(buf[30..32].try_into().unwrap()),
-            o_kind: buf[32],
-            op: buf[33],
+            dt: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
+            lang_id: u16::from_le_bytes(buf[34..36].try_into().unwrap()),
+            o_kind: buf[36],
+            op: buf[37],
         }
     }
 
-    /// Serialize to [`SPOOL_RECORD_WIRE_SIZE`] (38) bytes, little-endian.
+    /// Serialize to [`SPOOL_RECORD_WIRE_SIZE`] (42) bytes, little-endian.
     ///
     /// Includes `g_id` — spool records are pre-graph-partition.
     pub fn write_spool_le(&self, buf: &mut [u8; SPOOL_RECORD_WIRE_SIZE]) {
@@ -162,14 +175,14 @@ impl RunRecord {
         buf[12..20].copy_from_slice(&self.o_key.to_le_bytes());
         buf[20..24].copy_from_slice(&self.p_id.to_le_bytes());
         buf[24..28].copy_from_slice(&self.t.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.i.to_le_bytes());
-        buf[32..34].copy_from_slice(&self.dt.to_le_bytes());
-        buf[34..36].copy_from_slice(&self.lang_id.to_le_bytes());
-        buf[36] = self.o_kind;
-        buf[37] = self.op;
+        buf[28..36].copy_from_slice(&self.i.to_le_bytes());
+        buf[36..38].copy_from_slice(&self.dt.to_le_bytes());
+        buf[38..40].copy_from_slice(&self.lang_id.to_le_bytes());
+        buf[40] = self.o_kind;
+        buf[41] = self.op;
     }
 
-    /// Deserialize from [`SPOOL_RECORD_WIRE_SIZE`] (38) bytes, little-endian.
+    /// Deserialize from [`SPOOL_RECORD_WIRE_SIZE`] (42) bytes, little-endian.
     pub fn read_spool_le(buf: &[u8; SPOOL_RECORD_WIRE_SIZE]) -> Self {
         Self {
             g_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
@@ -177,11 +190,11 @@ impl RunRecord {
             o_key: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
             p_id: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
             t: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
-            i: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
-            dt: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
-            lang_id: u16::from_le_bytes(buf[34..36].try_into().unwrap()),
-            o_kind: buf[36],
-            op: buf[37],
+            i: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
+            dt: u16::from_le_bytes(buf[36..38].try_into().unwrap()),
+            lang_id: u16::from_le_bytes(buf[38..40].try_into().unwrap()),
+            o_kind: buf[40],
+            op: buf[41],
         }
     }
 
@@ -484,7 +497,7 @@ impl RunSortOrder {
 /// `(s_id, p_id, o_kind, o_key, dt, effective_lang_id, i)`.
 ///
 /// `lang_id` is forced to 0 unless `dt == LANG_STRING`. `i` participates as-is
-/// (with `ListIndex::none()` sentinel for non-list facts).
+/// (with the `LIST_INDEX_NONE` sentinel for non-list facts).
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FactKey {
     pub s_id: SubjectId,
@@ -493,8 +506,8 @@ pub struct FactKey {
     pub dt: DatatypeDictId,
     /// Effective lang_id: `LangId::none()` unless `dt == LANG_STRING`.
     pub lang_id: LangId,
-    /// List index (`ListIndex::none()` for non-list facts).
-    pub i: ListIndex,
+    /// List place (`LIST_INDEX_NONE` for non-list facts).
+    pub i: u64,
 }
 
 impl FactKey {
@@ -508,7 +521,7 @@ impl FactKey {
         o_key: u64,
         dt_raw: u32,
         lang_id: u16,
-        i: i32,
+        i: u64,
     ) -> Self {
         let dt = DatatypeDictId::from_u16(dt_raw as u16);
         let effective_lang_id = if dt == DatatypeDictId::LANG_STRING {
@@ -522,7 +535,7 @@ impl FactKey {
             o: ObjPair::new(ObjKind::from_u8(o_kind), ObjKey::from_u64(o_key)),
             dt,
             lang_id: effective_lang_id,
-            i: ListIndex::from_i32(i),
+            i,
         }
     }
 
@@ -534,11 +547,7 @@ impl FactKey {
         } else {
             LangId::none()
         };
-        let i = if r.i == LIST_INDEX_NONE {
-            ListIndex::none()
-        } else {
-            ListIndex::from_i32(r.i as i32)
-        };
+        let i = r.i;
         Self {
             s_id: r.s_id,
             p_id: PredicateId::from_u32(r.p_id),
@@ -575,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_record_size() {
-        assert_eq!(std::mem::size_of::<RunRecord>(), 40);
+        assert_eq!(std::mem::size_of::<RunRecord>(), 48);
     }
 
     #[test]
@@ -1213,7 +1222,7 @@ mod tests {
             ObjKey::encode_i64(42).as_u64(),
             DatatypeDictId::INTEGER.as_u16() as u32,
             0,
-            ListIndex::none().as_i32(),
+            LIST_INDEX_NONE,
         );
         let from_record = FactKey::from_run_record(&RunRecord::new(
             0,

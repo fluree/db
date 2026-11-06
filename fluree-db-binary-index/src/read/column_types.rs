@@ -105,7 +105,7 @@ pub struct ColumnBatch {
     pub o_type: ColumnData<u16>,
 
     /// List index — `AbsentDefault` when all values are sentinel (`u32::MAX`).
-    pub o_i: ColumnData<u32>,
+    pub o_i: ColumnData<u64>,
     /// Transaction time — always stored on disk but only decoded when requested.
     pub t: ColumnData<u32>,
     /// Graph of each row — a column only in pooled-tree leaflets; dedicated
@@ -319,7 +319,7 @@ pub struct BinaryFilter {
     pub p_id: Option<u32>,
     pub o_type: Option<u16>,
     pub o_key: Option<u64>,
-    pub o_i: Option<u32>,
+    pub o_i: Option<u64>,
     /// Graph to keep, for a scan of the pooled tree on behalf of one graph.
     pub g_id: Option<fluree_db_core::GraphId>,
 }
@@ -343,7 +343,7 @@ impl BinaryFilter {
 
     /// Check whether a single row passes this filter.
     #[inline]
-    pub fn matches(&self, s_id: u64, p_id: u32, o_type: u16, o_key: u64, o_i: u32) -> bool {
+    pub fn matches(&self, s_id: u64, p_id: u32, o_type: u16, o_key: u64, o_i: u64) -> bool {
         if let Some(f) = self.s_id {
             if s_id != f {
                 return false;
@@ -488,7 +488,7 @@ impl BinaryFilter {
             SortField::P => self.p_id.map(u64::from),
             SortField::OType => self.o_type.map(u64::from),
             SortField::OKey => self.o_key,
-            SortField::OI => self.o_i.map(u64::from),
+            SortField::OI => self.o_i,
             SortField::G => self.g_id.map(u64::from),
         }
     }
@@ -512,7 +512,7 @@ fn field_value(rec: &RunRecordV2, f: SortField) -> u64 {
         SortField::P => u64::from(rec.p_id),
         SortField::OType => u64::from(rec.o_type),
         SortField::OKey => rec.o_key,
-        SortField::OI => u64::from(rec.o_i),
+        SortField::OI => rec.o_i,
         SortField::G => u64::from(rec.g_id),
     }
 }
@@ -616,8 +616,8 @@ mod tests {
             p_id: Some(5),
             ..Default::default()
         };
-        assert!(filter.matches(1, 5, 0, 0, u32::MAX));
-        assert!(!filter.matches(1, 6, 0, 0, u32::MAX));
+        assert!(filter.matches(1, 5, 0, 0, u64::MAX));
+        assert!(!filter.matches(1, 6, 0, 0, u64::MAX));
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
         p_id: u32,
         o_type: u16,
         o_key: u64,
-        o_i: u32,
+        o_i: u64,
     ) -> [u8; ORDERED_KEY_V2_SIZE] {
         let rec = RunRecordV2 {
             s_id: SubjectId(s_id),
@@ -687,8 +687,8 @@ mod tests {
 
     #[test]
     fn leaflet_range_post_descends_past_constant_unbound_oi() {
-        let first_key = ordered_key(RunSortOrder::Post, 10, 5, 7, 11, u32::MAX);
-        let last_key = ordered_key(RunSortOrder::Post, 20, 5, 7, 11, u32::MAX);
+        let first_key = ordered_key(RunSortOrder::Post, 10, 5, 7, 11, u64::MAX);
+        let last_key = ordered_key(RunSortOrder::Post, 20, 5, 7, 11, u64::MAX);
         let filter = BinaryFilter {
             p_id: Some(5),
             o_type: Some(7),
@@ -702,8 +702,8 @@ mod tests {
 
     #[test]
     fn leaflet_range_opst_descends_past_constant_unbound_oi() {
-        let first_key = ordered_key(RunSortOrder::Opst, 10, 10, 7, 11, u32::MAX);
-        let last_key = ordered_key(RunSortOrder::Opst, 20, 20, 7, 11, u32::MAX);
+        let first_key = ordered_key(RunSortOrder::Opst, 10, 10, 7, 11, u64::MAX);
+        let last_key = ordered_key(RunSortOrder::Opst, 20, 20, 7, 11, u64::MAX);
         let filter = BinaryFilter {
             o_type: Some(7),
             o_key: Some(11),

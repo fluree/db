@@ -1,6 +1,8 @@
 //! SPARQL reads a list's members as values of the property that holds it,
-//! as JSON-LD does. Only the Graph Store `GET` reads a list's RDF cells
-//! (`it_sparql_lists.rs`).
+//! as JSON-LD does. A request reads a list's RDF cells only when it asks to
+//! (`# PRAGMA rdf-lists: true`, JSON-LD `opts.rdfLists`), and the Graph Store
+//! `GET` always does (`it_sparql_lists.rs`). Edits to cells are in
+//! `it_list_cell_edits.rs`.
 
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
@@ -107,18 +109,172 @@ async fn a_lists_members_are_values_of_its_property() {
     assert_eq!(jsonld_items(&fluree, &ledger, "ex:s").await, members);
 }
 
-/// SPARQL has no way to read a list's cells: the RDF view is not a request
-/// option.
+/// `# PRAGMA rdf-lists: true` reads each list as the RDF list it denotes,
+/// an owner edge to a chain of cells, as `opts.rdfLists` does in JSON-LD;
+/// without it a cell is nothing a pattern matches.
 #[tokio::test]
-async fn no_pragma_reads_a_lists_cells() {
+async fn the_rdf_lists_pragma_reads_a_lists_cells() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = create(&fluree, "no-pragma", "ex:s ex:items (1 2) .").await;
+    let id = create(
+        &fluree,
+        "rdf-lists",
+        "ex:s ex:items (1 2), (3) ; ex:items 9 .",
+    )
+    .await;
     let ledger = load(&fluree, &id).await;
-    let text = format!("# PRAGMA rdf-lists: true\n{PREFIX}SELECT ?o WHERE {{ ex:s ex:items ?o }}");
-    let err = support::query_sparql(&fluree, &ledger, &text)
+    let rdf = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n";
+    let heads = format!(
+        "{PREFIX}{rdf}SELECT ?first WHERE {{ ex:s ex:items ?head . ?head rdf:first ?first }}"
+    );
+    let firsts = vec![json!([1]), json!([3])];
+    let cells = sparql(
+        &fluree,
+        &ledger,
+        &format!("# PRAGMA rdf-lists: true\n{heads}"),
+    )
+    .await;
+    assert_eq!(cells, firsts);
+    assert!(sparql(&fluree, &ledger, &heads).await.is_empty());
+    let off = format!("# PRAGMA rdf-lists: false\n{heads}");
+    assert!(sparql(&fluree, &ledger, &off).await.is_empty());
+
+    // The second cell of each list, by its position.
+    let second = format!(
+        "# PRAGMA rdf-lists: true\n{PREFIX}{rdf}\
+         SELECT ?second WHERE {{ ex:s ex:items/rdf:rest/rdf:first ?second }}"
+    );
+    assert_eq!(sparql(&fluree, &ledger, &second).await, vec![json!([2])]);
+
+    // A plain value is a value; a list is its head cell, a blank node.
+    let values = format!(
+        "# PRAGMA rdf-lists: true\n{PREFIX}\
+         SELECT ?o WHERE {{ ex:s ex:items ?o FILTER(!isBlank(?o)) }}"
+    );
+    assert_eq!(sparql(&fluree, &ledger, &values).await, vec![json!([9])]);
+
+    let query = |opts: JsonValue| {
+        json!({
+            "@context": {"ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+            "select": ["?first"],
+            "where": [
+                {"@id": "ex:s", "ex:items": "?head"},
+                {"@id": "?head", "rdf:first": "?first"}
+            ],
+            "opts": opts
+        })
+    };
+    assert_eq!(
+        jsonld(&fluree, &ledger, query(json!({"rdfLists": true}))).await,
+        firsts
+    );
+    assert!(jsonld(&fluree, &ledger, query(json!({}))).await.is_empty());
+}
+
+/// Where a request cannot read lists as RDF it is refused, never answered
+/// with the members as values: a history range, a dataset spanning ledgers,
+/// a JSON-LD graph crawl, a policy query, and a malformed option.
+#[tokio::test]
+async fn rdf_lists_is_refused_where_it_cannot_be_honored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "rdf-lists-refused", "ex:s ex:items (1 2) .").await;
+    let other = create(&fluree, "rdf-lists-other", "ex:t ex:items (3) .").await;
+    let ledger = load(&fluree, &id).await;
+    fn refused<T>(result: fluree_db_api::Result<T>, expected: &str) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("refused: {expected}"));
+        assert!(err.to_string().contains(expected), "{expected}: {err}");
+        assert_eq!(err.status_code(), 400, "{err}");
+    }
+
+    let history = format!(
+        "# PRAGMA rdf-lists: true\n{PREFIX}SELECT ?o FROM <{id}@t:1> TO <{id}@t:latest> \
+         WHERE {{ ex:s ex:items ?o }}"
+    );
+    refused(
+        fluree
+            .query_from()
+            .sparql(&history)
+            .execute_formatted()
+            .await,
+        "history query",
+    );
+
+    let across = format!(
+        "# PRAGMA rdf-lists: true\n{PREFIX}SELECT ?o FROM <{id}> FROM <{other}> \
+         WHERE {{ ?s ex:items ?o }}"
+    );
+    refused(
+        fluree
+            .query_from()
+            .sparql(&across)
+            .execute_formatted()
+            .await,
+        "several ledgers",
+    );
+    let across = across.replace("# PRAGMA rdf-lists: true\n", "");
+    let members = fluree
+        .query_from()
+        .sparql(&across)
+        .execute_formatted()
         .await
-        .expect_err("an unknown pragma is refused");
-    assert!(err.to_string().contains("unknown pragma"), "{err}");
+        .expect("members across ledgers");
+    let rows = members["results"]["bindings"].as_array().map(Vec::len);
+    assert_eq!(rows, Some(3), "{members}");
+
+    // One ledger at two times: the list is only at t:2.
+    let times = create(&fluree, "rdf-lists-times", "ex:s ex:marker 0 .").await;
+    fluree
+        .graph(&times)
+        .transact()
+        .insert_turtle("@prefix ex: <http://example.org/> .\nex:s ex:items (1 2) .")
+        .commit()
+        .await
+        .expect("t:2");
+    let firsts = |from: &str| {
+        format!(
+            "# PRAGMA rdf-lists: true\n{PREFIX}\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             SELECT ?v {from} WHERE {{ ex:s ex:items ?h . ?h rdf:first ?v }}"
+        )
+    };
+    let at_two = fluree
+        .query_from()
+        .sparql(&firsts(&format!("FROM <{times}@t:2>")))
+        .execute_formatted()
+        .await
+        .expect("one time");
+    let rows = at_two["results"]["bindings"].as_array().map(Vec::len);
+    assert_eq!(rows, Some(1), "{at_two}");
+    refused(
+        fluree
+            .query_from()
+            .sparql(&firsts(&format!("FROM <{times}@t:1> FROM <{times}@t:2>")))
+            .execute_formatted()
+            .await,
+        "several points in time",
+    );
+
+    let crawl = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "ex:items": "?o"},
+        "opts": {"rdfLists": true}
+    });
+    refused(
+        support::query_jsonld(&fluree, &ledger, &crawl).await,
+        "graph crawl",
+    );
+    let malformed = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?o"],
+        "where": {"@id": "ex:s", "ex:items": "?o"},
+        "opts": {"rdfLists": "yes"}
+    });
+    refused(
+        support::query_jsonld(&fluree, &ledger, &malformed).await,
+        "opts.rdfLists",
+    );
 }
 
 #[tokio::test]
@@ -130,6 +286,59 @@ async fn a_repeated_member_is_a_value_each_time() {
     let members = vec![json!([1]), json!([1]), json!([2])];
     assert_eq!(sparql_items(&fluree, &ledger, "ex:s").await, members);
     assert_eq!(jsonld_items(&fluree, &ledger, "ex:s").await, members);
+}
+
+/// A value read over an index keeps each member, a repeated value as many:
+/// at the head; at an earlier `t`, where the leaflet's history replays and
+/// undoing the two `1`s of the lists written later leaves the first list's;
+/// and with novelty merged over the index.
+#[tokio::test]
+async fn indexed_reads_keep_each_member_at_an_earlier_t() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "indexed-at-t", "ex:s ex:items (1 2) .").await;
+    update(&fluree, &id, "INSERT DATA { ex:s ex:items (1), (1 3) }").await;
+    support::rebuild_and_publish_index(&fluree, &id).await;
+    let ledger = load(&fluree, &id).await;
+    assert_eq!(lists(&ledger, "s").await.len(), 3);
+    let before = fluree.db_at_t(&id, 1).await.expect("at t 1");
+    for pattern in ["ex:s ex:items ?o", "?s ex:items ?o"] {
+        let text = format!("{PREFIX}SELECT ?o WHERE {{ {pattern} }}");
+        let now = sparql(&fluree, &ledger, &text).await;
+        let five = [json!([1]), json!([1]), json!([1]), json!([2]), json!([3])];
+        assert_eq!(now, five, "{pattern}");
+        let rows = fluree
+            .query(&before, text.as_str())
+            .await
+            .unwrap_or_else(|e| panic!("query: {e}\n{text}"))
+            .to_jsonld(&before.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(
+            support::normalize_rows(&rows),
+            [json!([1]), json!([2])],
+            "{pattern} at t 1"
+        );
+    }
+    let twin = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?o"],
+        "where": {"@id": "ex:s", "ex:items": "?o"}
+    });
+    let rows = fluree
+        .query(&before, &twin)
+        .await
+        .expect("query")
+        .to_jsonld(&before.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(support::normalize_rows(&rows), [json!([1]), json!([2])]);
+
+    update(&fluree, &id, "DELETE DATA { ex:s ex:items 2 }").await;
+    update(&fluree, &id, "INSERT DATA { ex:s ex:items (1 4) }").await;
+    let ledger = load(&fluree, &id).await;
+    let merged = [1, 1, 1, 1, 3, 4].map(|v| json!([v]));
+    for pattern in ["ex:s ex:items ?o", "?s ex:items ?o"] {
+        let text = format!("{PREFIX}SELECT ?o WHERE {{ {pattern} }}");
+        assert_eq!(sparql(&fluree, &ledger, &text).await, merged, "{pattern}");
+    }
 }
 
 /// Counts read the stored rows, a member each, from novelty and from an
@@ -374,7 +583,8 @@ async fn a_list_added_or_copied_stays_in_its_source() {
 }
 
 /// ADD into a graph that holds another list on the same subject and
-/// property keeps that list, and adds the source's beside it.
+/// property keeps that list, and adds the source's beside it, as a list of
+/// its own.
 #[tokio::test]
 async fn adding_beside_another_list_keeps_both() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -393,31 +603,30 @@ async fn adding_beside_another_list_keeps_both() {
     )
     .await;
     assert_eq!(source, [json!([1]), json!([2])], "the source");
-    let firsts = sparql(
-        &fluree,
-        &ledger,
-        &format!(
-            "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-             SELECT ?x WHERE {{ GRAPH ex:g2 {{ ?c rdf:first ?x }} }}"
-        ),
-    )
-    .await;
-    assert_eq!(
-        firsts,
-        [json!([1]), json!([2])],
-        "the added list, as its triples"
-    );
     let members = sparql(
         &fluree,
         &ledger,
-        &format!("{PREFIX}SELECT ?o WHERE {{ GRAPH ex:g2 {{ ex:s ex:items ?o FILTER(isLiteral(?o)) }} }}"),
+        &format!("{PREFIX}SELECT ?o WHERE {{ GRAPH ex:g2 {{ ex:s ex:items ?o }} }}"),
     )
     .await;
     assert_eq!(
         members,
-        [json!([3]), json!([4])],
-        "the destination's own list"
+        [json!([1]), json!([2]), json!([3]), json!([4])],
+        "both lists' members"
     );
+    let g2 = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri("http://example.org/g2")
+        .expect("g2");
+    let held = support::stored_int_lists_in(
+        &ledger,
+        g2,
+        "http://example.org/s",
+        "http://example.org/items",
+    )
+    .await;
+    assert_eq!(held, [[1, 2], [3, 4]], "two lists");
 
     let t = ledger.t();
     update(&fluree, &id, "ADD ex:g1 TO ex:g2").await;
@@ -510,6 +719,55 @@ async fn construct_writes_the_lists_it_reads() {
         assert!(
             ttl.contains("ex:nums ( 3 1 3 )"),
             "indexed {indexed}: {ttl}"
+        );
+    }
+}
+
+/// Each list on one property is written as its own collection, and reads
+/// back as the lists it came from.
+#[tokio::test]
+async fn construct_writes_each_list_on_a_property() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "construct-several",
+        "ex:s ex:items (3 1) , (1 2) .",
+    )
+    .await;
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let ledger = load(&fluree, &id).await;
+        let everything = format!("{PREFIX}CONSTRUCT {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o }}");
+        let ttl = turtle(&fluree, &ledger, &everything).await;
+        assert!(
+            ttl.contains("( 3 1 )") && ttl.contains("( 1 2 )"),
+            "indexed {indexed}: {ttl}"
+        );
+        let filtered = format!(
+            "{PREFIX}CONSTRUCT {{ ?s ex:items ?o }} WHERE {{ ?s ex:items ?o FILTER(?o != 2) }}"
+        );
+        let ttl = turtle(&fluree, &ledger, &filtered).await;
+        assert!(
+            ttl.contains("( 3 1 )") && ttl.contains("( 1 )"),
+            "indexed {indexed}: {ttl}"
+        );
+
+        let copy = format!("it/sparql-list-members/construct-several-copy-{indexed}:main");
+        fluree.create_ledger(&copy).await.expect("create");
+        let ttl = turtle(&fluree, &ledger, &everything).await;
+        fluree
+            .graph(&copy)
+            .transact()
+            .insert_turtle(&ttl)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("insert: {e}\n{ttl}"));
+        assert_eq!(
+            lists(&load(&fluree, &copy).await, "s").await,
+            [[1, 2], [3, 1]],
+            "{ttl}"
         );
     }
 }
@@ -724,15 +982,341 @@ async fn lists_added_beside_another_stay_apart() {
     update(&fluree, &id, "ADD ex:g1 TO ex:g3").await;
     update(&fluree, &id, "ADD ex:g2 TO ex:g3").await;
     let ledger = load(&fluree, &id).await;
-    let cells = sparql(
+    let members = sparql(
         &fluree,
         &ledger,
         &format!(
-            "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-             SELECT (COUNT(DISTINCT ?c) AS ?cells) (COUNT(*) AS ?firsts) \
-             WHERE {{ GRAPH ex:g3 {{ ?c rdf:first ?x }} }}"
+            "{PREFIX}SELECT (COUNT(*) AS ?members) \
+             WHERE {{ GRAPH ex:g3 {{ ex:s ex:items ?x }} }}"
         ),
     )
     .await;
-    assert_eq!(cells, [json!([2, 2])], "a cell each, a member each");
+    assert_eq!(
+        members,
+        [json!([4])],
+        "a member each, beside the list there"
+    );
+}
+
+/// `p/rdf:rest*/rdf:first` reaches each member of every list `p` holds, once
+/// per entry, as the lists' RDF would: not a plain value of `p`, and a list
+/// stored as its triples, complete or not, through those triples. The query's
+/// other patterns read members as values. From novelty and from an index.
+#[tokio::test]
+async fn a_list_walk_reads_each_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "list-walk",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+         ex:s ex:items (1 1 2), (3), 9 .
+         ex:t ex:items _:c . _:c rdf:first 7 ; rdf:rest _:d ; ex:note 0 .
+         _:d rdf:first 8 ; rdf:rest rdf:nil .
+         ex:u ex:items _:e . _:e rdf:first 5 .",
+    )
+    .await;
+    let rdf = format!("{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n");
+    let walk = |subject: &str| {
+        format!("{rdf}SELECT ?x WHERE {{ {subject} ex:items/rdf:rest*/rdf:first ?x }}")
+    };
+    let values = |vs: &[i64]| vs.iter().map(|v| json!([v])).collect::<Vec<_>>();
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let ledger = load(&fluree, &id).await;
+        let lane = format!("indexed {indexed}");
+        assert_eq!(
+            sparql(&fluree, &ledger, &walk("ex:s")).await,
+            values(&[1, 1, 2, 3]),
+            "{lane}"
+        );
+        assert_eq!(
+            sparql(&fluree, &ledger, &walk("ex:t")).await,
+            values(&[7, 8]),
+            "{lane}"
+        );
+        assert_eq!(
+            sparql(&fluree, &ledger, &walk("ex:u")).await,
+            values(&[5]),
+            "{lane}"
+        );
+        let all = sparql(&fluree, &ledger, &walk("?s")).await;
+        assert_eq!(all, values(&[1, 1, 2, 3, 5, 7, 8]), "{lane}");
+        let holders = sparql(
+            &fluree,
+            &ledger,
+            &format!("{rdf}SELECT ?s WHERE {{ ?s ex:items/rdf:rest*/rdf:first 2 }}"),
+        )
+        .await;
+        assert_eq!(holders, [json!(["ex:s"])], "{lane}");
+        let beside = sparql(
+            &fluree,
+            &ledger,
+            &format!(
+                "{rdf}SELECT (COUNT(?x) AS ?n) WHERE {{ ex:s ex:items ?x \
+                 FILTER EXISTS {{ ex:s ex:items/rdf:rest*/rdf:first ?x }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(beside, [json!([4])], "the plain 9 is no member; {lane}");
+        let twin = jsonld(
+            &fluree,
+            &ledger,
+            json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                    "members": {"@path": "ex:items/rdf:rest*/rdf:first"}
+                },
+                "select": ["?x"],
+                "where": {"@id": "ex:s", "members": "?x"}
+            }),
+        )
+        .await;
+        assert_eq!(twin, values(&[1, 1, 2, 3]), "{lane}");
+    }
+    // An update's WHERE reads the walk as a query's does.
+    update(
+        &fluree,
+        &id,
+        "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         INSERT { ?s ex:member ?x } WHERE { ?s ex:items/rdf:rest*/rdf:first ?x }",
+    )
+    .await;
+    let ledger = load(&fluree, &id).await;
+    let members = sparql(
+        &fluree,
+        &ledger,
+        &format!("{PREFIX}SELECT ?x WHERE {{ ex:s ex:member ?x }}"),
+    )
+    .await;
+    assert_eq!(members, values(&[1, 2, 3]));
+}
+
+/// The rows of a SPARQL query over the dataset it names: each row's values,
+/// in projection order.
+async fn dataset_rows(
+    fluree: &fluree_db_api::Fluree,
+    text: &str,
+) -> fluree_db_api::Result<Vec<Vec<String>>> {
+    let result = fluree.query_from().sparql(text).execute_formatted().await?;
+    let vars: Vec<&str> = result["head"]["vars"]
+        .as_array()
+        .expect("vars")
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .collect();
+    let rows = result["results"]["bindings"].as_array().expect("bindings");
+    Ok(rows
+        .iter()
+        .map(|row| {
+            vars.iter()
+                .map(|v| row[*v]["value"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .collect())
+}
+
+/// A walk reads the lists of each graph a dataset names, in that graph's
+/// ledger: one ledger at two times in either order, and named graphs of two
+/// ledgers at one `t`, whether or not the first holds a list or codes the
+/// property as the second does. A default graph spanning ledgers is refused,
+/// as it is for any path, and so is a history range over compact lists; lists
+/// stored as triples walk in history as before.
+#[tokio::test]
+async fn a_list_walk_reads_each_graph_of_a_dataset() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let insert = |id: String, ttl: &'static str| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(&id)
+                .transact()
+                .insert_turtle(&format!("@prefix ex: <http://example.org/> .\n{ttl}"))
+                .commit()
+                .await
+                .expect("t:2");
+            id
+        }
+    };
+    // Both lists are at t:2. `b` met another namespace at t:1 (a declared
+    // prefix takes a code too), so it codes `ex:` apart from `a`.
+    let a = create(&fluree, "walk-a", "ex:q ex:name 0 .").await;
+    let a = insert(a, "ex:s ex:items (1 2) .").await;
+    let b = create(&fluree, "walk-b", "").await;
+    fluree
+        .graph(&b)
+        .transact()
+        .insert_turtle("<http://other.example/x> <http://other.example/y> 0 .")
+        .commit()
+        .await
+        .expect("t:1");
+    let b = insert(b, "ex:t ex:items (3) .").await;
+    // `c` codes `ex:` as `a` does, at the same `t`.
+    let c = create(&fluree, "walk-c", "ex:q ex:name 0 .").await;
+    let c = insert(c, "ex:t ex:items (3) .").await;
+    // One `ex:s` with a list, and one without, at the same `t`; and one that
+    // codes `ex:` apart.
+    let bare = create(&fluree, "walk-bare", "ex:s ex:name 0 .").await;
+    let held = create(&fluree, "walk-held", "ex:s ex:name 0 ; ex:items (5) .").await;
+    let far = create(&fluree, "walk-far", "").await;
+    fluree
+        .graph(&far)
+        .transact()
+        .insert_turtle("<http://other.example/x> <http://other.example/y> 0 .")
+        .commit()
+        .await
+        .expect("t:1");
+    let far = insert(far, "ex:s ex:items (6) .").await;
+    let nolist = create(&fluree, "walk-nolist", "ex:q ex:name 1 .").await;
+    let times = create(&fluree, "walk-times", "ex:q ex:name 1 .").await;
+    let times = insert(times, "ex:s ex:items (1 2) .").await;
+    let chains = create(
+        &fluree,
+        "walk-chains",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+         ex:u ex:items _:c . _:c rdf:first 7 ; rdf:rest rdf:nil ; ex:note 0 .",
+    )
+    .await;
+    let code = |ledger: &LedgerState| {
+        ledger
+            .snapshot
+            .encode_iri("http://example.org/items")
+            .map(|p| p.namespace_code)
+    };
+    for (one, other) in [(&a, &b), (&bare, &far)] {
+        assert_ne!(
+            code(&load(&fluree, one).await),
+            code(&load(&fluree, other).await),
+            "{one} and {other} code ex: apart"
+        );
+    }
+
+    let rdf = format!("{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n");
+    let walk = "?s ex:items/rdf:rest*/rdf:first ?x";
+    let rows = |text: String| {
+        let fluree = &fluree;
+        async move {
+            dataset_rows(fluree, &text)
+                .await
+                .unwrap_or_else(|e| panic!("query: {e}\n{text}"))
+        }
+    };
+    let row = |cells: &[&str]| cells.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let refused = |result: fluree_db_api::Result<Vec<Vec<String>>>, expected: &str| {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("refused: {expected}"));
+        assert!(err.to_string().contains(expected), "{expected}: {err}");
+        assert_eq!(err.status_code(), 400, "{err}");
+    };
+    for indexed in [false, true] {
+        if indexed {
+            for id in [&a, &b, &c, &bare, &held, &far, &nolist, &times, &chains] {
+                support::rebuild_and_publish_index(&fluree, id).await;
+            }
+        }
+        let lane = format!("indexed {indexed}");
+
+        for from in [
+            format!("FROM <{times}@t:1> FROM <{times}@t:2>"),
+            format!("FROM <{times}@t:2> FROM <{times}@t:1>"),
+        ] {
+            assert_eq!(
+                rows(format!(
+                    "{rdf}SELECT ?x {from} WHERE {{ {walk} }} ORDER BY ?x"
+                ))
+                .await,
+                [row(&["1"]), row(&["2"])],
+                "{lane}: {from}"
+            );
+        }
+
+        let named = |first: &str, second: &str, graph: &str| {
+            format!(
+                "{rdf}SELECT ?s ?x FROM NAMED <{first}> FROM NAMED <{second}> \
+                 WHERE {{ GRAPH {graph} {{ {walk} }} }} ORDER BY ?x"
+            )
+        };
+        for other in [&b, &c] {
+            assert_eq!(
+                rows(named(&a, other, "?g")).await,
+                [
+                    row(&["http://example.org/s", "1"]),
+                    row(&["http://example.org/s", "2"]),
+                    row(&["http://example.org/t", "3"]),
+                ],
+                "{lane}: each ledger's own lists, beside {other}"
+            );
+        }
+        for (first, second) in [(&bare, &held), (&held, &bare)] {
+            let text = format!(
+                "{rdf}SELECT ?x FROM NAMED <{first}> FROM NAMED <{second}> \
+                 WHERE {{ GRAPH ?g {{ ?s ex:name 0 . {walk} }} }}"
+            );
+            assert_eq!(rows(text).await, [row(&["5"])], "{lane}: {first}, {second}");
+        }
+        // A subject bound in one ledger walks in another by its IRI.
+        let joined = format!(
+            "{rdf}SELECT ?x FROM NAMED <{bare}> FROM NAMED <{far}> \
+             WHERE {{ GRAPH <{bare}> {{ ?s ex:name 0 }} GRAPH <{far}> {{ {walk} }} }}"
+        );
+        assert_eq!(rows(joined).await, [row(&["6"])], "{lane}");
+        let constant = format!(
+            "{rdf}SELECT ?x FROM NAMED <{a}> FROM NAMED <{b}> \
+             WHERE {{ GRAPH <{b}> {{ ex:t ex:items/rdf:rest*/rdf:first ?x }} }}"
+        );
+        assert_eq!(rows(constant).await, [row(&["3"])], "{lane}");
+        for graph in ["?g".to_string(), format!("<{b}>")] {
+            assert_eq!(
+                rows(named(&nolist, &b, &graph)).await,
+                [row(&["http://example.org/t", "3"])],
+                "{lane}: GRAPH {graph} past a ledger holding no list"
+            );
+        }
+        let members = fluree
+            .query_from()
+            .jsonld(&json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                    "members": {"@path": "ex:items/rdf:rest*/rdf:first"}
+                },
+                "fromNamed": [a, b],
+                "select": ["?x"],
+                "where": [["graph", "?g", {"@id": "?s", "members": "?x"}]],
+                "orderBy": ["?x"]
+            }))
+            .execute_formatted()
+            .await
+            .expect("JSON-LD walk over named graphs");
+        assert_eq!(members, json!([[1], [2], [3]]), "{lane}");
+
+        let across = format!("{rdf}SELECT ?x FROM <{a}> FROM <{b}> WHERE {{ {walk} }}");
+        refused(dataset_rows(&fluree, &across).await, "spanning ledgers");
+        let across = fluree
+            .query_from()
+            .jsonld(&json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                    "members": {"@path": "ex:items/rdf:rest*/rdf:first"}
+                },
+                "from": [a, b],
+                "select": ["?x"],
+                "where": {"@id": "?s", "members": "?x"}
+            }))
+            .execute_formatted()
+            .await
+            .map(|_| Vec::new());
+        refused(across, "spanning ledgers");
+
+        let history = |id: &str| {
+            format!("{rdf}SELECT ?x FROM <{id}@t:1> TO <{id}@t:latest> WHERE {{ {walk} }}")
+        };
+        refused(dataset_rows(&fluree, &history(&a)).await, "history query");
+        let chained = rows(history(&chains)).await;
+        assert!(chained.contains(&row(&["7"])), "{lane}: {chained:?}");
+    }
 }

@@ -15,7 +15,7 @@
 use crate::policy::shape_nodes;
 use crate::vocab::*;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, Term, TermId};
-use fluree_graph_json_ld::adapter::{to_graph_events_scoped, GraphNameRef};
+use fluree_graph_json_ld::adapter::{to_graph_events_scoped, AdapterError, GraphNameRef};
 use fluree_graph_turtle::ParserOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -122,7 +122,9 @@ pub fn parse(text: &str, format: RdfFormat, base: Option<&str>) -> Result<Parsed
             let expanded = fluree_graph_json_ld::expand(&json)
                 .map_err(|e| ReadError::JsonLd(e.to_string()))?;
             to_graph_events_scoped(&expanded, &mut sink, |name| match name {
-                GraphNameRef::NamedGraph(iri) => Ok(Some(iri.to_string())),
+                GraphNameRef::NamedGraph(name) => fluree_graph_json_ld::iri_named_graph(name)
+                    .map(|iri| Some(iri.to_string()))
+                    .map_err(AdapterError::InvalidStructure),
                 GraphNameRef::Selector(sel) if sel == "default" || sel == "@default" => Ok(None),
                 GraphNameRef::Selector(sel) => Ok(Some(sel.to_string())),
             })

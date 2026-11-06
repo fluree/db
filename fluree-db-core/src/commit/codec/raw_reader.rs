@@ -157,8 +157,9 @@ pub struct RawOp<'a> {
     pub op: bool,
     /// Language tag (if present), borrowed from ops buffer.
     pub lang: Option<&'a str>,
-    /// List index (if present).
-    pub i: Option<i32>,
+    /// List place (if present): which list of its graph, subject and
+    /// predicate, and the position in it (`crate::list_index`).
+    pub place: Option<(u32, i32)>,
 }
 
 /// Object value without allocation. Borrows from ops buffer or dicts.
@@ -447,15 +448,9 @@ fn decode_raw_op<'a>(
         None
     };
 
-    // Optional list index (unsigned varint)
-    let i = if flags & OP_FLAG_HAS_I != 0 {
-        let raw = decode_varint(data, pos)?;
-        if raw > i32::MAX as u64 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "list index {raw} exceeds i32::MAX"
-            )));
-        }
-        Some(raw as i32)
+    // Optional list place (unsigned varint)
+    let place = if flags & OP_FLAG_HAS_I != 0 {
+        Some(super::op_codec::decode_place(decode_varint(data, pos)?)?)
     } else {
         None
     };
@@ -472,7 +467,7 @@ fn decode_raw_op<'a>(
         o,
         op,
         lang,
-        i,
+        place,
     })
 }
 
@@ -805,7 +800,7 @@ mod tests {
             assert!(matches!(raw.o, RawObject::Long(30)));
             assert!(raw.op); // assert
             assert!(raw.lang.is_none());
-            assert!(raw.i.is_none());
+            assert!(raw.place.is_none());
             assert_eq!(raw.g_ns_code, 0);
             assert_eq!(raw.g_name, "");
             count += 1;
@@ -992,10 +987,7 @@ mod tests {
                 Sid::new(3, "langString"),
                 1,
                 true,
-                Some(FlakeMeta {
-                    lang: Some("fr".into()),
-                    i: Some(0),
-                }),
+                FlakeMeta::from_parts(Some("fr"), Some(0)),
             ),
         ];
 
@@ -1007,15 +999,15 @@ mod tests {
             match idx {
                 0 => {
                     assert_eq!(raw.lang, Some("en"));
-                    assert_eq!(raw.i, None);
+                    assert_eq!(raw.place, None);
                 }
                 1 => {
                     assert_eq!(raw.lang, None);
-                    assert_eq!(raw.i, Some(3));
+                    assert_eq!(raw.place, Some((0, 3)));
                 }
                 2 => {
                     assert_eq!(raw.lang, Some("fr"));
-                    assert_eq!(raw.i, Some(0));
+                    assert_eq!(raw.place, Some((0, 0)));
                 }
                 _ => panic!("too many ops"),
             }

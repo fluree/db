@@ -497,16 +497,17 @@ async fn wildcard_joins_keep_list_members_in_json_ld() {
     set_fast_paths_disabled(false);
     assert_eq!(normalized(&rows), normalized(&generic));
 
-    // SPARQL: the name and the list's head, for each driving row.
+    // SPARQL reads the same members, through the same lane.
     use Routing::*;
-    check(
+    let sparql = check(
         &fluree,
         &ledger,
         "SELECT ?s ?p ?o WHERE { VALUES ?s { ex:a ex:a } ?s ?p ?o }",
-        4,
-        MustNotFire,
+        8,
+        MustFire,
     )
     .await;
+    assert_eq!(normalized(&sparql), normalized(&rows));
 }
 
 /// Reproducible local A/B probe benchmark. Run separately in dev-fast/release;

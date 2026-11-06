@@ -5,16 +5,18 @@
 //! WHERE ([`ConstructTemplate::mark_list_entries`]) writes the triples the
 //! WHERE read, so where those are entries of a list, it writes that list.
 //! [`ListEntriesOperator`], above the whole plan, binds for each solution the
-//! positions of the entries of the owner's list that hold the triple's
-//! object, and whether the owner also holds the object beside the list. A
-//! value names every entry holding it, as a delete naming it does. A triple
+//! places of the entries of the owner's lists that hold the triple's object,
+//! and whether the owner also holds the object beside them. A value names
+//! every entry holding it, as a delete naming it does. A triple
 //! on a predicate that holds no list costs a row nothing beyond a look at
 //! its predicate, and a template whose every such triple has one is not
 //! wrapped at all.
 //!
-//! A list is read from the query's default graph. An owner holding lists in
-//! more than one of its graphs, like every owner over a dataset spanning
-//! ledgers, binds nothing, and its triples are written as values.
+//! A place is bound as an integer holding its packed bits
+//! ([`fluree_db_core::list_index::pack`]). A list is read from the query's
+//! default graph. An owner holding lists in more than one of its graphs, like
+//! every owner over a dataset spanning ledgers, binds nothing, and its
+//! triples are written as values.
 
 use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};
@@ -42,7 +44,7 @@ pub struct ListEntriesOperator {
     marked: Vec<(TriplePattern, ListEntryVars)>,
     view: Arc<ListView>,
     schema: Arc<[VarId]>,
-    /// Each owner's list as this request read it; `None` for an owner with
+    /// Each owner's lists as this request read them; `None` for an owner with
     /// no list, or lists in several graphs.
     held: HashMap<(Sid, Sid), Option<Arc<Held>>>,
     /// The owners and values whose entries a solution has been bound to:
@@ -50,10 +52,10 @@ pub struct ListEntriesOperator {
     bound: HashSet<(Sid, Sid, Binding)>,
 }
 
-/// An owner's list, and the values it holds beside it.
+/// An owner's lists, and the values it holds beside them.
 struct Held {
-    /// The positions of the entries holding each value, in order.
-    entries: HashMap<Binding, Vec<i64>>,
+    /// The packed places of the entries holding each value, in order.
+    entries: HashMap<Binding, Vec<u64>>,
     beside: HashSet<Binding>,
 }
 
@@ -158,7 +160,7 @@ impl ListEntriesOperator {
         Some((s, p, decoded(ctx, o)))
     }
 
-    /// The positions of the entries of `s`'s list on `p` holding `o`, none
+    /// The places of the entries of `s`'s lists on `p` holding `o`, none
     /// when an earlier solution named them, and whether the owner holds it
     /// beside them; `None` when no entry does.
     async fn entries(
@@ -187,7 +189,7 @@ impl ListEntriesOperator {
         }
         let at = at
             .iter()
-            .map(|&i| Binding::lit(FlakeValue::Long(i), Sid::xsd_integer()))
+            .map(|&place| Binding::lit(FlakeValue::Long(place as i64), Sid::xsd_integer()))
             .collect();
         Ok(Some((at, beside)))
     }
@@ -215,8 +217,8 @@ fn node(ctx: &ExecutionContext<'_>, batch: &Batch, row: usize, r: &Ref) -> Optio
     }
 }
 
-/// The list `s` holds under `p` in `graphs`, read under each graph's view
-/// policy, with the values held beside it; `None` when no graph, or more
+/// The lists `s` holds under `p` in `graphs`, read under each graph's view
+/// policy, with the values held beside them; `None` when no graph, or more
 /// than one, holds a list there.
 async fn read_held(
     ctx: &ExecutionContext<'_>,
@@ -224,7 +226,7 @@ async fn read_held(
     s: &Sid,
     p: &Sid,
 ) -> Result<Option<Held>> {
-    let mut entries: HashMap<Binding, Vec<i64>> = HashMap::new();
+    let mut entries: HashMap<Binding, Vec<u64>> = HashMap::new();
     let mut beside = HashSet::new();
     let mut lists = 0;
     for graph in graphs {
@@ -258,11 +260,11 @@ async fn read_held(
         if !members.is_empty() {
             lists += 1;
             for member in &members {
-                if let Some(i) = member.m.as_ref().and_then(|m| m.i) {
+                if let Some(m) = member.m.as_ref() {
                     entries
                         .entry(member_binding(member))
                         .or_default()
-                        .push(i64::from(i));
+                        .push(m.packed_place());
                 }
             }
         }

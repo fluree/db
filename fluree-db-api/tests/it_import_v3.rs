@@ -1353,13 +1353,14 @@ ex:c ex:amount "1234567890123456789.5"^^xsd:decimal .
     assert!(result.root_id.is_some(), "index should have been built");
 
     // The import must write a v5 root (inline decimals): byte 4 of the FIR6
-    // header is the version, and ROOT_V6_VERSION_V5 == 3.
+    // header is the version.
     let fir6_files = find_files_with_magic(db_dir.path(), b"FIR6");
     assert!(!fir6_files.is_empty(), "expected a FIR6 root file");
     let root_bytes = std::fs::read(&fir6_files[0]).expect("read FIR6 root");
     assert_eq!(
-        root_bytes[4], 3,
-        "bulk import must write a v3 inline-decimal root"
+        root_bytes[4],
+        fluree_db_binary_index::format::index_root::ROOT_V6_VERSION_V5,
+        "bulk import must write a v5 inline-decimal root"
     );
 
     let ledger = fluree

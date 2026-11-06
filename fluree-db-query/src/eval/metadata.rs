@@ -13,6 +13,7 @@ use fluree_db_binary_index::batched_lookup_predicate_refs;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
+use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::query_bounds::{RangeMatch, RangeOptions, RangeTest};
 use fluree_db_core::range_provider::RangeQuery;
@@ -475,9 +476,9 @@ fn subject_all_flakes_raw(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<V
 }
 
 /// One asserted data property: `(predicate, value, datatype, language, list
-/// index)`. The list index (`FlakeMeta::i`) orders the elements of a
+/// place)`. The list place (`FlakeMeta::place`) orders the elements of a
 /// list-valued (`@list`) property; `None` for a plain scalar.
-type DataProperty = (Sid, FlakeValue, Sid, Option<String>, Option<i32>);
+type DataProperty = (Sid, FlakeValue, Sid, Option<String>, Option<ListPlace>);
 
 /// The `Binding` for a property value, carrying its language tag when present
 /// (a `rdf:langString`) so map output keeps `@language`.
@@ -524,7 +525,7 @@ fn data_properties_from_flakes(mut flakes: Vec<Flake>) -> Vec<DataProperty> {
             continue;
         }
         let lang = flake.m.as_ref().and_then(|m| m.lang.clone());
-        let list_index = flake.m.as_ref().and_then(|m| m.i);
+        let list_index = flake.m.as_ref().and_then(fluree_db_core::FlakeMeta::place);
         let key = (
             flake.p.clone(),
             flake.o.clone(),
@@ -612,7 +613,7 @@ fn properties_binding(props: Vec<DataProperty>, ctx: &ExecutionContext<'_>) -> R
     // Group by key (local name), preserving first-seen order. Each value keeps
     // its list index so a list-valued property renders in `@list` order.
     let mut order: Vec<String> = Vec::new();
-    let mut grouped: HashMap<String, Vec<(Binding, Option<i32>)>> = HashMap::new();
+    let mut grouped: HashMap<String, Vec<(Binding, Option<ListPlace>)>> = HashMap::new();
     for (pred, val, dt, lang, list_index) in props {
         let Some(name) = cypher_name_from_sid(&pred, ctx)? else {
             continue;
@@ -632,8 +633,8 @@ fn properties_binding(props: Vec<DataProperty>, ctx: &ExecutionContext<'_>) -> R
             let value = if vals.len() == 1 {
                 vals.pop().expect("len == 1").0
             } else {
-                // Order list elements by their stored index (stable for absent).
-                vals.sort_by_key(|(_, i)| i.unwrap_or(i32::MAX));
+                // Order list elements by their stored place (stable for absent).
+                vals.sort_by_key(|(_, i)| i.unwrap_or((u32::MAX, i32::MAX)));
                 Binding::List(vals.into_iter().map(|(b, _)| b).collect())
             };
             (Arc::from(name.as_str()), value)
@@ -682,7 +683,7 @@ fn node_property_subject(
 
 /// Select the value(s) of one predicate out of a subject's data properties.
 fn node_property_binding(props: Vec<DataProperty>, pred_sid: &Sid) -> Binding {
-    let mut vals: Vec<(Binding, Option<i32>)> = props
+    let mut vals: Vec<(Binding, Option<ListPlace>)> = props
         .into_iter()
         .filter(|(p, ..)| p == pred_sid)
         .map(|(_, val, dt, lang, i)| (property_value_binding(val, dt, lang), i))
@@ -691,7 +692,7 @@ fn node_property_binding(props: Vec<DataProperty>, pred_sid: &Sid) -> Binding {
         0 => Binding::Unbound,
         1 => vals.pop().expect("len == 1").0,
         _ => {
-            vals.sort_by_key(|(_, i)| i.unwrap_or(i32::MAX));
+            vals.sort_by_key(|(_, i)| i.unwrap_or((u32::MAX, i32::MAX)));
             Binding::List(vals.into_iter().map(|(b, _)| b).collect())
         }
     }

@@ -15,6 +15,7 @@ use fluree_db_core::Tracker;
 
 use crate::format::branch::BranchManifest;
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record::LIST_INDEX_NONE;
 use crate::format::run_record_v2::cmp_v2_for_order;
 use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2};
 use crate::read::types::cmp_overlay_vs_record;
@@ -240,25 +241,10 @@ impl BinaryCursor {
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
         );
         // `merge_overlay_into_batch` compares each base row against overlay ops
-        // on the FULL V3 identity (s_id, p_id, o_type, o_key, o_i). If the
-        // projection omits any of these, the base column reads as `AbsentDefault`
-        // (p_id→0, o_type→0, o_i→u32::MAX), corrupting the sort/identity compare
-        // and over/under-counting. Production masks this because the leaflet
-        // cache always loads `ColumnProjection::all()`, but a cache-less store
-        // would miscount — so require the identity columns explicitly here.
-        debug_assert!(
-            ops.is_empty() || {
-                let eff = self.projection.effective();
-                eff.contains(ColumnId::SId)
-                    && eff.contains(ColumnId::PId)
-                    && eff.contains(ColumnId::OType)
-                    && eff.contains(ColumnId::OKey)
-                    && eff.contains(ColumnId::OI)
-            },
-            "overlay merge requires the full V3 identity (SId, PId, OType, OKey, OI) \
-             in the cursor projection; got {:?}",
-            self.projection
-        );
+        // on the FULL V3 identity (s_id, p_id, o_type, o_key, o_i). A leaflet
+        // an op falls in decodes every column (`leaflet_decode_set`), cached or
+        // not, so the projection need not carry the identity: a scan that reads
+        // no list places decodes none where no novelty merges.
         self.overlay_ops = ops;
         self.overlay_pos = start;
         self.overlay_end = end;
@@ -287,9 +273,11 @@ impl BinaryCursor {
     /// but widens it defensively so a narrowed decode can never starve a
     /// downstream read:
     /// - `has_ov`: the overlay merge reads every base column → decode ALL.
-    /// - non-empty filter: `filter_batch` reads s/p/o_type/o_key/o_i (mostly
-    ///   `Const`/absent, so free to include).
-    /// - `need_replay`: leaflet replay reads `t`.
+    /// - non-empty filter: `filter_batch` reads s/p/o_type/o_key (mostly
+    ///   `Const`/absent, so free to include), and `o_i` when the filter tests
+    ///   it — a leaflet of a property holding lists stores one per row.
+    /// - `need_replay`: leaflet replay reads `t`, and `o_i`, matching rows to
+    ///   history on the full fact identity.
     ///
     /// For a plain current-time scan this drops `t` (and any other unprojected
     /// column), so its `Block` is neither decoded nor allocated. The leaflet
@@ -304,10 +292,13 @@ impl BinaryCursor {
             set.insert(ColumnId::OKey);
             set.insert(ColumnId::PId);
             set.insert(ColumnId::OType);
-            set.insert(ColumnId::OI);
+            if self.filter.o_i.is_some() {
+                set.insert(ColumnId::OI);
+            }
         }
         if self.need_replay() {
             set.insert(ColumnId::T);
+            set.insert(ColumnId::OI);
         }
         set
     }
@@ -754,7 +745,7 @@ impl BinaryCursor {
             let r_p = base.p_id.get_or(ri, 0);
             let r_ot = base.o_type.get_or(ri, 0);
             let r_ok = base.o_key.get(ri);
-            let r_oi = base.o_i.get_or(ri, u32::MAX);
+            let r_oi = base.o_i.get_or(ri, LIST_INDEX_NONE);
             // Only the pooled tree has a graph column to compare.
             let r_g = if pooled { base.g_id.get_or(ri, 0) } else { 0 };
 
@@ -845,7 +836,7 @@ struct OutRows {
     o_key: Vec<u64>,
     p_id: Vec<u32>,
     o_type: Vec<u16>,
-    o_i: Vec<u32>,
+    o_i: Vec<u64>,
     t: Vec<u32>,
     g_id: Option<Vec<fluree_db_core::GraphId>>,
 }
@@ -868,7 +859,7 @@ impl OutRows {
         self.o_key.push(batch.o_key.get(i));
         self.p_id.push(batch.p_id.get_or(i, 0));
         self.o_type.push(batch.o_type.get_or(i, 0));
-        self.o_i.push(batch.o_i.get_or(i, u32::MAX));
+        self.o_i.push(batch.o_i.get_or(i, LIST_INDEX_NONE));
         self.t.push(batch.t.get_or(i, 0));
         if let Some(g) = &mut self.g_id {
             g.push(batch.g_id.get_or(i, 0));
@@ -929,7 +920,7 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder)
         let o_key = batch.o_key.get(i); // always present
         let p_id = batch.p_id.get_or(i, 0);
         let o_type = batch.o_type.get_or(i, 0);
-        let o_i = batch.o_i.get_or(i, u32::MAX);
+        let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
         if filter.matches(s_id, p_id, o_type, o_key, o_i)
             && (!check_graph || filter.matches_graph(batch.g_id.get_or(i, 0)))
         {
@@ -1117,7 +1108,7 @@ mod tests {
             p_id,
             o_type: 0,
             o_key: 0,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             t: 1,
             op: true,
             g_id: 0,
@@ -1385,5 +1376,90 @@ mod tests {
             "a wanted key equal to a leaflet's last or first subject keeps it"
         );
         assert_eq!(s_ids, (9..=16).collect::<Vec<u64>>());
+    }
+
+    /// A row's list place is decoded only where it is read: not for a filter
+    /// on the other columns, but for a filter on the place itself, and for a
+    /// replay, which matches rows to history on the full fact identity.
+    #[test]
+    fn list_places_decode_only_where_read() {
+        use crate::format::branch::{BranchManifest, LeafEntry};
+        use crate::format::leaf::LeafWriter;
+        use crate::read::binary_index_store::tests::empty_store;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
+        use fluree_db_core::content_kind::ContentKind;
+        use fluree_db_core::{ContentStore, MemoryContentStore};
+
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 4, 100_000, 1);
+        writer.set_skip_history(true);
+        for s in 1..=200u64 {
+            let mut rec = make_key(s, 1);
+            rec.o_key = s;
+            rec.o_i = s;
+            writer.push_record(rec).unwrap();
+        }
+        let leaf = writer.finish().unwrap().remove(0);
+        let mem = MemoryContentStore::new();
+        let cid = crate::read::binary_index_store::run_sync_on_runtime({
+            let mem = mem.clone();
+            let bytes = leaf.leaf_bytes.clone();
+            async move {
+                mem.put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .unwrap();
+        let cs: Arc<dyn ContentStore> = Arc::new(mem);
+        let store = Arc::new(empty_store(cs));
+        let branch = Arc::new(BranchManifest {
+            leaves: vec![LeafEntry {
+                first_key: leaf.first_key,
+                last_key: leaf.last_key,
+                row_count: leaf.total_rows,
+                leaf_cid: cid,
+                sidecar_cid: None,
+            }],
+        });
+        let cursor = |filter: BinaryFilter| {
+            BinaryCursor::new(
+                Arc::clone(&store),
+                RunSortOrder::Spot,
+                Arc::clone(&branch),
+                &make_key(1, 0),
+                &make_key(200, u32::MAX),
+                filter,
+                ColumnProjection {
+                    output: ColumnSet::CORE,
+                    internal: ColumnSet::EMPTY,
+                },
+            )
+        };
+        let on_predicate = BinaryFilter {
+            p_id: Some(1),
+            ..Default::default()
+        };
+
+        let mut values = cursor(on_predicate.clone());
+        assert!(!values.leaflet_decode_set(false).contains(ColumnId::OI));
+        let batch = values.next_batch().unwrap().expect("a batch");
+        assert!(batch.o_i.is_absent(), "no list place decoded");
+        assert_eq!(batch.row_count, 4);
+
+        let mut at_place = cursor(BinaryFilter {
+            o_i: Some(5),
+            ..on_predicate.clone()
+        });
+        assert!(at_place.leaflet_decode_set(false).contains(ColumnId::OI));
+        let mut s_ids = Vec::new();
+        while let Some(batch) = at_place.next_batch().unwrap() {
+            s_ids.extend((0..batch.row_count).map(|i| batch.s_id.get(i)));
+        }
+        assert_eq!(s_ids, [5], "the filter tests the decoded place");
+
+        let mut replaying = cursor(on_predicate);
+        replaying.set_to_t(0);
+        let set = replaying.leaflet_decode_set(false);
+        assert!(set.contains(ColumnId::OI) && set.contains(ColumnId::T));
     }
 }

@@ -15,15 +15,15 @@
 //! ## Blob layout
 //!
 //! ```text
-//! Header (72 bytes):
+//! Header (80 bytes):
 //!   magic:          [u8; 4]   "FLI3"
-//!   version:        u8        1
+//!   version:        u8        2 (1: a v4 leaf, whose keys hold a 32-bit o_i)
 //!   order:          u8        (0=SPOT, 1=PSOT, 2=POST, 3=OPST)
 //!   padding:        [u8; 2]
 //!   leaflet_count:  u32
 //!   total_rows:     u64
-//!   first_key:      [u8; 26]  (order-specific routing key)
-//!   last_key:       [u8; 26]  (order-specific routing key)
+//!   first_key:      [u8; 30]  (order-specific routing key)
+//!   last_key:       [u8; 30]  (order-specific routing key)
 //!
 //! Directory (variable):
 //!   [LeafletDirEntryV3 × leaflet_count]
@@ -41,20 +41,25 @@ use super::history_sidecar::{HistEntryV2, HistSidecarBuilder, HistorySegmentRef}
 use super::leaflet::{encode_leaflet, EncodedLeaflet};
 use super::run_record::RunSortOrder;
 use super::run_record_v2::{
-    cmp_v2_for_order, ordered_key_from_stored, ordered_key_len, read_ordered_key_v2,
-    write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+    cmp_v2_for_order, ordered_key_from_stored, ordered_key_len, ordered_key_stored_len,
+    read_ordered_key_v2, write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
 };
 use super::transitions::resolve_transitions;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 pub const LEAF_V3_MAGIC: &[u8; 4] = b"FLI3";
-pub const LEAF_V3_VERSION: u8 = 1;
 
-/// Header size of a dedicated-order leaf, 72 bytes: magic (4), version (1),
-/// order (1), pad (2), leaflet_count (4), total_rows (8), first_key (26) and
-/// last_key (26). Pooled leaves store 30-byte keys ([`leaf_header_size`]).
-pub const LEAF_V3_HEADER_SIZE: usize = 72;
+/// The leaf version this build writes: keys hold a 64-bit list place.
+pub const LEAF_V3_VERSION: u8 = 2;
+
+/// A v4 index's leaf version, read only: its keys hold a 32-bit `o_i`.
+pub const LEAF_V3_VERSION_NARROW: u8 = 1;
+
+/// Header size of a dedicated-order leaf, 80 bytes: magic (4), version (1),
+/// order (1), pad (2), leaflet_count (4), total_rows (8), first_key (30) and
+/// last_key (30). Pooled leaves store 34-byte keys ([`leaf_header_size`]).
+pub const LEAF_V3_HEADER_SIZE: usize = 80;
 
 /// Largest header of any order.
 pub const LEAF_V3_MAX_HEADER_SIZE: usize = 20 + 2 * ORDERED_KEY_V2_SIZE;
@@ -62,7 +67,13 @@ pub const LEAF_V3_MAX_HEADER_SIZE: usize = 20 + 2 * ORDERED_KEY_V2_SIZE;
 /// Header size for a leaf of `order`.
 #[inline]
 pub fn leaf_header_size(order: RunSortOrder) -> usize {
-    20 + 2 * ordered_key_len(order)
+    leaf_header_size_for(order, false)
+}
+
+/// Header size for a leaf of `order`, a v4 leaf when `narrow`.
+#[inline]
+fn leaf_header_size_for(order: RunSortOrder, narrow: bool) -> usize {
+    20 + 2 * ordered_key_stored_len(order, narrow)
 }
 
 /// Bytes of a leaflet directory entry before its column refs: row_count,
@@ -70,7 +81,13 @@ pub fn leaf_header_size(order: RunSortOrder) -> usize {
 /// payload_offset, payload_len, column_count.
 #[inline]
 pub fn leaflet_dir_fixed_size(order: RunSortOrder) -> usize {
-    28 + 2 * ordered_key_len(order)
+    leaflet_dir_fixed_size_for(order, false)
+}
+
+/// [`leaflet_dir_fixed_size`] in a v4 leaf when `narrow`.
+#[inline]
+fn leaflet_dir_fixed_size_for(order: RunSortOrder, narrow: bool) -> usize {
+    28 + 2 * ordered_key_stored_len(order, narrow)
 }
 
 /// Bytes of a leaflet directory entry after its column refs (history ref).
@@ -1001,19 +1018,26 @@ pub fn decode_leaf_header_v3(data: &[u8]) -> io::Result<LeafHeaderV3> {
         ));
     }
     let version = data[4];
+    if version != LEAF_V3_VERSION && version != LEAF_V3_VERSION_NARROW {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("leaf: unsupported version {version}"),
+        ));
+    }
+    let narrow = version == LEAF_V3_VERSION_NARROW;
     let order = RunSortOrder::from_u8(data[5])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad order byte"))?;
-    if data.len() < leaf_header_size(order) {
+    if data.len() < leaf_header_size_for(order, narrow) {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "leaf too short",
         ));
     }
-    let k = ordered_key_len(order);
+    let k = ordered_key_stored_len(order, narrow);
     let leaflet_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let total_rows = u64::from_le_bytes(data[12..20].try_into().unwrap());
-    let first_key = ordered_key_from_stored(order, &data[20..20 + k]);
-    let last_key = ordered_key_from_stored(order, &data[20 + k..20 + 2 * k]);
+    let first_key = ordered_key_from_stored(order, &data[20..20 + k], narrow);
+    let last_key = ordered_key_from_stored(order, &data[20 + k..20 + 2 * k], narrow);
 
     Ok(LeafHeaderV3 {
         version,
@@ -1070,9 +1094,10 @@ pub fn decode_leaf_dir_v3_with_base(
     header: &LeafHeaderV3,
 ) -> io::Result<DecodedLeafDirV3> {
     let order = header.order;
-    let k = ordered_key_len(order);
-    let fixed = leaflet_dir_fixed_size(order);
-    let mut pos = leaf_header_size(order);
+    let narrow = header.version == LEAF_V3_VERSION_NARROW;
+    let k = ordered_key_stored_len(order, narrow);
+    let fixed = leaflet_dir_fixed_size_for(order, narrow);
+    let mut pos = leaf_header_size_for(order, narrow);
     let mut entries = Vec::with_capacity(header.leaflet_count as usize);
 
     for _ in 0..header.leaflet_count {
@@ -1085,8 +1110,8 @@ pub fn decode_leaf_dir_v3_with_base(
 
         let row_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         let lead_group_count = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-        let first_key = ordered_key_from_stored(order, &data[pos + 8..pos + 8 + k]);
-        let last_key = ordered_key_from_stored(order, &data[pos + 8 + k..pos + 8 + 2 * k]);
+        let first_key = ordered_key_from_stored(order, &data[pos + 8..pos + 8 + k], narrow);
+        let last_key = ordered_key_from_stored(order, &data[pos + 8 + k..pos + 8 + 2 * k], narrow);
         // Fields after the keys: `o + 60` is where they start for 26-byte keys.
         let o = pos + 2 * k - 52;
         let p_const_raw = u32::from_le_bytes(data[o + 60..o + 64].try_into().unwrap());
@@ -1257,7 +1282,7 @@ mod tests {
                 })
                 .sum();
             assert_eq!(dir.payload_base, leaf_header_size(order) + dir_size);
-            assert_eq!(leaf_header_size(order), 80);
+            assert_eq!(leaf_header_size(order), 88);
             for entry in &dir.entries {
                 let g_ref = entry
                     .column_refs
@@ -1303,9 +1328,9 @@ mod tests {
         }
     }
 
-    /// A dedicated leaf's bytes do not change: 72-byte header, 26-byte keys.
+    /// A dedicated leaf stores 30-byte keys, so its header is 80 bytes.
     #[test]
-    fn dedicated_leaf_keeps_26_byte_keys() {
+    fn dedicated_leaf_keeps_30_byte_keys() {
         let int = OType::XSD_INTEGER.as_u16();
         let mut writer = LeafWriter::new(RunSortOrder::Post, 64, 10_000, 1);
         writer.set_skip_history(true);
@@ -1320,7 +1345,7 @@ mod tests {
         let entry = &dir.entries[0];
         assert_eq!(
             dir.payload_base,
-            LEAF_V3_HEADER_SIZE + 80 + entry.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20
+            LEAF_V3_HEADER_SIZE + 88 + entry.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20
         );
         assert!(entry
             .column_refs
@@ -1441,7 +1466,7 @@ mod tests {
 
         // Decode header.
         let header = decode_leaf_header_v3(&leaf.leaf_bytes).unwrap();
-        assert_eq!(header.version, 1);
+        assert_eq!(header.version, LEAF_V3_VERSION);
         assert_eq!(header.order, RunSortOrder::Post);
         assert_eq!(header.leaflet_count, 1);
         assert_eq!(header.total_rows, 10);
@@ -1587,7 +1612,7 @@ mod tests {
 
     fn compute_directory_size_from_dir(dir: &[LeafletDirEntryV3]) -> usize {
         dir.iter()
-            .map(|e| 80 + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20)
+            .map(|e| 88 + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20)
             .sum()
     }
 
@@ -1769,5 +1794,88 @@ mod tests {
             "the leaf's routing range must span the retracted subject, or \
              branch-level leaf selection never opens the leaf that holds it"
         );
+    }
+
+    /// `bytes`, a leaf of a dedicated `order`, in a v4 leaf's layout: header
+    /// version 1, and every key with its `o_i` as a 32-bit position.
+    fn narrow_leaf(order: RunSortOrder, bytes: &[u8]) -> Vec<u8> {
+        let at = match order {
+            RunSortOrder::Spot | RunSortOrder::Psot => 22,
+            RunSortOrder::Post => 14,
+            _ => 10,
+        };
+        let narrow_key = |key: &[u8]| -> Vec<u8> {
+            let o_i = u64::from_be_bytes(key[at..at + 8].try_into().unwrap());
+            let o_i = if o_i == LIST_INDEX_NONE {
+                u32::MAX
+            } else {
+                u32::try_from(o_i).unwrap()
+            };
+            [&key[..at], o_i.to_be_bytes().as_slice(), &key[at + 8..30]].concat()
+        };
+        let header = decode_leaf_header_v3(bytes).unwrap();
+        let mut out = bytes[..20].to_vec();
+        out[4] = LEAF_V3_VERSION_NARROW;
+        out.extend(narrow_key(&bytes[20..50]));
+        out.extend(narrow_key(&bytes[50..80]));
+        let mut pos = 80;
+        for _ in 0..header.leaflet_count {
+            out.extend_from_slice(&bytes[pos..pos + 8]);
+            out.extend(narrow_key(&bytes[pos + 8..pos + 38]));
+            out.extend(narrow_key(&bytes[pos + 38..pos + 68]));
+            let columns = u16::from_le_bytes(bytes[pos + 86..pos + 88].try_into().unwrap());
+            let end = pos + 88 + usize::from(columns) * COLUMN_BLOCK_REF_SIZE + 20;
+            out.extend_from_slice(&bytes[pos + 68..end]);
+            pos = end;
+        }
+        out.extend_from_slice(&bytes[pos..]);
+        out
+    }
+
+    /// A v4 leaf (version 1, 26-byte keys) decodes to the keys and payload
+    /// the same leaf written by this build decodes to, so a v4 index is
+    /// served until its ledger's first v5 build rebuilds it.
+    #[test]
+    fn a_v4_leaf_decodes_like_this_builds_leaf() {
+        let int = OType::XSD_INTEGER.as_u16();
+        for order in [RunSortOrder::Spot, RunSortOrder::Post, RunSortOrder::Opst] {
+            let mut writer = LeafWriter::new(order, 4, 10_000, 1);
+            writer.set_skip_history(true);
+            let mut recs: Vec<_> = (0..10u64).map(|i| make_rec(i, 1, int, i, 1)).collect();
+            recs[3].o_i = 2;
+            recs.sort_by(cmp_v2_for_order(order));
+            for rec in recs {
+                writer.push_record(rec).unwrap();
+            }
+            let infos = writer.finish().unwrap();
+            let wide = &infos[0].leaf_bytes;
+            let narrow = narrow_leaf(order, wide);
+            assert_eq!(
+                narrow.len() + 8 + 8 * 3,
+                wide.len(),
+                "{order:?}: 4 fewer bytes a key"
+            );
+
+            let (wh, nh) = (
+                decode_leaf_header_v3(wide).unwrap(),
+                decode_leaf_header_v3(&narrow).unwrap(),
+            );
+            assert_eq!(nh.version, LEAF_V3_VERSION_NARROW);
+            assert_eq!((nh.first_key, nh.last_key), (wh.first_key, wh.last_key));
+            let (wd, nd) = (
+                decode_leaf_dir_v3_with_base(wide, &wh).unwrap(),
+                decode_leaf_dir_v3_with_base(&narrow, &nh).unwrap(),
+            );
+            assert_eq!(wd.entries.len(), nd.entries.len());
+            for (w, n) in wd.entries.iter().zip(&nd.entries) {
+                assert_eq!(
+                    (n.first_key, n.last_key),
+                    (w.first_key, w.last_key),
+                    "{order:?}"
+                );
+                assert_eq!(n.column_refs, w.column_refs);
+            }
+            assert_eq!(narrow[nd.payload_base..], wide[wd.payload_base..]);
+        }
     }
 }

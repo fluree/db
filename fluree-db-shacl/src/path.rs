@@ -16,8 +16,10 @@
 
 use crate::error::{Result, ShaclError};
 use crate::predicates;
+use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::{
-    id_datatype_sid, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, SchemaHierarchy, Sid,
+    id_datatype_sid, FlakeMeta, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest,
+    SchemaHierarchy, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF, SHACL};
 use fluree_vocab::rdf_names;
@@ -156,8 +158,7 @@ pub fn resolve_sh_path<'a>(
     ps_subject: &'a Sid,
 ) -> PathFuture<'a, Option<PropertyPath>> {
     Box::pin(async move {
-        let (members, all_indexed) =
-            ordered_objects(db, ps_subject, &shacl(predicates::PATH)).await?;
+        let (members, one_list) = ordered_objects(db, ps_subject, &shacl(predicates::PATH)).await?;
         match members.len() {
             0 => Ok(None),
             1 => match &members[0] {
@@ -165,10 +166,10 @@ pub fn resolve_sh_path<'a>(
                 // sh:path with a literal object is invalid; skip.
                 _ => Ok(None),
             },
-            // Multiple sh:path objects are only a sequence under the JSON-LD
-            // @list encoding (every flake carries a list index). Un-indexed
-            // multiples are distinct sh:path assertions — a malformed shape.
-            _ if !all_indexed => Err(unsupported(ps_subject, "multiple sh:path values")),
+            // Multiple sh:path objects are only a sequence as the members of
+            // one list. Un-indexed multiples, or two lists, are distinct
+            // sh:path values — a malformed shape.
+            _ if !one_list => Err(unsupported(ps_subject, "multiple sh:path values")),
             _ => {
                 // JSON-LD @list sequence: each ordered object is a path step.
                 let mut steps = Vec::new();
@@ -261,7 +262,7 @@ fn resolve_members<'a>(
     predicate: &'a Sid,
 ) -> PathFuture<'a, Vec<PropertyPath>> {
     Box::pin(async move {
-        let (objects, all_indexed) = ordered_objects(db, subject, predicate).await?;
+        let (objects, one_list) = ordered_objects(db, subject, predicate).await?;
 
         // Turtle RDF-list form: a single object that is itself a list head.
         if let [FlakeValue::Ref(head)] = objects.as_slice() {
@@ -270,7 +271,7 @@ fn resolve_members<'a>(
                 return resolve_rdf_list(db, head).await;
             }
         }
-        if objects.len() > 1 && !all_indexed {
+        if objects.len() > 1 && !one_list {
             return Err(unsupported(
                 subject,
                 &format!(
@@ -323,10 +324,10 @@ fn resolve_rdf_list<'a>(
     })
 }
 
-/// All objects of `(subject, predicate)`, ordered by the JSON-LD list index in
-/// flake metadata (falling back to scan order when unindexed). The flag
-/// reports whether every flake carried a list index — multiple objects
-/// WITHOUT indexes are separate assertions, not a list encoding.
+/// All objects of `(subject, predicate)`, ordered by their list place in flake
+/// metadata (falling back to scan order when unindexed). The flag reports
+/// whether the objects are the members of one list — multiple objects WITHOUT
+/// places are separate assertions, and two lists are two values.
 async fn ordered_objects(
     db: GraphDbRef<'_>,
     subject: &Sid,
@@ -339,17 +340,21 @@ async fn ordered_objects(
             RangeMatch::subject_predicate(subject.clone(), predicate.clone()),
         )
         .await?;
-    // Order by the JSON-LD list index when present; unindexed flakes keep their
+    // Order by the JSON-LD list place when present; unindexed flakes keep their
     // scan order and sort after indexed ones (never interleaved). JSON-LD `@list`
     // always stamps `m.i`, so in practice all-or-none carry an index.
-    let mut items: Vec<(Option<i32>, usize, FlakeValue)> = flakes
+    let mut items: Vec<(Option<ListPlace>, usize, FlakeValue)> = flakes
         .iter()
         .enumerate()
-        .map(|(pos, f)| (f.m.as_ref().and_then(|m| m.i), pos, f.o.clone()))
+        .map(|(pos, f)| (f.m.as_ref().and_then(FlakeMeta::place), pos, f.o.clone()))
         .collect();
-    items.sort_by_key(|(idx, pos, _)| (idx.is_none(), idx.unwrap_or(0), *pos));
-    let all_indexed = items.iter().all(|(idx, _, _)| idx.is_some());
-    Ok((items.into_iter().map(|(_, _, v)| v).collect(), all_indexed))
+    items.sort_by_key(|(idx, pos, _)| (idx.is_none(), idx.unwrap_or((0, 0)), *pos));
+    let list_of = |idx: &Option<ListPlace>| idx.map(|(list, _)| list);
+    let first = items.first().and_then(|(idx, _, _)| list_of(idx));
+    let one_list = items
+        .iter()
+        .all(|(idx, _, _)| first.is_some() && list_of(idx) == first);
+    Ok((items.into_iter().map(|(_, _, v)| v).collect(), one_list))
 }
 
 /// The predicate plus its RDFS subproperties — the always-on entailment
@@ -529,15 +534,15 @@ fn dedup(mut values: Vec<PathValue>) -> Vec<PathValue> {
 }
 
 /// Resolve a path operator's operand: a single reference resolves as one
-/// sub-path; multiple references are a sequence only under the JSON-LD @list
-/// encoding (every flake indexed) — un-indexed multiples are a malformed path.
+/// sub-path; multiple references are a sequence only as the members of one
+/// list — un-indexed multiples, or two lists, are a malformed path.
 fn operand_path<'a>(
     db: GraphDbRef<'a>,
     subject: &'a Sid,
     predicate: &'a Sid,
 ) -> PathFuture<'a, Option<PropertyPath>> {
     Box::pin(async move {
-        let (objects, all_indexed) = ordered_objects(db, subject, predicate).await?;
+        let (objects, one_list) = ordered_objects(db, subject, predicate).await?;
         match objects.len() {
             0 => Ok(None),
             1 => match &objects[0] {
@@ -547,7 +552,7 @@ fn operand_path<'a>(
                     &format!("{} operand is a literal", predicate.name),
                 )),
             },
-            _ if !all_indexed => Err(unsupported(
+            _ if !one_list => Err(unsupported(
                 subject,
                 &format!(
                     "multiple values for {} in a path expression",

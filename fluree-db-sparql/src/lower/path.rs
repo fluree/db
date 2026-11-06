@@ -19,7 +19,7 @@ use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{Expression, Function, PathModifier, Pattern, PropertyPathPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
-use fluree_vocab::rdf::TYPE;
+use fluree_vocab::rdf::{FIRST, REST, TYPE};
 
 use super::{LowerError, LoweringContext, Result};
 
@@ -302,7 +302,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlPropertyPath::Sequence { .. } => {
                 let mut steps = Vec::new();
                 Self::flatten_sequence(effective_path, &mut steps);
-                self.lower_sequence_chain(s, &steps, o, span)
+                let walk = self.is_list_member_walk(&steps)?;
+                let mut chain = self.lower_sequence_chain(s, &steps, o, span)?;
+                if walk {
+                    fluree_db_query::list_view::mark_list_walk(&mut chain);
+                }
+                Ok(chain)
             }
             // Negated property set: `!iri`, `!(a|b)`, `!(^p)`, `!(a|^p)`.
             SparqlPropertyPath::NegatedSet { iris, .. } => {
@@ -442,6 +447,28 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             other => out.push(other),
         }
+    }
+
+    /// Whether `steps` are `p/rdf:rest*/rdf:first`, for a `p` other than
+    /// `rdf:first` and `rdf:rest`: the walk from an owner to its lists'
+    /// members.
+    fn is_list_member_walk(&self, steps: &[&SparqlPropertyPath]) -> Result<bool> {
+        let [owner, rest, first] = steps else {
+            return Ok(false);
+        };
+        let SparqlPropertyPath::ZeroOrMore { path: rest, .. } = Self::unwrap_group(rest) else {
+            return Ok(false);
+        };
+        let iri_of = |step: &SparqlPropertyPath| match Self::unwrap_group(step) {
+            SparqlPropertyPath::Iri(iri) => self.expand_iri(iri).map(Some),
+            _ => Ok(None),
+        };
+        let (Some(owner), Some(rest), Some(first)) =
+            (iri_of(owner)?, iri_of(rest)?, iri_of(first)?)
+        else {
+            return Ok(false);
+        };
+        Ok(rest == REST && first == FIRST && owner != FIRST && owner != REST)
     }
 
     /// Flatten a binary `Sequence` tree into a list of leaf paths.

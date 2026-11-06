@@ -332,6 +332,7 @@ mod tests {
                 Some(FlakeMeta {
                     lang: Some(lang.to_string()),
                     i: Some(i),
+                    list: 0,
                 }),
             )
         }

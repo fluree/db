@@ -366,6 +366,24 @@ pub async fn execute_where_streaming<'a>(
         });
     }
 
+    // A `p/rdf:rest*/rdf:first` walk reads lists as RDF cells, as a query's
+    // does (`crate::list_view::rewrite_list_walks`), unless the caller read
+    // every list so (`crate::list_view::rewrite_patterns`).
+    let walked;
+    let walks = list_view::has_list_walk(patterns) && !list_view::has_list_view(patterns);
+    let patterns = match walks {
+        true => match list_view::view_for(db.snapshot, db.overlay, None)? {
+            Some(view) => {
+                walked = list_view::rewrite_list_walks(patterns.to_vec(), &view, &|iri| {
+                    db.snapshot.encode_iri(iri)
+                });
+                &walked[..]
+            }
+            None => patterns,
+        },
+        false => patterns,
+    };
+
     // Plan with the same cached stats view the read path uses — without it,
     // `reorder_patterns` falls back to default selectivities, where a bound-
     // object seek (`?a <id> 4112` → 1 row) ties with a class scan

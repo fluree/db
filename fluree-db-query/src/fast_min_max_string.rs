@@ -142,7 +142,7 @@ fn encoded_lit_from_otype(
         p_id,
         dt_id,
         lang_id,
-        i_val: i32::MIN,
+        i_val: fluree_db_core::list_index::NONE,
         t: 0,
     };
     Some((ident, b))

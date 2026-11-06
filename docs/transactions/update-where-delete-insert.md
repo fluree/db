@@ -545,6 +545,25 @@ No INSERT clause—just deletes.
 }
 ```
 
+## List Members Through Their Cells
+
+With `"opts": {"rdfLists": true}`, the `where` reads every list as RDF (an owner edge to a chain of `rdf:first`/`rdf:rest` cells), and `delete`/`insert` can replace a member through its cell, as `# PRAGMA rdf-lists: true` does for SPARQL UPDATE:
+
+```json
+{
+  "@context": { "ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#" },
+  "opts": { "rdfLists": true },
+  "where": [
+    { "@id": "ex:alice", "ex:colors": "?cell" },
+    { "@id": "?cell", "rdf:first": "?old" }
+  ],
+  "delete": { "@id": "?cell", "rdf:first": "?old" },
+  "insert": { "@id": "?cell", "rdf:first": "navy" }
+}
+```
+
+This replaces the first member of `ex:alice`'s list in place, leaving the list's other members and the property's other lists as they are. Any other write naming a cell is refused with a `400`. That includes a cell left with no `rdf:first` or with two, an `rdf:rest` change, another property on a cell, and a cell used as a value or a property. A `delete` naming a value of the property deletes its plain value alone, since a list's members are its cells' `rdf:first`s, and a list in `delete` is refused, as is an upsert, which replaces a property's values and so the lists it holds. To insert, remove or reorder members, write the list again in an update without `rdfLists`. See [Editing a list through its cells](../query/sparql.md#editing-a-list-through-its-cells) for the rules.
+
 ## Complex Updates
 
 ### Cascading Updates

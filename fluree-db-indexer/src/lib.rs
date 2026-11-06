@@ -219,9 +219,21 @@ pub async fn build_index_for_record_with_tracker(
             }
         }
 
-        // Try incremental indexing if conditions are met.
+        // Try incremental indexing if conditions are met. A published index
+        // of an earlier format is rebuilt in full, so no root mixes artifacts
+        // of two formats.
+        let current_format = match &record.index_head_id {
+            Some(root_id) => published_root_is_current(content_store.as_ref(), root_id).await?,
+            None => false,
+        };
+        if !current_format && record.index_head_id.is_some() {
+            tracing::info!(
+                ledger_id = ledger_id,
+                "published index is of an earlier format; using full rebuild"
+            );
+        }
         let can_incremental = config.incremental_enabled
-            && record.index_head_id.is_some()
+            && current_format
             && record.index_t > 0
             && commit_gap <= config.incremental_max_commits as i64;
 
@@ -255,8 +267,7 @@ pub async fn build_index_for_record_with_tracker(
                     );
                 }
             }
-        } else if config.incremental_enabled && record.index_head_id.is_some() && record.index_t > 0
-        {
+        } else if config.incremental_enabled && current_format && record.index_t > 0 {
             tracing::info!(
                 commit_gap = commit_gap,
                 max = config.incremental_max_commits,
@@ -419,6 +430,19 @@ where
         config,
     )
     .await
+}
+
+/// Whether the root `root_id` names is of the index format this build writes
+/// (see [`fluree_db_binary_index::format::index_root::is_current_format`]).
+async fn published_root_is_current(
+    content_store: &dyn fluree_db_core::ContentStore,
+    root_id: &fluree_db_core::ContentId,
+) -> Result<bool> {
+    let bytes = content_store
+        .get(root_id)
+        .await
+        .map_err(|e| IndexerError::StorageRead(format!("index root: {e}")))?;
+    Ok(fluree_db_binary_index::format::index_root::is_current_format(&bytes))
 }
 
 /// Build `record`'s index incrementally over its published index, as

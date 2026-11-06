@@ -13,6 +13,7 @@
 
 use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{identity_v2_for_order, RunRecordV2};
 use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_binary_index::read::column_types::ColumnBatch;
@@ -20,7 +21,7 @@ use fluree_db_core::subject_id::SubjectId;
 use std::cmp::Ordering;
 
 /// Sentinel for o_i when no list index is present.
-const OI_NONE: u32 = u32::MAX;
+const OI_NONE: u64 = LIST_INDEX_NONE;
 
 /// Novelty op marking an identity of a graph leaving the pool. It routes the
 /// merge to every leaflet holding that graph (see [`MergeInput::purge`]) and
@@ -509,7 +510,7 @@ mod tests {
         let o_keys: Arc<[u64]> = records.iter().map(|r| r.o_key).collect();
         let p_ids: Arc<[u32]> = records.iter().map(|r| r.p_id).collect();
         let o_types: Arc<[u16]> = records.iter().map(|r| r.o_type).collect();
-        let o_is: Arc<[u32]> = records.iter().map(|r| r.o_i).collect();
+        let o_is: Arc<[u64]> = records.iter().map(|r| r.o_i).collect();
         let ts: Arc<[u32]> = records.iter().map(|r| r.t).collect();
 
         let has_non_sentinel_oi = o_is.iter().any(|&v| v != OI_NONE);

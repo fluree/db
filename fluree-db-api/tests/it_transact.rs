@@ -249,7 +249,10 @@ async fn staging_data_mixed_data_types_numeric() {
 
     // Should preserve ordered list with mixed types
     let wes = &jsonld.as_array().unwrap()[0];
-    assert_eq!(wes["ex:aFewOfMyFavoriteThings"], json!([2011, "jabalí"]));
+    assert_eq!(
+        wes["ex:aFewOfMyFavoriteThings"],
+        json!({"@list": [2011, "jabalí"]})
+    );
 }
 
 #[tokio::test]
@@ -1033,7 +1036,7 @@ async fn retracting_ordered_lists_removes_list_values() {
         before_json,
         json!([{
             "@id": "ex:list-test",
-            "ex:items1": ["zero","one","two","three"],
+            "ex:items1": {"@list": ["zero","one","two","three"]},
             "ex:items2": ["four","five","six","seven"]
         }])
     );

@@ -2653,6 +2653,7 @@ mod tests {
                 Some(FlakeMeta {
                     lang: Some(lang.to_string()),
                     i: Some(0),
+                    list: 0,
                 }),
             )
         };
@@ -3007,6 +3008,7 @@ mod tests {
         let at = |lang: &str, i: i32| FlakeMeta {
             lang: Some(lang.to_string()),
             i: Some(i),
+            list: 0,
         };
         let f_en0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 0)));
         let f_fr0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("fr", 0)));
@@ -3433,6 +3435,7 @@ mod tests {
             Some(FlakeMeta {
                 lang: None,
                 i: Some((sm64(rng) % 3) as i32),
+                list: 0,
             })
         } else {
             None

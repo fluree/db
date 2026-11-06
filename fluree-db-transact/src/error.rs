@@ -204,6 +204,11 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
+    /// A write in the RDF view of lists edits a compact list's cells in a
+    /// way it cannot store (see `crate::cell_edits`).
+    #[error("List cell edit refused: {0}")]
+    ListCellEdit(String),
+
     /// The commit being built would retract and assert one fact at one `t`.
     /// Staging cancels the two by fact identity, so this is an internal
     /// error, not a property of the request: the commit is refused rather

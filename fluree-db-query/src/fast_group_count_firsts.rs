@@ -12,6 +12,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
@@ -687,7 +688,7 @@ fn count_object_key_v6(
         o_key: target_o_key,
         p_id,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: target_o_type,
         g_id,
     };
@@ -893,7 +894,7 @@ pub(crate) fn group_count_v6(
         o_key: u64::MAX,
         p_id,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };

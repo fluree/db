@@ -64,6 +64,7 @@ use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::batched_lookup_predicate_refs;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::read::types::OverlayOp;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
@@ -90,14 +91,14 @@ type TopKRow = (u16, u64, u64);
 struct OvRow {
     o_key: u64,
     s_id: u64,
-    o_i: u32,
+    o_i: u64,
 }
 
 impl OvRow {
     /// Sort key for descending merge order, matching the physical POST tie-order
     /// within one `o_type`: `(o_key, o_i, s_id)`.
     #[inline]
-    fn cmp_desc_key(&self) -> (u64, u32, u64) {
+    fn cmp_desc_key(&self) -> (u64, u64, u64) {
         (self.o_key, self.o_i, self.s_id)
     }
 }
@@ -600,7 +601,7 @@ fn collect_post_desc_topk_overlay(
                     // `u32::MAX` is the V3 "no list index" sentinel (matches the
                     // cursor's `merge_overlay_into_batch` and overlay-op translation),
                     // so identity dedup/retract align even if `OI` weren't loaded.
-                    o_i: batch.o_i.get_or(row, u32::MAX),
+                    o_i: batch.o_i.get_or(row, LIST_INDEX_NONE),
                 });
             }
         }
@@ -844,7 +845,7 @@ mod tests {
 
     const T: u16 = 0x0010; // any o_type; emit_merged just passes it through
 
-    fn ov(o_key: u64, s_id: u64, o_i: u32) -> OvRow {
+    fn ov(o_key: u64, s_id: u64, o_i: u64) -> OvRow {
         OvRow { o_key, s_id, o_i }
     }
 
@@ -927,7 +928,7 @@ mod tests {
         let asserts = vec![ov(5, 2, 0), ov(4, 1, 0)];
         let base = vec![ov(5, 1, 1), ov(5, 1, 0), ov(3, 9, 0)];
         let merged = merge_desc(&asserts, &base);
-        let keys: Vec<(u64, u32, u64)> = merged.iter().map(|(r, _)| r.cmp_desc_key()).collect();
+        let keys: Vec<(u64, u64, u64)> = merged.iter().map(|(r, _)| r.cmp_desc_key()).collect();
         for w in keys.windows(2) {
             assert!(w[0] >= w[1], "merge not descending: {keys:?}");
         }

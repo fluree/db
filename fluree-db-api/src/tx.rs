@@ -4259,7 +4259,7 @@ impl crate::Fluree {
                 // An insert retracts nothing, so every list member the ledger
                 // holds survives it.
                 flakes.extend(
-                    fluree_db_transact::lists::store_lists(&ledger, lists, &txn_id, |_| false)
+                    fluree_db_transact::lists::store_lists(&ledger, lists, &txn_id, |_| false, &[])
                         .await
                         .map_err(ApiError::from)?,
                 );

@@ -516,11 +516,18 @@ async fn batched_object_join_merges_novelty() {
     let receipt = fluree
         .update(
             receipt.ledger,
-            // A delete naming a list position retracts that entry alone;
-            // naming the value would retract every entry holding it.
+            // Replacing the head cell's member retracts that entry alone
+            // (`ex:carol` is in none of the queries below); naming the value
+            // would retract every entry holding it.
             &json!({
-                "@context": ctx(),
-                "delete": {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:bob"}]}}
+                "@context": {"ex": "http://example.org/ns/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+                "where": [
+                    {"@id": "ex:b5", "ex:authors": "?h"},
+                    {"@id": "?h", "rdf:first": {"@id": "ex:bob"}}
+                ],
+                "delete": {"@id": "?h", "rdf:first": {"@id": "ex:bob"}},
+                "insert": {"@id": "?h", "rdf:first": {"@id": "ex:carol"}},
+                "opts": {"rdfLists": true}
             }),
         )
         .await

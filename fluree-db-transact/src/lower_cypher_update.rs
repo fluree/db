@@ -270,6 +270,7 @@ impl<'a> CypherLowering<'a> {
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
             update_where_names_ledger_default: false,
+            collection_cells: Vec::new(),
             opts: self.opts,
             vars: self.vars,
             txn_meta: Vec::new(),

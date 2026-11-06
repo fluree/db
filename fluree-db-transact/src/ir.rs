@@ -163,6 +163,15 @@ pub struct Txn {
     /// named graphs.
     pub update_where_names_ledger_default: bool,
 
+    /// The variables the cells of a DELETE WHERE's collections lowered to.
+    /// Staging reads the WHERE triples naming them in SPARQL's view of lists
+    /// (`fluree_db_query::list_view::rewrite_cells`), so a collection matches
+    /// a compact list as its owner edge and cells, and a list stored as its
+    /// triples as those triples. A compact list a collection matched is
+    /// deleted whole (`crate::cell_edits::MatchedLists`). Empty for every
+    /// other transaction.
+    pub collection_cells: Vec<VarId>,
+
     /// Transaction options
     pub opts: TxnOpts,
 
@@ -307,6 +316,7 @@ impl Txn {
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
             update_where_names_ledger_default: false,
+            collection_cells: Vec::new(),
             opts: TxnOpts::default(),
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
@@ -914,6 +924,13 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
+    /// Read and edit lists as the RDF lists they denote: the WHERE matches a
+    /// compact list as an owner edge to a chain of `rdf:first`/`rdf:rest`
+    /// cells, and the templates edit those cells (`crate::cell_edits`). Set
+    /// by `# PRAGMA rdf-lists: true`, or read from the transaction JSON's
+    /// `opts.rdfLists` when `None` here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rdf_lists: Option<bool>,
     /// The delete templates of a Cypher `DELETE r` (or several), each of which
     /// retracts the edge relationship `r` was matched on. An edge one of them
     /// retracts must carry at most one relationship: retracting the edge takes

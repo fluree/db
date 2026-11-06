@@ -1226,7 +1226,7 @@ mod tests {
                 o_key: term_handle(inner, seq),
                 p_id: 3,
                 t: 1,
-                o_i: u32::MAX,
+                o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
                 o_type: OType::TRIPLE_TERM.as_u16(),
                 g_id,
             };

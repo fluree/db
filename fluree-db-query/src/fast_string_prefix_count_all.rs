@@ -21,6 +21,7 @@ use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{BinaryFilter, ColumnProjection, ColumnSet};
 use fluree_db_core::o_type::OType;
@@ -141,7 +142,7 @@ fn count_prefix_rows_opst(
                 o_key: end_id as u64,
                 p_id,
                 t: u32::MAX,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 o_type,
                 g_id,
             };

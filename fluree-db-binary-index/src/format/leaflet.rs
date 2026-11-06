@@ -323,8 +323,8 @@ pub fn encode_leaflet(
 
     // Optional o_i column (only if any row has a list index).
     if has_o_i {
-        let o_i_vals: Vec<u32> = records.iter().map(|r| r.o_i).collect();
-        append_column_u32(
+        let o_i_vals: Vec<u64> = records.iter().map(|r| r.o_i).collect();
+        append_column_u64(
             &mut payload,
             &mut column_refs,
             ColumnId::OI,
@@ -447,7 +447,7 @@ mod tests {
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
 
-    fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, o_i: u32, t: u32) -> RunRecordV2 {
+    fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, o_i: u64, t: u32) -> RunRecordV2 {
         RunRecordV2 {
             s_id: SubjectId(s_id),
             o_key,

@@ -316,6 +316,10 @@ ex:ContactShape a sh:NodeShape ;
 
 Available: `sh:not`, `sh:and`, `sh:or`, `sh:xone`.
 
+A shape can hold more than one list on `sh:and`, `sh:or` or `sh:xone`, and
+each list is a constraint of its own: `sh:or (ex:A ex:B), (ex:C ex:D)` needs
+one of A or B, and one of C or D.
+
 ### Shape-based constraints (`sh:node`)
 
 `sh:node` validates a node against another node shape. On a property shape it

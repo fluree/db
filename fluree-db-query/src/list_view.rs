@@ -17,8 +17,9 @@
 //! planned as before. Lists stored as explicit `rdf:first`/`rdf:rest` chains
 //! are stored triples, and read as such.
 //!
-//! Over a dataset spanning ledgers the view is not applied: their subjects are
-//! not comparable, so such a query sees the members as values.
+//! The view covers every graph a query reads, each in its own ledger's
+//! namespace table. A default graph spanning ledgers is refused, as for any
+//! property path ([`ExecutionContext::path_graphs`]).
 
 use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};
@@ -31,36 +32,70 @@ use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::namespaces::{is_rdf_first, is_rdf_rest};
 use fluree_db_core::{
-    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, GraphId, IndexType, LedgerSnapshot,
-    OverlayProvider, RangeMatch, RangeOptions, RangeTest, Sid,
+    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, GraphId, IndexType, LedgerId,
+    LedgerSnapshot, OverlayProvider, RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-/// A list, named by the graph, subject and predicate that own it.
-pub type Owner = (GraphId, Sid, Sid);
+/// A list, named by the graph, subject and predicate that own it and which
+/// of their lists it is.
+pub type Owner = (GraphId, Sid, Sid, u32);
 
 /// A list and its members in position order.
 type List = (Owner, Vec<Flake>);
 
+/// A ledger a [`ListView`] reads, with the predicates holding list members
+/// there in its own namespace table (`None`: any may).
+type LedgerLists = (LedgerId, Option<HashSet<Sid>>);
+
 /// Which predicates hold list members, and the cells one request has named.
 #[derive(Debug)]
 pub struct ListView {
-    /// Predicates whose values include list members; `None` when that is
-    /// not known, and any may.
-    predicates: Option<HashSet<Sid>>,
-    /// The index ids of `predicates`, sorted; `None` when they are not known.
+    /// The index ids of the primary ledger's list predicates, sorted; `None`
+    /// when they are not known, or the request reads several ledgers.
     predicate_ids: Option<Vec<u32>>,
+    /// The ledger the query was lowered against (ledger 0), and each other
+    /// ledger the request reads (ledger `n` is `others[n - 1]`). Graphs of
+    /// one ledger share its namespace table and those of two do not, so
+    /// every read below is of one ledger ([`Self::ledger_of`]).
+    primary: LedgerLists,
+    others: Vec<LedgerLists>,
     /// The lists this request has named a cell of: list `n` is `owners[n]`.
     lists: Mutex<ListTable>,
     /// The lists each read of this request found, so a walk along a list's
     /// cells reads it once.
     reads: Mutex<HashMap<ListRead, Arc<[List]>>>,
     /// Whether each subject this request asked about may own a list, per
-    /// graph and `t` ([`Self::may_meet`]).
-    subjects: Mutex<HashMap<(GraphId, i64, Subject), bool>>,
+    /// ledger, graph and `t` ([`Self::may_meet`]).
+    subjects: Mutex<HashMap<(usize, GraphId, i64, Subject), bool>>,
+}
+
+/// A graph a [`ListView`] is built over: its snapshot, novelty and index.
+pub(crate) struct ListSource<'a> {
+    snapshot: &'a LedgerSnapshot,
+    overlay: &'a dyn OverlayProvider,
+    store: Option<Arc<BinaryIndexStore>>,
+}
+
+impl ListSource<'_> {
+    /// What the source's list predicates are read from: two graphs of one
+    /// snapshot, novelty and index read the same ones.
+    fn key(
+        &self,
+    ) -> (
+        *const LedgerSnapshot,
+        *const (),
+        Option<*const BinaryIndexStore>,
+    ) {
+        (
+            self.snapshot,
+            (self.overlay as *const dyn OverlayProvider).cast(),
+            self.store.as_ref().map(Arc::as_ptr),
+        )
+    }
 }
 
 /// A subject [`ListView::may_meet`] is asked about.
@@ -71,14 +106,74 @@ enum Subject {
     Node(Sid),
 }
 
+/// The cells' lists, each with the ledger it is in ([`ListView::ledger_of`]).
 #[derive(Debug, Default)]
 struct ListTable {
+    /// Each list's place in `owners`: the primary ledger's, and the others'
+    /// by ledger (ledger `n` at `others[n - 1]`).
     ids: HashMap<Owner, usize>,
-    owners: Vec<Owner>,
+    others: Vec<HashMap<Owner, usize>>,
+    owners: Vec<(usize, Owner)>,
 }
 
-/// The graph, its `t`, and the subject and predicate a list read asks for.
-type ListRead = (GraphId, i64, Want, Want);
+impl ListTable {
+    fn ids_of(&self, l: usize) -> Option<&HashMap<Owner, usize>> {
+        match l {
+            0 => Some(&self.ids),
+            l => self.others.get(l - 1),
+        }
+    }
+
+    fn ids_of_mut(&mut self, l: usize) -> &mut HashMap<Owner, usize> {
+        if l == 0 {
+            return &mut self.ids;
+        }
+        if self.others.len() < l {
+            self.others.resize_with(l, HashMap::new);
+        }
+        &mut self.others[l - 1]
+    }
+}
+
+/// The ledger, graph, its `t`, and the subject and predicate a list read
+/// asks for.
+type ListRead = (usize, GraphId, i64, Want, Want);
+
+/// The predicates holding list members in `snapshot` with `overlay`:
+/// `None` when that is not known, and empty when there are none.
+fn list_predicates(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    store: Option<&Arc<BinaryIndexStore>>,
+) -> Result<Option<HashSet<Sid>>> {
+    let mut predicates: Option<HashSet<Sid>> = Some(HashSet::new());
+    if snapshot.has_list_meta != Some(false) {
+        predicates = match store {
+            Some(store) => {
+                let ids = store
+                    .list_predicate_ids()
+                    .map_err(|e| QueryError::from_io("list predicates", e))?;
+                Some(ids.iter().filter_map(|&p| store.predicate_sid(p)).collect())
+            }
+            None => None,
+        };
+    }
+    match (predicates.as_mut(), overlay.list_predicates()) {
+        (Some(known), Some(novel)) => known.extend(novel.iter().cloned()),
+        (_, None) => predicates = None,
+        (None, Some(_)) => {}
+    }
+    Ok(predicates)
+}
+
+/// `known` with the predicates `found` in another graph of its ledger.
+fn merge_predicates(known: &mut Option<HashSet<Sid>>, found: Option<HashSet<Sid>>) {
+    match (known.as_mut(), found) {
+        (Some(known), Some(found)) => known.extend(found),
+        (_, None) => *known = None,
+        (None, Some(_)) => {}
+    }
+}
 
 impl ListView {
     /// The view for a query of `snapshot` with `overlay`, or `None` when the
@@ -88,28 +183,50 @@ impl ListView {
         overlay: &dyn OverlayProvider,
         store: Option<&Arc<BinaryIndexStore>>,
     ) -> Result<Option<Arc<Self>>> {
-        let mut predicates: Option<HashSet<Sid>> = Some(HashSet::new());
-        if snapshot.has_list_meta != Some(false) {
-            predicates = match store {
-                Some(store) => {
-                    let ids = store
-                        .list_predicate_ids()
-                        .map_err(|e| QueryError::from_io("list predicates", e))?;
-                    Some(ids.iter().filter_map(|&p| store.predicate_sid(p)).collect())
-                }
-                None => None,
-            };
+        Self::for_sources([ListSource {
+            snapshot,
+            overlay,
+            store: store.cloned(),
+        }])
+    }
+
+    /// The view for a query reading `sources`, the first the graph it was
+    /// lowered against, or `None` when none provably holds list members.
+    pub(crate) fn for_sources<'a>(
+        sources: impl IntoIterator<Item = ListSource<'a>>,
+    ) -> Result<Option<Arc<Self>>> {
+        let mut sources = sources.into_iter();
+        let Some(first) = sources.next() else {
+            return Ok(None);
+        };
+        let read = |s: &ListSource<'_>| list_predicates(s.snapshot, s.overlay, s.store.as_ref());
+        let mut primary: LedgerLists = (first.snapshot.ledger_id.clone(), read(&first)?);
+        let mut others: Vec<LedgerLists> = Vec::new();
+        let first_key = first.key();
+        let mut read_from = Vec::new();
+        for source in sources {
+            let key = source.key();
+            if key == first_key || read_from.contains(&key) {
+                continue;
+            }
+            read_from.push(key);
+            let found = read(&source)?;
+            let id = &source.snapshot.ledger_id;
+            if *id == primary.0 {
+                merge_predicates(&mut primary.1, found);
+                continue;
+            }
+            match others.iter_mut().find(|(other, _)| other == id) {
+                Some((_, known)) => merge_predicates(known, found),
+                None => others.push((id.clone(), found)),
+            }
         }
-        match (predicates.as_mut(), overlay.list_predicates()) {
-            (Some(known), Some(novel)) => known.extend(novel.iter().cloned()),
-            (_, None) => predicates = None,
-            (None, Some(_)) => {}
-        }
-        if predicates.as_ref().is_some_and(HashSet::is_empty) {
+        let holds = |(_, ps): &LedgerLists| ps.as_ref().is_none_or(|ps| !ps.is_empty());
+        if !holds(&primary) && !others.iter().any(holds) {
             return Ok(None);
         }
-        let predicate_ids = match (&predicates, store) {
-            (Some(predicates), Some(store)) => {
+        let predicate_ids = match (&primary.1, &first.store) {
+            (Some(predicates), Some(store)) if others.is_empty() => {
                 let mut ids: Vec<u32> = predicates
                     .iter()
                     .filter_map(|p| store.predicate_id_for_sid(p))
@@ -120,23 +237,49 @@ impl ListView {
             _ => None,
         };
         Ok(Some(Arc::new(Self {
-            predicates,
             predicate_ids,
+            primary,
+            others,
             lists: Mutex::new(ListTable::default()),
             reads: Mutex::new(HashMap::new()),
             subjects: Mutex::new(HashMap::new()),
         })))
     }
 
+    /// Which ledger of the view `snapshot` is of (see [`Self::primary`]);
+    /// past them for a ledger it was not built over, whose predicates are
+    /// not known.
+    fn ledger_of(&self, snapshot: &LedgerSnapshot) -> usize {
+        if self.others.is_empty() || snapshot.ledger_id == self.primary.0 {
+            return 0;
+        }
+        self.others
+            .iter()
+            .position(|(id, _)| *id == snapshot.ledger_id)
+            .map_or(self.others.len() + 1, |n| n + 1)
+    }
+
+    /// The predicates holding list members in ledger `l`, when known.
+    fn ledger_predicates(&self, l: usize) -> Option<&HashSet<Sid>> {
+        match l {
+            0 => self.primary.1.as_ref(),
+            l => self.others.get(l - 1).and_then(|(_, ps)| ps.as_ref()),
+        }
+    }
+
+    /// Whether `p`, in ledger `l`'s namespace table, may hold list members.
+    fn may_hold_lists_in(&self, l: usize, p: &Sid) -> bool {
+        self.ledger_predicates(l).is_none_or(|ps| ps.contains(p))
+    }
+
     /// Whether a list triple can have `subject` as its subject in `graphs`:
     /// an unbound subject, a cell this request named, or a node with a list
     /// row in novelty or in the index. A `false` is exact.
-    fn may_meet(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        graphs: &[PathGraph<'_>],
-        subject: &Binding,
-    ) -> Result<bool> {
+    fn may_meet(&self, graphs: &[PathGraph<'_>], subject: &Binding) -> Result<bool> {
+        let Some(path) = graphs.first() else {
+            return Ok(false);
+        };
+        let l = self.ledger_of(path.snapshot);
         let subject = match subject {
             Binding::Unbound => return Ok(true),
             Binding::EncodedSid { s_id, .. } => Subject::Id(*s_id),
@@ -144,12 +287,12 @@ impl ListView {
             | Binding::IriMatch {
                 primary_sid: sid, ..
             } => {
-                if self.decode(sid).is_some() {
+                if self.decode_in(l, sid).is_some() {
                     return Ok(true);
                 }
                 Subject::Node(sid.clone())
             }
-            Binding::Iri(iri) => match ctx.active_snapshot.encode_iri(iri) {
+            Binding::Iri(iri) => match path.snapshot.encode_iri(iri) {
                 Some(sid) => Subject::Node(sid),
                 None => return Ok(false),
             },
@@ -161,7 +304,7 @@ impl ListView {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
         for graph in graphs {
-            let key = (graph.g_id, graph.to_t, subject.clone());
+            let key = (l, graph.g_id, graph.to_t, subject.clone());
             let cached = known().get(&key).copied();
             let held = match cached {
                 Some(held) => held,
@@ -178,13 +321,18 @@ impl ListView {
         Ok(false)
     }
 
-    /// The predicates holding list members, when known.
+    /// The predicates holding list members, in the namespace table the
+    /// query was lowered against; `None` when that is not known, or the
+    /// request reads several ledgers, and any may.
     pub(crate) fn predicates(&self) -> Option<&HashSet<Sid>> {
-        self.predicates.as_ref()
+        match self.others.is_empty() {
+            true => self.primary.1.as_ref(),
+            false => None,
+        }
     }
 
     pub(crate) fn may_hold_lists(&self, p: &Sid) -> bool {
-        self.predicates.as_ref().is_none_or(|ps| ps.contains(p))
+        self.predicates().is_none_or(|ps| ps.contains(p))
     }
 
     /// [`Self::may_hold_lists`] for the predicate with index id `p_id`,
@@ -201,18 +349,18 @@ impl ListView {
         self.may_hold_lists(p) || is_rdf_first(p) || is_rdf_rest(p)
     }
 
-    /// The blank node for cell `k` of `owner`'s list.
-    pub fn cell(&self, owner: &Owner, k: usize) -> Sid {
+    /// The blank node for cell `k` of `owner`'s list, in ledger `l`.
+    fn cell(&self, l: usize, owner: &Owner, k: usize) -> Sid {
         let mut table = self
             .lists
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = match table.ids.get(owner) {
+        let n = match table.ids_of(l).and_then(|ids| ids.get(owner)) {
             Some(&n) => n,
             None => {
                 let n = table.owners.len();
-                table.owners.push(owner.clone());
-                table.ids.insert(owner.clone(), n);
+                table.owners.push((l, owner.clone()));
+                table.ids_of_mut(l).insert(owner.clone(), n);
                 n
             }
         };
@@ -220,7 +368,17 @@ impl ListView {
     }
 
     /// The list and position `sid` names, when it is a cell of this request.
-    fn decode(&self, sid: &Sid) -> Option<(Owner, usize)> {
+    pub fn decode(&self, sid: &Sid) -> Option<(Owner, usize)> {
+        self.decode_cell(sid).map(|(_, owner, k)| (owner, k))
+    }
+
+    /// [`Self::decode`] for a cell of a list in ledger `l`.
+    fn decode_in(&self, l: usize, sid: &Sid) -> Option<(Owner, usize)> {
+        let (at, owner, k) = self.decode_cell(sid)?;
+        (at == l).then_some((owner, k))
+    }
+
+    fn decode_cell(&self, sid: &Sid) -> Option<(usize, Owner, usize)> {
         if sid.namespace_code != BLANK_NODE {
             return None;
         }
@@ -230,7 +388,27 @@ impl ListView {
             .lists
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some((table.owners.get(n)?.clone(), k))
+        let (l, owner) = table.owners.get(n)?.clone();
+        Some((l, owner, k))
+    }
+
+    /// The members of each list of `owners` this request has read, in
+    /// position order: member `k` is the one cell `k` of the list names.
+    pub fn read_members(&self, owners: &HashSet<Owner>) -> HashMap<Owner, Vec<Flake>> {
+        let reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = HashMap::with_capacity(owners.len());
+        for (owner, members) in reads.values().flat_map(|lists| lists.iter()) {
+            if owners.contains(owner) && !out.contains_key(owner) {
+                out.insert(owner.clone(), members.clone());
+                if out.len() == owners.len() {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -351,17 +529,31 @@ pub(crate) fn modifiers_have_list_view(
     grouping: &Option<crate::ir::Grouping>,
     order_binds: &[(VarId, crate::ir::Expression)],
 ) -> bool {
+    modifiers_hold(grouping, order_binds, &is_list_view)
+}
+
+fn is_list_view(pattern: &Pattern) -> bool {
+    matches!(pattern, Pattern::ListView(_))
+}
+
+/// Whether an `EXISTS` of `grouping` or `order_binds` holds a pattern `is`
+/// accepts.
+fn modifiers_hold(
+    grouping: &Option<crate::ir::Grouping>,
+    order_binds: &[(VarId, crate::ir::Expression)],
+    is: &dyn Fn(&Pattern) -> bool,
+) -> bool {
     let mut exprs: Vec<&crate::ir::Expression> = order_binds.iter().map(|(_, e)| e).collect();
     if let Some(grouping) = grouping {
         exprs.extend(grouping.having());
         exprs.extend(grouping.binds().map(|(_, e)| e));
     }
-    exprs.into_iter().any(expression_has_list_view)
+    exprs.into_iter().any(|expr| expression_holds(expr, is))
 }
 
-fn expression_has_list_view(expr: &crate::ir::Expression) -> bool {
+fn expression_holds(expr: &crate::ir::Expression, is: &dyn Fn(&Pattern) -> bool) -> bool {
     let mut found = false;
-    expr.for_each_embedded_patterns(&mut |patterns| found |= has_list_view(patterns));
+    expr.for_each_embedded_patterns(&mut |patterns| found |= holds(patterns, is));
     found
 }
 
@@ -372,10 +564,37 @@ pub fn view_for(
     overlay: &dyn OverlayProvider,
     store: Option<&Arc<BinaryIndexStore>>,
 ) -> Result<Option<Arc<ListView>>> {
-    let store = store
-        .cloned()
-        .or_else(|| crate::context::ExecutionContext::extract_binary_store(snapshot));
-    ListView::for_db(snapshot, overlay, store.as_ref())
+    view_for_dataset(snapshot, overlay, store, None)
+}
+
+/// [`view_for`] over every ledger graph of `dataset` as well, so a list in
+/// any graph the query reads is in the view, in its own ledger.
+pub fn view_for_dataset(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    store: Option<&Arc<BinaryIndexStore>>,
+    dataset: Option<&crate::dataset::DataSet<'_>>,
+) -> Result<Option<Arc<ListView>>> {
+    let store_of = crate::context::ExecutionContext::extract_binary_store;
+    let primary = ListSource {
+        snapshot,
+        overlay,
+        store: store.cloned().or_else(|| store_of(snapshot)),
+    };
+    let graphs = dataset.into_iter().flat_map(|dataset| {
+        dataset
+            .default_graphs()
+            .iter()
+            .chain(dataset.named_graphs_iter().map(|(_, g)| g))
+    });
+    let members = graphs
+        .filter(|graph| graph.kind != crate::dataset::MemberKind::GraphSource)
+        .map(|graph| ListSource {
+            snapshot: graph.snapshot,
+            overlay: graph.overlay,
+            store: store_of(graph.snapshot),
+        });
+    ListView::for_sources(std::iter::once(primary).chain(members))
 }
 
 fn rewrite_pattern(
@@ -435,6 +654,157 @@ fn rewrite_pattern(
     }
 }
 
+/// Mark the `rdf:rest*` of a lowered `p/rdf:rest*/rdf:first` (its owner
+/// edge, the walk and the `rdf:first` step) as a list walk.
+pub fn mark_list_walk(chain: &mut [Pattern]) {
+    for pattern in chain {
+        if let Pattern::PropertyPath(pp) = pattern {
+            pp.list_walk = true;
+        }
+    }
+}
+
+/// Whether `query` holds a list walk ([`crate::ir::PropertyPathPattern::list_walk`]).
+pub fn query_has_list_walk(query: &crate::ir::Query) -> bool {
+    has_list_walk(&query.patterns)
+        || modifiers_hold(&query.grouping, &query.order_binds, &is_list_walk)
+}
+
+/// Whether `patterns` hold a list walk anywhere.
+pub fn has_list_walk(patterns: &[Pattern]) -> bool {
+    holds(patterns, &is_list_walk)
+}
+
+fn is_list_walk(pattern: &Pattern) -> bool {
+    matches!(pattern, Pattern::PropertyPath(pp) if pp.list_walk)
+}
+
+/// Read each list walk of `patterns`, with the owner edge that binds its
+/// start and the `rdf:first` step that reads its end, in SPARQL's view of
+/// lists: `p/rdf:rest*/rdf:first` reaches a list's members through its cells
+/// and a stored chain through its triples. Every other pattern keeps reading
+/// members as values.
+pub fn rewrite_list_walks(
+    patterns: Vec<Pattern>,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) -> Vec<Pattern> {
+    // A walk's endpoints are fresh variables only its two triples share.
+    let ends: Vec<(VarId, VarId)> = patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::PropertyPath(pp) if pp.list_walk => {
+                Some((pp.subject.as_var()?, pp.object.as_var()?))
+            }
+            _ => None,
+        })
+        .collect();
+    patterns
+        .into_iter()
+        .map(|pattern| {
+            let in_walk = match &pattern {
+                Pattern::PropertyPath(pp) => pp.list_walk,
+                Pattern::Triple(tp) => ends.iter().any(|&(head, cell)| {
+                    tp.o.as_var() == Some(head) || tp.s.as_var() == Some(cell)
+                }),
+                _ => false,
+            };
+            if in_walk {
+                rewrite_pattern(pattern, view, encode)
+            } else {
+                rewrite_walks_within(pattern, view, encode)
+            }
+        })
+        .collect()
+}
+
+/// Read each triple of `patterns` with a subject or object in `cells` (the
+/// cells of a DELETE WHERE's collections) in SPARQL's view of lists: a
+/// collection matches a list's owner edge and cells, and a stored chain's
+/// triples. Every other pattern keeps reading members as values.
+pub fn rewrite_cells(
+    patterns: Vec<Pattern>,
+    cells: &[VarId],
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) -> Vec<Pattern> {
+    let names_cell = |tp: &TriplePattern| {
+        [tp.s.as_var(), tp.o.as_var()]
+            .into_iter()
+            .flatten()
+            .any(|v| cells.contains(&v))
+    };
+    patterns
+        .into_iter()
+        .map(|pattern| match pattern {
+            Pattern::Triple(tp) if names_cell(&tp) => {
+                rewrite_pattern(Pattern::Triple(tp), view, encode)
+            }
+            Pattern::Triple(_) => pattern,
+            other => other.map_subpatterns(&mut |xs| rewrite_cells(xs, cells, view, encode)),
+        })
+        .collect()
+}
+
+/// [`rewrite_list_walks`] for the `EXISTS` of `query`'s grouping and
+/// ordering expressions.
+pub fn rewrite_list_walks_of_modifiers(
+    query: &mut crate::ir::Query,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    if let Some(grouping) = &mut query.grouping {
+        grouping.for_each_expression_mut(&mut |expr| walks_in_expression(expr, view, encode));
+    }
+    for (_, expr) in &mut query.order_binds {
+        walks_in_expression(expr, view, encode);
+    }
+}
+
+fn rewrite_walks_within(
+    pattern: Pattern,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) -> Pattern {
+    match pattern {
+        Pattern::Filter(mut expr) => {
+            walks_in_expression(&mut expr, view, encode);
+            Pattern::Filter(expr)
+        }
+        Pattern::Bind { var, mut expr } => {
+            walks_in_expression(&mut expr, view, encode);
+            Pattern::Bind { var, expr }
+        }
+        Pattern::Unwind { var, mut list } => {
+            walks_in_expression(&mut list, view, encode);
+            Pattern::Unwind { var, list }
+        }
+        Pattern::Subquery(mut sq) => {
+            sq.patterns = rewrite_list_walks(std::mem::take(&mut sq.patterns), view, encode);
+            if let Some(grouping) = &mut sq.grouping {
+                grouping
+                    .for_each_expression_mut(&mut |expr| walks_in_expression(expr, view, encode));
+            }
+            for (_, expr) in &mut sq.order_binds {
+                walks_in_expression(expr, view, encode);
+            }
+            Pattern::Subquery(sq)
+        }
+        Pattern::Service(_) => pattern,
+        other => other.map_subpatterns(&mut |xs| rewrite_list_walks(xs, view, encode)),
+    }
+}
+
+fn walks_in_expression(
+    expr: &mut crate::ir::Expression,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    expr.for_each_embedded_patterns_mut(&mut |patterns| {
+        *patterns = rewrite_list_walks(std::mem::take(patterns), view, encode);
+    });
+}
+
 /// `patterns` with each list-view pattern its triple again, for a graph that
 /// holds no RDF lists, such as an R2RML graph source.
 pub fn without_list_view(patterns: &[Pattern]) -> Vec<Pattern> {
@@ -474,23 +844,31 @@ fn rewrite_expression(
 
 /// Whether `patterns` hold a [`ListViewPattern`] anywhere.
 pub fn has_list_view(patterns: &[Pattern]) -> bool {
-    patterns.iter().any(|p| match p {
-        Pattern::ListView(_) => true,
-        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
-            expression_has_list_view(expr)
-        }
-        Pattern::Optional(xs)
-        | Pattern::Minus(xs)
-        | Pattern::Exists(xs)
-        | Pattern::NotExists(xs)
-        | Pattern::Graph { patterns: xs, .. }
-        | Pattern::DefaultGraphSource { patterns: xs } => has_list_view(xs),
-        Pattern::Union(branches) => branches.iter().any(|b| has_list_view(b)),
-        Pattern::Subquery(sq) => {
-            has_list_view(&sq.patterns) || modifiers_have_list_view(&sq.grouping, &sq.order_binds)
-        }
-        Pattern::EdgeAnnotation { body, .. } => has_list_view(body),
-        _ => false,
+    holds(patterns, &is_list_view)
+}
+
+/// Whether `patterns` hold a pattern `is` accepts anywhere, an `EXISTS`
+/// included.
+fn holds(patterns: &[Pattern], is: &dyn Fn(&Pattern) -> bool) -> bool {
+    patterns.iter().any(|p| {
+        is(p)
+            || match p {
+                Pattern::Filter(expr)
+                | Pattern::Bind { expr, .. }
+                | Pattern::Unwind { list: expr, .. } => expression_holds(expr, is),
+                Pattern::Optional(xs)
+                | Pattern::Minus(xs)
+                | Pattern::Exists(xs)
+                | Pattern::NotExists(xs)
+                | Pattern::Graph { patterns: xs, .. }
+                | Pattern::DefaultGraphSource { patterns: xs } => holds(xs, is),
+                Pattern::Union(branches) => branches.iter().any(|b| holds(b, is)),
+                Pattern::Subquery(sq) => {
+                    holds(&sq.patterns, is) || modifiers_hold(&sq.grouping, &sq.order_binds, is)
+                }
+                Pattern::EdgeAnnotation { body, .. } => holds(body, is),
+                _ => false,
+            }
     })
 }
 
@@ -588,9 +966,6 @@ impl ListAugmentOperator {
 
     /// The next batch of list triples, joined with the inputs waiting.
     async fn next_list_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
-        if ctx.is_multi_ledger() {
-            return Ok(None);
-        }
         loop {
             if self.inputs.is_empty() {
                 match &self.held {
@@ -640,6 +1015,7 @@ async fn list_rows(
     input: &Batch,
 ) -> Result<Option<Batch>> {
     let graphs = ctx.path_graphs()?;
+    let names = Names::of(ctx, &graphs);
     // Which triple position each output column takes, when not the input's.
     let positions: Vec<Option<usize>> = schema
         .iter()
@@ -654,9 +1030,9 @@ async fn list_rows(
     let mut cache: HashMap<(Want, Want, ObjectWant), Vec<ListTriple>> = HashMap::new();
     for row in 0..input.len() {
         let bound = |var: Option<VarId>| var.and_then(|v| input.get(row, v));
-        let s = node_want(ctx, bound(t.s.as_var()), &t.s);
-        let p = node_want(ctx, bound(t.p.as_var()), &t.p);
-        let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref());
+        let s = node_want(ctx, &names, bound(t.s.as_var()), &t.s);
+        let p = node_want(ctx, &names, bound(t.p.as_var()), &t.p);
+        let o = object_want(ctx, &names, bound(t.o.as_var()), &t.o, t.dtc.as_ref());
         let key = (s.clone(), p.clone(), o.clone());
         if !cache.contains_key(&key) {
             let found = list_triples(ctx, view, &graphs, &s, &p, &o).await?;
@@ -700,8 +1076,10 @@ async fn list_triples(
         return Ok(Vec::new());
     }
     let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
+    // The graphs of one read are of one ledger.
+    let l = graphs.first().map_or(0, |g| view.ledger_of(g.snapshot));
     let cell = match s {
-        Want::Node(sid) => view.decode(sid),
+        Want::Node(sid) => view.decode_in(l, sid),
         _ => None,
     };
     let mut out = Vec::new();
@@ -709,12 +1087,12 @@ async fn list_triples(
         // Owner edges: `s p head`, for a subject that is not a cell.
         let owner_edges = match p {
             Want::Any => true,
-            Want::Node(p) => view.may_hold_lists(p),
+            Want::Node(p) => view.may_hold_lists_in(l, p),
             Want::Nothing => false,
         };
         if owner_edges && cell.is_none() {
             for (owner, _) in lists_in(ctx, graph, view, s, p).await?.iter() {
-                let head = view.cell(owner, 0);
+                let head = view.cell(l, owner, 0);
                 out.push(ListTriple {
                     s: owner.1.clone(),
                     p: owner.2.clone(),
@@ -745,12 +1123,13 @@ async fn list_triples(
         };
         for (owner, members) in lists.iter() {
             let positions = match &cell {
+                Some((at, _)) if at != owner => continue,
                 Some((_, k)) => *k..members.len().min(k + 1),
                 None => 0..members.len(),
             };
             for k in positions {
                 let member = &members[k];
-                let here = view.cell(owner, k);
+                let here = view.cell(l, owner, k);
                 if want_first {
                     out.push(ListTriple {
                         s: here.clone(),
@@ -762,7 +1141,7 @@ async fn list_triples(
                     let next = if k + 1 == members.len() {
                         Sid::new(RDF, RDF_NIL)
                     } else {
-                        view.cell(owner, k + 1)
+                        view.cell(l, owner, k + 1)
                     };
                     out.push(ListTriple {
                         s: here,
@@ -842,29 +1221,62 @@ fn decoded(ctx: &ExecutionContext<'_>, b: &Binding) -> Binding {
     crate::group_aggregate::materialize_encoded(b, ctx.graph_view().as_ref())
 }
 
-fn iri_sid(ctx: &ExecutionContext<'_>, iri: &str) -> Want {
-    match ctx.active_snapshot.encode_iri(iri) {
-        Some(sid) => Want::Node(sid),
-        None => Want::Nothing,
+/// How the terms of a list read name nodes: in the namespace table of the
+/// ledger the read's graphs are of, which a constant the query was lowered
+/// against another ledger is re-encoded into, as a property path's is.
+struct Names<'a> {
+    snapshot: &'a LedgerSnapshot,
+    foreign: bool,
+}
+
+impl<'a> Names<'a> {
+    fn of(ctx: &ExecutionContext<'a>, graphs: &[PathGraph<'a>]) -> Self {
+        let snapshot = graphs.first().map_or(ctx.active_snapshot, |g| g.snapshot);
+        Self {
+            snapshot,
+            foreign: snapshot.ledger_id != ctx.original_snapshot.ledger_id,
+        }
+    }
+
+    fn iri(&self, iri: &str) -> Want {
+        match self.snapshot.encode_iri(iri) {
+            Some(sid) => Want::Node(sid),
+            None => Want::Nothing,
+        }
+    }
+
+    fn constant(&self, ctx: &ExecutionContext<'_>, sid: &Sid) -> Sid {
+        match self.foreign {
+            true => {
+                crate::context::reencode_sid(ctx, self.snapshot, sid).unwrap_or_else(|| sid.clone())
+            }
+            false => sid.clone(),
+        }
     }
 }
 
-fn node_want(ctx: &ExecutionContext<'_>, bound: Option<&Binding>, term: &Ref) -> Want {
+fn node_want(
+    ctx: &ExecutionContext<'_>,
+    names: &Names<'_>,
+    bound: Option<&Binding>,
+    term: &Ref,
+) -> Want {
     match (bound, term) {
         (Some(b), _) => match decoded(ctx, b) {
             Binding::Unbound => Want::Any,
             Binding::Sid { sid, .. } => Want::Node(sid),
-            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => iri_sid(ctx, &iri),
+            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => names.iri(&iri),
             _ => Want::Nothing,
         },
         (None, Ref::Var(_)) => Want::Any,
-        (None, Ref::Sid(sid)) => Want::Node(sid.clone()),
-        (None, Ref::Iri(iri)) => iri_sid(ctx, iri),
+        (None, Ref::Sid(sid)) => Want::Node(names.constant(ctx, sid)),
+        (None, Ref::Iri(iri)) => names.iri(iri),
     }
 }
 
 fn object_want(
     ctx: &ExecutionContext<'_>,
+    names: &Names<'_>,
     bound: Option<&Binding>,
     term: &Term,
     dtc: Option<&DatatypeConstraint>,
@@ -878,14 +1290,14 @@ fn object_want(
         (Some(b), _) => match decoded(ctx, b) {
             Binding::Unbound => ObjectWant::Any,
             Binding::Sid { sid, .. } => ObjectWant::Node(sid),
-            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => node(iri_sid(ctx, &iri)),
+            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => node(names.iri(&iri)),
             Binding::Lit { val, dtc, .. } => ObjectWant::Value(val, Some(dtc)),
             _ => ObjectWant::Nothing,
         },
         (None, Term::Var(_)) => ObjectWant::Any,
-        (None, Term::Sid(sid)) => ObjectWant::Node(sid.clone()),
-        (None, Term::Iri(iri)) => node(iri_sid(ctx, iri)),
-        (None, Term::Value(FlakeValue::Ref(sid))) => ObjectWant::Node(sid.clone()),
+        (None, Term::Sid(sid)) => ObjectWant::Node(names.constant(ctx, sid)),
+        (None, Term::Iri(iri)) => node(names.iri(iri)),
+        (None, Term::Value(FlakeValue::Ref(sid))) => ObjectWant::Node(names.constant(ctx, sid)),
         (None, Term::Value(v)) => ObjectWant::Value(v.clone(), dtc.cloned()),
     }
 }
@@ -921,7 +1333,10 @@ pub(crate) async fn path_steps(
     backward: bool,
 ) -> Result<Vec<Sid>> {
     let mut out = Vec::new();
-    let cell = view.decode(node).filter(|(owner, _)| owner.0 == graph.g_id);
+    let l = view.ledger_of(graph.snapshot);
+    let cell = view
+        .decode_in(l, node)
+        .filter(|(owner, _)| owner.0 == graph.g_id);
     let nil = Sid::new(RDF, RDF_NIL);
     let list_of = |owner: &Owner| (Want::Node(owner.1.clone()), Want::Node(owner.2.clone()));
     match (backward, &cell) {
@@ -935,21 +1350,21 @@ pub(crate) async fn path_steps(
                     out.push(if k + 1 == members.len() {
                         nil.clone()
                     } else {
-                        view.cell(owner, k + 1)
+                        view.cell(l, owner, k + 1)
                     });
                 } else if let FlakeValue::Ref(member) = &members[*k].o {
                     out.push(member.clone());
                 }
             }
         }
-        (false, None) if view.may_hold_lists(pred) => {
+        (false, None) if view.may_hold_lists_in(l, pred) => {
             let (s, p) = (Want::Node(node.clone()), Want::Node(pred.clone()));
             for (owner, _) in lists_in(ctx, graph, view, &s, &p).await?.iter() {
-                out.push(view.cell(owner, 0));
+                out.push(view.cell(l, owner, 0));
             }
         }
         (true, Some((owner, k))) if is_rdf_rest(pred) && *k > 0 => {
-            out.push(view.cell(owner, k - 1));
+            out.push(view.cell(l, owner, k - 1));
         }
         (true, Some((owner, 0))) if owner.2 == *pred => out.push(owner.1.clone()),
         (true, None) if is_rdf_rest(pred) && *node == nil => {
@@ -957,7 +1372,7 @@ pub(crate) async fn path_steps(
                 .await?
                 .iter()
             {
-                out.push(view.cell(owner, members.len() - 1));
+                out.push(view.cell(l, owner, members.len() - 1));
             }
         }
         (true, None) if is_rdf_first(pred) => {
@@ -967,7 +1382,7 @@ pub(crate) async fn path_steps(
             {
                 for (k, member) in members.iter().enumerate() {
                     if member.o == FlakeValue::Ref(node.clone()) {
-                        out.push(view.cell(owner, k));
+                        out.push(view.cell(l, owner, k));
                     }
                 }
             }
@@ -989,10 +1404,11 @@ pub(crate) async fn path_edges(
     let mut out = Vec::new();
     let (first, rest) = (is_rdf_first(pred), is_rdf_rest(pred));
     for graph in graphs {
+        let l = view.ledger_of(graph.snapshot);
         if !(first || rest) {
             let p = Want::Node(pred.clone());
             for (owner, _) in lists_in(ctx, graph, view, &Want::Any, &p).await?.iter() {
-                out.push((owner.1.clone(), view.cell(owner, 0)));
+                out.push((owner.1.clone(), view.cell(l, owner, 0)));
             }
             continue;
         }
@@ -1001,12 +1417,12 @@ pub(crate) async fn path_edges(
             .iter()
         {
             for (k, member) in members.iter().enumerate() {
-                let here = view.cell(owner, k);
+                let here = view.cell(l, owner, k);
                 if rest {
                     let next = if k + 1 == members.len() {
                         Sid::new(RDF, RDF_NIL)
                     } else {
-                        view.cell(owner, k + 1)
+                        view.cell(l, owner, k + 1)
                     };
                     out.push((here, next));
                 } else if let FlakeValue::Ref(m) = &member.o {
@@ -1027,11 +1443,12 @@ pub(crate) async fn cell_nodes(
 ) -> Result<Vec<Sid>> {
     let mut out = Vec::new();
     for graph in graphs {
+        let l = view.ledger_of(graph.snapshot);
         for (owner, members) in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
             .await?
             .iter()
         {
-            out.extend((0..members.len()).map(|k| view.cell(owner, k)));
+            out.extend((0..members.len()).map(|k| view.cell(l, owner, k)));
         }
     }
     if !out.is_empty() {
@@ -1099,7 +1516,13 @@ async fn lists_in(
     s: &Want,
     p: &Want,
 ) -> Result<Arc<[List]>> {
-    let key: ListRead = (graph.g_id, graph.to_t, s.clone(), p.clone());
+    let key: ListRead = (
+        view.ledger_of(graph.snapshot),
+        graph.g_id,
+        graph.to_t,
+        s.clone(),
+        p.clone(),
+    );
     let reads = || {
         view.reads
             .lock()
@@ -1120,10 +1543,11 @@ async fn read_lists_in(
     s: &Want,
     p: &Want,
 ) -> Result<Vec<List>> {
+    let l = view.ledger_of(graph.snapshot);
     let reads: Vec<(IndexType, RangeMatch)> = match (s, p) {
         (Want::Nothing, _) | (_, Want::Nothing) => return Ok(Vec::new()),
         (Want::Node(s), Want::Node(p)) => {
-            if !view.may_hold_lists(p) {
+            if !view.may_hold_lists_in(l, p) {
                 return Ok(Vec::new());
             }
             vec![(
@@ -1133,7 +1557,7 @@ async fn read_lists_in(
                     .with_predicate(p.clone()),
             )]
         }
-        (Want::Node(s), Want::Any) => match &view.predicates {
+        (Want::Node(s), Want::Any) => match view.ledger_predicates(l) {
             Some(predicates) => predicates
                 .iter()
                 .map(|p| {
@@ -1146,12 +1570,12 @@ async fn read_lists_in(
             None => vec![(IndexType::Spot, RangeMatch::new().with_subject(s.clone()))],
         },
         (Want::Any, Want::Node(p)) => {
-            if !view.may_hold_lists(p) {
+            if !view.may_hold_lists_in(l, p) {
                 return Ok(Vec::new());
             }
             vec![(IndexType::Psot, RangeMatch::new().with_predicate(p.clone()))]
         }
-        (Want::Any, Want::Any) => match &view.predicates {
+        (Want::Any, Want::Any) => match view.ledger_predicates(l) {
             Some(predicates) => predicates
                 .iter()
                 .map(|p| (IndexType::Psot, RangeMatch::new().with_predicate(p.clone())))
@@ -1190,7 +1614,8 @@ async fn read_lists_in(
         )
         .await?;
         for member in members {
-            let owner = (graph.g_id, member.s.clone(), member.p.clone());
+            let list = member.m.as_ref().map_or(0, |m| m.list);
+            let owner = (graph.g_id, member.s.clone(), member.p.clone(), list);
             let n = *slot.entry(owner.clone()).or_insert_with(|| {
                 by_owner.push((owner, Vec::new()));
                 by_owner.len() - 1
@@ -1222,18 +1647,19 @@ impl Operator for ListTeeOperator {
         let Some(batch) = self.child.next_batch(ctx).await? else {
             return Ok(None);
         };
-        if batch.is_empty() || ctx.is_multi_ledger() {
+        if batch.is_empty() {
             return Ok(Some(batch));
         }
         let graphs = ctx.path_graphs()?;
+        let names = Names::of(ctx, &graphs);
         let mut rows = Vec::new();
         for row in 0..batch.len() {
             let subject = match &self.pattern.s {
                 Ref::Var(v) => batch.get(row, *v).cloned().unwrap_or(Binding::Unbound),
-                Ref::Sid(sid) => Binding::sid(sid.clone()),
+                Ref::Sid(sid) => Binding::sid(names.constant(ctx, sid)),
                 Ref::Iri(iri) => Binding::Iri(iri.clone()),
             };
-            if self.view.may_meet(ctx, &graphs, &subject)? {
+            if self.view.may_meet(&graphs, &subject)? {
                 rows.push(row);
             }
         }

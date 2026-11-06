@@ -21,6 +21,21 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
 
 ## What changes
 
+### For query clients
+
+**Subject projections now preserve list boundaries.** JSON-LD `select` and
+`selectOne` subject expansions return `{"@list": [1, 2]}` for a stored list,
+where 4.2 returned `[1, 2]`. A singleton is `{"@list": [1]}` rather than `1`,
+and an empty list is `{"@list": []}`. Several lists on one property return an
+array of separate `@list` objects instead of one flattened array.
+
+Update clients that read these properties to access each object's `@list`
+array. A query context with `"@container": "@list"` still compacts a sole
+list to a bare array. Multiple lists or mixed list/plain values use the full
+predicate IRI and explicit wrappers when that context term cannot represent
+them. Ordinary variable selections still return individual list members.
+See [lists inside subject expansions](../query/jsonld-query.md#select).
+
 ### For operators
 
 - **One ledger per name.** A name holds one ledger, with the branches created
@@ -42,6 +57,21 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
   from which it can be restored under its name or purged.
 - **Ledgers 4.2 soft-dropped are moved to that list** by the upgrade, and
   their names become free.
+- **The first index build is a full rebuild.** This release serves a 4.2
+  index as it is, but builds indexes in a format of its own and never mixes
+  the two in one index. So the first time each ledger is
+  [indexed](../indexing-and-search/background-indexing.md) after the upgrade,
+  its index is rebuilt from its commits rather than updated, which takes as
+  long, and as much memory, as [`fluree reindex`](../cli/reindex.md) of that
+  ledger. Until then,
+  queries read the 4.2 index and the commits since. For a large ledger, run
+  `fluree reindex` at a time you choose rather than waiting for the indexer.
+- **4.2 cannot read what this release writes.** It refuses every index this
+  release builds, and every commit holding data it has no encoding for, such
+  as a second list on one property or an RDF 1.2 triple term. A ledger this
+  release has indexed or written such a commit to cannot be moved to a 4.2
+  store; [rolling back](#rolling-back) returns each ledger to what it was at
+  the upgrade.
 - **`fluree drop` keeps the data by default.** The 4.2 CLI deleted it. Scripts
   that relied on `fluree drop` freeing disk space need `--hard --force`.
   `POST /drop` was already soft by default.

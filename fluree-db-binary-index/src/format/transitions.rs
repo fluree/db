@@ -89,6 +89,7 @@ pub fn resolve_transitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::run_record::LIST_INDEX_NONE;
     use fluree_db_core::subject_id::SubjectId;
 
     fn ev(t: u32, op: u8) -> (RunRecordV2, u8) {
@@ -98,7 +99,7 @@ mod tests {
                 o_key: 10,
                 p_id: 1,
                 t,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 o_type: 3,
                 g_id: 0,
             },
