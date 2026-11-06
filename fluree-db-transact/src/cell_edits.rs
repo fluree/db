@@ -14,6 +14,9 @@
 //! as a value, a predicate or a graph. So is a list in a DELETE template,
 //! which in this view is a chain of new blank nodes. Lists stored as explicit
 //! `rdf:first`/`rdf:rest` chains are stored nodes, written as any triple is.
+//!
+//! Outside the view, a DELETE WHERE's collections alone read lists so, and
+//! delete the compact lists they match whole ([`MatchedLists`]).
 
 use crate::current_facts::{RetractIntent, Retraction};
 use crate::error::{Result, TransactError};
@@ -275,6 +278,66 @@ impl CellEdits {
             }
         }
         Ok(out)
+    }
+}
+
+/// The compact lists a DELETE WHERE's collections matched
+/// ([`crate::ir::Txn::collection_cells`]), each deleted whole: an owner
+/// edge to a list's head cell names the list, and a cell's own triples are
+/// the list's.
+pub(crate) struct MatchedLists {
+    view: Arc<ListView>,
+    /// Each list an owner edge named, with the graph its template names.
+    lists: Vec<(Owner, Option<Sid>)>,
+    seen: HashSet<Owner>,
+}
+
+impl MatchedLists {
+    pub(crate) fn new(view: Arc<ListView>) -> Self {
+        Self {
+            view,
+            lists: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// The retraction intents naming no cell; an owner edge's list is held.
+    pub(crate) fn take_deletes(&mut self, intents: Vec<RetractIntent>) -> Vec<RetractIntent> {
+        let mut rest = Vec::with_capacity(intents.len());
+        for intent in intents {
+            let flake = intent.flake();
+            if self.view.decode(&flake.s).is_some() {
+                continue;
+            }
+            let list = match &flake.o {
+                FlakeValue::Ref(head) => self.view.decode(head),
+                _ => None,
+            };
+            match list {
+                Some((owner, _)) => {
+                    if self.seen.insert(owner.clone()) {
+                        self.lists.push((owner, flake.g.clone()));
+                    }
+                }
+                None => rest.push(intent),
+            }
+        }
+        rest
+    }
+
+    /// The held lists' members, retracted at `t`.
+    pub(crate) fn resolve(self, t: i64) -> Vec<Retraction> {
+        let members = self.view.read_members(&self.seen);
+        self.lists
+            .iter()
+            .flat_map(|(owner, graph)| {
+                members
+                    .get(owner)
+                    .into_iter()
+                    .flatten()
+                    .map(move |m| Retraction::of_list_member(m, graph.clone(), t))
+            })
+            .collect()
     }
 }
 

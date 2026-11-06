@@ -718,6 +718,34 @@ pub fn rewrite_list_walks(
         .collect()
 }
 
+/// Read each triple of `patterns` with a subject or object in `cells` (the
+/// cells of a DELETE WHERE's collections) in SPARQL's view of lists: a
+/// collection matches a list's owner edge and cells, and a stored chain's
+/// triples. Every other pattern keeps reading members as values.
+pub fn rewrite_cells(
+    patterns: Vec<Pattern>,
+    cells: &[VarId],
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) -> Vec<Pattern> {
+    let names_cell = |tp: &TriplePattern| {
+        [tp.s.as_var(), tp.o.as_var()]
+            .into_iter()
+            .flatten()
+            .any(|v| cells.contains(&v))
+    };
+    patterns
+        .into_iter()
+        .map(|pattern| match pattern {
+            Pattern::Triple(tp) if names_cell(&tp) => {
+                rewrite_pattern(Pattern::Triple(tp), view, encode)
+            }
+            Pattern::Triple(_) => pattern,
+            other => other.map_subpatterns(&mut |xs| rewrite_cells(xs, cells, view, encode)),
+        })
+        .collect()
+}
+
 /// [`rewrite_list_walks`] for the `EXISTS` of `query`'s grouping and
 /// ordering expressions.
 pub fn rewrite_list_walks_of_modifiers(

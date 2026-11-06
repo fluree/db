@@ -766,23 +766,26 @@ async fn novelty_only_predicate_resolves_metadata_siblings() {
                 vec!["a", "b", "a"]
             );
 
-            // A delete naming the list position retracts exactly that entry:
-            // the one at position 0, whose metadata sorts first. (Naming the
-            // value alone deletes every entry holding it.)
+            // Replacing the head cell's member retracts exactly the entry at
+            // position 0, whose metadata sorts first. (A `@list` in a delete
+            // names the whole list, and the value alone every entry holding
+            // it.)
             let del_a = json!({
-                "@context": ctx(),
-                "where": [{"@id": "ex:dup", "ex:items": "a"}],
-                "delete": [{"@id": "ex:dup", "ex:items": {"@list": ["a"]}}]
+                "@context": {"ex": "http://example.org/ns/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+                "where": [{"@id": "ex:dup", "ex:items": "?h"}, {"@id": "?h", "rdf:first": "a"}],
+                "delete": {"@id": "?h", "rdf:first": "a"},
+                "insert": {"@id": "?h", "rdf:first": "z"},
+                "opts": {"rdfLists": true}
             });
             let r = fluree
                 .update_with_opts(ledger, &del_a, TxnOpts::default(), CommitOpts::default(), &index_cfg())
                 .await
                 .unwrap();
-            assert_eq!(r.receipt.flake_count, 1);
+            assert_eq!((r.receipt.retract_count, r.receipt.assert_count), (1, 1));
             let ledger = fluree.ledger(ledger_id).await.unwrap();
             assert_eq!(
                 list_values(&fluree, &ledger, "ex:dup").await,
-                vec!["b", "a"],
+                vec!["z", "b", "a"],
                 "the position-0 entry goes; its twin at position 2 stays"
             );
 

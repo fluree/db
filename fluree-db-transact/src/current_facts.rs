@@ -223,12 +223,35 @@ pub(crate) struct RetractIntent {
     /// The template is witnessed by a WHERE triple (`delete_witness`), so
     /// the row is the decode of a fact that WHERE matched at the same `t`.
     witnessed: bool,
+    /// The list literal this intent is a member of, by a number unique among
+    /// one batch's literals; 0 for none. Its members name a stored list
+    /// together (see [`DeleteResolver`]).
+    list: u32,
 }
 
 impl RetractIntent {
     pub(crate) fn new(flake: Flake, witnessed: bool) -> Self {
         debug_assert!(!flake.op, "a retraction intent is op = false");
-        Self { flake, witnessed }
+        Self {
+            flake,
+            witnessed,
+            list: 0,
+        }
+    }
+
+    /// Member `flake` of list literal `list` (not 0), its position in the
+    /// literal as its list position. Never witnessed: no WHERE triple binds
+    /// a list position (`delete_witness`).
+    pub(crate) fn of_list(flake: Flake, list: u32) -> Self {
+        debug_assert!(list != 0 && place_of(&flake).is_some());
+        Self {
+            list,
+            ..Self::new(flake, false)
+        }
+    }
+
+    pub(crate) fn list(&self) -> u32 {
+        self.list
     }
 
     pub(crate) fn flake(&self) -> &Flake {
@@ -1201,6 +1224,12 @@ type SlotKey = (GraphId, Sid, Sid);
 ///   retracted as read. An intent that names no stored fact stages
 ///   nothing; with `unmatched`, it is also appended there as instantiated,
 ///   for the caller's modify-policy check.
+/// - The members of a list literal ([`RetractIntent::of_list`]) name a
+///   stored list together, as a scalar intent names a value: every list of
+///   their slot as long as the literal whose k-th position holds its k-th
+///   member, each member matched as a scalar intent is. Each such list is
+///   retracted whole, every entry as read; a literal naming none stages
+///   nothing, and with `unmatched` its members are appended there.
 ///
 /// A slot with more than [`NARROW_SLOT`] facts is read once per
 /// transaction and matched through an index ([`SlotFacts`]), so retracting
@@ -1277,7 +1306,8 @@ impl<'l> DeleteResolver<'l> {
         for (intent, place) in pending.iter().zip(at) {
             if let SlotAt::Read(i) = *place {
                 named[i] += 1;
-                keyable[i] &= !intent.witnessed && point_keyable(&intent.flake);
+                // A list literal is matched against whole stored lists.
+                keyable[i] &= !intent.witnessed && intent.list == 0 && point_keyable(&intent.flake);
             }
         }
         // One bound per graph and predicate; slots of one predicate tend to
@@ -1462,23 +1492,13 @@ impl<'l> DeleteResolver<'l> {
         }
 
         let keys = &self.current.keys;
+        let mut listed: Vec<(RetractIntent, SlotAt)> = Vec::new();
         for (intent, at) in pending.into_iter().zip(at) {
-            let (slot, facts) = match at {
-                SlotAt::Wide(w) => {
-                    let (key, facts) = &mut self.wide[w];
-                    (&*key, facts)
-                }
-                SlotAt::Read(i) => match read[i] {
-                    ReadSlot::Narrow(n) => {
-                        let (key, facts) = &mut narrow[n];
-                        (&*key, facts)
-                    }
-                    ReadSlot::Wide(w) => {
-                        let (key, facts) = &mut self.wide[w];
-                        (&*key, facts)
-                    }
-                },
-            };
+            if intent.list != 0 {
+                listed.push((intent, at));
+                continue;
+            }
+            let (slot, facts) = slot_facts(&mut self.wide, &mut narrow, &read, at);
             let t = intent.flake.t;
             if intent.witnessed {
                 // A row that carries its list position names it already.
@@ -1549,8 +1569,47 @@ impl<'l> DeleteResolver<'l> {
                 }
             }
         }
+
+        // Each literal's members together, in position order; one literal's
+        // members share a slot.
+        listed.sort_by_key(|(intent, _)| (intent.list, place_of(&intent.flake)));
+        for literal in listed.chunk_by(|a, b| a.0.list == b.0.list) {
+            let (_, facts) = slot_facts(&mut self.wide, &mut narrow, &read, literal[0].1);
+            let members: Vec<&Flake> = literal.iter().map(|(intent, _)| &intent.flake).collect();
+            let named = facts.lists_named(&members, keys);
+            if named.is_empty() {
+                stats.phantom_intents += members.len();
+                if let Some(unmatched) = unmatched.as_deref_mut() {
+                    unmatched.extend(members.into_iter().cloned());
+                }
+                continue;
+            }
+            stats.matched += members.len();
+            for (n, k) in named {
+                let member = members[k];
+                out.push(facts.facts[n].retract_named(member.clone(), member.t));
+            }
+        }
         Ok((out, stats))
     }
+}
+
+/// The slot `at` places an intent in, and its facts: a wide slot of the
+/// resolver's, or one this batch read.
+fn slot_facts<'a>(
+    wide: &'a mut [(SlotKey, SlotFacts)],
+    narrow: &'a mut [(SlotKey, SlotFacts)],
+    read: &[ReadSlot],
+    at: SlotAt,
+) -> (&'a SlotKey, &'a mut SlotFacts) {
+    let (key, facts) = match at {
+        SlotAt::Wide(w) => &mut wide[w],
+        SlotAt::Read(i) => match read[i] {
+            ReadSlot::Narrow(n) => &mut narrow[n],
+            ReadSlot::Wide(w) => &mut wide[w],
+        },
+    };
+    (&*key, facts)
 }
 
 /// Where an intent's slot is: a wide slot an earlier batch read, by its
@@ -1805,6 +1864,70 @@ impl SlotFacts {
             .filter(|&n| is_entry(n))
             .chain(plain)
             .collect()
+    }
+
+    /// The entries of every stored list that list literal `members` (in
+    /// position order) names, each with the index of the member it holds:
+    /// lists with one position per member, the k-th holding member k as a
+    /// scalar intent names its value ([`Self::named`]: by term, else a big
+    /// integer by value, else by index key).
+    fn lists_named(&mut self, members: &[&Flake], keys: &IndexKeys) -> Vec<(usize, usize)> {
+        if !self.has_entries {
+            return Vec::new();
+        }
+        let member_keys: Vec<Option<IndexKey>> = members
+            .iter()
+            .map(|m| {
+                if m.o.index_keys_by_value() {
+                    None
+                } else {
+                    self.key_of(keys, m)
+                }
+            })
+            .collect();
+        if member_keys.iter().any(Option::is_some) {
+            self.ensure_keys(keys);
+        }
+        let narrow;
+        let entries: &[(ListPlace, u32)] = if self.is_wide() {
+            &self.positions
+        } else {
+            let mut sorted: Vec<(ListPlace, u32)> = self
+                .facts
+                .iter()
+                .enumerate()
+                .filter_map(|(n, f)| Some((place_of(&f.flake)?, n as u32)))
+                .collect();
+            sorted.sort_unstable();
+            narrow = sorted;
+            &narrow
+        };
+        let fact_keys = self.keys.as_deref();
+        let holds = |n: u32, k: usize| {
+            let (fact, member) = (&self.facts[n as usize].flake, members[k]);
+            same_term(fact, member)
+                || same_value(fact, member)
+                || member_keys[k]
+                    .is_some_and(|key| fact_keys.is_some_and(|keys| keys[n as usize] == Some(key)))
+        };
+        let mut named = Vec::new();
+        for list in entries.chunk_by(|a, b| a.0 .0 == b.0 .0) {
+            // A position holding two terms of one big integer (novelty, until
+            // the next index build) is one position.
+            let positions = || list.chunk_by(|a, b| a.0 == b.0);
+            let mut held = 0;
+            let holds_all = positions().all(|at| {
+                let k = held;
+                held += 1;
+                k < members.len() && at.iter().any(|&(_, n)| holds(n, k))
+            });
+            if holds_all && held == members.len() {
+                for (k, at) in positions().enumerate() {
+                    named.extend(at.iter().map(|&(_, n)| (n as usize, k)));
+                }
+            }
+        }
+        named
     }
 
     /// Narrow slot: every fact satisfying `pred`, in slot order.
@@ -2639,6 +2762,114 @@ mod tests {
                 )
                 .await,
                 vec![at("v", 0), at("v", 1), plain("v"), at("v", 1)],
+                "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// An intent's list literal number sits in the padding its `witnessed`
+    /// flag leaves: an intent is a flake and one word.
+    #[test]
+    fn an_intent_is_a_flake_and_a_word() {
+        assert_eq!(
+            std::mem::size_of::<RetractIntent>(),
+            std::mem::size_of::<Flake>() + 8
+        );
+    }
+
+    /// A list literal names every stored list it is: as long, its members in
+    /// order. A prefix, a reordering, a longer or shorter list and plain
+    /// values are not it; a literal that names no list stages nothing and is unmatched.
+    #[tokio::test]
+    async fn list_literals_name_whole_stored_lists() {
+        let entry = |o: &str, list: u32, i: i32| {
+            flake(
+                "a",
+                "items",
+                o,
+                1,
+                true,
+                FlakeMeta::from_place(None, Some((list, i))),
+            )
+        };
+        let ledger = ledger(
+            vec![vec![
+                entry("v", 1, 0),
+                entry("w", 1, 1),
+                entry("v", 2, 0),
+                entry("x", 2, 1),
+                entry("v", 3, 0),
+                entry("w", 3, 1),
+                entry("x", 3, 2),
+                entry("v", 4, 0),
+                entry("w", 4, 1),
+                flake("a", "items", "v", 1, true, None),
+                flake("a", "items", "w", 1, true, None),
+            ]],
+            &HashMap::new(),
+        );
+        let literal = |list: u32, members: &[&str]| -> Vec<RetractIntent> {
+            members
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let m = Some(FlakeMeta::with_index(i as i32));
+                    RetractIntent::of_list(flake("a", "items", o, 9, false, m), list)
+                })
+                .collect()
+        };
+        let stored = |o: &str, list: u32, i: i32| {
+            (o.to_string(), FlakeMeta::from_place(None, Some((list, i))))
+        };
+        for narrow_slot in [usize::MAX, 0] {
+            let mut resolver = DeleteResolver::new(&ledger, ListFree::check(&ledger));
+            resolver.narrow_slot = narrow_slot;
+            let mut batch = literal(1, &["v", "w"]);
+            batch.extend(literal(2, &["v"]));
+            batch.extend(literal(3, &["w", "v"]));
+            batch.extend(literal(4, &["x", "v"]));
+            // The literals' members interleaved with a scalar intent.
+            batch.insert(1, intent("other", "o", false, None));
+            batch.extend(literal(5, &["v", "x"]));
+            batch.extend(literal(6, &["v", "w", "x", "y"]));
+            let mut unmatched = Vec::new();
+            let (retractions, stats) = resolver
+                .resolve(batch, |_| Ok(0), Some(&mut unmatched))
+                .await
+                .expect("resolve");
+            let mut got: Vec<_> = retractions.iter().map(|r| term_of(r.flake())).collect();
+            got.sort_by(|a, b| a.1.cmp(&b.1));
+            assert_eq!(
+                got,
+                [
+                    stored("v", 1, 0),
+                    stored("w", 1, 1),
+                    stored("v", 2, 0),
+                    stored("x", 2, 1),
+                    stored("v", 4, 0),
+                    stored("w", 4, 1),
+                ],
+                "narrow_slot={narrow_slot}"
+            );
+            assert_eq!(
+                unmatched.iter().map(term_of).collect::<Vec<_>>(),
+                [
+                    plain("o"),
+                    at("v", 0),
+                    at("w", 0),
+                    at("v", 1),
+                    at("x", 0),
+                    at("v", 1),
+                    at("v", 0),
+                    at("w", 1),
+                    at("x", 2),
+                    at("y", 3)
+                ],
+                "narrow_slot={narrow_slot}"
+            );
+            assert_eq!(
+                (stats.matched, stats.phantom_intents),
+                (4, 10),
                 "narrow_slot={narrow_slot}"
             );
         }

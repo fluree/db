@@ -667,6 +667,9 @@ pub async fn stage_with_graph_delta(
                 stream_stats.unmatched_intents.extend(writes.unmatched);
             }
         }
+        if let Some(lists) = stream_stats.matched_lists.take() {
+            acc.push_retractions(lists.resolve(new_t));
+        }
 
         // Graph-sync wave: retract every current fact of the target graph
         // (see [`Txn::sync_graph`]). The accumulator nets retract+assert of
@@ -2324,6 +2327,8 @@ struct WhereStreamStats {
     unmatched_intents: Vec<Flake>,
     /// The list cells the templates edit, when the WHERE reads lists as RDF.
     cells: Option<crate::cell_edits::CellEdits>,
+    /// The lists a DELETE WHERE's collections matched.
+    matched_lists: Option<crate::cell_edits::MatchedLists>,
     /// The edges only a Cypher relationship's DELETE retracts, by edge, with
     /// the relationship variables that named it (see
     /// [`RelationshipEdges`]). Empty unless the transaction carries
@@ -2788,6 +2793,22 @@ async fn stream_where_into_accumulator(
             cells = Some(crate::cell_edits::CellEdits::new(view));
         }
     }
+    // A DELETE WHERE's collections alone read lists as RDF, and the lists
+    // they match are deleted whole (`crate::cell_edits::MatchedLists`).
+    let mut matched_lists = None;
+    if !txn.collection_cells.is_empty() {
+        if let Some(view) =
+            fluree_db_query::list_view::view_for(base_db.snapshot, base_db.overlay, None)?
+        {
+            query_patterns = fluree_db_query::list_view::rewrite_cells(
+                query_patterns,
+                &txn.collection_cells,
+                &view,
+                &|iri| ledger.snapshot.encode_iri(iri),
+            );
+            matched_lists = Some(crate::cell_edits::MatchedLists::new(view));
+        }
+    }
 
     // Which DELETE templates a WHERE triple witnesses, and whether the
     // ledger can hold a list position at all: together they decide which
@@ -2900,11 +2921,15 @@ async fn stream_where_into_accumulator(
                 fixed_graph_iris,
                 reverse_graph,
             )?;
-            match cells.as_mut() {
+            let intents = match cells.as_mut() {
                 Some(cells) => {
                     let routing: &HashMap<Sid, GraphId> = reverse_graph;
                     cells.take_deletes(intents, |f| resolve_flake_graph_id(f, routing))?
                 }
+                None => intents,
+            };
+            match matched_lists.as_mut() {
+                Some(lists) => lists.take_deletes(intents),
                 None => intents,
             }
         };
@@ -2973,6 +2998,7 @@ async fn stream_where_into_accumulator(
         assertion_count,
         unmatched_intents,
         cells,
+        matched_lists,
         relationship_edges: relationship_edges
             .map(RelationshipEdges::finish)
             .unwrap_or_default(),

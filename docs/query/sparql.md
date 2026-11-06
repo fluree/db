@@ -292,7 +292,7 @@ SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
 - A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
 - `ex:items/rdf:rest*/rdf:first` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would, in a query and in an update's WHERE. A plain value of `ex:items` is not a member, and the query's other patterns still read members as values. Its solutions carry no order; use `ORDER BY` for one.
 - Over a dataset, the walk reads the lists of each graph it names, in that graph's own ledger and time; under a default graph spanning ledgers it is refused, as any property path is (use `GRAPH`). A history query (a `FROM … TO` range) that walks a compact list is refused with a `400`; lists stored as triples walk in history as before.
-- No other pattern matches a list's `rdf:first`/`rdf:rest` cells: another path through them, or a `( ?x ?y )` pattern, finds nothing for a list stored this way, unless the request reads lists as RDF (below).
+- No other pattern matches a list's `rdf:first`/`rdf:rest` cells: another path through them, or a `( ?x ?y )` pattern, finds nothing for a list stored this way, unless the request reads lists as RDF (below). A `( … )` in a `DELETE WHERE` reads its lists so ([Writing lists](#writing-lists)).
 - A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
 
 #### Reading lists as RDF
@@ -1386,6 +1386,7 @@ INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
 ```
 
 - Deleting a value deletes every entry of a list that holds it, and the value where it is also stored beside the list, however the delete is written.
+- A `( … )` in a `DELETE WHERE` matches a list as the RDF list it denotes: the same members in the same order and no more. It deletes each list it matches whole, as a JSON-LD `@list` in a delete does. `DELETE WHERE { ex:s ex:items (1 2) }` deletes the list `(1 2)` and leaves `(1 2 3)`. Like any pattern, a collection that matches no list matches nothing, so the rest of its `DELETE WHERE` deletes nothing either. A member may be a variable: `( ?x 2 )` matches every two-member list that ends in `2`. The rest of the pattern reads members as values. A list stored as its triples matches as those triples, which are deleted. `()` is the IRI `rdf:nil`, a value, and matches and deletes as one, an entry of a list that holds `rdf:nil` included. `DELETE DATA` refuses a `( … )`, as SPARQL refuses blank nodes there.
 - To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
 - `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
 - A subject can hold several lists on one property, each in order and apart from the others, including one `ADD` brings into a graph that holds a list there. Writing a list the subject and property already hold, the same members in the same order, restates that list rather than adding another.
