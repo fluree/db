@@ -852,6 +852,7 @@ pub async fn incremental_index(
         IncrementalResolveError::Resolve(crate::run_index::ResolverError::Unindexable(msg)) => {
             IndexerError::Unindexable(msg)
         }
+        IncrementalResolveError::NeedsRebuild(why) => IndexerError::IncrementalAbort(why),
         e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
     })?;
 
