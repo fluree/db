@@ -1469,7 +1469,7 @@ impl<'a> HydrationFormatter<'a> {
                         JsonValue::Array(values)
                     };
                     // Dataset values stay wrapped until the union is complete.
-                    if self.dataset.is_none() {
+                    if has_lists && self.dataset.is_none() {
                         if let Some(expanded) =
                             compact_list_property(&key, &mut value, self.compactor)
                         {
