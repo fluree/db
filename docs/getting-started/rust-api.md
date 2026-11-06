@@ -194,8 +194,15 @@ println!(
 - An IRI or string the ledger already holds keeps its id, so the graph joins with the rest of
   the ledger. The new graph's index is built in bulk and spliced into the ledger's existing
   index; nothing else is rebuilt.
-- A ledger with commits after its index is indexed first. Writes to the ledger wait until the
-  import publishes; reads go on against the head it started from.
+- A ledger with commits after its index is indexed first. Writes through the same `Fluree`'s
+  cached ledger wait until the import publishes; reads go on against the head it started from.
+  A writer that does not share that cache (another process, another `Fluree`, or one built
+  without ledger caching) is not held: if it commits first, the import fails with nothing
+  published.
+- `ImportError::PublishedWithoutIndex { t, .. }` is the one failure after which the import is in
+  the ledger: its commits are published through `t` and its index is not. Queries read the graph
+  from those commits until an index covers them, which `Fluree::reindex` builds. A future
+  dropped while the import publishes can leave the ledger the same way.
 - The source holds default-graph data (Turtle, N-Triples, JSON-LD, JSONL/NDJSON). An existing
   graph, `urn:default`, the system graphs, TriG / N-Quads, and JSON-LD that names graphs of its
   own are refused with `ImportError::Refused` (or `ImportError::Invalid`), with nothing written.

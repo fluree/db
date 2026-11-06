@@ -8,7 +8,7 @@
 use super::CrossLedgerError;
 use crate::view::GraphDb;
 use crate::Fluree;
-use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+use fluree_db_core::graph_registry::{names_config_graph, txn_meta_graph_iri};
 use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_ledger::LedgerState;
 use fluree_db_policy::PolicyArtifactWire;
@@ -692,7 +692,8 @@ impl<'a> ResolveCtx<'a> {
 }
 
 /// Reject selectors that resolve to the model ledger's `#config` or
-/// `#txn-meta` graphs.
+/// `#txn-meta` graphs. Any ledger's config graph IRI is M's config
+/// graph ([`names_config_graph`]).
 ///
 /// Applied *before* any storage round-trip on the model ledger —
 /// `#txn-meta` in particular can leak commit metadata, and `#config`
@@ -704,9 +705,7 @@ pub(crate) fn reject_if_reserved_graph(
     canonical_ledger_id: &str,
     graph_iri: &str,
 ) -> Result<(), CrossLedgerError> {
-    if graph_iri == config_graph_iri(canonical_ledger_id)
-        || graph_iri == txn_meta_graph_iri(canonical_ledger_id)
-    {
+    if names_config_graph(graph_iri) || graph_iri == txn_meta_graph_iri(canonical_ledger_id) {
         return Err(CrossLedgerError::ReservedGraphSelected {
             graph_iri: graph_iri.to_string(),
         });
@@ -760,6 +759,11 @@ mod tests {
             reject_if_reserved_graph(ledger, "urn:fluree:model:main#txn-meta"),
             Err(CrossLedgerError::ReservedGraphSelected { .. })
         ));
+        // Any ledger's config graph IRI names model:main's config graph.
+        assert!(matches!(
+            reject_if_reserved_graph(ledger, "urn:fluree:other:main#config"),
+            Err(CrossLedgerError::ReservedGraphSelected { .. })
+        ));
     }
 
     #[test]
@@ -768,12 +772,8 @@ mod tests {
         // A user-named graph that happens to live on the model
         // ledger is fine — we only block the system graphs.
         assert!(reject_if_reserved_graph(ledger, "http://example.org/policy").is_ok());
-        // Even a config-shaped IRI for a *different* ledger is fine —
-        // it can't actually resolve to model:main's #config.
-        assert!(
-            reject_if_reserved_graph(ledger, "urn:fluree:other:main#config").is_ok(),
-            "config IRI for a different ledger should not match"
-        );
+        // Not a ledger's config graph IRI: no ledger id before the `#`.
+        assert!(reject_if_reserved_graph(ledger, "urn:fluree:#config").is_ok());
     }
 
     fn key(ledger: &str, graph: &str, t: i64) -> ResolutionKey {

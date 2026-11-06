@@ -649,6 +649,60 @@ pub(crate) fn graph_ids(snapshot: &LedgerSnapshot) -> Result<HashMap<Sid, GraphI
     Ok(graph_ids)
 }
 
+/// One of the config graph's IRIs in `graph_iris`, as a commit's `graph_delta`
+/// lists graphs by id: the one its slot is registered by when the commit
+/// writes under it, else the first. Flakes under the others (a merge of a
+/// branch that wrote under its source's config graph IRI and then its own)
+/// move to it. `ns_delta` holds the codes a merge brings in, which its flakes
+/// may name graphs by.
+fn one_config_graph_iri(
+    mut flakes: Vec<Flake>,
+    graph_iris: &mut Vec<String>,
+    registry: &fluree_db_core::GraphRegistry,
+    ns: &NamespaceRegistry,
+    ns_delta: Option<&HashMap<u16, String>>,
+) -> Result<Vec<Flake>> {
+    use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
+    let named: Vec<String> = graph_iris
+        .iter()
+        .filter(|iri| registry.graph_id_for_iri(iri) == Some(CONFIG_GRAPH_ID))
+        .cloned()
+        .collect();
+    if named.len() < 2 {
+        return Ok(flakes);
+    }
+    let mut ns = ns.clone();
+    if let Some(delta) = ns_delta {
+        ns.adopt_delta_for_persistence(delta)
+            .map_err(|e| TransactError::FlakeGeneration(e.to_string()))?;
+    }
+    // An IRI with no Sid names no flake.
+    let config: Vec<(&String, fluree_db_core::Sid)> = named
+        .iter()
+        .filter_map(|iri| ns.lookup_sid_for_iri(iri).map(|sid| (iri, sid)))
+        .collect();
+    let slot = registry.iri_for_graph_id(CONFIG_GRAPH_ID);
+    let keep = config
+        .iter()
+        .find(|(iri, _)| Some(iri.as_str()) == slot)
+        .or(config.first());
+    let keep_iri = keep.map_or(&named[0], |(iri, _)| *iri).clone();
+    if let Some((_, kept)) = keep {
+        let moved: Vec<&fluree_db_core::Sid> = config
+            .iter()
+            .filter(|(_, sid)| sid != kept)
+            .map(|(_, sid)| sid)
+            .collect();
+        for flake in &mut flakes {
+            if flake.g.as_ref().is_some_and(|g| moved.contains(&g)) {
+                flake.g = Some(kept.clone());
+            }
+        }
+    }
+    graph_iris.retain(|iri| *iri == keep_iri || !named.contains(iri));
+    Ok(flakes)
+}
+
 /// Commit a staged transaction
 ///
 /// This function:
@@ -783,6 +837,13 @@ pub async fn build_commit(
     });
     graph_iris.sort_unstable();
     graph_iris.dedup();
+    let flakes = one_config_graph_iri(
+        flakes,
+        &mut graph_iris,
+        registry,
+        &ns_registry,
+        override_ns_delta.as_ref(),
+    )?;
     if flakes.is_empty()
         && merge_parents.is_empty()
         && !registers_new_graph

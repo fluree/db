@@ -2277,7 +2277,35 @@ impl crate::Fluree {
         // index can't be loaded (e.g. first-ever reindex of a commits-only
         // ledger) we fall back to empty — only the `@fulltext` datatype path
         // will contribute entries, which matches pre-config behavior.
-        if let Some(state) = ledger_state.as_ref() {
+        //
+        // An index from before config graphs were read across ledgers can
+        // hold one as an ordinary graph, where no config is read. The rebuild
+        // reads it as the config graph, so its full-text settings are read
+        // from the commits as well.
+        let from_commits = match ledger_state.as_ref() {
+            Some(state) if state.snapshot.graph_registry.has_config_in_user_slot() => {
+                let mut unindexed = record.clone();
+                unindexed.index_head_id = None;
+                let loaded = match self.branched_content_store(&ledger_id).await {
+                    Ok(store) => fluree_db_ledger::LedgerState::load_with_store(store, unindexed)
+                        .await
+                        .map_err(ApiError::from),
+                    Err(e) => Err(e),
+                };
+                match loaded {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "reindex: failed to load the commits for the config read; configured fulltext properties will be skipped"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(state) = from_commits.as_ref().or(ledger_state.as_ref()) {
             // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
             // first-ever reindex (no prior index, all config in novelty)
             // the config query isn't filtered out by
@@ -2310,8 +2338,12 @@ impl crate::Fluree {
             track_fuel: true,
             ..Default::default()
         });
+        // Branch-aware: a branch's history runs through its source's commits.
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &ledger_id)
+            .await?;
         let index_result = rebuild_index_from_commits_with_tracker(
-            self.content_store(&ledger_id),
+            store,
             reindex_tracker,
             &ledger_id,
             &record,

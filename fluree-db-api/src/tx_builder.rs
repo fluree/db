@@ -1373,11 +1373,13 @@ impl Fluree {
                 .await?;
             // Answer the trailing RETURN against the final virtual state
             // (identical content to the state the commit publishes).
-            let cypher_return = match outcome.return_result {
-                Some(qr) => {
-                    let view = crate::GraphDb::from_ledger_state(&outcome.final_state);
+            let cypher_return = match outcome.returned {
+                Some(answered) => {
+                    let view = crate::GraphDb::from_ledger_state(&answered.final_state);
                     Some(
-                        qr.to_cypher_json_async(view.as_graph_db_ref())
+                        answered
+                            .result
+                            .to_cypher_json_async(view.as_graph_db_ref())
                             .await
                             .map_err(|e| {
                                 ApiError::internal(format!(

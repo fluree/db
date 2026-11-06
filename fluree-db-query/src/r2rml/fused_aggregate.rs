@@ -52,7 +52,7 @@ use fluree_db_r2rml::mapping::{
     TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
-    canonical_join, fill_join_key_from_batch, get_join_key_from_batch,
+    canonical_join, fill_join_key_from_batch, get_join_key_from_batch, lexical_column,
     materialize_object_from_batch, materialize_subject_from_batch, subject_sort_key, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
@@ -866,9 +866,21 @@ struct GroupCol {
     dt_sid: Sid,
 }
 
+/// A GROUP BY key column of one scanned batch, in the form its key kind reads.
+/// [`GroupCol::key_column`] is the only constructor: an `xsd:string` key over
+/// a column the batch holds as anything but text is rendered there, once per
+/// batch, to the lexical forms the materializer gives its literals. That is
+/// the generic path's key for an un-annotated `rr:column` (its natural
+/// mapping here is the `xsd:string` of the rendered value), so an integer,
+/// float, decimal, boolean, temporal or binary column groups by `"10"`, `"-0"`,
+/// `"0.050000000"` exactly as the materialized rows do — a raw read finds no
+/// string in such a column and would drop every row.
+struct KeyColumn<'b>(std::borrow::Cow<'b, Column>);
+
 /// Supported GROUP BY key column kinds (slice 3).
 #[derive(Clone, Copy, Debug)]
 enum GKind {
+    /// An `xsd:string` key, read from a [`KeyColumn`] already in lexical form.
     String,
     Integer,
     /// P2a: a RefObjectMap group key — the group value is the referenced parent
@@ -1056,13 +1068,31 @@ fn insert_dim_gkeys(
 }
 
 impl GroupCol {
+    /// This key's column in `batch` (absent → `None`), in the form
+    /// [`Self::key_at`] reads: see [`KeyColumn`].
+    fn key_column<'b>(&self, batch: &'b ColumnBatch) -> Option<KeyColumn<'b>> {
+        batch
+            .column_by_name(&self.column)
+            .map(|col| self.key_column_of(col))
+    }
+
+    fn key_column_of<'b>(&self, col: &'b Column) -> KeyColumn<'b> {
+        KeyColumn(match self.kind {
+            GKind::String => lexical_column(col),
+            GKind::Integer | GKind::Iri => std::borrow::Cow::Borrowed(col),
+        })
+    }
+
     /// Read this column's group-key value at a row.
-    fn key_at(&self, col: Option<&Column>, row: usize) -> GKey {
-        let Some(c) = col else { return GKey::Null };
+    fn key_at(&self, col: Option<&KeyColumn<'_>>, row: usize) -> GKey {
+        let Some(c) = col.map(|k| k.0.as_ref()) else {
+            return GKey::Null;
+        };
         match self.kind {
             // P2a: a ref-IRI key is Dim-sourced (from the FK→IRI map), never read
             // inline from the fact batch, so this is unreachable for it.
             GKind::Iri => GKey::Null,
+            // A `KeyColumn` of a string key is always a string column.
             GKind::String => match c {
                 Column::String(v) => v.get(row).cloned().flatten().map_or(GKey::Null, GKey::Str),
                 _ => GKey::Null,
@@ -1098,8 +1128,8 @@ impl GroupCol {
     /// `GKey::Null` (a null/absent/wrong-typed cell), so the vector fold drops the
     /// same rows and groups identically; the value variants match `key_at` bit for
     /// bit (including the `NUMBER(n,0)` physical-Decimal integer coercion).
-    fn key_ref_at<'a>(&self, col: Option<&'a Column>, row: usize) -> Option<GKeyRef<'a>> {
-        let c = col?;
+    fn key_ref_at<'a>(&self, col: Option<&'a KeyColumn<'_>>, row: usize) -> Option<GKeyRef<'a>> {
+        let c = col?.0.as_ref();
         match self.kind {
             // P2a: a ref-IRI key is Dim-sourced; never read inline from the fact.
             GKind::Iri => None,
@@ -1482,14 +1512,14 @@ impl FusedR2rmlAggregateOperator {
     fn assemble_group_key(
         plan: &[KeySource],
         group_cols: &[GroupCol],
-        key_cols: &[Option<&Column>],
+        key_cols: &[Option<KeyColumn<'_>>],
         dim_probes: &[&[GKey]],
         row: usize,
     ) -> Option<Vec<GKey>> {
         let mut key = Vec::with_capacity(plan.len());
         for (pos, slot) in plan.iter().enumerate() {
             let k = match slot {
-                KeySource::Fact => group_cols[pos].key_at(key_cols[pos], row),
+                KeySource::Fact => group_cols[pos].key_at(key_cols[pos].as_ref(), row),
                 KeySource::Dim { resolver, slot } => dim_probes.get(*resolver)?.get(*slot)?.clone(),
             };
             if matches!(k, GKey::Null) {
@@ -1899,10 +1929,8 @@ impl Operator for FusedR2rmlAggregateOperator {
                     }
                 })
                 .collect();
-            let key_cols: Vec<Option<&Column>> = gcols
-                .iter()
-                .map(|g| batch.column_by_name(&g.column))
-                .collect();
+            let key_cols: Vec<Option<KeyColumn>> =
+                gcols.iter().map(|g| g.key_column(&batch)).collect();
             let validity: Vec<Option<&Column>> = resolved
                 .validity_cols
                 .iter()
@@ -2035,7 +2063,9 @@ impl Operator for FusedR2rmlAggregateOperator {
                         let mut dropped = false;
                         for (pos, slot) in resolved.group_key_plan.iter().enumerate() {
                             let comp = match slot {
-                                KeySource::Fact => gcols[pos].key_ref_at(key_cols[pos], row),
+                                KeySource::Fact => {
+                                    gcols[pos].key_ref_at(key_cols[pos].as_ref(), row)
+                                }
                                 KeySource::Dim { resolver, slot } => dim_probes
                                     .get(*resolver)
                                     .and_then(|g| g.get(*slot))
@@ -3846,9 +3876,9 @@ impl FusedR2rmlAggregateOperator {
                 // fact-subset keys are read inline from the fact batch at fold time.
                 // An all-fact plan leaves this empty, so the map stores `[]` per FK
                 // and degenerates to a join-existence set (invariant #1).
-                let attr_cols: Vec<Option<&Column>> = dim_group_cols
+                let attr_cols: Vec<Option<KeyColumn>> = dim_group_cols
                     .iter()
-                    .map(|g| batch.column_by_name(&g.column))
+                    .map(|g| g.key_column(&batch))
                     .collect();
                 for row in 0..batch.num_rows {
                     let Some(key) = get_join_key_from_batch(&terminal_parent_cols, &batch, row)
@@ -3880,7 +3910,7 @@ impl FusedR2rmlAggregateOperator {
                     let mut gkeys = Vec::with_capacity(dim_group_cols.len());
                     let mut any_null = false;
                     for (g, c) in dim_group_cols.iter().zip(&attr_cols) {
-                        let k = g.key_at(*c, row);
+                        let k = g.key_at(c.as_ref(), row);
                         if matches!(k, GKey::Null) {
                             any_null = true;
                             break;
@@ -4471,6 +4501,7 @@ mod tests {
             dt_sid: Sid::new(1, "string"),
         };
         let col = Column::String(vec![Some("SMB".to_string()), None]);
+        let col = gc.key_column_of(&col);
         // Present value → the raw string, the xsd:string lexical form materialize emits.
         assert_eq!(gc.key_at(Some(&col), 0), GKey::Str("SMB".to_string()));
         // NULL value and a missing column both read as Null (row drops == BGP exclusion).
@@ -4511,7 +4542,7 @@ mod tests {
             (gc_str(), Column::String(vec![Some("A".into()), None]), 0),
             (gc_str(), Column::String(vec![Some("A".into()), None]), 1),
             (gc_str(), Column::String(vec![Some("A".into())]), 5),
-            (gc_str(), Column::Int64(vec![Some(7)]), 0), // wrong physical type
+            (gc_str(), Column::Int64(vec![Some(7)]), 0), // rendered: "7"
             (gc_int(), Column::Int64(vec![Some(42), None]), 0),
             (gc_int(), Column::Int64(vec![Some(42), None]), 1),
             (gc_int(), Column::Int32(vec![Some(-3)]), 0),
@@ -4553,18 +4584,85 @@ mod tests {
             ),
         ];
         for (gc, col, row) in &cases {
-            let owned = gc.key_at(Some(col), *row);
+            let col = gc.key_column_of(col);
+            let owned = gc.key_at(Some(&col), *row);
             let borrowed = gc
-                .key_ref_at(Some(col), *row)
+                .key_ref_at(Some(&col), *row)
                 .map(GKeyRef::to_owned_key)
                 .unwrap_or(GKey::Null);
             assert_eq!(owned, borrowed, "kind {:?} row {}", gc.kind, row);
-            if let Some(r) = gc.key_ref_at(Some(col), *row) {
+            if let Some(r) = gc.key_ref_at(Some(&col), *row) {
                 assert!(r.eq_owned(&owned), "eq_owned disagrees for {owned:?}");
             }
         }
         assert_eq!(gc_str().key_at(None, 0), GKey::Null);
         assert!(gc_str().key_ref_at(None, 0).is_none());
+    }
+
+    /// An `xsd:string` key over a column the batch holds in another physical
+    /// type reads the materializer's rendering of each cell, owned and borrowed,
+    /// and a null cell still drops the row. Cells that compare equal as numbers
+    /// but render differently (`-0.0` / `0.0`) stay apart, as their strings do.
+    #[test]
+    fn string_key_over_any_physical_type_reads_the_rendered_value() {
+        let cases: Vec<(Column, &[Option<&str>])> = vec![
+            (Column::Int32(vec![Some(10), None]), &[Some("10"), None]),
+            (
+                Column::Int64(vec![Some(-3), Some(9)]),
+                &[Some("-3"), Some("9")],
+            ),
+            (
+                Column::Float32(vec![Some(-0.0), Some(0.0)]),
+                &[Some("-0"), Some("0")],
+            ),
+            (
+                Column::Float64(vec![Some(f64::NAN), Some(1e21)]),
+                &[Some("NaN"), Some("1000000000000000000000")],
+            ),
+            (
+                Column::Boolean(vec![Some(true), Some(false)]),
+                &[Some("true"), Some("false")],
+            ),
+            (
+                Column::Date(vec![Some(-1), Some(0)]),
+                &[Some("1969-12-31"), Some("1970-01-01")],
+            ),
+            (
+                Column::Timestamp(vec![Some(1), Some(0)]),
+                &[
+                    Some("1970-01-01T00:00:00.000001Z"),
+                    Some("1970-01-01T00:00:00Z"),
+                ],
+            ),
+            (
+                Column::TimestampTz(vec![Some(-1), None]),
+                &[Some("1969-12-31T23:59:59.999999Z"), None],
+            ),
+            (
+                Column::Bytes(vec![Some(vec![0, 1]), Some(vec![])]),
+                &[Some("0001"), Some("")],
+            ),
+            (
+                Column::Decimal {
+                    values: vec![Some(50_000_000), Some(-500_000_000)],
+                    precision: 38,
+                    scale: 9,
+                },
+                &[Some("0.050000000"), Some("-0.500000000")],
+            ),
+        ];
+        let gc = gc_str();
+        for (col, expected) in &cases {
+            let key_col = gc.key_column_of(col);
+            for (row, want) in expected.iter().enumerate() {
+                let want = want.map_or(GKey::Null, |s| GKey::Str(s.to_string()));
+                assert_eq!(gc.key_at(Some(&key_col), row), want, "{col:?} row {row}");
+                let borrowed = gc
+                    .key_ref_at(Some(&key_col), row)
+                    .map_or(GKey::Null, GKeyRef::to_owned_key);
+                assert_eq!(borrowed, want, "{col:?} row {row} (borrowed)");
+            }
+        }
     }
 
     /// N1 hash-consistency invariant (the resize-safety guard): the borrowed probe
@@ -7184,6 +7282,8 @@ mod tests {
         };
         let ground = Column::String(vec![Some("Ground".into())]);
         let null_str = Column::String(vec![None]);
+        let ground = || Some(s_col.key_column_of(&ground));
+        let null_str = || Some(s_col.key_column_of(&null_str));
 
         // Resolver-0 probe slices (S2: `dim_probes` is one slice per resolver).
         let year: &[GKey] = &[GKey::Int(2024)];
@@ -7196,7 +7296,7 @@ mod tests {
 
         // plan [Fact(shipMethod), Dim{0,0}=year] → [Str, Int] in order.
         let gc = vec![s_col.clone(), i_col.clone()];
-        let kc = vec![Some(&ground), None];
+        let kc = vec![ground(), None];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact, dim0],
@@ -7209,7 +7309,7 @@ mod tests {
         );
         // Swapped order [Dim{0,0}=year, Fact(shipMethod)] → [Int, Str].
         let gc2 = vec![i_col.clone(), s_col.clone()];
-        let kc2 = vec![None, Some(&ground)];
+        let kc2 = vec![None, ground()];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[dim0, KeySource::Fact],
@@ -7221,7 +7321,7 @@ mod tests {
             Some(vec![GKey::Int(2024), GKey::Str("Ground".into())])
         );
         // Null FACT key position → drop.
-        let kc_null = vec![Some(&null_str), None];
+        let kc_null = vec![null_str(), None];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact, dim0],
@@ -7259,7 +7359,7 @@ mod tests {
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact],
                 std::slice::from_ref(&s_col),
-                &[Some(&ground)],
+                &[ground()],
                 &[],
                 0
             ),
@@ -7274,7 +7374,7 @@ mod tests {
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact],
                 std::slice::from_ref(&s_col),
-                &[Some(&ground)],
+                &[ground()],
                 &[empty_dim],
                 0
             ),
@@ -7298,28 +7398,19 @@ mod tests {
             precision: 38,
             scale: 0,
         };
-        assert_eq!(gc.key_at(Some(&scale0), 0), GKey::Int(2024));
-        assert_eq!(
-            gc.key_at(Some(&scale0), 1),
-            GKey::Null,
-            "null decimal → null key"
-        );
+        let key = |col: &Column, row: usize| gc.key_at(Some(&gc.key_column_of(col)), row);
+        assert_eq!(key(&scale0, 0), GKey::Int(2024));
+        assert_eq!(key(&scale0, 1), GKey::Null, "null decimal → null key");
         // Exact-integer decimal with a non-zero scale (202400 · 10^-2 = 2024).
         let scaled = Column::Decimal {
             values: vec![Some(202_400)],
             precision: 38,
             scale: 2,
         };
-        assert_eq!(gc.key_at(Some(&scaled), 0), GKey::Int(2024));
+        assert_eq!(key(&scaled, 0), GKey::Int(2024));
         // The native integer columns still read.
-        assert_eq!(
-            gc.key_at(Some(&Column::Int64(vec![Some(7)])), 0),
-            GKey::Int(7)
-        );
-        assert_eq!(
-            gc.key_at(Some(&Column::Int32(vec![Some(3)])), 0),
-            GKey::Int(3)
-        );
+        assert_eq!(key(&Column::Int64(vec![Some(7)]), 0), GKey::Int(7));
+        assert_eq!(key(&Column::Int32(vec![Some(3)]), 0), GKey::Int(3));
     }
 
     #[test]

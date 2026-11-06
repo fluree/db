@@ -1896,6 +1896,9 @@ fn route_query(
                     Err(TargetError::CrossLedger { also_iri, .. }) => {
                         local || !also_iri || !registry_known
                     }
+                    // Another branch's system graph: the connection path reads
+                    // the branch the IRI names.
+                    Err(TargetError::OtherLedgersSystemGraph { .. }) => true,
                 }
             };
             let Some(ast) = fluree_db_api::parse_sparql(content).ast else {

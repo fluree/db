@@ -7,10 +7,18 @@
 //! the same from the root the import spliced, after a full rebuild from its
 //! commits, and after later writes indexed incrementally over that root.
 
-use fluree_db_api::{Fluree, FlureeBuilder, ReindexOptions};
+use fluree_db_api::{
+    ApiError, Fluree, FlureeBuilder, ImportError, LedgerId, NameServiceMode, NotifyResult,
+    NsNotify, ReindexOptions,
+};
+use fluree_db_core::MemoryStorage;
+use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
+use crate::race_nameservice::PausingNameService;
 use crate::support;
 
 const LEDGER: &str = "it/graph-import:main";
@@ -49,7 +57,8 @@ ex:carol a ex:Person .
 "#;
 
 /// `graph s p o` for every statement in the default graph and in `GRAPH`,
-/// sorted, IRIs under `ex:` written `ex:` and blank nodes `_:`.
+/// sorted, IRIs under `ex:` written `ex:` and blank nodes `_:`. A ledger
+/// without `GRAPH` reads only the default graph; any other error fails.
 async fn statements(fluree: &Fluree) -> Vec<String> {
     let ledger = fluree.ledger(LEDGER).await.expect("load");
     let mut out = Vec::new();
@@ -64,7 +73,7 @@ async fn statements(fluree: &Fluree) -> Vec<String> {
         });
         let rows = match fluree.query_connection(&query).await {
             Ok(rows) => rows.to_jsonld(&ledger.snapshot).expect("jsonld"),
-            Err(e) if e.to_string().contains("not found") => continue,
+            Err(ApiError::GraphNotFound(_)) if label == "g" => continue,
             Err(e) => panic!("{label}: {e}"),
         };
         for row in rows.as_array().expect("rows") {
@@ -104,7 +113,11 @@ fn source_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
 
 /// A ledger with two commits of default-graph data, indexed to its head.
 async fn indexed_ledger(dir: &Path) -> i64 {
-    let fluree = fluree_at(dir);
+    seed_ledger(&fluree_at(dir)).await
+}
+
+/// [`indexed_ledger`]'s ledger, created through `fluree`.
+async fn seed_ledger(fluree: &Fluree) -> i64 {
     let ledger = fluree.create_ledger(LEDGER).await.unwrap();
     let ctx = json!({"ex": EX});
     let ledger = fluree
@@ -127,7 +140,7 @@ async fn indexed_ledger(dir: &Path) -> i64 {
         .await
         .unwrap()
         .ledger;
-    support::rebuild_and_publish_index(&fluree, LEDGER).await;
+    support::rebuild_and_publish_index(fluree, LEDGER).await;
     ledger.t()
 }
 
@@ -782,4 +795,290 @@ async fn the_annotation_arena_survives_only_an_unannotated_graph() {
         claims(&fluree, Some(annotated_graph)).await,
         ["ex:erin ex:frank 0.5"]
     );
+}
+
+/// A memory-backed connection whose nameservice can hold or fail an index
+/// publish, over [`seed_ledger`]'s ledger, and the storage and nameservice a
+/// second connection to it needs.
+struct Pausing {
+    fluree: Fluree,
+    ns: Arc<PausingNameService>,
+    storage: MemoryStorage,
+    inner: Arc<MemoryNameService>,
+    base_t: i64,
+}
+
+impl Pausing {
+    async fn new() -> Self {
+        let storage = MemoryStorage::new();
+        let inner = Arc::new(MemoryNameService::new());
+        let ns = Arc::new(PausingNameService::new(inner.clone()));
+        let fluree = FlureeBuilder::memory()
+            .build_with(storage.clone(), NameServiceMode::ReadWrite(ns.clone()));
+        let base_t = seed_ledger(&fluree).await;
+        Self {
+            fluree,
+            ns,
+            storage,
+            inner,
+            base_t,
+        }
+    }
+
+    /// Another connection to the ledger, through the nameservice unwrapped.
+    fn other(&self) -> Fluree {
+        FlureeBuilder::memory().build_with(
+            self.storage.clone(),
+            NameServiceMode::ReadWrite(self.inner.clone()),
+        )
+    }
+}
+
+/// Hold an import of `files` at its index publish, once its commit head has
+/// moved, and notify the connection's ledger cache with the record as it
+/// stands then, as the cache listener does on the import's commit event.
+/// Returns the import's commit count and what the notification did.
+async fn notify_while_the_import_publishes(files: Vec<(String, String)>) -> (i64, NotifyResult) {
+    let c = Pausing::new().await;
+    let handle = c.fluree.ledger_cached(LEDGER).await.unwrap();
+    c.ns.pause_next_index_publish();
+    let importer = c.fluree.clone();
+    let import = tokio::spawn(async move {
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_str()))
+            .collect();
+        import_into_graph(&importer, &files, GRAPH).await
+    });
+    tokio::time::timeout(Duration::from_secs(60), c.ns.index_entered.notified())
+        .await
+        .expect("the import reaches its index publish");
+
+    let record = c
+        .fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("record");
+    assert!(
+        record.index_t < record.commit_t,
+        "the commit head is published and the index not yet"
+    );
+    let manager = Arc::clone(c.fluree.ledger_manager().expect("a ledger cache"));
+    let notify = tokio::spawn(async move {
+        manager
+            .notify(NsNotify {
+                ledger_id: LedgerId::parse(LEDGER).unwrap(),
+                record: Some(record),
+            })
+            .await
+    });
+    // Time for the notification to plan against that record while the
+    // index publish is held.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.ns.index_resume.notify_one();
+
+    let imported = import.await.unwrap().expect("graph import");
+    let notified = notify.await.unwrap().expect("notify");
+    assert_eq!(handle.snapshot().await.to_ledger_state().t(), imported.t);
+    (imported.t - c.base_t, notified)
+}
+
+/// The ledger cache, notified while an import of a few commits publishes,
+/// finds it installed at its heads instead of catching up on its commits one
+/// by one.
+#[tokio::test]
+async fn a_notification_while_a_short_import_publishes_finds_it_installed() {
+    let few = vec![("a.ttl".to_string(), SOURCE_A.to_string())];
+    let (commits, notified) = notify_while_the_import_publishes(few).await;
+    assert!(commits <= 5, "the catch-up path ({commits} commits)");
+    assert!(
+        matches!(notified, NotifyResult::Current),
+        "{commits} commits: {notified:?}"
+    );
+}
+
+/// The ledger cache, notified while an import of more than five commits
+/// publishes, finds it installed at its heads instead of reloading the
+/// ledger.
+#[tokio::test]
+async fn a_notification_while_a_long_import_publishes_finds_it_installed() {
+    let many = (0..6)
+        .map(|i| {
+            (
+                format!("f{i}.ttl"),
+                format!("@prefix ex: <{EX}> .\nex:item{i} ex:name \"Item {i}\" .\n"),
+            )
+        })
+        .collect();
+    let (commits, notified) = notify_while_the_import_publishes(many).await;
+    assert!(commits > 5, "the reload path ({commits} commits)");
+    assert!(
+        matches!(notified, NotifyResult::Current),
+        "{commits} commits: {notified:?}"
+    );
+}
+
+/// Upserts replace imported values, in the imported graph and beside it in
+/// the default graph: one staged while the import holds the ledger, so
+/// staged again on the import, and one through the handle the import
+/// installed. The ledger then reads the same through that handle, after a
+/// fresh load, over an incremental index and after a reindex.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upserts_replace_imported_values() {
+    let dir = tempfile::tempdir().unwrap();
+    indexed_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    let handle = fluree.ledger_cached(LEDGER).await.unwrap();
+
+    let (parked, release) = handle.gate_next_writer_exclusion_for_test();
+    let importer = fluree.clone();
+    let import =
+        tokio::spawn(
+            async move { import_into_graph(&importer, &[("a.ttl", SOURCE_A)], GRAPH).await },
+        );
+    parked.await.expect("the import parks holding the ledger");
+    let (writer, writer_handle) = (fluree.clone(), handle.clone());
+    let early = tokio::spawn(async move {
+        let upsert = format!(
+            "@prefix ex: <{EX}> .\nGRAPH <{GRAPH}> {{ ex:widget2 ex:name \"Gadget Pro\" . }}\n"
+        );
+        writer
+            .stage(&writer_handle)
+            .upsert_turtle(&upsert)
+            .execute()
+            .await
+            .map(|r| r.receipt.t)
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!early.is_finished(), "the upsert waits for the import");
+    release.send(true).unwrap();
+    let imported = import.await.unwrap().expect("graph import");
+    let early_t = early
+        .await
+        .unwrap()
+        .expect("the upsert staged during the import");
+    assert_eq!(early_t, imported.t + 1);
+
+    let upsert = format!(
+        "@prefix ex: <{EX}> .\n\
+         ex:alice ex:name \"Alice B\" .\n\
+         ex:dave ex:name \"Dave\" .\n\
+         GRAPH <{GRAPH}> {{ ex:widget1 ex:name \"Widget Pro\" . ex:widget9 ex:name \"Widget Nine\" . }}\n"
+    );
+    fluree
+        .stage(&handle)
+        .upsert_turtle(&upsert)
+        .execute()
+        .await
+        .expect("the upsert after the import");
+
+    let read = statements(&fluree).await;
+    for row in [
+        "g: ex:widget1 ex:name Widget Pro",
+        "g: ex:widget2 ex:name Gadget Pro",
+        "g: ex:widget9 ex:name Widget Nine",
+        "g: ex:alice ex:likes ex:widget2",
+        "default: ex:alice ex:name Alice B",
+        "default: ex:dave ex:name Dave",
+    ] {
+        assert!(read.contains(&row.to_string()), "{row}: {read:?}");
+    }
+    for row in [
+        "g: ex:widget1 ex:name Widget",
+        "g: ex:widget2 ex:name Gadget",
+        "default: ex:alice ex:name Alice",
+    ] {
+        assert!(
+            !read.contains(&row.to_string()),
+            "{row} is replaced: {read:?}"
+        );
+    }
+
+    assert_eq!(
+        statements(&fluree_at(dir.path())).await,
+        read,
+        "a fresh load"
+    );
+    support::build_incrementally_and_publish_index(&fluree, LEDGER).await;
+    assert_eq!(
+        statements(&fluree_at(dir.path())).await,
+        read,
+        "over an incremental index"
+    );
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("full rebuild");
+    assert_eq!(
+        statements(&fluree_at(dir.path())).await,
+        read,
+        "after a reindex"
+    );
+}
+
+/// An index publish that fails once the commit head has moved leaves the
+/// import in the ledger, and the error says so. The ledger reads the graph
+/// from the import's commits, a write through the importing connection lands
+/// on top of them, and a reindex covers them.
+#[tokio::test]
+async fn an_index_publish_failure_leaves_the_import_published() {
+    let c = Pausing::new().await;
+    c.fluree.ledger_cached(LEDGER).await.unwrap();
+    c.ns.fail_index_publishes();
+    let source = source_dir(&[("a.ttl", SOURCE_A)]);
+    let err = c
+        .fluree
+        .import_into_graph(LEDGER, GRAPH)
+        .import(source.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect_err("the index publish fails");
+    let ImportError::PublishedWithoutIndex { t, .. } = err else {
+        panic!("{err}");
+    };
+    assert!(t > c.base_t);
+    let record = c
+        .other()
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("record");
+    assert_eq!((record.commit_t, record.index_t), (t, c.base_t));
+    let published = statements(&c.other()).await;
+    assert!(
+        published.contains(&"g: ex:widget1 ex:name Widget".to_string()),
+        "{published:?}"
+    );
+
+    let written = c
+        .fluree
+        .graph(LEDGER)
+        .transact()
+        .insert(&json!({"@context": {"ex": EX}, "@id": "ex:erin", "ex:name": "Erin"}))
+        .commit()
+        .await
+        .expect("a write after the failed publish");
+    assert_eq!(written.receipt.t, t + 1);
+
+    let other = c.other();
+    other
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let record = other
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("record");
+    assert_eq!(record.index_t, t + 1);
+    let mut want = published;
+    want.push("default: ex:erin ex:name Erin".to_string());
+    want.sort();
+    assert_eq!(statements(&c.other()).await, want);
 }

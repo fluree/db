@@ -28,6 +28,8 @@ use fluree_db_iceberg::io::{S3IcebergStorage, SendIcebergStorage};
 
 const ENDPOINT: &str = "https://storage.googleapis.com";
 
+// An SDK smoke test of the S3 client itself, not a graph-source read.
+#[allow(deprecated)]
 async fn gcs_storage() -> S3IcebergStorage {
     let region = std::env::var("FLUREE_GCS_REGION").unwrap_or_else(|_| "europe-west1".to_string());
     S3IcebergStorage::from_default_chain(Some(&region), Some(ENDPOINT), true)

@@ -12,9 +12,18 @@
 //!   the incremental indexer into the ledger's txn-meta graph.
 //!
 //! The ledger is held for the whole import: background indexing stops and
-//! writes wait ([`crate::LedgerHandle::exclude_writers`]), while reads go on
-//! against the head the import started from. Both heads are published at the
-//! end, the commit head first and only if it has not moved.
+//! writes through the same cached ledger handle wait
+//! ([`crate::LedgerHandle::exclude_writers`]), while reads go on against the
+//! head the import started from. A writer that does not share the handle (a
+//! separate connection or process, or a connection without ledger caching)
+//! is not held; the commit-head CAS catches it.
+//!
+//! Both heads are published at the end, under the handle's state lock, and
+//! the state at them, loaded beforehand, is installed with them. The commit
+//! head goes first and only if it has not moved: losing that CAS publishes
+//! nothing. Once it has moved the import is in the ledger, and a failure or a
+//! stop before the index publishes leaves its commits read as novelty until
+//! an index covers them ([`ImportError::PublishedWithoutIndex`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -282,7 +291,7 @@ pub(crate) async fn splice_graph_into_index(
 
     // ---- txn-meta, through the incremental indexer ----
     let records = txn_meta_records(&graph.txn_meta).map_err(ImportError::Io)?;
-    let shared = SharedResolverState::from_index_root(&root)
+    let shared = SharedResolverState::from_index_root(&root, &root.ledger_id)
         .map_err(|e| ImportError::IndexBuild(format!("spliced root dictionaries: {e}")))?;
     let novelty = IncrementalNovelty {
         ops: vec![1; records.len()],
@@ -632,6 +641,38 @@ where
         .sync()
         .await
         .map_err(|e| ImportError::Storage(format!("flush import artifacts: {e}")))?;
+
+    // The state the cached handle takes, loaded before either head moves:
+    // the ledger's record with both heads replaced, read as a load reads it.
+    let prepared = match &handle {
+        Some(_) => {
+            let mut published = lookup(fluree, &ledger).await?;
+            published.commit_head_id = Some(result.commit_head_id.clone());
+            published.commit_t = result.t;
+            published.index_head_id = Some(root_id.clone());
+            published.index_t = result.index_t;
+            Some(load_state(fluree, published).await?)
+        }
+        None => None,
+    };
+    // Publish under the state lock and install with it, as a push does. A
+    // snapshot taken meanwhile, this process's cache listener's among them,
+    // waits and reads the new head, rather than a commit head moved past the
+    // state it holds and the import's commits to catch up on.
+    let mut installing = match writers {
+        Some(writers) => Some(writers.lock_state().await),
+        None => None,
+    };
+
+    tracing::info!(
+        ledger_id = %alias,
+        graph = %seed.graph_iri,
+        t = result.t,
+        commit_head = %result.commit_head_id,
+        index_t = result.index_t,
+        index_root = %root_id,
+        "publishing graph import"
+    );
     let publisher = fluree.publisher()?;
     let expected = fluree_db_nameservice::RefValue {
         id: Some(seed.head_commit.clone()),
@@ -660,18 +701,24 @@ where
             ))));
         }
     }
+    // From here the import is in the ledger. A failure or a stop before the
+    // index publishes leaves the commits read as novelty until an index
+    // covers them; the cached handle keeps the state it had, which the next
+    // write reconciles on losing its commit-head CAS.
     publisher
         .publish_index(&alias, result.index_t, &root_id)
         .await
-        .map_err(|e| ImportError::Storage(format!("publish index: {e}")))?;
+        .map_err(|e| ImportError::PublishedWithoutIndex {
+            t: result.t,
+            reason: e.to_string(),
+        })?;
 
     // Writers held off resume on the new head.
-    if let (Some(handle), Some(writers)) = (&handle, writers) {
-        let state = reload_state(fluree, &alias).await?;
-        let mut guard = writers.lock_state().await;
+    if let (Some(handle), Some(guard), Some(state)) = (&handle, installing.as_mut(), prepared) {
         handle.sync_binary_store_from_state(&state).await;
         guard.replace(state);
     }
+    drop(installing);
 
     result.graph = Some(crate::import::ImportedGraph {
         iri: seed.graph_iri,
@@ -742,7 +789,7 @@ async fn load_seed(
     let mut base_root = IndexRoot::decode(&root_bytes)
         .map_err(|e| ImportError::Storage(format!("decode index root {base_root_id}: {e}")))?;
     bind_reserved_graphs(&mut base_root, &record.ledger_id);
-    let base_dicts = SharedResolverState::from_index_root(&base_root)
+    let base_dicts = SharedResolverState::from_index_root(&base_root, &record.ledger_id)
         .map_err(|e| ImportError::Storage(format!("index root dictionaries: {e}")))?;
 
     // A graph a drop left keeps its id, and the import fills it afresh; a
@@ -822,11 +869,16 @@ async fn load_seed(
     })
 }
 
-/// The ledger's state at its new head, loaded as the ledger manager loads it.
-async fn reload_state(fluree: &Fluree, alias: &str) -> Result<crate::LedgerState, ImportError> {
-    let mut state = crate::LedgerState::load(&fluree.nameservice_mode, alias, fluree.backend())
-        .await
-        .map_err(|e| ImportError::Api(e.into()))?;
+/// The ledger's state at the heads `record` names, loaded as the ledger
+/// manager loads one.
+async fn load_state(
+    fluree: &Fluree,
+    record: fluree_db_nameservice::NsRecord,
+) -> Result<crate::LedgerState, ImportError> {
+    let mut state =
+        crate::LedgerState::load_record(&fluree.nameservice_mode, record, fluree.backend())
+            .await
+            .map_err(|e| ImportError::Api(e.into()))?;
     if let Some(manager) = &fluree.ledger_manager {
         crate::ledger_manager::load_and_attach_binary_store(
             fluree.backend(),

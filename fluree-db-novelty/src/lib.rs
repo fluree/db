@@ -150,6 +150,11 @@ pub const MAX_SEGMENTS: usize = FlakeId::SEG_MASK as usize + 1;
 const FACT_SWEEP_PER_FLAKE: usize = 4;
 const FACT_SWEEP_MIN: usize = 4096;
 
+/// Surviving flakes, across graphs, a trim re-records into the fact state
+/// rather than leaving its stale entries for commits to sweep. The trim runs
+/// at index publish, under the ledger write lock queries wait on.
+const FACT_REBUILD_MAX: usize = 1024;
+
 /// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
 /// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
 /// novelty size with only bounded per-merge work (no full-novelty rewrite).
@@ -671,6 +676,11 @@ pub struct Novelty {
     /// identity, per graph, within this novelty window). Persistent map, so it
     /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
     fact_state: NoveltyFactState,
+
+    /// Planner stats this overlay's queries plan from instead of assembling
+    /// their own ([`Self::pin_planner_stats`]). Cleared by every change to
+    /// the overlay's content.
+    planner_stats_pin: Option<Arc<fluree_db_core::StatsView>>,
 }
 
 #[inline]
@@ -748,7 +758,25 @@ impl Novelty {
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
+            planner_stats_pin: None,
         }
+    }
+
+    /// Plan this overlay's queries from `stats` rather than from stats
+    /// assembled over its own content, until its content next changes. For
+    /// the virtual states of one sequential write, which differ from the
+    /// state it began on by its own few flakes: assembling the stats walks
+    /// the whole novelty window, once per operation otherwise. `stats` must
+    /// carry no soundness licence ([`fluree_db_core::StatsView::estimates_only`]),
+    /// since it doesn't describe this overlay exactly.
+    pub fn pin_planner_stats(&mut self, stats: Arc<fluree_db_core::StatsView>) {
+        self.planner_stats_pin = Some(stats);
+    }
+
+    /// The stats pinned by [`Self::pin_planner_stats`], if the content hasn't
+    /// changed since.
+    pub fn planner_stats_pin(&self) -> Option<&Arc<fluree_db_core::StatsView>> {
+        self.planner_stats_pin.as_ref()
     }
 
     /// Resolve a flake's graph ID from its `Flake.g` field.
@@ -772,6 +800,7 @@ impl Novelty {
         // Drawn from the process-wide allocator shared by every overlay type
         // (see `next_overlay_content_version`); `0` = empty since construction.
         self.content_version = fluree_db_core::overlay::next_overlay_content_version();
+        self.planner_stats_pin = None;
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.
@@ -1374,6 +1403,12 @@ impl Novelty {
     /// after each index rebuild rather than mutated in-place, so this is rarely
     /// the hot path.
     pub fn clear_up_to(&mut self, cutoff_t: i64) {
+        self.clear_up_to_rebuilding(cutoff_t, FACT_REBUILD_MAX);
+    }
+
+    /// [`Self::clear_up_to`], re-recording up to `rebuild_max` surviving
+    /// flakes into the fact state.
+    fn clear_up_to_rebuilding(&mut self, cutoff_t: i64, rebuild_max: usize) {
         if self.flake_count == 0 {
             return;
         }
@@ -1403,15 +1438,25 @@ impl Novelty {
 
         self.recompute_totals();
 
-        // The current-state index loses the ops the trim dropped. Moving its
-        // cutoff answers as rebuilding it from the survivors would, without
-        // a pass over them under the ledger write lock at every index publish;
+        // The current-state index loses the ops the trim dropped. A graph left
+        // with few flakes is rebuilt from them, so a ledger that goes idle
+        // after the publish holds none of the trimmed window. Otherwise moving
+        // its cutoff answers as rebuilding it would, without a pass over the
+        // survivors under the ledger write lock at every index publish;
         // commits sweep the stale entries out afterwards.
         let graphs = &self.graphs;
+        let mut budget = rebuild_max;
         self.fact_state.trim_through(cutoff_t, |g| {
-            graphs
+            let segs = graphs
                 .get(g as usize)
-                .is_none_or(|segs| segs.as_ref().is_none_or(Vec::is_empty))
+                .and_then(Option::as_ref)
+                .map_or(&[][..], Vec::as_slice);
+            let survivors: usize = segs.iter().map(|s| s.flakes.len()).sum();
+            if survivors > budget {
+                return None;
+            }
+            budget -= survivors;
+            Some(segs.iter().flat_map(|s| s.flakes.iter()))
         });
 
         self.epoch += 1;
@@ -1911,7 +1956,8 @@ mod tests {
             universe.iter().map(|f| fs.is_asserted(0, f)).collect()
         };
 
-        n.clear_up_to(25);
+        // No rebuild budget, so the trim moves the cutoff.
+        n.clear_up_to_rebuilding(25, 0);
         let want = answers(&rebuilt(&n));
         assert_eq!(answers(&n.fact_state), want, "unswept");
         assert!(want.iter().any(|&a| a) && want.iter().any(|&a| !a));
@@ -1944,6 +1990,40 @@ mod tests {
         assert!(n.is_empty());
         assert!(n.fact_state.graphs.iter().all(Option::is_none));
         assert!(answers(&n.fact_state).iter().all(|&a| !a));
+    }
+
+    /// A trim that leaves few flakes rebuilds the fact state from them, so a
+    /// ledger that goes idle after an index publish holds none of the trimmed
+    /// window; past the rebuild budget the window stays until commits sweep it.
+    #[test]
+    fn a_trim_leaving_few_survivors_rebuilds_the_fact_state() {
+        let window = || {
+            let mut n = Novelty::new(0);
+            for t in 1..=20i64 {
+                let batch: Vec<Flake> = (0..200i64)
+                    .map(|i| make_flake((i % 9) as u16, (i % 5) as u16, t * 1000 + i, t, true))
+                    .collect();
+                n.apply_commit(batch, t, &HashMap::new()).unwrap();
+            }
+            n.apply_commit(vec![make_flake(1, 1, 1, 21, true)], 21, &HashMap::new())
+                .unwrap();
+            n
+        };
+        let entries = |n: &Novelty| n.fact_state.graphs[0].as_ref().map_or(0, imbl::OrdMap::len);
+        let survivor = make_flake(1, 1, 1, 0, true);
+        let trimmed = make_flake(0, 0, 1000, 0, true);
+
+        let mut rebuilt = window();
+        rebuilt.clear_up_to(20);
+        assert_eq!(entries(&rebuilt), 1, "only the survivor's identity");
+        assert!(rebuilt.fact_state.is_asserted(0, &survivor));
+        assert!(!rebuilt.fact_state.is_asserted(0, &trimmed));
+
+        let mut cut = window();
+        cut.clear_up_to_rebuilding(20, 0);
+        assert_eq!(entries(&cut), 4001, "the trimmed window, unswept");
+        assert!(cut.fact_state.is_asserted(0, &survivor));
+        assert!(!cut.fact_state.is_asserted(0, &trimmed));
     }
 
     /// Merging sorted segments gives every order the flake sequence a fresh

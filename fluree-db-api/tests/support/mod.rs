@@ -347,7 +347,9 @@ pub async fn seed_user_with_ssn(
 /// Use this in regression tests that need to exercise the FIR6/binary-only
 /// reload path rather than the purely in-memory novelty path. The rebuild
 /// replaces an index already published at the same `t`, so a test that asks
-/// for a full rebuild reads one ([`publish_built_index`]).
+/// for a full rebuild reads one ([`publish_built_index`]). A branch's
+/// pre-fork commits live in its source's namespace, so the rebuild reads
+/// through the branch-aware store.
 pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let record = fluree
         .nameservice()
@@ -356,7 +358,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
@@ -378,7 +380,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
@@ -406,7 +408,7 @@ pub async fn build_incrementally_and_publish_index(
         "an incremental build needs a published index"
     );
     let result = fluree_db_indexer::build_incremental_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )

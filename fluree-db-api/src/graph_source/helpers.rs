@@ -166,9 +166,10 @@ pub(crate) fn latest_drop_read(snapshot: &LedgerSnapshot, query: &JsonValue) -> 
                 .iter()
                 .filter_map(|iri| match target.graph_position(iri) {
                     GraphPosition::Registered { g_id, .. } => Some(g_id),
-                    GraphPosition::Default | GraphPosition::New(_) | GraphPosition::NotAGraph => {
-                        None
-                    }
+                    GraphPosition::Default
+                    | GraphPosition::New(_)
+                    | GraphPosition::NotAGraph
+                    | GraphPosition::OtherLedgersSystemGraph(_) => None,
                 })
                 .chain([DEFAULT_GRAPH_ID])
                 .collect()

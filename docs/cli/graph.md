@@ -79,17 +79,19 @@ fluree graph import <IRI> --from <PATH> [OPTIONS]
 
 `fluree graph import` runs the bulk-import pipeline of `fluree create --from` over a ledger that already exists:
 
-- **The graph must be new.** Every statement in the source lands in `<IRI>`, which the ledger must not have yet. Importing into a graph that already holds data is refused.
+- **The graph must be new.** Every statement in the source lands in `<IRI>`, which the ledger must not have registered. A graph that holds data is refused, and so is one emptied by `fluree graph drop`, which keeps its registration; import into a new IRI instead.
 - **The ledger's history continues.** The import writes commits after the ledger's head, `t = head + 1` onward, so a query `as-of` an earlier `t` does not see the graph, and a full reindex from the commits rebuilds it.
 - **Terms are shared.** An IRI or string the ledger already holds keeps its identity, so the graph joins with the default graph and other graphs through the subjects they have in common.
 - **The index is extended, not rebuilt.** The new graph's index is built in bulk and added to the ledger's existing index; the rest of the index is reused as it is. A ledger with commits after its index is indexed first.
-- **Writes wait.** Transactions against the ledger wait until the import finishes; queries go on against the head the import started from.
+- **Writes wait.** Transactions that go through the connection running the import (the server the CLI routes it to, or the program that embeds Fluree) wait until it finishes; queries go on against the head the import started from. A writer that does not share that connection, such as a second process over the same storage, is not held: if it commits during the import, the import fails at the end with nothing published.
 
 The source holds default-graph data: Turtle, N-Triples, JSON-LD, or JSONL/NDJSON files (optionally `.gz`/`.zst`), or CSV / Cypher inputs, as a single file or a directory. TriG, N-Quads, and JSON-LD that names graphs of its own are refused, since their statements belong to other graphs. Blank nodes are minted from the ledger id and the graph IRI unless `--skolem-namespace` is given, so importing one file into two graphs gives each its own blank nodes.
 
 If the source holds statement annotations (RDF 1.2 / `f:reifies`), the ledger's annotation index is set aside: annotation queries stay correct but read by scan until [`fluree reindex`](reindex.md) seals it again. The CLI prints a note when this happens.
 
 A graph the ledger dropped can be imported into again; it starts empty, under the IRI and `g_id` it had. The following are refused with nothing written: a graph the ledger already has, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, and the source formats above.
+
+**If an import fails.** Until its last step an import publishes nothing, so a failure leaves the ledger as it was, including when another writer moved the ledger's head during the import. The last step publishes the import's commits and then its index. If the index does not publish, because publishing it fails or the process stops in between, the import is in the ledger all the same: the error says it is published through `t=…`, and queries see the graph, read from the import's commits until an index covers them. Every load of the ledger reads those commits into memory until then, so after a large import run [`fluree reindex`](reindex.md). The log records each import's commit head and index root (`publishing graph import`) before it publishes them.
 
 **Routing:** with `--remote <name>`, or when the active ledger is tracked, the file is uploaded to the server and imported there; the server must advertise the `source-upload-graph` import mode, and `source-upload-skolem` when `--skolem-namespace` is given (see [server-integration](server-integration.md#into-a-new-graph-of-an-existing-ledger)). With a local `fluree server` running against the same storage, the import is routed through it in the same way, as a single file. Pass `--direct` only when no server holds the storage.
 

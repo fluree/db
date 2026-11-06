@@ -94,10 +94,9 @@ async fn cascade_attachment_retracts(
     reverse_graph: &HashMap<Sid, GraphId>,
     new_t: i64,
     lpg_edge_lifecycle: bool,
+    relationship_edges: &HashMap<EdgeId, Vec<String>>,
 ) -> Result<Vec<Flake>> {
-    use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
-    use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
     use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
 
     use std::collections::BTreeMap;
@@ -131,11 +130,6 @@ async fn cascade_attachment_retracts(
         cascade_count = tracing::field::Empty,
     );
     async {
-        let f_reifies_subject = Sid::new(
-            fluree_vocab::namespaces::FLUREE_DB,
-            fluree_vocab::db::REIFIES_SUBJECT,
-        );
-        let to_t = ledger.t();
         let current = CurrentFacts::new(ledger);
         let is_bundle = |f: &StoredFact| is_reserved_reifies_predicate(&f.flake().p);
         let retract_all = |facts: Vec<StoredFact>| {
@@ -187,56 +181,34 @@ async fn cascade_attachment_retracts(
             let edge_key = EdgeKey::from_flake(flake);
             let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
 
-            // POST scan: find every annotation whose `f:reifiesSubject`
-            // points at this edge's subject. The flake's `s` is the
-            // candidate annotation Sid.
-            let candidates = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
-                g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Post,
-                RangeTest::Eq,
-                RangeMatch::new()
-                    .with_predicate(f_reifies_subject.clone())
-                    .with_object(FlakeValue::Ref(edge_key.s.clone())),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-
-            let mut seen: HashSet<Sid> = HashSet::new();
-            for cand in &candidates {
-                let ann_sid = cand.s.clone();
-                if !seen.insert(ann_sid.clone()) {
-                    continue;
+            // A reifier this transaction re-points is the transaction's to
+            // rewrite, not the cascade's to retract (its bundle describes
+            // some edge afterwards). `enforce_single_target_reifiers` still
+            // checks the result, so a genuinely malformed re-point is caught.
+            let reifiers: Vec<EdgeReifier> = edge_reifiers(ledger, &current, g_id, &edge_key)
+                .await?
+                .into_iter()
+                .filter(|r| !repointed.contains(&r.ann))
+                .collect();
+            // A Cypher `DELETE r` means one relationship, but retracting the
+            // edge takes every relationship on it: refuse an edge that
+            // carries others, whatever the statement's MATCH kept.
+            if let Some(rels) = relationship_edges.get(&edge_id(flake)) {
+                if reifiers.len() > 1 {
+                    return Err(TransactError::UnsupportedFeature(format!(
+                        "DELETE of relationship `{}` failed: parallel relationships share its \
+                         underlying edge, so deleting one would affect the others. \
+                         Per-occurrence DELETE of a parallel relationship is not yet supported.",
+                        rels.join("`, `")
+                    )));
                 }
-                if repointed.contains(&ann_sid) {
-                    // This transaction re-points the reifier; its bundle is
-                    // the transaction's to rewrite, not the cascade's to
-                    // retract. `enforce_single_target_reifiers` still checks
-                    // the result, so a genuinely malformed re-point is caught.
-                    continue;
-                }
-
-                // All of the candidate's facts (system bundle + body
-                // metadata), stamped with the edge's graph: index rows decode
-                // without one, and `from_reifies_facts` reconciles the
-                // bundle's `f:reifiesGraph` against the flake-level `g`.
-                let (bundle, metadata): (Vec<StoredFact>, Vec<StoredFact>) = current
-                    .of_subject(g_id, flake.g.as_ref(), &ann_sid)
-                    .await?
-                    .into_iter()
-                    .partition(is_bundle);
-                if bundle.is_empty() {
-                    continue;
-                }
-                let cand_edge = match decode(&bundle) {
-                    Ok(k) => k,
-                    Err(_) => continue,
-                };
-                if cand_edge != edge_key {
-                    continue;
-                }
-
+            }
+            for EdgeReifier {
+                ann: ann_sid,
+                bundle,
+                metadata,
+            } in reifiers
+            {
                 // Retract the bundle as stored.
                 cascade.extend(retract_all(bundle));
 
@@ -499,6 +471,78 @@ fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid
         .collect()
 }
 
+/// One relationship on an edge: an annotation subject whose `f:reifies*`
+/// bundle names the edge, with the bundle and the rest of its facts (its
+/// properties), as the ledger holds them.
+struct EdgeReifier {
+    ann: Sid,
+    bundle: Vec<StoredFact>,
+    metadata: Vec<StoredFact>,
+}
+
+/// Every annotation subject whose `f:reifies*` bundle names `edge` (in graph
+/// `g_id`), as `current` reads it: what retracting the edge cascades away
+/// (see [`cascade_attachment_retracts`]). The candidates come from one POST
+/// point lookup (annotations whose `f:reifiesSubject` is the edge's subject),
+/// novelty and indexed base both; each candidate's facts then take one
+/// bounded subject read, stamped with the edge's graph (index rows decode
+/// without one, and `from_reifies_facts` reconciles the bundle's
+/// `f:reifiesGraph` against it).
+async fn edge_reifiers(
+    ledger: &LedgerState,
+    current: &CurrentFacts<'_>,
+    g_id: GraphId,
+    edge: &fluree_db_core::edge::EdgeKey,
+) -> Result<Vec<EdgeReifier>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
+
+    let f_reifies_subject = Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    );
+    let candidates = fluree_db_core::range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::new()
+            .with_predicate(f_reifies_subject)
+            .with_object(FlakeValue::Ref(edge.s.clone())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await?;
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<Sid> = HashSet::new();
+    for cand in &candidates {
+        let ann = cand.s.clone();
+        if !seen.insert(ann.clone()) {
+            continue;
+        }
+        let (bundle, metadata): (Vec<StoredFact>, Vec<StoredFact>) = current
+            .of_subject(g_id, edge.g.as_ref(), &ann)
+            .await?
+            .into_iter()
+            .partition(|f| is_reserved_reifies_predicate(&f.flake().p));
+        if bundle.is_empty() {
+            continue;
+        }
+        let flakes: Vec<Flake> = bundle.iter().map(|f| f.flake().clone()).collect();
+        match fluree_db_core::edge::EdgeKey::from_reifies_facts(&flakes) {
+            Ok(key) if &key == edge => out.push(EdgeReifier {
+                ann,
+                bundle,
+                metadata,
+            }),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve a flake's graph ID from its `Flake.g` field.
 ///
 /// - `None` → default graph (g_id = 0)
@@ -534,14 +578,15 @@ pub struct StageOptions<'a> {
 
     /// Graph routing map for named-graph flakes.
     ///
-    /// Maps `GraphId → Sid` so that `stage_flakes` can resolve each flake's
-    /// `Flake.g` to a `GraphId` for per-graph policy enforcement and SHACL validation.
+    /// Maps each flake's `Flake.g` to its `GraphId` for per-graph policy
+    /// enforcement and SHACL validation. Several Sids can name one graph: any
+    /// ledger's config graph IRI is the config graph.
     ///
     /// **Required** when any flake has `g != None`. If `None` is provided and
     /// named-graph flakes are present, `stage_flakes` will return an error.
     ///
     /// The normal `stage()` path builds this internally from `txn.write_graphs`.
-    pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+    pub graph_ids: Option<&'a HashMap<Sid, GraphId>>,
 
     /// These flakes come from a commit that was already authored and written,
     /// not from a transaction being authored now.
@@ -583,8 +628,8 @@ impl<'a> StageOptions<'a> {
     }
 
     /// Set the graph routing map for named-graph flakes
-    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
-        self.graph_sids = Some(graph_sids);
+    pub fn with_graph_ids(mut self, graph_ids: &'a HashMap<Sid, GraphId>) -> Self {
+        self.graph_ids = Some(graph_ids);
         self
     }
 
@@ -1034,6 +1079,7 @@ pub async fn stage_with_graph_delta(
             &reverse_graph,
             new_t,
             lpg_edge_lifecycle,
+            &stream_stats.relationship_edges,
         )
         .await?;
         if !cascade.is_empty() {
@@ -1245,6 +1291,28 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
     Ok(())
 }
 
+/// The refusal of `graph`, the system graph IRI of another ledger, or of
+/// another branch, that a write names: [`TransactError::OtherLedgersConfigGraph`]
+/// or [`TransactError::OtherLedgersTxnMetaGraph`].
+pub(crate) fn other_ledgers_system_graph(
+    ledger_id: &fluree_db_core::LedgerId,
+    graph: &str,
+) -> TransactError {
+    use fluree_db_core::graph_registry::{config_graph_ledger, txn_meta_graph_ledger};
+    match config_graph_ledger(graph) {
+        Some(named) => TransactError::OtherLedgersConfigGraph {
+            graph_iri: graph.to_string(),
+            named: named.to_string(),
+            own: fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+        },
+        None => TransactError::OtherLedgersTxnMetaGraph {
+            graph_iri: graph.to_string(),
+            named: txn_meta_graph_ledger(graph)
+                .map_or_else(|| graph.to_string(), |named| named.to_string()),
+        },
+    }
+}
+
 /// The ledger's binary index store, when it has one. Its graph dictionary can
 /// hold an entry the snapshot's registry has not caught up with, so graph
 /// names are read through both ([`HeadGraphNames`]), as on the query path.
@@ -1271,6 +1339,9 @@ fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
         GraphPosition::Default => Ok(WriteGraph::Default),
         GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
             Ok(WriteGraph::Named(iri.into()))
+        }
+        GraphPosition::OtherLedgersSystemGraph(graph) => {
+            Err(other_ledgers_system_graph(target.id(), &graph))
         }
         GraphPosition::NotAGraph => Err(TransactError::Parse(format!(
             "<{iri}> names no graph a write can go to: an address of this ledger ('{}') \
@@ -2234,27 +2305,36 @@ fn subjects_with_prior_rows(
     Some(present)
 }
 
-/// Whether graph `g_id`'s novelty holds a flake with subject `subject`.
+/// Whether graph `g_id`'s novelty holds a flake with subject `subject`: no
+/// when [`dictionary_rules_out`] says so, and otherwise by
+/// [`novelty_seek_finds_subject`].
+fn novelty_holds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
+    !dictionary_rules_out(ledger, subject) && novelty_seek_finds_subject(ledger, g_id, subject)
+}
+
+/// Whether the dictionary novelty settles that no novelty flake has subject
+/// `subject`, with no read of novelty.
 ///
 /// A dictionary novelty that covers the ledger's novelty
 /// ([`DictNovelty::covers`](fluree_db_core::DictNovelty::covers)) holds every
 /// subject of a novelty flake that the persisted dictionary does not, so a
-/// subject in neither is in no novelty flake: the miss settles it with no
-/// read. Otherwise, and for a hit (the dictionary novelty spans every graph,
-/// and names ref objects too), a seek bounded to the subject decides, never a
-/// walk of the graph's novelty.
-fn novelty_holds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
-    use fluree_db_core::comparator::IndexType;
-
+/// subject in neither is in no novelty flake.
+fn dictionary_rules_out(ledger: &LedgerState, subject: &Sid) -> bool {
     let dict = &ledger.dict_novelty;
-    if dict.covers(ledger.novelty.t)
+    dict.covers(ledger.novelty.t)
         && dict
             .subjects
             .find_subject(subject.namespace_code, &subject.name)
             .is_none()
-    {
-        return false;
-    }
+}
+
+/// Whether a seek bounded to `subject` finds a flake of it in graph `g_id`'s
+/// novelty: what decides when the dictionary doesn't (no coverage, or a hit,
+/// since the dictionary novelty spans every graph and names ref objects too),
+/// never a walk of the graph's novelty.
+fn novelty_seek_finds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
+    use fluree_db_core::comparator::IndexType;
+
     let lo = Flake::min_for_subject(subject.clone());
     let hi = Flake::max_for_subject(subject.clone());
     let mut found = false;
@@ -2460,7 +2540,7 @@ async fn enforce_single_target_reifiers(
 /// # Named Graph Support
 ///
 /// When flakes include named-graph data (`Flake.g = Some(_)`), the caller
-/// **must** provide `StageOptions.graph_sids` so that policy enforcement
+/// **must** provide `StageOptions.graph_ids` so that policy enforcement
 /// and SHACL validation can resolve each flake's graph. If named-graph flakes
 /// are present without a routing map, this function returns an error.
 ///
@@ -2495,15 +2575,15 @@ pub async fn stage_flakes(
 
         // 2. Build graph routing map.
         //
-        // If the caller provided graph_sids (push/import path), use it.
+        // If the caller provided graph_ids (push/import path), use it.
         // Otherwise, verify no named-graph flakes are present — stage_flakes
         // cannot correctly enforce policy/SHACL without a routing map.
-        let reverse_graph: HashMap<Sid, GraphId> = match options.graph_sids {
-            Some(gs) => build_reverse_graph_lookup(gs),
+        let reverse_graph: HashMap<Sid, GraphId> = match options.graph_ids {
+            Some(ids) => ids.clone(),
             None => {
                 if flakes.iter().any(|f| f.g.is_some()) {
                     return Err(TransactError::FlakeGeneration(
-                        "stage_flakes received named-graph flakes but no graph_sids \
+                        "stage_flakes received named-graph flakes but no graph_ids \
                          routing map was provided in StageOptions"
                             .to_string(),
                     ));
@@ -3028,6 +3108,88 @@ struct WhereStreamStats {
     /// DELETE intents that named no stored fact, as instantiated. Collected
     /// only under a non-root policy, for the modify-policy check.
     unmatched_intents: Vec<Flake>,
+    /// The edges only a Cypher relationship's DELETE retracts, by edge, with
+    /// the relationship variables that named it (see
+    /// [`RelationshipEdges`]). Empty unless the transaction carries
+    /// [`crate::ir::TxnOpts::relationship_deletes`].
+    relationship_edges: HashMap<EdgeId, Vec<String>>,
+}
+
+/// An edge as a retraction names it: graph, subject, predicate, object.
+type EdgeId = (Option<Sid>, Sid, Sid, FlakeValue);
+
+fn edge_id(flake: &Flake) -> EdgeId {
+    (
+        flake.g.clone(),
+        flake.s.clone(),
+        flake.p.clone(),
+        flake.o.clone(),
+    )
+}
+
+/// The edges a Cypher relationship's DELETE retracts (see
+/// [`crate::ir::TxnOpts::relationship_deletes`]), noted as the delete
+/// templates are instantiated, so the parallel-relationship check covers
+/// those edges and no others.
+///
+/// An edge another delete template retracts as well is left out: that is a
+/// `DETACH DELETE` of one of its endpoints, which takes every relationship on
+/// the node, so the edge's other relationships go as the statement asks.
+struct RelationshipEdges {
+    /// Each delete template's relationship variable, when it is a
+    /// relationship's DELETE.
+    vars: Vec<Option<String>>,
+    /// The predicates those templates retract: another template's retraction
+    /// can only name one of their edges with one of these.
+    predicates: HashSet<Sid>,
+    deleted: HashMap<EdgeId, Vec<String>>,
+    also: HashSet<EdgeId>,
+}
+
+impl RelationshipEdges {
+    fn new(txn: &Txn) -> Option<Self> {
+        let deletes = txn.opts.relationship_deletes.as_ref()?;
+        let mut vars = vec![None; txn.delete_templates.len()];
+        let mut predicates = HashSet::new();
+        for d in deletes {
+            let Some(template) = txn.delete_templates.get(d.template) else {
+                continue;
+            };
+            vars[d.template] = Some(d.var.clone());
+            if let TemplateTerm::Sid(p) = &template.predicate {
+                predicates.insert(p.clone());
+            }
+        }
+        Some(Self {
+            vars,
+            predicates,
+            deleted: HashMap::new(),
+            also: HashSet::new(),
+        })
+    }
+
+    /// Note one retraction intent, from delete template `template`.
+    fn note(&mut self, template: usize, flake: &Flake) {
+        match self.vars.get(template) {
+            Some(Some(var)) => {
+                let vars = self.deleted.entry(edge_id(flake)).or_default();
+                if !vars.contains(var) {
+                    vars.push(var.clone());
+                }
+            }
+            _ => {
+                if matches!(flake.o, FlakeValue::Ref(_)) && self.predicates.contains(&flake.p) {
+                    self.also.insert(edge_id(flake));
+                }
+            }
+        }
+    }
+
+    /// The edges only a relationship's DELETE retracts.
+    fn finish(mut self) -> HashMap<EdgeId, Vec<String>> {
+        self.deleted.retain(|edge, _| !self.also.contains(edge));
+        self.deleted
+    }
 }
 
 /// Stream the WHERE result into `acc`, projecting → materializing encoded
@@ -3166,6 +3328,9 @@ async fn stream_where_into_accumulator(
                 "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
                  reads only its own ledger ('{target_ledger}')"
             ))),
+            Err(other @ TargetError::OtherLedgersSystemGraph { .. }) => Err(TransactError::Parse(
+                format!("WHERE dataset graph: {other}"),
+            )),
         }
     };
     let where_default_g_ids: Vec<Option<GraphId>> = desired_where_default_graph_iris
@@ -3390,7 +3555,9 @@ async fn stream_where_into_accumulator(
             match TargetLedger::new(target_ledger, graph_names).graph_position(name) {
                 GraphPosition::Default => name_of_graph.get(&DEFAULT_GRAPH_ID).cloned(),
                 GraphPosition::Registered { g_id, .. } => name_of_graph.get(&g_id).cloned(),
-                GraphPosition::New(_) | GraphPosition::NotAGraph => None,
+                GraphPosition::New(_)
+                | GraphPosition::NotAGraph
+                | GraphPosition::OtherLedgersSystemGraph(_) => None,
             }
         });
     }
@@ -3461,6 +3628,7 @@ async fn stream_where_into_accumulator(
     let mut total_binding_rows: u64 = 0;
     let mut retraction_count: usize = 0;
     let mut assertion_count: usize = 0;
+    let mut relationship_edges = RelationshipEdges::new(txn);
 
     while let Some(batch) = cursor.next_batch().await.map_err(TransactError::Query)? {
         // Blank nodes in INSERT templates are fresh per WHERE solution
@@ -3484,8 +3652,17 @@ async fn stream_where_into_accumulator(
         );
         let intents = {
             let _g = delete_span.enter();
-            let intents =
-                generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?;
+            let intents = match relationship_edges.as_mut() {
+                Some(edges) => generator.generate_retract_intents_noting(
+                    &txn.delete_templates,
+                    &witnessed,
+                    &batch,
+                    |template, flake| edges.note(template, flake),
+                )?,
+                None => {
+                    generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?
+                }
+            };
             route_var_graphs(
                 ledger,
                 generator.written_graphs(),
@@ -3554,6 +3731,9 @@ async fn stream_where_into_accumulator(
         retraction_count,
         assertion_count,
         unmatched_intents,
+        relationship_edges: relationship_edges
+            .map(RelationshipEdges::finish)
+            .unwrap_or_default(),
     })
 }
 
@@ -3972,6 +4152,9 @@ async fn generate_upsert_deletions(
 
     let mut slots: Vec<Slot> = Vec::new();
     let mut skipped_subjects = 0usize;
+    // Skipped with no read of novelty: what keeps an upsert of new subjects
+    // flat in the novelty a ledger holds.
+    let mut ruled_out_by_dictionary = 0usize;
 
     for ((subject, graph_id), predicates) in &subject_groups {
         let ledger_g_id: Option<u16> = ledger_g_for_txn_g.get(graph_id).copied().flatten();
@@ -3996,12 +4179,16 @@ async fn generate_upsert_deletions(
 
         // Skip subjects with no persisted or novelty presence entirely. The
         // base dictionary is a point probe, so it is consulted first.
-        if can_decide_absence
-            && !subject_in_base(subject)
-            && !novelty_holds_subject(ledger, effective_g_id, subject)
-        {
-            skipped_subjects += 1;
-            continue;
+        if can_decide_absence && !subject_in_base(subject) {
+            if dictionary_rules_out(ledger, subject) {
+                ruled_out_by_dictionary += 1;
+                skipped_subjects += 1;
+                continue;
+            }
+            if !novelty_seek_finds_subject(ledger, effective_g_id, subject) {
+                skipped_subjects += 1;
+                continue;
+            }
         }
 
         slots.extend(predicates.iter().map(|p| Slot {
@@ -4016,6 +4203,7 @@ async fn generate_upsert_deletions(
     tracing::debug!(
         subject_count = subject_groups.len(),
         skipped_subjects,
+        ruled_out_by_dictionary,
         pattern_queries = slots.len(),
         "upsert deletion subject pre-check"
     );

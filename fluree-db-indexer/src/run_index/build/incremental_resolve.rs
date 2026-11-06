@@ -129,6 +129,9 @@ impl From<ResolverError> for IncrementalResolveError {
 
 /// Configuration for V6 incremental commit resolution.
 pub struct IncrementalResolveConfig {
+    /// The ledger being built, whose system graph IRIs the new root carries:
+    /// a base root another ledger built (a branch's, adopted) names its own.
+    pub ledger_id: String,
     /// CID of the base FIR6 index root.
     pub base_root_id: ContentId,
     /// CID of the head commit (latest commit to include).
@@ -290,7 +293,7 @@ pub async fn resolve_incremental_commits_v6(
     };
 
     // 4. Seed SharedResolverState from V6 root.
-    let mut shared = SharedResolverState::from_index_root(&root)?;
+    let mut shared = SharedResolverState::from_index_root(&root, &config.ledger_id)?;
 
     // Enable spatial hook for non-POINT geometry detection.
     shared.spatial_hook = Some(crate::spatial_hook::SpatialHook::new());

@@ -531,6 +531,22 @@ impl crate::Fluree {
         // that brought the target in keeps only its resolution, as in the
         // merge this previews. Conflict keys come from the source's own
         // changes only.
+        // Both sides' flakes and keys name the config graph as the target
+        // does, as in the merge.
+        let early_target = match &diff {
+            Some(_) if need_conflicts || need_changes || need_validation => Some(
+                self.load_queryable_state_with_store(
+                    target_branched.clone(),
+                    target_record.clone(),
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        let mut config = early_target
+            .as_ref()
+            .map(crate::commit_data::ConfigGraphs::for_target);
+        let source_config = &mut config;
         let source_fut = async {
             match (&diff, &source_head) {
                 (Some(diff), _) => {
@@ -543,6 +559,7 @@ impl crate::Fluree {
                             &source_store,
                             &diff.source.commits,
                             &diff.source.own,
+                            source_config.as_mut().expect("loaded for a divergence"),
                         )
                         .await?;
                         Ok::<_, ApiError>((
@@ -586,6 +603,13 @@ impl crate::Fluree {
         };
         let ((source_delta, net_flakes, source_deltas), target_delta) =
             tokio::try_join!(source_fut, target_fut)?;
+        let (source_delta, target_delta) = match config.as_mut() {
+            Some(config) => (
+                source_delta.map(|keys| config.keys(keys)),
+                target_delta.map(|keys| config.keys(keys)),
+            ),
+            None => (source_delta, target_delta),
+        };
 
         // ---- Conflicts. ----------------------------------------------------
         // `all_conflict_keys` is the full, uncapped intersection whenever both
@@ -642,12 +666,13 @@ impl crate::Fluree {
             }
         };
         let target_state_fut = async {
-            if want_target {
-                self.load_queryable_state_with_store(target_branched.clone(), target_record.clone())
+            match (want_target, &early_target) {
+                (true, Some(state)) => Ok(Some(state.clone())),
+                (true, None) => self
+                    .load_queryable_state_with_store(target_branched.clone(), target_record.clone())
                     .await
-                    .map(Some)
-            } else {
-                Ok::<_, ApiError>(None)
+                    .map(Some),
+                (false, _) => Ok::<_, ApiError>(None),
             }
         };
         let (source_state, target_state) = tokio::try_join!(source_state_fut, target_state_fut)?;
@@ -724,6 +749,7 @@ impl crate::Fluree {
                 let (_view, outcome) = self
                     .stage_merge(
                         target_state.clone(),
+                        source_branch,
                         net.unwrap_or_default(),
                         &all_conflict_keys,
                         &opts.conflict_strategy,
@@ -738,7 +764,7 @@ impl crate::Fluree {
             } else if let (Some(base), Some(diff)) = (fast_forward_base, diff.as_ref()) {
                 // A fast-forward: the check the merge runs before adopting the
                 // commits, when it runs one.
-                self.validate_fast_forward(base, &source_store, diff)
+                self.validate_fast_forward(base, source_branch, &source_store, diff)
                     .await?
                     .map(|outcome| ValidationSummary {
                         conforms: outcome.conforms(),

@@ -608,15 +608,20 @@ async fn stage_cypher(
                             Some(&request),
                         )
                         .await?;
-                    if let Some(result) = outcome.return_result {
+                    if let Some(answered) = outcome.returned {
                         let view = fluree
                             .resolve_and_attach_config(GraphDb::from_ledger_state(
-                                &outcome.final_state,
+                                &answered.final_state,
                             ))
                             .await?;
-                        let table = result.to_cypher_typed_table(&view).await.map_err(|e| {
-                            ApiError::internal(format!("Cypher RETURN formatting: {e}"))
-                        })?;
+                        let table =
+                            answered
+                                .result
+                                .to_cypher_typed_table(&view)
+                                .await
+                                .map_err(|e| {
+                                    ApiError::internal(format!("Cypher RETURN formatting: {e}"))
+                                })?;
                         *pending_ref = Some(PendingReturn::Rows(table));
                     }
                     return Ok(outcome.stage_result);

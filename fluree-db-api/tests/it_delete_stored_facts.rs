@@ -1665,7 +1665,8 @@ async fn transfer_seed(
 /// a name the identity may change beside the salary it may not. A fact the
 /// destination holds is restated, not skipped unseen: when the identity
 /// cannot view it, both sides go to the modify check, as for upsert and
-/// sync. (MOVE also retracts the source, which this identity may not.)
+/// sync. MOVE drops its source, which only an identity without a restricting
+/// policy may do, so it is refused before either graph is read.
 #[tokio::test]
 async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
     let mut failures = Vec::new();
@@ -1678,10 +1679,24 @@ async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
                 let r =
                     sparql_update_as(&fluree, ledger, &format!("{verb} <{G1}> TO <{G2}>"), policy)
                         .await;
-                failures.extend(not_refused(
-                    r,
-                    &format!("{verb}, dest_holds={dest_holds}, indexed={indexed}"),
-                ));
+                let what = format!("{verb}, dest_holds={dest_holds}, indexed={indexed}");
+                failures.extend(if verb == "MOVE" {
+                    match r {
+                        Err(e)
+                            if e.status_code() == 403
+                                && e.to_string().contains("drops a graph with its history") =>
+                        {
+                            None
+                        }
+                        Err(e) => Some(format!("{what}: {e}")),
+                        Ok(r) => Some(format!(
+                            "{what}: committed {} flakes",
+                            r.receipt.flake_count
+                        )),
+                    }
+                } else {
+                    not_refused(r, &what)
+                });
             }
         }
     }

@@ -165,19 +165,9 @@ For embedded applications calling `Fluree::merge_branch` directly with a Raft na
 
 The server's Raft merge path uses `QueuedTransactor::merge`, which queues the merge alongside transactions and prepares it when the worker reaches it. That path preserves queue ordering and was not affected by the direct API's empty-queue publish failure.
 
-### Repair a target that adopted another branch's index
+### A target that adopted another branch's index
 
-Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. Ordinary data queries could still work while the target stopped resolving its own governance configuration. Rewriting the config alone does not repair the graph registry.
-
-Run a full rebuild of the affected target:
-
-```bash
-fluree reindex mydb:main
-```
-
-In an embedded application, call `fluree.reindex("mydb:main", ReindexOptions::default()).await?` on the serving instance. After publishing the rebuilt root, reindex evicts that instance's cached ledger so subsequent loads read the corrected registry, even when the index transaction time is unchanged. Existing handles held by callers must be reacquired; other serving instances must also reload their cached ledger. Older versions without this eviction require a cache disconnect or process restart after reindex.
-
-An affected root can also cause `graph_iris[0] must be txn-meta IRI` on the second incremental indexing cycle: the first cycle stamps the target's ledger ID onto the root but retains the source's graph labels. The normal indexer falls back to a full rebuild when this validation fails; it does not permanently stop indexing. Explicit reindex repairs the target without waiting for those cycles.
+Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. The target's config still governs it, and a query or write names its system graphs as `config` and `txn-meta` or by the target's own IRIs, not by the source's labels; its next index build relabels both graphs with the target's own IRIs. `fluree reindex mydb:main` relabels them at once.
 
 ### Compare branches
 

@@ -18,7 +18,7 @@
 //!   rejected — only `Abort`, `TakeSource`, and `TakeBranch` make sense for
 //!   revert.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, ConfigGraphs, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::ledger_view::{CommitRef, LedgerView};
@@ -402,11 +402,13 @@ impl crate::Fluree {
             }
             refuse_reverting_drops(&reverted, &branch_state)?;
         }
+        let mut config = ConfigGraphs::for_target(&branch_state);
         let conflict_keys = compute_conflict_keys(
             &branch_store,
             &branch_head_id,
             &plan.reverted_set,
             plan.oldest_t,
+            &mut config,
         )
         .await?;
 
@@ -416,6 +418,7 @@ impl crate::Fluree {
             branch_store,
             plan,
             conflict_keys,
+            config,
         })
     }
 
@@ -444,6 +447,7 @@ impl crate::Fluree {
             branch_store,
             plan,
             conflict_keys,
+            mut config,
         } = ctx;
         let reverted_commits = plan.ordered_commits.clone().into_vec();
         let conflict_count = conflict_keys.len();
@@ -454,7 +458,9 @@ impl crate::Fluree {
         // named graphs, matching the merge path's `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
-            commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+            let mut commit = load_commit_by_id(&branch_store, commit_id).await?;
+            config.flakes(&mut commit.flakes);
+            commits.push(commit);
         }
         let reverted: Vec<RevertedWrites> = commits.iter().map(RevertedWrites::of).collect();
         let CollectedCommitData {
@@ -607,6 +613,9 @@ pub(crate) struct RevertContext {
     pub(crate) branch_store: BranchedContentStore,
     pub(crate) plan: RevertPlan,
     pub(crate) conflict_keys: Vec<ConflictKey>,
+    /// How the branch names its config graph, which the conflict keys and
+    /// the folded flakes take.
+    pub(crate) config: ConfigGraphs,
 }
 
 /// Source after [`CommitRef`] resolution, ready for plan computation.
@@ -866,6 +875,7 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
     head_id: &CommitId,
     reverted_set: &FxHashSet<CommitId>,
     oldest_t: i64,
+    config: &mut ConfigGraphs,
 ) -> Result<Vec<ConflictKey>> {
     // stop_at_t = oldest_t - 1 → include every commit with t >= oldest_t.
     let stop = oldest_t.saturating_sub(1);
@@ -887,6 +897,8 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
         }
     }
 
+    let (reverted_keys, intervening_keys) =
+        (config.keys(reverted_keys), config.keys(intervening_keys));
     let mut conflicts: Vec<ConflictKey> = reverted_keys
         .intersection(&intervening_keys)
         .cloned()

@@ -1081,11 +1081,9 @@ mod tests {
             .await
             .expect("put v3 blob");
 
-        let probe = crate::commit::first_t_where_graph_registered(
-            &store,
-            &cid,
-            "urn:fluree:test/v3-probe:main#config",
-        )
+        let probe = crate::commit::first_t_where_graph_registered(&store, &cid, |iri| {
+            iri == "urn:fluree:test/v3-probe:main#config"
+        })
         .await
         .expect("envelope walk");
 

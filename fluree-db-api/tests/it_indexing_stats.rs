@@ -77,6 +77,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
         had_annotation_arena: root.had_annotation_arena,
         has_list_meta: root.has_list_meta,
         graph_drops: root.graph_drops.clone(),
+        index_root_id: Some(root_id.clone()),
     };
     let mut db = LedgerSnapshot::new_meta(meta).expect("seed graph registry from root");
     db.range_provider = Some(Arc::new(provider));

@@ -96,13 +96,17 @@ fn unity_json(unity: &DeltaUnityArgs, body: &mut Value) {
             ("unity_uri", &unity.unity_uri),
             ("unity_catalog", &unity.unity_catalog),
             ("unity_schema", &unity.unity_schema),
-            ("auth_bearer", &unity.auth_bearer),
-            ("auth_bearer_env", &unity.auth_bearer_env),
-            ("oauth2_client_id", &unity.oauth2_client_id),
-            ("oauth2_client_secret", &unity.oauth2_client_secret),
-            ("oauth2_client_secret_env", &unity.oauth2_client_secret_env),
-            ("oauth2_token_url", &unity.oauth2_token_url),
-            ("oauth2_scope", &unity.oauth2_scope),
+            ("auth_bearer", &unity.auth.auth_bearer),
+            ("auth_bearer_env", &unity.auth.auth_bearer_env),
+            ("oauth2_client_id", &unity.auth.oauth2_client_id),
+            ("oauth2_client_secret", &unity.auth.oauth2_client_secret),
+            (
+                "oauth2_client_secret_env",
+                &unity.auth.oauth2_client_secret_env,
+            ),
+            ("oauth2_token_url", &unity.auth.oauth2_token_url),
+            ("oauth2_scope", &unity.auth.oauth2_scope),
+            ("oauth2_audience", &unity.auth.oauth2_audience),
         ],
     );
 }
@@ -205,20 +209,22 @@ fn strings(value: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The Unity Catalog connection the flags describe, through the converter
+/// every surface uses: `None` without `--unity-uri`, and catalog or auth flags
+/// without it refused.
 #[cfg(feature = "delta")]
 fn unity_config(unity: &DeltaUnityArgs) -> CliResult<Option<fluree_db_api::DeltaUnityConfig>> {
-    let secret = super::iceberg::secret_value;
-    Ok(fluree_db_api::DeltaUnityFields {
-        uri: unity.unity_uri.clone(),
-        catalog: unity.unity_catalog.clone(),
-        schema: unity.unity_schema.clone(),
-        bearer: secret(&unity.auth_bearer, &unity.auth_bearer_env),
-        oauth2_client_id: unity.oauth2_client_id.clone(),
-        oauth2_client_secret: secret(&unity.oauth2_client_secret, &unity.oauth2_client_secret_env),
-        oauth2_token_url: unity.oauth2_token_url.clone(),
-        oauth2_scope: unity.oauth2_scope.clone(),
-    }
-    .into_config()?)
+    use super::source_auth::usage;
+    let auth = unity.auth.fields(None)?;
+    auth.check(&fluree_db_api::SecretRules::local(false))
+        .map_err(usage)?;
+    fluree_db_api::unity_config(
+        unity.unity_uri.clone(),
+        unity.unity_catalog.clone(),
+        unity.unity_schema.clone(),
+        auth,
+    )
+    .map_err(usage)
 }
 
 #[cfg(feature = "delta")]
@@ -226,14 +232,21 @@ fn create_config(
     name: &str,
     source: &DeltaSourceArgs,
 ) -> CliResult<fluree_db_api::DeltaCreateConfig> {
+    use super::source_auth::usage;
     require_location(source)?;
-    let azure = fluree_db_api::DeltaAzureFields {
-        tenant_id: source.azure_tenant_id.clone(),
-        client_id: source.azure_client_id.clone(),
-        client_secret: source.azure_client_secret.clone(),
-        client_secret_env: source.azure_client_secret_env.clone(),
-    }
-    .into_auth()?;
+    let client_secret = fluree_db_api::secret_field(
+        "azure_client_secret",
+        source.azure_client_secret.clone(),
+        "azure_client_secret_env",
+        source.azure_client_secret_env.clone(),
+    )
+    .map_err(usage)?;
+    let azure = fluree_db_api::azure_auth(
+        source.azure_tenant_id.clone(),
+        source.azure_client_id.clone(),
+        client_secret,
+    )
+    .map_err(usage)?;
     Ok(fluree_db_api::DeltaCreateConfig {
         unity: unity_config(&source.unity)?,
         name: name.to_string(),
@@ -812,7 +825,14 @@ mod tests {
         // With --root present clap waives `requires`; the API's all-or-nothing
         // check on the Unity fields is what refuses that combination.
         assert!(map_args(&["--table", "t=s3://lake/t", "--unity-catalog", "main"]).is_err());
-        assert!(map_args(&["--table", "t=s3://lake/t", "--auth-bearer-env", "T"]).is_err());
+        // The auth flags are the shared catalog-auth group, which clap cannot
+        // tie to --unity-uri; the one converter refuses them without it.
+        #[cfg(feature = "delta")]
+        {
+            let args = map_args(&["--table", "t=s3://lake/t", "--auth-bearer-env", "T"]).unwrap();
+            let e = unity_config(&args.source.unity).unwrap_err().to_string();
+            assert!(e.contains("--auth-bearer-env needs --unity-uri"), "{e}");
+        }
         assert!(map_args(&[
             unity[0],
             unity[1],
