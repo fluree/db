@@ -999,12 +999,7 @@ fn binary_range_eq_v3(
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
-            // Language tag.
-            let lang = store
-                .resolve_lang_tag(o_type)
-                .map(std::string::ToString::to_string);
-            // List index.
-            let meta = fluree_db_core::FlakeMeta::from_packed(lang.as_deref(), o_i);
+            let meta = fluree_db_core::FlakeMeta::from_packed(store.resolve_lang_tag(o_type), o_i);
 
             let flake = fluree_db_core::Flake {
                 g: None,
@@ -1605,10 +1600,7 @@ fn binary_range_bounded_v3(
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
-            let lang = store
-                .resolve_lang_tag(o_type)
-                .map(std::string::ToString::to_string);
-            let meta = fluree_db_core::FlakeMeta::from_packed(lang.as_deref(), o_i);
+            let meta = fluree_db_core::FlakeMeta::from_packed(store.resolve_lang_tag(o_type), o_i);
 
             let flake = Flake {
                 g: None,

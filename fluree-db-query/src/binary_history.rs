@@ -620,10 +620,7 @@ fn decode_event_to_flake(
     let dt = store
         .resolve_datatype_sid_for_value(o_type, &o_val)
         .unwrap_or_else(|| Sid::new(0, ""));
-    let lang = store
-        .resolve_lang_tag(o_type)
-        .map(std::string::ToString::to_string);
-    let meta = FlakeMeta::from_packed(lang.as_deref(), o_i);
+    let meta = FlakeMeta::from_packed(store.resolve_lang_tag(o_type), o_i);
     Ok(Some(Flake {
         g: None,
         s: s_sid,

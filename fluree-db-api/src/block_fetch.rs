@@ -321,10 +321,7 @@ pub fn decode_leaf_block(
                 }
             };
 
-            let lang = store
-                .resolve_lang_tag(o_type)
-                .map(std::string::ToString::to_string);
-            let meta = fluree_db_core::FlakeMeta::from_packed(lang.as_deref(), o_i);
+            let meta = fluree_db_core::FlakeMeta::from_packed(store.resolve_lang_tag(o_type), o_i);
 
             // Basic sanity: o_type should always be valid.
             let _ = OType::from_u16(o_type);

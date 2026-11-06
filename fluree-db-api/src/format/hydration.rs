@@ -2513,7 +2513,7 @@ impl<'a> HydrationFormatter<'a> {
             let FlakeValue::Ref(head) = &flake.o else {
                 continue;
             };
-            if *head == Sid::new(RDF, fluree_vocab::predicates::RDF_NIL) {
+            if fluree_db_core::namespaces::is_rdf_nil(head) {
                 out.push((k, Vec::new()));
                 continue;
             }
