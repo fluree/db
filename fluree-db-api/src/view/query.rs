@@ -1493,7 +1493,7 @@ impl Fluree {
                     "SPARQL FROM/FROM NAMED <{iri}> names no graph in ledger '{target}'; \
                      check the IRI against the ledger's registered graphs"
                 )),
-                other @ TargetError::OtherLedgersConfig { .. } => {
+                other @ TargetError::OtherLedgersSystemGraph { .. } => {
                     ApiError::invalid_query(format!("SPARQL FROM/FROM NAMED: {other}"))
                 }
             })?;

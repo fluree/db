@@ -1291,14 +1291,25 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`TransactError::OtherLedgersConfigGraph`] for `graph`, the config graph IRI
-/// of another ledger, or of another branch, that a write names.
-fn other_ledgers_config(ledger_id: &fluree_db_core::LedgerId, graph: &str) -> TransactError {
-    TransactError::OtherLedgersConfigGraph {
-        graph_iri: graph.to_string(),
-        named: fluree_db_core::graph_registry::config_graph_ledger(graph)
-            .map_or_else(|| graph.to_string(), |named| named.to_string()),
-        own: fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+/// The refusal of `graph`, the system graph IRI of another ledger, or of
+/// another branch, that a write names: [`TransactError::OtherLedgersConfigGraph`]
+/// or [`TransactError::OtherLedgersTxnMetaGraph`].
+pub(crate) fn other_ledgers_system_graph(
+    ledger_id: &fluree_db_core::LedgerId,
+    graph: &str,
+) -> TransactError {
+    use fluree_db_core::graph_registry::{config_graph_ledger, txn_meta_graph_ledger};
+    match config_graph_ledger(graph) {
+        Some(named) => TransactError::OtherLedgersConfigGraph {
+            graph_iri: graph.to_string(),
+            named: named.to_string(),
+            own: fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+        },
+        None => TransactError::OtherLedgersTxnMetaGraph {
+            graph_iri: graph.to_string(),
+            named: txn_meta_graph_ledger(graph)
+                .map_or_else(|| graph.to_string(), |named| named.to_string()),
+        },
     }
 }
 
@@ -1329,7 +1340,9 @@ fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
         GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
             Ok(WriteGraph::Named(iri.into()))
         }
-        GraphPosition::OtherLedgersConfig(graph) => Err(other_ledgers_config(target.id(), &graph)),
+        GraphPosition::OtherLedgersSystemGraph(graph) => {
+            Err(other_ledgers_system_graph(target.id(), &graph))
+        }
         GraphPosition::NotAGraph => Err(TransactError::Parse(format!(
             "<{iri}> names no graph a write can go to: an address of this ledger ('{}') \
              names its default graph, or one of its graphs through '#', and carries no time",
@@ -3247,7 +3260,7 @@ async fn stream_where_into_accumulator(
                 "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
                  reads only its own ledger ('{target_ledger}')"
             ))),
-            Err(other @ TargetError::OtherLedgersConfig { .. }) => Err(TransactError::Parse(
+            Err(other @ TargetError::OtherLedgersSystemGraph { .. }) => Err(TransactError::Parse(
                 format!("WHERE dataset graph: {other}"),
             )),
         }
@@ -3476,7 +3489,7 @@ async fn stream_where_into_accumulator(
                 GraphPosition::Registered { g_id, .. } => name_of_graph.get(&g_id).cloned(),
                 GraphPosition::New(_)
                 | GraphPosition::NotAGraph
-                | GraphPosition::OtherLedgersConfig(_) => None,
+                | GraphPosition::OtherLedgersSystemGraph(_) => None,
             }
         });
     }

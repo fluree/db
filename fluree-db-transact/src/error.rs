@@ -284,6 +284,21 @@ pub enum TransactError {
         own: String,
     },
 
+    /// A write named the txn-meta graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own txn-meta graph, which no
+    /// write names: a transaction adds metadata to its own commit in a
+    /// `#txn-meta` block.
+    #[error(
+        "<{graph_iri}> is the txn-meta graph of '{named}', not of this ledger; a \
+         transaction adds metadata to its own commit in a `#txn-meta` block"
+    )]
+    OtherLedgersTxnMetaGraph {
+        /// The txn-meta graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+    },
+
     /// A bulk RDF import (`fluree create --from`, the server's source-import
     /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
     ///

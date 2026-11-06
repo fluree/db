@@ -118,8 +118,9 @@ pub enum GraphSel {
     /// The ledger's config graph (g_id 2).
     Config,
     /// A graph named by an absolute IRI, resolved against the ledger's graph
-    /// registry. It may name a reserved slot too: a branch inherits its
-    /// source's `urn:fluree:<source>#config` registration verbatim.
+    /// registry. It may name a reserved slot too: a branch of an indexed
+    /// ledger holds its source's system graph IRIs at the reserved slots
+    /// until a build relabels them.
     Named(GraphIri),
 }
 
@@ -804,14 +805,16 @@ pub enum TargetError {
     },
     /// The reference is a graph IRI the target ledger has no graph for.
     GraphNotFound(String),
-    /// The reference is the config graph IRI of another ledger, or of
-    /// another branch of this one (`urn:fluree:<named>#config`): each branch
-    /// names its own config graph.
-    OtherLedgersConfig {
+    /// The reference is the system graph IRI of another ledger, or of another
+    /// branch of this one (`urn:fluree:<named>#config`, `…#txn-meta`): each
+    /// branch names its own system graphs.
+    OtherLedgersSystemGraph {
         /// The ledger, or branch, the IRI names.
         named: LedgerId,
         /// The ledger the surface reads.
         target: LedgerId,
+        /// Which system graph: [`GraphSel::Config`] or [`GraphSel::TxnMeta`].
+        graph: GraphSel,
     },
 }
 
@@ -834,10 +837,11 @@ pub enum GraphPosition<'a> {
     /// address of this ledger and no graph is registered under it. Nothing to
     /// read, and no name a write may create a graph under.
     NotAGraph,
-    /// The config graph IRI of another ledger, or of another branch of this
-    /// one (the text as written, or `<g>` for `L#<g>`). Nothing to read, and
-    /// no name a write may use: each branch names its own config graph.
-    OtherLedgersConfig(Cow<'a, str>),
+    /// The system graph IRI (config or txn-meta) of another ledger, or of
+    /// another branch of this one (the text as written, or `<g>` for
+    /// `L#<g>`). Nothing to read, and no name a write may use: each branch
+    /// names its own system graphs.
+    OtherLedgersSystemGraph(Cow<'a, str>),
 }
 
 impl fmt::Display for TargetError {
@@ -862,14 +866,25 @@ impl fmt::Display for TargetError {
                  another ledger. Query both through the connection endpoint (/query) instead"
             ),
             Self::GraphNotFound(iri) => write!(f, "Graph not found: '{iri}'"),
-            Self::OtherLedgersConfig { named, target } => write!(
-                f,
-                "<{}> is the config graph of '{named}'; this endpoint reads '{target}', whose \
-                 config graph is <{}> (or `config`). Read the config of '{named}' through \
-                 the connection endpoint (/query)",
-                crate::graph_registry::config_graph_iri(named),
-                crate::graph_registry::config_graph_iri(target),
-            ),
+            Self::OtherLedgersSystemGraph {
+                named,
+                target,
+                graph,
+            } => {
+                let iri = |ledger: &LedgerId| match graph {
+                    GraphSel::TxnMeta => crate::graph_registry::txn_meta_graph_iri(ledger),
+                    _ => crate::graph_registry::config_graph_iri(ledger),
+                };
+                let role = graph.as_str();
+                write!(
+                    f,
+                    "<{}> is the {role} graph of '{named}'; this endpoint reads '{target}', \
+                     whose {role} graph is <{}> (or `{role}`). Read the {role} graph of \
+                     '{named}' through the connection endpoint (/query)",
+                    iri(named),
+                    iri(target),
+                )
+            }
         }
     }
 }
@@ -950,8 +965,10 @@ impl<'a> TargetLedger<'a> {
     /// 2. The written text as an exact registry IRI, reserved slots included:
     ///    a user graph may itself be named `urn:fluree:…`. The registry reads
     ///    any ledger's config graph IRI as this ledger's config graph, for
-    ///    replayed history; here the config graph IRI of another ledger, or of
-    ///    another branch of this one, is [`TargetError::OtherLedgersConfig`].
+    ///    replayed history, and a branch of an indexed ledger holds its
+    ///    source's system graph IRIs at the reserved slots; here the system
+    ///    graph IRI of another ledger, or of another branch of this one, is
+    ///    [`TargetError::OtherLedgersSystemGraph`].
     /// 3. Otherwise by what the text parsed as: an address of this ledger
     ///    selects its graph; an address of another ledger is
     ///    [`TargetError::CrossLedger`]; a graph IRI the registry does not hold
@@ -981,8 +998,8 @@ impl<'a> TargetLedger<'a> {
                 .cloned()
                 .unwrap_or_else(|| GraphIri(written.into()))
         }) {
-            return match self.other_ledgers_config(written, found.g_id) {
-                Some(named) => Err(self.other_ledgers_config_error(named)),
+            return match self.other_ledgers_system_graph(written, found.g_id) {
+                Some(error) => Err(error),
                 None => Ok(found),
             };
         }
@@ -1008,8 +1025,8 @@ impl<'a> TargetLedger<'a> {
     pub fn graph(&self, sel: &GraphSel) -> Result<TargetGraph, TargetError> {
         match sel {
             GraphSel::Named(iri) => match self.registered(iri, || iri.clone()) {
-                Some(found) => match self.other_ledgers_config(iri, found.g_id) {
-                    Some(named) => Err(self.other_ledgers_config_error(named)),
+                Some(found) => match self.other_ledgers_system_graph(iri, found.g_id) {
+                    Some(error) => Err(error),
                     None => Ok(found),
                 },
                 None if **iri == crate::graph_registry::config_graph_iri(self.id) => {
@@ -1163,17 +1180,21 @@ impl<'a> TargetLedger<'a> {
     /// The graph registered under exactly `iri`, else a new graph by it: one
     /// registry lookup, and `iri` moves into the position as it came (a
     /// borrow stays a borrow). A reserved graph is named by the IRI at its
-    /// slot, whichever of its IRIs `iri` is. The config graph IRI of another
-    /// ledger, or of another branch, which the registry reads as this
-    /// ledger's config graph for replayed history, is
-    /// [`GraphPosition::OtherLedgersConfig`]; judged on `iri` as given, so a
-    /// keyword reaching the slot through an inherited IRI is not.
+    /// slot, whichever of its IRIs `iri` is. The system graph IRI of another
+    /// ledger, or of another branch, which the registry may read as this
+    /// ledger's reserved graph (any config graph IRI, for replayed history; a
+    /// source's at the slot of a branch of an indexed ledger), is
+    /// [`GraphPosition::OtherLedgersSystemGraph`]; judged on `iri` as given,
+    /// so a keyword reaching the slot through an inherited IRI is not.
     fn registered_under<'i>(&self, iri: Cow<'i, str>) -> GraphPosition<'i> {
         match self.names.graph_id(&iri) {
-            // Unregistered too: a write would register it, and the commit
-            // read it as the config graph.
-            None | Some(CONFIG_GRAPH_ID) if self.foreign_config(&iri).is_some() => {
-                GraphPosition::OtherLedgersConfig(iri)
+            // Unregistered too: a write would register it, as the config graph
+            // for a config graph IRI, or as a graph that takes the other
+            // branch's txn-meta name.
+            None | Some(TXN_META_GRAPH_ID | CONFIG_GRAPH_ID)
+                if self.foreign_system_graph(&iri).is_some() =>
+            {
+                GraphPosition::OtherLedgersSystemGraph(iri)
             }
             Some(g_id @ (TXN_META_GRAPH_ID | CONFIG_GRAPH_ID)) => {
                 let iri = match self.names.reserved_iri(g_id) {
@@ -1230,29 +1251,36 @@ impl<'a> TargetLedger<'a> {
             .filter(|address| address.id() == self.id)
     }
 
-    /// The ledger, or branch, that `iri` names when the registry reads it as
-    /// the graph `found` and it is the config graph IRI of another ledger, or
-    /// of another branch of this one. The registry reads any ledger's as this
-    /// ledger's config graph, which replayed history relies on; a dataset
-    /// reads it as the graph of the ledger it names.
-    fn other_ledgers_config(&self, iri: &str, found: GraphId) -> Option<LedgerId> {
-        if found != CONFIG_GRAPH_ID {
+    /// [`TargetError::OtherLedgersSystemGraph`] when the registry reads `iri`
+    /// as the reserved graph `found` and `iri` is the system graph IRI of
+    /// another ledger, or of another branch of this one. The registry reads
+    /// any ledger's config graph IRI as this ledger's config graph, which
+    /// replayed history relies on, and a branch of an indexed ledger holds
+    /// its source's system graph IRIs at the reserved slots; a dataset reads
+    /// such an IRI as the graph of the ledger it names.
+    fn other_ledgers_system_graph(&self, iri: &str, found: GraphId) -> Option<TargetError> {
+        if !matches!(found, TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) {
             return None;
         }
-        self.foreign_config(iri)
-    }
-
-    /// The ledger, or branch, whose config graph IRI `iri` is, when that is
-    /// not this ledger.
-    fn foreign_config(&self, iri: &str) -> Option<LedgerId> {
-        crate::graph_registry::config_graph_ledger(iri).filter(|ledger| ledger != self.id)
-    }
-
-    fn other_ledgers_config_error(&self, named: LedgerId) -> TargetError {
-        TargetError::OtherLedgersConfig {
+        let (named, graph) = self.foreign_system_graph(iri)?;
+        Some(TargetError::OtherLedgersSystemGraph {
             named,
             target: self.id.clone(),
-        }
+            graph,
+        })
+    }
+
+    /// The ledger, or branch, whose system graph IRI `iri` is, and which
+    /// system graph, when that is not this ledger.
+    fn foreign_system_graph(&self, iri: &str) -> Option<(LedgerId, GraphSel)> {
+        let (named, graph) = match crate::graph_registry::config_graph_ledger(iri) {
+            Some(named) => (named, GraphSel::Config),
+            None => (
+                crate::graph_registry::txn_meta_graph_ledger(iri)?,
+                GraphSel::TxnMeta,
+            ),
+        };
+        (named != *self.id).then_some((named, graph))
     }
 
     /// The graph registered under exactly `iri`: a reserved slot as its
@@ -1640,7 +1668,7 @@ mod tests {
         // branch's registry holds it at the config slot.
         assert!(matches!(
             resolve("urn:fluree:L:main#config"),
-            Err(TargetError::OtherLedgersConfig { .. })
+            Err(TargetError::OtherLedgersSystemGraph { .. })
         ));
         assert_eq!(g_id("txn-meta"), TXN_META_GRAPH_ID);
         assert_eq!(g_id("urn:fluree:L:feature#txn-meta"), TXN_META_GRAPH_ID);
@@ -1661,12 +1689,18 @@ mod tests {
         let graph = |iri: &str| target.graph(&GraphSel::Named(GraphIri(iri.into())));
         for other in ["urn:fluree:other:main#config", "urn:fluree:L:main#config"] {
             assert!(
-                matches!(resolve(other), Err(TargetError::OtherLedgersConfig { .. })),
+                matches!(
+                    resolve(other),
+                    Err(TargetError::OtherLedgersSystemGraph { .. })
+                ),
                 "{other}: {:?}",
                 resolve(other)
             );
             assert!(
-                matches!(graph(other), Err(TargetError::OtherLedgersConfig { .. })),
+                matches!(
+                    graph(other),
+                    Err(TargetError::OtherLedgersSystemGraph { .. })
+                ),
                 "{other}"
             );
         }
@@ -1737,7 +1771,7 @@ mod tests {
     /// its default graph, even where a graph is registered under that text
     /// (`L:feature` here), and `L#<g>` as the graph `<g>`. Any other IRI is
     /// exactly what the registry holds, another ledger's address included,
-    /// except another ledger's or branch's config graph IRI.
+    /// except another ledger's or branch's system graph IRI.
     #[test]
     fn a_graph_position_reads_the_address_as_the_default_graph() {
         for own in ["L:feature", "urn:fluree:L:feature", "L:feature#default"] {
@@ -1752,18 +1786,27 @@ mod tests {
         }
         // The graph registered under the address is reached through it.
         assert_eq!(position_g_id("L:feature#L:feature"), Some(5));
-        // Main's config graph IRI, held at the slot, is main's config graph.
-        assert!(matches!(
-            position("urn:fluree:L:main#config"),
-            GraphPosition::OtherLedgersConfig(_)
-        ));
-        // A registered graph keeps the IRI it is registered under, a reserved
-        // one reached through `L#<iri>` included.
+        // Main's system graph IRIs, held at the slots, are main's system
+        // graphs, as written or through `L#<iri>`.
+        for main in [
+            "urn:fluree:L:main#config",
+            "urn:fluree:L:main#txn-meta",
+            "L:feature#urn:fluree:L:main#config",
+            "L:feature#urn:fluree:L:main#txn-meta",
+        ] {
+            assert!(
+                matches!(position(main), GraphPosition::OtherLedgersSystemGraph(_)),
+                "{main}: {:?}",
+                position(main)
+            );
+        }
+        // A registered graph keeps the IRI it is registered under, through
+        // `L#<iri>` included.
         assert_eq!(
-            position("L:feature#urn:fluree:L:main#txn-meta"),
+            position("L:feature#urn:fluree:L:main#resolution-config"),
             GraphPosition::Registered {
-                g_id: TXN_META_GRAPH_ID,
-                iri: "urn:fluree:L:main#txn-meta".into()
+                g_id: 4,
+                iri: "urn:fluree:L:main#resolution-config".into()
             }
         );
         // No graph yet: a write creates it under the IRI the position names.
@@ -2040,19 +2083,45 @@ mod tests {
                 iri: "urn:fluree:L:feature#config".into()
             }
         );
-        // The config graph IRI of another ledger, or of another branch, names
+        // The branch's own system graph IRIs, its address with a keyword, reach
+        // the slots, which hold the source's IRIs.
+        for (written, g_id, slot) in [
+            (
+                "urn:fluree:L:feature#config",
+                CONFIG_GRAPH_ID,
+                "urn:fluree:L:main#config",
+            ),
+            (
+                "urn:fluree:L:feature#txn-meta",
+                TXN_META_GRAPH_ID,
+                "urn:fluree:L:main#txn-meta",
+            ),
+        ] {
+            assert_eq!(
+                target.graph_position(written),
+                GraphPosition::Registered {
+                    g_id,
+                    iri: slot.into()
+                },
+                "{written}"
+            );
+        }
+        // The system graph IRI of another ledger, or of another branch, names
         // no graph here, as written or as the `<g>` of `L#<g>`, though the
-        // registry reads it as the config graph, and holds the source's at the
-        // slot that the keyword above reaches.
+        // registry reads it as the reserved graph, and holds the source's at
+        // the slot that the keyword above reaches.
         for written in [
             "urn:fluree:other:main#config",
             "urn:fluree:L:main#config",
             "L:feature#urn:fluree:L:main#config",
+            "urn:fluree:other:main#txn-meta",
+            "urn:fluree:L:main#txn-meta",
+            "L:feature#urn:fluree:L:main#txn-meta",
         ] {
             assert!(
                 matches!(
                     target.graph_position(written),
-                    GraphPosition::OtherLedgersConfig(_)
+                    GraphPosition::OtherLedgersSystemGraph(_)
                 ),
                 "{written}: {:?}",
                 target.graph_position(written)

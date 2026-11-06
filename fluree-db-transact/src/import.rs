@@ -63,9 +63,15 @@ mod inner {
         let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
             Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
                 GraphPosition::Default => return Ok(None),
+                // Another ledger's config graph is refused below, as any is.
+                GraphPosition::OtherLedgersSystemGraph(iri)
+                    if fluree_db_core::graph_registry::names_txn_meta_graph(&iri) =>
+                {
+                    return Err(crate::stage::other_ledgers_system_graph(&id, &iri));
+                }
                 GraphPosition::Registered { iri, .. }
                 | GraphPosition::New(iri)
-                | GraphPosition::OtherLedgersConfig(iri) => iri.into_owned(),
+                | GraphPosition::OtherLedgersSystemGraph(iri) => iri.into_owned(),
                 GraphPosition::NotAGraph => {
                     return Err(TransactError::Parse(format!(
                         "<{iri}> names no graph an import can write: an address of this \

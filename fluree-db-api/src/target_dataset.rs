@@ -119,7 +119,7 @@ fn resolve_member_in_target(
                 ""
             }
         ))),
-        Err(other @ TargetError::OtherLedgersConfig { .. }) => {
+        Err(other @ TargetError::OtherLedgersSystemGraph { .. }) => {
             Err(ApiError::invalid_query(other.to_string()))
         }
     }

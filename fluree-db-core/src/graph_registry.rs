@@ -145,7 +145,12 @@ pub fn config_graph_ledger(iri: &str) -> Option<crate::LedgerId> {
 /// Whether `iri` is a ledger's txn-meta graph IRI ([`txn_meta_graph_iri`]),
 /// whichever ledger it names.
 pub fn names_txn_meta_graph(iri: &str) -> bool {
-    system_graph_ledger(iri, "txn-meta").is_some()
+    txn_meta_graph_ledger(iri).is_some()
+}
+
+/// The ledger whose txn-meta graph IRI ([`txn_meta_graph_iri`]) `iri` is.
+pub fn txn_meta_graph_ledger(iri: &str) -> Option<crate::LedgerId> {
+    system_graph_ledger(iri, "txn-meta")
 }
 
 fn system_graph_ledger(iri: &str, graph: &str) -> Option<crate::LedgerId> {

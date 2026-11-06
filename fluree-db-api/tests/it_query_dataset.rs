@@ -4394,9 +4394,10 @@ async fn a_named_only_dataset_advises_when_the_query_reads_its_empty_default_gra
 /// names main's config graph, so the branch's view and `query_from()` naming
 /// the branch refuse it, naming the branch's own (SPARQL `FROM`, `FROM NAMED`
 /// + `GRAPH`, and the JSON-LD `from` object). A connection query naming main's
-/// URN reads main's config. A user graph named `urn:fluree:…#…` is a graph,
-/// never an address. On a branch of an unindexed main, and of an indexed one,
-/// whose config slot holds main's URN.
+/// URN reads main's config. Main's txn-meta URN is refused the same way. A
+/// user graph named `urn:fluree:…#…` is a graph, never an address. On a branch
+/// of an unindexed main, and of an indexed one, whose system graph slots hold
+/// main's URNs.
 #[tokio::test]
 async fn a_branch_reads_config_by_its_own_urn_and_urn_named_graphs_stay_graphs() {
     for indexed in [false, true] {
@@ -4436,16 +4437,28 @@ async fn a_branch_reads_config_by_its_own_urn_and_urn_named_graphs_stay_graphs()
             .await
             .expect("the branch's own config")
             .ledger;
-        let slot = branch
-            .snapshot
-            .graph_registry
-            .iri_for_graph_id(fluree_db_core::graph_registry::CONFIG_GRAPH_ID);
-        let expected_slot = if indexed {
-            &main_config
-        } else {
-            &branch_config
-        };
-        assert_eq!(slot, Some(expected_slot.as_str()), "indexed={indexed}");
+        let main_txn_meta = format!("urn:fluree:{name}:main#txn-meta");
+        let branch_txn_meta = format!("urn:fluree:{branch_id}#txn-meta");
+        for (g_id, main_iri, branch_iri) in [
+            (
+                fluree_db_core::graph_registry::CONFIG_GRAPH_ID,
+                &main_config,
+                &branch_config,
+            ),
+            (
+                fluree_db_core::graph_registry::TXN_META_GRAPH_ID,
+                &main_txn_meta,
+                &branch_txn_meta,
+            ),
+        ] {
+            let slot = branch.snapshot.graph_registry.iri_for_graph_id(g_id);
+            let expected = if indexed { main_iri } else { branch_iri };
+            assert_eq!(
+                slot,
+                Some(expected.as_str()),
+                "indexed={indexed}, slot {g_id}"
+            );
+        }
         let case = |graph: &str| format!("indexed={indexed}, graph {graph}");
 
         for (graph, want) in [
@@ -4538,6 +4551,24 @@ async fn a_branch_reads_config_by_its_own_urn_and_urn_named_graphs_stay_graphs()
             .map(|_| ())
             .expect_err("query_from() naming the branch and main's config URN");
         refused(err, "query_from()");
+        // Main's txn-meta URN names main's txn-meta graph, as main's config URN
+        // names its config graph: refused, naming the branch's own where the
+        // branch holds main's at its slot.
+        let err = support::query_sparql(
+            &fluree,
+            &branch,
+            &format!("SELECT ?s FROM <{main_txn_meta}> WHERE {{ ?s ?p ?o }}"),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("main's txn-meta URN on the branch's view");
+        assert_eq!(err.status_code(), 400, "{}: {err}", case(&main_txn_meta));
+        if indexed {
+            assert!(
+                err.to_string().contains(&branch_txn_meta),
+                "names the branch's own txn-meta graph: {err}"
+            );
+        }
         let rows = fluree
             .query_from()
             .sparql(&format!(

@@ -12,7 +12,7 @@ urn:fluree:{ledger_id}#config
 
 For a ledger named `mydb:main`, the config graph is `urn:fluree:mydb:main#config`.
 
-Each branch has its own config graph, named by its own config graph IRI or the `config` keyword. A query or write that names the config graph IRI of another ledger, or of another branch, is refused (400) with a message naming this branch's own; to read another branch's config, query that branch, or name its IRI in a connection query. History is the exception: a branch, or a copy restored under another name, replays commits that wrote its source's config graph under the source's IRI, and that config applies to it.
+Each branch has its own config graph, named by its own config graph IRI or the `config` keyword. A query or write that names the config graph IRI of another ledger, or of another branch, is refused (400) with a message naming this branch's own (the `txn-meta` graph follows the same rule); to read another branch's config, query that branch, or name its IRI in a connection query. History is the exception: a branch, or a copy restored under another name, replays commits that wrote its source's config graph under the source's IRI, and that config applies to it.
 
 An index built by an earlier version can hold another ledger's config graph as an ordinary graph: a branch created before its source's first index build, or a copy under another name, then indexed. Such a ledger reads that graph as an ordinary graph, as it did before, so its source's config does not apply to it, and its incremental index builds keep it so. `fluree reindex <ledger>` rebuilds the index from its commits, after which the source's config applies, configured full-text properties included.
 
