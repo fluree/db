@@ -106,6 +106,32 @@ pub(crate) fn dropped_source(kind: &str, iri: &str, floor: i64, t: i64) -> ApiEr
     ApiError::GraphNotFound(dropped_source_message(kind, iri, floor, t))
 }
 
+/// Refuse a governed read as of `to_t` whose stored policies or identity
+/// records live in a graph a later drop took: what the graph held then is
+/// gone, and governing without it would show what it hid. The default graph
+/// is the one this reaches, after `DROP DEFAULT` or `DROP ALL`; a dropped
+/// `f:policySource` graph is refused when it is resolved.
+fn refuse_dropped_policy_graphs(
+    snapshot: &LedgerSnapshot,
+    policy_graphs: &[fluree_db_core::GraphId],
+    to_t: i64,
+) -> Result<()> {
+    let registry = &snapshot.graph_registry;
+    if !registry.has_drops() {
+        return Ok(());
+    }
+    for &g_id in policy_graphs {
+        if let Some(floor) = registry.drop_after(g_id, to_t) {
+            let iri = match g_id {
+                fluree_db_core::DEFAULT_GRAPH_ID => config_iris::DEFAULT_GRAPH,
+                _ => registry.iri_for_graph_id(g_id).unwrap_or_default(),
+            };
+            return Err(dropped_source("policy", iri, floor, to_t));
+        }
+    }
+    Ok(())
+}
+
 /// The message of [`dropped_source`].
 pub(crate) fn dropped_source_message(kind: &str, iri: &str, floor: i64, t: i64) -> String {
     format!(
@@ -244,6 +270,12 @@ async fn build_policy_context_from_opts_inner(
     // policy class that selects zero model-ledger rules cannot collapse to a
     // root (unrestricted) context; `default_allow` governs instead.
     let has_cross_ledger_source = cross_ledger_restrictions.is_some();
+
+    // An identity binds, and a same-ledger policy class selects, from
+    // `policy_graphs`; an inline policy alone reads none of them.
+    if opts.identity.is_some() || (!has_cross_ledger_source && opts.policy_class.is_some()) {
+        refuse_dropped_policy_graphs(snapshot, policy_graphs, to_t)?;
+    }
 
     struct PolicyStatsLookup<'a> {
         overlay: &'a dyn fluree_db_core::OverlayProvider,

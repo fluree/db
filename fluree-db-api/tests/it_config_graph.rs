@@ -6756,6 +6756,99 @@ async fn a_read_before_the_drop_of_its_policy_source_is_refused() {
     );
 }
 
+/// The default graph's twin of the test above: policies stored in the default
+/// graph, data in a named graph. A governed read as of a `t` before
+/// `DROP DEFAULT` is refused rather than governed by no policy; an ungoverned
+/// one reads the named graph as before.
+#[tokio::test]
+async fn a_governed_read_before_a_drop_of_the_default_graph_is_refused() {
+    use fluree_db_api::TimeSpec;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-default-dropped:main";
+    fluree.create_ledger(ledger_id).await.unwrap();
+    let config_iri = config_graph_iri(ledger_id);
+    let deny_ssn = r"@prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/> .
+        ex:denySsn a f:AccessPolicy ; f:action f:view ;
+            f:onProperty ex:ssn ; f:allow false .";
+    for trig in [
+        r#"@prefix ex: <http://example.org/> .
+           GRAPH <http://example.org/people> { ex:alice ex:ssn "111-11-1111" . }"#
+            .to_string(),
+        deny_ssn.to_string(),
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{config_iri}> {{
+                 <urn:config:main> a f:LedgerConfig ; f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow true ; f:policyClass f:AccessPolicy .
+             }}"
+        ),
+    ] {
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap();
+    }
+    let governed_at = fluree.ledger(ledger_id).await.unwrap().t();
+    let ssn = |spec: TimeSpec, governed: bool| {
+        let fluree = &fluree;
+        async move {
+            let mut view = fluree.db_at(ledger_id, spec).await?;
+            if governed {
+                view = fluree.wrap_policy_defaults(view).await?;
+            }
+            let result = fluree
+                .query(
+                    &view,
+                    "SELECT ?ssn WHERE { GRAPH <http://example.org/people> { \
+                     <http://example.org/alice> <http://example.org/ssn> ?ssn } }",
+                )
+                .await?;
+            Ok::<_, fluree_db_api::ApiError>(result.to_jsonld(&view.snapshot)?)
+        }
+    };
+    let alice_ssn = json!([["111-11-1111"]]);
+    assert_eq!(
+        ssn(TimeSpec::AtT(governed_at), true).await.unwrap(),
+        json!([])
+    );
+
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    let dropped = fluree
+        .stage(&handle)
+        .sparql_update("DROP DEFAULT")
+        .execute()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(deny_ssn)
+        .commit()
+        .await
+        .unwrap();
+
+    let head = fluree.ledger(ledger_id).await.unwrap().t();
+    assert_eq!(ssn(TimeSpec::AtT(head), true).await.unwrap(), json!([]));
+    let err = ssn(TimeSpec::AtT(governed_at), true).await.unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("dropped at t={dropped}")),
+        "{err}"
+    );
+    assert_eq!(
+        ssn(TimeSpec::AtT(governed_at), false).await.unwrap(),
+        alice_ssn
+    );
+    // As of the drop the default graph holds no policy, which is what governs.
+    assert_eq!(ssn(TimeSpec::AtT(dropped), true).await.unwrap(), alice_ssn);
+}
+
 #[tokio::test]
 async fn policy_source_cross_ledger_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();

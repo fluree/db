@@ -376,6 +376,7 @@ SPARQL `DROP GRAPH`, `DROP DEFAULT`, `DROP NAMED` and `DROP ALL` used to retract
 - Merging, rebasing or reverting across a drop is supported only when the result keeps the drop as committed: a fast-forward merge or rebase. Pushing and pulling commits that drop graphs is not supported yet.
 - A BM25 or vector index whose indexing query reads a dropped graph is rebuilt at its next sync, and BM25 retires its snapshots from before the drop. Until that sync, searches serve the snapshot they had.
 - A reasoning query as of a `t` before the drop of a graph its `f:schemaSource` reads (the starting graph, or one it follows through `owl:imports`) is refused with a 404, as a query naming the graph is.
+- A governed query as of a `t` before the drop of the graph its stored policies live in is refused with a 404: the default graph after `DROP DEFAULT` or `DROP ALL`, or the `f:policySource` graph. Governing it with the policies gone would show what they hid. The same query without policy reads as it did.
 
 #### Writing schema triples is checked by modify policy
 
