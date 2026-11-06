@@ -503,16 +503,17 @@ pub enum GraphRegistrationProbe {
 }
 
 /// Probe the commit DAG envelope-only to discover whether a named graph
-/// IRI was ever registered, and at what `t` it first appeared.
+/// IRI `names_graph` accepts was ever registered, and at what `t` it first
+/// appeared.
 ///
 /// Walks the chain via byte-range envelope reads (~128 KiB per envelope on
 /// range-capable backends), inspects each envelope's `graph_delta` for
-/// `graph_iri`, and returns:
+/// such an IRI, and returns:
 ///
 /// - [`Found(t)`](GraphRegistrationProbe::Found) — the smallest `t`
-///   where the IRI appears in any commit's `graph_delta`.
+///   where one appears in any commit's `graph_delta`.
 /// - [`NotFound`](GraphRegistrationProbe::NotFound) — every commit was a
-///   v4 envelope and none registered the IRI.
+///   v4 envelope and none registered one.
 /// - [`Inconclusive`](GraphRegistrationProbe::Inconclusive) — at least one
 ///   envelope was v3 (or an unknown future version) and could not be
 ///   inspected for `graph_delta`. Walk short-circuits and returns
@@ -539,7 +540,7 @@ pub enum GraphRegistrationProbe {
 pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
-    graph_iri: &str,
+    names_graph: impl Fn(&str) -> bool,
 ) -> Result<GraphRegistrationProbe> {
     let mut earliest: Option<i64> = None;
     let mut frontier = vec![head_id.clone()];
@@ -561,7 +562,7 @@ pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
         if version != codec::VERSION {
             return Ok(GraphRegistrationProbe::Inconclusive);
         }
-        if envelope.graph_delta.values().any(|iri| iri == graph_iri) {
+        if envelope.graph_delta.values().any(|iri| names_graph(iri)) {
             earliest = Some(match earliest {
                 Some(e) => e.min(envelope.t),
                 None => envelope.t,

@@ -578,14 +578,15 @@ pub struct StageOptions<'a> {
 
     /// Graph routing map for named-graph flakes.
     ///
-    /// Maps `GraphId → Sid` so that `stage_flakes` can resolve each flake's
-    /// `Flake.g` to a `GraphId` for per-graph policy enforcement and SHACL validation.
+    /// Maps each flake's `Flake.g` to its `GraphId` for per-graph policy
+    /// enforcement and SHACL validation. Several Sids can name one graph: any
+    /// ledger's config graph IRI is the config graph.
     ///
     /// **Required** when any flake has `g != None`. If `None` is provided and
     /// named-graph flakes are present, `stage_flakes` will return an error.
     ///
     /// The normal `stage()` path builds this internally from `txn.write_graphs`.
-    pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+    pub graph_ids: Option<&'a HashMap<Sid, GraphId>>,
 
     /// These flakes come from a commit that was already authored and written,
     /// not from a transaction being authored now.
@@ -627,8 +628,8 @@ impl<'a> StageOptions<'a> {
     }
 
     /// Set the graph routing map for named-graph flakes
-    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
-        self.graph_sids = Some(graph_sids);
+    pub fn with_graph_ids(mut self, graph_ids: &'a HashMap<Sid, GraphId>) -> Self {
+        self.graph_ids = Some(graph_ids);
         self
     }
 
@@ -1290,6 +1291,28 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
     Ok(())
 }
 
+/// The refusal of `graph`, the system graph IRI of another ledger, or of
+/// another branch, that a write names: [`TransactError::OtherLedgersConfigGraph`]
+/// or [`TransactError::OtherLedgersTxnMetaGraph`].
+pub(crate) fn other_ledgers_system_graph(
+    ledger_id: &fluree_db_core::LedgerId,
+    graph: &str,
+) -> TransactError {
+    use fluree_db_core::graph_registry::{config_graph_ledger, txn_meta_graph_ledger};
+    match config_graph_ledger(graph) {
+        Some(named) => TransactError::OtherLedgersConfigGraph {
+            graph_iri: graph.to_string(),
+            named: named.to_string(),
+            own: fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+        },
+        None => TransactError::OtherLedgersTxnMetaGraph {
+            graph_iri: graph.to_string(),
+            named: txn_meta_graph_ledger(graph)
+                .map_or_else(|| graph.to_string(), |named| named.to_string()),
+        },
+    }
+}
+
 /// The ledger's binary index store, when it has one. Its graph dictionary can
 /// hold an entry the snapshot's registry has not caught up with, so graph
 /// names are read through both ([`HeadGraphNames`]), as on the query path.
@@ -1316,6 +1339,9 @@ fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
         GraphPosition::Default => Ok(WriteGraph::Default),
         GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
             Ok(WriteGraph::Named(iri.into()))
+        }
+        GraphPosition::OtherLedgersSystemGraph(graph) => {
+            Err(other_ledgers_system_graph(target.id(), &graph))
         }
         GraphPosition::NotAGraph => Err(TransactError::Parse(format!(
             "<{iri}> names no graph a write can go to: an address of this ledger ('{}') \
@@ -2446,7 +2472,7 @@ async fn enforce_single_target_reifiers(
 /// # Named Graph Support
 ///
 /// When flakes include named-graph data (`Flake.g = Some(_)`), the caller
-/// **must** provide `StageOptions.graph_sids` so that policy enforcement
+/// **must** provide `StageOptions.graph_ids` so that policy enforcement
 /// and SHACL validation can resolve each flake's graph. If named-graph flakes
 /// are present without a routing map, this function returns an error.
 ///
@@ -2481,15 +2507,15 @@ pub async fn stage_flakes(
 
         // 2. Build graph routing map.
         //
-        // If the caller provided graph_sids (push/import path), use it.
+        // If the caller provided graph_ids (push/import path), use it.
         // Otherwise, verify no named-graph flakes are present — stage_flakes
         // cannot correctly enforce policy/SHACL without a routing map.
-        let reverse_graph: HashMap<Sid, GraphId> = match options.graph_sids {
-            Some(gs) => build_reverse_graph_lookup(gs),
+        let reverse_graph: HashMap<Sid, GraphId> = match options.graph_ids {
+            Some(ids) => ids.clone(),
             None => {
                 if flakes.iter().any(|f| f.g.is_some()) {
                     return Err(TransactError::FlakeGeneration(
-                        "stage_flakes received named-graph flakes but no graph_sids \
+                        "stage_flakes received named-graph flakes but no graph_ids \
                          routing map was provided in StageOptions"
                             .to_string(),
                     ));
@@ -3234,6 +3260,9 @@ async fn stream_where_into_accumulator(
                 "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
                  reads only its own ledger ('{target_ledger}')"
             ))),
+            Err(other @ TargetError::OtherLedgersSystemGraph { .. }) => Err(TransactError::Parse(
+                format!("WHERE dataset graph: {other}"),
+            )),
         }
     };
     let where_default_g_ids: Vec<Option<GraphId>> = desired_where_default_graph_iris
@@ -3458,7 +3487,9 @@ async fn stream_where_into_accumulator(
             match TargetLedger::new(target_ledger, graph_names).graph_position(name) {
                 GraphPosition::Default => name_of_graph.get(&DEFAULT_GRAPH_ID).cloned(),
                 GraphPosition::Registered { g_id, .. } => name_of_graph.get(&g_id).cloned(),
-                GraphPosition::New(_) | GraphPosition::NotAGraph => None,
+                GraphPosition::New(_)
+                | GraphPosition::NotAGraph
+                | GraphPosition::OtherLedgersSystemGraph(_) => None,
             }
         });
     }

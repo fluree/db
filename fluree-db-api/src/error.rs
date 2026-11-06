@@ -1142,8 +1142,9 @@ impl From<fluree_db_core::TargetError> for ApiError {
     fn from(e: fluree_db_core::TargetError) -> Self {
         match e {
             fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
-            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
-                ApiError::invalid_query(cross.to_string())
+            other @ (fluree_db_core::TargetError::CrossLedger { .. }
+            | fluree_db_core::TargetError::OtherLedgersSystemGraph { .. }) => {
+                ApiError::invalid_query(other.to_string())
             }
         }
     }

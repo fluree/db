@@ -129,6 +129,38 @@ pub fn config_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")
 }
 
+/// Whether `iri` is a ledger's config graph IRI ([`config_graph_iri`]),
+/// whichever ledger it names. A commit carries the IRI of the ledger it was
+/// written in, so a branch replaying its source's history, or a copy under
+/// another name, reads the source's config graph as its own.
+pub fn names_config_graph(iri: &str) -> bool {
+    config_graph_ledger(iri).is_some()
+}
+
+/// The ledger whose config graph IRI ([`config_graph_iri`]) `iri` is.
+pub fn config_graph_ledger(iri: &str) -> Option<crate::LedgerId> {
+    system_graph_ledger(iri, "config")
+}
+
+/// Whether `iri` is a ledger's txn-meta graph IRI ([`txn_meta_graph_iri`]),
+/// whichever ledger it names.
+pub fn names_txn_meta_graph(iri: &str) -> bool {
+    txn_meta_graph_ledger(iri).is_some()
+}
+
+/// The ledger whose txn-meta graph IRI ([`txn_meta_graph_iri`]) `iri` is.
+pub fn txn_meta_graph_ledger(iri: &str) -> Option<crate::LedgerId> {
+    system_graph_ledger(iri, "txn-meta")
+}
+
+fn system_graph_ledger(iri: &str, graph: &str) -> Option<crate::LedgerId> {
+    // The last `#`: names from before the ledger-id grammar may hold one.
+    iri.strip_prefix("urn:fluree:")
+        .and_then(|rest| rest.rsplit_once('#'))
+        .filter(|(_, name)| *name == graph)
+        .and_then(|(ledger, _)| crate::LedgerId::parse_persisted(ledger).ok())
+}
+
 /// Ledger-level registry mapping graph IRIs to deterministic GraphIds.
 ///
 /// In production, use `new_for_ledger(ledger_id)` or `seed_from_root_iris()`
@@ -144,6 +176,9 @@ pub struct GraphRegistry {
     /// id_to_iri[1] = Some(txn-meta IRI) when properly seeded.
     /// id_to_iri[2] = Some(config IRI) when properly seeded.
     id_to_iri: Vec<Option<Arc<str>>>,
+    /// Other ledgers' config graph IRIs the commits carry, each the config
+    /// graph here ([`names_config_graph`]); also in `iri_to_id`.
+    aliases: Vec<Arc<str>>,
     /// Next available GraphId for assignment (always >= FIRST_USER_GRAPH_ID).
     next_id: GraphId,
 }
@@ -158,6 +193,7 @@ impl Default for GraphRegistry {
             iri_to_id: HashMap::new(),
             // slot 0 = default graph, slot 1 = txn-meta (empty), slot 2 = config (empty)
             id_to_iri: vec![None, None, None],
+            aliases: Vec::new(),
             next_id: FIRST_USER_GRAPH_ID,
         }
     }
@@ -178,6 +214,7 @@ impl GraphRegistry {
         Self {
             iri_to_id,
             id_to_iri: vec![None, Some(txn_meta), Some(config)],
+            aliases: Vec::new(),
             next_id: FIRST_USER_GRAPH_ID,
         }
     }
@@ -196,6 +233,11 @@ impl GraphRegistry {
     /// The method accepts any non-empty list — it does not enforce the
     /// system graph layout. The config graph will be seeded on first
     /// write if absent.
+    ///
+    /// A root from before config graphs were read across ledgers may list
+    /// another ledger's config graph as a user graph, its rows under that
+    /// graph's id. It stays the ordinary graph the index holds until a
+    /// rebuild from the commits ([`Self::has_config_in_user_slot`]).
     ///
     /// # Errors
     ///
@@ -237,6 +279,7 @@ impl GraphRegistry {
         Ok(Self {
             iri_to_id,
             id_to_iri,
+            aliases: Vec::new(),
             next_id,
         })
     }
@@ -284,6 +327,7 @@ impl GraphRegistry {
         Ok(Self {
             iri_to_id,
             id_to_iri,
+            aliases: Vec::new(),
             next_id,
         })
     }
@@ -292,7 +336,8 @@ impl GraphRegistry {
     ///
     /// New IRIs (not already in registry) are deduped, sorted lexicographically,
     /// and assigned sequential GraphIds from `next_id`. Returns the newly assigned
-    /// `(GraphId, Arc<str>)` pairs.
+    /// `(GraphId, Arc<str>)` pairs. Another ledger's config graph IRI is
+    /// assigned none: it is the config graph here.
     ///
     /// This is the **only mutation path** — called at commit-apply time only.
     pub fn apply_delta(
@@ -307,7 +352,10 @@ impl GraphRegistry {
             let iri_ref = iri.as_ref();
             if !self.iri_to_id.contains_key(iri_ref) {
                 let arc: Arc<str> = Arc::from(iri_ref);
-                if seen.insert(arc.clone()) {
+                if names_config_graph(iri_ref) {
+                    self.iri_to_id.insert(arc.clone(), CONFIG_GRAPH_ID);
+                    self.aliases.push(arc);
+                } else if seen.insert(arc.clone()) {
                     new_iris.push(arc);
                 }
             }
@@ -353,7 +401,12 @@ impl GraphRegistry {
         let mut seen: HashSet<&str> = HashSet::new();
 
         for iri in new_iris {
-            if !self.iri_to_id.contains_key(iri.as_str()) && seen.insert(iri.as_str()) {
+            if self.iri_to_id.contains_key(iri.as_str()) {
+                continue;
+            }
+            if names_config_graph(iri) {
+                result.insert(Arc::from(iri.as_str()), CONFIG_GRAPH_ID);
+            } else if seen.insert(iri.as_str()) {
                 truly_new.push(Arc::from(iri.as_str()));
             }
         }
@@ -368,16 +421,20 @@ impl GraphRegistry {
         result
     }
 
-    /// Forward lookup: IRI → GraphId.
+    /// Forward lookup: IRI → GraphId. Any ledger's config graph IRI is the
+    /// config graph.
     pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
-        self.iri_to_id.get(iri).copied()
+        self.iri_to_id
+            .get(iri)
+            .copied()
+            .or_else(|| names_config_graph(iri).then_some(CONFIG_GRAPH_ID))
     }
 
     /// Whether any of `iris` is not yet registered — that is, whether a
     /// commit writing to them would register a graph.
     pub fn has_unregistered<'a>(&self, iris: impl IntoIterator<Item = &'a str>) -> bool {
         iris.into_iter()
-            .any(|iri| !self.iri_to_id.contains_key(iri))
+            .any(|iri| !self.iri_to_id.contains_key(iri) && !names_config_graph(iri))
     }
 
     /// Reverse lookup: GraphId → IRI.
@@ -395,14 +452,31 @@ impl GraphRegistry {
             .filter_map(|(idx, opt)| opt.as_deref().map(|iri| (idx as GraphId, iri)))
     }
 
+    /// Whether the index root holds a config graph IRI as an ordinary graph:
+    /// a root built before any ledger's config graph IRI named the config
+    /// graph. That config is read only once the index is rebuilt from the
+    /// commits.
+    pub fn has_config_in_user_slot(&self) -> bool {
+        self.iter_entries()
+            .any(|(g_id, iri)| g_id >= FIRST_USER_GRAPH_ID && names_config_graph(iri))
+    }
+
+    /// Other ledgers' config graph IRIs the commits carry, each the config
+    /// graph here. Not in [`Self::iter_entries`].
+    pub fn iter_aliases(&self) -> impl Iterator<Item = (GraphId, &str)> {
+        self.aliases
+            .iter()
+            .map(|iri| (CONFIG_GRAPH_ID, iri.as_ref()))
+    }
+
     /// Number of registered graphs (excluding default graph).
     pub fn len(&self) -> usize {
-        self.iri_to_id.len()
+        self.iri_to_id.len() - self.aliases.len()
     }
 
     /// True if no named graphs are registered.
     pub fn is_empty(&self) -> bool {
-        self.iri_to_id.is_empty()
+        self.len() == 0
     }
 
     /// Next GraphId that would be assigned.
@@ -692,6 +766,90 @@ mod tests {
         assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
         assert_eq!(reg.graph_id_for_iri(&config), Some(2));
         assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
+    }
+
+    #[test]
+    fn any_ledgers_config_graph_iri_is_recognized() {
+        assert!(names_config_graph(&config_graph_iri("a:main")));
+        assert!(names_config_graph(&config_graph_iri("org/a:dev")));
+        // A name from before the ledger-id grammar, holding `#`.
+        assert!(names_config_graph("urn:fluree:a#b:main#config"));
+        assert!(names_txn_meta_graph(&txn_meta_graph_iri("a:main")));
+        assert!(!names_txn_meta_graph(&config_graph_iri("a:main")));
+        for other in [
+            "urn:fluree:a:main#configs",
+            "urn:fluree:#config",
+            "urn:fluree:a/../b:main#config",
+            "http://example.org/a:main#config",
+            "urn:fluree:materialize#appliedSequence",
+        ] {
+            assert!(!names_config_graph(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn another_ledgers_config_graph_is_the_config_graph() {
+        let mut reg = GraphRegistry::new_for_ledger("b:main");
+        let source = config_graph_iri("a:main");
+        assert_eq!(reg.graph_id_for_iri(&source), Some(CONFIG_GRAPH_ID));
+        assert!(!reg.has_unregistered([source.as_str()]));
+        let prov = reg.provisional_ids(&[source.clone(), "http://example.org/g".into()]);
+        assert_eq!(prov.get(source.as_str()).copied(), Some(CONFIG_GRAPH_ID));
+        assert_eq!(
+            prov.get("http://example.org/g").copied(),
+            Some(FIRST_USER_GRAPH_ID)
+        );
+
+        let assigned = reg.apply_delta([source.as_str(), "http://example.org/g"]);
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g"),
+            Some(FIRST_USER_GRAPH_ID)
+        );
+        assert_eq!(reg.graph_id_for_iri(&source), Some(CONFIG_GRAPH_ID));
+        assert_eq!(
+            reg.iri_for_graph_id(CONFIG_GRAPH_ID),
+            Some(config_graph_iri("b:main").as_str())
+        );
+        assert_eq!(
+            reg.iter_aliases().collect::<Vec<_>>(),
+            vec![(CONFIG_GRAPH_ID, source.as_str())]
+        );
+        assert_eq!(reg.len(), 3);
+    }
+
+    #[test]
+    fn a_root_listing_another_ledgers_config_graph_as_a_user_graph_keeps_it() {
+        let source = config_graph_iri("a:main");
+        let iris = vec![
+            txn_meta_graph_iri("b:main"),
+            config_graph_iri("b:main"),
+            source.clone(),
+            "http://example.org/g".to_string(),
+        ];
+        let entries: Vec<(GraphId, &str)> = iris
+            .iter()
+            .enumerate()
+            .map(|(i, iri)| (i as GraphId + 1, iri.as_str()))
+            .collect();
+        for mut reg in [
+            GraphRegistry::seed_from_root_iris(&iris).unwrap(),
+            GraphRegistry::seed_from_entries(&entries).unwrap(),
+        ] {
+            assert!(reg.has_config_in_user_slot());
+            assert_eq!(reg.graph_id_for_iri(&source), Some(3));
+            assert_eq!(reg.iri_for_graph_id(3), Some(source.as_str()));
+            assert_eq!(reg.next_id(), 5);
+            // Commits replayed over the index route to it as the index does.
+            assert!(reg.apply_delta([source.as_str()]).is_empty());
+            assert_eq!(reg.graph_id_for_iri(&source), Some(3));
+            // Another ledger's config graph IRI the root does not list is
+            // still the config graph.
+            let other = config_graph_iri("c:main");
+            reg.apply_delta([other.as_str()]);
+            assert_eq!(reg.graph_id_for_iri(&other), Some(CONFIG_GRAPH_ID));
+        }
+        assert!(!GraphRegistry::new_for_ledger("b:main").has_config_in_user_slot());
     }
 
     #[test]

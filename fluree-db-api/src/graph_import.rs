@@ -265,7 +265,7 @@ pub(crate) async fn splice_graph_into_index(
 
     // ---- txn-meta, through the incremental indexer ----
     let records = txn_meta_records(&graph.txn_meta).map_err(ImportError::Io)?;
-    let shared = SharedResolverState::from_index_root(&root)
+    let shared = SharedResolverState::from_index_root(&root, &root.ledger_id)
         .map_err(|e| ImportError::IndexBuild(format!("spliced root dictionaries: {e}")))?;
     let novelty = IncrementalNovelty {
         ops: vec![1; records.len()],
@@ -761,7 +761,7 @@ async fn load_seed(
     let mut base_root = IndexRoot::decode(&root_bytes)
         .map_err(|e| ImportError::Storage(format!("decode index root {base_root_id}: {e}")))?;
     bind_reserved_graphs(&mut base_root, &record.ledger_id);
-    let base_dicts = SharedResolverState::from_index_root(&base_root)
+    let base_dicts = SharedResolverState::from_index_root(&base_root, &record.ledger_id)
         .map_err(|e| ImportError::Storage(format!("index root dictionaries: {e}")))?;
 
     if base_dicts.graphs.get(&graph_iri).is_some() {

@@ -37,7 +37,10 @@ pub use types::{
 ///   ([`crate::cross_ledger::types::reject_if_reserved_graph`])
 ///   and surfaces the dedicated error variant instead of letting
 ///   the request leak to a `GraphMissingAtT` after touching M.
-/// - Named graph IRI present in the snapshot's registry →
+/// - Named graph IRI the snapshot's registry reads as its txn-meta or
+///   config graph, in any spelling (any ledger's config graph IRI is
+///   the config graph) → `Err(ReservedGraphSelected)`.
+/// - Other named graph IRI present in the snapshot's registry →
 ///   `Ok(Some(g_id))`.
 /// - Otherwise → `Ok(None)`; callers map to
 ///   [`CrossLedgerError::GraphMissingAtT`] with the full context
@@ -49,12 +52,18 @@ pub(crate) fn resolve_selector_g_id(
     if graph_iri == fluree_vocab::config_iris::DEFAULT_GRAPH {
         return Ok(Some(0u16));
     }
+    use fluree_db_core::graph_registry::{CONFIG_GRAPH_ID, TXN_META_GRAPH_ID};
     if graph_iri == fluree_vocab::config_iris::TXN_META_GRAPH {
         return Err(CrossLedgerError::ReservedGraphSelected {
             graph_iri: graph_iri.to_string(),
         });
     }
-    Ok(snapshot.graph_registry.graph_id_for_iri(graph_iri))
+    match snapshot.graph_registry.graph_id_for_iri(graph_iri) {
+        Some(TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) => Err(CrossLedgerError::ReservedGraphSelected {
+            graph_iri: graph_iri.to_string(),
+        }),
+        g_id => Ok(g_id),
+    }
 }
 
 /// Encode a fixed system IRI (e.g. `rdf:type`, `f:allow`) against a
@@ -143,4 +152,32 @@ pub(crate) async fn resolve_schema_closure_bundle(
             detail: format!("schema wire translation failed: {e}"),
         })?;
     Ok(Some(bundle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::LedgerSnapshot;
+
+    #[test]
+    fn a_selector_the_registry_reads_as_a_system_graph_is_refused() {
+        let snapshot = LedgerSnapshot::genesis("model:main");
+        for iri in [
+            "urn:fluree:model:main#txn-meta",
+            "urn:fluree:model:main#config",
+            "urn:fluree:other:main#config",
+        ] {
+            assert!(
+                matches!(
+                    resolve_selector_g_id(&snapshot, iri),
+                    Err(CrossLedgerError::ReservedGraphSelected { .. })
+                ),
+                "{iri}"
+            );
+        }
+        assert!(matches!(
+            resolve_selector_g_id(&snapshot, "http://example.org/policy"),
+            Ok(None)
+        ));
+    }
 }

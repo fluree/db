@@ -583,19 +583,17 @@ fn shacl_group_field_in_the_default_graph() -> serde_json::Value {
     })
 }
 
-/// Config written on a branch is in that branch's own config graph
-/// (`urn:fluree:<name>:<branch>#config`) and configures that branch only. A
-/// merge or fast-forward carrying it to another branch is refused, naming the
-/// branch and the graph, rather than landing it in an ordinary graph of the
-/// target where it would never be read; the preview reports it. Merging the
-/// other way, from the branch a branch was created from, is not refused:
-/// that parent's config graph is already an ordinary graph on the branch.
+/// Config written on a branch configures that branch only. A merge or
+/// fast-forward carrying it into the branch's parent is refused, naming the
+/// target's config graph; the preview reports it. Merging the other way, from
+/// the branch a branch was created from, carries the parent's later config
+/// changes into the branch, as the fork carried the earlier ones.
 #[tokio::test]
 async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
     let edits = [
-        // A whole config of the branch's own.
-        "<urn:config:dev> a f:LedgerConfig ; f:shaclDefaults <urn:config:devshacl> .
-         <urn:config:devshacl> f:shaclEnabled false .",
+        // A group of the branch's own, on the config it read from main.
+        "<urn:config:main> f:transactDefaults <urn:config:devtx> .
+         <urn:config:devtx> f:uniqueEnabled true .",
         // A setting on a group main's config links.
         "<urn:config:shacl> f:validationMode f:ValidationWarn .",
     ];
@@ -662,7 +660,8 @@ async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
             assert_eq!(err.status_code(), 409, "{i}/{fast_forward}: {err}");
             let message = err.to_string();
             assert!(
-                message.contains("branch dev's config graph") && message.contains(&dev_cfg),
+                message.contains("this branch's config graph")
+                    && message.contains(&config_graph_iri(&format!("{name}:main"))),
                 "{i}/{fast_forward}: {message}"
             );
             let view = fluree.db(&format!("{name}:main")).await.unwrap();
@@ -676,38 +675,61 @@ async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
         }
     }
 
-    // From the parent: main's config change after the fork merges into dev.
-    let fluree = FlureeBuilder::memory().build_memory();
-    let name = "it-config-branch-parent";
-    let main = ledger_with_branch(&fluree, name).await;
-    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
-    fluree
-        .insert(
-            dev,
-            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:d", "ex:p": 1}),
-        )
-        .await
-        .unwrap();
-    fluree
-        .stage_owned(main)
-        .upsert_turtle(&format!(
-            "@prefix f: <https://ns.flur.ee/db#> .
-             GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
-               f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}",
-            config_graph_iri(&format!("{name}:main"))
-        ))
-        .execute()
-        .await
-        .expect("main's config");
-    fluree
-        .merge_branch(
-            name,
-            "main",
-            Some("dev"),
-            fluree_db_api::ConflictStrategy::default(),
-        )
-        .await
-        .expect("main's history merges into dev");
+    // From the parent: main's config change after the fork merges into dev
+    // and configures it.
+    for fast_forward in [true, false] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = format!("it-config-branch-parent-{fast_forward}");
+        let main = ledger_with_branch(&fluree, &name).await;
+        if !fast_forward {
+            let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+            fluree
+                .insert(
+                    dev,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:d", "ex:p": 1}),
+                )
+                .await
+                .unwrap();
+        }
+        fluree
+            .stage_owned(main)
+            .upsert_turtle(&format!(
+                "@prefix f: <https://ns.flur.ee/db#> .
+                 GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+                   f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}",
+                config_graph_iri(&format!("{name}:main"))
+            ))
+            .execute()
+            .await
+            .expect("main's config");
+        let preview = fluree
+            .merge_preview_with(
+                &name,
+                "main",
+                Some("dev"),
+                fluree_db_api::MergePreviewOpts::default(),
+            )
+            .await
+            .expect("preview");
+        assert!(preview.mergeable, "{fast_forward}: the preview accepts");
+        fluree
+            .merge_branch(
+                &name,
+                "main",
+                Some("dev"),
+                fluree_db_api::ConflictStrategy::default(),
+            )
+            .await
+            .expect("main's history merges into dev");
+        let view = fluree.db(&format!("{name}:dev")).await.unwrap();
+        assert_eq!(
+            view.ledger_config()
+                .and_then(|c| c.shacl.as_ref())
+                .and_then(|s| s.enabled),
+            Some(true),
+            "{fast_forward}: main's config configures dev"
+        );
+    }
 
     // Plain data a branch wrote to its own config graph is refused the same
     // way, also into a target whose config governs no writes, where a
@@ -759,128 +781,78 @@ async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
         assert_eq!(err.status_code(), 409, "{fast_forward}: {err}");
         let message = err.to_string();
         assert!(
-            message.contains("branch dev's config graph") && message.contains(&dev_cfg),
+            message.contains("this branch's config graph")
+                && message.contains(&config_graph_iri(&format!("{name}:main"))),
             "{fast_forward}: {message}"
         );
     }
 }
 
-/// A merge may not change the target's own config or txn-meta graph with
-/// what another branch wrote there: on the branch, the target's system graph
-/// IRIs name ordinary graphs, so a value written (or deleted) there is data,
-/// not a change to the target's config. A fast-forward and a general merge
-/// are refused (409), the preview says so, and the target's config is
-/// untouched, also into a target whose config governs no writes.
+/// A branch cannot write under its source's system graph IRIs: each branch
+/// has its own config and txn-meta graphs, so on the branch a write naming the
+/// source's config graph IRI (replacing or deleting a setting) or its txn-meta
+/// graph IRI is refused (400), naming the IRI, and nothing reaches the source's
+/// config.
 #[tokio::test]
-async fn a_merge_changing_the_targets_system_graph_from_another_branch_is_refused() {
-    let edits = [
+async fn a_branch_cannot_write_under_its_sources_system_graph_iris() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-branch-target";
+    let main_id = format!("{name}:main");
+    let main_cfg = config_graph_iri(&main_id);
+    let main_txn = fluree_db_core::graph_registry::txn_meta_graph_iri(&main_id);
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             ex:seed ex:p 1 .
+             GRAPH <{main_cfg}> {{ <urn:config:main> a f:LedgerConfig ;
+               f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}"
+        ))
+        .execute()
+        .await
+        .expect("main's config");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    for (what, graph, edit) in [
         (
             "a setting replaced",
-            true,
-            "config",
-            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
-             INSERT DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled false } }",
+            &main_cfg,
+            "DELETE DATA { GRAPH <IRI> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { GRAPH <IRI> { <urn:config:shacl> f:shaclEnabled false } }",
         ),
         (
             "a setting deleted",
-            true,
-            "config",
-            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } }",
+            &main_cfg,
+            "DELETE DATA { GRAPH <IRI> { <urn:config:shacl> f:shaclEnabled true } }",
         ),
         (
             "commit metadata written",
-            true,
-            "txn-meta",
-            "INSERT DATA { GRAPH <TXN> { <urn:x:commit> f:message \"from dev\" } }",
+            &main_txn,
+            "INSERT DATA { GRAPH <IRI> { <urn:x:commit> f:message \"from dev\" } }",
         ),
-        (
-            "commit metadata written, into a target that governs no writes",
-            false,
-            "txn-meta",
-            "INSERT DATA { GRAPH <TXN> { <urn:x:commit> f:message \"from dev\" } }",
-        ),
-    ];
-    for (i, (what, governed, role, edit)) in edits.into_iter().enumerate() {
-        for fast_forward in [true, false] {
-            let fluree = FlureeBuilder::memory().build_memory();
-            let name = format!("it-config-branch-target-{i}-{fast_forward}");
-            let ledger = fluree.create_ledger(&name).await.unwrap();
-            let main_id = format!("{name}:main");
-            let main_cfg = config_graph_iri(&main_id);
-            let main_txn = fluree_db_core::graph_registry::txn_meta_graph_iri(&main_id);
-            let main = fluree
-                .stage_owned(ledger)
-                .upsert_turtle(&format!(
-                    "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
-                     ex:seed ex:p 1 .
-                     GRAPH <{main_cfg}> {{ <urn:config:main> a f:LedgerConfig ;
-                       f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled {governed} . }}"
-                ))
-                .execute()
-                .await
-                .expect("main's config")
-                .ledger;
-            fluree
-                .create_branch(&name, "dev", None, None)
-                .await
-                .unwrap();
-            fluree
-                .graph(&format!("{name}:dev"))
-                .transact()
-                .sparql_update(&format!(
-                    "PREFIX f: <https://ns.flur.ee/db#> {}",
-                    edit.replace("CFG", &main_cfg).replace("TXN", &main_txn)
-                ))
-                .commit()
-                .await
-                .unwrap_or_else(|e| panic!("{what}: an ordinary graph on dev: {e}"));
-            if !fast_forward {
-                fluree
-                    .insert(main, &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}))
-                    .await
-                    .unwrap();
-            }
-            let case = format!("{what}/{fast_forward}");
-            let preview = fluree
-                .merge_preview_with(
-                    &name,
-                    "dev",
-                    None,
-                    fluree_db_api::MergePreviewOpts::default(),
-                )
-                .await
-                .expect("preview");
-            assert!(!preview.mergeable, "{case}: the preview refuses");
-            let err = fluree
-                .merge_branch(
-                    &name,
-                    "dev",
-                    None,
-                    fluree_db_api::ConflictStrategy::default(),
-                )
-                .await
-                .expect_err(&case);
-            assert_eq!(err.status_code(), 409, "{case}: {err}");
-            let message = err.to_string();
-            let graph = if role == "config" {
-                &main_cfg
-            } else {
-                &main_txn
-            };
-            assert!(
-                message.contains(&format!("this branch's {role} graph")) && message.contains(graph),
-                "{case}: {message}"
-            );
-            let view = fluree.db(&main_id).await.unwrap();
-            assert_eq!(
-                view.ledger_config()
-                    .and_then(|c| c.shacl.as_ref())
-                    .and_then(|s| s.enabled),
-                Some(governed),
-                "{case}: main's config is untouched"
-            );
-        }
+    ] {
+        let err = fluree
+            .graph(&format!("{name}:dev"))
+            .transact()
+            .sparql_update(&format!(
+                "PREFIX f: <https://ns.flur.ee/db#> {}",
+                edit.replace("<IRI>", &format!("<{graph}>"))
+            ))
+            .commit()
+            .await
+            .map(|_| ())
+            .expect_err(what);
+        assert_eq!(err.status_code(), 400, "{what}: {err}");
+        assert!(err.to_string().contains(graph.as_str()), "{what}: {err}");
     }
+    let view = fluree.db(&main_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.as_ref())
+            .and_then(|s| s.enabled),
+        Some(true),
+        "main's config is untouched"
+    );
 }
 
 /// A merge may not split one of the target's config groups. After the fork
@@ -8413,4 +8385,1191 @@ async fn fulltext_doc_verification_query_reads_the_config_graph() {
         Some(1),
         "the config row: {rows}"
     );
+}
+
+/// The config switching uniqueness on.
+fn uniqueness_on() -> serde_json::Value {
+    json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "urn:config:main",
+        "@type": "f:LedgerConfig",
+        "@graph": "config",
+        "f:transactDefaults": {"@id": "urn:config:transact", "f:uniqueEnabled": true}
+    })
+}
+
+/// `ex:email` unique, and `subject`'s email `a@x`.
+fn unique_email(subject: &str) -> serde_json::Value {
+    json!({
+        "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+        "@graph": [
+            {"@id": "ex:email", "f:enforceUnique": true},
+            {"@id": subject, "ex:email": "a@x"}
+        ]
+    })
+}
+
+/// What `ledger_id`'s config says of uniqueness.
+async fn unique_enabled(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Option<bool> {
+    fluree
+        .db(ledger_id)
+        .await
+        .unwrap()
+        .ledger_config()
+        .and_then(|c| c.transact.as_ref())
+        .and_then(|t| t.unique_enabled)
+}
+
+/// TriG setting uniqueness to `on` in the graph `graph`.
+fn uniqueness_in(graph: &str, on: bool) -> String {
+    format!(
+        "@prefix f: <https://ns.flur.ee/db#> .
+         GRAPH <{graph}> {{
+             <urn:config:main> a f:LedgerConfig ;
+                 f:transactDefaults <urn:config:transact> .
+             <urn:config:transact> f:uniqueEnabled {on} .
+         }}"
+    )
+}
+
+/// A branch of a ledger never indexed reads its source's config, before and
+/// after the branch is indexed. Replayed from genesis, the source's config
+/// commits name the source's config graph, which is the branch's config graph
+/// too (#2069).
+#[tokio::test]
+async fn a_branch_of_an_unindexed_ledger_applies_its_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-unindexed-branch";
+    let main = fluree.create_ledger(name).await.unwrap();
+    let main = fluree.insert(main, &uniqueness_on()).await.unwrap().ledger;
+    fluree.insert(main, &unique_email("ex:u1")).await.unwrap();
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &dev).await;
+            fluree.disconnect_ledger(&dev).await;
+        }
+        assert_eq!(unique_enabled(&fluree, &dev).await, Some(true), "{indexed}");
+        let ledger = fluree.ledger(&dev).await.unwrap();
+        fluree
+            .insert(ledger, &unique_email("ex:u2"))
+            .await
+            .expect_err("a second a@x on the branch");
+    }
+}
+
+/// A copy under another name reads its source's config, restored with the
+/// source's index or without: the source's config commits name the source's
+/// config graph, which is the copy's too (#2179). The copy changes its config
+/// under its own config graph IRI.
+#[tokio::test]
+async fn a_copy_under_another_name_applies_its_sources_config() {
+    for with_index in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        let source = "it/config-source:main";
+        let ledger = fluree.create_ledger("it/config-source").await.unwrap();
+        let ledger = fluree
+            .insert(ledger, &uniqueness_on())
+            .await
+            .unwrap()
+            .ledger;
+        fluree.insert(ledger, &unique_email("ex:u1")).await.unwrap();
+        if with_index {
+            fluree
+                .reindex(source, fluree_db_api::ReindexOptions::default())
+                .await
+                .unwrap();
+        }
+        let mut archive = Vec::new();
+        fluree
+            .archive_ledger(source, with_index, &mut archive)
+            .await
+            .unwrap();
+        let copy = fluree
+            .restore_ledger("it/config-copy", &mut archive.as_slice())
+            .await
+            .unwrap()
+            .ledger_id;
+
+        assert_eq!(
+            unique_enabled(&fluree, &copy).await,
+            Some(true),
+            "{with_index}"
+        );
+        let ledger = fluree.ledger(&copy).await.unwrap();
+        fluree
+            .insert(ledger, &unique_email("ex:u2"))
+            .await
+            .expect_err("a second a@x on the copy");
+
+        fluree
+            .graph(&copy)
+            .transact()
+            .upsert_turtle(&uniqueness_in(&config_graph_iri(&copy), false))
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(
+            unique_enabled(&fluree, &copy).await,
+            Some(false),
+            "{with_index}"
+        );
+    }
+}
+
+/// A merge carrying config written under two config graph IRIs, a branch's
+/// own and its parent's, commits it under one: the grandchild reads both
+/// settings, also reloaded from its commits.
+#[tokio::test]
+async fn a_merge_of_config_under_two_config_graph_iris_commits_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let name = "it-config-two-iris";
+    let main_cfg = config_graph_iri(&format!("{name}:main"));
+    // Main's config graph is written before the fork too: a merge is refused
+    // when both sides allocated a namespace since it.
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let main = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             ex:seed ex:p 1 . GRAPH <{main_cfg}> {{ <urn:config:main> a f:LedgerConfig . }}"
+        ))
+        .execute()
+        .await
+        .expect("main's first config")
+        .ledger;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    fluree
+        .create_branch(name, "dev2", Some("dev"), None)
+        .await
+        .unwrap();
+    let (dev, dev2) = (format!("{name}:dev"), format!("{name}:dev2"));
+    fluree
+        .graph(&dev)
+        .transact()
+        .upsert_turtle(&uniqueness_in(&config_graph_iri(&dev), true))
+        .commit()
+        .await
+        .expect("dev's config");
+    fluree
+        .stage_owned(main)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{main_cfg}> {{ <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled true . }}"
+        ))
+        .execute()
+        .await
+        .expect("main's config");
+    fluree
+        .merge_branch(
+            name,
+            "main",
+            Some("dev"),
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("main merges into dev");
+    let ledger = fluree.ledger(&dev2).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:d2", "ex:p": 1}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .merge_branch(
+            name,
+            "dev",
+            Some("dev2"),
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("dev merges into dev2");
+
+    async fn reads_both(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+        let view = fluree.db(ledger_id).await.expect("loads");
+        let config = view.ledger_config();
+        assert_eq!(
+            config
+                .and_then(|c| c.shacl.as_ref())
+                .and_then(|s| s.enabled),
+            Some(true)
+        );
+        assert_eq!(
+            config
+                .and_then(|c| c.transact.as_ref())
+                .and_then(|t| t.unique_enabled),
+            Some(true)
+        );
+    }
+    reads_both(&fluree, &dev2).await;
+    drop(fluree);
+    let reloaded = FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .unwrap();
+    reads_both(&reloaded, &dev2).await;
+}
+
+/// A write naming the system graph IRI of another ledger, or of another branch
+/// of its own, is refused (400), also wrapped as one of this ledger's graphs
+/// (`L#<g>`): each branch has its own config and txn-meta graphs. A config
+/// graph IRI, in TriG, JSON-LD and SPARQL, sets no config, and the refusal
+/// names the branch's own; a txn-meta graph IRI registers no graph by that
+/// name.
+#[tokio::test]
+async fn a_write_to_another_ledgers_system_graph_iri_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-alias";
+    let main = format!("{name}:main");
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .insert(ledger, &json!({"@id": "urn:seed", "urn:p": 1}))
+        .await
+        .unwrap();
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+
+    for (ledger_id, other) in [
+        (main.as_str(), config_graph_iri("elsewhere:main")),
+        (dev.as_str(), config_graph_iri(&main)),
+    ] {
+        let trig = fluree
+            .graph(ledger_id)
+            .transact()
+            .upsert_turtle(&uniqueness_in(&other, true))
+            .commit()
+            .await
+            .map(|_| ());
+        let jsonld = fluree
+            .graph(ledger_id)
+            .transact()
+            .upsert(&json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": other,
+                "f:transactDefaults": {"@id": "urn:config:transact", "f:uniqueEnabled": true}
+            }))
+            .commit()
+            .await
+            .map(|_| ());
+        let sparql = multi_op(
+            &fluree,
+            ledger_id,
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT DATA {{ GRAPH <{other}> {{
+                     <urn:config:main> a f:LedgerConfig ;
+                         f:transactDefaults <urn:config:transact> .
+                     <urn:config:transact> f:uniqueEnabled true .
+                 }} }}"
+            ),
+        )
+        .await
+        .map(|_| ());
+        // Wrapped as one of this ledger's graphs: `L#<g>` names the graph `<g>`.
+        let wrapped = multi_op(
+            &fluree,
+            ledger_id,
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT DATA {{ GRAPH <{ledger_id}#{other}> {{
+                     <urn:config:transact> f:uniqueEnabled true .
+                 }} }}"
+            ),
+        )
+        .await
+        .map(|_| ());
+        for (syntax, written) in [
+            ("TriG", trig),
+            ("JSON-LD", jsonld),
+            ("SPARQL", sparql),
+            ("SPARQL, as L#<g>", wrapped),
+        ] {
+            let err = written.expect_err(syntax);
+            assert_eq!(err.status_code(), 400, "{ledger_id} {syntax}: {err}");
+            assert!(
+                err.to_string().contains(&other)
+                    && err.to_string().contains(&config_graph_iri(ledger_id)),
+                "{ledger_id} {syntax}: {err}"
+            );
+        }
+        assert_eq!(
+            unique_enabled(&fluree, ledger_id).await,
+            None,
+            "{ledger_id}"
+        );
+        let ledger = fluree.ledger(ledger_id).await.unwrap();
+        assert!(
+            ledger
+                .snapshot
+                .graph_registry
+                .iter_entries()
+                .all(|(_, iri)| iri != other),
+            "{ledger_id}"
+        );
+    }
+
+    // Another ledger's or branch's txn-meta graph IRI, as written and wrapped:
+    // no write names it, so none registers a graph under it.
+    for (ledger_id, other) in [
+        (
+            main.as_str(),
+            fluree_db_core::graph_registry::txn_meta_graph_iri("elsewhere:main"),
+        ),
+        (
+            dev.as_str(),
+            fluree_db_core::graph_registry::txn_meta_graph_iri(&main),
+        ),
+    ] {
+        for graph in [other.clone(), format!("{ledger_id}#{other}")] {
+            let err = multi_op(
+                &fluree,
+                ledger_id,
+                &format!(
+                    "PREFIX ex: <http://example.org/>
+                     INSERT DATA {{ GRAPH <{graph}> {{ ex:a ex:b \"c\" }} }}"
+                ),
+            )
+            .await
+            .map(|_| ())
+            .expect_err(&graph);
+            assert_eq!(err.status_code(), 400, "{ledger_id} {graph}: {err}");
+            assert!(
+                err.to_string()
+                    .contains(&format!("<{other}> is the txn-meta graph of")),
+                "{ledger_id} {graph}: {err}"
+            );
+        }
+        let ledger = fluree.ledger(ledger_id).await.unwrap();
+        assert!(
+            ledger
+                .snapshot
+                .graph_registry
+                .iter_entries()
+                .all(|(_, iri)| iri != other),
+            "{ledger_id}"
+        );
+    }
+}
+
+/// An update's WHERE reads the config graph IRI of another branch as no graph,
+/// though the registry reads it as the ledger's own config graph: `GRAPH <…>`
+/// over it binds nothing, while the branch's own config graph IRI reads its
+/// config. On main naming dev's, and on dev naming main's.
+#[tokio::test]
+async fn an_updates_where_reads_another_branchs_config_graph_iri_as_no_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-where";
+    let main = format!("{name}:main");
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree.insert(ledger, &uniqueness_on()).await.unwrap();
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+
+    for (ledger_id, other) in [
+        (&main, config_graph_iri(&dev)),
+        (&dev, config_graph_iri(&main)),
+    ] {
+        let own = config_graph_iri(ledger_id);
+        sparql_update(
+            &fluree,
+            fluree.ledger(ledger_id).await.unwrap(),
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                 INSERT {{ ex:copy ex:fromOther ?o . ex:copy ex:fromOwn ?n }}
+                 WHERE {{ {{ GRAPH <{other}> {{ ?s f:uniqueEnabled ?o }} }}
+                          UNION {{ GRAPH <{own}> {{ ?s f:uniqueEnabled ?n }} }} }}"
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{ledger_id}: {e}"));
+        let ledger = fluree.ledger(ledger_id).await.unwrap();
+        for (property, expected) in [("ex:fromOwn", json!([true])), ("ex:fromOther", json!([]))] {
+            let rows = fluree
+                .query_connection(&json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "from": ledger_id,
+                    "select": "?v",
+                    "where": {"@id": "ex:copy", property: "?v"}
+                }))
+                .await
+                .expect("query")
+                .to_jsonld(&ledger.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(rows, expected, "{ledger_id}: {property}");
+        }
+    }
+}
+
+/// On a branch of an indexed ledger, whose txn-meta slot holds its source's
+/// txn-meta graph IRI until a build relabels it, an update's WHERE reads that
+/// IRI as no graph: `GRAPH <…main#txn-meta>` binds nothing.
+#[tokio::test]
+async fn an_updates_where_reads_the_sources_txn_meta_graph_iri_as_no_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-txn-meta-where";
+    let main = format!("{name}:main");
+    let main_txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(&main);
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .insert(ledger, &json!({"@id": "urn:seed", "urn:p": 1}))
+        .await
+        .unwrap();
+    support::rebuild_and_publish_index(&fluree, &main).await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    let ledger = fluree.ledger(&dev).await.unwrap();
+    assert_eq!(
+        ledger
+            .snapshot
+            .graph_registry
+            .iri_for_graph_id(fluree_db_core::graph_registry::TXN_META_GRAPH_ID),
+        Some(main_txn_meta.as_str()),
+        "the branch holds main's txn-meta graph IRI at its slot"
+    );
+    sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT {{ ex:copy ex:ran true . ex:copy ex:fromSource ?o }}
+             WHERE {{ OPTIONAL {{ GRAPH <{main_txn_meta}> {{ ?c ?p ?o }} }} }}"
+        ),
+    )
+    .await
+    .expect("update");
+    let ledger = fluree.ledger(&dev).await.unwrap();
+    for (property, expected) in [("ex:ran", json!([true])), ("ex:fromSource", json!([]))] {
+        let rows = fluree
+            .query_connection(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": dev,
+                "select": "?v",
+                "where": {"@id": "ex:copy", property: "?v"}
+            }))
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(rows, expected, "{property}");
+    }
+}
+
+/// A ledger `name` whose main's config sets reasoning `setting`, written
+/// before its branch `dev` is made.
+async fn reasoning_ledger(fluree: &fluree_db_api::Fluree, name: &str, setting: &str) {
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             ex:seed ex:p 1 .
+             GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+               f:reasoningDefaults <urn:config:r> . <urn:config:r> {setting} . }}",
+            config_graph_iri(&format!("{name}:main"))
+        ))
+        .execute()
+        .await
+        .expect("main's config");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+}
+
+/// `ledger_id` sets reasoning `setting` in its own config graph.
+async fn set_reasoning(fluree: &fluree_db_api::Fluree, ledger_id: &str, setting: &str) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{}> {{ <urn:config:r> {setting} . }}",
+            config_graph_iri(ledger_id)
+        ))
+        .commit()
+        .await
+        .expect("a reasoning setting");
+}
+
+/// `ledger_id`'s reasoning config.
+async fn reasoning_of(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> Option<fluree_db_core::ledger_config::ReasoningDefaults> {
+    fluree
+        .db(ledger_id)
+        .await
+        .unwrap()
+        .ledger_config()
+        .and_then(|c| c.reasoning.clone())
+}
+
+/// A setting a branch and its parent both changed since the fork, each in
+/// its own config graph IRI, is one setting: a merge from the parent (and
+/// its preview) and a rebase onto it resolve the conflict by the strategy.
+#[tokio::test]
+async fn a_setting_both_branches_changed_follows_the_strategy() {
+    use fluree_db_api::ConflictStrategy;
+    for (strategy, kept) in [
+        (ConflictStrategy::TakeSource, 300),
+        (ConflictStrategy::TakeBranch, 200),
+    ] {
+        for rebase in [false, true] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let name = format!("it-config-both-{kept}-{rebase}");
+            reasoning_ledger(&fluree, &name, "f:reasoningMaxFacts 100").await;
+            let dev = format!("{name}:dev");
+            set_reasoning(&fluree, &dev, "f:reasoningMaxFacts 200").await;
+            set_reasoning(&fluree, &format!("{name}:main"), "f:reasoningMaxFacts 300").await;
+            if rebase {
+                fluree
+                    .rebase_branch(&name, "dev", strategy)
+                    .await
+                    .expect("rebase");
+            } else {
+                let preview = fluree
+                    .merge_preview_with(
+                        &name,
+                        "main",
+                        Some("dev"),
+                        fluree_db_api::MergePreviewOpts {
+                            conflict_strategy: strategy,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(preview.mergeable, "{strategy:?}: the preview accepts");
+                fluree
+                    .merge_branch(&name, "main", Some("dev"), strategy)
+                    .await
+                    .expect("merge");
+            }
+            assert_eq!(
+                reasoning_of(&fluree, &dev).await.and_then(|r| r.max_facts),
+                Some(kept),
+                "{strategy:?}, rebase {rebase}"
+            );
+        }
+    }
+}
+
+/// Reverting a branch's commits that changed a setting under two config
+/// graph IRIs (its parent's, merged in, then its own) puts the setting back:
+/// the undo is one change to one setting, not a retraction under one IRI and
+/// an assertion under the other at one `t`, where the retraction would win.
+#[tokio::test]
+async fn a_revert_across_two_config_graph_iris_restores_the_setting() {
+    use fluree_db_api::{CommitRef, ConflictStrategy};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-revert-two-iris";
+    reasoning_ledger(&fluree, name, "f:reasoningModes \"rdfs\"").await;
+    let dev = format!("{name}:dev");
+    set_reasoning(
+        &fluree,
+        &format!("{name}:main"),
+        "f:reasoningModes \"owl2rl\"",
+    )
+    .await;
+    fluree
+        .merge_branch(name, "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .expect("main merges into dev");
+    let merged = fluree.ledger(&dev).await.unwrap().t();
+    set_reasoning(&fluree, &dev, "f:reasoningModes \"rdfs\"").await;
+    let own = fluree.ledger(&dev).await.unwrap().t();
+
+    fluree
+        .revert_commits(
+            name,
+            "dev",
+            vec![CommitRef::T(merged), CommitRef::T(own)],
+            ConflictStrategy::Abort,
+        )
+        .await
+        .expect("revert");
+    assert_eq!(
+        reasoning_of(&fluree, &dev).await.and_then(|r| r.modes),
+        Some(vec!["rdfs".to_string()])
+    );
+}
+
+/// An index from before every ledger's config graph IRI named the config
+/// graph can hold one as an ordinary graph, its rows under that graph's id: a
+/// copy whose source's config commits named the source's config graph, indexed
+/// before this change. The copy is served as that index reads it, with no
+/// config, and an incremental build keeps it so. A reindex rebuilds the index
+/// from the commits, which name the config graph: its settings apply, its
+/// full-text property among them.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_reindexed() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_core::ContentKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let source = "it/legacy-source:main";
+    let source_config = config_graph_iri(source);
+    fluree.create_ledger("it/legacy-source").await.unwrap();
+    fluree
+        .graph(source)
+        .transact()
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> . ex:seed ex:p 1 .
+             GRAPH <urn:legacy:holder> { ex:a ex:p 1 . }",
+        )
+        .commit()
+        .await
+        .unwrap();
+    fluree
+        .reindex(source, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    for trig in [
+        uniqueness_in(&source_config, true),
+        full_text_title_in(&source_config),
+        r#"@prefix ex: <http://example.org/> . ex:doc1 ex:title "Advanced Rust systems" ."#
+            .to_string(),
+    ] {
+        fluree
+            .graph(source)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap();
+    }
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(source, true, &mut archive)
+        .await
+        .unwrap();
+    let id = fluree
+        .restore_ledger("it/legacy-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+
+    // The root as such an index lists the graphs: the copy's own config graph
+    // at the config graph's slot, and the source's config graph as an
+    // ordinary graph, which the source's later config commits write.
+    let store = fluree.content_store(&id);
+    let root_iris = || async {
+        let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+        let bytes = store
+            .get(record.index_head_id.as_ref().unwrap())
+            .await
+            .unwrap();
+        (record, IndexRoot::decode(&bytes).unwrap())
+    };
+    let (record, mut root) = root_iris().await;
+    let slot = root
+        .graph_iris
+        .iter()
+        .position(|iri| iri == "urn:legacy:holder")
+        .unwrap();
+    assert!(slot >= 2, "{:?}", root.graph_iris);
+    root.graph_iris[1] = config_graph_iri(&id);
+    root.graph_iris[slot] = source_config.clone();
+    let root_id = store
+        .put(ContentKind::IndexRoot, &root.encode())
+        .await
+        .unwrap();
+    support::publish_built_index(&fluree, &id, record.index_t, &root_id).await;
+    fluree.disconnect_ledger(&id).await;
+
+    let a_in_source_config = || async {
+        let result = fluree
+            .graph(&id)
+            .query()
+            .sparql(&format!(
+                "SELECT ?o WHERE {{ GRAPH <{source_config}> {{ <http://example.org/a> <http://example.org/p> ?o }} }}"
+            ))
+            .execute_formatted()
+            .await
+            .expect("query the graph");
+        result["results"]["bindings"].as_array().map(Vec::len)
+    };
+    for build in ["as published", "built incrementally"] {
+        if build == "built incrementally" {
+            support::build_incrementally_and_publish_index(&fluree, &id).await;
+            fluree.disconnect_ledger(&id).await;
+            assert_eq!(root_iris().await.1.graph_iris[slot], source_config);
+        }
+        assert_eq!(a_in_source_config().await, Some(1), "{build}");
+        assert_eq!(unique_enabled(&fluree, &id).await, None, "{build}");
+        assert!(title_hits(&fluree, &id, "Rust").await.is_empty(), "{build}");
+    }
+
+    fluree
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(unique_enabled(&fluree, &id).await, Some(true));
+    assert_eq!(title_hits(&fluree, &id, "Rust").await, ["ex:doc1"]);
+}
+
+/// A branch whose index holds its source's config graph as an ordinary graph
+/// (made before its source's first index build, indexed before this change)
+/// takes a merge from its source as that index reads it: the source's config
+/// changes land in that ordinary graph, not as the branch's config. A rebuild
+/// from the commits reads them as config.
+#[tokio::test]
+async fn a_merge_into_an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_core::ContentKind;
+
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let name = "it/legacy-merge";
+    let main = format!("{name}:main");
+    let main_config = config_graph_iri(&main);
+    fluree.create_ledger(name).await.unwrap();
+    // The source writes its config graph before the fork, as the history of
+    // such a branch does, which registers that graph's namespace. Its later
+    // config names no namespace new since the fork, which a merge would
+    // refuse as a conflict with the branch's.
+    fluree
+        .graph(&main)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix ex: <http://example.org/> .
+             GRAPH <urn:legacy:holder> {{ ex:a ex:p 1 . <urn:config:seed> ex:p 1 . }}
+             GRAPH <{main_config}> {{ ex:note ex:p 1 . }}"
+        ))
+        .commit()
+        .await
+        .unwrap();
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    support::rebuild_and_publish_index(&fluree, &dev).await;
+
+    // The root as such an index lists the graph: under the source's config
+    // graph IRI.
+    let store = fluree.branched_content_store(&dev).await.unwrap();
+    let record = fluree.nameservice().lookup(&dev).await.unwrap().unwrap();
+    let bytes = store
+        .get(record.index_head_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let mut root = IndexRoot::decode(&bytes).unwrap();
+    let slot = root
+        .graph_iris
+        .iter()
+        .position(|iri| iri == "urn:legacy:holder")
+        .unwrap();
+    assert!(slot >= 2, "{:?}", root.graph_iris);
+    root.graph_iris[slot] = main_config.clone();
+    let root_id = store
+        .put(ContentKind::IndexRoot, &root.encode())
+        .await
+        .unwrap();
+    support::publish_built_index(&fluree, &dev, record.index_t, &root_id).await;
+    fluree.disconnect_ledger(&dev).await;
+
+    let main_ledger = fluree.ledger(&main).await.unwrap();
+    fluree.insert(main_ledger, &uniqueness_on()).await.unwrap();
+    // The branch writes its own config graph.
+    fluree
+        .graph(&dev)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix ex: <http://example.org/> . GRAPH <{}> {{ ex:note ex:p 2 . }}",
+            config_graph_iri(&dev)
+        ))
+        .commit()
+        .await
+        .unwrap();
+    fluree
+        .merge_branch(
+            name,
+            "main",
+            Some("dev"),
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("merge main into dev");
+
+    assert_eq!(unique_enabled(&fluree, &dev).await, None);
+    let rows = fluree
+        .graph(&dev)
+        .query()
+        .sparql(&format!(
+            "SELECT ?on WHERE {{ GRAPH <{main_config}> {{ <urn:config:transact> <https://ns.flur.ee/db#uniqueEnabled> ?on }} }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("query the graph");
+    assert_eq!(
+        rows["results"]["bindings"].as_array().map(Vec::len),
+        Some(1),
+        "{rows}"
+    );
+
+    support::rebuild_and_publish_index(&fluree, &dev).await;
+    fluree.disconnect_ledger(&dev).await;
+    assert_eq!(unique_enabled(&fluree, &dev).await, Some(true));
+}
+
+/// TriG naming `ex:title` a full-text property, in the graph `graph`.
+fn full_text_title_in(graph: &str) -> String {
+    format!(
+        "@prefix f: <https://ns.flur.ee/db#> .
+         @prefix ex: <http://example.org/> .
+         GRAPH <{graph}> {{
+             <urn:config:main> a f:LedgerConfig ;
+                 f:fullTextDefaults <urn:config:ft> .
+             <urn:config:ft> a f:FullTextDefaults ;
+                 f:property <urn:config:ft:title> .
+             <urn:config:ft:title> a f:FullTextProperty ;
+                 f:target ex:title .
+         }}"
+    )
+}
+
+/// The subjects whose `ex:title` scores for `text` in `ledger_id`, sorted.
+async fn title_hits(fluree: &fluree_db_api::Fluree, ledger_id: &str, text: &str) -> Vec<String> {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ledger_id,
+        "select": "?id",
+        "where": [
+            {"@id": "?id", "ex:title": "?title"},
+            ["bind", "?score", format!("(fulltext ?title \"{text}\")")],
+            ["filter", "(> ?score 0)"]
+        ]
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("full-text query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let mut hits: Vec<String> = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    hits.sort();
+    hits
+}
+
+/// Build `ledger_id`'s index as the background indexer does, its full-text
+/// properties read from the ledger's config at the build.
+async fn build_with_full_text_config(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let result = fluree_db_indexer::build_index_for_ledger(
+        fluree.branched_content_store(ledger_id).await.unwrap(),
+        fluree.nameservice(),
+        ledger_id,
+        fluree_db_indexer::IndexerConfig::default()
+            .with_fulltext_config_provider(fluree.fulltext_config_provider()),
+    )
+    .await
+    .expect("index build");
+    support::publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+}
+
+/// A branch, or a copy under another name, indexes the full-text property its
+/// source's config names: the indexer reads the config under the source's
+/// config graph IRI, at the first build and at the builds after it.
+#[tokio::test]
+async fn a_branch_or_copy_indexes_its_sources_full_text_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let source = "it/ft-source:main";
+    fluree.create_ledger("it/ft-source").await.unwrap();
+    for trig in [
+        full_text_title_in(&config_graph_iri(source)),
+        r#"@prefix ex: <http://example.org/> . ex:doc1 ex:title "Advanced Rust systems" ."#
+            .to_string(),
+    ] {
+        fluree
+            .graph(source)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap();
+    }
+    fluree
+        .create_branch("it/ft-source", "dev", None, None)
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(source, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/ft-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+
+    for ledger_id in ["it/ft-source:dev".to_string(), copy] {
+        build_with_full_text_config(&fluree, &ledger_id).await;
+        assert_eq!(
+            title_hits(&fluree, &ledger_id, "Rust").await,
+            ["ex:doc1"],
+            "{ledger_id}"
+        );
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .upsert_turtle(
+                r#"@prefix ex: <http://example.org/> . ex:doc2 ex:title "Rust in production" ."#,
+            )
+            .commit()
+            .await
+            .unwrap();
+        build_with_full_text_config(&fluree, &ledger_id).await;
+        assert_eq!(
+            title_hits(&fluree, &ledger_id, "Rust").await,
+            ["ex:doc1", "ex:doc2"],
+            "{ledger_id}"
+        );
+    }
+}
+
+/// A push carrying config under two config graph IRIs, a branch's history with
+/// its source's config from before the fork and its own after, applies both
+/// to the config graph: a ledger of another name receiving it reads the config
+/// the branch does, as pushed and once reloaded.
+#[tokio::test]
+async fn a_push_carrying_config_under_two_iris_applies_both() {
+    let source = FlureeBuilder::memory().without_indexing().build_memory();
+    let name = "it/push-two-configs";
+    let main = source.create_ledger(name).await.unwrap();
+    let main = source.insert(main, &uniqueness_on()).await.unwrap().ledger;
+    source.insert(main, &unique_email("ex:u1")).await.unwrap();
+    source.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    let dev_config = config_graph_iri(&dev);
+    sparql_update(
+        &source,
+        source.ledger(&dev).await.unwrap(),
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ GRAPH <{dev_config}> {{ <urn:config:transact> f:uniqueEnabled ?on }} }} \
+             INSERT {{ GRAPH <{dev_config}> {{ <urn:config:transact> f:uniqueEnabled false }} }} \
+             WHERE {{ GRAPH <{dev_config}> {{ <urn:config:transact> f:uniqueEnabled ?on }} }}"
+        ),
+    )
+    .await
+    .expect("turn uniqueness off on the branch");
+    assert_eq!(unique_enabled(&source, &dev).await, Some(false));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let target = FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let remote = "it/push-two-configs-remote:main";
+    target.create_ledger(remote).await.unwrap();
+    let pushed = target
+        .push_commits(
+            remote,
+            newest_commits(&source, &dev, 100).await,
+            &GovernanceOptions::default(),
+            &target.default_index_config(),
+        )
+        .await
+        .expect("push");
+    assert_eq!(pushed.accepted, 3);
+    assert_eq!(unique_enabled(&target, remote).await, Some(false));
+    drop(target);
+    let reloaded = FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .unwrap();
+    assert_eq!(unique_enabled(&reloaded, remote).await, Some(false));
+}
+
+/// The policy a source's config sets governs a request carrying no policy of
+/// its own on a branch of the source, or on a copy under another name, as on
+/// the source: it sees what the policy allows and nothing else, and can change
+/// neither the config nor the policy rules, so it cannot grant itself access.
+/// A branch of an unindexed source, before and after the branch is indexed,
+/// and a copy.
+#[tokio::test]
+async fn a_sources_policy_governs_its_branch_and_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let name = "it/policy-source";
+    let source = format!("{name}:main");
+    fluree.create_ledger(name).await.unwrap();
+    fluree
+        .graph(&source)
+        .transact()
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice", "ex:ssn": "111-11-1111"},
+                {
+                    "@id": "ex:viewNames",
+                    "@type": ["f:AccessPolicy", "ex:UserPolicy"],
+                    "f:action": {"@id": "f:view"},
+                    "f:onProperty": [{"@id": "ex:name"}],
+                    "f:allow": true
+                },
+                {
+                    "@id": "ex:modifyNames",
+                    "@type": ["f:AccessPolicy", "ex:UserPolicy"],
+                    "f:action": {"@id": "f:modify"},
+                    "f:onProperty": [{"@id": "ex:name"}],
+                    "f:allow": true
+                }
+            ]
+        }))
+        .commit()
+        .await
+        .unwrap();
+    fluree
+        .graph(&source)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             @prefix ex: <http://example.org/> .
+             GRAPH <{}> {{
+                 <urn:config:main> a f:LedgerConfig ;
+                     f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow false ;
+                     f:policyClass ex:UserPolicy .
+             }}",
+            config_graph_iri(&source)
+        ))
+        .commit()
+        .await
+        .unwrap();
+    assert_policy_confines(&fluree, &source).await;
+
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    assert_policy_confines(&fluree, &dev).await;
+    support::rebuild_and_publish_index(&fluree, &dev).await;
+    fluree.disconnect_ledger(&dev).await;
+    assert_policy_confines(&fluree, &dev).await;
+
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&source, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/policy-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    assert_policy_confines(&fluree, &copy).await;
+}
+
+/// Under `ledger_id`'s config policy, a request with no policy of its own
+/// reads `ex:alice`'s name but not her SSN, and writes a name but not the
+/// config, by keyword or by its IRI, nor the policy rules.
+async fn assert_policy_confines(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let alice = |property: &str| {
+        let mut query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": ledger_id,
+            "select": "?v",
+            "where": {"@id": "ex:alice"}
+        });
+        query["where"][property] = json!("?v");
+        query
+    };
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    for (property, expected) in [("ex:name", json!(["Alice"])), ("ex:ssn", json!([]))] {
+        let rows = fluree
+            .query_connection(&alice(property))
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(rows, expected, "{ledger_id}: {property}");
+    }
+
+    let policy = fluree_db_api::build_transact_policy_context(
+        fluree,
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &GovernanceOptions::default(),
+    )
+    .await
+    .unwrap()
+    .expect("the config's policy governs writes");
+    // The policy lets the request modify `ex:name`, so the refusals below are
+    // of the config and the rules, not of every write.
+    fluree
+        .stage_owned(ledger.clone())
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:bob",
+            "ex:name": "Bob"
+        }))
+        .policy(policy.clone())
+        .stage()
+        .await
+        .unwrap_or_else(|e| panic!("{ledger_id}: write a name: {e}"));
+    let open_config = |graph: &str| {
+        json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": "urn:config:policy",
+            "@graph": graph,
+            "f:defaultAllow": true
+        })
+    };
+    for (what, doc) in [
+        ("open the config", open_config("config")),
+        (
+            "open the config by its IRI",
+            open_config(&config_graph_iri(ledger_id)),
+        ),
+        (
+            "grant itself access",
+            json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:viewAll",
+                "@type": ["f:AccessPolicy", "ex:UserPolicy"],
+                "f:action": {"@id": "f:view"},
+                "f:allow": true
+            }),
+        ),
+    ] {
+        let err = fluree
+            .stage_owned(ledger.clone())
+            .insert(&doc)
+            .policy(policy.clone())
+            .stage()
+            .await
+            .map(|_| ())
+            .expect_err(what);
+        assert_eq!(err.status_code(), 403, "{ledger_id}: {what}: {err}");
+    }
 }

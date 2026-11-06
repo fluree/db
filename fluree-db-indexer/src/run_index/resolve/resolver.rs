@@ -719,7 +719,7 @@ impl CommitResolver {
         }
         let prefix = self.lookup_prefix(ns_code);
         // +1 to reserve 0 for default graph
-        let raw = dicts.graphs.get_or_insert_parts(prefix, name) + 1;
+        let raw = dicts.graphs.graph_dict_id_or_insert_parts(prefix, name) + 1;
         if raw > u16::MAX as u32 {
             return Err(io::Error::other(format!(
                 "graph count {raw} exceeds u16::MAX"
@@ -1165,9 +1165,12 @@ impl SharedResolverState {
     /// from the root's inline vectors using `from_ordered_vec()` for exact
     /// ID stability. Validates critical invariants:
     /// - First 14 datatypes match `new_datatype_dict()` reserved order
-    /// - `graph_iris[0]` is the txn-meta graph IRI
+    /// - `graph_iris[0]` is a txn-meta graph IRI
+    ///
+    /// The system graphs take `ledger_id`'s IRIs, the ledger being built.
     pub fn from_index_root(
         root: &fluree_db_binary_index::format::index_root::IndexRoot,
+        ledger_id: &str,
     ) -> Result<Self, ResolverError> {
         use fluree_db_core::value_id::ValueTypeTag;
         use std::sync::Arc;
@@ -1194,14 +1197,28 @@ impl SharedResolverState {
             .collect();
         let predicates = super::global_dict::PredicateDict::from_ordered_iris(pred_iris);
 
-        let expected_txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(&root.ledger_id);
-        if root.graph_iris.is_empty() || root.graph_iris[0] != expected_txn_meta {
+        use fluree_db_core::graph_registry::{
+            config_graph_iri, names_config_graph, names_txn_meta_graph, txn_meta_graph_iri,
+        };
+        // Any ledger's txn-meta IRI: a copy under another name, a branch, or
+        // a ledger that adopted a branch's index starts from another's root.
+        let expected_txn_meta = txn_meta_graph_iri(ledger_id);
+        if root.graph_iris.is_empty()
+            || (root.graph_iris[0] != expected_txn_meta
+                && !names_txn_meta_graph(&root.graph_iris[0]))
+        {
             return Err(ResolverError::Resolve(format!(
                 "graph_iris[0] must be txn-meta IRI '{}', got: {:?}",
                 expected_txn_meta,
                 root.graph_iris.first()
             )));
         }
+        // An index built before config graphs were read across ledgers may
+        // hold another ledger's config graph as a user graph. It keeps that
+        // graph, as the query side reads it, until a rebuild from the commits.
+        // The system graphs under this ledger's own IRIs, which the root this
+        // build writes then carries.
+        //
         // Upgrade legacy roots that only contain txn-meta by inserting the config graph IRI
         // into slot 1 (g_id=2). This aligns indexed graph IDs with in-memory graph ID
         // allocation (`GraphRegistry::apply_delta` starts user graphs at g_id=3).
@@ -1213,9 +1230,12 @@ impl SharedResolverState {
             .iter()
             .map(|s| Arc::from(s.as_str()))
             .collect();
-        if graph_iris.len() == 1 {
-            let config_iri = fluree_db_core::graph_registry::config_graph_iri(&root.ledger_id);
-            graph_iris.push(Arc::from(config_iri.as_str()));
+        graph_iris[0] = Arc::from(expected_txn_meta.as_str());
+        let own_config: Arc<str> = Arc::from(config_graph_iri(ledger_id).as_str());
+        match graph_iris.get_mut(1) {
+            Some(config) if names_config_graph(config) => *config = own_config,
+            Some(_) => {}
+            None => graph_iris.push(own_config),
         }
         let graphs = super::global_dict::PredicateDict::from_ordered_iris(graph_iris);
 
@@ -1358,7 +1378,7 @@ impl SharedResolverState {
                     config.add_per_graph(1, p_id);
                 }
                 ConfiguredFulltextScope::NamedGraph(iri) => {
-                    let raw = self.graphs.get_or_insert(iri) + 1;
+                    let raw = self.graphs.graph_dict_id_or_insert(iri) + 1;
                     if raw > u16::MAX as u32 {
                         tracing::warn!(
                             graph_iri = %iri,
@@ -1599,7 +1619,7 @@ impl SharedResolverState {
             .get(&ns_code)
             .map(std::string::String::as_str)
             .unwrap_or("");
-        let raw = self.graphs.get_or_insert_parts(prefix, name) + 1;
+        let raw = self.graphs.graph_dict_id_or_insert_parts(prefix, name) + 1;
         if raw > u16::MAX as u32 {
             return Err(io::Error::other(format!(
                 "graph count {raw} exceeds u16::MAX"

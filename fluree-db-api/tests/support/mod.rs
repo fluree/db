@@ -347,7 +347,9 @@ pub async fn seed_user_with_ssn(
 /// Use this in regression tests that need to exercise the FIR6/binary-only
 /// reload path rather than the purely in-memory novelty path. The rebuild
 /// replaces an index already published at the same `t`, so a test that asks
-/// for a full rebuild reads one ([`publish_built_index`]).
+/// for a full rebuild reads one ([`publish_built_index`]). A branch's
+/// pre-fork commits live in its source's namespace, so the rebuild reads
+/// through the branch-aware store.
 pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let record = fluree
         .nameservice()
