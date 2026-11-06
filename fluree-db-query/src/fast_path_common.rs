@@ -2313,14 +2313,115 @@ pub fn cached_overlay_ops(
     // A concurrent miss on the same key duplicates the walk (acceptable —
     // last write wins with an identical value) but never holds the lock
     // across the walk.
-    let computed = collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
-        .map(SharedOverlayOps::from);
+    let computed = resolved_overlay_ops_cross_query(ctx, store, g_id, order, pred_sid)?;
     bound
         .map
         .lock()
         .expect("overlay ops cache poisoned")
         .insert(key, computed.clone());
     Ok(computed)
+}
+
+/// Cross-query layer under [`cached_overlay_ops`]. A predicate's resolved ops
+/// are a function of the state a [`GlobalTranslationKey`] names, and a
+/// reasoning materialization's derived extents cost a dictionary translation
+/// per fact, so they are translated once rather than once per query.
+fn resolved_overlay_ops_cross_query(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    let collect = || -> Result<Option<SharedOverlayOps>> {
+        Ok(
+            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+                .map(SharedOverlayOps::from),
+        )
+    };
+    // An overlay that cannot vouch for its content is not cached across
+    // queries (see `GlobalTranslationKey`).
+    let Some(content_version) = ctx.overlay().content_version() else {
+        return collect();
+    };
+    let key = (
+        crate::binary_scan::GlobalTranslationKey {
+            ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
+            snapshot_t: ctx.active_snapshot.t,
+            content_version,
+            store_id: store.store_id(),
+            to_t: ctx.to_t,
+            g_id,
+            index: crate::binary_scan::sort_order_to_index_type(order),
+        },
+        pred_sid.clone(),
+    );
+    if let Some(hit) = global_pred_ops_cache().get(&key) {
+        return Ok(Some(hit));
+    }
+    let computed = collect()?;
+    if let Some(ops) = &computed {
+        global_pred_ops_cache().insert(key, ops.clone());
+    }
+    Ok(computed)
+}
+
+type PredOpsKey = (crate::binary_scan::GlobalTranslationKey, Sid);
+
+/// Ops the cross-query per-predicate cache retains in total (~40 B each).
+const PRED_OPS_CACHE_MAX_OPS: usize = 1 << 22;
+
+/// LRU of per-predicate resolved ops, bounded by the ops it retains: one
+/// derived `rdf:type` extent can hold millions, and every commit mints new
+/// keys.
+struct PredOpsCache {
+    inner: std::sync::Mutex<PredOpsLru>,
+}
+
+struct PredOpsLru {
+    entries: lru::LruCache<PredOpsKey, SharedOverlayOps>,
+    retained_ops: usize,
+}
+
+impl PredOpsCache {
+    fn get(&self, key: &PredOpsKey) -> Option<SharedOverlayOps> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(key)
+            .cloned()
+    }
+
+    fn insert(&self, key: PredOpsKey, ops: SharedOverlayOps) {
+        if ops.len() > PRED_OPS_CACHE_MAX_OPS {
+            return;
+        }
+        let mut lru = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lru.retained_ops += ops.len();
+        if let Some(replaced) = lru.entries.put(key, ops) {
+            lru.retained_ops -= replaced.len();
+        }
+        while lru.retained_ops > PRED_OPS_CACHE_MAX_OPS {
+            let Some((_, evicted)) = lru.entries.pop_lru() else {
+                break;
+            };
+            lru.retained_ops -= evicted.len();
+        }
+    }
+}
+
+fn global_pred_ops_cache() -> &'static PredOpsCache {
+    static CACHE: std::sync::LazyLock<PredOpsCache> = std::sync::LazyLock::new(|| PredOpsCache {
+        inner: std::sync::Mutex::new(PredOpsLru {
+            entries: lru::LruCache::unbounded(),
+            retained_ops: 0,
+        }),
+    });
+    &CACHE
 }
 
 /// Fate of a base row checked against a predicate's overlay ops.
@@ -2692,6 +2793,12 @@ pub(crate) fn policy_lane_for_predicates(
     verdict
 }
 
+/// An eager (reasoning) caller with an overlay to merge. Lanes that emit
+/// their own encoded bindings decline it; [`probe_lane_admission`] does not.
+pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.eager_materialization && !ctx.overlay_free_single_graph()
+}
+
 /// Admission shared by every probe lane and by the join's early routing
 /// decision: `Some(plan)` settles the lane without consulting the overlay,
 /// `None` means plan against it.
@@ -2722,12 +2829,9 @@ pub(crate) fn probe_lane_admission(
     if ctx.overlay_free_single_graph() {
         return Some(ProbeLanePlan::Clean);
     }
-    // Eager-materialization callers (reasoning queries with Sid-space derived
-    // overlays, federated queries) need the per-row path: probes emit
-    // encoded bindings and merge only V3-translated novelty.
-    if ctx.eager_materialization {
-        return Some(ProbeLanePlan::Decline);
-    }
+    // Eager callers (reasoning) are admitted: the resolved ops carry the
+    // derived facts, and `build_probe_object_binding` decodes under eager.
+    // A lane that emits its own encoded bindings declines eager itself.
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
         return Some(ProbeLanePlan::Decline);
     }

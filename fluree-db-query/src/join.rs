@@ -40,6 +40,8 @@ use tracing::Instrument;
 /// work; the per-join success path is otherwise far too noisy for perf captures.
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
+/// Entries the decoded-key memo holds before it starts over.
+const BATCHED_KEY_MEMO_CAP: usize = 1 << 18;
 
 fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
     count
@@ -822,6 +824,10 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
+    /// Decoded left keys (`Sid`/`IriMatch`) resolved to raw `s_id`s. Eager
+    /// left streams repeat subjects across many rows, and each reverse
+    /// dictionary lookup costs microseconds.
+    batched_key_memo: FxHashMap<Sid, Option<u64>>,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
     /// doesn't buffer ~100k left rows before producing anything. Each flush
@@ -1073,6 +1079,7 @@ impl NestedLoopJoinOperator {
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
+            batched_key_memo: FxHashMap::default(),
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1337,6 +1344,7 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
+        self.batched_key_memo.clear();
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1392,14 +1400,11 @@ impl Operator for NestedLoopJoinOperator {
         let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
                 && !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline)
-                // The batched path reads binary leaves directly and works in
-                // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
-                // subject vars). Whenever eager materialization is required —
-                // reasoning queries (derived facts in the overlay are `Sid` and
-                // must join with base rows), federated queries, or any other
-                // caller that sets this flag — fall back to the per-row path,
-                // which merges the overlay and honours eager decoding.
-                && !ctx.eager_materialization
+                // Under eager materialization (reasoning, datalog rule
+                // bodies) the lanes emit decoded bindings, as the per-row path
+                // does. Multi-ledger eager rows also need `IriMatch`
+                // provenance, which only the per-row path stamps.
+                && !(ctx.eager_materialization && ctx.is_multi_ledger())
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
@@ -1544,11 +1549,20 @@ impl Operator for NestedLoopJoinOperator {
                     // the batched lane (the merge injects their facts) instead
                     // of each paying a per-row fallback scan. The dictionaries
                     // are read only for a decoded subject.
-                    let resolve_subject = |sid: &Sid| -> Option<u64> {
-                        TermDicts::of(ctx)?
+                    let memo = &mut self.batched_key_memo;
+                    let mut resolve_subject = |sid: &Sid| -> Option<u64> {
+                        if let Some(&hit) = memo.get(sid) {
+                            return hit;
+                        }
+                        let s_id = TermDicts::of(ctx)?
                             .subject_id(sid.namespace_code, &sid.name)
                             .ok()
-                            .flatten()
+                            .flatten();
+                        if memo.len() >= BATCHED_KEY_MEMO_CAP {
+                            memo.clear();
+                        }
+                        memo.insert(sid.clone(), s_id);
+                        s_id
                     };
                     match left_batch.get_by_col(left_row, left_col) {
                         Binding::EncodedSid { s_id, .. } => Some(*s_id),
@@ -2079,8 +2093,6 @@ impl NestedLoopJoinOperator {
         mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
-        use fluree_db_core::o_type::OType;
-
         let scan_start = Instant::now();
 
         let mut leaflets_scanned: u64 = 0;
@@ -2182,24 +2194,16 @@ impl NestedLoopJoinOperator {
                             continue;
                         }
 
-                        let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
-                            || o_type_val == OType::BLANK_NODE.as_u16()
-                        {
-                            Binding::encoded_sid(o_key_val)
-                        } else {
-                            let o_i = batch.o_i.get_or(row, u32::MAX);
-                            let t = batch.t.get_or(row, 0) as i64;
-                            build_probe_object_binding(
-                                ctx,
-                                store,
-                                dict_overlay.as_ref(),
-                                p_id,
-                                o_type_val,
-                                o_key_val,
-                                o_i,
-                                t,
-                            )?
-                        };
+                        let obj_binding = subject_lane_object_binding(
+                            ctx,
+                            store,
+                            dict_overlay.as_ref(),
+                            p_id,
+                            o_type_val,
+                            o_key_val,
+                            batch.o_i.get_or(row, u32::MAX),
+                            batch.t.get_or(row, 0) as i64,
+                        )?;
 
                         on_match(accum_indices, &obj_binding)?;
                     }
@@ -2227,22 +2231,16 @@ impl NestedLoopJoinOperator {
                     )? {
                         return Ok(());
                     }
-                    let obj_binding = if op.o_type == OType::IRI_REF.as_u16()
-                        || op.o_type == OType::BLANK_NODE.as_u16()
-                    {
-                        Binding::encoded_sid(op.o_key)
-                    } else {
-                        build_probe_object_binding(
-                            ctx,
-                            store,
-                            dict_overlay.as_ref(),
-                            p_id,
-                            op.o_type,
-                            op.o_key,
-                            op.o_i,
-                            op.t,
-                        )?
-                    };
+                    let obj_binding = subject_lane_object_binding(
+                        ctx,
+                        store,
+                        dict_overlay.as_ref(),
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                        op.o_i,
+                        op.t,
+                    )?;
                     matched_rows += 1;
                     on_match(accum_indices, &obj_binding)
                 })?;
@@ -2730,6 +2728,11 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
         let accums: Vec<&[usize]> = objs.iter().map(|o| o_to_accum[o].as_slice()).collect();
+        let eager_dicts = if ctx.eager_materialization {
+            make_dict_overlay(ctx, &store)
+        } else {
+            None
+        };
 
         let this = &*self;
         for_each_object_probe_match(
@@ -2740,9 +2743,14 @@ impl NestedLoopJoinOperator {
             &objs,
             probe_ops.as_mut(),
             |obj_idx, s_id| {
+                let subject = if ctx.eager_materialization {
+                    Binding::sid(probe_subject_sid(&store, eager_dicts.as_ref(), s_id)?)
+                } else {
+                    Binding::encoded_sid(s_id)
+                };
                 this.emit_object_probe_match(
                     ctx,
-                    s_id,
+                    &subject,
                     accums[obj_idx],
                     &mut scatter,
                     &mut matched_rows,
@@ -2779,7 +2787,7 @@ impl NestedLoopJoinOperator {
     fn emit_object_probe_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        s_id: u64,
+        subject: &Binding,
         accum_idxs: &[usize],
         scatter: &mut [Vec<Vec<Binding>>],
         matched_rows: &mut u64,
@@ -2791,7 +2799,7 @@ impl NestedLoopJoinOperator {
             })?;
             let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
             for _ in &self.right_new_vars {
-                right_bindings.push(Binding::encoded_sid(s_id));
+                right_bindings.push(subject.clone());
             }
             if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
                 continue;
@@ -2936,9 +2944,47 @@ fn term_matches_probe_value(
     }
 }
 
-/// Object binding for a non-ref row matched on a batched lane: the scan's
+/// Object binding for a row of the subject-probe lane. Refs stay raw
+/// subject ids except under eager materialization.
+#[allow(clippy::too_many_arguments)]
+fn subject_lane_object_binding(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+    o_i: u32,
+    t: i64,
+) -> Result<Binding> {
+    use fluree_db_core::o_type::OType;
+    let is_ref = o_type == OType::IRI_REF.as_u16() || o_type == OType::BLANK_NODE.as_u16();
+    if is_ref && !ctx.eager_materialization {
+        return Ok(Binding::encoded_sid(o_key));
+    }
+    build_probe_object_binding(ctx, store, dict_overlay, p_id, o_type, o_key, o_i, t)
+}
+
+/// The `Sid` the per-row scan decodes for `s_id`: through the overlay's
+/// novelty-aware graph view when there is one, else the store's parts.
+fn probe_subject_sid(
+    store: &BinaryIndexStore,
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    s_id: u64,
+) -> Result<Sid> {
+    let sid = match dict_overlay {
+        Some(ov) => ov.resolve_subject_sid(s_id),
+        None => store
+            .resolve_subject_parts(s_id)
+            .and_then(|(ns_code, suffix)| store.subject_sid_of_parts(ns_code, suffix)),
+    };
+    sid.map_err(|e| QueryError::from_io("resolve_subject_sid", e))
+}
+
+/// Object binding for a row matched on a batched lane: the scan's
 /// late-materialized form when it has one, so every lane keys a literal
 /// alike, else the decoded value (novelty ids resolve through `dict_overlay`).
+/// Eager callers always get the decoded form.
 #[allow(clippy::too_many_arguments)]
 fn build_probe_object_binding(
     ctx: &ExecutionContext<'_>,
@@ -2953,7 +2999,19 @@ fn build_probe_object_binding(
     if let Some(binding) =
         late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
     {
-        return Ok(binding);
+        // Eager callers get what the per-row scan emits: a datalog rule head
+        // built from an encoded binding derives nothing.
+        match binding {
+            Binding::EncodedSid { .. } if ctx.eager_materialization => {
+                return Ok(Binding::Sid {
+                    sid: probe_subject_sid(store, dict_overlay, o_key_val)?,
+                    t: Some(t),
+                    op: None,
+                });
+            }
+            Binding::EncodedLit { .. } if ctx.eager_materialization => {}
+            other => return Ok(other),
+        }
     }
 
     let val = decode_overlay_object(ctx, store, dict_overlay, p_id, o_type_val, o_key_val)?;

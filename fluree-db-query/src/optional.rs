@@ -1170,7 +1170,10 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
     /// grouped triple, so the operator never buffers the driving side
     /// just to fall back per-row.
     fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
-        if ctx.is_multi_ledger() || self.triples.iter().any(|tp| tp.dtc.is_some()) {
+        if ctx.is_multi_ledger()
+            || crate::fast_path_common::eager_with_overlay(ctx)
+            || self.triples.iter().any(|tp| tp.dtc.is_some())
+        {
             return false;
         }
         let Some(store) = ctx.binary_store.as_ref() else {
@@ -1224,6 +1227,15 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             );
             return Ok(None);
         };
+        if crate::fast_path_common::eager_with_overlay(ctx) {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                reason = "eager-materialization",
+                "grouped optional builder fallback"
+            );
+            return Ok(None);
+        }
         if self.triples.iter().any(|tp| tp.dtc.is_some()) {
             tracing::debug!(
                 predicate_count = self.triples.len(),

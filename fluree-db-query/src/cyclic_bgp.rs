@@ -1126,7 +1126,7 @@ impl CyclicBgpOperator {
     /// every edge). With novelty present, probing stays allowed when every
     /// edge's resolved ops are mergeable (empty → `None`, non-empty →
     /// `Some(ops)` merged per probed subject); any unmergeable edge
-    /// (translation failure, novelty-only predicate, eager materialization)
+    /// (translation failure, novelty-only predicate), or eager materialization,
     /// disables probes for the cascade — full scans, which merge through the
     /// overlay cursor, are unaffected. Historical snapshots keep probes off:
     /// the seek reads latest base state with no replay.
@@ -1142,6 +1142,11 @@ impl CyclicBgpOperator {
             return Ok((false, vec![None; n]));
         };
         if ctx.to_t < store.max_t() {
+            return Ok((false, vec![None; n]));
+        }
+        // The cascade emits encoded bindings; eager (reasoning) callers are
+        // owed decoded ones.
+        if crate::fast_path_common::eager_with_overlay(ctx) {
             return Ok((false, vec![None; n]));
         }
         let mut ops_per_edge = Vec::with_capacity(n);
