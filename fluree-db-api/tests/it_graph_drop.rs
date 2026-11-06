@@ -917,6 +917,86 @@ async fn a_full_reindex_leaves_out_the_annotations_a_drop_took() {
         .await;
 }
 
+/// Before an index build covers a drop, the sealed annotation arena still
+/// holds what the drop took: an edge written again without its annotation
+/// hydrates and exports with none, from a fresh load and from the cached
+/// head alike.
+#[tokio::test]
+async fn an_edge_written_again_after_a_drop_has_no_annotation_before_the_next_build() {
+    use fluree_db_api::export::ExportFormat;
+
+    let ledger_id = "it/graph-drop/annotations-before-build:main";
+    let mut fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let (local, handle) = crate::support::start_background_indexer_with_attachments(
+        &fluree,
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    let hydrate = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    local
+        .run_until(async {
+            fluree.create_ledger(ledger_id).await.expect("create");
+            let t = update(
+                &fluree,
+                ledger_id,
+                "PREFIX ex: <http://example.org/> \
+                 INSERT DATA { ex:alice ex:worksFor ex:acme {| ex:source \"hr\" |} . }",
+            )
+            .await
+            .unwrap();
+            index_through(&fluree, &handle, ledger_id, t).await;
+            assert!(published_root(&fluree, ledger_id)
+                .await
+                .annotation_index
+                .is_some());
+
+            update(
+                &fluree,
+                ledger_id,
+                "PREFIX ex: <http://example.org/> \
+                 DROP DEFAULT ; INSERT DATA { ex:alice ex:worksFor ex:acme . }",
+            )
+            .await
+            .expect("drop and write the edge again");
+
+            let fresh = fluree.ledger(ledger_id).await.expect("load");
+            let cached = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached")
+                .snapshot()
+                .await
+                .to_ledger_state();
+            for (load, state) in [("fresh", &fresh), ("cached", &cached)] {
+                assert!(state.snapshot.annotation_index.is_some(), "{load}");
+                let hydrated = crate::support::query_jsonld_formatted(&fluree, state, &hydrate)
+                    .await
+                    .expect("hydration");
+                assert_eq!(
+                    hydrated,
+                    serde_json::json!([{"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme"}}]),
+                    "{load}"
+                );
+            }
+            let mut turtle = Vec::new();
+            fluree
+                .export(ledger_id)
+                .format(ExportFormat::Turtle)
+                .write_to(&mut turtle)
+                .await
+                .expect("export");
+            let turtle = String::from_utf8(turtle).unwrap();
+            assert!(!turtle.contains('~') && !turtle.contains("{|"), "{turtle}");
+        })
+        .await;
+}
+
 /// Shapes that only the index held go with their graph: the compiled
 /// shapes a transaction cached before the drop are not reused after it.
 #[cfg(feature = "shacl")]

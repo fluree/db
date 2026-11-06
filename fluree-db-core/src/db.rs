@@ -686,6 +686,28 @@ impl LedgerSnapshot {
         self.forget_graph_stats(g_ids);
     }
 
+    /// The graphs a drop took after the index, as an edge names its graph
+    /// (`EdgeKey::g`, `None` for the default graph). The sealed annotation
+    /// arena predates those drops, so what it holds of their edges is gone:
+    /// an edge of theirs carries only what novelty holds. Empty, allocating
+    /// nothing, on a ledger that never dropped a graph since its index.
+    pub fn edge_graphs_dropped_since_index(&self) -> Vec<Option<crate::Sid>> {
+        if !self.graph_registry.has_drops() {
+            return Vec::new();
+        }
+        self.graph_registry
+            .dropped_after(self.t)
+            .into_iter()
+            .filter_map(|g_id| {
+                if g_id == crate::DEFAULT_GRAPH_ID {
+                    return Some(None);
+                }
+                let iri = self.graph_registry.iri_for_graph_id(g_id)?;
+                self.encode_iri(iri).map(Some)
+            })
+            .collect()
+    }
+
     /// Record that a commit at `t` wrote `graph_iris` (its `graph_delta`)
     /// after its drops applied: each dropped graph among them exists again.
     pub fn revive_graphs<'a>(&mut self, graph_iris: impl IntoIterator<Item = &'a str>, t: i64) {
