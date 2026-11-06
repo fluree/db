@@ -1194,15 +1194,18 @@ fn lower_delete_where(
         })
         .collect();
 
-    let mut bnode_vars = BlankNodeVarNamer::new();
+    // One namer per side: each numbers the anonymous `[]`s it meets, and both
+    // meet them in the same order, so the two sides name each `[]` alike.
+    let mut where_bnodes = BlankNodeVarNamer::new();
+    let mut delete_bnodes = BlankNodeVarNamer::new();
     let mut where_patterns: Vec<UnresolvedPattern> = Vec::with_capacity(triples.len());
     let mut delete_templates: Vec<TripleTemplate> = Vec::with_capacity(triples.len());
 
     for tp in triples {
         // WHERE side: lower to UnresolvedPattern::Triple with bnodes rewritten as vars
-        let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut bnode_vars)?;
+        let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut where_bnodes)?;
         let p = predicate_to_unresolved(&tp.predicate, prologue)?;
-        let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut bnode_vars)?;
+        let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut where_bnodes)?;
 
         where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
             s,
@@ -1217,7 +1220,7 @@ fn lower_delete_where(
             prologue,
             ns,
             vars,
-            &mut bnode_vars,
+            &mut delete_bnodes,
         )?);
     }
 
@@ -2597,6 +2600,47 @@ mod tests {
                 "a user label _:b0 must not unify with an anonymous [] existential ({input})"
             );
         }
+    }
+
+    #[test]
+    fn test_delete_where_anon_bnode_names_one_var_on_both_sides() {
+        // Each `[]` of a triple-only DELETE WHERE is one existential: its
+        // template must read the variable its WHERE pattern binds, as subject,
+        // as object, and with several in one pattern.
+        let input = "DELETE WHERE { [] <http://example.org/p> ?o . \
+                     <http://example.org/s> <http://example.org/q> [] . \
+                     [] <http://example.org/r> [] }";
+        let parsed = fluree_db_sparql::parse_sparql(input);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        assert!(txn.sparql_where.is_none(), "the triple-only path");
+        let var_of = |term: &UnresolvedTerm| match term {
+            UnresolvedTerm::Var(name) => txn.vars.get(name),
+            _ => None,
+        };
+        let mut anon = Vec::new();
+        for (pattern, template) in txn.where_patterns.iter().zip(&txn.delete_templates) {
+            let UnresolvedPattern::Triple(tp) = pattern else {
+                panic!("a triple pattern: {pattern:?}");
+            };
+            for (where_term, template_term) in
+                [(&tp.s, &template.subject), (&tp.o, &template.object)]
+            {
+                if let TemplateTerm::Var(v) = template_term {
+                    assert_eq!(var_of(where_term), Some(*v), "{where_term:?}");
+                    anon.push(*v);
+                }
+            }
+        }
+        anon.retain(|v| txn.vars.name(*v).starts_with("_:[]"));
+        let distinct: std::collections::HashSet<_> = anon.iter().collect();
+        assert_eq!(
+            (anon.len(), distinct.len()),
+            (4, 4),
+            "four `[]`, four existentials"
+        );
     }
 
     #[test]
