@@ -976,6 +976,74 @@ async fn shapes_the_index_held_go_with_their_graph() {
         .await;
 }
 
+/// A read as of a `t` the index covers learns of the drops after the index
+/// from the cached head, reading none of the commits after it: with every
+/// commit gone from storage, it still knows the drop. A view loaded with no
+/// head at hand reads those commits for their drops.
+#[tokio::test]
+async fn a_read_below_the_index_takes_later_drops_from_the_head() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let ledger_id = "it/graph-drop/below-index:main";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let insert = |facts: &str| {
+        format!("PREFIX ex: <http://example.org/> INSERT DATA {{ GRAPH <{G}> {{ {facts} }} }}")
+    };
+    let written = update(&fluree, ledger_id, &insert("ex:a ex:v \"a\" ."))
+        .await
+        .unwrap();
+    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let dropped = update(&fluree, ledger_id, &format!("DROP GRAPH <{G}>"))
+        .await
+        .unwrap();
+    for i in 0..3 {
+        update(
+            &fluree,
+            ledger_id,
+            &format!("PREFIX ex: <http://example.org/> INSERT DATA {{ ex:x ex:n {i} }}"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let view = fluree.ledger_view_at(ledger_id, written).await.unwrap();
+    let registry = &view.snapshot.graph_registry;
+    let g = registry.graph_id_for_iri(G).unwrap();
+    assert_eq!(registry.drop_after(g, written), Some(dropped));
+
+    remove_commit_blobs(tmp.path());
+    assert!(
+        fluree.ledger_view_at(ledger_id, written).await.is_err(),
+        "a view with no head reads the commits, which are gone"
+    );
+    let err = objects(
+        &fluree,
+        &at(&fluree, ledger_id, written).await,
+        &in_graph(G),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("dropped at t={dropped}")),
+        "{err}"
+    );
+}
+
+/// Remove every commit blob under `dir`.
+fn remove_commit_blobs(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            remove_commit_blobs(&path);
+        } else if path.extension().is_some_and(|ext| ext == "fcv2") {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+}
+
 /// The acceptance sequence: write, clear, write again, drop, then write the
 /// graph afresh — read at the head and as of every `t`, through a restart, an
 /// incremental index build, a full reindex, and from a branch taken before

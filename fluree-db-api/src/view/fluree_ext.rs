@@ -25,6 +25,11 @@ use tracing::Instrument;
 // ============================================================================
 
 /// A view of a cached handle's head, with its binary store attached.
+/// The drops the cached head `snap` knows, for a view below its index.
+fn head_drops(snap: &LedgerView) -> Option<fluree_db_ledger::HeadDrops<'_>> {
+    fluree_db_ledger::HeadDrops::of(snap.head_commit_id.as_ref(), &snap.snapshot.graph_registry)
+}
+
 fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
     let binary_store = snap.binary_store.clone();
     let ledger = snap.to_ledger_state();
@@ -348,7 +353,8 @@ impl Fluree {
             return Ok(graph_db_from_cached_head(snap));
         }
 
-        self.load_graph_db_historical(ledger_id, target_t).await
+        self.load_graph_db_historical(ledger_id, target_t, head_drops(&snap))
+            .await
     }
 
     /// Load a ledger at `t`, where its head commit is `commit_id`.
@@ -370,18 +376,24 @@ impl Fluree {
             return Ok(graph_db_from_cached_head(snap));
         }
 
-        self.load_graph_db_historical(ledger_id, t).await
+        self.load_graph_db_historical(ledger_id, t, head_drops(&snap))
+            .await
     }
 
     /// Open a ledger at a past `t` through the historical loader: no ledger
     /// cache, so no cache lock is taken. [`Self::load_graph_db_at_t`] uses
-    /// this once it knows `t` is not the cached head.
+    /// this once it knows `t` is not the cached head. `head`, a state the
+    /// caller holds, spares the loader reading the commits after the index
+    /// for their drops when it is at the ledger's head commit.
     pub(crate) async fn load_graph_db_historical(
         &self,
         ledger_id: &str,
         target_t: i64,
+        head: Option<fluree_db_ledger::HeadDrops<'_>>,
     ) -> Result<GraphDb> {
-        let historical = self.ledger_view_at(ledger_id, target_t).await?;
+        let historical = self
+            .ledger_view_at_from_head(ledger_id, target_t, head)
+            .await?;
         let mut view = GraphDb::from_historical(&historical);
 
         // Attach dict_novelty derived from the historical Db's watermarks.
@@ -656,7 +668,8 @@ impl Fluree {
                 if t == snapshot.t {
                     graph_db_from_cached_head(snapshot)
                 } else {
-                    self.load_graph_db_historical(ledger_id, t).await?
+                    self.load_graph_db_historical(ledger_id, t, head_drops(&snapshot))
+                        .await?
                 }
             }
         };

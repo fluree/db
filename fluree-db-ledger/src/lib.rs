@@ -30,7 +30,7 @@ mod historical;
 mod staged;
 
 pub use error::{LedgerError, Result};
-pub use historical::HistoricalLedgerView;
+pub use historical::{HeadDrops, HistoricalLedgerView};
 pub use staged::StagedLedger;
 
 use fluree_db_core::{
@@ -213,17 +213,17 @@ pub(crate) fn apply_commit_lifecycles(
     floors
 }
 
-/// Carry the drops `old` knows into `new`, the snapshot of an index root
-/// about to replace it: the root knows the drops through its own `t`, the
-/// state those after it too. Matched by IRI, since a rebuilt root may number
-/// the graphs differently. A graph dropped after the root still has what it
-/// held before the drop counted in the root's statistics.
-fn carry_graph_drops(old: &LedgerSnapshot, new: &mut LedgerSnapshot) {
-    if !old.graph_registry.has_drops() {
+/// Carry the drops `old`, a registry at the head, knows into `new`, the
+/// snapshot of an index root behind that head: the root knows the drops
+/// through its own `t`, the head those after it too. Matched by IRI, since a
+/// rebuilt root may number the graphs differently. A graph dropped after the
+/// root still has what it held before the drop counted in the root's
+/// statistics.
+fn carry_graph_drops(old: &fluree_db_core::GraphRegistry, new: &mut LedgerSnapshot) {
+    if !old.has_drops() {
         return;
     }
-    new.graph_registry
-        .merge_graph_drops_by_iri(&old.graph_registry);
+    new.graph_registry.merge_graph_drops_by_iri(old);
     let later = new.graph_registry.dropped_after(new.t);
     new.forget_graph_stats(&later);
 }
@@ -793,7 +793,7 @@ impl LedgerState {
         }
 
         // Update state
-        carry_graph_drops(&self.snapshot, &mut new_snapshot);
+        carry_graph_drops(&self.snapshot.graph_registry, &mut new_snapshot);
         self.snapshot = Arc::new(new_snapshot);
         drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
         self.dict_novelty = Arc::new(new_dict_novelty);
@@ -900,7 +900,7 @@ impl LedgerState {
             // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
             merged_snapshot.graph_registry.apply_delta(&old_graph_iris);
         }
-        carry_graph_drops(&self.snapshot, &mut merged_snapshot);
+        carry_graph_drops(&self.snapshot.graph_registry, &mut merged_snapshot);
         // The old snapshot goes first: its range provider holds the
         // dictionary novelty, and while it lives the retire below would copy
         // the whole dictionary instead of trimming it in place.
