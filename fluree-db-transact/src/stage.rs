@@ -1569,11 +1569,13 @@ fn resolve_named_graph(
 
 /// The refusal a policed (non-root) identity gets for an operation that
 /// drops a graph: the drop takes facts and history the identity's policy may
-/// not let it see, let alone modify.
+/// not let it see, let alone modify. It leads with the standard modify
+/// refusal, which clients match on.
 fn drop_needs_unrestricted_identity(verb: &str) -> TransactError {
     TransactError::PolicyViolation(fluree_db_policy::PolicyError::modify_denied(format!(
-        "{verb} drops a graph with its history, which only an identity without a \
-         restricting policy may do; CLEAR retracts what a graph holds, under policy"
+        "Policy enforcement prevents modification. {verb} drops a graph with its history, \
+         which only an identity without a restricting policy may do; CLEAR retracts what a \
+         graph holds, under policy"
     )))
 }
 

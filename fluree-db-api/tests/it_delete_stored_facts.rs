@@ -1679,24 +1679,10 @@ async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
                 let r =
                     sparql_update_as(&fluree, ledger, &format!("{verb} <{G1}> TO <{G2}>"), policy)
                         .await;
-                let what = format!("{verb}, dest_holds={dest_holds}, indexed={indexed}");
-                failures.extend(if verb == "MOVE" {
-                    match r {
-                        Err(e)
-                            if e.status_code() == 403
-                                && e.to_string().contains("drops a graph with its history") =>
-                        {
-                            None
-                        }
-                        Err(e) => Some(format!("{what}: {e}")),
-                        Ok(r) => Some(format!(
-                            "{what}: committed {} flakes",
-                            r.receipt.flake_count
-                        )),
-                    }
-                } else {
-                    not_refused(r, &what)
-                });
+                failures.extend(not_refused(
+                    r,
+                    &format!("{verb}, dest_holds={dest_holds}, indexed={indexed}"),
+                ));
             }
         }
     }
