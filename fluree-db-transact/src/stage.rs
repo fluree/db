@@ -1291,6 +1291,17 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`TransactError::OtherLedgersConfigGraph`] for `graph`, the config graph IRI
+/// of another ledger, or of another branch, that a write names.
+fn other_ledgers_config(ledger_id: &fluree_db_core::LedgerId, graph: &str) -> TransactError {
+    TransactError::OtherLedgersConfigGraph {
+        graph_iri: graph.to_string(),
+        named: fluree_db_core::graph_registry::config_graph_ledger(graph)
+            .map_or_else(|| graph.to_string(), |named| named.to_string()),
+        own: fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+    }
+}
+
 /// The ledger's binary index store, when it has one. Its graph dictionary can
 /// hold an entry the snapshot's registry has not caught up with, so graph
 /// names are read through both ([`HeadGraphNames`]), as on the query path.
@@ -1318,6 +1329,7 @@ fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
         GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
             Ok(WriteGraph::Named(iri.into()))
         }
+        GraphPosition::OtherLedgersConfig(graph) => Err(other_ledgers_config(target.id(), &graph)),
         GraphPosition::NotAGraph => Err(TransactError::Parse(format!(
             "<{iri}> names no graph a write can go to: an address of this ledger ('{}') \
              names its default graph, or one of its graphs through '#', and carries no time",
@@ -3235,6 +3247,9 @@ async fn stream_where_into_accumulator(
                 "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
                  reads only its own ledger ('{target_ledger}')"
             ))),
+            Err(other @ TargetError::OtherLedgersConfig { .. }) => Err(TransactError::Parse(
+                format!("WHERE dataset graph: {other}"),
+            )),
         }
     };
     let where_default_g_ids: Vec<Option<GraphId>> = desired_where_default_graph_iris
@@ -3459,7 +3474,9 @@ async fn stream_where_into_accumulator(
             match TargetLedger::new(target_ledger, graph_names).graph_position(name) {
                 GraphPosition::Default => name_of_graph.get(&DEFAULT_GRAPH_ID).cloned(),
                 GraphPosition::Registered { g_id, .. } => name_of_graph.get(&g_id).cloned(),
-                GraphPosition::New(_) | GraphPosition::NotAGraph => None,
+                GraphPosition::New(_)
+                | GraphPosition::NotAGraph
+                | GraphPosition::OtherLedgersConfig(_) => None,
             }
         });
     }

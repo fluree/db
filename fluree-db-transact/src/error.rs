@@ -265,6 +265,25 @@ pub enum TransactError {
     )]
     DefaultGraphNameAsGraph,
 
+    /// A write named the config graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own config graph, which a
+    /// write names by the branch's own config graph IRI or `config`. The graph
+    /// registry reads any ledger's config graph IRI as this ledger's config
+    /// graph only so that history written under another name (a branch's
+    /// source, a copy) replays into it.
+    #[error(
+        "<{graph_iri}> is the config graph of '{named}', not of this ledger; \
+         write this ledger's config to <{own}> or the `config` graph"
+    )]
+    OtherLedgersConfigGraph {
+        /// The config graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+        /// This ledger's own config graph IRI.
+        own: String,
+    },
+
     /// A bulk RDF import (`fluree create --from`, the server's source-import
     /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
     ///

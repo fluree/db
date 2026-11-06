@@ -63,7 +63,9 @@ mod inner {
         let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
             Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
                 GraphPosition::Default => return Ok(None),
-                GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => iri.into_owned(),
+                GraphPosition::Registered { iri, .. }
+                | GraphPosition::New(iri)
+                | GraphPosition::OtherLedgersConfig(iri) => iri.into_owned(),
                 GraphPosition::NotAGraph => {
                     return Err(TransactError::Parse(format!(
                         "<{iri}> names no graph an import can write: an address of this \

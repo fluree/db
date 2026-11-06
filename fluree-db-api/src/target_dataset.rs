@@ -119,6 +119,9 @@ fn resolve_member_in_target(
                 ""
             }
         ))),
+        Err(other @ TargetError::OtherLedgersConfig { .. }) => {
+            Err(ApiError::invalid_query(other.to_string()))
+        }
     }
 }
 
