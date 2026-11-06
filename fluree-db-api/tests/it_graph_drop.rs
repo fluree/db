@@ -778,6 +778,95 @@ async fn a_restart_replays_the_drop() {
         .await;
 }
 
+/// A second process over the same storage (a query peer, a raft follower)
+/// that has the ledger loaded catches up a drop by applying the commit, as
+/// its writer did: the dropped graph's facts leave its novelty before the
+/// commit writes the graph again, and as of before the drop the graph is
+/// refused there too.
+#[tokio::test]
+async fn a_peer_catching_up_a_drop_commit_applies_the_drop() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/graph-drop/peer:main";
+
+    let writer = FlureeBuilder::file(path.clone()).build().unwrap();
+    writer.create_ledger(ledger_id).await.expect("create");
+    let written = update(
+        &writer,
+        ledger_id,
+        &format!(
+            "PREFIX ex: <http://example.org/> INSERT DATA {{ ex:d ex:v \"default\" . \
+             GRAPH <{G}> {{ ex:a ex:v \"a\" . ex:b ex:v \"b\" . }} }}"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let peer = FlureeBuilder::file(path).build().unwrap();
+    assert_eq!(
+        objects(&peer, &head(&peer, ledger_id).await, &in_graph(G))
+            .await
+            .unwrap(),
+        ["\"a\"", "\"b\""]
+    );
+    let catch_up = |t: i64| {
+        let peer = &peer;
+        async move {
+            let refreshed = peer
+                .refresh(ledger_id, fluree_db_api::RefreshOpts::default())
+                .await
+                .expect("refresh")
+                .expect("ledger");
+            assert_eq!(
+                refreshed.action,
+                fluree_db_api::ledger_manager::NotifyResult::CommitsApplied { count: 1 },
+                "the peer applies the commit rather than reloading"
+            );
+            assert_eq!(refreshed.t, t);
+        }
+    };
+
+    let dropped = update(
+        &writer,
+        ledger_id,
+        &format!(
+            "PREFIX ex: <http://example.org/> \
+             DROP GRAPH <{G}> ; INSERT DATA {{ GRAPH <{G}> {{ ex:a ex:v \"a\" }} }}"
+        ),
+    )
+    .await
+    .unwrap();
+    catch_up(dropped).await;
+    let now = head(&peer, ledger_id).await;
+    assert_eq!(objects(&peer, &now, &in_graph(G)).await.unwrap(), ["\"a\""]);
+    assert_eq!(
+        objects(&peer, &now, DEFAULT_GRAPH).await.unwrap(),
+        ["\"default\""]
+    );
+    let err = objects(&peer, &at(&peer, ledger_id, written).await, &in_graph(G))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("dropped at t={dropped}")),
+        "{err}"
+    );
+
+    let dropped_default = update(&writer, ledger_id, "DROP DEFAULT").await.unwrap();
+    catch_up(dropped_default).await;
+    let now = head(&peer, ledger_id).await;
+    assert!(objects(&peer, &now, DEFAULT_GRAPH)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(objects(&peer, &now, &in_graph(G)).await.unwrap(), ["\"a\""]);
+    assert!(
+        objects(&peer, &at(&peer, ledger_id, written).await, DEFAULT_GRAPH)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// An incremental index build whose commits write a graph, drop it and write
 /// it again indexes only the last write.
 #[tokio::test]
