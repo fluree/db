@@ -368,7 +368,7 @@ Changes within v1 that a client may need to account for.
 
 #### `DROP` drops a graph's history (breaking)
 
-SPARQL `DROP GRAPH`, `DROP DEFAULT`, `DROP NAMED` and `DROP ALL` used to retract the graph's facts, as `CLEAR` does. They now take the graph out of the ledger: what it held is no longer queryable at the head or as of any earlier `t`, and a query that names the graph as of a `t` before the drop is refused with a 404. The drop commits without retracting anything, so it costs the same for any size of graph and is not limited by `FLUREE_MAX_GRAPH_SCAN_FLAKES`. Writing to the graph again starts it afresh, under the same IRI. The commits that wrote the dropped facts keep them: a branch created at a `t` before the drop reads them. The same applies to `fluree graph drop`, `POST /v1/fluree/drop-graph`, the Graph Store Protocol's `DELETE` of a named graph, the Python `Ledger.drop_graph`, and the source graph of `MOVE`.
+SPARQL `DROP GRAPH`, `DROP DEFAULT`, `DROP NAMED` and `DROP ALL` used to retract the graph's facts, as `CLEAR` does. They now take the graph out of the ledger: what it held is no longer queryable at the head or as of any earlier `t`, and a query that names the graph as of a `t` before the drop is refused with a 404. The drop commits without retracting anything, so it costs the same for any size of graph and is not limited by `FLUREE_MAX_GRAPH_SCAN_FLAKES`. Writing to the graph again starts it afresh, under the same IRI. The commits that wrote the dropped facts keep them: a branch created at a `t` before the drop reads them. A drop is therefore not a deletion: the facts stay in the ledger's storage. The same applies to `fluree graph drop`, `POST /v1/fluree/drop-graph`, the Graph Store Protocol's `DELETE` of a named graph, the Python `Ledger.drop_graph`, and the source graph of `MOVE`.
 
 - Dropping needs an identity without a restricting policy; others get a 403. `CLEAR` is unchanged and remains available under policy.
 - `DROP GRAPH` of a graph that does not exist, or that was dropped, is an error unless `SILENT` (it used to be a no-op).
@@ -494,6 +494,8 @@ Earlier data:
   ADD GRAPH <mydb:main> TO DEFAULT ;
   DROP GRAPH <mydb:main>
   ```
+
+  `DROP` takes the old graph's history with it and needs an identity without a restricting policy. `CLEAR GRAPH <mydb:main>` in its place keeps the history, and works under policy.
 
 #### Datalog rules derive into named graphs and read the commit time
 
