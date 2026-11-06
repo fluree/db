@@ -1388,7 +1388,7 @@ fn resolve_local_rules_source_g_id(
     }
     let g_id = match src.graph_selector.as_deref() {
         Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
         None => Some(0u16),
     };
     match g_id {

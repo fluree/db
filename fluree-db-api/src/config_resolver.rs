@@ -714,7 +714,7 @@ pub(crate) async fn unenforced_shapes(
             Some(sel) if sel == config_iris::DEFAULT_GRAPH => {
                 Some(fluree_db_core::DEFAULT_GRAPH_ID)
             }
-            Some(sel) => snapshot.graph_registry.graph_id_for_iri(sel),
+            Some(sel) => snapshot.graph_registry.assigned_graph_id(sel),
         },
         None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
     };

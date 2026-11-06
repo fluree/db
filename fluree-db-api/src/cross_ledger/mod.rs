@@ -58,7 +58,7 @@ pub(crate) fn resolve_selector_g_id(
             graph_iri: graph_iri.to_string(),
         });
     }
-    match snapshot.graph_registry.graph_id_for_iri(graph_iri) {
+    match snapshot.graph_registry.assigned_graph_id(graph_iri) {
         Some(TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) => Err(CrossLedgerError::ReservedGraphSelected {
             graph_iri: graph_iri.to_string(),
         }),

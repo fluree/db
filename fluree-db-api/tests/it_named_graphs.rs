@@ -1982,7 +1982,7 @@ async fn test_update_from_named_alias_usable_in_templates() {
                 ledger
                     .snapshot
                     .graph_registry
-                    .graph_id_for_iri("http://example.org/g2")
+                    .assigned_graph_id("http://example.org/g2")
                     .is_some(),
                 "expected g2 IRI to be registered in graph_registry"
             );
@@ -2866,7 +2866,7 @@ INSERT DATA {
         let g2_id = ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(g2)
+            .assigned_graph_id(g2)
             .expect("dest graph registered after transfer");
         let dest_keys =
             support::decode_annotations_for_subject(&ledger, g2_id, "http://example.org/alice")

@@ -1011,7 +1011,7 @@ async fn a_read_below_the_index_takes_later_drops_from_the_head() {
 
     let view = fluree.ledger_view_at(ledger_id, written).await.unwrap();
     let registry = &view.snapshot.graph_registry;
-    let g = registry.graph_id_for_iri(G).unwrap();
+    let g = registry.assigned_graph_id(G).unwrap();
     assert_eq!(registry.drop_after(g, written), Some(dropped));
 
     remove_commit_blobs(tmp.path());

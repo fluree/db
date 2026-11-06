@@ -2233,7 +2233,7 @@ mod tests {
         let mut state = LedgerState::new(LedgerSnapshot::genesis("test:main"), Novelty::new(0));
         let snapshot = Arc::make_mut(&mut state.snapshot);
         snapshot.graph_registry.apply_delta([a, z]);
-        let dropped = snapshot.graph_registry.graph_id_for_iri(a).unwrap();
+        let dropped = snapshot.graph_registry.assigned_graph_id(a).unwrap();
         snapshot.apply_graph_drops(&[dropped], 2);
 
         let mut rebuilt = LedgerSnapshot::genesis("test:main");
@@ -2243,7 +2243,7 @@ mod tests {
         state.apply_loaded_db(rebuilt, None).unwrap();
 
         let registry = &state.snapshot.graph_registry;
-        assert!(registry.is_dropped(registry.graph_id_for_iri(a).unwrap()));
-        assert!(!registry.is_dropped(registry.graph_id_for_iri(z).unwrap()));
+        assert!(registry.is_dropped(registry.assigned_graph_id(a).unwrap()));
+        assert!(!registry.is_dropped(registry.assigned_graph_id(z).unwrap()));
     }
 }

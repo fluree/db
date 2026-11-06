@@ -961,7 +961,7 @@ impl crate::Fluree {
 
         let g_id = snapshot
             .graph_registry
-            .graph_id_for_iri(graph_iri)
+            .assigned_graph_id(graph_iri)
             .filter(|g_id| !snapshot.graph_registry.is_dropped(*g_id))
             .ok_or_else(|| {
                 ApiError::NotFound(format!(
@@ -1215,7 +1215,7 @@ impl crate::Fluree {
         };
         let handle = self.ledger_cached(ledger_id).await?;
         let ledger = handle.snapshot().await.to_ledger_state();
-        let Some(g_id) = ledger.snapshot.graph_registry.graph_id_for_iri(iri) else {
+        let Some(g_id) = ledger.snapshot.graph_registry.assigned_graph_id(iri) else {
             return Ok(false);
         };
         if g_id < FIRST_USER_GRAPH_ID {

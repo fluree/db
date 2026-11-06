@@ -238,7 +238,7 @@ fn resolve_local_graph_source(
         Some(sel) if sel == config_iris::TXN_META_GRAPH => TXN_META_GRAPH_ID,
         Some(sel) => snapshot
             .graph_registry
-            .graph_id_for_iri(sel)
+            .assigned_graph_id(sel)
             .ok_or_else(|| {
                 ApiError::OntologyImport(format!(
                     "f:schemaSource / f:graphRef points to graph '{sel}' \
@@ -287,7 +287,7 @@ fn resolve_import_iri(
     reasoning: &ReasoningDefaults,
     import_iri: &str,
 ) -> Result<GraphId> {
-    if let Some(g_id) = snapshot.graph_registry.graph_id_for_iri(import_iri) {
+    if let Some(g_id) = snapshot.graph_registry.assigned_graph_id(import_iri) {
         reject_if_system_graph(g_id)?;
         return Ok(g_id);
     }

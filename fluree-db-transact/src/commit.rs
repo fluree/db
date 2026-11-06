@@ -665,7 +665,7 @@ fn one_config_graph_iri(
     use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
     let named: Vec<String> = graph_iris
         .iter()
-        .filter(|iri| registry.graph_id_for_iri(iri) == Some(CONFIG_GRAPH_ID))
+        .filter(|iri| registry.assigned_graph_id(iri) == Some(CONFIG_GRAPH_ID))
         .cloned()
         .collect();
     if named.len() < 2 {
@@ -831,7 +831,7 @@ pub async fn build_commit(
     let registers_new_graph = registry.has_unregistered(graph_iris.iter().map(String::as_str));
     let mut graph_iris = graph_iris;
     graph_iris.retain(|iri| {
-        registry.graph_id_for_iri(iri).is_none_or(|g_id| {
+        registry.assigned_graph_id(iri).is_none_or(|g_id| {
             g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID || registry.is_dropped(g_id)
         })
     });
@@ -1022,7 +1022,7 @@ pub async fn build_commit(
             let g_id = base
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri(&iri)
+                .assigned_graph_id(&iri)
                 .ok_or_else(|| {
                     TransactError::FlakeGeneration(format!(
                         "graph <{iri}> was written but is not in the registry after apply"

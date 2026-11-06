@@ -520,7 +520,7 @@ impl GraphRegistry {
     /// Forward lookup: IRI → GraphId. Any ledger's config graph IRI is the
     /// config graph. A dropped graph keeps its id, so this answers for it
     /// too; [`Self::is_dropped`] tells it apart.
-    pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<GraphId> {
         self.iri_to_id
             .get(iri)
             .copied()
@@ -587,7 +587,7 @@ impl GraphRegistry {
                 if iri == DEFAULT_GRAPH_IRI {
                     Some(DEFAULT_GRAPH_ID)
                 } else {
-                    self.graph_id_for_iri(iri)
+                    self.assigned_graph_id(iri)
                 }
             })
             .filter(|g_id| drop_may_take(*g_id))
@@ -651,7 +651,7 @@ impl GraphRegistry {
                 let ours = if g_id == DEFAULT_GRAPH_ID {
                     DEFAULT_GRAPH_ID
                 } else {
-                    self.graph_id_for_iri(other.iri_for_graph_id(g_id)?)?
+                    self.assigned_graph_id(other.iri_for_graph_id(g_id)?)?
                 };
                 drop_may_take(ours).then_some((ours, drop))
             })
@@ -805,10 +805,10 @@ mod tests {
         let txn_meta_iri = "urn:fluree:mydb:main#txn-meta";
         let config_iri = "urn:fluree:mydb:main#config";
         // txn-meta at g_id=1
-        assert_eq!(reg.graph_id_for_iri(txn_meta_iri), Some(TXN_META_GRAPH_ID));
+        assert_eq!(reg.assigned_graph_id(txn_meta_iri), Some(TXN_META_GRAPH_ID));
         assert_eq!(reg.iri_for_graph_id(TXN_META_GRAPH_ID), Some(txn_meta_iri));
         // config at g_id=2
-        assert_eq!(reg.graph_id_for_iri(config_iri), Some(CONFIG_GRAPH_ID));
+        assert_eq!(reg.assigned_graph_id(config_iri), Some(CONFIG_GRAPH_ID));
         assert_eq!(reg.iri_for_graph_id(CONFIG_GRAPH_ID), Some(config_iri));
         // default graph still None
         assert_eq!(reg.iri_for_graph_id(0), None);
@@ -827,8 +827,8 @@ mod tests {
 
         assert_eq!(assigned1, assigned2);
         // User graphs start at g_id=3
-        assert_eq!(reg1.graph_id_for_iri("http://a.org/g"), Some(3));
-        assert_eq!(reg1.graph_id_for_iri("http://b.org/g"), Some(4));
+        assert_eq!(reg1.assigned_graph_id("http://a.org/g"), Some(3));
+        assert_eq!(reg1.assigned_graph_id("http://b.org/g"), Some(4));
     }
 
     #[test]
@@ -841,7 +841,7 @@ mod tests {
         ]);
         assert_eq!(assigned.len(), 1);
         assert_eq!(
-            reg.graph_id_for_iri("http://example.org/g1"),
+            reg.assigned_graph_id("http://example.org/g1"),
             Some(FIRST_USER_GRAPH_ID)
         );
     }
@@ -874,8 +874,8 @@ mod tests {
 
         let txn_meta = txn_meta_graph_iri("test:a");
         let config = config_graph_iri("test:a");
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g2"), Some(4));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g1"), Some(3));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g2"), Some(4));
         assert_eq!(reg.iri_for_graph_id(1), Some(txn_meta.as_str()));
         assert_eq!(reg.iri_for_graph_id(2), Some(config.as_str()));
         assert_eq!(reg.iri_for_graph_id(3), Some("http://example.org/g1"));
@@ -893,9 +893,9 @@ mod tests {
         ];
         let reg = GraphRegistry::seed_from_root_iris(&iris).unwrap();
 
-        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
-        assert_eq!(reg.graph_id_for_iri(&config), Some(2));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
+        assert_eq!(reg.assigned_graph_id(&txn_meta), Some(1));
+        assert_eq!(reg.assigned_graph_id(&config), Some(2));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g1"), Some(3));
         assert_eq!(reg.next_id(), 4);
     }
 
@@ -910,7 +910,7 @@ mod tests {
         // seed_from_root_iris trusts whatever IRI is at iris[0]
         let iris = vec!["http://custom.org/txn-meta".to_string()];
         let reg = GraphRegistry::seed_from_root_iris(&iris).unwrap();
-        assert_eq!(reg.graph_id_for_iri("http://custom.org/txn-meta"), Some(1));
+        assert_eq!(reg.assigned_graph_id("http://custom.org/txn-meta"), Some(1));
     }
 
     #[test]
@@ -953,9 +953,9 @@ mod tests {
         ];
         let reg = GraphRegistry::seed_from_entries(&entries).unwrap();
 
-        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
-        assert_eq!(reg.graph_id_for_iri(&config), Some(2));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
+        assert_eq!(reg.assigned_graph_id(&txn_meta), Some(1));
+        assert_eq!(reg.assigned_graph_id(&config), Some(2));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g1"), Some(3));
         assert_eq!(reg.next_id(), 4);
     }
 
@@ -1005,7 +1005,7 @@ mod tests {
 
         // Registry unchanged
         assert_eq!(reg.next_id(), 4);
-        assert_eq!(reg.graph_id_for_iri("http://example.org/new_a"), None);
+        assert_eq!(reg.assigned_graph_id("http://example.org/new_a"), None);
     }
 
     #[test]
@@ -1038,22 +1038,22 @@ mod tests {
         let assigned = reg.apply_delta(["http://example.org/g2"]);
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, 4);
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g2"), Some(4));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
-        assert_eq!(reg.graph_id_for_iri(&config), Some(2));
-        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g2"), Some(4));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g1"), Some(3));
+        assert_eq!(reg.assigned_graph_id(&config), Some(2));
+        assert_eq!(reg.assigned_graph_id(&txn_meta), Some(1));
     }
 
     #[test]
     fn a_dropped_graph_keeps_its_id_until_written_again() {
         let mut reg = GraphRegistry::new_for_ledger("test:a");
         reg.apply_delta(["http://example.org/g"]);
-        let g = reg.graph_id_for_iri("http://example.org/g").unwrap();
+        let g = reg.assigned_graph_id("http://example.org/g").unwrap();
         assert!(!reg.has_unregistered(["http://example.org/g"]));
 
         reg.apply_drops(&[g], 5);
         assert!(reg.is_dropped(g));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g"), Some(g));
+        assert_eq!(reg.assigned_graph_id("http://example.org/g"), Some(g));
         // Writing it again would bring it back, as a new graph would register.
         assert!(reg.has_unregistered(["http://example.org/g"]));
         assert!(reg.would_revive(["http://example.org/g"]));
@@ -1088,7 +1088,7 @@ mod tests {
     fn a_commit_can_drop_a_graph_and_write_it_afresh() {
         let mut reg = GraphRegistry::new_for_ledger("test:a");
         reg.apply_delta(["http://example.org/g"]);
-        let g = reg.graph_id_for_iri("http://example.org/g").unwrap();
+        let g = reg.assigned_graph_id("http://example.org/g").unwrap();
         reg.apply_drops(&[g], 5);
         reg.revive(["http://example.org/g"], 5);
         assert_eq!(
@@ -1116,7 +1116,7 @@ mod tests {
     fn a_later_drop_replaces_the_earlier_one() {
         let mut reg = GraphRegistry::new_for_ledger("test:a");
         reg.apply_delta(["http://example.org/g"]);
-        let g = reg.graph_id_for_iri("http://example.org/g").unwrap();
+        let g = reg.assigned_graph_id("http://example.org/g").unwrap();
         reg.apply_drops(&[g], 5);
         reg.revive(["http://example.org/g"], 6);
         reg.apply_drops(&[g], 9);
@@ -1138,18 +1138,18 @@ mod tests {
         let (a, z) = ("http://example.org/a", "http://example.org/z");
         let mut head = GraphRegistry::new_for_ledger("test:a");
         head.apply_delta([a, z]);
-        head.apply_drops(&[head.graph_id_for_iri(a).unwrap(), DEFAULT_GRAPH_ID], 5);
+        head.apply_drops(&[head.assigned_graph_id(a).unwrap(), DEFAULT_GRAPH_ID], 5);
 
         // A rebuild met z first.
         let mut rebuilt = GraphRegistry::new_for_ledger("test:a");
         rebuilt.apply_delta([z]);
         rebuilt.apply_delta([a]);
-        assert_ne!(rebuilt.graph_id_for_iri(a), head.graph_id_for_iri(a));
+        assert_ne!(rebuilt.assigned_graph_id(a), head.assigned_graph_id(a));
 
         rebuilt.merge_graph_drops_by_iri(&head);
-        assert!(rebuilt.is_dropped(rebuilt.graph_id_for_iri(a).unwrap()));
+        assert!(rebuilt.is_dropped(rebuilt.assigned_graph_id(a).unwrap()));
         assert_eq!(
-            rebuilt.graph_drop(rebuilt.graph_id_for_iri(z).unwrap()),
+            rebuilt.graph_drop(rebuilt.assigned_graph_id(z).unwrap()),
             None
         );
         assert_eq!(
@@ -1189,7 +1189,7 @@ mod tests {
 
         let mut rebuilt = GraphRegistry::new_for_ledger("b:main");
         rebuilt.apply_delta([source.as_str(), g]);
-        let g_id = rebuilt.graph_id_for_iri(g).unwrap();
+        let g_id = rebuilt.assigned_graph_id(g).unwrap();
         assert_eq!(
             rebuilt.graph_ids_of_drops(&record),
             vec![DEFAULT_GRAPH_ID, g_id]
@@ -1222,7 +1222,7 @@ mod tests {
     fn another_ledgers_config_graph_is_the_config_graph() {
         let mut reg = GraphRegistry::new_for_ledger("b:main");
         let source = config_graph_iri("a:main");
-        assert_eq!(reg.graph_id_for_iri(&source), Some(CONFIG_GRAPH_ID));
+        assert_eq!(reg.assigned_graph_id(&source), Some(CONFIG_GRAPH_ID));
         assert!(!reg.has_unregistered([source.as_str()]));
         let prov = reg.provisional_ids(&[source.clone(), "http://example.org/g".into()]);
         assert_eq!(prov.get(source.as_str()).copied(), Some(CONFIG_GRAPH_ID));
@@ -1234,10 +1234,10 @@ mod tests {
         let assigned = reg.apply_delta([source.as_str(), "http://example.org/g"]);
         assert_eq!(assigned.len(), 1);
         assert_eq!(
-            reg.graph_id_for_iri("http://example.org/g"),
+            reg.assigned_graph_id("http://example.org/g"),
             Some(FIRST_USER_GRAPH_ID)
         );
-        assert_eq!(reg.graph_id_for_iri(&source), Some(CONFIG_GRAPH_ID));
+        assert_eq!(reg.assigned_graph_id(&source), Some(CONFIG_GRAPH_ID));
         assert_eq!(
             reg.iri_for_graph_id(CONFIG_GRAPH_ID),
             Some(config_graph_iri("b:main").as_str())
@@ -1268,17 +1268,17 @@ mod tests {
             GraphRegistry::seed_from_entries(&entries).unwrap(),
         ] {
             assert!(reg.has_config_in_user_slot());
-            assert_eq!(reg.graph_id_for_iri(&source), Some(3));
+            assert_eq!(reg.assigned_graph_id(&source), Some(3));
             assert_eq!(reg.iri_for_graph_id(3), Some(source.as_str()));
             assert_eq!(reg.next_id(), 5);
             // Commits replayed over the index route to it as the index does.
             assert!(reg.apply_delta([source.as_str()]).is_empty());
-            assert_eq!(reg.graph_id_for_iri(&source), Some(3));
+            assert_eq!(reg.assigned_graph_id(&source), Some(3));
             // Another ledger's config graph IRI the root does not list is
             // still the config graph.
             let other = config_graph_iri("c:main");
             reg.apply_delta([other.as_str()]);
-            assert_eq!(reg.graph_id_for_iri(&other), Some(CONFIG_GRAPH_ID));
+            assert_eq!(reg.assigned_graph_id(&other), Some(CONFIG_GRAPH_ID));
         }
         assert!(!GraphRegistry::new_for_ledger("b:main").has_config_in_user_slot());
     }

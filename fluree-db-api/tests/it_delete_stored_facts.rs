@@ -218,7 +218,7 @@ async fn deleting_an_absent_fact_commits_nothing() {
 #[tokio::test]
 async fn a_delete_in_a_new_graph_commits_nothing() {
     const NEW: &str = "http://example.org/new";
-    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.graph_id_for_iri(NEW);
+    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.assigned_graph_id(NEW);
     for indexed in [false, true] {
         let seed = json!({"@id": "ex:s", "ex:p": "present"});
 
@@ -1781,7 +1781,7 @@ async fn a_delete_naming_a_graph_the_ledger_lacks_commits_nothing() {
         ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .is_some()
     };
     for indexed in [false, true] {
@@ -1855,7 +1855,7 @@ async fn graph_objects(ledger: &LedgerState, iri: Option<&str>) -> Vec<String> {
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph"),
     };
     let s = ledger.snapshot.encode_iri(&format!("{EX}s")).expect("s");
@@ -1947,7 +1947,7 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
             ledger
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri(&id)
+                .assigned_graph_id(&id)
                 .is_some(),
             "the fixture registers a graph under the ledger's address"
         );

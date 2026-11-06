@@ -527,7 +527,7 @@ async fn a_branch_takes_one_import_after_another() {
         assert_eq!(rows.as_array().map(Vec::len), Some(1), "{graph}: {rows}");
     }
     let main = fresh.ledger(LEDGER).await.unwrap();
-    assert_eq!(main.snapshot.graph_registry.graph_id_for_iri(GRAPH), None);
+    assert_eq!(main.snapshot.graph_registry.assigned_graph_id(GRAPH), None);
 }
 
 /// A refused import publishes nothing: the ledger stays at its head.

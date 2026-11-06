@@ -627,7 +627,7 @@ fn resolve_graph_iri(snapshot: &LedgerSnapshot, iri: &str) -> Result<GraphId> {
     }
     snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "graph '{iri}' not found in this ledger's graph registry"

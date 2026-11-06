@@ -208,7 +208,7 @@ impl<'a> ExportBuilder<'a> {
     fn resolve_graph_iri(&self, registry: &GraphRegistry) -> Result<(u16, String)> {
         let iri = self.graph_iri.as_deref().unwrap();
         match registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .filter(|g_id| !registry.is_dropped(*g_id))
         {
             Some(g_id) => Ok((g_id, iri.to_string())),

@@ -373,7 +373,13 @@ impl SequentialStager {
                 continue;
             };
             graphs.insert(Some(ns_registry.sid_for_iri(&iri)));
-            if self.original.snapshot.graph_registry.graph_id_for_iri(&iri) == Some(g_id) {
+            if self
+                .original
+                .snapshot
+                .graph_registry
+                .assigned_graph_id(&iri)
+                == Some(g_id)
+            {
                 of_original.push(g_id);
             }
             if self.seen_graph_iris.remove(&iri) {
@@ -545,7 +551,7 @@ impl SequentialStager {
         }
         let mut graph_delta: FxHashMap<u16, String> = FxHashMap::default();
         for iri in &self.merged_graph_iris {
-            if let Some(g_id) = self.sim_registry.graph_id_for_iri(iri) {
+            if let Some(g_id) = self.sim_registry.assigned_graph_id(iri) {
                 graph_delta.insert(g_id, iri.clone());
             }
         }
@@ -1236,7 +1242,7 @@ pub(crate) fn resolve_shapes_source_g_ids(
 
     let g_id = match source.graph_selector.as_deref() {
         Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
         None => Some(0u16),
     };
 
@@ -2388,7 +2394,7 @@ fn resolve_constraint_source_g_ids_for(
 
         let g_id = match source.graph_selector.as_deref() {
             Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-            Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+            Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
             None => Some(0u16), // no selector → default graph
         };
         match g_id {

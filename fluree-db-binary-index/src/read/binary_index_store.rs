@@ -3060,7 +3060,7 @@ impl BinaryIndexStore {
     }
 
     /// Lookup graph IRI → `GraphId`. Returns `None` if the IRI is not known.
-    pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<GraphId> {
         self.dicts.graphs_reverse.get(iri).copied()
     }
 

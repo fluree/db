@@ -743,7 +743,7 @@ pub(crate) fn resolve_graph_selector(
                 // Try as IRI
                 if let Some(store) = store {
                     store
-                        .graph_id_for_iri(other)
+                        .assigned_graph_id(other)
                         .ok_or_else(|| LedgerInfoError::UnknownGraph(other.to_string()))
                 } else {
                     Err(LedgerInfoError::UnknownGraph(format!(
@@ -768,7 +768,7 @@ pub(crate) fn resolve_graph_selector(
             }
             if let Some(store) = store {
                 store
-                    .graph_id_for_iri(iri)
+                    .assigned_graph_id(iri)
                     .ok_or_else(|| LedgerInfoError::UnknownGraph(iri.clone()))
             } else {
                 Err(LedgerInfoError::UnknownGraph(format!(

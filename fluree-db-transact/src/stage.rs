@@ -846,7 +846,7 @@ pub async fn stage_with_graph_delta(
                         graph_iri: iri.clone(),
                     });
                 }
-                match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+                match ledger.snapshot.graph_registry.assigned_graph_id(iri) {
                     Some(g_id) if g_id < FIRST_USER_GRAPH_ID => {
                         return Err(TransactError::ReservedGraphTarget {
                             graph_iri: iri.clone(),
@@ -1225,7 +1225,7 @@ pub async fn stage_with_graph_delta(
                 .collect();
             graph_delta.retain(|_, iri| {
                 registry
-                    .graph_id_for_iri(iri)
+                    .assigned_graph_id(iri)
                     .is_some_and(|g_id| !registry.is_dropped(g_id))
                     || inserted.contains(iri.as_str())
                     || graph_sids
@@ -1272,7 +1272,7 @@ fn refuse_txn_meta_write(ledger: &LedgerState, iri: &str) -> Result<()> {
     let routes_to_txn_meta = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .is_some_and(|g_id| g_id == TXN_META_GRAPH_ID);
     if iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id) || routes_to_txn_meta {
         return Err(TransactError::ReservedGraphTarget {
@@ -1562,7 +1562,7 @@ fn resolve_named_graph(
 ) -> Option<(GraphId, Sid)> {
     let registry = &ledger.snapshot.graph_registry;
     registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .filter(|g_id| !registry.is_dropped(*g_id))
         .map(|g_id| (g_id, ns_registry.sid_for_iri(iri)))
 }
@@ -4085,7 +4085,7 @@ async fn generate_upsert_deletions(
         .map(|graph| {
             let ledger_g = match &graph {
                 None => Some(0),
-                Some(iri) => ledger.snapshot.graph_registry.graph_id_for_iri(iri),
+                Some(iri) => ledger.snapshot.graph_registry.assigned_graph_id(iri),
             };
             (graph, ledger_g)
         })
