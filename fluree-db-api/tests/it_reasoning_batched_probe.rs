@@ -753,3 +753,243 @@ ex:a ex:parent ex:b . ex:b ex:parent ex:c . ex:c ex:name "Cee" .
         "facts derived per row"
     );
 }
+
+const SUBJECT_LANE: &str = "join_flush_batched_binary";
+const OBJECT_LANE: &str = "join_flush_batched_object_binary";
+const PER_ROW_EVENT: &str = "join batched probe: too few rows for the overlay extent; per-row";
+
+/// `mentored` derived `ex:knows` edges `s{i} → o{i}`. `ex:board` ranks
+/// `s0` and levels the first `wide` subjects; `o0` has an age and the first
+/// `wide` objects a tier. The markers bind the probe key from a pattern of
+/// their own, so the join is a nested loop, not a star. Stored `ex:knows`
+/// edges outnumber the markers in the planner's stats (derived facts aren't
+/// in them), so the markers drive.
+fn derived_extent_data(mentored: usize, wide: usize) -> Value {
+    let mut graph = vec![
+        json!({"@id": "ex:mentors", "rdfs:subPropertyOf": {"@id": "ex:knows"}}),
+        json!({"@id": "ex:board", "ex:ranks": {"@id": "ex:s0"}}),
+        json!({"@id": "ex:o0", "ex:age": 30}),
+    ];
+    for i in 0..4 * wide {
+        graph.push(json!({"@id": format!("ex:k{i}"), "ex:knows": {"@id": format!("ex:j{i}")}}));
+    }
+    for i in 0..mentored {
+        graph.push(json!({"@id": format!("ex:s{i}"), "ex:mentors": {"@id": format!("ex:o{i}")}}));
+        if i < wide {
+            graph.push(json!({"@id": "ex:board", "ex:levels": {"@id": format!("ex:s{i}")}}));
+            graph.push(json!({"@id": format!("ex:o{i}"), "ex:tier": 1}));
+        }
+    }
+    json!({"@context": ctx(), "@graph": graph})
+}
+
+/// `[?x ?z]` for a marker pattern joined to `?x ex:knows ?z`.
+fn knows_query(marker: Value, sparql_marker: &str) -> (Value, String) {
+    (
+        json!({
+            "@context": ctx(),
+            "select": ["?x", "?z"],
+            "where": [marker, {"@id": "?x", "ex:knows": "?z"}],
+            "reasoning": "owl2rl"
+        }),
+        sparql(&format!(
+            "SELECT ?x ?z WHERE {{ {sparql_marker} . ?x ex:knows ?z }}"
+        )),
+    )
+}
+
+/// A query's rows, whether it flushed `lane`, whether a flush handed its
+/// rows to the per-row path, and its span names.
+async fn routed_rows(
+    fluree: &Fluree,
+    view: &GraphDb,
+    store: &SpanStore,
+    lane: &str,
+    input: QueryInput<'_>,
+) -> (Vec<Value>, bool, bool, Vec<&'static str>) {
+    let flushes = store.find_spans(lane).len();
+    let per_row = store.find_events(PER_ROW_EVENT).len();
+    let spans = store.span_names().len();
+    let rows = query_rows(fluree, view, input).await;
+    (
+        rows,
+        store.find_spans(lane).len() > flushes,
+        store.find_events(PER_ROW_EVENT).len() > per_row,
+        store.span_names()[spans..].to_vec(),
+    )
+}
+
+/// A cold lane would translate its predicate's whole derived extent before
+/// the first probe. A final flush with too few rows to repay that runs per
+/// row; a wide input takes the lane, and once its ops are translated a
+/// selective input takes it too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_lane_leaves_a_selective_input_per_row() {
+    const MENTORED: usize = 400;
+    const WIDE: usize = 60;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-selective:main";
+    let warmup_id = "it/reasoning-selective-warmup:main";
+    for id in [warmup_id, ledger_id] {
+        let ledger = genesis_ledger_for_fluree(&fluree, id);
+        fluree
+            .insert(ledger, &derived_extent_data(MENTORED, WIDE))
+            .await
+            .expect("insert");
+        fluree
+            .reindex(id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+    }
+    let selective = [
+        (
+            OBJECT_LANE,
+            knows_query(json!({"@id": "?z", "ex:age": 30}), "?z ex:age 30"),
+        ),
+        (
+            SUBJECT_LANE,
+            knows_query(
+                json!({"@id": "ex:board", "ex:ranks": "?x"}),
+                "ex:board ex:ranks ?x",
+            ),
+        ),
+    ];
+    let wide = [
+        (
+            OBJECT_LANE,
+            knows_query(json!({"@id": "?z", "ex:tier": 1}), "?z ex:tier 1"),
+        ),
+        (
+            SUBJECT_LANE,
+            knows_query(
+                json!({"@id": "ex:board", "ex:levels": "?x"}),
+                "ex:board ex:levels ?x",
+            ),
+        ),
+    ];
+    let one = vec![json!(["ex:s0", "ex:o0"])];
+    let all_wide = sorted(
+        (0..WIDE)
+            .map(|i| json!([format!("ex:s{i}"), format!("ex:o{i}")]))
+            .collect(),
+    );
+
+    let (store, guard) = init_test_tracing();
+    // Register every callsite on a twin ledger (its cache keys are its own),
+    // then recompute interest before measuring.
+    let warmup = fluree.db(warmup_id).await.expect("warmup view");
+    for (_, (jsonld, _)) in selective.iter().chain(&wide) {
+        query_rows(&fluree, &warmup, QueryInput::JsonLd(jsonld)).await;
+    }
+    tracing::callsite::rebuild_interest_cache();
+
+    let view = fluree.db(ledger_id).await.expect("view");
+    for (phase, queries, expected, takes_lane) in [
+        ("cold", &selective, &one, false),
+        ("wide", &wide, &all_wide, true),
+        ("warm", &selective, &one, true),
+    ] {
+        for (lane, (jsonld, sparql)) in queries {
+            for (surface, input) in [
+                ("JSON-LD", QueryInput::JsonLd(jsonld)),
+                ("SPARQL", QueryInput::Sparql(sparql)),
+            ] {
+                let label = format!("{phase} {lane} ({surface})");
+                let (rows, flushed, per_row, spans) =
+                    routed_rows(&fluree, &view, &store, lane, input).await;
+                assert_eq!(&rows, expected, "{label}: rows");
+                assert_eq!(
+                    (flushed, per_row),
+                    (takes_lane, !takes_lane),
+                    "{label}: (flushed the lane, ran per row); this query's spans: {spans:?}"
+                );
+            }
+        }
+    }
+    drop(guard);
+}
+
+/// Two eager overlays over one state derive different `ex:friend` facts
+/// (OWL 2 RL symmetry, a datalog rule); a lane's translated ops for one are
+/// never served to the other. Stored filler edges outnumber the club in the
+/// planner's stats, so the club drives and the lane probes `ex:friend`.
+#[tokio::test(flavor = "current_thread")]
+async fn translated_ops_are_kept_apart_per_reasoning_mode() {
+    const DATA: &str = r"
+@prefix ex: <http://example.org/ns/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+ex:friend a owl:SymmetricProperty .
+ex:club ex:member ex:a, ex:b, ex:c, ex:d .
+ex:a ex:friend ex:b .
+ex:c ex:teammate ex:d .
+ex:p0 ex:friend ex:q0 . ex:p1 ex:friend ex:q1 . ex:p2 ex:friend ex:q2 .
+ex:p3 ex:friend ex:q3 . ex:p4 ex:friend ex:q4 . ex:p5 ex:friend ex:q5 .
+";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-modes-apart:main";
+    let ledger = fluree
+        .stage_owned(genesis_ledger_for_fluree(&fluree, ledger_id))
+        .upsert_turtle(DATA)
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let rule = json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "http://example.org/ns/rule/teammates",
+        "f:rule": {"@type": "f:sparql", "@value": format!(
+            "{SPARQL_PREFIXES}CONSTRUCT {{ ?x ex:friend ?y }} WHERE {{ ?x ex:teammate ?y }}"
+        )}
+    });
+    fluree.insert(ledger, &rule).await.expect("rule");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let query = |mode: &str| {
+        (
+            json!({
+                "@context": ctx(),
+                "select": ["?x", "?y"],
+                "where": [
+                    {"@id": "ex:club", "ex:member": "?x"},
+                    {"@id": "?x", "ex:friend": "?y"}
+                ],
+                "reasoning": mode
+            }),
+            format!(
+                "# PRAGMA reasoning: {mode}\n{SPARQL_PREFIXES}\
+                 SELECT ?x ?y WHERE {{ ex:club ex:member ?x . ?x ex:friend ?y }}"
+            ),
+        )
+    };
+    let symmetric = sorted(vec![json!(["ex:a", "ex:b"]), json!(["ex:b", "ex:a"])]);
+    let teammates = sorted(vec![json!(["ex:a", "ex:b"]), json!(["ex:c", "ex:d"])]);
+
+    let (store, guard) = init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let view = fluree.db(ledger_id).await.expect("view");
+    for (mode, expected) in [
+        ("owl2rl", &symmetric),
+        ("datalog", &teammates),
+        ("owl2rl", &symmetric),
+    ] {
+        let (jsonld, sparql) = query(mode);
+        for (surface, input) in [
+            ("JSON-LD", QueryInput::JsonLd(&jsonld)),
+            ("SPARQL", QueryInput::Sparql(&sparql)),
+        ] {
+            let label = format!("{mode} ({surface})");
+            let lane = Lane::Join(SUBJECT_LANE);
+            let before = mark(&store, lane);
+            assert_eq!(
+                &query_rows(&fluree, &view, input).await,
+                expected,
+                "{label}"
+            );
+            assert_lane(&store, &before, lane, &label);
+        }
+    }
+    drop(guard);
+}

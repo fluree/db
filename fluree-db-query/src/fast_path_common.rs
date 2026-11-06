@@ -2105,6 +2105,24 @@ pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, flure
     (first, rhs)
 }
 
+/// Upper bound on the overlay flakes of `pred_sid` in `g_id` (the extent
+/// [`collect_resolved_overlay_ops`] walks for PSOT), when the overlay can
+/// count without walking.
+pub(crate) fn predicate_overlay_extent(
+    ctx: &ExecutionContext<'_>,
+    g_id: GraphId,
+    pred_sid: &Sid,
+) -> Option<usize> {
+    let (first, rhs) = predicate_walk_bounds(pred_sid);
+    ctx.overlay().overlay_range_flake_count(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(RunSortOrder::Psot),
+        Some(&first),
+        Some(&rhs),
+        false,
+    )
+}
+
 /// Collect the novelty-overlay ops for a single predicate, translated into the
 /// binary-index `OverlayOp` representation and sorted/resolved for `order`.
 ///
@@ -2283,6 +2301,72 @@ pub fn cached_overlay_ops(
     order: RunSortOrder,
     pred_sid: &Sid,
 ) -> Result<Option<SharedOverlayOps>> {
+    debug_assert!(
+        !matches!(order, RunSortOrder::Opst),
+        "OPST keys hold the object lane's ops (`cached_object_probe_ops`)"
+    );
+    cached_ops_entry(ctx, store, g_id, order, pred_sid, || {
+        Ok(
+            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+                .map(SharedOverlayOps::from),
+        )
+    })
+}
+
+/// The predicate's `IRI_REF` ops sorted by `(o_key, s_id, o_i)`, the order
+/// the OPST object lane reconciles in. Derived from the PSOT ops once and
+/// cached beside them under the OPST key.
+pub(crate) fn cached_object_probe_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    let g_id = ctx.binary_g_id;
+    cached_ops_entry(ctx, store, g_id, RunSortOrder::Opst, pred_sid, || {
+        let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? else {
+            return Ok(None);
+        };
+        let iri_ref = OType::IRI_REF.as_u16();
+        let mut subset: Vec<_> = ops
+            .iter()
+            .filter(|o| o.o_type == iri_ref)
+            .copied()
+            .collect();
+        subset.sort_unstable_by_key(|o| (o.o_key, o.s_id, o.o_i));
+        Ok(Some(subset.into()))
+    })
+}
+
+/// Whether the ops for `(g_id, order, pred_sid)` are already translated,
+/// in this execution or (for an eager caller) a previous one.
+pub(crate) fn overlay_ops_cached(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> bool {
+    let in_execution = ctx.overlay_ops_cache.inner.get().is_some_and(|bound| {
+        bound.binding == OverlayOpsBinding::of(ctx, store)
+            && bound
+                .map
+                .lock()
+                .expect("overlay ops cache poisoned")
+                .contains_key(&(g_id, order, pred_sid.clone()))
+    });
+    in_execution
+        || pred_ops_key(ctx, store, g_id, order, pred_sid)
+            .is_some_and(|key| global_pred_ops_cache().contains(&key))
+}
+
+fn cached_ops_entry(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+    compute: impl FnOnce() -> Result<Option<SharedOverlayOps>>,
+) -> Result<Option<SharedOverlayOps>> {
     let binding = OverlayOpsBinding::of(ctx, store);
     let bound = ctx.overlay_ops_cache.inner.get_or_init(|| BoundOpsMap {
         binding,
@@ -2296,10 +2380,7 @@ pub fn cached_overlay_ops(
              the deriving constructor must start a fresh cache"
         );
         tracing::debug!("overlay-ops cache binding mismatch; computing uncached");
-        return Ok(
-            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
-                .map(SharedOverlayOps::from),
-        );
+        return compute();
     }
     let key = (g_id, order, pred_sid.clone());
     if let Some(entry) = bound
@@ -2313,7 +2394,7 @@ pub fn cached_overlay_ops(
     // A concurrent miss on the same key duplicates the walk (acceptable —
     // last write wins with an identical value) but never holds the lock
     // across the walk.
-    let computed = resolved_overlay_ops_cross_query(ctx, store, g_id, order, pred_sid)?;
+    let computed = ops_cross_query(ctx, store, g_id, order, pred_sid, compute)?;
     bound
         .map
         .lock()
@@ -2322,29 +2403,45 @@ pub fn cached_overlay_ops(
     Ok(computed)
 }
 
-/// Cross-query layer under [`cached_overlay_ops`]. A predicate's resolved ops
-/// are a function of the state a [`GlobalTranslationKey`] names, and a
+/// Cross-query layer under [`cached_ops_entry`], for eager callers only: a
 /// reasoning materialization's derived extents cost a dictionary translation
-/// per fact, so they are translated once rather than once per query.
-fn resolved_overlay_ops_cross_query(
+/// per fact and are read by query after query, so they are translated once.
+/// Novelty extents are bounded by indexing and stay per-execution.
+fn ops_cross_query(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     order: RunSortOrder,
     pred_sid: &Sid,
+    compute: impl FnOnce() -> Result<Option<SharedOverlayOps>>,
 ) -> Result<Option<SharedOverlayOps>> {
-    let collect = || -> Result<Option<SharedOverlayOps>> {
-        Ok(
-            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
-                .map(SharedOverlayOps::from),
-        )
+    let Some(key) = pred_ops_key(ctx, store, g_id, order, pred_sid) else {
+        return compute();
     };
-    // An overlay that cannot vouch for its content is not cached across
-    // queries (see `GlobalTranslationKey`).
-    let Some(content_version) = ctx.overlay().content_version() else {
-        return collect();
-    };
-    let key = (
+    if let Some(hit) = global_pred_ops_cache().get(&key) {
+        return Ok(Some(hit));
+    }
+    let computed = compute()?;
+    if let Some(ops) = &computed {
+        global_pred_ops_cache().insert(key, ops.clone());
+    }
+    Ok(computed)
+}
+
+/// The cross-query key, or `None` when the caller isn't eager or its overlay
+/// cannot vouch for its content (see `GlobalTranslationKey`).
+fn pred_ops_key(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Option<PredOpsKey> {
+    if !ctx.eager_materialization {
+        return None;
+    }
+    let content_version = ctx.overlay().content_version()?;
+    Some((
         crate::binary_scan::GlobalTranslationKey {
             ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
             snapshot_t: ctx.active_snapshot.t,
@@ -2355,72 +2452,81 @@ fn resolved_overlay_ops_cross_query(
             index: crate::binary_scan::sort_order_to_index_type(order),
         },
         pred_sid.clone(),
-    );
-    if let Some(hit) = global_pred_ops_cache().get(&key) {
-        return Ok(Some(hit));
-    }
-    let computed = collect()?;
-    if let Some(ops) = &computed {
-        global_pred_ops_cache().insert(key, ops.clone());
-    }
-    Ok(computed)
+    ))
 }
 
 type PredOpsKey = (crate::binary_scan::GlobalTranslationKey, Sid);
 
-/// Ops the cross-query per-predicate cache retains in total (~40 B each).
+/// Budget of the cross-query per-predicate cache, in ops (~40 B each).
 const PRED_OPS_CACHE_MAX_OPS: usize = 1 << 22;
 
-/// LRU of per-predicate resolved ops, bounded by the ops it retains: one
+/// What one entry's key, LRU node and allocations cost against
+/// [`PRED_OPS_CACHE_MAX_OPS`], in op-sized units, so that many small entries
+/// are bounded as well as a few large ones.
+const PRED_OPS_ENTRY_COST: usize = 8;
+
+/// LRU of per-predicate resolved ops, bounded by what it retains: one
 /// derived `rdf:type` extent can hold millions, and every commit mints new
-/// keys.
+/// keys. Empty results aren't retained; computing one is a walk that finds
+/// nothing.
 struct PredOpsCache {
     inner: std::sync::Mutex<PredOpsLru>,
 }
 
 struct PredOpsLru {
     entries: lru::LruCache<PredOpsKey, SharedOverlayOps>,
-    retained_ops: usize,
+    retained: usize,
+}
+
+fn pred_ops_entry_cost(ops: &SharedOverlayOps) -> usize {
+    ops.len() + PRED_OPS_ENTRY_COST
 }
 
 impl PredOpsCache {
-    fn get(&self, key: &PredOpsKey) -> Option<SharedOverlayOps> {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PredOpsLru {
+                entries: lru::LruCache::unbounded(),
+                retained: 0,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PredOpsLru> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .get(key)
-            .cloned()
+    }
+
+    fn get(&self, key: &PredOpsKey) -> Option<SharedOverlayOps> {
+        self.lock().entries.get(key).cloned()
+    }
+
+    fn contains(&self, key: &PredOpsKey) -> bool {
+        self.lock().entries.contains(key)
     }
 
     fn insert(&self, key: PredOpsKey, ops: SharedOverlayOps) {
-        if ops.len() > PRED_OPS_CACHE_MAX_OPS {
+        let cost = pred_ops_entry_cost(&ops);
+        if ops.is_empty() || cost > PRED_OPS_CACHE_MAX_OPS {
             return;
         }
-        let mut lru = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        lru.retained_ops += ops.len();
+        let mut lru = self.lock();
+        lru.retained += cost;
         if let Some(replaced) = lru.entries.put(key, ops) {
-            lru.retained_ops -= replaced.len();
+            lru.retained -= pred_ops_entry_cost(&replaced);
         }
-        while lru.retained_ops > PRED_OPS_CACHE_MAX_OPS {
+        while lru.retained > PRED_OPS_CACHE_MAX_OPS {
             let Some((_, evicted)) = lru.entries.pop_lru() else {
                 break;
             };
-            lru.retained_ops -= evicted.len();
+            lru.retained -= pred_ops_entry_cost(&evicted);
         }
     }
 }
 
 fn global_pred_ops_cache() -> &'static PredOpsCache {
-    static CACHE: std::sync::LazyLock<PredOpsCache> = std::sync::LazyLock::new(|| PredOpsCache {
-        inner: std::sync::Mutex::new(PredOpsLru {
-            entries: lru::LruCache::unbounded(),
-            retained_ops: 0,
-        }),
-    });
+    static CACHE: std::sync::LazyLock<PredOpsCache> = std::sync::LazyLock::new(PredOpsCache::new);
     &CACHE
 }
 
@@ -2553,27 +2659,15 @@ impl ProbeOps {
     }
 }
 
-/// One overlay op of the object-probe subset: an `IRI_REF`-valued fact of
-/// the probed predicate, keyed for object-major reconciliation.
-#[derive(Clone, Copy)]
-struct ObjectProbeOp {
-    o_key: u64,
-    s_id: u64,
-    o_i: u32,
-    /// true = assert, false = retract.
-    op: bool,
-}
-
 /// Per-flush reconciler for the OPST bound-object probe lane.
 ///
 /// The lane scans only `IRI_REF` rows of one predicate, keyed by object id,
-/// so this owns the matching subset of the predicate's resolved ops re-sorted
-/// by `(o_key, s_id, o_i)` — object-major windows with a well-defined
-/// binary-search order regardless of the source vec's sort order (the cached
-/// PSOT ops serve directly; no second overlay walk in OPST order). Same case
+/// so it reconciles against [`cached_object_probe_ops`]: that subset of the
+/// predicate's resolved ops in `(o_key, s_id, o_i)` order, object-major
+/// windows shared across flushes and (for eager callers) queries. Same case
 /// analysis and per-flush scope as [`ProbeOps`].
 pub struct ObjectProbeOps {
-    ops: Vec<ObjectProbeOp>,
+    ops: SharedOverlayOps,
     consumed: Vec<bool>,
     /// Base rows suppressed by novelty retracts (diagnostics).
     pub dropped_rows: u64,
@@ -2582,28 +2676,20 @@ pub struct ObjectProbeOps {
 }
 
 impl ObjectProbeOps {
-    /// Filter `ops` (one predicate's resolved ops, any sort order) to the
-    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
-    /// can affect the lane — callers then run their unmodified scan.
-    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
-        let iri_ref = OType::IRI_REF.as_u16();
-        let mut subset: Vec<ObjectProbeOp> = ops
-            .iter()
-            .filter(|o| o.o_type == iri_ref)
-            .map(|o| ObjectProbeOp {
-                o_key: o.o_key,
-                s_id: o.s_id,
-                o_i: o.o_i,
-                op: o.op,
-            })
-            .collect();
-        if subset.is_empty() {
+    /// `ops` must come from [`cached_object_probe_ops`]. Returns `None` when
+    /// empty: no op can affect the lane, so callers run their unmodified scan.
+    pub fn new(ops: SharedOverlayOps) -> Option<Self> {
+        if ops.is_empty() {
             return None;
         }
-        subset.sort_unstable_by_key(|o| (o.o_key, o.s_id, o.o_i));
-        let consumed = vec![false; subset.len()];
+        debug_assert!(
+            ops.windows(2)
+                .all(|w| (w[0].o_key, w[0].s_id, w[0].o_i) < (w[1].o_key, w[1].s_id, w[1].o_i)),
+            "ObjectProbeOps requires object-major sorted, resolved ops"
+        );
+        let consumed = vec![false; ops.len()];
         Some(Self {
-            ops: subset,
+            ops,
             consumed,
             dropped_rows: 0,
             injected_rows: 0,
@@ -2838,6 +2924,18 @@ pub(crate) fn probe_lane_admission(
     None
 }
 
+/// An eager caller declines a predicate the index lacks before translating
+/// its ops, which could only decide between declining and an empty lane: a
+/// derived-only extent is translated in full for nothing, and the fallback is
+/// correct either way.
+fn eager_declines_unindexed(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    pred_sid: &Sid,
+) -> bool {
+    eager_with_overlay(ctx) && store.sid_to_p_id(pred_sid).is_none()
+}
+
 /// Plan a single-predicate PSOT subject probe under the active overlay.
 pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
@@ -2846,6 +2944,9 @@ pub fn subject_probe_lane_plan(
 ) -> Result<ProbeLanePlan> {
     if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
         return Ok(plan);
+    }
+    if eager_declines_unindexed(ctx, store, pred_sid) {
+        return Ok(ProbeLanePlan::Decline);
     }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
@@ -2871,9 +2972,8 @@ pub fn subject_probe_lane_plan(
 
 /// Plan an OPST bound-object probe under the active overlay.
 ///
-/// Reuses the predicate's cached PSOT ops (the object lane filters and
-/// re-sorts its `IRI_REF` subset itself), but gates on the OPST branch the
-/// scan actually reads.
+/// Gates on the predicate's PSOT ops and the OPST branch the scan reads, and
+/// merges the ops' `IRI_REF` subset ([`cached_object_probe_ops`]).
 pub fn object_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -2881,6 +2981,9 @@ pub fn object_probe_lane_plan(
 ) -> Result<ProbeLanePlan> {
     if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
         return Ok(plan);
+    }
+    if eager_declines_unindexed(ctx, store, pred_sid) {
+        return Ok(ProbeLanePlan::Decline);
     }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
@@ -2901,7 +3004,10 @@ pub fn object_probe_lane_plan(
         tracing::debug!("object probe: OPST branch absent with novelty present; declining");
         return Ok(ProbeLanePlan::Decline);
     }
-    Ok(ProbeLanePlan::Merge(ops))
+    let Some(ref_ops) = cached_object_probe_ops(ctx, store, pred_sid)? else {
+        return Ok(ProbeLanePlan::Decline);
+    };
+    Ok(ProbeLanePlan::Merge(ref_ops))
 }
 
 /// Plan a multi-predicate SPOT star probe under the active overlay.
@@ -2917,6 +3023,12 @@ pub fn star_probe_lane_plan(
 ) -> Result<ProbeLanePlan> {
     if let Some(plan) = probe_lane_admission(ctx, pred_sids) {
         return Ok(plan);
+    }
+    if pred_sids
+        .iter()
+        .any(|pred_sid| eager_declines_unindexed(ctx, store, pred_sid))
+    {
+        return Ok(ProbeLanePlan::Decline);
     }
     let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
     for pred_sid in pred_sids {
@@ -4647,5 +4759,81 @@ mod tests {
             Err(QueryError::Internal("merge check failed".into()))
         });
         assert!(refused.is_err(), "a failed merge check fails the lookup");
+    }
+
+    fn pred_ops_test_key(content_version: u64) -> PredOpsKey {
+        (
+            crate::binary_scan::GlobalTranslationKey {
+                ledger_id: "cache/test:main".into(),
+                snapshot_t: 1,
+                content_version,
+                store_id: 1,
+                to_t: 1,
+                g_id: 0,
+                index: IndexType::Psot,
+            },
+            Sid::new(1, "p"),
+        )
+    }
+
+    fn pred_ops_of(n: usize) -> SharedOverlayOps {
+        (0..n as u64)
+            .map(|s_id| fluree_db_binary_index::read::types::OverlayOp {
+                s_id,
+                p_id: 0,
+                o_type: OType::IRI_REF.as_u16(),
+                o_key: 0,
+                o_i: 0,
+                t: 1,
+                op: true,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pred_ops_cache_bounds_small_entries_and_skips_empty_ones() {
+        let cache = PredOpsCache::new();
+        let keys = 4 * PRED_OPS_CACHE_MAX_OPS / PRED_OPS_ENTRY_COST;
+        for version in 0..keys as u64 {
+            cache.insert(pred_ops_test_key(version), pred_ops_of(0));
+        }
+        assert_eq!(
+            cache.lock().entries.len(),
+            0,
+            "empty results aren't retained"
+        );
+
+        let one = pred_ops_of(1);
+        for version in 0..keys as u64 {
+            cache.insert(pred_ops_test_key(version), Arc::clone(&one));
+        }
+        let lru = cache.lock();
+        let per_entry = 1 + PRED_OPS_ENTRY_COST;
+        assert_eq!(lru.entries.len(), PRED_OPS_CACHE_MAX_OPS / per_entry);
+        assert_eq!(lru.retained, lru.entries.len() * per_entry);
+    }
+
+    #[test]
+    fn pred_ops_cache_evicts_least_recent_to_its_budget() {
+        let cache = PredOpsCache::new();
+        let half = pred_ops_of(PRED_OPS_CACHE_MAX_OPS / 2 - PRED_OPS_ENTRY_COST);
+        cache.insert(pred_ops_test_key(1), Arc::clone(&half));
+        cache.insert(pred_ops_test_key(2), Arc::clone(&half));
+        assert!(cache.get(&pred_ops_test_key(1)).is_some());
+        cache.insert(pred_ops_test_key(3), Arc::clone(&half));
+        assert!(cache.contains(&pred_ops_test_key(1)), "recently read");
+        assert!(
+            !cache.contains(&pred_ops_test_key(2)),
+            "least recent evicted"
+        );
+        assert!(cache.contains(&pred_ops_test_key(3)));
+        assert!(cache.lock().retained <= PRED_OPS_CACHE_MAX_OPS);
+
+        let oversized = pred_ops_of(PRED_OPS_CACHE_MAX_OPS);
+        cache.insert(pred_ops_test_key(4), oversized);
+        assert!(
+            !cache.contains(&pred_ops_test_key(4)),
+            "larger than the budget"
+        );
     }
 }

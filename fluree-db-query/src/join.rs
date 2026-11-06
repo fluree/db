@@ -42,6 +42,11 @@ const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 /// Entries the decoded-key memo holds before it starts over.
 const BATCHED_KEY_MEMO_CAP: usize = 1 << 18;
+/// Roughly what one per-row scan costs in overlay-flake translations. A cold
+/// eager lane translates its predicate's whole overlay extent up front, so a
+/// final flush with fewer rows than `extent / COLD_LANE_FLAKES_PER_ROW` runs
+/// per-row instead, where each row translates only its own matches.
+const COLD_LANE_FLAKES_PER_ROW: usize = 8;
 
 fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
     count
@@ -824,9 +829,15 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
-    /// Decoded left keys (`Sid`/`IriMatch`) resolved to raw `s_id`s. Eager
-    /// left streams repeat subjects across many rows, and each reverse
-    /// dictionary lookup costs microseconds.
+    /// The overlay plan waits for the first flush ([`Self::defers_batched_overlay`]).
+    batched_overlay_deferred: bool,
+    /// `(stored batch, row)` left rows a flush handed to the per-row path;
+    /// drained before any further left row is read.
+    per_row_backlog: VecDeque<(usize, usize)>,
+    /// Decoded left keys (`Sid`/`IriMatch`) resolved to raw `s_id`s, for
+    /// eager callers only: every row of an eager left stream is decoded, its
+    /// subjects repeat across many rows, and each reverse dictionary lookup
+    /// costs microseconds.
     batched_key_memo: FxHashMap<Sid, Option<u64>>,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
@@ -1079,6 +1090,8 @@ impl NestedLoopJoinOperator {
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
+            batched_overlay_deferred: false,
+            per_row_backlog: VecDeque::new(),
             batched_key_memo: FxHashMap::default(),
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
@@ -1345,6 +1358,8 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
         self.batched_key_memo.clear();
+        self.batched_overlay_deferred = false;
+        self.per_row_backlog.clear();
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1396,10 +1411,14 @@ impl Operator for NestedLoopJoinOperator {
         // the object/exists lanes still require an overlay-free graph and
         // otherwise force the per-row scan path (whose binary cursor merges
         // overlay ops).
-        self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        self.batched_overlay_deferred = self.defers_batched_overlay(ctx);
+        if !self.batched_overlay_deferred {
+            self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        }
         let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
-                && !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline)
+                && (self.batched_overlay_deferred
+                    || !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline))
                 // Under eager materialization (reasoning, datalog rule
                 // bodies) the lanes emit decoded bindings, as the per-row path
                 // does. Multi-ledger eager rows also need `IriMatch`
@@ -1485,6 +1504,13 @@ impl Operator for NestedLoopJoinOperator {
                 }
             }
 
+            // 3b. Left rows a flush handed back to the per-row path.
+            if let Some((batch_idx, left_row)) = self.per_row_backlog.pop_front() {
+                self.open_per_row_scan(ctx, batch_idx, left_row, cached_view.as_ref())
+                    .await?;
+                continue;
+            }
+
             // 4. Need to process more left rows
             if self.current_left_batch.is_none() {
                 ctx.check_cancelled()?;
@@ -1499,7 +1525,7 @@ impl Operator for NestedLoopJoinOperator {
                         // Left exhausted — flush any remaining accumulator
                         if !self.batched_accumulator.is_empty() {
                             ctx.check_cancelled()?;
-                            self.flush_batched_accumulator_for_ctx(ctx).await?;
+                            self.flush_batched_accumulator_for_ctx(ctx, true).await?;
                             ctx.check_cancelled()?;
                             continue;
                         }
@@ -1549,15 +1575,23 @@ impl Operator for NestedLoopJoinOperator {
                     // the batched lane (the merge injects their facts) instead
                     // of each paying a per-row fallback scan. The dictionaries
                     // are read only for a decoded subject.
-                    let memo = &mut self.batched_key_memo;
+                    let mut memo = ctx
+                        .eager_materialization
+                        .then_some(&mut self.batched_key_memo);
                     let mut resolve_subject = |sid: &Sid| -> Option<u64> {
+                        let lookup = || {
+                            TermDicts::of(ctx)?
+                                .subject_id(sid.namespace_code, &sid.name)
+                                .ok()
+                                .flatten()
+                        };
+                        let Some(memo) = memo.as_deref_mut() else {
+                            return lookup();
+                        };
                         if let Some(&hit) = memo.get(sid) {
                             return hit;
                         }
-                        let s_id = TermDicts::of(ctx)?
-                            .subject_id(sid.namespace_code, &sid.name)
-                            .ok()
-                            .flatten();
+                        let s_id = lookup();
                         if memo.len() >= BATCHED_KEY_MEMO_CAP {
                             memo.clear();
                         }
@@ -1582,64 +1616,21 @@ impl Operator for NestedLoopJoinOperator {
                     self.batched_accumulator.push((batch_idx, left_row, key));
                     if self.batched_accumulator.len() >= self.flush_schedule.size() {
                         ctx.check_cancelled()?;
-                        self.flush_batched_accumulator_for_ctx(ctx).await?;
+                        self.flush_batched_accumulator_for_ctx(ctx, false).await?;
                         ctx.check_cancelled()?;
                         self.flush_schedule.advance();
                     }
                 } else {
                     // Fall back to per-row scan for unsupported binding types.
                     let batch_idx = self.ensure_current_batch_stored();
-                    let batch_ref = BatchRef::Stored(batch_idx);
-                    let left_batch = self.stored_left_batches.last().unwrap();
-                    let Some(bound_pattern) = self.substitute_pattern_with_store(
-                        left_batch,
-                        left_row,
-                        cached_view.as_ref(),
-                    )?
-                    else {
-                        continue;
-                    };
-                    let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
-                    let mut right_scan = make_right_scan(
-                        bound_pattern,
-                        bounds,
-                        self.right_emit,
-                        self.right_scan_inline_ops.clone(),
-                        self.right_index_hint,
-                        ctx,
-                        self.mode,
-                        self.hide_list_members,
-                    );
-                    right_scan.open(ctx).await?;
-                    self.active_right_scan = Some(right_scan);
-                    self.active_right_batch_ref = Some(batch_ref);
-                    self.active_right_left_row = left_row;
+                    self.open_per_row_scan(ctx, batch_idx, left_row, cached_view.as_ref())
+                        .await?;
                 }
             } else {
                 // Non-batched path: existing per-row join
                 let batch_idx = self.ensure_current_batch_stored();
-                let batch_ref = BatchRef::Stored(batch_idx);
-                let left_batch = self.stored_left_batches.last().unwrap();
-                let Some(bound_pattern) =
-                    self.substitute_pattern_with_store(left_batch, left_row, cached_view.as_ref())?
-                else {
-                    continue;
-                };
-                let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
-                let mut right_scan = make_right_scan(
-                    bound_pattern,
-                    bounds,
-                    self.right_emit,
-                    self.right_scan_inline_ops.clone(),
-                    self.right_index_hint,
-                    ctx,
-                    self.mode,
-                    self.hide_list_members,
-                );
-                right_scan.open(ctx).await?;
-                self.active_right_scan = Some(right_scan);
-                self.active_right_batch_ref = Some(batch_ref);
-                self.active_right_left_row = left_row;
+                self.open_per_row_scan(ctx, batch_idx, left_row, cached_view.as_ref())
+                    .await?;
             }
         }
     }
@@ -1761,6 +1752,7 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.batched_accumulator.clear();
+        self.per_row_backlog.clear();
         self.stored_left_batches.clear();
         self.batched_output.clear();
         self.count_only = None;
@@ -1891,6 +1883,93 @@ impl NestedLoopJoinOperator {
         self.current_left_batch_stored_idx = Some(idx);
         idx
     }
+
+    /// Open the per-row right scan for one stored left row; a row whose
+    /// bindings can't bind the pattern opens nothing.
+    async fn open_per_row_scan(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        batch_idx: usize,
+        left_row: usize,
+        view: Option<&BinaryGraphView>,
+    ) -> Result<()> {
+        let left_batch = &self.stored_left_batches[batch_idx];
+        let Some(bound_pattern) = self.substitute_pattern_with_store(left_batch, left_row, view)?
+        else {
+            return Ok(());
+        };
+        let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
+        let mut right_scan = make_right_scan(
+            bound_pattern,
+            bounds,
+            self.right_emit,
+            self.right_scan_inline_ops.clone(),
+            self.right_index_hint,
+            ctx,
+            self.mode,
+            self.hide_list_members,
+        );
+        right_scan.open(ctx).await?;
+        self.active_right_scan = Some(right_scan);
+        self.active_right_batch_ref = Some(BatchRef::Stored(batch_idx));
+        self.active_right_left_row = left_row;
+        Ok(())
+    }
+
+    /// Whether to plan the overlay at the first flush instead of now. A cold
+    /// eager lane translates its predicate's whole overlay extent, which a
+    /// derived extent can make far larger than the left input; at the flush
+    /// the rows are counted ([`Self::per_row_is_cheaper`]). Once translated,
+    /// the ops are cached and later calls plan at once.
+    fn defers_batched_overlay(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if !crate::fast_path_common::eager_with_overlay(ctx)
+            || !(self.batched_eligible
+                || self.batched_object_eligible
+                || self.batched_exists_eligible)
+        {
+            return false;
+        }
+        let (Some(store), Some(pred)) =
+            (ctx.binary_store.as_ref(), self.batched_predicate.as_ref())
+        else {
+            return false;
+        };
+        crate::fast_path_common::probe_lane_admission(ctx, &[pred]).is_none()
+            && store.sid_to_p_id(pred).is_some()
+            && !crate::fast_path_common::overlay_ops_cached(
+                ctx,
+                store,
+                ctx.binary_g_id,
+                fluree_db_binary_index::RunSortOrder::Psot,
+                pred,
+            )
+    }
+
+    /// Whether the accumulated rows are too few to repay translating the
+    /// predicate's overlay extent. An overlay that can't count says no.
+    fn per_row_is_cheaper(&self, ctx: &ExecutionContext<'_>) -> bool {
+        let Some(pred) = self.batched_predicate.as_ref() else {
+            return false;
+        };
+        crate::fast_path_common::predicate_overlay_extent(ctx, ctx.binary_g_id, pred).is_some_and(
+            |extent| {
+                self.batched_accumulator
+                    .len()
+                    .saturating_mul(COLD_LANE_FLAKES_PER_ROW)
+                    < extent
+            },
+        )
+    }
+
+    /// Hand the accumulated rows to the per-row path. Their stored batches
+    /// stay: the backlog drains before another flush can clear them.
+    fn reroute_accumulator_per_row(&mut self) {
+        self.per_row_backlog.extend(
+            self.batched_accumulator
+                .drain(..)
+                .map(|(batch_idx, left_row, _)| (batch_idx, left_row)),
+        );
+    }
     /// Flush batched accumulator using the appropriate snapshot/overlay/to_t for the current context.
     ///
     /// - Single-db mode: uses ctx.active_snapshot/ctx.overlay()/ctx.to_t
@@ -1898,6 +1977,7 @@ impl NestedLoopJoinOperator {
     async fn flush_batched_accumulator_for_ctx(
         &mut self,
         ctx: &ExecutionContext<'_>,
+        left_exhausted: bool,
     ) -> Result<()> {
         tracing::debug!(
             input_rows = self.batched_accumulator.len(),
@@ -1907,6 +1987,22 @@ impl NestedLoopJoinOperator {
             return Err(crate::error::QueryError::execution(
                 "binary_store is required for batched joins — no non-binary fallback exists",
             ));
+        }
+        if std::mem::take(&mut self.batched_overlay_deferred) {
+            // Only a final flush knows its input is all there is.
+            if left_exhausted && self.per_row_is_cheaper(ctx) {
+                tracing::debug!(
+                    input_rows = self.batched_accumulator.len(),
+                    "join batched probe: too few rows for the overlay extent; per-row"
+                );
+                self.reroute_accumulator_per_row();
+                return Ok(());
+            }
+            self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        }
+        if matches!(self.batched_overlay_mode, ProbeLanePlan::Decline) {
+            self.reroute_accumulator_per_row();
+            return Ok(());
         }
 
         let accum_len = self.batched_accumulator.len();
@@ -1942,6 +2038,10 @@ impl NestedLoopJoinOperator {
 
     /// Clear all batched accumulator state after a flush or early return.
     fn clear_batched_state(&mut self) {
+        debug_assert!(
+            self.per_row_backlog.is_empty(),
+            "per-row backlog rows reference the stored left batches"
+        );
         self.batched_accumulator.clear();
         self.stored_left_batches.clear();
         self.current_left_batch_stored_idx = None;
@@ -2713,7 +2813,7 @@ impl NestedLoopJoinOperator {
 
         // One reconciler per flush (see `flush_batched_accumulator_binary`).
         let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(Arc::clone(ops)),
             _ => None,
         };
 

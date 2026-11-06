@@ -507,7 +507,7 @@ impl PatternOptionalBuilder {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();
             let mut probe_ops = match &lane_plan {
-                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(Arc::clone(ops)),
                 _ => None,
             };
             for_each_object_probe_match(
