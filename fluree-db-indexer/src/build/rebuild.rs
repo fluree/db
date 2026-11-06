@@ -316,7 +316,7 @@ where
             // What a graph held before its latest drop is not indexed: the
             // commits keep it, the index does not (see `Commit::graph_drops`).
             let graph_floors =
-                crate::run_index::build::incremental_resolve::graph_floors(&lifecycles);
+                crate::run_index::build::incremental_resolve::graph_floors(&lifecycles, &shared);
             shared.set_graph_floors(graph_floors.clone());
 
             let chunk_max_flakes: u64 = 5_000_000; // ~5M flakes per chunk

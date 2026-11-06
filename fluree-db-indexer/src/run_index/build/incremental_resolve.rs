@@ -505,7 +505,7 @@ pub async fn resolve_incremental_commits_v6(
     // 6. Resolve commits into chunk, leaving out what a drop later in the
     // window took (see `Commit::graph_drops`).
     let lifecycles = window_lifecycles(&walked_commits)?;
-    shared.set_graph_floors(graph_floors(&lifecycles));
+    shared.set_graph_floors(graph_floors(&lifecycles, &shared));
     let (
         chunk,
         max_t,
@@ -1014,11 +1014,15 @@ fn window_lifecycles(
 }
 
 /// Each graph's latest drop among `lifecycles`, by graph IRI: what
-/// [`SharedResolverState::set_graph_floors`] takes.
-pub(crate) fn graph_floors(lifecycles: &[CommitLifecycle]) -> HashMap<String, i64> {
+/// [`SharedResolverState::set_graph_floors`] takes. A record naming what
+/// `shared` holds as a system graph drops nothing.
+pub(crate) fn graph_floors(
+    lifecycles: &[CommitLifecycle],
+    shared: &SharedResolverState,
+) -> HashMap<String, i64> {
     let mut floors = HashMap::new();
     for (t, drops, _) in lifecycles {
-        for iri in drops {
+        for iri in drops.iter().filter(|iri| !names_system_graph(iri, shared)) {
             let floor = floors.entry(iri.clone()).or_insert(*t);
             *floor = (*floor).max(*t);
         }
@@ -1026,9 +1030,23 @@ pub(crate) fn graph_floors(lifecycles: &[CommitLifecycle]) -> HashMap<String, i6
     floors
 }
 
+/// Whether `shared` holds the graph `iri` names as a system graph, which a
+/// drop record never drops, whichever IRI it names it by: another ledger's
+/// config graph IRI, or the ledger's own from a branch that held it as an
+/// ordinary graph ([`fluree_db_core::graph_registry::drop_may_take`]).
+fn names_system_graph(iri: &str, shared: &SharedResolverState) -> bool {
+    iri != fluree_db_core::DEFAULT_GRAPH_IRI
+        && shared
+            .graphs
+            .graph_dict_id(iri)
+            .and_then(|id| u16::try_from(id + 1).ok())
+            .is_some_and(|g_id| !fluree_db_core::graph_registry::drop_may_take(g_id))
+}
+
 /// The drop records `drops` (by this run's graph ids) become once
 /// `lifecycles` apply, oldest first: each commit's drops, then the dropped
-/// graphs it writes again. The default graph is revived by its own drop.
+/// graphs it writes again. The default graph is revived by its own drop. A
+/// record naming a system graph drops nothing.
 pub(crate) fn apply_lifecycles(
     drops: &mut std::collections::BTreeMap<u16, fluree_db_core::GraphDrop>,
     lifecycles: &[CommitLifecycle],
@@ -1036,12 +1054,13 @@ pub(crate) fn apply_lifecycles(
 ) {
     let graph_of = |iri: &str| -> Option<u16> {
         if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
-            Some(0)
+            Some(fluree_db_core::DEFAULT_GRAPH_ID)
         } else {
             shared
                 .graphs
-                .get(iri)
+                .graph_dict_id(iri)
                 .and_then(|id| u16::try_from(id + 1).ok())
+                .filter(|g_id| fluree_db_core::graph_registry::drop_may_take(*g_id))
         }
     };
     for (t, dropped, written) in lifecycles {
@@ -1862,6 +1881,55 @@ fn remap_record(
 mod tests {
     use super::*;
     use fluree_db_core::subject_id::SubjectId;
+
+    /// A drop record naming what this run holds as a system graph drops
+    /// nothing: another ledger's config graph IRI, or the ledger's own system
+    /// graph IRIs, which a record made where they named ordinary graphs can
+    /// carry. A root that held another ledger's config graph IRI as an
+    /// ordinary graph keeps dropping it there.
+    #[test]
+    fn a_drop_record_never_drops_a_system_graph() {
+        use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+        use fluree_db_core::DEFAULT_GRAPH_IRI;
+
+        let g = "http://example.org/g";
+        let source = config_graph_iri("a:main");
+        let lifecycles: Vec<CommitLifecycle> = vec![(
+            5,
+            vec![
+                DEFAULT_GRAPH_IRI.to_string(),
+                source.clone(),
+                config_graph_iri("b:main"),
+                txn_meta_graph_iri("b:main"),
+                g.to_string(),
+            ],
+            Vec::new(),
+        )];
+        let dropped = |shared: &SharedResolverState| {
+            let mut floors: Vec<String> = graph_floors(&lifecycles, shared).into_keys().collect();
+            floors.sort();
+            let mut drops = std::collections::BTreeMap::new();
+            apply_lifecycles(&mut drops, &lifecycles, shared);
+            (floors, drops.into_keys().collect::<Vec<u16>>())
+        };
+
+        let mut shared = SharedResolverState::new_for_ledger("b:main");
+        let g_id = u16::try_from(shared.graphs.get_or_insert(g) + 1).unwrap();
+        assert_eq!(
+            dropped(&shared),
+            (
+                vec![g.to_string(), DEFAULT_GRAPH_IRI.to_string()],
+                vec![0, g_id]
+            )
+        );
+
+        let mut legacy = SharedResolverState::new_for_ledger("b:main");
+        let source_id = u16::try_from(legacy.graphs.get_or_insert(&source) + 1).unwrap();
+        let g_id = u16::try_from(legacy.graphs.get_or_insert(g) + 1).unwrap();
+        let mut floors = vec![g.to_string(), source.clone(), DEFAULT_GRAPH_IRI.to_string()];
+        floors.sort();
+        assert_eq!(dropped(&legacy), (floors, vec![0, source_id, g_id]));
+    }
 
     #[test]
     fn custom_datatype_iris_refuses_a_root_past_the_dt_id_width() {

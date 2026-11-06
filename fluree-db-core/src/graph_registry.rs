@@ -40,6 +40,16 @@ pub const CONFIG_GRAPH_ID: GraphId = 2;
 /// First GraphId available for user-defined named graphs.
 pub const FIRST_USER_GRAPH_ID: GraphId = 3;
 
+/// Whether a drop may take `g_id`: the default graph or a user graph, never a
+/// system graph. `DROP` refuses one, but a drop record is read again wherever
+/// it replays, and an IRI it names as an ordinary graph can name a system
+/// graph there: another ledger's config graph IRI, or the branch's own once
+/// the record came from a branch that held it as an ordinary graph. Every
+/// reader of a record keeps only these.
+pub const fn drop_may_take(g_id: GraphId) -> bool {
+    g_id == DEFAULT_GRAPH_ID || g_id >= FIRST_USER_GRAPH_ID
+}
+
 /// The name ledger info gives the default graph, which has no IRI of its own.
 ///
 /// It names the default graph wherever a graph is read or chosen as a default
@@ -566,7 +576,8 @@ impl GraphRegistry {
 
     /// The ids of the graphs a commit's drop record names (`Commit::
     /// graph_drops`): [`DEFAULT_GRAPH_IRI`] for the default graph, else a
-    /// registered IRI. An IRI the registry does not hold names nothing here.
+    /// registered IRI. An IRI the registry does not hold, or holds as a
+    /// system graph ([`drop_may_take`]), names nothing here.
     pub fn graph_ids_of_drops<'a>(
         &self,
         iris: impl IntoIterator<Item = &'a String>,
@@ -579,6 +590,7 @@ impl GraphRegistry {
                     self.graph_id_for_iri(iri)
                 }
             })
+            .filter(|g_id| drop_may_take(*g_id))
             .collect()
     }
 
@@ -631,7 +643,7 @@ impl GraphRegistry {
     /// [`Self::merge_graph_drops`] for the drop records of `other`, which
     /// may number the same ledger's graphs differently (a rebuild numbers
     /// them as it meets them): each graph is matched by IRI. A graph `self`
-    /// does not register is left out.
+    /// does not register, or registers as a system graph, is left out.
     pub fn merge_graph_drops_by_iri(&mut self, other: &GraphRegistry) {
         let drops: Vec<(GraphId, GraphDrop)> = other
             .graph_drops()
@@ -641,7 +653,7 @@ impl GraphRegistry {
                 } else {
                     self.graph_id_for_iri(other.iri_for_graph_id(g_id)?)?
                 };
-                Some((ours, drop))
+                drop_may_take(ours).then_some((ours, drop))
             })
             .collect();
         self.merge_graph_drops(drops);
@@ -1144,6 +1156,47 @@ mod tests {
             rebuilt.graph_drop(DEFAULT_GRAPH_ID).map(|d| d.floor),
             Some(5)
         );
+    }
+
+    /// A drop record replayed where an IRI it names as an ordinary graph is a
+    /// system graph drops nothing there: another ledger's config graph IRI,
+    /// which an index from before every such IRI named the config graph held
+    /// as an ordinary graph, or the ledger's own system graph IRIs.
+    #[test]
+    fn a_drop_record_never_drops_a_system_graph() {
+        let g = "http://example.org/g";
+        let source = config_graph_iri("a:main");
+        let record = [
+            DEFAULT_GRAPH_IRI.to_string(),
+            source.clone(),
+            config_graph_iri("b:main"),
+            txn_meta_graph_iri("b:main"),
+            g.to_string(),
+        ];
+
+        let legacy_iris = vec![
+            txn_meta_graph_iri("b:main"),
+            config_graph_iri("b:main"),
+            source.clone(),
+            g.to_string(),
+        ];
+        let mut legacy = GraphRegistry::seed_from_root_iris(&legacy_iris).unwrap();
+        assert_eq!(
+            legacy.graph_ids_of_drops(&record),
+            vec![DEFAULT_GRAPH_ID, 3, 4]
+        );
+        legacy.apply_drops(&[3, 4], 5);
+
+        let mut rebuilt = GraphRegistry::new_for_ledger("b:main");
+        rebuilt.apply_delta([source.as_str(), g]);
+        let g_id = rebuilt.graph_id_for_iri(g).unwrap();
+        assert_eq!(
+            rebuilt.graph_ids_of_drops(&record),
+            vec![DEFAULT_GRAPH_ID, g_id]
+        );
+        rebuilt.merge_graph_drops_by_iri(&legacy);
+        assert_eq!(rebuilt.graph_drop(CONFIG_GRAPH_ID), None);
+        assert!(rebuilt.is_dropped(g_id));
     }
 
     #[test]

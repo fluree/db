@@ -9006,24 +9006,20 @@ async fn a_revert_across_two_config_graph_iris_restores_the_setting() {
     );
 }
 
-/// An index from before every ledger's config graph IRI named the config
-/// graph can hold one as an ordinary graph, its rows under that graph's id: a
-/// copy whose source's config commits named the source's config graph, indexed
-/// before this change. The copy is served as that index reads it, with no
-/// config, and an incremental build keeps it so. A reindex rebuilds the index
-/// from the commits, which name the config graph: its settings apply, its
-/// full-text property among them.
+/// A copy whose index holds its source's config graph as an ordinary graph,
+/// as an index from before every ledger's config graph IRI named the config
+/// graph can: the source's config commits name the source's config graph,
+/// and the copy's root lists it at an ordinary graph's slot, over the rows of
+/// `urn:legacy:holder` (`ex:a ex:p 1`). The config sets uniqueness and names
+/// `ex:title` a full-text property, which `ex:doc1`'s title scores under.
+/// Returns the copy, the source's config graph IRI and that slot.
 #[cfg(feature = "native")]
-#[tokio::test]
-async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_reindexed() {
+async fn a_copy_indexed_with_its_sources_config_as_an_ordinary_graph(
+    fluree: &fluree_db_api::Fluree,
+) -> (String, String, usize) {
     use fluree_db_binary_index::format::index_root::IndexRoot;
     use fluree_db_core::ContentKind;
 
-    let dir = tempfile::tempdir().unwrap();
-    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-        .without_indexing()
-        .build()
-        .unwrap();
     let source = "it/legacy-source:main";
     let source_config = config_graph_iri(source);
     fluree.create_ledger("it/legacy-source").await.unwrap();
@@ -9066,19 +9062,13 @@ async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_rei
         .unwrap()
         .ledger_id;
 
-    // The root as such an index lists the graphs: the copy's own config graph
-    // at the config graph's slot, and the source's config graph as an
-    // ordinary graph, which the source's later config commits write.
     let store = fluree.content_store(&id);
-    let root_iris = || async {
-        let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
-        let bytes = store
-            .get(record.index_head_id.as_ref().unwrap())
-            .await
-            .unwrap();
-        (record, IndexRoot::decode(&bytes).unwrap())
-    };
-    let (record, mut root) = root_iris().await;
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let bytes = store
+        .get(record.index_head_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let mut root = IndexRoot::decode(&bytes).unwrap();
     let slot = root
         .graph_iris
         .iter()
@@ -9091,8 +9081,40 @@ async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_rei
         .put(ContentKind::IndexRoot, &root.encode())
         .await
         .unwrap();
-    support::publish_built_index(&fluree, &id, record.index_t, &root_id).await;
+    support::publish_built_index(fluree, &id, record.index_t, &root_id).await;
     fluree.disconnect_ledger(&id).await;
+    (id, source_config, slot)
+}
+
+/// An index from before every ledger's config graph IRI named the config
+/// graph can hold one as an ordinary graph, its rows under that graph's id: a
+/// copy whose source's config commits named the source's config graph, indexed
+/// before this change. The copy is served as that index reads it, with no
+/// config, and an incremental build keeps it so. A reindex rebuilds the index
+/// from the commits, which name the config graph: its settings apply, its
+/// full-text property among them.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_reindexed() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let (id, source_config, slot) =
+        a_copy_indexed_with_its_sources_config_as_an_ordinary_graph(&fluree).await;
+
+    let store = fluree.content_store(&id);
+    let root_iris = || async {
+        let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+        let bytes = store
+            .get(record.index_head_id.as_ref().unwrap())
+            .await
+            .unwrap();
+        IndexRoot::decode(&bytes).unwrap().graph_iris
+    };
 
     let a_in_source_config = || async {
         let result = fluree
@@ -9110,7 +9132,7 @@ async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_rei
         if build == "built incrementally" {
             support::build_incrementally_and_publish_index(&fluree, &id).await;
             fluree.disconnect_ledger(&id).await;
-            assert_eq!(root_iris().await.1.graph_iris[slot], source_config);
+            assert_eq!(root_iris().await[slot], source_config);
         }
         assert_eq!(a_in_source_config().await, Some(1), "{build}");
         assert_eq!(unique_enabled(&fluree, &id).await, None, "{build}");
@@ -9123,6 +9145,70 @@ async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_rei
         .unwrap();
     assert_eq!(unique_enabled(&fluree, &id).await, Some(true));
     assert_eq!(title_hits(&fluree, &id, "Rust").await, ["ex:doc1"]);
+}
+
+/// A drop of a config graph an index holds as an ordinary graph takes that
+/// graph as the index reads it. A reindex reads the IRI the drop names as the
+/// config graph, which a drop never takes: the settings apply as they would
+/// without the drop, in the head the reindex refreshes and in a fresh load.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn a_reindex_does_not_drop_the_config_graph_a_drop_named_as_an_ordinary_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let (id, source_config, _) =
+        a_copy_indexed_with_its_sources_config_as_an_ordinary_graph(&fluree).await;
+    let a_in_source_config = || async {
+        let result = fluree
+            .graph(&id)
+            .query()
+            .sparql(&format!(
+                "SELECT ?o WHERE {{ GRAPH <{source_config}> {{ <http://example.org/a> <http://example.org/p> ?o }} }}"
+            ))
+            .execute_formatted()
+            .await
+            .expect("query the graph");
+        result["results"]["bindings"].as_array().map(Vec::len)
+    };
+    assert_eq!(a_in_source_config().await, Some(1));
+
+    let handle = fluree.ledger_cached(&id).await.unwrap();
+    fluree
+        .stage(&handle)
+        .sparql_update(&format!("DROP GRAPH <{source_config}>"))
+        .execute()
+        .await
+        .expect("drop the ordinary graph");
+    assert_eq!(a_in_source_config().await, Some(0));
+    assert_eq!(unique_enabled(&fluree, &id).await, None);
+
+    fluree
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    for load in ["refreshed", "fresh"] {
+        if load == "fresh" {
+            fluree.disconnect_ledger(&id).await;
+        }
+        let ledger = fluree.ledger(&id).await.unwrap();
+        assert_eq!(
+            ledger
+                .snapshot
+                .graph_registry
+                .graph_drop(fluree_db_core::CONFIG_GRAPH_ID),
+            None,
+            "{load}"
+        );
+        assert_eq!(unique_enabled(&fluree, &id).await, Some(true), "{load}");
+        assert_eq!(
+            title_hits(&fluree, &id, "Rust").await,
+            ["ex:doc1"],
+            "{load}"
+        );
+    }
 }
 
 /// A branch whose index holds its source's config graph as an ordinary graph
