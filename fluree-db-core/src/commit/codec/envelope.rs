@@ -50,9 +50,11 @@ pub const MAX_GRAPH_DELTA_ENTRIES: usize = 1 << 20;
 /// Maximum length of a graph IRI in bytes.
 pub const MAX_GRAPH_IRI_LENGTH: usize = 8192;
 
-/// Maximum number of graphs one commit drops: every graph id there is, so a
-/// `DROP ALL` is never refused for its size.
-pub const MAX_GRAPH_DROP_ENTRIES: usize = GraphId::MAX as usize;
+/// Maximum number of graphs one commit drops: every graph a drop may take
+/// (the default graph and each user graph id), so a `DROP ALL` is never
+/// refused for its size.
+pub const MAX_GRAPH_DROP_ENTRIES: usize =
+    (GraphId::MAX - crate::graph_registry::FIRST_USER_GRAPH_ID) as usize + 2;
 
 /// Maximum byte length for a length-prefixed CID blob.
 /// Fluree SHA-256 CIDs are exactly 39 bytes; 128 provides headroom
