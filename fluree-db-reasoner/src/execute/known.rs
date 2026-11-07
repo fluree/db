@@ -26,6 +26,16 @@ pub enum ReadKey {
     Po(Sid, Sid),
 }
 
+impl ReadKey {
+    /// Approximate heap and inline bytes of a pending read.
+    pub fn approx_bytes(&self) -> usize {
+        let (a, b) = match self {
+            ReadKey::Ps(a, b) | ReadKey::Po(a, b) => (a, b),
+        };
+        std::mem::size_of::<Self>() + a.name.len() + b.name.len()
+    }
+}
+
 struct Entry {
     facts: Vec<Flake>,
     bytes: usize,

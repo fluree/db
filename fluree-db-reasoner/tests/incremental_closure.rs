@@ -289,3 +289,119 @@ async fn a_property_chain_learns_each_key_from_the_read_before() {
     .collect();
     assert_eq!(gained, expected);
 }
+
+/// The closed state, counting its subject-predicate reads and taking `delay`
+/// over each.
+struct CountedOverlay {
+    inner: SortedOverlay,
+    reads: std::sync::atomic::AtomicUsize,
+    delay: std::time::Duration,
+}
+
+impl CountedOverlay {
+    fn new(state: Vec<Flake>, delay: std::time::Duration) -> Self {
+        Self {
+            inner: SortedOverlay::new(state),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            delay,
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl OverlayProvider for CountedOverlay {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn epoch(&self) -> u64 {
+        1
+    }
+    fn for_each_overlay_flake(
+        &self,
+        g: fluree_db_core::GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+        to_t: i64,
+        cb: &mut dyn FnMut(&Flake),
+    ) {
+        if index == IndexType::Spot {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+        }
+        self.inner
+            .for_each_overlay_flake(g, index, first, rhs, leftmost, to_t, cb);
+    }
+}
+
+/// 64 students inserted at once: each needs its own read.
+fn many_students() -> (Vec<Flake>, Vec<Flake>) {
+    let inserted: Vec<Flake> = (0..64)
+        .map(|i| fact(ex(&format!("s{i}")), ty(), ex("Student")))
+        .collect();
+    let mut state = vec![fact(ex("Student"), Sid::new(4, "subClassOf"), ex("Person"))];
+    state.extend(inserted.iter().cloned());
+    (state, inserted)
+}
+
+/// The reads a stage is waiting for count against the working bound, so a
+/// bound they already exceed stops the run before it reads anything.
+#[tokio::test]
+async fn pending_reads_count_against_the_working_bound() {
+    let snapshot = snapshot();
+    let (state, inserted) = many_students();
+    let overlay = CountedOverlay::new(state, std::time::Duration::ZERO);
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let mut opts = ReasoningOptions::default();
+    opts.maintenance.working_bytes = 1;
+    let result = run_fixpoint_incremental(db, &inserted, &opts)
+        .await
+        .unwrap();
+    assert!(result.is_none(), "outgrown: computed in full");
+    assert_eq!(overlay.reads(), 0);
+}
+
+/// The working bound is checked before every read, not after a batch: a
+/// bound with room for some of a stage's reads stops partway through them.
+#[tokio::test]
+async fn the_working_bound_is_checked_between_reads() {
+    let snapshot = snapshot();
+    let (state, inserted) = many_students();
+    let overlay = CountedOverlay::new(state, std::time::Duration::ZERO);
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let mut opts = ReasoningOptions::default();
+    opts.maintenance.working_bytes = 8 * 1024;
+    let result = run_fixpoint_incremental(db, &inserted, &opts)
+        .await
+        .unwrap();
+    assert!(result.is_none(), "outgrown: computed in full");
+    let reads = overlay.reads();
+    assert!(reads > 0 && reads < 64, "{reads} of 64 reads");
+}
+
+/// A run that reaches its fixpoint after its deadline is capped, not
+/// complete.
+#[tokio::test]
+async fn a_run_past_its_deadline_is_capped() {
+    let snapshot = snapshot();
+    let inserted = vec![fact(ex("s"), ty(), ex("Student"))];
+    let state = vec![
+        fact(ex("Student"), Sid::new(4, "subClassOf"), ex("Person")),
+        fact(ex("s"), ty(), ex("Person")),
+        inserted[0].clone(),
+    ];
+    let overlay = CountedOverlay::new(state, std::time::Duration::from_millis(150));
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let mut opts = ReasoningOptions::default();
+    opts.budget.max_duration = std::time::Duration::from_millis(100);
+    let (_, diagnostics) = run_fixpoint_incremental(db, &inserted, &opts)
+        .await
+        .unwrap()
+        .expect("a budget caps the run");
+    assert!(diagnostics.capped);
+    assert_eq!(diagnostics.capped_reason.as_deref(), Some("time"));
+}

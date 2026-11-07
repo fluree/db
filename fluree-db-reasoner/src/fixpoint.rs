@@ -35,9 +35,7 @@ use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
 use crate::restrictions::{extract_restrictions, RestrictionIndex};
 use crate::same_as::SameAsTracker;
-use crate::{
-    FrozenSameAs, MaintenanceBounds, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result,
-};
+use crate::{FrozenSameAs, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result};
 use fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL;
 
 /// Run OWL2-RL reasoning to fixpoint
@@ -69,7 +67,7 @@ pub async fn run_fixpoint(
 /// `None` when the run cannot maintain the closure: the identity rules
 /// (`prp-fp`, `prp-ifp`, `prp-key`, `cls-maxc2`, `cls-maxqc`) group facts
 /// across rounds, `owl:sameAs` canonicalization rewrites facts already
-/// derived, and a run that outgrows [`MaintenanceBounds`] stops. Callers then
+/// derived, and a run that outgrows [`crate::MaintenanceBounds`] stops. Callers then
 /// compute the closure in full.
 pub async fn run_fixpoint_incremental(
     db: GraphDbRef<'_>,
@@ -484,16 +482,60 @@ struct OnDemandStats {
     peak_working_bytes: usize,
 }
 
+/// Why an on-demand run stops before its fixpoint.
+enum Stop {
+    /// A budget of the program ran out: the run is capped, as a full one
+    /// would be.
+    Capped(&'static str),
+    /// The run outgrew [`crate::MaintenanceBounds`]: the caller computes the
+    /// closure in full.
+    Outgrown,
+}
+
+/// The limits an on-demand run checks between work units and reads.
+struct Limits<'a> {
+    opts: &'a ReasoningOptions,
+    start: Instant,
+}
+
+impl Limits<'_> {
+    /// Cancellation, then the program's budget over `derived` and the
+    /// round's `candidates`, then the working bound over `working` bytes.
+    fn check(
+        &self,
+        derived: &DerivedSet,
+        candidates: &DeltaSet,
+        working: usize,
+        stats: &mut OnDemandStats,
+    ) -> Result<Option<Stop>> {
+        interrupted(self.opts)?;
+        stats.peak_working_bytes = stats.peak_working_bytes.max(working);
+        if let Some(reason) = budget_exceeded(&self.opts.budget, &self.start, derived, candidates) {
+            return Ok(Some(Stop::Capped(reason)));
+        }
+        if working > self.opts.maintenance.working_bytes {
+            tracing::debug!(working, "on-demand closure outgrew its working bound");
+            return Ok(Some(Stop::Outgrown));
+        }
+        Ok(None)
+    }
+}
+
 /// Maintain a closed state under `inserted`, reading the state as the
 /// rules' joins need it.
 ///
 /// Each round runs its work units against what is known: reads already
 /// fetched from `db`, combined with the facts derived this run. A unit whose
 /// lookup is not fetched yet is discarded, the missing reads are fetched in
-/// one batch, and the unit runs again, so a property chain learns its next
+/// one batch, and the unit runs again, so a property chain learns each link's
 /// key from the read before. A candidate conclusion `db` already holds is
-/// known, not gained. `None` when a read or the run's working set outgrows
-/// `opts.maintenance`: the caller computes the closure in full.
+/// known, not gained.
+///
+/// Between every unit and every read the run checks cancellation, the
+/// program's budget and the working bound, which counts the reads held, the
+/// facts derived, the round's candidates, its pending reads and a unit's
+/// output. A budget caps the run; outgrowing `opts.maintenance` returns
+/// `None`, and the caller computes the closure in full.
 #[allow(clippy::too_many_arguments)]
 async fn run_on_demand(
     db: GraphDbRef<'_>,
@@ -505,8 +547,7 @@ async fn run_on_demand(
     same_as: &SameAsTracker,
     start: Instant,
 ) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
-    let budget = &opts.budget;
-    let bounds = &opts.maintenance;
+    let limits = Limits { opts, start };
     let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
     let chains = ontology.property_chains();
     let mut diagnostics = ReasoningDiagnostics::default();
@@ -523,16 +564,10 @@ async fn run_on_demand(
     }
 
     let mut iterations = 0;
-    let mut capped = false;
-    while !delta.is_empty() {
-        interrupted(opts)?;
+    let mut capped: Option<&'static str> = None;
+    'rounds: while !delta.is_empty() {
         opts.tracker
             .consume_fuel(delta.len() as u64 * PER_ROW_MICRO_FUEL)?;
-        if let Some(reason) = budget_exceeded(budget, &start, &derived, &DeltaSet::new()) {
-            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
-            capped = true;
-            break;
-        }
         iterations += 1;
 
         let facts: Vec<&Flake> = delta.iter().collect();
@@ -549,11 +584,23 @@ async fn run_on_demand(
 
         let mut new_delta = DeltaSet::new();
         while !pending.is_empty() {
-            interrupted(opts)?;
             stats.stages += 1;
             let mut misses = Vec::new();
+            let mut missed_bytes = 0;
             let mut again = Vec::new();
             for unit in pending {
+                let working = cache.bytes()
+                    + derived.approx_bytes()
+                    + new_delta.approx_bytes()
+                    + missed_bytes;
+                match limits.check(&derived, &new_delta, working, &mut stats)? {
+                    Some(Stop::Capped(reason)) => {
+                        capped = Some(reason);
+                        break 'rounds;
+                    }
+                    Some(Stop::Outgrown) => return Ok(None),
+                    None => {}
+                }
                 let view = OnDemand::new(&derived, &cache);
                 let mut out = DeltaSet::new();
                 let mut fired = ReasoningDiagnostics::default();
@@ -576,9 +623,20 @@ async fn run_on_demand(
                     }
                 }
                 if view.missed() {
-                    misses.extend(view.into_misses());
+                    let unit_misses = view.into_misses();
+                    missed_bytes += unit_misses.iter().map(ReadKey::approx_bytes).sum::<usize>();
+                    misses.extend(unit_misses);
                     again.push(unit);
                 } else {
+                    let working = cache.bytes()
+                        + derived.approx_bytes()
+                        + new_delta.approx_bytes()
+                        + out.approx_bytes()
+                        + missed_bytes;
+                    if working > opts.maintenance.working_bytes {
+                        tracing::debug!(working, "on-demand closure outgrew its working bound");
+                        return Ok(None);
+                    }
                     for flake in out.iter() {
                         new_delta.push(flake.clone());
                     }
@@ -587,14 +645,23 @@ async fn run_on_demand(
                     }
                 }
             }
-            if !fetch(db, misses, &mut cache, iterations, bounds, &mut stats).await? {
-                return Ok(None);
-            }
-            let working = cache.bytes() + derived.approx_bytes() + new_delta.approx_bytes();
-            stats.peak_working_bytes = stats.peak_working_bytes.max(working);
-            if working > bounds.working_bytes {
-                tracing::debug!(working, "on-demand closure outgrew its working bound");
-                return Ok(None);
+            match fetch(
+                db,
+                misses,
+                &mut cache,
+                iterations,
+                &limits,
+                (&derived, &new_delta, missed_bytes),
+                &mut stats,
+            )
+            .await?
+            {
+                Some(Stop::Capped(reason)) => {
+                    capped = Some(reason);
+                    break 'rounds;
+                }
+                Some(Stop::Outgrown) => return Ok(None),
+                None => {}
             }
             pending = again;
         }
@@ -606,8 +673,24 @@ async fn run_on_demand(
             .filter(|f| !derived.contains(&f.s, &f.p, &f.o))
             .map(|f| ReadKey::Ps(f.p.clone(), f.s.clone()))
             .collect();
-        if !fetch(db, wanted, &mut cache, iterations, bounds, &mut stats).await? {
-            return Ok(None);
+        let wanted_bytes = wanted.iter().map(ReadKey::approx_bytes).sum();
+        match fetch(
+            db,
+            wanted,
+            &mut cache,
+            iterations,
+            &limits,
+            (&derived, &new_delta, wanted_bytes),
+            &mut stats,
+        )
+        .await?
+        {
+            Some(Stop::Capped(reason)) => {
+                capped = Some(reason);
+                break 'rounds;
+            }
+            Some(Stop::Outgrown) => return Ok(None),
+            None => {}
         }
         let mut next = DeltaSet::new();
         for flake in new_delta.iter() {
@@ -625,11 +708,23 @@ async fn run_on_demand(
             }
         }
         delta = next;
-        cache.evict_to(bounds.cache_bytes);
+        cache.evict_to(opts.maintenance.cache_bytes);
     }
 
-    if !capped {
-        diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
+    // Reaching the fixpoint late is no completion.
+    if capped.is_none() {
+        let working = cache.bytes() + derived.approx_bytes();
+        match limits.check(&derived, &DeltaSet::new(), working, &mut stats)? {
+            Some(Stop::Capped(reason)) => capped = Some(reason),
+            Some(Stop::Outgrown) => return Ok(None),
+            None => {}
+        }
+    }
+    match capped {
+        Some(reason) => {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+        }
+        None => diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed()),
     }
     let rounds_ms = start.elapsed().as_millis() as u64 - extracted_ms;
     let derived_len = derived.derived_len();
@@ -643,6 +738,7 @@ async fn run_on_demand(
         facts_read = stats.facts_read,
         peak_working_bytes = stats.peak_working_bytes,
         derived = derived_len,
+        capped = capped.unwrap_or(""),
         "OWL 2 RL on-demand closure"
     );
     Ok(Some((flakes, diagnostics)))
@@ -668,23 +764,36 @@ fn fire_delta_fact(
     }
 }
 
-/// Read `keys` from the closed state into `cache`, each once. False when a
-/// read is larger than `bounds` allows: the run is then incomplete, and no
-/// part of that read is kept.
+/// Read `keys` from the closed state into `cache`, each once. Before every
+/// read the run's limits are checked, counting the cache and `held`: the
+/// facts derived, the round's candidates and the bytes of pending reads. A
+/// read may return only as many facts as the working bound has room for,
+/// and one that would return more stops the run; no part of it is kept.
 async fn fetch(
     db: GraphDbRef<'_>,
     mut keys: Vec<ReadKey>,
     cache: &mut ReadCache,
     round: usize,
-    bounds: &MaintenanceBounds,
+    limits: &Limits<'_>,
+    held: (&DerivedSet, &DeltaSet, usize),
     stats: &mut OnDemandStats,
-) -> Result<bool> {
+) -> Result<Option<Stop>> {
+    let (derived, candidates, pending_bytes) = held;
+    let bounds = &limits.opts.maintenance;
+    let other = derived.approx_bytes() + candidates.approx_bytes() + pending_bytes;
     keys.sort();
     keys.dedup();
     for key in keys {
         if cache.contains_key(&key) {
             continue;
         }
+        if let Some(stop) = limits.check(derived, candidates, cache.bytes() + other, stats)? {
+            return Ok(Some(stop));
+        }
+        let room = bounds
+            .working_bytes
+            .saturating_sub(cache.bytes() + other + key.approx_bytes());
+        let max_facts = bounds.read_facts.min(room / std::mem::size_of::<Flake>());
         let (index, wanted) = match &key {
             ReadKey::Ps(p, s) => (
                 IndexType::Spot,
@@ -703,12 +812,12 @@ async fn fetch(
                 index,
                 RangeTest::Eq,
                 wanted,
-                RangeOptions::default().with_flake_limit(bounds.read_facts + 1),
+                RangeOptions::default().with_flake_limit(max_facts + 1),
             )
             .await?;
-        if facts.len() > bounds.read_facts {
-            tracing::debug!(?key, "on-demand read larger than its bound");
-            return Ok(false);
+        if facts.len() > max_facts {
+            tracing::debug!(?key, max_facts, "on-demand read larger than its room");
+            return Ok(Some(Stop::Outgrown));
         }
         let facts: Vec<Flake> = facts
             .into_iter()
@@ -726,7 +835,7 @@ async fn fetch(
         stats.facts_read += facts.len();
         cache.insert(key, facts, round);
     }
-    Ok(true)
+    limits.check(derived, candidates, cache.bytes() + other, stats)
 }
 
 /// Fails the run once the request it serves has been cancelled. A cancelled
