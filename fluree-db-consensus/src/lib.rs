@@ -502,6 +502,20 @@ impl QueuedRequest {
         Ok(serde_json::from_slice(bytes)?)
     }
 
+    /// Tie the envelope to one submission, so that its address is that
+    /// submission's alone. See [`QueuedTransact::submission`].
+    pub fn stamp_submission(&mut self, submission: String) {
+        let slot = match self {
+            Self::Transact(t) => &mut t.submission,
+            Self::Push(p) => &mut p.submission,
+            Self::PushWithMerges(p) => &mut p.push.submission,
+            Self::Revert(r) => &mut r.submission,
+            Self::Merge(m) => &mut m.submission,
+            Self::Rebase(r) => &mut r.submission,
+        };
+        *slot = Some(submission);
+    }
+
     /// Canonical bytes used to derive the idempotency body CID. Skips
     /// per-request transient context (commit-opts timestamp, tracking
     /// flags, governance metadata) so a retry of the same logical
@@ -519,23 +533,39 @@ impl QueuedRequest {
     /// silently defeating idempotency dedup.
     #[cfg(feature = "raft")]
     pub fn canonical_body_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
-        match self {
+        let mut payload = match self {
             // Transact: the transaction body is the only semantically
             // identifying field. txn_opts / commit_opts / tracking /
             // governance can drift between retries (timestamps, request
             // IDs, observability toggles) without changing what the
             // commit means.
-            QueuedRequest::Transact(t) => canonical_json_bytes(&t.body),
+            QueuedRequest::Transact(t) => return canonical_json_bytes(&t.body),
             // Push / Revert / Merge / Rebase envelopes carry only stable
             // fields (content-addressed commit ids, selection / strategy
-            // descriptors, branch names), so hashing the full envelope is
-            // equivalent to hashing the canonical body.
-            QueuedRequest::Push(p) => canonical_json_bytes(p),
-            QueuedRequest::PushWithMerges(p) => canonical_json_bytes(p),
-            QueuedRequest::Revert(r) => canonical_json_bytes(r),
-            QueuedRequest::Merge(m) => canonical_json_bytes(m),
-            QueuedRequest::Rebase(r) => canonical_json_bytes(r),
-        }
+            // descriptors, branch names) besides the submission, so
+            // hashing the rest of the envelope is equivalent to hashing
+            // the canonical body.
+            QueuedRequest::Push(p) => serde_json::to_value(p)?,
+            QueuedRequest::PushWithMerges(p) => {
+                let mut payload = serde_json::to_value(p)?;
+                if let Some(push) = payload.get_mut("push") {
+                    forget_submission(push);
+                }
+                payload
+            }
+            QueuedRequest::Revert(r) => serde_json::to_value(r)?,
+            QueuedRequest::Merge(m) => serde_json::to_value(m)?,
+            QueuedRequest::Rebase(r) => serde_json::to_value(r)?,
+        };
+        forget_submission(&mut payload);
+        canonical_value_bytes(&payload)
+    }
+}
+
+#[cfg(feature = "raft")]
+fn forget_submission(payload: &mut serde_json::Value) {
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("submission");
     }
 }
 
@@ -546,8 +576,12 @@ impl QueuedRequest {
 /// on map insertion or `HashMap` iteration order.
 #[cfg(feature = "raft")]
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, QueuedRequestCodecError> {
-    let json = serde_json::to_value(value)?;
-    let canonical = crate::raft::state_machine::CanonicalValue::from(&json);
+    canonical_value_bytes(&serde_json::to_value(value)?)
+}
+
+#[cfg(feature = "raft")]
+fn canonical_value_bytes(json: &serde_json::Value) -> Result<Vec<u8>, QueuedRequestCodecError> {
+    let canonical = crate::raft::state_machine::CanonicalValue::from(json);
     Ok(serde_json::to_vec(&canonical)?)
 }
 
@@ -562,6 +596,13 @@ pub struct QueuedTransact {
     pub commit_opts: CommitOptsRequest,
     pub tracking: Option<TrackingOptions>,
     pub governance: GovernanceOptions,
+    /// The submission this envelope belongs to. An envelope's address is
+    /// the hash of its bytes, so without it two submissions of one request
+    /// share a blob, and the first to release it deletes it from under the
+    /// other. Not part of the request: [`QueuedRequest::canonical_body_bytes`]
+    /// leaves it out. `None` in an envelope from a node that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Push-side envelope payload.
@@ -584,6 +625,9 @@ pub struct QueuedPush {
     pub commit_cids: Vec<CommitId>,
     pub blobs: HashMap<String, Vec<u8>>,
     pub governance: GovernanceOptions,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Push-side envelope payload for a push whose commits include a merge.
@@ -609,6 +653,9 @@ pub struct QueuedPushWithMerges {
 pub struct QueuedRevert {
     pub selection: RevertSelection,
     pub strategy: ConflictStrategy,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Merge-side envelope payload. The queue entry rides on the target
@@ -621,6 +668,9 @@ pub struct QueuedMerge {
     pub source_branch: String,
     pub target_branch: Option<String>,
     pub strategy: ConflictStrategy,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Rebase-side envelope payload. The queue entry rides on the branch
@@ -629,6 +679,9 @@ pub struct QueuedMerge {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedRebase {
     pub strategy: ConflictStrategy,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Error encoding or decoding a [`QueuedRequest`].
@@ -1079,6 +1132,88 @@ impl<T> SubmittingCommitter for T where T: Committer + SubmissionLookup + ?Sized
 mod tests {
     use super::*;
 
+    /// Two submissions of one request write different envelopes, so that
+    /// neither shares the other's address, and one idempotency body, so
+    /// that a retry is still the same request. An unstamped envelope encodes
+    /// as it did before the stamp, and a node predating the stamp still
+    /// reads a stamped one.
+    #[cfg(feature = "raft")]
+    #[test]
+    fn a_submission_stamp_separates_envelopes_but_not_requests() {
+        use fluree_db_api::CommitRef;
+        use fluree_db_core::{ContentId, ContentKind};
+
+        #[derive(Deserialize)]
+        enum PriorRequest {
+            Merge(PriorMerge),
+        }
+        #[derive(Deserialize)]
+        #[expect(dead_code, reason = "the shape a prior node decodes")]
+        struct PriorMerge {
+            source_branch: String,
+            target_branch: Option<String>,
+            strategy: ConflictStrategy,
+        }
+
+        let commit = ContentId::new(ContentKind::Commit, b"c");
+        let push = QueuedPush {
+            commit_cids: vec![commit.clone()],
+            blobs: HashMap::new(),
+            governance: GovernanceOptions::default(),
+            submission: None,
+        };
+        let merge = QueuedRequest::Merge(QueuedMerge {
+            source_branch: "dev".into(),
+            target_branch: Some("main".into()),
+            strategy: ConflictStrategy::default(),
+            submission: None,
+        });
+        let requests = [
+            QueuedRequest::Transact(Box::new(QueuedTransact {
+                body: TransactionBody::JsonLdInsert(serde_json::json!({"@id": "ex:s"})),
+                txn_opts: TxnOpts::default(),
+                commit_opts: CommitOptsRequest::default(),
+                tracking: None,
+                governance: GovernanceOptions::default(),
+                submission: None,
+            })),
+            QueuedRequest::for_push(push.clone(), Vec::new()),
+            QueuedRequest::for_push(push, vec![commit.clone()]),
+            QueuedRequest::Revert(QueuedRevert {
+                selection: RevertSelection::single(CommitRef::Exact(commit)),
+                strategy: ConflictStrategy::default(),
+                submission: None,
+            }),
+            merge.clone(),
+            QueuedRequest::Rebase(QueuedRebase {
+                strategy: ConflictStrategy::default(),
+                submission: None,
+            }),
+        ];
+        for request in requests {
+            let unstamped = request.to_bytes().unwrap();
+            let body = request.canonical_body_bytes().unwrap();
+            let stamped = |submission: &str| {
+                let mut request = request.clone();
+                request.stamp_submission(submission.into());
+                request
+            };
+            let (a, b) = (stamped("a"), stamped("b"));
+            assert!(!String::from_utf8_lossy(&unstamped).contains("submission"));
+            assert_ne!(a.to_bytes().unwrap(), b.to_bytes().unwrap(), "{request:?}");
+            assert_eq!(a.canonical_body_bytes().unwrap(), body, "{request:?}");
+            assert_eq!(b.canonical_body_bytes().unwrap(), body, "{request:?}");
+            let decoded = QueuedRequest::from_bytes(&a.to_bytes().unwrap()).unwrap();
+            assert_eq!(decoded.to_bytes().unwrap(), a.to_bytes().unwrap());
+        }
+
+        let mut merge = merge;
+        merge.stamp_submission("a".into());
+        let PriorRequest::Merge(prior) =
+            serde_json::from_slice(&merge.to_bytes().unwrap()).expect("decodes without the stamp");
+        assert_eq!(prior.source_branch, "dev");
+    }
+
     /// The idempotency body CID must be identical for two logically
     /// equal payloads regardless of object-key order — otherwise a
     /// retry that rebuilds the body with different key ordering (or a
@@ -1132,6 +1267,7 @@ mod tests {
             commit_cids: vec![commit_cid.clone()],
             blobs: HashMap::new(),
             governance: GovernanceOptions::default(),
+            submission: None,
         };
         let bytes = QueuedRequest::for_push(push.clone(), vec![merged_cid.clone()])
             .to_bytes()
@@ -1168,6 +1304,7 @@ mod tests {
             commit_opts: CommitOptsRequest::default(),
             tracking: None,
             governance: GovernanceOptions::default(),
+            submission: None,
         }));
         let decoded = QueuedRequest::from_bytes(&queued.to_bytes().expect("encode"));
         match decoded.expect("decode") {
