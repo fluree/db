@@ -208,6 +208,13 @@ pub struct BinaryScanOperator {
     /// [`crate::list_view`]) a member is not a value of its predicate; the
     /// list's owner edge and cells come from [`crate::list_view`] instead.
     hide_list_members: bool,
+    /// With [`Self::hide_list_members`], the owners of the lists whose
+    /// members the scan skips: the scan emits each one's owner edge itself
+    /// ([`Self::listing_owners`]).
+    list_owners: Option<ListOwners>,
+    /// A cursor batch a listing-owners scan stopped converting when its
+    /// output batch filled, and the row to resume at.
+    owner_resume: Option<(ColumnBatch, usize)>,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -746,6 +753,8 @@ impl BinaryScanOperator {
             p_is_var,
             include_system_facts: false,
             hide_list_members: false,
+            list_owners: None,
+            owner_resume: None,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -765,6 +774,26 @@ impl BinaryScanOperator {
     /// Skip list members (see [`Self::hide_list_members`]).
     pub fn hiding_list_members(mut self) -> Self {
         self.hide_list_members = true;
+        self
+    }
+
+    /// Skip list members, and emit in their place each list's owner edge
+    /// `s p head` in SPARQL's view of lists (`crate::list_view`), once per
+    /// list, as the scan meets the list's first member. For a pattern
+    /// `?s <p> ?o` (two distinct variables, `<p>` not `rdf:first` or
+    /// `rdf:rest`, no datatype constraint) read with no input, whose list
+    /// triples are exactly those owner edges: one pass over the predicate
+    /// answers the pattern, where a member-hiding scan followed by a read of
+    /// every list would read it twice.
+    pub fn listing_owners(mut self, view: Arc<crate::list_view::ListView>) -> Self {
+        self.hide_list_members = true;
+        self.list_owners = Some(ListOwners {
+            view,
+            seen: std::collections::HashSet::new(),
+            seen_ids: rustc_hash::FxHashSet::default(),
+            last_s_id: None,
+            by_id: false,
+        });
         self
     }
 
@@ -836,6 +865,15 @@ impl BinaryScanOperator {
                 continue;
             }
             if self.hide_list_members && flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
+                let g_id = self.g_id;
+                if let Some(owners) = self.list_owners.as_mut() {
+                    if let Some(row) = owners.edge(g_id, &flake.s, &flake.p, || {
+                        Ok(Binding::sid(flake.s.clone()))
+                    })? {
+                        self.push_owner_edge(columns, row);
+                        produced += 1;
+                    }
+                }
                 continue;
             }
 
@@ -1281,6 +1319,21 @@ impl BinaryScanOperator {
     }
 
     #[inline]
+    /// Push an owner edge `(s, head)` as a row of this scan's columns. A
+    /// position the scan does not emit takes no column, as for a stored row;
+    /// the row counts either way.
+    fn push_owner_edge(&self, columns: &mut [Vec<Binding>], (s, head): (Binding, Sid)) {
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.push(if Some(i) == self.s_var_pos {
+                s.clone()
+            } else if Some(i) == self.o_var_pos {
+                Binding::sid(head.clone())
+            } else {
+                Binding::Unbound
+            });
+        }
+    }
+
     fn set_binding_at(slots: &mut [Binding], pos: usize, b: Binding) -> bool {
         match &slots[pos] {
             Binding::Unbound => {
@@ -1366,12 +1419,19 @@ impl BinaryScanOperator {
     }
 
     /// Convert a ColumnBatch into columnar Bindings.
+    /// Convert `batch`'s rows from `start` into `columns`, returning how many
+    /// rows were produced and, when the scan lists owners
+    /// ([`Self::listing_owners`]) and `budget` rows were produced before the
+    /// next owner edge, the row to resume at: a leaflet's list owners are
+    /// named only as far as a batch needs them.
     fn batch_to_bindings(
         &mut self,
         batch: &ColumnBatch,
+        start: usize,
+        budget: usize,
         columns: &mut [Vec<Binding>],
         ctx: Option<&ExecutionContext<'_>>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Option<usize>)> {
         let mut produced = 0;
         let ncols = self.schema.len();
         let base_len = self.base_schema_len();
@@ -1418,7 +1478,7 @@ impl BinaryScanOperator {
                 fluree_db_binary_index::ColumnData::Const(u32::MAX)
                     | fluree_db_binary_index::ColumnData::AbsentDefault
             );
-        for row in 0..batch.row_count {
+        for row in start..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
@@ -1436,6 +1496,21 @@ impl BinaryScanOperator {
                 continue;
             }
             if hide_members && o_i != u32::MAX {
+                // The batch is full: the rest of the leaflet waits for the
+                // next one, so its owners are named only if it is asked for.
+                if produced >= budget && self.list_owners.is_some() {
+                    return Ok((produced, Some(row)));
+                }
+                let p = self.list_owners.is_some().then(|| self.resolve_p_id(p_id));
+                let g_id = self.g_id;
+                if let (Some(p), Some(owners)) = (p, self.list_owners.as_mut()) {
+                    if let Some(row) =
+                        owners.edge_for_row(g_id, s_id, p_id, &p, &view, late_materialize)?
+                    {
+                        self.push_owner_edge(columns, row);
+                        produced += 1;
+                    }
+                }
                 continue;
             }
 
@@ -1602,7 +1677,7 @@ impl BinaryScanOperator {
             produced += 1;
         }
 
-        Ok(produced)
+        Ok((produced, None))
     }
 }
 
@@ -2019,7 +2094,14 @@ impl Operator for BinaryScanOperator {
         self.g_id = ctx.binary_g_id;
         // Over a dataset spanning ledgers the list view is not applied, and a
         // member is a value of its predicate.
+        self.owner_resume = None;
         self.hide_list_members &= !ctx.is_multi_ledger();
+        if !self.hide_list_members {
+            self.list_owners = None;
+        }
+        if let (Some(owners), Some(store)) = (self.list_owners.as_mut(), self.store.as_ref()) {
+            owners.by_id = owners.view.names_by_id_in(store);
+        }
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history
@@ -2949,8 +3031,20 @@ impl Operator for BinaryScanOperator {
 
         let mut produced = 0usize;
 
+        // A leaflet a listing-owners scan stopped converting when its last
+        // batch filled (`batch_to_bindings`): finish it first.
+        if let Some((batch, start)) = self.owner_resume.take() {
+            ctx.check_cancelled()?;
+            let (n, resume) =
+                self.batch_to_bindings(&batch, start, batch_size, &mut columns, Some(ctx))?;
+            produced += n;
+            if let Some(row) = resume {
+                self.owner_resume = Some((batch, row));
+            }
+        }
+
         // Prefer binary cursor (indexed data), then drain any overlay-only fallback flakes.
-        while produced < batch_size {
+        while produced < batch_size && self.owner_resume.is_none() {
             let Some(cursor) = &mut self.cursor else {
                 break;
             };
@@ -2960,8 +3054,17 @@ impl Operator for BinaryScanOperator {
                 Ok(Some(batch)) => {
                     // Per-leaflet fuel charge happens inside cursor.next_batch.
                     ctx.check_cancelled()?;
-                    let n = self.batch_to_bindings(&batch, &mut columns, Some(ctx))?;
+                    let (n, resume) = self.batch_to_bindings(
+                        &batch,
+                        0,
+                        batch_size - produced,
+                        &mut columns,
+                        Some(ctx),
+                    )?;
                     produced += n;
+                    if let Some(row) = resume {
+                        self.owner_resume = Some((batch, row));
+                    }
                     ctx.check_cancelled()?;
                 }
                 Ok(None) => {
@@ -3005,7 +3108,7 @@ impl Operator for BinaryScanOperator {
             produced as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
         )?;
 
-        if produced < batch_size && self.range_iter.is_some() {
+        if produced < batch_size && self.owner_resume.is_none() && self.range_iter.is_some() {
             // Overlay/novelty rows are in-memory; charge per row at 1 micro-fuel.
             let n = self.flakes_to_bindings(&mut columns, ctx, batch_size - produced)?;
             for _ in 0..n {
@@ -3082,6 +3185,7 @@ impl Operator for BinaryScanOperator {
 
     fn close(&mut self) {
         self.cursor = None;
+        self.owner_resume = None;
         self.pending_cursors.clear();
         self.range_iter = None;
         self.store = None;
@@ -4468,6 +4572,75 @@ pub(crate) fn value_to_otype_okey_simple(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),
         )),
+    }
+}
+
+/// The list owners a [`BinaryScanOperator::listing_owners`] scan has met,
+/// so each list's owner edge is emitted once: by subject id while the scan's
+/// member rows stay on one subject, and by subject for any order (a POST
+/// scan) or rows read past the cursor (novelty the index cannot name).
+struct ListOwners {
+    view: Arc<crate::list_view::ListView>,
+    seen: std::collections::HashSet<Sid>,
+    /// The subjects met by id, when the scan names lists by id.
+    seen_ids: rustc_hash::FxHashSet<u64>,
+    last_s_id: Option<u64>,
+    /// Whether the view names this scan's lists by the store's ids
+    /// (`ListView::scanned_head`), so a row's subject need not be resolved.
+    by_id: bool,
+}
+
+impl ListOwners {
+    /// The owner edge of `s`'s list on `p` in graph `g_id`, the first time
+    /// it is met: the subject as the scan binds it (`subject`), and the
+    /// list's head cell.
+    fn edge(
+        &mut self,
+        g_id: GraphId,
+        s: &Sid,
+        p: &Sid,
+        subject: impl FnOnce() -> Result<Binding>,
+    ) -> Result<Option<(Binding, Sid)>> {
+        if !self.seen.insert(s.clone()) {
+            return Ok(None);
+        }
+        let head = self.view.cell(&(g_id, s.clone(), p.clone()), 0);
+        Ok(Some((subject()?, head)))
+    }
+
+    /// [`Self::edge`] for a cursor row of subject `s_id` on predicate
+    /// `p_id` (`p`). Over persisted ids alone (`late_materialize`, no
+    /// novelty) a list is named by those ids, and its subject stays encoded.
+    fn edge_for_row(
+        &mut self,
+        g_id: GraphId,
+        s_id: u64,
+        p_id: u32,
+        p: &Sid,
+        view: &BinaryGraphView,
+        late_materialize: bool,
+    ) -> Result<Option<(Binding, Sid)>> {
+        if self.last_s_id == Some(s_id) {
+            return Ok(None);
+        }
+        self.last_s_id = Some(s_id);
+        if self.by_id && late_materialize {
+            if !self.seen_ids.insert(s_id) {
+                return Ok(None);
+            }
+            let head = self.view.scanned_head(g_id, s_id, p_id, p);
+            return Ok(Some((Binding::encoded_sid(s_id), head)));
+        }
+        let sid = view
+            .resolve_subject_sid(s_id)
+            .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;
+        self.edge(g_id, &sid, p, || {
+            Ok(if late_materialize {
+                Binding::encoded_sid(s_id)
+            } else {
+                Binding::sid(sid.clone())
+            })
+        })
     }
 }
 
