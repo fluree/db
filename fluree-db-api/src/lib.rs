@@ -359,10 +359,11 @@ pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::DeleteConvention;
 
-#[cfg(not(target_arch = "wasm32"))]
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use reasoned::{HeadRetention, ReasonedHeadWorker, RefreshOutcome};
 
 #[cfg(feature = "iceberg")]
 pub use materialize_worker::{

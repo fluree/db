@@ -15,8 +15,10 @@ mod build;
 pub(crate) mod derived;
 pub(crate) mod program;
 mod serve;
+mod worker;
 
 pub use build::RefreshOutcome;
+pub use worker::{ReasonedHeadWorker, DEFAULT_CATCHUP_INTERVAL};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -66,6 +68,10 @@ pub(crate) struct HeadState {
     flights: Mutex<HashSet<(String, HeadId)>>,
     loaded: Mutex<HashMap<(String, HeadId), Arc<LoadedGeneration>>>,
     retention: Mutex<HeadRetention>,
+    /// Ledgers that registered a head in this process since the worker last
+    /// looked, and the signal that wakes it.
+    registered_ledgers: Mutex<HashSet<String>>,
+    pub(crate) registered: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for HeadState {
@@ -96,6 +102,15 @@ impl HeadState {
 
     pub(crate) fn set_retention(&self, retention: HeadRetention) {
         *self.retention.lock() = retention;
+    }
+
+    pub(crate) fn note_registered(&self, ledger_id: &str) {
+        self.registered_ledgers.lock().insert(ledger_id.to_string());
+        self.registered.notify_one();
+    }
+
+    pub(crate) fn take_registered(&self) -> Vec<String> {
+        self.registered_ledgers.lock().drain().collect()
     }
 
     pub(crate) fn begin(&self, ledger_id: &str, head_id: &HeadId) -> Option<Flight<'_>> {

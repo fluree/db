@@ -777,3 +777,49 @@ async fn publication_waits_rather_than_shorten_the_guard() {
     );
     assert_eq!(chain_len(&fluree, id, &head).await, 2);
 }
+
+/// The worker refreshes a head after each commit, with no explicit refresh.
+#[tokio::test]
+async fn the_worker_follows_commits() {
+    let fluree = std::sync::Arc::new(FlureeBuilder::memory().build_memory());
+    let id = "heads/worker:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"}
+            ]
+        }),
+    )
+    .await;
+    let worker = tokio::spawn(
+        fluree_db_api::ReasonedHeadWorker::new(std::sync::Arc::clone(&fluree))
+            .with_catchup_interval(std::time::Duration::from_secs(3600))
+            .run(),
+    );
+    fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    let served_at = |generation: u64| {
+        let fluree = std::sync::Arc::clone(&fluree);
+        async move {
+            for _ in 0..200 {
+                if let (people, Some(head)) = rows(&fluree, id, &people_query()).await {
+                    if head.generation >= generation {
+                        return people;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("generation {generation} was never served");
+        }
+    };
+    assert_eq!(served_at(1).await, vec![json!("ex:alice")]);
+    let _ledger = student_commit(&fluree, ledger, "bob").await;
+    assert_eq!(served_at(2).await, vec![json!("ex:alice"), json!("ex:bob")]);
+    worker.abort();
+}

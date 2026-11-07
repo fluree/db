@@ -435,6 +435,17 @@ impl FlureeServer {
             }
         };
 
+        // Reasoned heads are built where writes publish: here when this
+        // server owns its ledgers, on the leader under Raft (spawned with
+        // the leader's tasks), never on a peer.
+        let reasoned_heads_task = (consensus == Consensus::Standalone
+            && self.state.config.server_role != ServerRole::Peer)
+            .then(|| {
+                tokio::spawn(
+                    fluree_db_api::ReasonedHeadWorker::new(Arc::clone(&self.state.fluree)).run(),
+                )
+            });
+
         // Spawn the private Raft listener. Carries the inter-node
         // RPC + cluster admin routers — mount on a VPC-internal
         // interface (no auth on these endpoints by design).
@@ -552,6 +563,11 @@ impl FlureeServer {
         //
         // Bounded, because a sync re-runs the whole indexing query over the
         // source ledger; a large corpus must not hold teardown open.
+        // A refresh cut short publishes nothing: publication is one
+        // compare-and-swap, and its unpublished files are a sweep's to reclaim.
+        if let Some(task) = reasoned_heads_task {
+            task.abort();
+        }
         if let Some((handle, task)) = bm25_auto_sync {
             handle.stop();
             if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
@@ -892,6 +908,10 @@ impl FlureeServerBuilder {
                     if bm25_auto_sync {
                         tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
                     }
+                    // Reasoned heads publish through the nameservice too.
+                    tasks.push(tokio::spawn(
+                        fluree_db_api::ReasonedHeadWorker::new(Arc::clone(&bm25_fluree)).run(),
+                    ));
                     // A key rotation in progress continues on the new leader
                     // and is handed off when leadership is lost: the guard's
                     // drop, run by the abort, releases the record so the next

@@ -179,6 +179,7 @@ impl Fluree {
             Ok((Some(next), head_id))
         })
         .await
+        .inspect(|_| self.reasoned.note_registered(&id))
     }
 
     /// Retire a head: from now on workers are refused and queries stop being
