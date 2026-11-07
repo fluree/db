@@ -7016,7 +7016,20 @@ fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
                 log.push(request);
                 log.len() - 1
             };
-            let payload = answers[n.min(answers.len() - 1)].to_string();
+            let answer = &answers[n.min(answers.len() - 1)];
+            // `{"__status": 401, "body": …}` answers that status instead.
+            if let Some(status) = answer.get("__status").and_then(serde_json::Value::as_u64) {
+                let payload = answer["body"].to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+                continue;
+            }
+            let payload = answer.to_string();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nX-Fluree-Serialized-Tokens: 1032\r\nX-Fluree-Ontology-Not-Shown: rdfs:domain=1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -7397,6 +7410,66 @@ fn doc_read_names_what_is_missing() {
         ));
 }
 
+/// A JWT whose `exp` is far off, so the sign-in is used without a refresh.
+fn long_lived_jwt() -> String {
+    use base64::Engine;
+    let enc = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    format!(
+        "{}.{}.sig",
+        enc(serde_json::json!({"alg": "none"})),
+        enc(serde_json::json!({"exp": 4_102_444_800_i64, "sub": "acct"}))
+    )
+}
+
+/// `account = true`: the reader is the signed-in account's own, reached at
+/// `<api base>/grounding` with the sign-in's token; not signed in, it says so.
+#[test]
+fn doc_read_through_the_signed_in_account() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .env("FLUREE_DOC_READER_ACCOUNT", "true")
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read().assert().failure().stderr(predicate::str::contains(
+        "isn't signed in: run `fluree login`",
+    ));
+    assert!(seen.lock().unwrap().is_empty());
+
+    let token = long_lived_jwt();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{base}\"\napi_base_url = \"{base}/v1\"\nexchange_url = \"{base}/v1/oauth/token\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+    read()
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!("via {base}/v1/grounding")));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let head = &seen[0].0;
+    assert!(head.starts_with("post /v1/grounding "), "{head}");
+    assert!(
+        head.contains(&format!("authorization: bearer {}", token.to_lowercase())),
+        "{head}"
+    );
+}
+
 /// A catalog scoped to a class is sent with each record's types (the
 /// reader links by class) and its labels as written, language tag kept.
 #[test]
@@ -7579,4 +7652,52 @@ fn doc_ingest_reader_sends_nothing_for_a_document_with_no_text() {
         .assert()
         .success();
     assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+/// A sign-in token that predates the account's configuration (401
+/// `config_stale`) is renewed once and the read sent again.
+#[test]
+fn doc_read_through_the_account_renews_a_stale_token_once() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (url, seen) = spawn_stub_reader(vec![
+        serde_json::json!({ "__status": 401, "body": { "error": { "message": "Configuration updated, please refresh token", "status": 401, "error": "config_stale" } } }),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        stub_reading(0.9, true),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let token = long_lived_jwt();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{base}\"\napi_base_url = \"{base}/v1\"\nexchange_url = \"{base}/v1/oauth/exchange\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .success();
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen
+        .iter()
+        .map(|(head, _)| head.split_whitespace().nth(1).unwrap_or(""))
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["/v1/grounding", "/v1/oauth/exchange", "/v1/grounding"]
+    );
+    assert!(seen[2]
+        .0
+        .contains(&format!("authorization: bearer {}", fresh.to_lowercase())));
+    assert!(std::fs::read_to_string(home.join("account.toml"))
+        .unwrap()
+        .contains(&fresh));
 }

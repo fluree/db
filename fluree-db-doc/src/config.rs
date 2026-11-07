@@ -144,6 +144,10 @@ impl ModelEndpoint {
 /// auth_header = "X-Api-Key"        # default: Authorization: Bearer <key>
 /// models = ["reader-small", "reader-large"]
 /// ```
+///
+/// With `account = true` the credential is this machine's `fluree login`
+/// instead of `api_key`, and `url` defaults to the account's own reader
+/// (`<api base>/grounding`).
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ReaderEndpoint {
     /// The URL a request is POSTed to.
@@ -170,6 +174,10 @@ pub struct ReaderEndpoint {
     /// (`ontology`, `catalog`), sent as `X-Fluree-Cache`; `--cache` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<String>,
+    /// Use the signed-in account (`fluree login`) as the credential, and
+    /// its API as the default `url`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account: bool,
 }
 
 /// `["a", "b"]` or `"a, b"`, as a list of trimmed, non-empty ids.
@@ -202,6 +210,7 @@ impl std::fmt::Debug for ReaderEndpoint {
             .field("auth_header", &self.auth_header)
             .field("models", &self.models)
             .field("cache", &self.cache)
+            .field("account", &self.account)
             .finish()
     }
 }
@@ -246,10 +255,13 @@ impl ReaderEndpoint {
         if let Some(v) = var("CACHE") {
             self.cache = Some(v);
         }
+        if let Some(v) = var("ACCOUNT") {
+            self.account = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
     }
 
     fn is_usable(&self) -> bool {
-        !self.url.trim().is_empty()
+        !self.url.trim().is_empty() || self.account
     }
 }
 

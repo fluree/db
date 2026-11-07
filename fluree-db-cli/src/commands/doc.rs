@@ -808,6 +808,8 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                         }
                     }
                 } else {
+                    // A signed-in account's token, renewed before the call.
+                    doc_reader::renew(&reader).await?;
                     let (doc, read) = tokio::task::spawn_blocking(move || {
                         let read = doc_reader::read_document(&reader, &doc, out_dir.as_deref());
                         (doc, read)
