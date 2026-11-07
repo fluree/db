@@ -18,6 +18,12 @@
 //! the logical refresh, and per query the first and the median of
 //! `SPIKE_RUNS` (default 5) runs, query-time and from the index. Take timings
 //! on the benchmark hosts only.
+//!
+//! `SPIKE_DIR=<path>` keeps the ledger there instead of in a temporary
+//! directory. A second process with `SPIKE_REOPEN=1` and the same
+//! `SPIKE_DIR` then opens it cold and times each query's first and median
+//! run from the index, as after a restart. Each process reports its peak
+//! resident set (`peak_rss_kb`) where the platform exposes it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -155,6 +161,62 @@ async fn storage_report(
     })
 }
 
+/// The process's peak resident set in KiB, from `/proc/self/status`.
+fn peak_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+}
+
+/// The `.sparql` files of `dir`, by name, each with a budget no LUBM closure
+/// reaches, so query-time answers are complete.
+fn load_queries(dir: &Path) -> Vec<(String, String)> {
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("queries")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "sparql"))
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(p).expect("query");
+            let text = format!("# PRAGMA reasoning-max-facts: 100000000\n{text}");
+            (p.file_stem().unwrap().to_string_lossy().to_string(), text)
+        })
+        .collect()
+}
+
+/// Open a kept ledger cold and time every query from its reasoning index.
+async fn reopen(dir: &Path, queries_dir: &Path) {
+    let opened = std::time::Instant::now();
+    let fluree: Fluree = FlureeBuilder::file(dir.to_string_lossy().to_string())
+        .build()
+        .expect("fluree");
+    let mut per_query = Vec::new();
+    for (name, sparql) in load_queries(queries_dir) {
+        let started = std::time::Instant::now();
+        let (rows, served) = run(&fluree, &sparql).await;
+        let first_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut entry = timed(&fluree, &sparql).await;
+        entry["first_ms"] = json!(first_ms);
+        entry["query"] = json!(name);
+        entry["rows"] = json!(rows.len());
+        entry["served_from_index"] = json!(served);
+        per_query.push(entry);
+    }
+    let report = json!({
+        "ledger": LEDGER,
+        "reopen": per_query,
+        "total_ms": opened.elapsed().as_secs_f64() * 1000.0,
+        "peak_rss_kb": peak_rss_kb(),
+    });
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -167,8 +229,24 @@ async fn main() {
         .map(|s| s.split(',').map(|n| n.trim().parse().ok()).collect())
         .unwrap_or_default();
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let fluree: Fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+    let kept = std::env::var("SPIKE_DIR").ok().map(PathBuf::from);
+    if std::env::var("SPIKE_REOPEN").is_ok_and(|v| v == "1") {
+        let dir = kept.expect("SPIKE_REOPEN needs SPIKE_DIR");
+        reopen(&dir, &queries_dir).await;
+        return;
+    }
+    let temp;
+    let dir: PathBuf = match kept {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir).expect("SPIKE_DIR");
+            dir
+        }
+        None => {
+            temp = tempfile::tempdir().expect("tempdir");
+            temp.path().to_path_buf()
+        }
+    };
+    let fluree: Fluree = FlureeBuilder::file(dir.to_string_lossy().to_string())
         .build()
         .expect("fluree");
     // `SPIKE_IMPORT=1` bulk-imports the file (indexed on arrival); otherwise
@@ -197,22 +275,7 @@ async fn main() {
         ledger
     };
 
-    let mut names: Vec<PathBuf> = std::fs::read_dir(&queries_dir)
-        .expect("queries")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "sparql"))
-        .collect();
-    names.sort();
-    let queries: Vec<(String, String)> = names
-        .iter()
-        .map(|p| {
-            let text = std::fs::read_to_string(p).expect("query");
-            // A budget no LUBM closure reaches, so query-time answers are complete.
-            let text = format!("# PRAGMA reasoning-max-facts: 100000000\n{text}");
-            (p.file_stem().unwrap().to_string_lossy().to_string(), text)
-        })
-        .collect();
+    let queries = load_queries(&queries_dir);
 
     let mut query_time = Vec::new();
     let mut query_time_ms = Vec::new();
@@ -268,7 +331,7 @@ async fn main() {
         }
         per_query.push(entry);
     }
-    let storage = storage_report(&fluree, dir.path(), &index, &manifest.root).await;
+    let storage = storage_report(&fluree, &dir, &index, &manifest.root).await;
 
     // One small commit, folded in as a logical generation.
     let _ledger = fluree
@@ -298,7 +361,7 @@ async fn main() {
         &index_store.get(&pointer.manifest).await.unwrap(),
     )
     .unwrap();
-    let storage2 = storage_report(&fluree, dir.path(), &index, &manifest2.root).await;
+    let storage2 = storage_report(&fluree, &dir, &index, &manifest2.root).await;
     let (q1_rows, q1_served) = run(&fluree, &queries[0].1).await;
 
     let derived_set_bytes = {
@@ -329,5 +392,6 @@ async fn main() {
     if timings_enabled() {
         report["timings"] = json!({"rebuild_ms": rebuild_ms, "logical_refresh_ms": logical_ms});
     }
+    report["peak_rss_kb"] = json!(peak_rss_kb());
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
