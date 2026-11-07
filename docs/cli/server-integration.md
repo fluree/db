@@ -2447,6 +2447,16 @@ The CLI sends the connection **structured**: `catalog` and `io` objects exactly 
 - One way to authenticate: a bearer beside OAuth2 or a Google identity is refused (400), as is a literal beside its `_env` variable
 - An unknown field, inside the structured objects too, is refused (400, `err:api/InvalidGraphSourceConfig`), as is a variable not listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`
 
+**Stored connections and mappings (optional):** a remote that stores catalog connections and R2RML mappings under ids of its own can take them by reference. With `--stored-catalog <ID>` / `--stored-mapping <ID>`, the CLI sends `stored_catalog_id` / `stored_mapping_id` in place of the connection (and, for a stored mapping, of `r2rml` / `r2rml_type`). Beside a reference the body carries only `name`, `table`, `branch`, `model`, `default_allow`, and `r2rml` / `r2rml_type` when the mapping is not stored. It never carries `catalog`, `io`, `mode` or any flat connection or auth field:
+
+```json
+{ "name": "warehouse-orders", "stored_mapping_id": "<mapping-id>" }
+{ "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "table": "sales.orders", "r2rml": "@prefix rr: ...", "r2rml_type": "text/turtle" }
+{ "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "stored_mapping_id": "<mapping-id>", "table": "sales.orders" }
+```
+
+A stored mapping implies its connection, and `table` defaults to its first table. With `stored_catalog_id` and an inline `r2rml`, `table` is required. As with an inline connection, a mapping is required: the CLI refuses `stored_catalog_id` without `r2rml` or `stored_mapping_id`. The CLI does not ask whether a server supports references. A server that does not, such as the Fluree server, refuses the request and registers nothing: a body without `r2rml` lacks the mapping it requires, and one with `r2rml` carries a field it does not know. A `400`, `404` or `422` to a by-reference request is shown with the server's message and a hint that the remote may not support stored connections or mappings.
+
 **Example — REST catalog with R2RML:**
 
 ```json

@@ -10,11 +10,9 @@ use fluree_db_api::server_defaults::FlureeDir;
 pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
-        let result = run_sql_map_remote(&client, &args).await.map_err(|e| {
-            CliError::Remote(format!(
-                "failed to map SQL graph source on '{remote_name}': {e}"
-            ))
-        });
+        let result = run_sql_map_remote(&client, &args)
+            .await
+            .map_err(|e| e.context(format!("failed to map SQL graph source on '{remote_name}'")));
         crate::context::persist_refreshed_tokens(&client, remote_name, dirs).await;
         return result;
     }
@@ -23,7 +21,7 @@ pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir, direct: bool) -> Cl
         if let Some(client) = crate::context::try_server_route_client(dirs) {
             return run_sql_map_remote(&client, &args)
                 .await
-                .map_err(|e| CliError::Remote(format!("failed to map SQL graph source: {e}")));
+                .map_err(|e| e.context("failed to map SQL graph source"));
         }
     }
 
