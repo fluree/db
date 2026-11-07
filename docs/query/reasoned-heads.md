@@ -70,6 +70,11 @@ A query is answered from a head when all of these hold:
 - the query runs without a restricting policy (a head is computed without
   policy, so a policy-restricted view always reasons at query time).
 
+An instance that has found a ledger with no heads does not look again for 30
+seconds, so a head registered through another server instance starts
+answering that instance's queries within that time; one registered through the
+same instance answers at once.
+
 Reasoning budgets are not part of the match: a head holds only complete
 results, so a query that would have hit its budget at query time gets the
 complete answer from a head.

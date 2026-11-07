@@ -102,9 +102,15 @@ impl Fluree {
         as_of: bool,
     ) -> Result<Option<ServedHead>> {
         let ledger_id = db.ledger_id.as_ref();
+        if self.reasoned.known_to_have_no_heads(ledger_id) {
+            return Ok(None);
+        }
         let doc = match self.nameservice().get_reasoned_heads(ledger_id).await? {
             Some(doc) if !doc.is_empty() => doc,
-            _ => return Ok(None),
+            _ => {
+                self.reasoned.note_no_heads(ledger_id);
+                return Ok(None);
+            }
         };
         let Some(record) = self.nameservice().lookup(ledger_id).await? else {
             return Ok(None);

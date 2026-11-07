@@ -74,7 +74,15 @@ pub(crate) struct HeadState {
     pub(crate) registered: tokio::sync::Notify,
     /// How long a `strict` query waits for a generation at its snapshot.
     strict_wait: Mutex<Option<std::time::Duration>>,
+    /// Ledgers whose heads document was empty when last read, and when, so a
+    /// reasoning query on a ledger with no heads does not read the
+    /// nameservice each time. A registration here clears its ledger at once;
+    /// one made elsewhere is seen within [`NO_HEADS_TTL`].
+    no_heads: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+/// How long an empty heads document is trusted without re-reading.
+pub(crate) const NO_HEADS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl std::fmt::Debug for HeadState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,8 +125,24 @@ impl HeadState {
     }
 
     pub(crate) fn note_registered(&self, ledger_id: &str) {
+        self.no_heads.lock().remove(ledger_id);
         self.registered_ledgers.lock().insert(ledger_id.to_string());
         self.registered.notify_one();
+    }
+
+    pub(crate) fn known_to_have_no_heads(&self, ledger_id: &str) -> bool {
+        self.no_heads
+            .lock()
+            .get(ledger_id)
+            .is_some_and(|read_at| read_at.elapsed() < NO_HEADS_TTL)
+    }
+
+    pub(crate) fn note_no_heads(&self, ledger_id: &str) {
+        let mut no_heads = self.no_heads.lock();
+        if no_heads.len() > 4096 {
+            no_heads.retain(|_, read_at| read_at.elapsed() < NO_HEADS_TTL);
+        }
+        no_heads.insert(ledger_id.to_string(), std::time::Instant::now());
     }
 
     pub(crate) fn take_registered(&self) -> Vec<String> {
