@@ -1124,17 +1124,15 @@ impl PropertyJoinOperator {
         // all-`Id` key set) could never engage the batched walks under an
         // overlay.
         //
-        // NOT under eager materialization: eager `Sid` bindings (reasoning
-        // views with derived-fact overlays, federation) can carry namespace
-        // codes from a different snapshot space, so resolving them against
-        // this store's dictionary would key the wrong subject. A policy does
-        // not gate this: the batched walks an all-`Id` key set enables
-        // (`subject_probe_lane_plan` / `star_probe_lane_plan`) decide per
-        // predicate whether the view policy can touch them, and decline to
-        // the filtered scans when it can.
-        let normalizable = !ctx.eager_materialization;
+        // Eager `Sid`s (reasoning) normalize too: in one ledger they share
+        // this store's namespace codes, and multi-ledger keys took
+        // `subject_key_multi` above. A policy does not gate this: the batched
+        // walks an all-`Id` key set enables (`subject_probe_lane_plan` /
+        // `star_probe_lane_plan`) decide per predicate whether the view
+        // policy can touch them, and decline to the filtered scans when it
+        // can.
         Ok(Self::subject_key_single(subject).map(|key| match key {
-            SubjectKey::Sid(sid) if normalizable => {
+            SubjectKey::Sid(sid) => {
                 let resolved = crate::object_binding::TermDicts::of(ctx).and_then(|dicts| {
                     dicts
                         .subject_id(sid.namespace_code, &sid.name)

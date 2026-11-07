@@ -101,6 +101,23 @@ impl GraphFacts {
         }
     }
 
+    /// Positions [`OverlayProvider::for_each_overlay_flake`] visits: `first`
+    /// exclusive (unless `leftmost`), `rhs` inclusive.
+    fn range(
+        &self,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> std::ops::Range<usize> {
+        let start = match first {
+            Some(first) if !leftmost => self.upper_bound(index, first),
+            _ => 0,
+        };
+        let end = rhs.map_or(self.spot.len(), |rhs| self.upper_bound(index, rhs));
+        start..end.max(start)
+    }
+
     /// Binary search for the first flake > target in the given index
     fn upper_bound(&self, index: IndexType, target: &Flake) -> usize {
         let view = self.view(index);
@@ -285,35 +302,26 @@ impl OverlayProvider for DerivedFactsOverlay {
             return;
         };
         let view = graph.view(index);
-        if view.len() == 0 {
-            return;
-        }
-
-        // Determine start position
-        let start = if leftmost {
-            0
-        } else if let Some(first) = first {
-            // Exclusive left boundary: start after first
-            graph.upper_bound(index, first)
-        } else {
-            0
-        };
-
-        // Determine end position
-        let end = if let Some(rhs) = rhs {
-            // Inclusive right boundary: include rhs
-            graph.upper_bound(index, rhs)
-        } else {
-            view.len()
-        };
-
-        // Emit flakes in range, filtered by to_t
-        for i in start..end {
+        for i in graph.range(index, first, rhs, leftmost) {
             let flake = view.get(i);
             if flake.t <= to_t {
                 callback(flake);
             }
         }
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        Some(
+            self.graph(g_id)
+                .map_or(0, |g| g.range(index, first, rhs, leftmost).len()),
+        )
     }
 }
 
@@ -404,6 +412,73 @@ mod tests {
         assert!(overlay.is_empty());
         assert_eq!(overlay.len(), 0);
         assert_eq!(overlay.epoch(), 0);
+    }
+
+    #[test]
+    fn range_count_matches_the_walk() {
+        let mut builder = DerivedFactsBuilder::new();
+        for s in 1..=5 {
+            builder.push(make_flake(s, 1, 100, 1));
+        }
+        for s in 1..=3 {
+            builder.push(make_flake(s, 2, 100, 1));
+        }
+        let overlay =
+            builder.build_routed(
+                FrozenSameAs::empty(),
+                1,
+                |f| {
+                    if f.p == sid(2) {
+                        0
+                    } else {
+                        4
+                    }
+                },
+            );
+        let bracket = |p: u16| {
+            let lo = Flake::new(
+                Sid::min(),
+                sid(p),
+                FlakeValue::min(),
+                Sid::min(),
+                i64::MIN,
+                false,
+                None,
+            );
+            let hi = Flake::new(
+                Sid::max(),
+                sid(p),
+                FlakeValue::max(),
+                Sid::max(),
+                i64::MAX,
+                true,
+                None,
+            );
+            (lo, hi)
+        };
+        for (g_id, p) in [(4, 1), (0, 2), (0, 1), (4, 2), (9, 1)] {
+            let (lo, hi) = bracket(p);
+            let mut walked = 0;
+            overlay.for_each_overlay_flake(
+                g_id,
+                IndexType::Psot,
+                Some(&lo),
+                Some(&hi),
+                false,
+                i64::MAX,
+                &mut |_| walked += 1,
+            );
+            let counted = overlay.overlay_range_flake_count(
+                g_id,
+                IndexType::Psot,
+                Some(&lo),
+                Some(&hi),
+                false,
+            );
+            assert_eq!(counted, Some(walked), "graph {g_id}, predicate {p}");
+        }
+        let counted = overlay.overlay_range_flake_count(4, IndexType::Spot, None, None, true);
+        assert_eq!(counted, Some(5));
     }
 
     #[test]
