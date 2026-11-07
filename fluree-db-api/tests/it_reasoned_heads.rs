@@ -1475,3 +1475,30 @@ async fn a_within_ledger_dataset_is_served_from_the_head() {
     assert!(served, "a dataset of one ledger's graphs is served");
     assert_eq!(got, expected);
 }
+
+/// A branch does not inherit its source's heads: they are derived state of
+/// the source, and the branch registers its own.
+#[tokio::test]
+async fn a_new_branch_starts_with_no_heads() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    school(&fluree, "heads/inherit:main").await;
+    let head = fluree
+        .register_reasoned_head("heads/inherit:main", &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(
+        fluree
+            .refresh_reasoned_head("heads/inherit:main", &head)
+            .await
+            .unwrap(),
+    );
+    fluree
+        .create_branch("heads/inherit", "dev", None, None)
+        .await
+        .unwrap();
+    let doc = fluree.reasoned_heads("heads/inherit:dev").await.unwrap();
+    assert!(doc.heads.is_empty(), "{doc:?}");
+    let (people, served) = rows(&fluree, "heads/inherit:dev", &people_query()).await;
+    assert!(served.is_none());
+    assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
+}
