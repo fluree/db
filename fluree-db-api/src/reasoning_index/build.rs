@@ -2601,6 +2601,135 @@ mod tests {
         assert_eq!(index_files(&fluree, id, &index).await, Vec::<String>::new());
     }
 
+    /// A served query reads every graph from the generation, in its one
+    /// dictionary scope. The generation minted a string before the base
+    /// asserted it, and the base, reindexed at the same commit, gives it
+    /// another id; a join on that value between a derived fact and an
+    /// asserted one in another graph is still answered from the index, for
+    /// one ledger's graphs and for a dataset of them.
+    #[tokio::test]
+    async fn a_served_join_across_graphs_reads_one_dictionary() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/dict-scope:main";
+        let ctx = json!({"ex": "http://example.org/"});
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Student"},
+                    {"@id": "ex:bob", "@type": "ex:Student"}
+                ]}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        fluree
+            .reindex(id, crate::ReindexOptions::default())
+            .await
+            .unwrap();
+        let rules = json!([{
+            "@context": ctx,
+            "where": {"@id": "?x", "@type": "ex:Student"},
+            "insert": {"@id": "?x", "ex:tag": "minted"}
+        }]);
+        let program = json!({"reasoning": "datalog", "rules": rules});
+        let index = fluree.register_reasoning_index(id, &program).await.unwrap();
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+
+        // The base gives "Ally" the id the generation gave "minted".
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                r#"@prefix ex: <http://example.org/> .
+                GRAPH ex:roster { ex:carol ex:nick "Ally" . }"#,
+            )
+            .execute()
+            .await
+            .unwrap()
+            .ledger;
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                r#"@prefix ex: <http://example.org/> .
+                GRAPH ex:roster { ex:carol ex:alias "minted" . }"#,
+            )
+            .execute()
+            .await
+            .unwrap();
+        fluree
+            .reindex(id, crate::ReindexOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 2, .. }
+        ));
+
+        let db = fluree.db(id).await.unwrap();
+        let reasoning = settled_reasoning(&fluree, &db, &program).await;
+        let served = fluree
+            .reasoning_index_for(&db, &reasoning)
+            .await
+            .unwrap()
+            .expect("servable");
+        let string_ids = |view: &crate::view::GraphDb| {
+            let store = view.binary_store.clone().unwrap();
+            ["minted", "Ally"].map(|v| store.find_string_id(v).unwrap().unwrap())
+        };
+        let (base, generation) = (string_ids(&db), string_ids(&served.view));
+        assert_ne!(base, generation, "the dictionaries assign the same ids");
+
+        let expected = vec![
+            json!(["ex:alice", "ex:carol"]),
+            json!(["ex:bob", "ex:carol"]),
+        ];
+        let joined = |graph: &str| {
+            json!({
+                "@context": ctx,
+                "select": ["?x", "?y"],
+                "where": [
+                    {"@id": "?x", "ex:tag": "?v"},
+                    ["graph", graph, {"@id": "?y", "ex:alias": "?v"}]
+                ],
+                "reasoning": "datalog",
+                "rules": rules
+            })
+        };
+        let rows = |result: &serde_json::Value| {
+            let mut rows = result.as_array().unwrap().clone();
+            rows.sort_by_key(ToString::to_string);
+            rows
+        };
+
+        let resp = fluree
+            .graph(id)
+            .query()
+            .jsonld(&joined("http://example.org/roster"))
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        assert!(resp.reasoning.and_then(|r| r.index).is_some(), "served");
+        assert_eq!(rows(&resp.result), expected, "one ledger's graphs");
+
+        let mut dataset = joined("?g");
+        dataset["from"] = json!(id);
+        dataset["fromNamed"] = json!([format!("{id}#http://example.org/roster")]);
+        let resp = fluree
+            .query_from()
+            .jsonld(&dataset)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        assert!(resp.reasoning.and_then(|r| r.index).is_some(), "served");
+        assert_eq!(rows(&resp.result), expected, "a dataset of its graphs");
+    }
+
     /// Insert-only refreshes under `bounds`, each compared with a full
     /// recompute; each is expected to compute `incremental` when given.
     /// Returns how many computed the closure in full.
