@@ -38,6 +38,17 @@ pub type MemoryFluree = fluree_db_api::Fluree;
 pub type MemoryLedger = LedgerState;
 
 // =============================================================================
+// The fast-path kill switch
+// =============================================================================
+
+/// The fast-path kill switch (`set_fast_paths_disabled`) is process-wide, and
+/// a group binary runs its tests on concurrent threads. A test that turns it
+/// on holds the write side for as long as it is on; a test in the same binary
+/// that asserts the routing of a lane the switch controls holds the read side
+/// across its queries, so none of them is planned with the switch flipped.
+pub static FAST_PATH_SWITCH: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+// =============================================================================
 // Context helpers
 // =============================================================================
 

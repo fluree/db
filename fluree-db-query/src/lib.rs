@@ -290,6 +290,9 @@ impl WhereCursor<'_> {
                     .next_batch(&state.ctx)
                     .await
                     .map_err(|e| e.name_variables(state.ctx.vars))?;
+                // A batch built after a key comparison failed to read is not
+                // an answer (see `ExecutionContext::check_key_reads`).
+                state.ctx.check_key_reads()?;
                 if result.is_none() {
                     state.operator.close();
                     state.closed = true;

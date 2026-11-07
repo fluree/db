@@ -418,6 +418,15 @@ pub struct BinaryIndexStore {
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// Per `(graph, predicate)` vector arena, its identity table, built on
+    /// first use. The store owns it, so it lives and dies with the store's
+    /// immutable arenas. See [`Self::vector_identity`].
+    vector_identities: RwLock<HashMap<(GraphId, u32), Arc<VectorIdentity>>>,
+    /// Per graph, the [`ShardPins`] its table-resolved vector keys share,
+    /// held weakly so it drops with the last such key. Shared across views:
+    /// an operator may key each batch through a fresh view, and its keys
+    /// from every batch compare against each other.
+    vector_pins: RwLock<HashMap<GraphId, std::sync::Weak<ShardPins>>>,
     /// The predicates with list rows, built on first use. See
     /// [`Self::list_predicate_ids`].
     list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
@@ -504,6 +513,8 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
+            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -695,6 +706,8 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
+            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -1807,6 +1820,15 @@ impl BinaryIndexStore {
             .filter(|&dims| dims != 0)
     }
 
+    /// Whether any predicate of `g_id` has a vector arena, whose object keys
+    /// are not value identities even within the predicate
+    /// (`OType::o_key_is_predicate_identifying`).
+    pub fn graph_holds_vectors(&self, g_id: GraphId) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .is_some_and(|gi| !gi.vectors.is_empty())
+    }
+
     /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
     ///
     /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops
@@ -2605,6 +2627,121 @@ impl BinaryIndexStore {
             .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
     }
 
+    /// Whether `(g_id, p_id)`'s object keys name values one to one, so a
+    /// consumer may count or group the predicate's objects by their raw
+    /// `(o_type, o_key)`. Two arenas can break that within one predicate: a
+    /// vector arena, which gives every stored fact its own handle
+    /// (`OType::o_key_is_predicate_identifying`), unless it holds no value
+    /// twice ([`Self::vector_handles_name_values`]); and a legacy NumBig arena
+    /// with scale-variant duplicates
+    /// ([`Self::graph_numbig_has_duplicate_handles`]).
+    pub fn objects_keyed_by_value(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+        let Some(gi) = self.graph_indexes.get(&g_id) else {
+            return Ok(true);
+        };
+        if gi
+            .numbig
+            .get(&p_id)
+            .is_some_and(crate::arena::numbig::NumBigArena::has_duplicate_handles)
+        {
+            return Ok(false);
+        }
+        self.vector_handles_name_values(g_id, p_id)
+    }
+
+    /// Whether `(g_id, p_id)`'s vector arena holds no value twice, so within
+    /// the predicate a vector's handle names its value. True without an
+    /// arena. Builds the arena's [identity table](Self::vector_identity) if
+    /// it isn't built yet. This certifies the persisted arena only: a caller
+    /// that also reads novelty must not rely on it unless it merges novelty
+    /// by value.
+    pub fn vector_handles_name_values(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+        Ok(self
+            .vector_identity(g_id, p_id)?
+            .is_none_or(|identity| identity.duplicate_free))
+    }
+
+    /// `(g_id, p_id)`'s vector identity table, built on first use: one pass
+    /// that hashes every vector in the arena (shards read without entering
+    /// the shared cache), then compares the vectors of any hash that repeats.
+    /// `None` without an arena. The arena is immutable for the store's
+    /// lifetime, so the table is too; concurrent first callers may each build
+    /// it, and one wins.
+    pub fn vector_identity(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> io::Result<Option<Arc<VectorIdentity>>> {
+        let Some(arena) = self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        if let Some(built) = self.built_vector_identity(g_id, p_id) {
+            return Ok(Some(built));
+        }
+        let identity = Arc::new(VectorIdentity::build(arena)?);
+        Ok(Some(Arc::clone(
+            self.vector_identities
+                .write()
+                .entry((g_id, p_id))
+                .or_insert(identity),
+        )))
+    }
+
+    /// `g_id`'s shared [`ShardPins`]: the live one if any key holds it, or a
+    /// new one.
+    fn shard_pins(store: &Arc<Self>, g_id: GraphId) -> Arc<ShardPins> {
+        let mut pins = store.vector_pins.write();
+        if let Some(live) = pins.get(&g_id).and_then(std::sync::Weak::upgrade) {
+            return live;
+        }
+        let fresh = Arc::new(ShardPins::new(Arc::clone(store), g_id));
+        pins.insert(g_id, Arc::downgrade(&fresh));
+        fresh
+    }
+
+    /// `(g_id, p_id)`'s vector identity table if something has built it;
+    /// never builds it.
+    pub fn built_vector_identity(&self, g_id: GraphId, p_id: u32) -> Option<Arc<VectorIdentity>> {
+        self.vector_identities.read().get(&(g_id, p_id)).cloned()
+    }
+
+    /// Whether any NumBig arena of `g_id` holds one value under several
+    /// handles: a legacy pre-normalization arena, where `1.5` and `1.50` kept
+    /// a handle each. Its rows are then not one key per value even within a
+    /// predicate, so a consumer that relies on that declines.
+    pub fn graph_numbig_has_duplicate_handles(&self, g_id: GraphId) -> bool {
+        self.numbig_arenas(g_id)
+            .any(|(_, arena)| arena.has_duplicate_handles())
+    }
+
+    /// Install `arena` as `(g_id, p_id)`'s NumBig arena. For tests that need
+    /// an arena shape no current build writes, such as a legacy arena with
+    /// scale-variant duplicates.
+    #[doc(hidden)]
+    pub fn set_numbig_arena_for_test(
+        &mut self,
+        g_id: GraphId,
+        p_id: u32,
+        arena: crate::arena::numbig::NumBigArena,
+    ) {
+        self.graph_indexes
+            .entry(g_id)
+            .or_insert_with(|| GraphIndex {
+                orders: HashMap::new(),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            })
+            .numbig
+            .insert(p_id, arena);
+    }
+
     /// Memoizes `prove` per `(graph, predicate)`. An inconclusive (`None`)
     /// proof is not cached, so a transient read failure is retried later.
     pub fn memoized_decimal_only_proof(
@@ -3288,6 +3425,292 @@ impl NsLookup for BinaryIndexStore {
 // BinaryGraphView — graph-scoped wrapper
 // ============================================================================
 
+/// One vector arena's identity table: per handle, the hash of its value
+/// ([`fluree_db_core::value::vector_value_hash_f32`], the same function a
+/// decoded vector's key hashes with) and its canonical handle, the lowest
+/// handle holding an equal vector. 12 bytes per handle; it holds no shards.
+pub struct VectorIdentity {
+    hashes: Box<[u64]>,
+    canonical: Box<[u32]>,
+    duplicate_free: bool,
+}
+
+impl VectorIdentity {
+    fn build(arena: &crate::arena::vector::LazyVectorArena) -> io::Result<Self> {
+        let len = arena.len() as usize;
+        let mut hashes = vec![0u64; len];
+        let mut canonical: Vec<u32> = (0..len as u32).collect();
+        let mut by_hash: Vec<(u64, u32)> = Vec::with_capacity(len);
+        arena.scan_all(|handle, components| {
+            let hash = fluree_db_core::value::vector_value_hash_f32(components);
+            if let Some(slot) = hashes.get_mut(handle as usize) {
+                *slot = hash;
+                by_hash.push((hash, handle));
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+        by_hash.sort_unstable();
+        let mut duplicate_free = true;
+        for run in by_hash.chunk_by(|a, b| a.0 == b.0) {
+            if run.len() < 2 {
+                continue;
+            }
+            // Handles ascend within a run, so the first equal vector met is
+            // the canonical one.
+            let mut seen: Vec<(u32, crate::arena::vector::VectorSlice)> = Vec::new();
+            for &(_, handle) in run {
+                let Some(slice) = arena.lookup_vector(handle)? else {
+                    continue;
+                };
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                match seen
+                    .iter()
+                    .find(|(_, s)| bits(s.as_f32()) == bits(slice.as_f32()))
+                {
+                    Some(&(canon, _)) => {
+                        canonical[handle as usize] = canon;
+                        duplicate_free = false;
+                    }
+                    None => seen.push((handle, slice)),
+                }
+            }
+        }
+        Ok(Self {
+            hashes: hashes.into_boxed_slice(),
+            canonical: canonical.into_boxed_slice(),
+            duplicate_free,
+        })
+    }
+
+    /// The value hash and canonical handle of `handle`; `None` out of range.
+    pub fn of(&self, handle: u32) -> Option<(u64, u32)> {
+        Some((
+            *self.hashes.get(handle as usize)?,
+            *self.canonical.get(handle as usize)?,
+        ))
+    }
+
+    /// Whether no value is held twice: every handle is its own canonical one.
+    pub fn duplicate_free(&self) -> bool {
+        self.duplicate_free
+    }
+
+    /// The table's heap bytes.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.hashes) + std::mem::size_of_val(&*self.canonical)
+    }
+}
+
+/// The first read failure met while building or comparing a hash-table key.
+/// `PartialEq` can't return an error, and counting the pair unequal (or
+/// keying a value by its arena handle) would answer wrong, so the failure is
+/// recorded here and the operator that owns the table fails the query on its
+/// next check. One slot per
+/// query: every view the query keys through carries it
+/// ([`BinaryGraphView::with_key_read_errors`]), and so does every key read
+/// from those views. The first error is kept as is, so a residency miss
+/// stays a typed `NeedFetch`.
+#[derive(Debug, Default)]
+pub struct KeyReadErrors(std::sync::OnceLock<io::Error>);
+
+impl KeyReadErrors {
+    /// Record `err`, unless an earlier failure is already recorded.
+    pub fn record(&self, err: io::Error) {
+        let _ = self.0.set(err);
+    }
+
+    /// The first failure recorded, if any.
+    pub fn first(&self) -> Option<&io::Error> {
+        self.0.get()
+    }
+}
+
+/// A stored vector as a key: the arena's identity (store, graph, predicate)
+/// and handle, its value hash, and how its value is reached ([`ArenaVectorForm`]).
+#[derive(Clone, Debug)]
+pub struct ArenaVector {
+    pub hash: u64,
+    pub store_id: u64,
+    pub g_id: GraphId,
+    pub p_id: u32,
+    pub handle: u32,
+    pub form: ArenaVectorForm,
+}
+
+/// How an [`ArenaVector`] reaches its value.
+#[derive(Clone)]
+pub enum ArenaVectorForm {
+    /// Read without the arena's identity table: a zero-copy slice of its
+    /// shard, hashed in place.
+    Slice(crate::arena::vector::VectorSlice),
+    /// Resolved by the arena's identity table, which gave the hash and the
+    /// canonical handle, the lowest handle holding an equal vector. It holds
+    /// no shard. Two keys of one arena compare by canonical handle; only a
+    /// comparison with another arena's key or a decoded vector, on a hash
+    /// match, reads the components ([`ArenaVector::components`]), through the
+    /// [`ShardPins`] its graph's keys share.
+    Canonical {
+        canonical: u32,
+        pins: Arc<ShardPins>,
+        /// Where a comparison that can't return its read failure records
+        /// it: the query's slot, from the view that read the key.
+        read_errors: Arc<KeyReadErrors>,
+    },
+}
+
+/// The shards that comparisons of a graph's table-resolved vector keys have
+/// read, shared by those keys. A comparison that reads a vector's components
+/// pins its shard here, so later comparisons in that shard reuse it rather
+/// than reload it after the shared cache evicts it (a scan in subject order
+/// reads handles out of order). It lives as long as the keys do: the store
+/// and its views hold it weakly. Each shard is pinned at most once, and only
+/// shards a comparison needed, so a `DISTINCT` or `GROUP BY` over one tabled
+/// predicate pins none.
+pub struct ShardPins {
+    store: Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    shards: std::sync::Mutex<
+        rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
+    >,
+}
+
+impl ShardPins {
+    fn new(store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
+        Self {
+            store,
+            g_id,
+            shards: std::sync::Mutex::default(),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
+    > {
+        self.shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `handle` of `p_id`'s arena, pinning its shard; `None` for a handle
+    /// the arena doesn't hold.
+    fn slice(
+        &self,
+        p_id: u32,
+        handle: u32,
+    ) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&self.g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let held = self.lock().get(&(p_id, shard_idx)).cloned();
+        let shard = match held {
+            Some(shard) => shard,
+            None => {
+                // The load can read from disk; don't hold the lock meanwhile.
+                let shard = arena.shard(shard_idx)?;
+                Arc::clone(self.lock().entry((p_id, shard_idx)).or_insert(shard))
+            }
+        };
+        Ok(crate::arena::vector::VectorSlice::new(shard, offset))
+    }
+}
+
+impl std::fmt::Debug for ArenaVectorForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slice(slice) => f.debug_tuple("Slice").field(slice).finish(),
+            Self::Canonical { canonical, .. } => f
+                .debug_struct("Canonical")
+                .field("canonical", canonical)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl ArenaVector {
+    /// Its canonical handle, when the identity table resolved it.
+    pub fn canonical(&self) -> Option<u32> {
+        match &self.form {
+            ArenaVectorForm::Slice(_) => None,
+            ArenaVectorForm::Canonical { canonical, .. } => Some(*canonical),
+        }
+    }
+
+    /// Whether `self` and `other` are keys of one arena.
+    pub fn same_arena(&self, other: &Self) -> bool {
+        self.store_id == other.store_id && self.g_id == other.g_id && self.p_id == other.p_id
+    }
+
+    /// Its components: the slice it holds, or its arena's, read through its
+    /// graph's [`ShardPins`]. `None` if the arena doesn't hold the handle,
+    /// which an arena that built a table for it always does.
+    pub fn components(&self) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        match &self.form {
+            ArenaVectorForm::Slice(slice) => Ok(Some(slice.clone())),
+            ArenaVectorForm::Canonical { pins, .. } => pins.slice(self.p_id, self.handle),
+        }
+    }
+
+    /// Whether `self` and `other` hold equal vectors (bitwise-equal
+    /// components). Keys of one arena that the identity table resolved
+    /// compare by canonical handle and read nothing; any other pair compares
+    /// components on a hash match, reading them for a key that holds none.
+    pub fn same_value(&self, other: &Self) -> io::Result<bool> {
+        if self.hash != other.hash {
+            return Ok(false);
+        }
+        if self.same_arena(other) {
+            if self.handle == other.handle {
+                return Ok(true);
+            }
+            if let (Some(x), Some(y)) = (self.canonical(), other.canonical()) {
+                return Ok(x == y);
+            }
+        }
+        if let (ArenaVectorForm::Slice(x), ArenaVectorForm::Slice(y)) = (&self.form, &other.form) {
+            if x.same_slot(y) {
+                return Ok(true);
+            }
+        }
+        let (Some(x), Some(y)) = (self.components()?, other.components()?) else {
+            return Ok(false);
+        };
+        let (x, y) = (x.as_f32(), y.as_f32());
+        Ok(x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()))
+    }
+
+    /// Whether `self` holds the decoded vector `wide`
+    /// ([`fluree_db_core::value::vector_eq_f32_f64`]), on a hash match.
+    pub fn same_value_as_decoded(&self, wide_hash: u64, wide: &[f64]) -> io::Result<bool> {
+        if self.hash != wide_hash {
+            return Ok(false);
+        }
+        Ok(self
+            .components()?
+            .is_some_and(|slice| fluree_db_core::value::vector_eq_f32_f64(slice.as_f32(), wide)))
+    }
+
+    /// The query's read-failure slot this key records into: a key resolved
+    /// by the identity table carries one, since only it reads to compare. A
+    /// slice key holds its components and never fails a comparison.
+    pub fn read_errors(&self) -> Option<&KeyReadErrors> {
+        match &self.form {
+            ArenaVectorForm::Slice(_) => None,
+            ArenaVectorForm::Canonical { read_errors, .. } => Some(read_errors),
+        }
+    }
+}
+
 /// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
 ///
 /// When `dict_novelty` is present, all decode methods automatically perform
@@ -3312,6 +3735,45 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
+    /// The vector shard this view's keys read last, and that predicate's
+    /// identity table if it was built. See [`Self::arena_vector`].
+    vector_cursor: VectorCursor,
+    /// Where keys read from this view record a read failure they can't
+    /// return. Its own unless the query attaches its slot
+    /// ([`Self::with_key_read_errors`]).
+    key_read_errors: Arc<KeyReadErrors>,
+}
+
+/// Where a view's vector keys read: the shard read last, by
+/// `(p_id, shard index)` (a scan reads handles mostly in runs, so a key
+/// usually skips the shared cache's probe), and the identity table of the
+/// predicate read last. One shard only, so the view never holds more of an
+/// arena than the cache's eviction allows; a key's own slice keeps its shard
+/// for as long as the key lives, and keys share one copy of each shard.
+#[derive(Default)]
+struct VectorCursor(std::sync::Mutex<VectorCursorInner>);
+
+#[derive(Default)]
+struct VectorCursorInner {
+    shard: Option<(u32, usize, Arc<crate::arena::vector::VectorShard>)>,
+    identity: Option<(u32, Option<Arc<VectorIdentity>>)>,
+    /// Every shard this view has handed to a key, weakly: while some key
+    /// still holds a shard, a later key reuses that copy rather than load
+    /// another once the shared cache has evicted it, so keys never hold more
+    /// than one copy of the arena. Holds nothing alive itself.
+    handed_out:
+        rustc_hash::FxHashMap<(u32, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
+    /// The store's [`ShardPins`] for this view's graph, weakly, so a key
+    /// skips the store's lock while the pins live.
+    pins: std::sync::Weak<ShardPins>,
+}
+
+impl VectorCursor {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VectorCursorInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Per-view id-to-name memo, bounded by clearing rather than evicting.
@@ -3354,6 +3816,8 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vector_cursor: VectorCursor::default(),
+            key_read_errors: Arc::default(),
         }
     }
 
@@ -3376,7 +3840,22 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vector_cursor: VectorCursor::default(),
+            key_read_errors: Arc::default(),
         }
+    }
+
+    /// Record the read failures of keys read from this view in `slot`, the
+    /// query's, so the operators that key through it can fail the query.
+    pub fn with_key_read_errors(mut self, slot: Arc<KeyReadErrors>) -> Self {
+        self.key_read_errors = slot;
+        self
+    }
+
+    /// Where keys read from this view record a read failure they can't
+    /// return; a caller that builds keys records its own failures here too.
+    pub fn key_read_errors(&self) -> &KeyReadErrors {
+        &self.key_read_errors
     }
 
     /// Attach a fuel tracker. When set, each forward-pack dict touch (a call
@@ -3605,6 +4084,96 @@ impl BinaryGraphView {
 
     pub fn store(&self) -> &BinaryIndexStore {
         &self.store
+    }
+
+    /// `handle` of `p_id`'s vector arena in this view's graph, as a key.
+    /// When the arena's identity table is built, the key is the table's hash
+    /// and canonical handle, and no shard is read. Otherwise it is a
+    /// zero-copy slice of its shard, hashed in place with the same function.
+    /// This never builds the table: a small query would pay for the whole
+    /// arena. `None` for a handle the arena does not hold, such as a novelty
+    /// handle.
+    pub fn arena_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<ArenaVector>> {
+        let mut cursor = self.vector_cursor.lock();
+        if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
+            cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
+        }
+        // With the identity table built, the key is its hash and canonical
+        // handle: no shard is read or held, and the arena isn't looked up.
+        if let Some((hash, canonical)) = cursor
+            .identity
+            .as_ref()
+            .and_then(|(_, identity)| identity.as_ref()?.of(handle))
+        {
+            let pins = cursor.pins.upgrade().unwrap_or_else(|| {
+                let pins = BinaryIndexStore::shard_pins(&self.store, self.g_id);
+                cursor.pins = Arc::downgrade(&pins);
+                pins
+            });
+            drop(cursor);
+            return Ok(Some(ArenaVector {
+                hash,
+                store_id: self.store.store_id(),
+                g_id: self.g_id,
+                p_id,
+                handle,
+                form: ArenaVectorForm::Canonical {
+                    canonical,
+                    pins,
+                    read_errors: Arc::clone(&self.key_read_errors),
+                },
+            }));
+        }
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&self.g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let held = cursor
+            .shard
+            .as_ref()
+            .filter(|(p, i, _)| *p == p_id && *i == shard_idx)
+            .map(|(_, _, shard)| Arc::clone(shard));
+        let held = held.or_else(|| {
+            cursor
+                .handed_out
+                .get(&(p_id, shard_idx))
+                .and_then(std::sync::Weak::upgrade)
+        });
+        let shard = match held {
+            Some(shard) => shard,
+            None => {
+                // The load can read from disk; don't hold the cursor meanwhile.
+                drop(cursor);
+                let shard = arena.shard(shard_idx)?;
+                cursor = self.vector_cursor.lock();
+                cursor
+                    .handed_out
+                    .insert((p_id, shard_idx), Arc::downgrade(&shard));
+                shard
+            }
+        };
+        if !matches!(&cursor.shard, Some((p, i, _)) if *p == p_id && *i == shard_idx) {
+            cursor.shard = Some((p_id, shard_idx, Arc::clone(&shard)));
+        }
+        drop(cursor);
+        let Some(slice) = crate::arena::vector::VectorSlice::new(shard, offset) else {
+            return Ok(None);
+        };
+        Ok(Some(ArenaVector {
+            hash: fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
+            store_id: self.store.store_id(),
+            g_id: self.g_id,
+            p_id,
+            handle,
+            form: ArenaVectorForm::Slice(slice),
+        }))
     }
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
@@ -4220,6 +4789,346 @@ impl ContentStoreRangeFetcher {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A lazy arena of `shards`, each a shard of capacity `capacity`, over
+    /// files in `dir`.
+    fn vector_arena_of(
+        dir: &std::path::Path,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+    ) -> crate::arena::vector::LazyVectorArena {
+        vector_arena_cached(
+            dir,
+            capacity,
+            dims,
+            shards,
+            Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024)),
+        )
+    }
+
+    /// [`vector_arena_of`] reading through `cache`.
+    fn vector_arena_cached(
+        dir: &std::path::Path,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+        cache: Arc<LeafletCache>,
+    ) -> crate::arena::vector::LazyVectorArena {
+        use crate::arena::vector::tests::write_test_shard;
+        use crate::arena::vector::{ShardInfo, VectorManifest};
+        let mut sources = Vec::new();
+        let mut infos = Vec::new();
+        for (i, vectors) in shards.iter().enumerate() {
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let (_, source) = write_test_shard(dir, &format!("s{i}.vas"), dims, &refs);
+            sources.push(source);
+            infos.push(ShardInfo {
+                cas: format!("s{i}"),
+                count: vectors.len() as u32,
+            });
+        }
+        let manifest = VectorManifest {
+            version: 1,
+            dims,
+            dtype: "f32".to_string(),
+            normalized: false,
+            shard_capacity: capacity,
+            total_count: shards.iter().map(|v| v.len() as u32).sum(),
+            shards: infos,
+        };
+        crate::arena::vector::LazyVectorArena::new(manifest, sources, cache, None)
+    }
+
+    /// A view of graph 0 of a store holding `arena` as predicate `p_id`'s
+    /// vector arena.
+    fn view_with_vector_arena(
+        p_id: u32,
+        arena: crate::arena::vector::LazyVectorArena,
+    ) -> BinaryGraphView {
+        view_with_vector_arenas(vec![(p_id, arena)])
+    }
+
+    /// A view of graph 0 of a store holding each `(p_id, arena)` as that
+    /// predicate's vector arena.
+    fn view_with_vector_arenas(
+        arenas: Vec<(u32, crate::arena::vector::LazyVectorArena)>,
+    ) -> BinaryGraphView {
+        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
+        let gi = store.graph_indexes.entry(0).or_insert_with(|| GraphIndex {
+            orders: HashMap::new(),
+            order_cids: HashMap::new(),
+            numbig: HashMap::new(),
+            vectors: HashMap::new(),
+            spatial: HashMap::new(),
+            fulltext: HashMap::new(),
+        });
+        for (p_id, arena) in arenas {
+            gi.vectors.insert(p_id, arena);
+        }
+        BinaryGraphView::new(Arc::new(store), 0)
+    }
+
+    fn slice_of(key: &ArenaVector) -> &crate::arena::vector::VectorSlice {
+        match &key.form {
+            ArenaVectorForm::Slice(slice) => slice,
+            ArenaVectorForm::Canonical { .. } => panic!("expected a slice key: {key:?}"),
+        }
+    }
+
+    /// Two keys over one shard share one loaded copy of it, even after the
+    /// shared cache has evicted it between them: the view reuses the copy an
+    /// earlier key still holds rather than load a second.
+    #[test]
+    fn vector_keys_over_an_evicted_shard_share_one_copy() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_shared_shard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        let first = view.arena_vector(7, 0).unwrap().unwrap();
+        // Move the view's cursor to the other shard, then evict everything.
+        let _other = view.arena_vector(7, 2).unwrap().unwrap();
+        cache.invalidate_all();
+        let again = view.arena_vector(7, 1).unwrap().unwrap();
+        assert_eq!(slice_of(&again).as_f32(), &[0.0, 1.0]);
+        assert!(
+            slice_of(&first).same_shard(slice_of(&again)),
+            "a second key over shard 0 loaded another copy of it"
+        );
+        drop((first, again));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key's hash doesn't depend on whether the identity table is built,
+    /// and keys compare by value with the table, without it, and with one
+    /// key from each side (a query that keyed some rows before another built
+    /// the table), for every pair of handles of an arena with repeats.
+    #[test]
+    fn vector_keys_agree_with_and_without_the_identity_table() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_table_on_off");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Eight handles over three shards; values repeat within and across
+        // shards, and include `-0.0` beside `0.0`.
+        let values: [[f32; 2]; 8] = [
+            [1.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 0.0],
+            [-0.0, 1.0],
+            [0.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [1.0, 0.0],
+        ];
+        let shards: Vec<Vec<Vec<f32>>> = values
+            .chunks(3)
+            .map(|c| c.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        let arena = vector_arena_of(&dir, 3, 2, &shards);
+        let view = view_with_vector_arena(7, arena);
+        let off: Vec<ArenaVector> = (0..8)
+            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .collect();
+        assert!(off.iter().all(|k| k.canonical().is_none()));
+
+        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+        assert!(!table.duplicate_free());
+        // A fresh view, as a later query has, sees the built table.
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let on: Vec<ArenaVector> = (0..8)
+            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for i in 0..8 {
+            assert_eq!(off[i].hash, on[i].hash, "handle {i}'s hash");
+            for j in 0..8 {
+                let same = bits(&values[i]) == bits(&values[j]);
+                assert_eq!(
+                    on[i].canonical() == on[j].canonical(),
+                    same,
+                    "handles {i} and {j}"
+                );
+                assert_eq!(on[i].same_value(&on[j]).unwrap(), same, "{i} {j} with");
+                assert_eq!(off[i].same_value(&off[j]).unwrap(), same, "{i} {j} without");
+                assert_eq!(on[i].same_value(&off[j]).unwrap(), same, "{i} {j} mixed");
+                assert_eq!(off[i].same_value(&on[j]).unwrap(), same, "{i} {j} mixed");
+                if same {
+                    assert_eq!(off[i].hash, off[j].hash);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the identity table built, keying a vector reads no shard: every
+    /// handle keys, and keys of the arena compare by value, with the shard
+    /// files gone and the cache empty. Only a comparison that needs
+    /// components (here against a decoded vector) reads the arena, and its
+    /// failure surfaces rather than reading as an answer.
+    #[test]
+    fn vector_keys_read_no_shard_once_the_identity_table_is_built() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_no_shard_read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let values: [[f32; 2]; 5] = [[1.0, 0.0], [0.5, 0.5], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        let shards: Vec<Vec<Vec<f32>>> = values
+            .chunks(2)
+            .map(|c| c.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+
+        cache.invalidate_all();
+        for i in 0..shards.len() {
+            std::fs::remove_file(dir.join(format!("s{i}.vas"))).unwrap();
+        }
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let keys: Vec<ArenaVector> = (0..5)
+            .map(|h| {
+                view.arena_vector(7, h)
+                    .unwrap_or_else(|e| panic!("handle {h} read its shard: {e}"))
+                    .unwrap()
+            })
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (h, key) in keys.iter().enumerate() {
+            assert_eq!(
+                Some((key.hash, key.canonical().unwrap())),
+                table.of(h as u32)
+            );
+            for (g, other) in keys.iter().enumerate() {
+                assert_eq!(
+                    key.same_value(other).unwrap(),
+                    bits(&values[h]) == bits(&values[g]),
+                    "handles {h} and {g}"
+                );
+            }
+        }
+        let decoded = [1.0f64, 0.0];
+        let decoded_hash = fluree_db_core::value::vector_value_hash(&decoded);
+        assert!(
+            keys[0]
+                .same_value_as_decoded(decoded_hash, &decoded)
+                .is_err(),
+            "a comparison that needs the components reads them"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Comparisons of table-resolved keys pin the shards they read, shared by
+    /// the graph's keys across views (an operator may key each batch through
+    /// a fresh view): after the shared cache evicts a shard, a later
+    /// comparison in it reuses the copy an earlier one read rather than load
+    /// another, so a join whose matches jump between shards loads each once.
+    #[test]
+    fn tabled_vector_key_comparisons_share_the_shards_they_read() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_pinned_reads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        view.store().vector_identity(0, 7).unwrap().unwrap();
+        let store = view.clone_store();
+        // Each key through its own view, as a batch-at-a-time operator has.
+        let keys: Vec<ArenaVector> = (0..4)
+            .map(|h| {
+                BinaryGraphView::new(Arc::clone(&store), 0)
+                    .arena_vector(7, h)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let first = keys[0].components().unwrap().unwrap();
+        // Read the other shard, then evict everything.
+        let _other = keys[2].components().unwrap().unwrap();
+        cache.invalidate_all();
+        drop(first);
+        let again = keys[1].components().unwrap().unwrap();
+        assert_eq!(again.as_f32(), &[0.0, 1.0]);
+        cache.invalidate_all();
+        assert!(
+            keys[0].components().unwrap().unwrap().same_shard(&again),
+            "a second read of shard 0 loaded another copy of it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys of two arenas whose tables are both built compare components on
+    /// a hash match: an equal vector in each arena is one value wherever it
+    /// sits, since canonical handles only name values within one arena.
+    #[test]
+    fn vector_keys_of_two_tabled_arenas_compare_components() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_two_arenas");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let a = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let b = vec![vec![vec![0.5f32, 0.5], vec![1.0, 0.0], vec![0.25, 0.25]]];
+        let view = view_with_vector_arenas(vec![
+            (7, vector_arena_of(&dir.join("a"), 2, 2, &a)),
+            (8, vector_arena_of(&dir.join("b"), 3, 2, &b)),
+        ]);
+        view.store().vector_identity(0, 7).unwrap().unwrap();
+        view.store().vector_identity(0, 8).unwrap().unwrap();
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let ka: Vec<ArenaVector> = (0..2)
+            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .collect();
+        let kb: Vec<ArenaVector> = (0..3)
+            .map(|h| view.arena_vector(8, h).unwrap().unwrap())
+            .collect();
+        assert!(ka.iter().chain(&kb).all(|k| k.canonical().is_some()));
+        for (i, x) in ka.iter().enumerate() {
+            for (j, y) in kb.iter().enumerate() {
+                let same = a[0][i] == b[0][j];
+                assert_eq!(x.same_value(y).unwrap(), same, "7/{i} against 8/{j}");
+                assert_eq!(y.same_value(x).unwrap(), same, "8/{j} against 7/{i}");
+                if same {
+                    assert_eq!(x.hash, y.hash);
+                }
+            }
+        }
+        // `[1.0, 0.0]` is canonical handle 0 of one arena and 1 of the other.
+        assert_eq!((ka[0].canonical(), kb[1].canonical()), (Some(0), Some(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The identity table hashes each vector with the function a decoded
+    /// vector's key uses, gives equal vectors one canonical handle, and is
+    /// duplicate-free exactly when no vector repeats.
+    #[test]
+    fn vector_identity_hashes_by_value_and_canonicalizes_repeats() {
+        use fluree_db_core::value::{vector_value_hash, vector_value_hash_f32};
+        let dir = std::env::temp_dir().join("fluree_vector_identity_table");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Handles 0..4 over two shards; handle 3 repeats handle 1.
+        let shards = vec![
+            vec![vec![0.5f32, 0.25], vec![1.0, 0.0]],
+            vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+        ];
+        let arena = vector_arena_of(&dir, 2, 2, &shards);
+        let table = VectorIdentity::build(&arena).unwrap();
+        assert!(!table.duplicate_free());
+        assert_eq!(table.of(3).unwrap().1, 1, "a repeat's canonical handle");
+        assert_eq!(table.of(1).unwrap().1, 1);
+        assert_eq!(table.of(2).unwrap().1, 2);
+        assert_eq!(table.of(1).unwrap().0, table.of(3).unwrap().0);
+        // The same vector arriving decoded (novelty, VALUES) hashes the same.
+        assert_eq!(table.of(1).unwrap().0, vector_value_hash(&[1.0, 0.0]));
+        assert_eq!(table.of(0).unwrap().0, vector_value_hash_f32(&[0.5, 0.25]));
+        assert_eq!(table.heap_bytes(), 4 * 12);
+
+        let distinct = vector_arena_of(&dir, 2, 2, &shards[..1]);
+        assert!(VectorIdentity::build(&distinct).unwrap().duplicate_free());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::o_type::OType;

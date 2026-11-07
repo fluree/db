@@ -130,6 +130,17 @@ impl ObjKind {
         Self(raw)
     }
 
+    /// Whether this kind's key is a handle into a per-(graph, predicate) arena
+    /// (`NUM_BIG`, `VECTOR_ID`) rather than an inline value or a graph-wide
+    /// dictionary id. Such a handle names its value only together with the
+    /// predicate, and the vector arena does not deduplicate, so even within
+    /// one predicate two handles can name one value: the key is not a term
+    /// identity, and equality surfaces compare these literals by decoded value.
+    #[inline]
+    pub const fn is_arena_handle(self) -> bool {
+        self.0 == Self::NUM_BIG.0 || self.0 == Self::VECTOR_ID.0
+    }
+
     /// Returns `true` if this is a sentinel-only kind (`Min` or `Max`).
     #[inline]
     pub const fn is_sentinel(self) -> bool {

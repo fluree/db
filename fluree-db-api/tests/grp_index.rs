@@ -31,6 +31,8 @@ mod it_ledger_info_reindex_size;
 mod it_memory_storage_reads;
 #[path = "it_notify_incremental.rs"]
 mod it_notify_incremental;
+#[path = "it_numbig_legacy_identity.rs"]
+mod it_numbig_legacy_identity;
 #[path = "it_reasoning_reindex.rs"]
 mod it_reasoning_reindex;
 #[path = "it_reindex_class_stats.rs"]
@@ -55,5 +57,7 @@ mod it_trigger_index_incremental;
 mod it_typed_literal_index;
 #[path = "it_vector_lengths.rs"]
 mod it_vector_lengths;
+#[path = "it_vector_term_identity.rs"]
+mod it_vector_term_identity;
 #[path = "it_xsd_double_special_values.rs"]
 mod it_xsd_double_special_values;

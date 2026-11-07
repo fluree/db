@@ -912,10 +912,13 @@ impl PartialEq for FlakeValue {
                 (FlakeValue::String(a), FlakeValue::String(b)) => a == b,
                 (FlakeValue::Json(a), FlakeValue::Json(b)) => a == b,
                 (FlakeValue::Vector(a), FlakeValue::Vector(b)) => {
-                    a.len() == b.len()
-                        && a.iter()
-                            .zip(b.iter())
-                            .all(|(x, y)| x.to_bits() == y.to_bits())
+                    // A decode shares one allocation per distinct value
+                    // (`BinaryGraphView`), so most equal pairs are one `Arc`.
+                    Arc::ptr_eq(a, b)
+                        || a.len() == b.len()
+                            && a.iter()
+                                .zip(b.iter())
+                                .all(|(x, y)| x.to_bits() == y.to_bits())
                 }
                 (FlakeValue::GeoPoint(a), FlakeValue::GeoPoint(b)) => a == b,
                 // Numeric and temporal types already handled above
@@ -992,6 +995,94 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
         let (digits, scale) = normalized.as_bigint_and_exponent();
         scale.hash(state);
         digits.to_signed_bytes_le().hash(state);
+    }
+}
+
+/// The hash of a vector's value, for in-memory hash keys. One function for
+/// every form a vector takes: [`vector_value_hash`] for decoded components
+/// and [`vector_value_hash_f32`] for an arena's `f32` slice give equal
+/// hashes for vectors [`vector_eq_f32_f64`] / bitwise equality call equal.
+///
+/// Vector equality is bitwise on the `f64` components, as `FlakeValue`'s is:
+/// `-0.0` and `0.0` differ, and a NaN equals a NaN of the same bits (writes
+/// and query literals reject non-finite components, so neither reaches a
+/// stored vector). Every stored vector is `f32`-quantized, so the canonical
+/// bytes are the components narrowed to `f32` whenever that round-trips
+/// exactly; a vector with a component that doesn't (a query literal such as
+/// `[0.1]`, which equals no stored vector) hashes its `f64` bytes under
+/// another seed.
+///
+/// It is `xxh3` over native-endian bytes, in memory only. A per-component
+/// multiply chain is latency-bound, and an add-and-multiply hasher such as
+/// `FxHasher` is weak here: a widened `f32` has its low 29 bits zero, which
+/// leaves such a hash's low bits independent of the data.
+pub fn vector_value_hash(components: &[f64]) -> u64 {
+    const CHUNK: usize = 256;
+    if !components.iter().all(|&x| narrows_exactly(x)) {
+        // SAFETY: `f64` has no padding and any byte is a valid `u8`; the byte
+        // slice covers exactly `components`' memory and borrows it.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                components.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(components),
+            )
+        };
+        return xxhash_rust::xxh3::xxh3_64_with_seed(bytes, WIDE_VECTOR_SEED);
+    }
+    if components.len() <= CHUNK {
+        let mut narrow = [0f32; CHUNK];
+        for (n, &x) in narrow.iter_mut().zip(components) {
+            *n = x as f32;
+        }
+        return vector_value_hash_f32(&narrow[..components.len()]);
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut narrow = [0f32; CHUNK];
+    for chunk in components.chunks(CHUNK) {
+        for (n, &x) in narrow.iter_mut().zip(chunk) {
+            *n = x as f32;
+        }
+        hasher.update(f32_bytes(&narrow[..chunk.len()]));
+    }
+    hasher.digest()
+}
+
+/// [`vector_value_hash`] of a vector held as `f32`, as a vector arena holds
+/// it: `xxh3` over the slice's bytes in place.
+pub fn vector_value_hash_f32(components: &[f32]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(f32_bytes(components))
+}
+
+/// Whether an arena's `f32` vector equals a decoded one: every component of
+/// `wide` narrows to `f32` exactly, to the same bits. For every finite `f32`
+/// this is bitwise equality of `narrow` widened with `wide`, and it agrees
+/// with [`vector_value_hash`] on every input.
+pub fn vector_eq_f32_f64(narrow: &[f32], wide: &[f64]) -> bool {
+    narrow.len() == wide.len()
+        && narrow
+            .iter()
+            .zip(wide)
+            .all(|(&n, &w)| narrows_exactly(w) && (w as f32).to_bits() == n.to_bits())
+}
+
+/// Seed for vectors that don't narrow to `f32`, so they never collide with
+/// the narrowed form's hashes by construction.
+const WIDE_VECTOR_SEED: u64 = 0x5745_4944_4556_4543;
+
+#[inline]
+fn narrows_exactly(x: f64) -> bool {
+    f64::from(x as f32).to_bits() == x.to_bits()
+}
+
+#[inline]
+fn f32_bytes(components: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no padding and any byte is a valid `u8`; the byte
+    // slice covers exactly `components`' memory and borrows it.
+    unsafe {
+        std::slice::from_raw_parts(
+            components.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(components),
+        )
     }
 }
 
@@ -1114,9 +1205,7 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
+                vector_value_hash(v).hash(state);
             }
             FlakeValue::GeoPoint(bits) => {
                 self.type_discriminant().hash(state);
