@@ -1222,3 +1222,116 @@ async fn a_rebase_under_a_head_selects_the_rebuild_path() {
     assert_eq!(served.map(|h| h.generation), Some(2));
     assert_eq!(people, expected);
 }
+
+const TRIG: &str = r#"
+@prefix ex: <http://example.org/> .
+ex:a ex:parent ex:b .
+ex:b ex:parent ex:c .
+ex:c ex:parent ex:d .
+GRAPH ex:inferred { ex:seed ex:note "inferred graph" . }
+GRAPH ex:stage { ex:x ex:parent ex:y . ex:y ex:parent ex:z . }
+"#;
+
+/// A rule that derives into a named graph: the head holds the derived facts
+/// in that graph, and a query of the graph is served with the same answer as
+/// query-time reasoning; the default graph never sees them.
+#[tokio::test]
+async fn derived_facts_land_in_the_rule_s_named_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/named:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let _ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(TRIG)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let ex = json!({"ex": "http://example.org/"});
+    let rules = json!([{
+        "@context": ex,
+        "where": [{"@id": "?x", "ex:parent": "?y"}, {"@id": "?y", "ex:parent": "?z"}],
+        "insert": {"@id": "?x", "@graph": "ex:inferred", "ex:grandparent": {"@id": "?z"}}
+    }]);
+    let in_graph = json!({
+        "@context": ex,
+        "select": ["?x", "?z"],
+        "where": [["graph", "http://example.org/inferred", {"@id": "?x", "ex:grandparent": "?z"}]],
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let in_default = json!({
+        "@context": ex,
+        "select": ["?x", "?z"],
+        "where": {"@id": "?x", "ex:grandparent": "?z"},
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let (expected, _) = rows(&fluree, id, &in_graph).await;
+    assert_eq!(
+        expected,
+        vec![json!(["ex:a", "ex:c"]), json!(["ex:b", "ex:d"])]
+    );
+
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (served_rows, served) = rows(&fluree, id, &in_graph).await;
+    assert!(served.is_some());
+    assert_eq!(served_rows, expected);
+    let (default_rows, served) = rows(&fluree, id, &in_default).await;
+    assert!(served.is_some());
+    assert!(default_rows.is_empty(), "{default_rows:?}");
+}
+
+/// A program that reasons against a named graph is served to queries of
+/// that graph, and only those.
+#[tokio::test]
+async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/over-graph:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let _ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(TRIG)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let ex = json!({"ex": "http://example.org/"});
+    let rules = json!([{
+        "@context": ex,
+        "where": [{"@id": "?x", "ex:parent": "?y"}, {"@id": "?y", "ex:parent": "?z"}],
+        "insert": {"@id": "?x", "ex:grandparent": {"@id": "?z"}}
+    }]);
+    let q = json!({
+        "@context": ex,
+        "select": ["?x", "?z"],
+        "where": {"@id": "?x", "ex:grandparent": "?z"},
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let stage = format!("{id}#http://example.org/stage");
+    let (expected, _) = rows(&fluree, &stage, &q).await;
+    assert_eq!(expected, vec![json!(["ex:x", "ex:z"])]);
+
+    let head = fluree
+        .register_reasoned_head(
+            id,
+            &json!({"reasoning": "datalog", "rules": rules, "graph": "http://example.org/stage"}),
+        )
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (served_rows, served) = rows(&fluree, &stage, &q).await;
+    assert!(served.is_some(), "a query of the reasoned graph is served");
+    assert_eq!(served_rows, expected);
+    let (default_rows, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_none(), "the default graph is another program");
+    assert_eq!(
+        default_rows,
+        vec![json!(["ex:a", "ex:c"]), json!(["ex:b", "ex:d"])]
+    );
+}

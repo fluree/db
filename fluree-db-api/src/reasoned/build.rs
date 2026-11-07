@@ -305,7 +305,7 @@ impl Fluree {
         let program_json = &entry.registration.program;
         let db = match program_json.get("graph").and_then(|g| g.as_str()) {
             Some(iri) => match db.snapshot.graph_registry.existing_graph_id(iri, db.t) {
-                Ok(Some(g_id)) => db.with_graph_id(g_id),
+                Ok(Some(g_id)) => Fluree::select_graph_id(db, g_id)?,
                 Ok(None) | Err(_) => {
                     return Ok(RefreshOutcome::Failed {
                         reason: format!("the reasoned graph {iri} does not exist"),
