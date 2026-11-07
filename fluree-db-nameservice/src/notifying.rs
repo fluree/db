@@ -435,6 +435,34 @@ where
     }
 }
 
+#[async_trait]
+impl<N> crate::ReasonedHeadsLookup for NotifyingNameService<N>
+where
+    N: crate::ReasonedHeadsLookup,
+{
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+        self.inner.get_reasoned_heads(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<N> crate::ReasonedHeadsPublisher for NotifyingNameService<N>
+where
+    N: crate::ReasonedHeadsPublisher,
+{
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasonedHeads,
+    ) -> Result<crate::ReasonedHeadsCasResult> {
+        self.inner
+            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ConfigPublisher — pure delegation (no events)
 // ---------------------------------------------------------------------------

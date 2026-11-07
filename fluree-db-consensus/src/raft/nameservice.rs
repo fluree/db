@@ -2161,6 +2161,75 @@ impl ConfigPublisher for RaftNameService {
     }
 }
 
+fn heads_from_stored(
+    stored: Option<&crate::raft::state_machine::StoredReasonedHeads>,
+) -> Result<fluree_db_nameservice::ReasonedHeads> {
+    match stored {
+        Some(stored) if !stored.json.is_empty() => serde_json::from_str(&stored.json)
+            .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}"))),
+        _ => Ok(fluree_db_nameservice::ReasonedHeads::default()),
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsLookup for RaftNameService {
+    async fn get_reasoned_heads(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let canonical = format_ledger_id(&name, &branch);
+        let state = self.state.read().await;
+        let branch_registered = state
+            .ledgers
+            .get(&name)
+            .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+        if !branch_registered {
+            return Ok(None);
+        }
+        heads_from_stored(state.reasoned_heads.get(&canonical)).map(Some)
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsPublisher for RaftNameService {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasonedHeads,
+    ) -> Result<fluree_db_nameservice::ReasonedHeadsCasResult> {
+        use fluree_db_nameservice::ReasonedHeadsCasResult;
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let json = serde_json::to_string(new)
+            .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}")))?;
+        let cmd = fenced_command(
+            ledger_id,
+            SmCommand::PushReasonedHeads {
+                ledger_id: format_ledger_id(&name, &branch),
+                expected_v,
+                new: crate::raft::state_machine::StoredReasonedHeads { v: new.v, json },
+            },
+            fence,
+        )?;
+        let response = self.submit_lifecycle(cmd).await?;
+        check_fence_response(&response, ledger_id)?;
+        match response {
+            SmResponse::ReasonedHeadsUpdated => Ok(ReasonedHeadsCasResult::Updated),
+            SmResponse::ReasonedHeadsConflict { actual } => Ok(ReasonedHeadsCasResult::Conflict {
+                actual: match actual {
+                    Some(stored) => Some(heads_from_stored(Some(&stored))?),
+                    None => None,
+                },
+            }),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for PushReasonedHeads: {other:?}"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Two test surfaces here:

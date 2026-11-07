@@ -2012,6 +2012,109 @@ impl StatusPublisher for DynamoDbNameService {
     }
 }
 
+// ─── Reasoned heads (on the status item) ───────────────────────────────────
+
+impl DynamoDbNameService {
+    fn reasoned_heads_of(
+        item: &Item,
+    ) -> std::result::Result<fluree_db_nameservice::ReasonedHeads, NameServiceError> {
+        match item.get(ATTR_REASONED_HEADS).and_then(|v| v.as_s().ok()) {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}"))),
+            None => Ok(fluree_db_nameservice::ReasonedHeads::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsLookup for DynamoDbNameService {
+    async fn get_reasoned_heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<fluree_db_nameservice::ReasonedHeads>, NameServiceError> {
+        let pk = Self::normalize(ledger_id)?;
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
+        match response.item() {
+            Some(item) => Self::reasoned_heads_of(item).map(Some),
+            None if self.meta_exists(&pk).await? => {
+                Ok(Some(fluree_db_nameservice::ReasonedHeads::default()))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsPublisher for DynamoDbNameService {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasonedHeads,
+    ) -> std::result::Result<fluree_db_nameservice::ReasonedHeadsCasResult, NameServiceError> {
+        use fluree_db_nameservice::{ReasonedHeadsCasResult, ReasonedHeadsLookup as _};
+        let pk = Self::normalize(ledger_id)?;
+        let conflict = |actual| Ok(ReasonedHeadsCasResult::Conflict { actual });
+        if new.v <= expected_v {
+            return conflict(self.get_reasoned_heads(ledger_id).await?);
+        }
+        let json = serde_json::to_string(new)
+            .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}")))?;
+        let version_clause = if expected_v == 0 {
+            "(attribute_not_exists(#rv) OR #rv = :expected_v)"
+        } else {
+            "#rv = :expected_v"
+        };
+        let request = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()));
+        let result = lifecycle::fenced_update_item(request, Some(version_clause), fence)
+            .update_expression("SET #rh = :doc, #rv = :new_v, #ua = :now")
+            .expression_attribute_names("#rh", ATTR_REASONED_HEADS)
+            .expression_attribute_names("#rv", ATTR_REASONED_HEADS_V)
+            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+            .expression_attribute_values(":expected_v", AttributeValue::N(expected_v.to_string()))
+            .expression_attribute_values(":new_v", AttributeValue::N(new.v.to_string()))
+            .expression_attribute_values(":doc", AttributeValue::S(json))
+            .expression_attribute_values(
+                ":now",
+                AttributeValue::N(Self::now_epoch_ms().to_string()),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(ReasonedHeadsCasResult::Updated),
+            Err(e) if Self::is_conditional_check_failed(&e) => {
+                if self.fence_refuses(&pk, SK_STATUS, fence).await? {
+                    return Err(NameServiceError::fenced(ledger_id));
+                }
+                conflict(self.get_reasoned_heads(ledger_id).await?)
+            }
+            Err(e) => Err(NameServiceError::storage(format!(
+                "DynamoDB UpdateItem failed: {e}"
+            ))),
+        }
+    }
+}
+
 // ─── ConfigLookup (ledger configs only) ─────────────────────────────────────
 //
 // ConfigLookup/ConfigPublisher handle ledger configs (ConfigPayload with

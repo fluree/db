@@ -1673,6 +1673,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl fluree_db_nameservice::ReasonedHeadsLookup for LosePublishRaceNameService {
+        async fn get_reasoned_heads(
+            &self,
+            ledger_id: &str,
+        ) -> fluree_db_nameservice::Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+            self.inner.get_reasoned_heads(ledger_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl RefPublisher for LosePublishRaceNameService {
         async fn compare_and_set_ref_fenced(
             &self,

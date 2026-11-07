@@ -1255,6 +1255,22 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         "push_config",
         missing,
     );
+    let heads = store
+        .get_reasoned_heads(id)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    let next_heads = crate::ReasonedHeads {
+        v: heads.v + 1,
+        ..heads.clone()
+    };
+    assert_refused(
+        store
+            .push_reasoned_heads_fenced(id, fence, heads.v, &next_heads)
+            .await,
+        "push_reasoned_heads",
+        missing,
+    );
 }
 
 /// Every write to a branch record presents the fence its writer loaded: a
@@ -1892,6 +1908,109 @@ pub async fn a_dropped_branch_reads_as_absent<S: crate::NameServicePublisher>(st
     }
     assert!(store.get_status("mydb:main").await.unwrap().is_none());
     assert!(store.get_config("mydb:main").await.unwrap().is_none());
+    assert!(store
+        .get_reasoned_heads("mydb:main")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A sample reasoned-heads document with one active head.
+fn sample_heads(v: i64, revision: u64) -> crate::ReasonedHeads {
+    use fluree_db_core::reasoned_head::{
+        ClockPolicy, ErasureEpoch, HeadEntry, HeadId, Registration, RegistrationState, SemanticKey,
+    };
+    let mut heads = std::collections::BTreeMap::new();
+    heads.insert(
+        HeadId::parse("01JC0000000000000000000000").unwrap(),
+        HeadEntry {
+            registration: Registration {
+                revision,
+                semantics: SemanticKey {
+                    program: cid(fluree_db_core::ContentKind::LedgerConfig, "program"),
+                    reasoned_graph: None,
+                    clock: ClockPolicy::SnapshotCommitTime,
+                },
+                program: serde_json::json!({"reasoning": "owl2rl"}),
+                state: RegistrationState::Active,
+            },
+            floor: ErasureEpoch(0),
+            published: None,
+        },
+    );
+    crate::ReasonedHeads { v, heads }
+}
+
+/// A branch's reasoned-heads document swaps on its version under the
+/// branch fence; a conflict carries the document as it stands, and commit
+/// and index publication leave it alone.
+pub async fn reasoned_heads_swap_on_version<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::IndexRoot;
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence;
+    let unborn = store
+        .get_reasoned_heads("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unborn.v, 0);
+    assert!(unborn.heads.is_empty());
+
+    let first = sample_heads(1, 1);
+    assert_eq!(
+        store
+            .push_reasoned_heads_fenced("mydb:main", fence, 0, &first)
+            .await
+            .unwrap(),
+        crate::ReasonedHeadsCasResult::Updated
+    );
+    // A writer that read v=0 loses, and is handed the current document.
+    let stale = sample_heads(1, 7);
+    assert_eq!(
+        store
+            .push_reasoned_heads_fenced("mydb:main", fence, 0, &stale)
+            .await
+            .unwrap(),
+        crate::ReasonedHeadsCasResult::Conflict {
+            actual: Some(first.clone())
+        }
+    );
+    // The version must advance.
+    assert!(matches!(
+        store
+            .push_reasoned_heads_fenced("mydb:main", fence, 1, &sample_heads(1, 2))
+            .await
+            .unwrap(),
+        crate::ReasonedHeadsCasResult::Conflict { .. }
+    ));
+
+    advance_commit(store, "mydb:main", fence, 1).await;
+    store
+        .publish_index_fenced("mydb:main", fence, 1, &cid(IndexRoot, "i1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_reasoned_heads("mydb:main").await.unwrap(),
+        Some(first.clone())
+    );
+
+    let second = sample_heads(2, 2);
+    assert_eq!(
+        store
+            .push_reasoned_heads_fenced("mydb:main", fence, 1, &second)
+            .await
+            .unwrap(),
+        crate::ReasonedHeadsCasResult::Updated
+    );
+    assert_eq!(
+        store.get_reasoned_heads("mydb:main").await.unwrap(),
+        Some(second)
+    );
+    assert!(store
+        .get_reasoned_heads("other:main")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Fields a later version wrote into a binding survive this version's
@@ -1976,6 +2095,7 @@ where
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
+    reasoned_heads_swap_on_version(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -2031,6 +2151,7 @@ macro_rules! lifecycle_conformance_tests {
             an_unmirrored_branch_with_children_is_kept,
             a_rerun_migration_binds_late_legacy_records,
             a_rerun_migration_keeps_a_stopped_branch_drop_dropped,
+            reasoned_heads_swap_on_version,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

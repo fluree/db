@@ -233,6 +233,18 @@ impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsLookup for ProxyNameService {
+    async fn get_reasoned_heads(
+        &self,
+        _ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+        Err(NameServiceError::storage(
+            "get_reasoned_heads not supported in proxy mode".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
 impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let url = self.ns_url(ledger_id);

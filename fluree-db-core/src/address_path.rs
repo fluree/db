@@ -26,6 +26,11 @@ use crate::ledger_id::{LedgerId, LedgerIdParseError, LedgerName};
 /// `@` is forbidden by [`validate_branch_name`](crate::validate_branch_name).
 pub const SHARED_NAMESPACE: &str = "@shared";
 
+/// The folder inside a branch that holds its reasoned heads:
+/// `{root}/{branch}/@reasoned/{head_id}/`. The `@` keeps it from colliding
+/// with a branch name, and keeps it out of the branch's own `index/`.
+pub const REASONED_SEGMENT: &str = "@reasoned";
+
 /// Parse an id that a storage seam received as a string.
 ///
 /// Debug builds panic on a non-canonical id so tests catch the path that
@@ -290,6 +295,22 @@ impl StorageNamespace {
     pub fn shared_prefix(&self) -> &str {
         &self.shared_prefix
     }
+
+    /// The namespace of one reasoned head of this branch:
+    /// `{root}/{branch}/@reasoned/{head_id}`, sharing this branch's
+    /// `@shared` dictionaries.
+    pub fn reasoned_head(&self, head_id: &str) -> Self {
+        Self {
+            branch_prefix: format!("{}/{REASONED_SEGMENT}/{head_id}", self.branch_prefix),
+            shared_prefix: self.shared_prefix.clone(),
+            root: self.root.clone(),
+        }
+    }
+
+    /// `{root}/{branch}/@reasoned`: every reasoned head of this branch.
+    pub fn reasoned_prefix(&self) -> String {
+        format!("{}/{REASONED_SEGMENT}", self.branch_prefix)
+    }
 }
 
 impl fmt::Display for StorageNamespace {
@@ -345,6 +366,21 @@ mod tests {
             ns.shared_prefix(),
             "acme/inventory/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3/@shared"
         );
+    }
+
+    #[test]
+    fn a_reasoned_head_lives_inside_its_branch_and_shares_its_dictionaries() {
+        let name = LedgerName::parse("acme/inventory").unwrap();
+        let instance = InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
+        let branch = StorageRoot::for_instance(&name, &instance).namespace("main");
+        let head = branch.reasoned_head("01JC0000000000000000000000");
+        assert_eq!(
+            head.branch_prefix(),
+            "acme/inventory/@01JB8ZK4X5Y6Z7A8B9C0D1E2F3/main/@reasoned/01JC0000000000000000000000"
+        );
+        assert_eq!(head.shared_prefix(), branch.shared_prefix());
+        assert_eq!(head.root(), branch.root());
+        assert!(head.branch_prefix().starts_with(&branch.reasoned_prefix()));
     }
 
     #[test]

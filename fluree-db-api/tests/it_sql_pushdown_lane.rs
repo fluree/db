@@ -4205,6 +4205,16 @@ mod source_lookups_fail {
     }
 
     #[async_trait]
+    impl fluree_db_nameservice::ReasonedHeadsLookup for SourceLookupsFail {
+        async fn get_reasoned_heads(
+            &self,
+            id: &str,
+        ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+            self.0.get_reasoned_heads(id).await
+        }
+    }
+
+    #[async_trait]
     impl NameServiceLookup for SourceLookupsFail {
         async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
             self.0.lookup(id).await

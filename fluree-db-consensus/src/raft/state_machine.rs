@@ -542,6 +542,19 @@ pub struct NameServiceState {
     pub dropped: HashMap<String, VersionedJson>,
     /// The fence and frozen flag of each branch created under a binding.
     pub fences: HashMap<RefKey, FenceState>,
+    /// Per-`name:branch` reasoned-heads documents, as JSON. Appended after
+    /// every field above, so a snapshot taken before heads still decodes
+    /// through [`NameServiceStateV2`].
+    pub reasoned_heads: HashMap<String, StoredReasonedHeads>,
+}
+
+/// A branch's reasoned-heads document: its compare-and-swap version and the
+/// document as JSON, which postcard cannot carry structurally (it holds
+/// internally tagged enums and open JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReasonedHeads {
+    pub v: i64,
+    pub json: String,
 }
 
 /// A name binding or dropped-ledger entry: its version, and the value as
@@ -616,6 +629,54 @@ struct NameServiceStateV1 {
     configured_voters: BTreeSet<NodeId>,
 }
 
+/// [`NameServiceState`] as snapshotted before reasoned heads.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV2 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+    bindings: HashMap<String, VersionedJson>,
+    dropped: HashMap<String, VersionedJson>,
+    fences: HashMap<RefKey, FenceState>,
+}
+
+impl From<NameServiceStateV2> for NameServiceState {
+    fn from(v2: NameServiceStateV2) -> Self {
+        Self {
+            refs: v2.refs,
+            ledgers: v2.ledgers,
+            retracted: v2.retracted,
+            idempotency: v2.idempotency,
+            queues: v2.queues,
+            next_queue_id: v2.next_queue_id,
+            recently_cleared: v2.recently_cleared,
+            evicted_idempotency_count: v2.evicted_idempotency_count,
+            queue_config: v2.queue_config,
+            status: v2.status,
+            config: v2.config,
+            graph_sources: v2.graph_sources,
+            worker_eligible_voters: v2.worker_eligible_voters,
+            configured_voters: v2.configured_voters,
+            bindings: v2.bindings,
+            dropped: v2.dropped,
+            fences: v2.fences,
+            reasoned_heads: HashMap::new(),
+        }
+    }
+}
+
 impl From<NameServiceStateV1> for NameServiceState {
     fn from(v1: NameServiceStateV1) -> Self {
         Self {
@@ -636,6 +697,7 @@ impl From<NameServiceStateV1> for NameServiceState {
             bindings: HashMap::new(),
             dropped: HashMap::new(),
             fences: HashMap::new(),
+            reasoned_heads: HashMap::new(),
         }
     }
 }
@@ -859,6 +921,13 @@ pub enum Command {
     /// again under its name can publish from `t` 0. A no-op on a live or
     /// missing record.
     ResetGraphSourceIndex { name: String, branch: String },
+    /// Compare-and-swap a branch's reasoned-heads document on its version.
+    /// Always wrapped in [`Command::Fenced`].
+    PushReasonedHeads {
+        ledger_id: String,
+        expected_v: i64,
+        new: StoredReasonedHeads,
+    },
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1475,6 +1544,11 @@ pub enum Response {
     },
     /// [`Command::ResetGraphSourceIndex`] cleared the index pointer.
     GraphSourceIndexReset,
+    /// [`Command::PushReasonedHeads`] wrote the document.
+    ReasonedHeadsUpdated,
+    /// [`Command::PushReasonedHeads`] found another version; `actual` is
+    /// `None` when the branch is not registered.
+    ReasonedHeadsConflict { actual: Option<StoredReasonedHeads> },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1547,8 +1621,9 @@ impl NameServiceState {
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => postcard::from_bytes::<NameServiceStateV1>(bytes)
+            Err(e) => postcard::from_bytes::<NameServiceStateV2>(bytes)
                 .map(Self::from)
+                .or_else(|_| postcard::from_bytes::<NameServiceStateV1>(bytes).map(Self::from))
                 .map_err(|_| e.into()),
         }
     }
@@ -1595,6 +1670,7 @@ fn fenced_branch(command: &Command) -> Option<RefKey> {
         Command::CompareAndSetRef(args) => Some(RefKey::new(&args.ledger_id, &args.branch)),
         Command::PushStatus { ledger_id, .. } => of_id(ledger_id),
         Command::PushConfig(args) => of_id(&args.ledger_id),
+        Command::PushReasonedHeads { ledger_id, .. } => of_id(ledger_id),
         _ => None,
     }
 }
@@ -1658,6 +1734,11 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             } = *args;
             apply_versioned_push(&state.ledgers, &mut state.config, ledger_id, expected, new)
         }
+        Command::PushReasonedHeads {
+            ledger_id,
+            expected_v,
+            new,
+        } => apply_push_reasoned_heads(state, ledger_id, expected_v, new),
         Command::PublishGraphSource {
             name,
             branch,
@@ -1887,6 +1968,7 @@ fn delete_branch(
     state.fences.remove(&key);
     state.status.remove(&full);
     state.config.remove(&full);
+    state.reasoned_heads.remove(&full);
     if let Some(ledger) = state.ledgers.get_mut(&key.ledger_name) {
         ledger.branches.retain(|b| b != &key.branch);
         if ledger.branches.is_empty() {
@@ -2625,6 +2707,38 @@ fn apply_versioned_push<T: VersionedValue>(
     }
     values.insert(ledger_id, new);
     T::updated()
+}
+
+/// [`Command::PushReasonedHeads`]: the version check only. An absent
+/// document reads as version 0; the publication rules run in the proposer.
+fn apply_push_reasoned_heads(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    expected_v: i64,
+    new: StoredReasonedHeads,
+) -> Response {
+    let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
+        return Response::ReasonedHeadsConflict { actual: None };
+    };
+    let registered = state
+        .ledgers
+        .get(&name)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !registered {
+        return Response::ReasonedHeadsConflict { actual: None };
+    }
+    let current = state.reasoned_heads.get(&ledger_id).cloned();
+    let current_v = current.as_ref().map_or(0, |c| c.v);
+    if current_v != expected_v || new.v <= current_v {
+        return Response::ReasonedHeadsConflict {
+            actual: Some(current.unwrap_or(StoredReasonedHeads {
+                v: 0,
+                json: String::new(),
+            })),
+        };
+    }
+    state.reasoned_heads.insert(ledger_id, new);
+    Response::ReasonedHeadsUpdated
 }
 
 fn apply_publish_graph_source(
@@ -4207,6 +4321,51 @@ mod tests {
         );
         let restored = NameServiceState::from_snapshot(&state.to_snapshot().unwrap()).unwrap();
         assert_eq!(restored.bindings.len(), 1);
+    }
+
+    #[test]
+    fn pre_reasoned_heads_snapshot_restores() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 1);
+        let v2 = NameServiceStateV2 {
+            refs: state.refs.clone(),
+            ledgers: state.ledgers.clone(),
+            retracted: state.retracted.clone(),
+            idempotency: state.idempotency.clone(),
+            queues: state.queues.clone(),
+            next_queue_id: state.next_queue_id,
+            recently_cleared: state.recently_cleared.clone(),
+            evicted_idempotency_count: state.evicted_idempotency_count,
+            queue_config: state.queue_config,
+            status: state.status.clone(),
+            config: state.config.clone(),
+            graph_sources: state.graph_sources.clone(),
+            worker_eligible_voters: state.worker_eligible_voters.clone(),
+            configured_voters: state.configured_voters.clone(),
+            bindings: state.bindings.clone(),
+            dropped: state.dropped.clone(),
+            fences: state.fences.clone(),
+        };
+        let bytes = postcard::to_allocvec(&v2).unwrap();
+        assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
+
+        // A document pushed into the current layout survives a snapshot.
+        let response = apply(
+            &mut state,
+            Command::PushReasonedHeads {
+                ledger_id: "test/db:main".into(),
+                expected_v: 0,
+                new: StoredReasonedHeads {
+                    v: 1,
+                    json: "{\"v\":1}".into(),
+                },
+            },
+            7,
+        );
+        assert_eq!(response, Response::ReasonedHeadsUpdated);
+        let restored = NameServiceState::from_snapshot(&state.to_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.reasoned_heads.len(), 1);
     }
 
     // -------------------------------------------------------------

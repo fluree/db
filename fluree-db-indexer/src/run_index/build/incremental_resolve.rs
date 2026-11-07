@@ -147,6 +147,10 @@ pub struct IncrementalResolveConfig {
     pub pending_commit_cids: Option<Vec<(i64, ContentId)>>,
     /// Global bound on in-flight commit-body fetches on the fast path.
     pub commit_fetch_concurrency: usize,
+    /// A reasoned head's derived facts, in commit-codec form, applied after
+    /// the window's commits at their `t` (see
+    /// [`crate::config::IndexerConfig::derived_facts`]).
+    pub derived_facts: Option<Arc<Vec<u8>>>,
 }
 
 /// Result of V6 incremental commit resolution.
@@ -384,10 +388,25 @@ pub async fn resolve_incremental_commits_v6(
     // 5. Walk commit chain (commit format is version-independent). Moved
     // ahead of the vector-shard load so we can detect whether the chunk
     // contains any vector op before deciding to pay that cost.
-    let (walked_commits, t_walk_chain_ms) = {
+    let (mut walked_commits, t_walk_chain_ms) = {
         let t0 = Instant::now();
         let commits = walk_commit_chain_since(cs.as_ref(), &config).await?;
         (commits, t0.elapsed().as_millis() as u64)
+    };
+    // The derived facts go last, so at their `t` they follow the commit that
+    // ends the window.
+    let derived_index = match &config.derived_facts {
+        Some(bytes) => {
+            let envelope = fluree_db_core::commit::codec::read_commit_envelope(bytes)
+                .map_err(|e| IncrementalResolveError::CommitChain(format!("derived facts: {e}")))?;
+            walked_commits.push(WalkedCommit {
+                cid: ContentId::new(fluree_db_core::ContentKind::DerivedFacts, bytes),
+                t: envelope.t,
+                bytes: bytes.as_ref().clone(),
+            });
+            Some(walked_commits.len() - 1)
+        }
+        None => None,
     };
 
     // 4b/4c. Vector arena shard load + fact-handle seeding — gated on the
@@ -513,17 +532,24 @@ pub async fn resolve_incremental_commits_v6(
         let mut delta_retracts = 0u64;
         let mut commit_count = 0usize;
 
-        for walked in &walked_commits {
-            let resolved = shared
-                .resolve_commit_into_chunk(&walked.bytes, &walked.cid.digest_hex(), &mut chunk)
-                .map_err(|e| {
-                    IncrementalResolveError::Resolve(match e {
-                        ResolverError::Unindexable(msg) => {
-                            ResolverError::Unindexable(format!("commit {}: {msg}", walked.cid))
-                        }
-                        e => e,
-                    })
-                })?;
+        for (index, walked) in walked_commits.iter().enumerate() {
+            let resolved = if Some(index) == derived_index {
+                shared.resolve_derived_into_chunk(&walked.bytes, &mut chunk)
+            } else {
+                shared.resolve_commit_into_chunk(
+                    &walked.bytes,
+                    &walked.cid.digest_hex(),
+                    &mut chunk,
+                )
+            };
+            let resolved = resolved.map_err(|e| {
+                IncrementalResolveError::Resolve(match e {
+                    ResolverError::Unindexable(msg) => {
+                        ResolverError::Unindexable(format!("commit {}: {msg}", walked.cid))
+                    }
+                    e => e,
+                })
+            })?;
 
             max_t = max_t.max(walked.t);
             delta_commit_size += resolved.size;

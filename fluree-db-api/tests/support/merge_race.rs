@@ -134,6 +134,31 @@ impl ConfigLookup for PausingNameService {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsLookup for PausingNameService {
+    async fn get_reasoned_heads(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+        self.inner.get_reasoned_heads(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsPublisher for PausingNameService {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasonedHeads,
+    ) -> Result<fluree_db_nameservice::ReasonedHeadsCasResult> {
+        self.inner
+            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+}
+
+#[async_trait]
 impl NameServiceLookup for PausingNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let record = self.inner.lookup(ledger_id).await?;

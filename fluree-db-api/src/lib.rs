@@ -827,6 +827,19 @@ impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasonedHeadsLookup for NameServiceMode {
+    async fn get_reasoned_heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<
+        Option<fluree_db_nameservice::ReasonedHeads>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().get_reasoned_heads(ledger_id).await
+    }
+}
+
+#[async_trait]
 impl fluree_db_nameservice::StatusLookup for NameServiceMode {
     async fn get_status(
         &self,

@@ -1650,6 +1650,37 @@ where
 }
 
 #[async_trait]
+impl<S> crate::ReasonedHeadsLookup for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = self.ns_key(&ledger_name, &branch);
+        crate::ns_cas::read_reasoned_heads(&self.storage, &key).await
+    }
+}
+
+#[async_trait]
+impl<S> crate::ReasonedHeadsPublisher for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasonedHeads,
+    ) -> Result<crate::ReasonedHeadsCasResult> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = self.ns_key(&ledger_name, &branch);
+        crate::ns_cas::push_reasoned_heads(&self.storage, &key, ledger_id, fence, expected_v, new)
+            .await
+    }
+}
+
+#[async_trait]
 impl<S> ConfigLookup for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,

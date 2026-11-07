@@ -278,6 +278,16 @@ impl ConfigLookup for CompositeNameService {
     }
 }
 
+#[async_trait]
+impl crate::ReasonedHeadsLookup for CompositeNameService {
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+        match self.mount_for(ledger_id) {
+            Some((mount, remote)) => mount.lookup.get_reasoned_heads(remote).await,
+            None => self.local.get_reasoned_heads(ledger_id).await,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Write surface: reject mounted aliases, delegate the rest to local
 // ---------------------------------------------------------------------------
@@ -478,6 +488,24 @@ impl ConfigPublisher for CompositeNameService {
         }
         self.local
             .push_config_fenced(ledger_id, fence, expected, new)
+            .await
+    }
+}
+
+#[async_trait]
+impl crate::ReasonedHeadsPublisher for CompositeNameService {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasonedHeads,
+    ) -> Result<crate::ReasonedHeadsCasResult> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local
+            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
             .await
     }
 }

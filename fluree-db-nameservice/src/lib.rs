@@ -499,7 +499,14 @@ pub enum NsLookupResult {
 /// implement the lookup surface without claiming write capability.
 #[async_trait]
 pub trait NameServiceLookup:
-    GraphSourceLookup + RefLookup + StatusLookup + ConfigLookup + Debug + Send + Sync
+    GraphSourceLookup
+    + RefLookup
+    + StatusLookup
+    + ConfigLookup
+    + ReasonedHeadsLookup
+    + Debug
+    + Send
+    + Sync
 {
     /// Look up a ledger by its ledger ID (e.g. "mydb:main")
     ///
@@ -1450,6 +1457,62 @@ pub trait ConfigPublisher: ConfigLookup {
     ) -> Result<ConfigCasResult>;
 }
 
+// ---------------------------------------------------------------------------
+// Reasoned heads
+// ---------------------------------------------------------------------------
+
+pub use fluree_db_core::reasoned_head::ReasonedHeads;
+
+/// Result of a compare-and-swap on a branch's reasoned-heads document.
+///
+/// A conflict is not an error: `actual` is the document as it stands (`None`
+/// when the branch record does not exist), and the caller rebuilds its
+/// update from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasonedHeadsCasResult {
+    Updated,
+    Conflict { actual: Option<ReasonedHeads> },
+}
+
+/// Read access to each branch's reasoned-heads document.
+#[async_trait]
+pub trait ReasonedHeadsLookup: Debug + Send + Sync {
+    /// The branch's document. `Some` with `v == 0` when the branch exists
+    /// but no head was ever registered; `None` when the branch record does
+    /// not exist (or is a tombstone).
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<ReasonedHeads>>;
+}
+
+/// Compare-and-swap on a branch's reasoned-heads document.
+///
+/// Backends check only the version and the fence: the update lands when the
+/// stored document's `v` equals `expected_v` and `new.v > expected_v`, and is
+/// refused with [`NameServiceError::Fenced`] unless the record carries
+/// `fence` and is not frozen. Publication rules (eligibility, basis,
+/// progress) run above the nameservice, in
+/// [`fluree_db_core::reasoned_head::admit`].
+#[async_trait]
+pub trait ReasonedHeadsPublisher: ReasonedHeadsLookup {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &ReasonedHeads,
+    ) -> Result<ReasonedHeadsCasResult>;
+}
+
+/// The version check every backend applies to a reasoned-heads push.
+pub(crate) fn reasoned_heads_conflict(
+    current: &ReasonedHeads,
+    expected_v: i64,
+    new: &ReasonedHeads,
+) -> Option<ReasonedHeadsCasResult> {
+    (current.v != expected_v || new.v <= current.v).then(|| ReasonedHeadsCasResult::Conflict {
+        actual: Some(current.clone()),
+    })
+}
+
 /// A dynamically-dispatched nameservice with full read-write capability.
 ///
 /// This is the complete set of nameservice traits needed for full read-write
@@ -1466,6 +1529,7 @@ pub trait NameServicePublisher:
     + GraphSourcePublisher
     + StatusPublisher
     + ConfigPublisher
+    + ReasonedHeadsPublisher
     + LedgerRegistry
     + BranchRecordStore
 {
@@ -1478,6 +1542,7 @@ impl<T> NameServicePublisher for T where
         + GraphSourcePublisher
         + StatusPublisher
         + ConfigPublisher
+        + ReasonedHeadsPublisher
         + LedgerRegistry
         + BranchRecordStore
 {
@@ -1608,6 +1673,16 @@ where
 {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         (**self).get_config(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<T> ReasonedHeadsLookup for Arc<T>
+where
+    T: ReasonedHeadsLookup + ?Sized,
+{
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<ReasonedHeads>> {
+        (**self).get_reasoned_heads(ledger_id).await
     }
 }
 
@@ -1790,6 +1865,24 @@ where
     ) -> Result<StatusCasResult> {
         (**self)
             .push_status_fenced(ledger_id, fence, expected, new)
+            .await
+    }
+}
+
+#[async_trait]
+impl<T> ReasonedHeadsPublisher for Arc<T>
+where
+    T: ReasonedHeadsPublisher + ?Sized,
+{
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &ReasonedHeads,
+    ) -> Result<ReasonedHeadsCasResult> {
+        (**self)
+            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
             .await
     }
 }
@@ -2076,6 +2169,12 @@ mod tests {
     #[async_trait]
     impl ConfigLookup for RefOnlyNs {
         async fn get_config(&self, _: &str) -> Result<Option<ConfigValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl ReasonedHeadsLookup for RefOnlyNs {
+        async fn get_reasoned_heads(&self, _: &str) -> Result<Option<ReasonedHeads>> {
             Ok(None)
         }
     }

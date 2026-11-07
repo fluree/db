@@ -1484,6 +1484,26 @@ impl SharedResolverState {
         commit_hash_hex: &str,
         chunk: &mut RebuildChunk,
     ) -> Result<ResolvedCommit, ResolverError> {
+        self.resolve_ops_into_chunk(bytes, Some(commit_hash_hex), chunk)
+    }
+
+    /// Resolve a reasoned head's derived facts, carried in commit-codec
+    /// form, into `chunk`. They are facts, not a commit: nothing is written
+    /// to the txn-meta graph for them.
+    pub fn resolve_derived_into_chunk(
+        &mut self,
+        bytes: &[u8],
+        chunk: &mut RebuildChunk,
+    ) -> Result<ResolvedCommit, ResolverError> {
+        self.resolve_ops_into_chunk(bytes, None, chunk)
+    }
+
+    fn resolve_ops_into_chunk(
+        &mut self,
+        bytes: &[u8],
+        commit_hash_hex: Option<&str>,
+        chunk: &mut RebuildChunk,
+    ) -> Result<ResolvedCommit, ResolverError> {
         let commit_size = bytes.len() as u64;
         let commit_ops = load_commit_ops(bytes)?;
 
@@ -1601,19 +1621,22 @@ impl SharedResolverState {
 
         // Emit txn-meta records into the same chunk. Its failures are about
         // the envelope's content too.
-        let meta_count = self
-            .emit_txn_meta_chunk(
-                commit_hash_hex,
-                &commit_ops.envelope,
-                commit_size,
-                asserts,
-                retracts,
-                chunk,
-            )
-            .map_err(|e| match e {
-                ResolverError::Resolve(msg) => ResolverError::Unindexable(msg),
-                other => other,
-            })?;
+        let meta_count = match commit_hash_hex {
+            Some(commit_hash_hex) => self
+                .emit_txn_meta_chunk(
+                    commit_hash_hex,
+                    &commit_ops.envelope,
+                    commit_size,
+                    asserts,
+                    retracts,
+                    chunk,
+                )
+                .map_err(|e| match e {
+                    ResolverError::Resolve(msg) => ResolverError::Unindexable(msg),
+                    other => other,
+                })?,
+            None => 0,
+        };
 
         Ok(ResolvedCommit {
             total_records: asserts + retracts + meta_count,

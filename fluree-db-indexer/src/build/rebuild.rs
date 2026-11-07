@@ -439,6 +439,20 @@ where
                 }
             }
 
+            // A reasoned head's derived facts follow the last commit, at its `t`.
+            if let Some(derived) = config.derived_facts.as_deref() {
+                let resolved = shared
+                    .resolve_derived_into_chunk(derived, &mut chunk)
+                    .map_err(|e| match e {
+                        run_index::ResolverError::Unindexable(_) => {
+                            IndexerError::Unindexable(format!("derived facts: {e}"))
+                        }
+                        e => IndexerError::StorageRead(e.to_string()),
+                    })?;
+                total_asserts += resolved.asserts as u64;
+                total_retracts += resolved.retracts as u64;
+            }
+
             // Push final chunk if non-empty.
             if !chunk.is_empty() {
                 let spatial_end = shared

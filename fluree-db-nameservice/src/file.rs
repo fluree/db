@@ -1735,6 +1735,31 @@ impl StatusPublisher for FileNameService {
 }
 
 #[async_trait]
+impl crate::ReasonedHeadsLookup for FileNameService {
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = Self::ns_address(&ledger_name, &branch);
+        crate::ns_cas::read_reasoned_heads(&self.storage, &key).await
+    }
+}
+
+#[async_trait]
+impl crate::ReasonedHeadsPublisher for FileNameService {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasonedHeads,
+    ) -> Result<crate::ReasonedHeadsCasResult> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = Self::ns_address(&ledger_name, &branch);
+        crate::ns_cas::push_reasoned_heads(&self.storage, &key, ledger_id, fence, expected_v, new)
+            .await
+    }
+}
+
+#[async_trait]
 impl ConfigLookup for FileNameService {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;

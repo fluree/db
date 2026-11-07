@@ -1906,6 +1906,8 @@ fn content_path_from_prefixes(
         ContentKind::GraphSourceMapping => {
             format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/mapping/{hash_hex}.ttl")
         }
+        ContentKind::ReasonedManifest => format!("{prefix}/index/manifests/{hash_hex}.frm1"),
+        ContentKind::DerivedFacts => format!("{prefix}/index/derived/{hash_hex}.fds1"),
         // Forward-compatibility: unknown kinds go to a generic blob directory
         #[allow(unreachable_patterns)]
         _ => format!("{prefix}/blob/{hash_hex}.bin"),

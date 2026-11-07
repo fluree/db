@@ -139,6 +139,7 @@
 //! as a disk limit.
 
 pub(crate) mod collector;
+pub mod heads;
 mod record;
 mod siblings;
 mod sweep;

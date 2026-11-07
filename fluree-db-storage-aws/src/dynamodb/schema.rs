@@ -117,6 +117,11 @@ pub const ATTR_STATUS_META: &str = "status_meta";
 // ── Common attributes ───────────────────────────────────────────────────────
 /// Last update timestamp (epoch milliseconds)
 pub const ATTR_UPDATED_AT_MS: &str = "updated_at_ms";
+/// The branch's reasoned-heads document, as JSON, on the status item: it
+/// carries the branch fence and frozen flag, and exists for every record.
+pub const ATTR_REASONED_HEADS: &str = "reasoned_heads";
+/// The reasoned-heads document's compare-and-swap version; absent = 0.
+pub const ATTR_REASONED_HEADS_V: &str = "reasoned_heads_v";
 /// Schema version number
 pub const ATTR_SCHEMA: &str = "schema";
 /// Current schema version
