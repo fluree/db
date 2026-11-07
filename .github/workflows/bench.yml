@@ -61,6 +61,12 @@ jobs:
       # memory as advisory until a ci-* baseline is committed (bench-capture).
       # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
       FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
+      # This gate checks that benches build and run, not how fast they run, so
+      # it skips the release profile's fat LTO and single codegen unit. Under
+      # them, eight concurrent rustc and LTO-link jobs got the runner shut down
+      # partway through every cold build.
+      CARGO_PROFILE_BENCH_LTO: "off"
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: 16
     steps:
       - name: Runner capacity
         run: |
