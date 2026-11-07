@@ -330,8 +330,10 @@ impl crate::Fluree {
 
         let use_attached =
             matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
-        let (config, cross) = if use_attached {
-            let config = resolve_config_for_validate(&view).await;
+        // Read whatever the shapes: the config also says which graphs are
+        // read with the validated one.
+        let config = resolve_config_for_validate(&view).await?;
+        let cross = if use_attached {
             let is_cross_ledger = config
                 .as_ref()
                 .and_then(|c| c.shacl.as_ref())
@@ -346,34 +348,29 @@ impl crate::Fluree {
             } else {
                 None
             };
-            (config, cross)
+            cross
         } else {
-            (None, None)
+            None
         };
 
         validate_view_inner(&view, ledger_id, options, config, cross).await
     }
 }
 
-/// Resolve the ledger config for validation. Mirrors the transaction path's
-/// degrade semantics: a broken config graph read falls back to defaults
-/// (default-graph shapes) rather than failing validation.
+/// Resolve the ledger config for validation. A read failure fails validation,
+/// as it fails a transaction: the config says which shapes apply and which
+/// graphs are read, so validating without it would report against the wrong
+/// rules or the wrong data.
 async fn resolve_config_for_validate(
     view: &LedgerView,
-) -> Option<fluree_db_core::ledger_config::LedgerConfig> {
-    match crate::config_resolver::resolve_ledger_config(
+) -> Result<Option<fluree_db_core::ledger_config::LedgerConfig>> {
+    crate::config_resolver::resolve_ledger_config(
         view.snapshot.as_ref(),
         view.novelty.as_ref(),
         view.t,
     )
     .await
-    {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::debug!(error = %e, "Config graph read failed during validate — using defaults");
-            None
-        }
-    }
+    .map_err(|e| ApiError::ConfigUnavailable(e.to_string()))
 }
 
 /// Validate a ledger view against SHACL shapes.
@@ -389,12 +386,7 @@ pub async fn validate_view(
     ledger_id: &str,
     options: &ValidateOptions,
 ) -> Result<ValidateReport> {
-    let use_attached = matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
-    let config = if use_attached {
-        resolve_config_for_validate(view).await
-    } else {
-        None
-    };
+    let config = resolve_config_for_validate(view).await?;
     validate_view_inner(view, ledger_id, options, config, None).await
 }
 
@@ -570,11 +562,27 @@ async fn validate_view_inner(
         shapes,
         hierarchy.as_ref(),
     );
+    // The graphs read with the validated graph, from its effective SHACL
+    // group, as on the transaction path.
+    let additional_data_g_ids = match &config {
+        Some(config) => {
+            let graph_iri = (data_g_id != fluree_db_core::DEFAULT_GRAPH_ID)
+                .then(|| snapshot.graph_registry.iri_for_graph_id(data_g_id))
+                .flatten();
+            let resolved = crate::config_resolver::resolve_effective_config(config, graph_iri);
+            crate::tx::resolve_additional_data_g_ids(resolved.shacl.as_ref(), snapshot, None)?
+        }
+        None => Vec::new(),
+    };
     let mut engine = match hierarchy {
         Some(h) => ShaclEngine::new_with_hierarchy(cache, h),
         None => ShaclEngine::new(cache),
     }
-    .with_membership_graphs(membership);
+    .with_membership_graphs(membership)
+    .with_additional_data_graphs(std::collections::HashMap::from([(
+        data_g_id,
+        additional_data_g_ids,
+    )]));
     if let Some(cancellation) = options.cancellation.clone() {
         engine = engine.with_cancellation(cancellation);
     }
