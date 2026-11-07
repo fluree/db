@@ -387,88 +387,103 @@ impl Fluree {
             flake.op = op;
             flake
         };
-        let (kind, fold, stats_added, stats_removed) = match &previous {
-            None => {
-                let asserts: Vec<Flake> = derived_only
-                    .iter()
-                    .cloned()
-                    .map(|f| to_flake(f, true))
-                    .collect();
-                let n = asserts.len() as u64;
-                (GenerationKind::Rebuild, asserts, n, 0)
+        // A logical fold the indexer cannot apply is redone as a rebuild.
+        let mut previous = previous;
+        let (kind, built, stats_added, stats_removed) = loop {
+            let (kind, fold, stats_added, stats_removed) = match &previous {
+                None => {
+                    let asserts: Vec<Flake> = derived_only
+                        .iter()
+                        .cloned()
+                        .map(|f| to_flake(f, true))
+                        .collect();
+                    let n = asserts.len() as u64;
+                    (GenerationKind::Rebuild, asserts, n, 0)
+                }
+                Some(prev) => {
+                    let retracted = window_retractions(
+                        branch_store.as_ref(),
+                        &basis.commit,
+                        prev.manifest.basis.t,
+                        &db,
+                    )
+                    .await?;
+                    let mut fold = Vec::new();
+                    for fact in &derived_only {
+                        if !prev.derived.contains(fact) || retracted.contains(fact) {
+                            fold.push(to_flake(fact.clone(), true));
+                        }
+                    }
+                    let added = fold.len() as u64;
+                    let lost: HashSet<(GraphId, Flake)> = prev
+                        .derived
+                        .iter()
+                        .filter(|f| !derived_only.contains(*f) && !retracted.contains(*f))
+                        .cloned()
+                        .collect();
+                    let still_asserted =
+                        asserted_filter(&db, lost.iter().cloned().collect(), true).await?;
+                    let mut removed = 0;
+                    for fact in lost {
+                        if !still_asserted.contains(&fact) {
+                            fold.push(to_flake(fact, false));
+                            removed += 1;
+                        }
+                    }
+                    (GenerationKind::Logical, fold, added, removed)
+                }
+            };
+
+            // Build the merged root in the head's namespace.
+            let mut head_record = record.clone();
+            match &previous {
+                None => {
+                    if let Some(base_root) = &record.index_head_id {
+                        self.copy_index_to_branch(ledger_id, &head_ns, base_root)
+                            .await?;
+                    }
+                }
+                Some(prev) => {
+                    head_record.index_head_id = Some(prev.manifest.root.clone());
+                    head_record.index_t = prev.manifest.basis.t;
+                }
             }
-            Some(prev) => {
-                let retracted = window_retractions(
-                    branch_store.as_ref(),
-                    &basis.commit,
-                    prev.manifest.basis.t,
-                    &db,
-                )
-                .await?;
-                let mut fold = Vec::new();
-                for fact in &derived_only {
-                    if !prev.derived.contains(fact) || retracted.contains(fact) {
-                        fold.push(to_flake(fact.clone(), true));
-                    }
+            let mut config = crate::build_indexer_config(&self.config);
+            config.incremental_retype_max_subjects = usize::MAX;
+            config.incremental_max_commits = 1 << 40;
+            config.incremental_max_commit_bytes = None;
+            config.derived_facts = Some(Arc::new(encode_facts(basis.t, fold)?));
+            let built = match &previous {
+                None => {
+                    fluree_db_indexer::build_index_for_record(
+                        Arc::clone(&head_store),
+                        &head_record,
+                        config,
+                    )
+                    .await
                 }
-                let added = fold.len() as u64;
-                let lost: HashSet<(GraphId, Flake)> = prev
-                    .derived
-                    .iter()
-                    .filter(|f| !derived_only.contains(*f) && !retracted.contains(*f))
-                    .cloned()
-                    .collect();
-                let still_asserted =
-                    asserted_filter(&db, lost.iter().cloned().collect(), true).await?;
-                let mut removed = 0;
-                for fact in lost {
-                    if !still_asserted.contains(&fact) {
-                        fold.push(to_flake(fact, false));
-                        removed += 1;
-                    }
+                Some(_) => {
+                    fluree_db_indexer::fold_index_for_record(
+                        Arc::clone(&head_store),
+                        &head_record,
+                        config,
+                    )
+                    .await
                 }
-                (GenerationKind::Logical, fold, added, removed)
+            };
+            match built {
+                Ok(built) => break (kind, built, stats_added, stats_removed),
+                Err(e) if previous.is_some() => {
+                    tracing::warn!(
+                        head = %head_id,
+                        error = %e,
+                        "logical fold failed; rebuilding the head from the base"
+                    );
+                    previous = None;
+                }
+                Err(e) => return Err(ApiError::internal(format!("reasoned-head build: {e}"))),
             }
         };
-
-        // Build the merged root in the head's namespace.
-        let mut head_record = record.clone();
-        match &previous {
-            None => {
-                if let Some(base_root) = &record.index_head_id {
-                    self.copy_index_to_branch(ledger_id, &head_ns, base_root)
-                        .await?;
-                }
-            }
-            Some(prev) => {
-                head_record.index_head_id = Some(prev.manifest.root.clone());
-                head_record.index_t = prev.manifest.basis.t;
-            }
-        }
-        let mut config = crate::build_indexer_config(&self.config);
-        config.incremental_retype_max_subjects = usize::MAX;
-        config.incremental_max_commits = 1 << 40;
-        config.incremental_max_commit_bytes = None;
-        config.derived_facts = Some(Arc::new(encode_facts(basis.t, fold)?));
-        let built = match &previous {
-            None => {
-                fluree_db_indexer::build_index_for_record(
-                    Arc::clone(&head_store),
-                    &head_record,
-                    config,
-                )
-                .await
-            }
-            Some(_) => {
-                fluree_db_indexer::fold_index_for_record(
-                    Arc::clone(&head_store),
-                    &head_record,
-                    config,
-                )
-                .await
-            }
-        }
-        .map_err(|e| ApiError::internal(format!("reasoned-head build: {e}")))?;
 
         let derived_only_flakes: Vec<Flake> = derived_only
             .iter()
