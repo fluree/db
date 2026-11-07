@@ -45,6 +45,9 @@ pub use fluree_db_erasure::{
 };
 pub use index::{ErasedCommit, ErasureStep};
 pub use members::{MemberProving, ProofStep, ProvingMembers, StepOutcome};
+/// Holds on purge passes, for other crates' tests.
+#[cfg(feature = "testing")]
+pub use purge::hooks as purge_hooks;
 pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan, PurgeTimings};
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};
 use serde::{Deserialize, Serialize};

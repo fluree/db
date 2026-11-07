@@ -1404,6 +1404,233 @@ async fn adopted(next_is_prover: bool) {
     }
 }
 
+/// A leader that loses its leadership while its purge pass has planned
+/// stops the pass there, deleting nothing, and the next leader purges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_purge_planned_by_a_deposed_leader_is_done_by_the_next() {
+    purge_across_a_leader_change(fluree_db_api::retention::erasure::purge_hooks::Hold::Planned)
+        .await;
+}
+
+/// [`a_purge_planned_by_a_deposed_leader_is_done_by_the_next`], deposed
+/// once the pass erased the holders' indexes and recorded it: the next
+/// leader goes on from that record rather than erasing them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_purge_resumes_from_what_a_deposed_leader_recorded() {
+    purge_across_a_leader_change(fluree_db_api::retention::erasure::purge_hooks::Hold::Rebuilt)
+        .await;
+}
+
+async fn purge_across_a_leader_change(at: fluree_db_api::retention::erasure::purge_hooks::Hold) {
+    use fluree_db_api::retention::erasure::purge_hooks::PurgeHold;
+    use fluree_db_api::retention::erasure::ErasureStage;
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let ids = [91u64, 92, 93];
+    let provers = [
+        GatedProver::closed(),
+        GatedProver::closed(),
+        GatedProver::closed(),
+    ];
+    let mut nodes = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        provers[i].open();
+        nodes.push(
+            start_node_with(
+                *id,
+                data_dir.path(),
+                erasing_with(&provers[i]),
+                |config| config,
+                |app| app,
+            )
+            .await,
+        );
+    }
+    let leader = &nodes[0].0;
+    leader
+        .raft
+        .initialize(BTreeMap::from([(91, nodes[0].4.clone())]))
+        .await
+        .expect("initialize");
+    eventually("self-election", async || {
+        leader.raft.current_leader().await == Some(91)
+    })
+    .await;
+    for i in [1, 2] {
+        leader
+            .raft
+            .add_learner(ids[i], nodes[i].4.clone(), true)
+            .await
+            .expect("learner added");
+    }
+    leader
+        .raft
+        .change_membership(
+            openraft::ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([92, 93])),
+            false,
+        )
+        .await
+        .expect("voters");
+
+    let name = format!("purge-{}/db", format!("{at:?}").to_lowercase());
+    let id = format!("{name}:main");
+    let first = &nodes[0].1;
+    first.create_ledger(&name).await.expect("create");
+    insert_and_erase(first, &nodes[0].2, &id).await;
+    first.run_erasure_pass(&id).await.expect("proved");
+    first
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("indexed");
+    let published = first.run_erasure_pass(&id).await.expect("published");
+    assert_eq!(published.published, 1, "{published:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        first.run_erasure_pass(&id).await.expect("pass");
+        let job = first_job(first, &id).await;
+        if job
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.effective_ms.is_some())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every member to install: {job:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The request's own idempotency record names its envelope until it
+    // goes, which a purge waits for.
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 1;
+    leader
+        .raft
+        .client_write(
+            fluree_db_consensus::raft::state_machine::Command::EvictIdempotency {
+                cutoff_millis: now,
+                marker_cutoff_millis: now,
+            },
+        )
+        .await
+        .expect("records evicted, as their time-to-live would");
+
+    let record = leader
+        .nameservice()
+        .lookup(&id)
+        .await
+        .expect("lookup")
+        .expect("registered");
+    let originals: Vec<std::path::PathBuf> = first_job(first, &id)
+        .await
+        .commits
+        .iter()
+        .map(|task| {
+            let cid: fluree_db_core::ContentId = task.commit.parse().expect("a commit id");
+            let address = fluree_db_core::content_address(
+                "file",
+                fluree_db_core::ContentKind::Commit,
+                &record.storage_namespace(),
+                &cid.address_digest(),
+            );
+            data_dir
+                .path()
+                .join(address.trim_start_matches("fluree:file://"))
+        })
+        .collect();
+    assert!(!originals.is_empty());
+    assert!(originals.iter().all(|o| o.exists()), "{originals:?}");
+
+    let housekeeping = |i: usize| {
+        let writer: Arc<dyn fluree_db_api::retention::RetentionWriter> = Arc::new(
+            fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+                std::sync::OnceLock::from(Arc::clone(&nodes[i].2.committer)),
+            )),
+        );
+        nodes[i].1.retention_housekeeping(
+            Some(writer),
+            fluree_db_api::retention::RetentionOptions {
+                interval: Duration::from_millis(200),
+                purge_grace: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+    };
+    let hold = PurgeHold::set(at, &name);
+    let leading = housekeeping(0);
+    leading.tick().await;
+    tokio::time::timeout(Duration::from_secs(60), hold.reached())
+        .await
+        .expect("the leader's background pass reaches the hold");
+    let held = first_job(first, &id).await.purge;
+
+    // The leader goes quiet and another member is elected.
+    let next = 1;
+    leader.raft.runtime_config().elect(false);
+    leader.raft.runtime_config().heartbeat(false);
+    nodes[2].0.raft.runtime_config().elect(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let led = nodes[next].0.raft.metrics().borrow().current_leader;
+        let deposed = leader.raft.metrics().borrow().current_leader != Some(91);
+        if led == Some(ids[next]) && deposed {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "a new leader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Its housekeeping still runs, but the pass it began ended with its
+    // leadership: let go now, it does not go on.
+    hold.clear();
+    hold.proceed();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(hold.resumed(), 0, "the deposed leader's pass went on");
+    assert!(originals.iter().all(|o| o.exists()), "{originals:?}");
+    let job = first_job(&nodes[next].1, &id).await;
+    assert!(
+        job.purge.as_ref().is_none_or(|p| p.storage_ms.is_none()),
+        "{job:?}"
+    );
+    drop(leading);
+
+    // The next leader purges, from what the first recorded.
+    let led = housekeeping(next);
+    led.tick().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let job = loop {
+        let job = first_job(&nodes[next].1, &id).await;
+        if job.stage == ErasureStage::Purged {
+            break job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not purged: {:?}",
+            job.purge
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let purge = job.purge.expect("purge progress");
+    assert!(purge.blocked.is_none(), "{purge:?}");
+    assert!(originals.iter().all(|o| !o.exists()), "{originals:?}");
+    if at == fluree_db_api::retention::erasure::purge_hooks::Hold::Rebuilt {
+        let recorded = held.and_then(|p| p.rebuilt_ms);
+        assert!(recorded.is_some(), "held before the rebuild was recorded");
+        assert_eq!(purge.rebuilt_ms, recorded, "the indexes were erased again");
+    }
+    drop(led);
+    for (_, _, node, _, _) in nodes {
+        node.shutdown().await;
+    }
+}
+
 /// An erasure reaches only the branches whose history holds its commits:
 /// a branch made before the erased commit keeps its generation, and its
 /// writes go on from the views they began with.

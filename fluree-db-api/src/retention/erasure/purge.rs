@@ -429,38 +429,87 @@ mod scan;
 mod sources;
 
 /// Where a test holds a purge pass, for one ledger name.
-#[cfg(test)]
-pub(crate) mod hooks {
+#[cfg(any(test, feature = "testing"))]
+pub mod hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use tokio::sync::Notify;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Hold {
+    pub enum Hold {
         /// Once the pass over the name has planned.
         Planned,
         /// Once the release marked the dropped ledger of the name, before
         /// deleting its index files.
         Marked,
+        /// Once the pass has erased the holders' indexes and recorded it,
+        /// before it releases or deletes anything.
+        Rebuilt,
     }
 
-    /// Notified on reaching the hold; the pass then waits for the second.
-    #[allow(clippy::type_complexity)]
-    pub(crate) static HOLD: parking_lot::Mutex<
-        Option<(
-            Hold,
-            String,
-            Arc<tokio::sync::Notify>,
-            Arc<tokio::sync::Notify>,
-        )>,
-    > = parking_lot::Mutex::new(None);
+    /// Passes over one ledger name, held at one point until let go.
+    #[derive(Debug)]
+    pub struct PurgeHold {
+        at: Hold,
+        name: String,
+        reached: Notify,
+        proceed: Notify,
+        resumed: AtomicUsize,
+    }
+
+    /// One per ledger name: tests over other names hold their own passes.
+    static HOLDS: parking_lot::Mutex<Vec<Arc<PurgeHold>>> = parking_lot::Mutex::new(Vec::new());
+
+    impl PurgeHold {
+        /// Hold every pass over `name` that reaches `at` from now on, in
+        /// place of any earlier hold over `name`.
+        pub fn set(at: Hold, name: &str) -> Arc<Self> {
+            let hold = Arc::new(Self {
+                at,
+                name: name.to_string(),
+                reached: Notify::new(),
+                proceed: Notify::new(),
+                resumed: AtomicUsize::new(0),
+            });
+            let mut holds = HOLDS.lock();
+            holds.retain(|h| h.name != name);
+            holds.push(Arc::clone(&hold));
+            hold
+        }
+
+        /// Hold no further pass. Passes already held stay held until let go.
+        pub fn clear(&self) {
+            HOLDS.lock().retain(|h| !std::ptr::eq(h.as_ref(), self));
+        }
+
+        /// Until a pass reaches the hold.
+        pub async fn reached(&self) {
+            self.reached.notified().await;
+        }
+
+        /// Let one held pass go on, or the next to reach the hold.
+        pub fn proceed(&self) {
+            self.proceed.notify_one();
+        }
+
+        /// How many held passes went on past the hold. A pass dropped
+        /// while held never does.
+        pub fn resumed(&self) -> usize {
+            self.resumed.load(Ordering::SeqCst)
+        }
+    }
 
     pub(crate) async fn hold(at: Hold, name: &str) {
-        let held = HOLD
+        let held = HOLDS
             .lock()
-            .clone()
-            .filter(|(hold, held, ..)| *hold == at && held == name);
-        if let Some((_, _, reached, proceed)) = held {
-            reached.notify_one();
-            proceed.notified().await;
+            .iter()
+            .find(|hold| hold.at == at && hold.name == name)
+            .cloned();
+        if let Some(hold) = held {
+            hold.reached.notify_one();
+            hold.proceed.notified().await;
+            hold.resumed.fetch_add(1, Ordering::SeqCst);
         }
     }
 }

@@ -968,22 +968,19 @@ async fn while_held<T>(
     name: &str,
     during: impl std::future::Future<Output = T>,
 ) -> Option<T> {
-    use std::sync::Arc;
-    use tokio::sync::Notify;
-
-    let (reached, proceed) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-    *super::hooks::HOLD.lock() = Some((at, name.to_string(), reached.clone(), proceed.clone()));
+    let hold = super::hooks::PurgeHold::set(at, name);
     let held = async {
-        reached.notified().await;
+        hold.reached().await;
         let done = tokio::time::timeout(std::time::Duration::from_secs(2), during)
             .await
             .ok();
-        proceed.notify_one();
+        hold.proceed();
         done
     };
     let (pass, done) = tokio::join!(fluree.run_purge_pass(id, std::time::Duration::ZERO), held);
-    *super::hooks::HOLD.lock() = None;
+    hold.clear();
     pass.unwrap();
+    assert_eq!(hold.resumed(), 1, "the held pass went on");
     done
 }
 

@@ -147,7 +147,7 @@ impl Fluree {
         let clock = Instant::now();
         let plan = self.plan_purge(ledger).await?;
         report.timings.plan += clock.elapsed();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         super::hooks::hold(super::hooks::Hold::Planned, name.as_str()).await;
         let stuck = self.unrebuildable_sources(&plan.rebuilt_sources).await?;
         let blocked = (!stuck.is_empty()).then_some(
@@ -224,6 +224,8 @@ impl Fluree {
                     let ms = now_ms();
                     self.update_purge(&jobs, |p| p.rebuilt_ms = Some(ms))
                         .await?;
+                    #[cfg(any(test, feature = "testing"))]
+                    super::hooks::hold(super::hooks::Hold::Rebuilt, name.as_str()).await;
                     ms
                 }
             };
