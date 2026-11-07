@@ -917,6 +917,7 @@ async fn dynamodb_lists_bindings_and_dropped_ledgers_in_batches() {
             .unwrap();
         let entry = DroppedLedger {
             extra: Default::default(),
+            reasoned_heads: Default::default(),
             instance: instance.clone(),
             state: DroppedState::Dropped,
             dropped_at: 0,
@@ -957,6 +958,7 @@ async fn dynamodb_dropped_entry_at_the_cap_is_written() {
     let instance = fluree_db_core::InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
     let mut entry = DroppedLedger {
         extra: Default::default(),
+        reasoned_heads: Default::default(),
         instance: instance.clone(),
         state: DroppedState::Dropped,
         dropped_at: 0,

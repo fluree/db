@@ -72,6 +72,28 @@ impl<S> std::fmt::Debug for PausedBeforeInsert<'_, S> {
 }
 
 #[async_trait]
+impl<S: LifecycleStore> crate::ReasonedHeadsLookup for PausedBeforeInsert<'_, S> {
+    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+        self.inner.get_reasoned_heads(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ReasonedHeadsPublisher for PausedBeforeInsert<'_, S> {
+    async fn push_reasoned_heads_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<crate::Fence>,
+        expected_v: i64,
+        new: &crate::ReasonedHeads,
+    ) -> Result<crate::ReasonedHeadsCasResult> {
+        self.inner
+            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+}
+
+#[async_trait]
 impl<S: LifecycleStore> LedgerRegistry for PausedBeforeInsert<'_, S> {
     async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
         self.inner.get_binding(name).await
@@ -1941,6 +1963,57 @@ fn sample_heads(v: i64, revision: u64) -> crate::ReasonedHeads {
     crate::ReasonedHeads { v, heads }
 }
 
+/// A soft-dropped ledger keeps each branch's reasoned-heads document in its
+/// entry, and a restore writes it back under the fresh fence; the old fence
+/// takes no write.
+pub async fn reasoned_heads_survive_drop_and_restore<S: crate::NameServicePublisher>(store: &S) {
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let doc = sample_heads(1, 3);
+    store
+        .push_reasoned_heads_fenced("mydb:main", created.fence, 0, &doc)
+        .await
+        .unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.entry.reasoned_heads.get("main"), Some(&doc));
+    assert!(store
+        .get_reasoned_heads("mydb:main")
+        .await
+        .unwrap()
+        .is_none());
+
+    let restored = lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let fence = restored[0].fence;
+    let back = store
+        .get_reasoned_heads("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.heads, doc.heads);
+    assert_fenced(
+        store
+            .push_reasoned_heads_fenced(
+                "mydb:main",
+                created.fence,
+                back.v,
+                &sample_heads(back.v + 1, 4),
+            )
+            .await,
+        "push_reasoned_heads with the fence from before the drop",
+    );
+    assert_eq!(
+        store
+            .push_reasoned_heads_fenced("mydb:main", fence, back.v, &sample_heads(back.v + 1, 4))
+            .await
+            .unwrap(),
+        crate::ReasonedHeadsCasResult::Updated
+    );
+}
+
 /// A branch's reasoned-heads document swaps on its version under the
 /// branch fence; a conflict carries the document as it stands, and commit
 /// and index publication leave it alone.
@@ -2096,6 +2169,7 @@ where
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
     reasoned_heads_swap_on_version(&make().await).await;
+    reasoned_heads_survive_drop_and_restore(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -2152,6 +2226,7 @@ macro_rules! lifecycle_conformance_tests {
             a_rerun_migration_binds_late_legacy_records,
             a_rerun_migration_keeps_a_stopped_branch_drop_dropped,
             reasoned_heads_swap_on_version,
+            reasoned_heads_survive_drop_and_restore,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {
