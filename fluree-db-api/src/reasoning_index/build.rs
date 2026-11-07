@@ -289,6 +289,12 @@ impl Fluree {
             return Ok(Vec::new());
         };
         let record = self.branch_record(&id).await?;
+        // A build already writing finishes first, and none starts writing
+        // until the folders are gone.
+        let _hold = self
+            .reasoning_index_state
+            .hold_for_reclaim(record.ledger_id.name())
+            .await;
         let method = storage.storage_method().to_string();
         let mut cleaned = Vec::new();
         for index_id in due {
@@ -629,6 +635,14 @@ impl Fluree {
             flake.op = op;
             flake
         };
+        #[cfg(test)]
+        {
+            let seam = self.reasoning_index_state.before_write.lock().clone();
+            if let Some(seam) = seam {
+                seam.reached.notify_one();
+                seam.resume.notified().await;
+            }
+        }
         // From here until publication, files are written that no published
         // generation references yet.
         // Sweeps and collector passes hold these off, or wait for them, so
@@ -642,6 +656,23 @@ impl Fluree {
                 reason: "a sweep or collector pass of the ledger is running".into(),
             });
         };
+        // Retired, or cleaned up, while the closure ran: its folder is not
+        // written again once a cleanup could have deleted it.
+        match self
+            .reasoning_indexes(ledger_id)
+            .await?
+            .indexes
+            .get(index_id)
+        {
+            Some(entry)
+                if matches!(entry.registration.state, RegistrationState::Active)
+                    && entry.registration.revision == revision => {}
+            _ => {
+                return Ok(RefreshOutcome::Discarded {
+                    reason: "not eligible: the index was retired while it was computed".into(),
+                })
+            }
+        }
         let _build = match &self.indexing_mode {
             crate::IndexingMode::Background(handle) => {
                 match handle.begin_build(&record.ledger_id) {
@@ -1431,7 +1462,7 @@ mod tests {
     use crate::Fluree;
     use fluree_db_core::reasoning_index::{
         ClosureMode, GenerationKind, HeadPointer, ReasoningIndexId, ReasoningManifest,
-        ENGINE_SEMANTICS,
+        RegistrationState, ENGINE_SEMANTICS,
     };
     use fluree_db_core::{ContentKind, ContentStore, Flake, FlakeValue, Sid};
     use fluree_db_query::reasoning::MaintenanceBounds;
@@ -2359,6 +2390,215 @@ mod tests {
             );
         }
         assert_eq!(alice_classes(&fluree, id).await.1, Some(2));
+    }
+
+    /// The files under an index's folder.
+    async fn index_files(fluree: &Fluree, id: &str, index: &ReasoningIndexId) -> Vec<String> {
+        let storage = fluree.backend().admin_storage_cloned().unwrap();
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let prefix = format!(
+            "fluree:{}://{}/",
+            storage.storage_method(),
+            record
+                .storage_namespace()
+                .reasoning_index(index.as_str())
+                .branch_prefix()
+        );
+        storage.list_prefix(&prefix).await.unwrap()
+    }
+
+    /// Retiring an index while a refresh builds it refuses the build. The
+    /// entry stays retired until cleanup removes it with every file the build
+    /// wrote, and nothing recreates it.
+    #[tokio::test]
+    async fn retiring_an_index_while_it_builds_refuses_the_build() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/retire-race:main";
+        let (index, _) = students(&fluree, id).await;
+        let seam = Arc::new(PauseSeam::default());
+        *fluree.reasoning_index_state.before_publish.lock() = Some(Arc::clone(&seam));
+        let retire = async {
+            seam.reached.notified().await;
+            fluree.retire_reasoning_index(id, &index).await.unwrap();
+            seam.resume.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(fluree.refresh_reasoning_index(id, &index), retire);
+        *fluree.reasoning_index_state.before_publish.lock() = None;
+        match outcome.unwrap() {
+            RefreshOutcome::Discarded { reason } => assert!(reason.contains("retired"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        let entry = fluree.reasoning_indexes(id).await.unwrap().indexes[&index].clone();
+        assert!(matches!(
+            entry.registration.state,
+            RegistrationState::Retired { .. }
+        ));
+        assert!(entry.head.is_none());
+        assert_eq!(alice_classes(&fluree, id).await.1, None);
+        assert!(fluree
+            .refresh_reasoning_indexes(id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            !index_files(&fluree, id, &index).await.is_empty(),
+            "the refused build wrote files"
+        );
+
+        fluree.set_reasoning_index_retention(super::super::GenerationRetention {
+            min_age_ms: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            fluree.clean_retired_reasoning_indexes(id).await.unwrap(),
+            vec![index.clone()]
+        );
+        assert!(fluree
+            .reasoning_indexes(id)
+            .await
+            .unwrap()
+            .indexes
+            .is_empty());
+        assert_eq!(index_files(&fluree, id, &index).await, Vec::<String>::new());
+        assert!(fluree
+            .refresh_reasoning_indexes(id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fluree
+            .reasoning_indexes(id)
+            .await
+            .unwrap()
+            .indexes
+            .is_empty());
+    }
+
+    /// Dropping a branch that has children, while its index builds, freezes
+    /// the branch; the build's publication is refused, and nothing is
+    /// published on the frozen branch.
+    #[tokio::test]
+    async fn dropping_a_branch_while_its_index_builds_refuses_the_build() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let name = "reasoning-indexes/frozen-race";
+        students(&fluree, &format!("{name}:main")).await;
+        fluree.create_branch(name, "dev", None, None).await.unwrap();
+        fluree
+            .create_branch(name, "child", Some("dev"), None)
+            .await
+            .unwrap();
+        let dev = format!("{name}:dev");
+        let index = fluree
+            .register_reasoning_index(&dev, &json!({"reasoning": "owl2rl"}))
+            .await
+            .unwrap();
+        let seam = Arc::new(PauseSeam::default());
+        *fluree.reasoning_index_state.before_publish.lock() = Some(Arc::clone(&seam));
+        let drop = async {
+            seam.reached.notified().await;
+            let drop = fluree.drop_branch(name, "dev");
+            tokio::pin!(drop);
+            let early = tokio::time::timeout(Duration::from_millis(300), &mut drop).await;
+            seam.resume.notify_one();
+            match early {
+                Ok(done) => done,
+                Err(_) => drop.await,
+            }
+        };
+        let (outcome, dropped) = tokio::join!(fluree.refresh_reasoning_index(&dev, &index), drop);
+        *fluree.reasoning_index_state.before_publish.lock() = None;
+        assert!(dropped.unwrap().deferred, "a branch with children is kept");
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::ApiError::NameService(
+                    fluree_db_nameservice::NameServiceError::Fenced(_)
+                ))
+            ),
+            "{outcome:?}"
+        );
+        let doc = fluree
+            .nameservice()
+            .get_reasoning_indexes(&dev)
+            .await
+            .unwrap();
+        assert!(doc
+            .map(|d| d.indexes.values().all(|e| e.head.is_none()))
+            .unwrap_or(true));
+    }
+
+    /// A build that starts writing after cleanup removed its retired index
+    /// leaves nothing in the index's folder.
+    #[tokio::test]
+    async fn a_build_outlasting_its_index_cleanup_leaves_no_files() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/cleanup-race:main";
+        let (index, _) = students(&fluree, id).await;
+        fluree.set_reasoning_index_retention(super::super::GenerationRetention {
+            min_age_ms: 0,
+            ..Default::default()
+        });
+        let seam = Arc::new(PauseSeam::default());
+        *fluree.reasoning_index_state.before_write.lock() = Some(Arc::clone(&seam));
+        let cleanup = async {
+            seam.reached.notified().await;
+            fluree.retire_reasoning_index(id, &index).await.unwrap();
+            let cleaned = fluree.clean_retired_reasoning_indexes(id).await.unwrap();
+            seam.resume.notify_one();
+            cleaned
+        };
+        let (outcome, cleaned) = tokio::join!(fluree.refresh_reasoning_index(id, &index), cleanup);
+        *fluree.reasoning_index_state.before_write.lock() = None;
+        assert_eq!(cleaned, vec![index.clone()]);
+        assert!(
+            !matches!(outcome, Ok(RefreshOutcome::Published { .. })),
+            "{outcome:?}"
+        );
+        assert!(fluree
+            .reasoning_indexes(id)
+            .await
+            .unwrap()
+            .indexes
+            .is_empty());
+        assert_eq!(index_files(&fluree, id, &index).await, Vec::<String>::new());
+    }
+
+    /// Cleanup of a retired index waits for a build writing into its folder,
+    /// then deletes what the build wrote along with the rest.
+    #[tokio::test]
+    async fn cleanup_waits_for_a_build_writing_into_the_folder() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/cleanup-hold:main";
+        let (index, _) = students(&fluree, id).await;
+        fluree.set_reasoning_index_retention(super::super::GenerationRetention {
+            min_age_ms: 0,
+            ..Default::default()
+        });
+        let seam = Arc::new(PauseSeam::default());
+        *fluree.reasoning_index_state.before_publish.lock() = Some(Arc::clone(&seam));
+        let cleanup = async {
+            seam.reached.notified().await;
+            fluree.retire_reasoning_index(id, &index).await.unwrap();
+            let cleanup = fluree.clean_retired_reasoning_indexes(id);
+            tokio::pin!(cleanup);
+            let early = tokio::time::timeout(Duration::from_millis(300), &mut cleanup).await;
+            seam.resume.notify_one();
+            assert!(early.is_err(), "cleanup ran while the build was writing");
+            cleanup.await.unwrap()
+        };
+        let (outcome, cleaned) = tokio::join!(fluree.refresh_reasoning_index(id, &index), cleanup);
+        *fluree.reasoning_index_state.before_publish.lock() = None;
+        assert!(
+            matches!(outcome, Ok(RefreshOutcome::Discarded { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(cleaned, vec![index.clone()]);
+        assert!(fluree
+            .reasoning_indexes(id)
+            .await
+            .unwrap()
+            .indexes
+            .is_empty());
+        assert_eq!(index_files(&fluree, id, &index).await, Vec::<String>::new());
     }
 
     /// Insert-only refreshes under `bounds`, each compared with a full

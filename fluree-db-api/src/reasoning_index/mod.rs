@@ -92,6 +92,9 @@ pub(crate) struct ReasoningIndexState {
     /// publishes them.
     #[cfg(test)]
     pub(crate) before_publish: Mutex<Option<Arc<PauseSeam>>>,
+    /// Pauses a refresh after its closure and before it writes any file.
+    #[cfg(test)]
+    pub(crate) before_write: Mutex<Option<Arc<PauseSeam>>>,
     /// Bounds an incremental closure runs under, in place of the defaults.
     #[cfg(test)]
     pub(crate) maintenance: Mutex<Option<fluree_db_query::reasoning::MaintenanceBounds>>,
