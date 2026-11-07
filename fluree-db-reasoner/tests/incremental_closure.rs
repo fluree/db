@@ -215,3 +215,77 @@ async fn a_conclusion_the_state_already_holds_is_not_gained() {
     let expected: HashSet<Flake> = [fact(ex("a"), ex("knows"), ex("z"))].into_iter().collect();
     assert_eq!(gained, expected);
 }
+
+/// A join can need a fact derived rounds before, no longer in the delta
+/// and not in the closed state: `a q b` (round 1) meets `b q c`, which takes
+/// an inverse and then a sub-property step (round 2), in round 3.
+#[tokio::test]
+async fn a_join_reaches_facts_derived_rounds_before() {
+    let sub = Sid::new(4, "subPropertyOf");
+    let ontology = vec![
+        fact(ex("p"), sub.clone(), ex("q")),
+        fact(ex("t"), Sid::new(6, "inverseOf"), ex("u")),
+        fact(ex("u"), sub, ex("q")),
+        fact(ex("q"), ty(), Sid::new(6, "TransitiveProperty")),
+    ];
+    let inserted = vec![
+        fact(ex("a"), ex("p"), ex("b")),
+        fact(ex("c"), ex("t"), ex("b")),
+    ];
+    let state: Vec<Flake> = ontology
+        .into_iter()
+        .chain(inserted.iter().cloned())
+        .collect();
+
+    let gained = gained(state, &inserted).await.expect("maintainable");
+    let expected: HashSet<Flake> = [
+        fact(ex("a"), ex("q"), ex("b")),
+        fact(ex("b"), ex("u"), ex("c")),
+        fact(ex("b"), ex("q"), ex("c")),
+        fact(ex("a"), ex("q"), ex("c")),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(gained, expected);
+}
+
+/// A property chain learns each link's key from the read before it: an
+/// insertion at the head of a three-link chain reaches two links into the
+/// closed state.
+#[tokio::test]
+async fn a_property_chain_learns_each_key_from_the_read_before() {
+    let rdf = |l: &str| Sid::new(3, l);
+    let ontology = vec![
+        fact(
+            ex("greatGrandparent"),
+            Sid::new(6, "propertyChainAxiom"),
+            ex("l1"),
+        ),
+        fact(ex("l1"), rdf("first"), ex("parent")),
+        fact(ex("l1"), rdf("rest"), ex("l2")),
+        fact(ex("l2"), rdf("first"), ex("parent")),
+        fact(ex("l2"), rdf("rest"), ex("l3")),
+        fact(ex("l3"), rdf("first"), ex("parent")),
+        fact(ex("l3"), rdf("rest"), rdf("nil")),
+    ];
+    let held = vec![
+        fact(ex("b"), ex("parent"), ex("c")),
+        fact(ex("c"), ex("parent"), ex("d")),
+        fact(ex("c"), ex("parent"), ex("e")),
+    ];
+    let inserted = vec![fact(ex("a"), ex("parent"), ex("b"))];
+    let state: Vec<Flake> = ontology
+        .into_iter()
+        .chain(held)
+        .chain(inserted.iter().cloned())
+        .collect();
+
+    let gained = gained(state, &inserted).await.expect("maintainable");
+    let expected: HashSet<Flake> = [
+        fact(ex("a"), ex("greatGrandparent"), ex("d")),
+        fact(ex("a"), ex("greatGrandparent"), ex("e")),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(gained, expected);
+}

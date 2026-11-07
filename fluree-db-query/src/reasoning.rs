@@ -148,7 +148,8 @@ pub fn global_reasoning_cache() -> &'static ReasoningCache {
 
 /// Re-export reasoning types for convenience
 pub use fluree_db_reasoner::{
-    reason_owl2rl, DerivedFactsBuilder, FrozenSameAs, ReasoningBudget, ReasoningDiagnostics,
+    reason_owl2rl, DerivedFactsBuilder, FrozenSameAs, MaintenanceBounds, ReasoningBudget,
+    ReasoningDiagnostics,
 };
 
 #[cfg(test)]

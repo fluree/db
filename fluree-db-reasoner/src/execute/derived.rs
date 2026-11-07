@@ -238,19 +238,13 @@ impl DerivedSet {
     }
 
     /// Get all flakes with a specific (predicate, subject)
-    pub fn get_by_ps(&self, p: &Sid, s: &Sid) -> impl Iterator<Item = &Flake> {
-        self.by_ps
-            .get(&(p.clone(), s.clone()))
-            .into_iter()
-            .flat_map(|indices| indices.iter().map(|&i| &self.flakes[i]))
+    pub fn get_by_ps(&self, p: &Sid, s: &Sid) -> Indexed<'_> {
+        Indexed::new(&self.flakes, self.by_ps.get(&(p.clone(), s.clone())))
     }
 
     /// Get all flakes with a specific (predicate, object)
-    pub fn get_by_po(&self, p: &Sid, o: &Sid) -> impl Iterator<Item = &Flake> {
-        self.by_po
-            .get(&(p.clone(), o.clone()))
-            .into_iter()
-            .flat_map(|indices| indices.iter().map(|&i| &self.flakes[i]))
+    pub fn get_by_po(&self, p: &Sid, o: &Sid) -> Indexed<'_> {
+        Indexed::new(&self.flakes, self.by_po.get(&(p.clone(), o.clone())))
     }
 
     /// Get number of derived flakes
@@ -289,6 +283,34 @@ impl DerivedSet {
             .zip(is_base)
             .filter_map(|(flake, base)| (!base).then_some(flake))
             .collect()
+    }
+}
+
+/// The flakes one of a [`DerivedSet`]'s indexes lists for a key.
+#[derive(Clone)]
+pub struct Indexed<'a> {
+    flakes: &'a [Flake],
+    indices: std::slice::Iter<'a, usize>,
+}
+
+impl<'a> Indexed<'a> {
+    fn new(flakes: &'a [Flake], indices: Option<&'a Vec<usize>>) -> Self {
+        Self {
+            flakes,
+            indices: indices.map_or([].iter(), |v| v.iter()),
+        }
+    }
+}
+
+impl<'a> Iterator for Indexed<'a> {
+    type Item = &'a Flake;
+
+    fn next(&mut self) -> Option<&'a Flake> {
+        self.indices.next().map(|&i| &self.flakes[i])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
     }
 }
 

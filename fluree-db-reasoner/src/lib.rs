@@ -91,6 +91,31 @@ pub struct ReasoningOptions {
     /// The request's tracker: each fact a round processes is charged as its
     /// fuel.
     pub tracker: Tracker,
+    /// Bounds on maintaining a closed state
+    /// ([`fixpoint::run_fixpoint_incremental`]).
+    pub maintenance: MaintenanceBounds,
+}
+
+/// How much a run maintaining a closed state may read and hold. Past any of
+/// these it stops, and the caller computes the closure in full.
+#[derive(Clone, Debug)]
+pub struct MaintenanceBounds {
+    /// Bytes of closed-state reads kept from one round to the next.
+    pub cache_bytes: usize,
+    /// Bytes of reads, candidate conclusions and derived facts held at once.
+    pub working_bytes: usize,
+    /// Facts one read may return.
+    pub read_facts: usize,
+}
+
+impl Default for MaintenanceBounds {
+    fn default() -> Self {
+        Self {
+            cache_bytes: 64 << 20,
+            working_bytes: 1 << 30,
+            read_facts: 1 << 20,
+        }
+    }
 }
 
 /// All rule identifiers accepted in [`ReasoningOptions::enabled_rules`]: the

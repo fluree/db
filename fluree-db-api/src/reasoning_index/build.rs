@@ -1025,6 +1025,7 @@ impl Fluree {
             base,
             modes,
             &inserted,
+            self.reasoning_index_state.maintenance(),
             QueryRequest {
                 tracker: None,
                 cancellation: None,
@@ -1390,6 +1391,7 @@ mod tests {
     use crate::Fluree;
     use fluree_db_core::reasoning_index::{ClosureMode, ReasoningIndexId, ReasoningManifest};
     use fluree_db_core::{ContentStore, Flake, Sid};
+    use fluree_db_query::reasoning::MaintenanceBounds;
     use std::collections::HashSet;
 
     /// The persisted derived-only set of the index's head generation, with
@@ -1582,24 +1584,23 @@ mod tests {
         }
     }
 
-    /// Every fact of the ledger with owl2rl reasoning, answered from the
-    /// index when `served`, else at query time by an equivalent program the
-    /// index does not match (datalog with no rules derives nothing).
-    /// Refresh, expecting a closure of kind `closure`, and compare D and the
-    /// served results with a full recompute.
+    /// Refresh, expecting a closure of kind `closure` when given, and
+    /// compare D and the served results with a full recompute. Returns the
+    /// kind of closure the refresh computed.
     async fn refresh_and_compare(
         fluree: &Fluree,
         id: &str,
         index: &ReasoningIndexId,
         program: &serde_json::Value,
-        closure: ClosureMode,
+        closure: Option<ClosureMode>,
         step: usize,
-    ) {
-        match fluree.refresh_reasoning_index(id, index).await.unwrap() {
-            RefreshOutcome::Published { stats, .. } => {
-                assert_eq!(stats.closure, closure, "step {step}");
-            }
+    ) -> ClosureMode {
+        let computed = match fluree.refresh_reasoning_index(id, index).await.unwrap() {
+            RefreshOutcome::Published { stats, .. } => stats.closure,
             other => panic!("step {step}: {other:?}"),
+        };
+        if let Some(closure) = closure {
+            assert_eq!(computed, closure, "step {step}");
         }
         let persisted = persisted_derived(fluree, id, index).await;
         let full = full_derived(fluree, id, program).await;
@@ -1616,8 +1617,12 @@ mod tests {
             whole_graph(fluree, id, false).await,
             "step {step}"
         );
+        computed
     }
 
+    /// Every fact of the ledger with owl2rl reasoning, answered from the
+    /// index when `served`, else at query time by an equivalent program the
+    /// index does not match (datalog with no rules derives nothing).
     async fn whole_graph(fluree: &Fluree, id: &str, served: bool) -> Vec<String> {
         let reasoning = if served {
             json!("owl2rl")
@@ -1675,6 +1680,36 @@ mod tests {
     /// second instance opening the same storage answers the same.
     #[tokio::test]
     async fn incremental_generations_equal_a_full_recompute() {
+        oracle(None, Some(ClosureMode::Incremental)).await;
+    }
+
+    /// With no read kept from one round to the next, every lookup reads the
+    /// closed state again; the answers are the same.
+    #[tokio::test]
+    async fn incremental_generations_equal_a_full_recompute_with_no_read_cache() {
+        let bounds = MaintenanceBounds {
+            cache_bytes: 0,
+            ..Default::default()
+        };
+        oracle(Some(bounds), Some(ClosureMode::Incremental)).await;
+    }
+
+    /// A closure whose reads are larger than its bounds allow is computed in
+    /// full, and publishes the same generation.
+    #[tokio::test]
+    async fn an_incremental_closure_past_its_bounds_is_computed_in_full() {
+        let bounds = MaintenanceBounds {
+            read_facts: 1,
+            ..Default::default()
+        };
+        let full = oracle(Some(bounds), None).await;
+        assert!(full >= 20, "{full} refreshes fell back to a full closure");
+    }
+
+    /// Insert-only refreshes under `bounds`, each compared with a full
+    /// recompute; each is expected to compute `incremental` when given.
+    /// Returns how many computed the closure in full.
+    async fn oracle(bounds: Option<MaintenanceBounds>, incremental: Option<ClosureMode>) -> usize {
         let storage = fluree_db_core::MemoryStorage::new();
         let nameservice = Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
         let instance = || {
@@ -1684,6 +1719,13 @@ mod tests {
             )
         };
         let fluree = instance();
+        *fluree.reasoning_index_state.maintenance.lock() = bounds;
+        let mut full_closures = 0;
+        let mut count = |closure: ClosureMode| {
+            if closure == ClosureMode::Full {
+                full_closures += 1;
+            }
+        };
         let id = "reasoning-indexes/incremental-oracle:main";
         let ctx = json!({
             "ex": "http://example.org/",
@@ -1830,15 +1872,7 @@ mod tests {
                     .unwrap()
                     .ledger;
             }
-            refresh_and_compare(
-                &fluree,
-                id,
-                &index,
-                &program,
-                ClosureMode::Incremental,
-                step,
-            )
-            .await;
+            count(refresh_and_compare(&fluree, id, &index, &program, incremental, step).await);
             partitions.push(bucket_count(&fluree, id, &index).await);
         }
 
@@ -1860,15 +1894,7 @@ mod tests {
                 .await
                 .unwrap()
                 .ledger;
-            refresh_and_compare(
-                &fluree,
-                id,
-                &index,
-                &program,
-                ClosureMode::Incremental,
-                step,
-            )
-            .await;
+            count(refresh_and_compare(&fluree, id, &index, &program, incremental, step).await);
             step += 1;
         }
 
@@ -1883,7 +1909,7 @@ mod tests {
             .await
             .unwrap()
             .ledger;
-        refresh_and_compare(&fluree, id, &index, &program, ClosureMode::Full, step).await;
+        refresh_and_compare(&fluree, id, &index, &program, Some(ClosureMode::Full), step).await;
         let _ledger = fluree
             .insert(
                 ledger,
@@ -1895,15 +1921,7 @@ mod tests {
             .await
             .unwrap()
             .ledger;
-        refresh_and_compare(
-            &fluree,
-            id,
-            &index,
-            &program,
-            ClosureMode::Incremental,
-            step + 1,
-        )
-        .await;
+        count(refresh_and_compare(&fluree, id, &index, &program, incremental, step + 1).await);
         let db = fluree.db(id).await.unwrap();
         assert!(
             db.snapshot
@@ -1925,6 +1943,7 @@ mod tests {
             whole_graph(&fluree, id, false).await,
             "a second instance answers from the stored index"
         );
+        full_closures
     }
 
     /// A sweep that starts while an index build has written its files and not

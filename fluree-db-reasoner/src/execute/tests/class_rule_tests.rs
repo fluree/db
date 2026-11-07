@@ -56,7 +56,7 @@ fn test_subclass_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -127,7 +127,7 @@ fn test_subclass_rule_transitive() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -202,7 +202,7 @@ fn test_subclass_rule_no_superclass() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -265,7 +265,7 @@ fn test_equivalent_class_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -335,7 +335,7 @@ fn test_equivalent_class_rule_bidirectional() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -402,7 +402,7 @@ fn test_equivalent_class_rule_no_equivalent() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,

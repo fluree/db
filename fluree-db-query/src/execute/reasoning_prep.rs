@@ -466,6 +466,7 @@ pub async fn compute_derived_facts_incremental(
     base_db: GraphDbRef<'_>,
     reasoning: &ReasoningModes,
     inserted: &[fluree_db_core::Flake],
+    maintenance: fluree_db_reasoner::MaintenanceBounds,
     request: QueryRequest<'_>,
 ) -> crate::error::Result<Option<DerivedFactsOutcome>> {
     if !reasoning.owl2rl || reasoning.datalog || reasoning.owl_datalog || reasoning.has_rules() {
@@ -475,6 +476,7 @@ pub async fn compute_derived_facts_incremental(
         budget: reasoning_budget(reasoning),
         cancellation: request.cancellation.cloned().unwrap_or_default(),
         tracker: request.tracker.cloned().unwrap_or_default(),
+        maintenance,
         ..Default::default()
     };
     match fluree_db_reasoner::reason_owl2rl_incremental(base_db, inserted, &opts).await {

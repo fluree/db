@@ -92,6 +92,9 @@ pub(crate) struct ReasoningIndexState {
     /// publishes them.
     #[cfg(test)]
     pub(crate) before_publish: Mutex<Option<Arc<PauseSeam>>>,
+    /// Bounds an incremental closure runs under, in place of the defaults.
+    #[cfg(test)]
+    pub(crate) maintenance: Mutex<Option<fluree_db_query::reasoning::MaintenanceBounds>>,
 }
 
 #[derive(Default)]
@@ -180,6 +183,15 @@ impl ReasoningIndexState {
 
     pub(crate) fn set_retention(&self, retention: GenerationRetention) {
         *self.retention.lock() = retention;
+    }
+
+    /// The bounds an incremental closure runs under.
+    pub(crate) fn maintenance(&self) -> fluree_db_query::reasoning::MaintenanceBounds {
+        #[cfg(test)]
+        if let Some(bounds) = self.maintenance.lock().clone() {
+            return bounds;
+        }
+        Default::default()
     }
 
     pub(crate) fn strict_wait(&self) -> std::time::Duration {

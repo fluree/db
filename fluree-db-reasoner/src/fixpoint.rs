@@ -12,6 +12,7 @@ use fluree_db_core::clock::Instant;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::range::{RangeMatch, RangeTest};
+use fluree_db_core::RangeOptions;
 use fluree_db_core::{GraphDbRef, Sid};
 use fluree_vocab::jsonld_names::ID as JSONLD_ID;
 use fluree_vocab::namespaces::{JSON_LD, RDF};
@@ -28,15 +29,16 @@ use crate::execute::{
     fire_inverse, fire_range, fire_some_values_from, fire_some_values_from_filler,
     fire_some_values_from_inverse, fire_sub_property, fire_subclass, fire_symmetric,
     fire_transitive, fire_union_member, DeltaSet, DerivedSet, IdentityRuleContext,
-    IdentityRuleState, RuleContext,
+    IdentityRuleState, Known, OnDemand, ReadCache, ReadKey, RuleContext,
 };
 use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
 use crate::restrictions::{extract_restrictions, RestrictionIndex};
 use crate::same_as::SameAsTracker;
-use crate::{FrozenSameAs, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result};
+use crate::{
+    FrozenSameAs, MaintenanceBounds, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result,
+};
 use fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL;
-use hashbrown::{HashMap, HashSet};
 
 /// Run OWL2-RL reasoning to fixpoint
 ///
@@ -60,11 +62,15 @@ pub async fn run_fixpoint(
 ///
 /// Every rule fires from a delta fact in each of its premise positions and
 /// joins the rest against everything known, so seeding the delta with just
-/// the insertions, against the closed state, finds every new derivation.
-/// `None` when the program keeps state a delta alone cannot rebuild: the
-/// identity rules (`prp-fp`, `prp-ifp`, `prp-key`, `cls-maxc2`, `cls-maxqc`)
-/// group facts across rounds, and `owl:sameAs` canonicalization rewrites
-/// facts already derived. Callers then compute the closure in full.
+/// the insertions, against the closed state, finds every new derivation. The
+/// closed state is read on demand, as the delta's joins need it
+/// ([`run_on_demand`]).
+///
+/// `None` when the run cannot maintain the closure: the identity rules
+/// (`prp-fp`, `prp-ifp`, `prp-key`, `cls-maxc2`, `cls-maxqc`) group facts
+/// across rounds, `owl:sameAs` canonicalization rewrites facts already
+/// derived, and a run that outgrows [`MaintenanceBounds`] stops. Callers then
+/// compute the closure in full.
 pub async fn run_fixpoint_incremental(
     db: GraphDbRef<'_>,
     inserted: &[Flake],
@@ -72,7 +78,6 @@ pub async fn run_fixpoint_incremental(
 ) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
     let start = Instant::now();
     let out = run(db, opts, Some(inserted)).await?;
-    // Past the phases: dropping the join indexes and the closed state.
     tracing::debug!(
         returned_ms = start.elapsed().as_millis() as u64,
         "OWL 2 RL incremental fixpoint returned"
@@ -160,13 +165,24 @@ async fn run(
     // dispatches each delta fact straight to the rules it can fire.
     let compiled = compile(&ontology, &restrictions, opts);
 
+    if let Some(inserted) = inserted {
+        return Ok(run_on_demand(
+            db,
+            opts,
+            inserted,
+            &ontology,
+            &restrictions,
+            &compiled,
+            &same_as_tracker,
+            start,
+        )
+        .await?
+        .map(|(flakes, diagnostics)| (flakes, FrozenSameAs::empty(), diagnostics)));
+    }
+
     // Seed initial delta with all base facts for relevant predicates
     let extracted_ms = start.elapsed().as_millis() as u64;
-    let (mut delta, loaded) = seed_initial_delta(db, &ontology, &restrictions).await?;
-    // Maintaining a closed state, facts of the other predicates are not all
-    // known to the run: a conclusion of one is checked against the state.
-    let loaded = inserted.is_some().then_some(loaded);
-    let mut closed_state_reads = 0usize;
+    let mut delta = seed_initial_delta(db, &ontology, &restrictions).await?;
     let seeded_ms = start.elapsed().as_millis() as u64;
 
     // Accumulated derived facts
@@ -180,21 +196,6 @@ async fn run(
     // (eq-rep-s/o entailments are genuine derivations).
     for flake in delta.iter() {
         derived.register_base(flake);
-    }
-
-    // Maintaining a closed state: it is the join side from the first round,
-    // and only the insertions fire rules. They are base facts too, whatever
-    // their predicate, so none is emitted as derived.
-    if let Some(inserted) = inserted {
-        for flake in delta.iter() {
-            derived.try_add(flake.clone());
-        }
-        let mut seeded = DeltaSet::with_capacity(inserted.len());
-        for flake in inserted {
-            derived.register_base(flake);
-            seeded.push(flake.clone());
-        }
-        delta = seeded;
     }
     let joined_ms = start.elapsed().as_millis() as u64;
 
@@ -324,7 +325,7 @@ async fn run(
         // Non-identity rules: produce property/type facts (not sameAs).
         let mut ctx = RuleContext {
             delta: &delta,
-            derived: &derived,
+            derived: Known::Resident(&derived),
             new_delta: &mut new_delta,
             same_as: &same_as_tracker,
             rdf_type_sid: &rdf_type_sid,
@@ -357,9 +358,13 @@ async fn run(
                     }
                 }
             }
-            if let Some(reason) =
-                budget_exceeded_sampled(budget, &start, ctx.derived, ctx.new_delta, &mut ticks)
-            {
+            if let Some(reason) = budget_exceeded_sampled(
+                budget,
+                &start,
+                ctx.derived.derived(),
+                ctx.new_delta,
+                &mut ticks,
+            ) {
                 in_round_cap = Some(reason);
                 break;
             }
@@ -375,7 +380,9 @@ async fn run(
             let chains = ontology.property_chains();
             for chain_idx in compiled.triggered_chains(delta.predicates()) {
                 apply_single_property_chain(&chains[chain_idx], &mut ctx);
-                if let Some(reason) = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta) {
+                if let Some(reason) =
+                    budget_exceeded(budget, &start, ctx.derived.derived(), ctx.new_delta)
+                {
                     in_round_cap = Some(reason);
                     break;
                 }
@@ -386,7 +393,7 @@ async fn run(
         // trigger); the derived-set check keeps it idempotent per iteration.
         if in_round_cap.is_none() && compiled.one_of_active() {
             apply_one_of_rule(&restrictions, &mut ctx);
-            in_round_cap = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta);
+            in_round_cap = budget_exceeded(budget, &start, ctx.derived.derived(), ctx.new_delta);
         }
 
         // If sameAs changed this iteration, canonicalize both delta and
@@ -411,32 +418,9 @@ async fn run(
             derived.try_add(flake.clone());
         }
 
-        // A conclusion the closed state already holds is known, not derived,
-        // and its consequences are already in that state.
-        let known = match &loaded {
-            Some(loaded) => {
-                let (known, reads) =
-                    known_in_closed_state(db, &new_delta, loaded, &derived).await?;
-                closed_state_reads += reads;
-                known
-            }
-            None => HashSet::new(),
-        };
-
         // Filter new_delta to only include truly new facts
         let mut filtered_delta = DeltaSet::new();
         for flake in new_delta.iter() {
-            if !known.is_empty()
-                && known.contains(&(
-                    flake.s.clone(),
-                    flake.p.clone(),
-                    DerivedSet::object_hash(&flake.o),
-                ))
-            {
-                derived.register_base(flake);
-                derived.try_add(flake.clone());
-                continue;
-            }
             if derived.try_add(flake.clone()) {
                 filtered_delta.push(flake.clone());
             }
@@ -469,19 +453,280 @@ async fn run(
     let derived_len = derived.derived_len();
     let derived_flakes = derived.into_derived_flakes();
     tracing::debug!(
-        incremental = inserted.is_some(),
         extract_ms = extracted_ms,
         seed_scan_ms = seeded_ms - extracted_ms,
         join_index_ms = joined_ms - seeded_ms,
         rounds_ms = total_ms - joined_ms,
         convert_ms = start.elapsed().as_millis() as u64 - total_ms,
-        closed_state_reads,
         rounds = iterations,
         derived = derived_len,
         "OWL 2 RL fixpoint phases"
     );
 
     Ok(Some((derived_flakes, frozen_same_as, diagnostics)))
+}
+
+/// A piece of a round's work that can be run again: a delta fact's
+/// dispatch, a triggered property chain, or `cls-oo`.
+#[derive(Clone, Copy)]
+enum Unit {
+    Fact(usize),
+    Chain(usize),
+    OneOf,
+}
+
+/// What an on-demand run read and held, for its log.
+#[derive(Default)]
+struct OnDemandStats {
+    stages: usize,
+    reads: usize,
+    facts_read: usize,
+    peak_working_bytes: usize,
+}
+
+/// Maintain a closed state under `inserted`, reading the state as the
+/// rules' joins need it.
+///
+/// Each round runs its work units against what is known: reads already
+/// fetched from `db`, combined with the facts derived this run. A unit whose
+/// lookup is not fetched yet is discarded, the missing reads are fetched in
+/// one batch, and the unit runs again, so a property chain learns its next
+/// key from the read before. A candidate conclusion `db` already holds is
+/// known, not gained. `None` when a read or the run's working set outgrows
+/// `opts.maintenance`: the caller computes the closure in full.
+#[allow(clippy::too_many_arguments)]
+async fn run_on_demand(
+    db: GraphDbRef<'_>,
+    opts: &ReasoningOptions,
+    inserted: &[Flake],
+    ontology: &OntologyRL,
+    restrictions: &RestrictionIndex,
+    compiled: &crate::compile::CompiledRules,
+    same_as: &SameAsTracker,
+    start: Instant,
+) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
+    let budget = &opts.budget;
+    let bounds = &opts.maintenance;
+    let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
+    let chains = ontology.property_chains();
+    let mut diagnostics = ReasoningDiagnostics::default();
+    let mut stats = OnDemandStats::default();
+    let mut derived = DerivedSet::new();
+    let mut cache = ReadCache::default();
+    let extracted_ms = start.elapsed().as_millis() as u64;
+
+    // The insertions are in the closed state: known, and the first delta.
+    let mut delta = DeltaSet::with_capacity(inserted.len());
+    for flake in inserted {
+        derived.register_base(flake);
+        delta.push(flake.clone());
+    }
+
+    let mut iterations = 0;
+    let mut capped = false;
+    while !delta.is_empty() {
+        interrupted(opts)?;
+        opts.tracker
+            .consume_fuel(delta.len() as u64 * PER_ROW_MICRO_FUEL)?;
+        if let Some(reason) = budget_exceeded(budget, &start, &derived, &DeltaSet::new()) {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+            capped = true;
+            break;
+        }
+        iterations += 1;
+
+        let facts: Vec<&Flake> = delta.iter().collect();
+        let mut pending: Vec<Unit> = (0..facts.len()).map(Unit::Fact).collect();
+        pending.extend(
+            compiled
+                .triggered_chains(delta.predicates())
+                .into_iter()
+                .map(Unit::Chain),
+        );
+        if compiled.one_of_active() {
+            pending.push(Unit::OneOf);
+        }
+
+        let mut new_delta = DeltaSet::new();
+        while !pending.is_empty() {
+            interrupted(opts)?;
+            stats.stages += 1;
+            let mut misses = Vec::new();
+            let mut again = Vec::new();
+            for unit in pending {
+                let view = OnDemand::new(&derived, &cache);
+                let mut out = DeltaSet::new();
+                let mut fired = ReasoningDiagnostics::default();
+                {
+                    let mut ctx = RuleContext {
+                        delta: &delta,
+                        derived: Known::OnDemand(&view),
+                        new_delta: &mut out,
+                        same_as,
+                        rdf_type_sid: &rdf_type_sid,
+                        t: db.t,
+                        diagnostics: &mut fired,
+                    };
+                    match unit {
+                        Unit::Fact(i) => {
+                            fire_delta_fact(compiled, ontology, restrictions, facts[i], &mut ctx);
+                        }
+                        Unit::Chain(c) => apply_single_property_chain(&chains[c], &mut ctx),
+                        Unit::OneOf => apply_one_of_rule(restrictions, &mut ctx),
+                    }
+                }
+                if view.missed() {
+                    misses.extend(view.into_misses());
+                    again.push(unit);
+                } else {
+                    for flake in out.iter() {
+                        new_delta.push(flake.clone());
+                    }
+                    for (rule, n) in fired.rules_fired {
+                        *diagnostics.rules_fired.entry(rule).or_default() += n;
+                    }
+                }
+            }
+            if !fetch(db, misses, &mut cache, iterations, bounds, &mut stats).await? {
+                return Ok(None);
+            }
+            let working = cache.bytes() + derived.approx_bytes() + new_delta.approx_bytes();
+            stats.peak_working_bytes = stats.peak_working_bytes.max(working);
+            if working > bounds.working_bytes {
+                tracing::debug!(working, "on-demand closure outgrew its working bound");
+                return Ok(None);
+            }
+            pending = again;
+        }
+
+        // Exact membership: a candidate the closed state already holds is
+        // known, and its consequences are already in that state.
+        let wanted: Vec<ReadKey> = new_delta
+            .iter()
+            .filter(|f| !derived.contains(&f.s, &f.p, &f.o))
+            .map(|f| ReadKey::Ps(f.p.clone(), f.s.clone()))
+            .collect();
+        if !fetch(db, wanted, &mut cache, iterations, bounds, &mut stats).await? {
+            return Ok(None);
+        }
+        let mut next = DeltaSet::new();
+        for flake in new_delta.iter() {
+            if derived.contains(&flake.s, &flake.p, &flake.o) {
+                continue;
+            }
+            let o = DerivedSet::object_hash(&flake.o);
+            let held = cache
+                .get(&ReadKey::Ps(flake.p.clone(), flake.s.clone()))
+                .is_some_and(|facts| facts.iter().any(|f| DerivedSet::object_hash(&f.o) == o));
+            if held {
+                derived.register_base(flake);
+            } else if derived.try_add(flake.clone()) {
+                next.push(flake.clone());
+            }
+        }
+        delta = next;
+        cache.evict_to(bounds.cache_bytes);
+    }
+
+    if !capped {
+        diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
+    }
+    let rounds_ms = start.elapsed().as_millis() as u64 - extracted_ms;
+    let derived_len = derived.derived_len();
+    let flakes = derived.into_derived_flakes();
+    tracing::debug!(
+        extract_ms = extracted_ms,
+        rounds_ms,
+        rounds = iterations,
+        stages = stats.stages,
+        reads = stats.reads,
+        facts_read = stats.facts_read,
+        peak_working_bytes = stats.peak_working_bytes,
+        derived = derived_len,
+        "OWL 2 RL on-demand closure"
+    );
+    Ok(Some((flakes, diagnostics)))
+}
+
+/// Dispatch one delta fact to the compiled rules it can fire.
+fn fire_delta_fact(
+    compiled: &crate::compile::CompiledRules,
+    ontology: &OntologyRL,
+    restrictions: &RestrictionIndex,
+    flake: &Flake,
+    ctx: &mut RuleContext<'_>,
+) {
+    for rule in compiled.property_rules_for(&flake.p) {
+        fire_property_rule(rule, ontology, restrictions, flake, ctx);
+    }
+    if &flake.p == ctx.rdf_type_sid {
+        if let fluree_db_core::value::FlakeValue::Ref(class) = &flake.o {
+            for rule in compiled.class_rules_for(class) {
+                fire_class_rule(rule, ontology, restrictions, flake, class, ctx);
+            }
+        }
+    }
+}
+
+/// Read `keys` from the closed state into `cache`, each once. False when a
+/// read is larger than `bounds` allows: the run is then incomplete, and no
+/// part of that read is kept.
+async fn fetch(
+    db: GraphDbRef<'_>,
+    mut keys: Vec<ReadKey>,
+    cache: &mut ReadCache,
+    round: usize,
+    bounds: &MaintenanceBounds,
+    stats: &mut OnDemandStats,
+) -> Result<bool> {
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        if cache.contains_key(&key) {
+            continue;
+        }
+        let (index, wanted) = match &key {
+            ReadKey::Ps(p, s) => (
+                IndexType::Spot,
+                RangeMatch::subject_predicate(s.clone(), p.clone()),
+            ),
+            ReadKey::Po(p, o) => (
+                IndexType::Post,
+                RangeMatch::predicate_object(
+                    p.clone(),
+                    fluree_db_core::value::FlakeValue::Ref(o.clone()),
+                ),
+            ),
+        };
+        let facts = db
+            .range_with_opts(
+                index,
+                RangeTest::Eq,
+                wanted,
+                RangeOptions::default().with_flake_limit(bounds.read_facts + 1),
+            )
+            .await?;
+        if facts.len() > bounds.read_facts {
+            tracing::debug!(?key, "on-demand read larger than its bound");
+            return Ok(false);
+        }
+        let facts: Vec<Flake> = facts
+            .into_iter()
+            .filter(|f| {
+                f.op && match &key {
+                    ReadKey::Ps(p, s) => &f.p == p && &f.s == s,
+                    ReadKey::Po(p, o) => {
+                        &f.p == p
+                            && matches!(&f.o, fluree_db_core::value::FlakeValue::Ref(x) if x == o)
+                    }
+                }
+            })
+            .collect();
+        stats.reads += 1;
+        stats.facts_read += facts.len();
+        cache.insert(key, facts, round);
+    }
+    Ok(true)
 }
 
 /// Fails the run once the request it serves has been cancelled. A cancelled
@@ -637,14 +882,11 @@ fn fire_class_rule(
 /// - Facts with inverse-functional properties (for prp-ifp)
 /// - Facts with restricted properties (hasValue, someValuesFrom, etc.)
 /// - owl:sameAs facts
-///
-/// Returns those predicates too: the ones whose facts are all known to the
-/// run.
 async fn seed_initial_delta(
     db: GraphDbRef<'_>,
     ontology: &OntologyRL,
     restrictions: &RestrictionIndex,
-) -> Result<(DeltaSet, HashSet<Sid>)> {
+) -> Result<DeltaSet> {
     let mut delta = DeltaSet::new();
 
     // Collect all predicates we need to query
@@ -736,8 +978,6 @@ async fn seed_initial_delta(
     let needs_type_facts =
         !key_properties.is_empty() || ontology.has_class_rules() || !restrictions.is_empty();
 
-    let mut loaded: HashSet<Sid> = predicates_to_query.iter().map(|p| (*p).clone()).collect();
-
     // Query facts for each relevant predicate using PSOT index
     for p in predicates_to_query {
         let flakes: Vec<Flake> = db
@@ -762,7 +1002,6 @@ async fn seed_initial_delta(
     // Load rdf:type facts for hasKey and class hierarchy rules
     if needs_type_facts {
         let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
-        loaded.insert(rdf_type_sid.clone());
         let type_flakes: Vec<Flake> = db
             .range(
                 IndexType::Psot,
@@ -784,7 +1023,6 @@ async fn seed_initial_delta(
 
     // Also seed owl:sameAs facts
     let owl_same_as_sid = owl::same_as_sid();
-    loaded.insert(owl_same_as_sid.clone());
     let same_as_flakes: Vec<Flake> = db
         .range(
             IndexType::Psot,
@@ -803,47 +1041,7 @@ async fn seed_initial_delta(
         delta.push(flake);
     }
 
-    Ok((delta, loaded))
-}
-
-/// The keys of the `candidates` the closed state `db` already holds, among
-/// those of a predicate the run did not load (`loaded`) and not yet known to
-/// `derived`. One subject-predicate read per pair.
-async fn known_in_closed_state(
-    db: GraphDbRef<'_>,
-    candidates: &DeltaSet,
-    loaded: &HashSet<Sid>,
-    derived: &DerivedSet,
-) -> Result<(HashSet<(Sid, Sid, u64)>, usize)> {
-    let mut wanted: HashMap<(Sid, Sid), HashSet<u64>> = HashMap::new();
-    for f in candidates.iter() {
-        if !loaded.contains(&f.p) && !derived.contains(&f.s, &f.p, &f.o) {
-            wanted
-                .entry((f.s.clone(), f.p.clone()))
-                .or_default()
-                .insert(DerivedSet::object_hash(&f.o));
-        }
-    }
-    let reads = wanted.len();
-    let mut known = HashSet::new();
-    for ((s, p), objects) in wanted {
-        let held = db
-            .range(
-                IndexType::Psot,
-                RangeTest::Eq,
-                RangeMatch::subject_predicate(s.clone(), p.clone()),
-            )
-            .await?;
-        for f in held {
-            if f.op && f.s == s && f.p == p {
-                let o = DerivedSet::object_hash(&f.o);
-                if objects.contains(&o) {
-                    known.insert((s.clone(), p.clone(), o));
-                }
-            }
-        }
-    }
-    Ok((known, reads))
+    Ok(delta)
 }
 
 /// Generate explicit owl:sameAs flakes from the equivalence classes.
