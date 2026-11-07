@@ -1342,6 +1342,18 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Persisted reasoning: register a reasoning program on a branch, and
+    /// list, refresh or retire its reasoned heads
+    ///
+    /// A reasoned head keeps the branch's data merged with a program's
+    /// derived facts, current in the background; reasoning queries that match
+    /// the program are answered from it.
+    #[command(name = "reasoned-heads")]
+    ReasonedHeads {
+        #[command(subcommand)]
+        action: ReasonedHeadsAction,
+    },
+
     /// Reclaim index artifacts that no index chain references
     ///
     /// Deletes orphaned index blobs left behind by earlier reindexes and
@@ -1880,6 +1892,68 @@ pub enum DroppedAction {
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Reasoned-head subcommands.
+#[derive(Subcommand)]
+pub enum ReasonedHeadsAction {
+    /// Register a reasoning program for persistence
+    Register {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Reasoning modes, as a query's `reasoning` key (e.g. `owl2rl`)
+        #[arg(long, conflicts_with = "program")]
+        reasoning: Option<String>,
+
+        /// The whole program as JSON: the reasoning keys a query would carry
+        /// (`reasoning`, `rules`, `ontology`, `reasoningTime`, `@context`),
+        /// plus an optional `graph` IRI to reason against
+        #[arg(long)]
+        program: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show the branch's reasoned heads
+    List {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Bring the branch's heads up to its current commit now
+    Refresh {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Refresh only this head
+        #[arg(long)]
+        head: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Stop a head from being served or refreshed
+    Retire {
+        /// The head's id
+        head: String,
+
+        /// Ledger name (defaults to active ledger)
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
