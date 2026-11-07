@@ -32,7 +32,7 @@ async fn rows(
         .unwrap_or_else(|e| panic!("query failed: {e:?}"));
     (
         normalize_rows(&resp.result),
-        resp.reasoning.and_then(|r| r.head),
+        resp.reasoning.and_then(|r| r.head).map(|h| *h),
     )
 }
 
@@ -218,7 +218,7 @@ async fn an_asserted_and_derived_fact_survives_losing_either_support() {
             assert_eq!(
                 stats.derived_only, 0,
                 "alice is asserted a Person: {stats:?}"
-            )
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -422,7 +422,7 @@ async fn a_rule_into_a_missing_graph_publishes_nothing() {
         .unwrap();
     match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
         RefreshOutcome::Failed { reason } => {
-            assert!(reason.contains("inferred"), "{reason}")
+            assert!(reason.contains("inferred"), "{reason}");
         }
         other => panic!("expected a failed run, got {other:?}"),
     }

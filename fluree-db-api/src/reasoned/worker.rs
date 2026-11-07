@@ -58,7 +58,7 @@ impl ReasonedHeadWorker {
                             }
                         }
                         Err(TryRecvError::Lagged(_)) => {
-                            pending.extend(self.scan(&mut has_heads).await)
+                            pending.extend(self.scan(&mut has_heads).await);
                         }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Closed) => return,
@@ -76,7 +76,7 @@ impl ReasonedHeadWorker {
                     Err(RecvError::Closed) => return,
                 },
                 _ = tick.tick() => pending.extend(self.scan(&mut has_heads).await),
-                _ = self.fluree.reasoned.registered.notified() => {
+                () = self.fluree.reasoned.registered.notified() => {
                     for id in self.fluree.reasoned.take_registered() {
                         has_heads.insert(id.clone(), true);
                         pending.insert(id);
@@ -184,7 +184,7 @@ impl ReasonedHeadWorker {
                 }
             }
             Err(e) => {
-                tracing::warn!(ledger = ledger_id, error = %e, "reasoned-head refresh failed")
+                tracing::warn!(ledger = ledger_id, error = %e, "reasoned-head refresh failed");
             }
         }
     }

@@ -1602,7 +1602,7 @@ impl Fluree {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
-                head: Some(served.tally),
+                head: Some(Box::new(served.tally)),
             });
         }
         Ok(Some(served.view))

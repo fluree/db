@@ -610,7 +610,7 @@ pub struct ReasoningTally {
     /// Set when a persisted reasoned head answered the query instead of
     /// query-time reasoning: which head, which generation, and its basis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head: Option<ReasonedHeadTally>,
+    pub head: Option<Box<ReasonedHeadTally>>,
 }
 
 /// The reasoned head that served a query.
