@@ -1008,7 +1008,7 @@ mem:decision-01m39m1smeyt11n1mqs0xzz4a9 a mem:Decision ;
     mem:artifactRef "fluree-db-crypto/src/encrypted.rs" ;
     mem:artifactRef "fluree-db-server/src/routes/encryption.rs" ;
     mem:branch "feat/encryption-key-rotation" ;
-    mem:createdAt "2026-09-24T11:50:41.039290+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-24T11:50:41.03929Z"^^xsd:dateTime ;
     mem:alternatives "Encrypt cache/blob copies to a new location (doubles disk), lazy re-encrypt on read (never finishes for cold blobs), two-tier KEK/DEK envelope (deferred: new envelope version)" .
 
 mem:constraint-01m2ndzbe89853esz7dc7apxbv a mem:Constraint ;
@@ -1022,7 +1022,7 @@ mem:constraint-01m2ndzbe89853esz7dc7apxbv a mem:Constraint ;
     mem:artifactRef "fluree-db-api/src/admin.rs" ;
     mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
     mem:branch "feat/gc-shared-dict-reclaim" ;
-    mem:createdAt "2026-09-16T15:39:40.872581+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-16T15:39:40.872581Z"^^xsd:dateTime ;
     mem:rationale "The sibling check decides from a snapshot of the other branches' chains; two deciders with interleaved snapshots each conclude the other still needs the blob." .
 
 mem:decision-01m2ndz73ex89zq0ftggn4dq2n a mem:Decision ;
@@ -1037,7 +1037,7 @@ mem:decision-01m2ndz73ex89zq0ftggn4dq2n a mem:Decision ;
     mem:artifactRef "fluree-db-indexer/src/gc/mod.rs" ;
     mem:artifactRef "fluree-db-indexer/src/gc/siblings.rs" ;
     mem:branch "feat/gc-shared-dict-reclaim" ;
-    mem:createdAt "2026-09-16T15:39:36.430342+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-16T15:39:36.430342Z"^^xsd:dateTime ;
     mem:rationale "Before this the collector skipped every dict-blob CID and only a storage sweep reclaimed them; nothing ran sweeps, so each incremental build leaked its rewritten reverse-dict leaves (34 GB under a 225 MB commit log on one deployment)." ;
     mem:alternatives "Copy dictionaries per branch at fork (huge copies); auto-run the sweep periodically (lists all storage, needs every branch held)" .
 
@@ -1055,8 +1055,39 @@ mem:fact-01m2ndzh3f0ttxz9zt9g63rs14 a mem:Fact ;
     mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
     mem:artifactRef "fluree-db-storage-aws/src/s3/mod.rs" ;
     mem:branch "feat/gc-shared-dict-reclaim" ;
-    mem:createdAt "2026-09-16T15:39:46.671346+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-16T15:39:46.671346Z"^^xsd:dateTime ;
     mem:rationale "Answers the recurring \"why did nothing get cleaned up\" question for a given deployment shape before anyone looks for a collector bug." .
+
+mem:constraint-01m6fefszkchxrs46qkhzp4kd5 a mem:Constraint ;
+    mem:content "A ledger's GraphId numbering is not stable across registries: LedgerState::apply_delta registers a commit's new graphs in IRI order, while a full rebuild registers them in the order its ops meet them. Per-graph state copied from one registry to another (drop records, stats, arenas) must be matched by IRI, never by g_id. GraphRegistry::merge_graph_drops_by_iri does this for drops on index install." ;
+    mem:tag "g-id" ;
+    mem:tag "graph-registry" ;
+    mem:tag "indexer" ;
+    mem:tag "named-graph" ;
+    mem:tag "rebuild" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-core/src/graph_registry.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/build/rebuild.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:branch "feat/graph-drop" ;
+    mem:createdAt "2026-11-03T00:56:00.755982+00:00"^^xsd:dateTime ;
+    mem:rationale "Copying drops by g_id after a rebuild marked the wrong graph dropped (graphs a=3,z=4 in state became z=3,a=4 in the rebuilt root)." .
+
+mem:constraint-01m6fefwt89b7p335xd8kbkap2 a mem:Constraint ;
+    mem:content "The SHACL compile cache (CachedShaclCompile) keys on snapshot t, novelty shacl_epoch/schema_epoch and the shape source, and it is warmed during staging, before validation, so even a rejected transaction fills it. Any change that removes or alters shapes without adding novelty flakes (e.g. Novelty::drop_graphs on a graph only the index holds) must still bump the epochs, or the old shapes stay enforced." ;
+    mem:tag "cache" ;
+    mem:tag "epoch" ;
+    mem:tag "named-graph" ;
+    mem:tag "novelty" ;
+    mem:tag "shacl" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/tests/it_graph_drop.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/lib.rs" ;
+    mem:branch "feat/graph-drop" ;
+    mem:createdAt "2026-11-03T00:56:03.656491+00:00"^^xsd:dateTime ;
+    mem:rationale "DROP of a shape-holding graph that lived only in the index left its shapes active until the epochs were bumped unconditionally." .
 
 mem:constraint-01kxej5vnp087j9mjp31d8yw62 a mem:Constraint ;
     mem:content "A span-capture integration test with an ABSENCE assertion (`!store.has_event(...)`) must be its OWN `[[test]]` bin — never bundled into a shared grp_* group, and never converted to `set_global_default`. A process-global subscriber captures PARALLEL siblings' events (a sibling emitting the same event from a shared code path breaks the absence assertion), and tracing's process-global callsite-interest cache lets a sibling hit the callsite first under the no-op default and cache it \"disabled\" (breaks PRESENCE capture). oauth2.rs's set_global_default pattern is sound only for PRESENCE-only assertions. fluree-db-api convention: it_cyclic_bgp_probe and it_minmax_fast_path_fired are standalone bins for this reason." ;
@@ -1767,24 +1798,25 @@ mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:createdAt "2026-03-18T10:03:48.703812Z"^^xsd:dateTime .
 
 mem:decision-01krvht9hdmca3m5j1rz761g46 a mem:Decision ;
-    mem:content "`Fluree::drop_named_graph(ledger_id, graph_iri)` is a transactional, history-preserving, per-branch retract: it stages a SPARQL `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { ... }` and produces one normal commit. System graphs (default, txn-meta g_id=1, config g_id=2) are rejected with 400; unknown graph IRIs 404 BEFORE staging so the registry isn't silently extended; `graph_iri` must pass `validate_absolute_iri`. Idempotent: re-dropping an empty graph reports committed=false without creating a commit. Wire: admin-protected `POST /drop-graph`; CLI `fluree graph drop`." ;
+    mem:content "`Fluree::drop_named_graph` (POST /drop-graph, `fluree graph drop`, Graph Store DELETE of a named graph, MOVE's source) is SPARQL DROP GRAPH: one commit naming the graph's IRI in `Commit::graph_drops`, retracting nothing. The registry keeps a floor t per dropped graph (GraphDrop); nothing from before it is queryable, at the head or as of any t, and a query naming the graph before the floor is refused. Writing the IRI again revives it under the same g_id. Unrestricted identity only (403); system graphs 400; unknown or dropped IRI 404. Commits keep the facts, so a branch at a pre-drop t has them. CLEAR stays the history-preserving retract." ;
     mem:tag "admin" ;
     mem:tag "api-design" ;
     mem:tag "drop" ;
     mem:tag "named-graph" ;
     mem:tag "transactional" ;
     mem:scope mem:repo ;
-    mem:artifactRef "docs/api/endpoints.md" ;
     mem:artifactRef "docs/cli/graph.md" ;
-    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "docs/reference/compatibility.md" ;
     mem:artifactRef "fluree-db-api/src/admin.rs" ;
-    mem:artifactRef "fluree-db-api/tests/it_drop_named_graph.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_graph_drop.rs" ;
     mem:artifactRef "fluree-db-cli/src/commands/graph.rs" ;
+    mem:artifactRef "fluree-db-core/src/graph_registry.rs" ;
     mem:artifactRef "fluree-db-server/src/routes/ledger.rs" ;
     mem:branch "feature/drop-branch" ;
     mem:createdAt "2026-05-17T18:05:17.741794Z"^^xsd:dateTime ;
-    mem:rationale "Named-graph data is interleaved in the same index/leaves/dicts as the rest of the ledger — there is no storage prefix to wipe the way drop_branch/drop_ledger do. A transactional retract is the only approach that composes with branches, rebases, replication, and immutable history. Alternative rejected: structural drop + reindex (a needless rewrite of history)." ;
-    mem:alternatives "structural drop with graph_registry mark + reindex skip; soft/hard mode like drop_ledger" .
+    mem:updatedAt "2026-11-03T00:55:57.642450+00:00"^^xsd:dateTime ;
+    mem:rationale "The earlier retract form was one commit sized by the graph, capped by FLUREE_MAX_GRAPH_SCAN_FLAKES, so a large graph could not be dropped, and its history stayed queryable. A drop record costs the same for any size; the IRI-keyed commit record survives replay and rebuild. Non-fast-forward merge/rebase and revert across a drop are refused." ;
+    mem:alternatives "transactional retract of every fact (the prior design); a new g_id per graph generation" .
 
 mem:fact-01krb618x0axad5mj8jev4ej0s a mem:Fact ;
     mem:content "Annotation hydration arena lookups use full EdgeKey identity. The current read path is HydrationFormatter::arena_lookup_annotations -> AnnotationArenaReader::current_annotations_merged(edge_key, novelty_events, t), with novelty events from collect_forward_events(edge_key). The scan fallback decodes candidate bundles with EdgeKey::from_reifies_facts and compares cand_edge == edge_key, so language-tagged literal lookup depends on writers emitting f:reifiesLang to populate EdgeKey.lang." ;
@@ -2659,7 +2691,7 @@ mem:constraint-01m38cy00ac9k2ms1n6xp0qast a mem:Constraint ;
     mem:artifactRef "fluree-db-core/src/disk_cache.rs" ;
     mem:artifactRef "fluree-db-core/src/storage.rs" ;
     mem:branch "fix/encryption-at-rest-coverage" ;
-    mem:createdAt "2026-09-24T00:27:02.026429+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-24T00:27:02.026429Z"^^xsd:dateTime ;
     mem:rationale "Encryption at rest was defeated by the read-through cache writing decrypted leaves to $TMPDIR; cache files are mmap'd and range-read, so encrypting cache entries was not viable." .
 
 mem:fact-01m38cy2g76e891v6k39zp1grq a mem:Fact ;
@@ -2672,7 +2704,7 @@ mem:fact-01m38cy2g76e891v6k39zp1grq a mem:Fact ;
     mem:artifactRef "fluree-db-api/tests/it_storage_s3_testcontainers.rs" ;
     mem:artifactRef "fluree-db-connection/src/config.rs" ;
     mem:branch "fix/encryption-at-rest-coverage" ;
-    mem:createdAt "2026-09-24T00:27:04.583337+00:00"^^xsd:dateTime .
+    mem:createdAt "2026-09-24T00:27:04.583337Z"^^xsd:dateTime .
 
 mem:fact-01kwpj81fpnp0rk5s952wf3shd a mem:Fact ;
     mem:content "`range_with_overlay` looks like a cheap point lookup at call sites but pays a full overlay-translation tax per call (unbounded novelty walk + dict-translate + sort in binary_range_eq_v3) — per-flake lookup loops are O(calls x novelty log novelty) and once livelocked filtered-DELETE staging >900s. Mitigations now in place: staging list-meta hydration grouped per (g_id, s, p) taking the FIRST dt-compatible meta per retraction (duplicate-value @list entries must lose exactly one entry per distinct WHERE binding), and a cross-call LRU in binary_range.rs keyed (store_id, index_t, OverlayProvider::content_version, to_t, g, index). content_version is refreshed on every Novelty mutation; wrapper overlays stay uncached." ;
@@ -2910,7 +2942,7 @@ mem:constraint-01m2mvq8by6dxjs9p0dg1t80pc a mem:Constraint ;
     mem:artifactRef "fluree-db-api/src/policy_builder.rs" ;
     mem:artifactRef "fluree-db-query/src/context.rs" ;
     mem:branch "fix/policy-empty-ruleset-allow-root" ;
-    mem:createdAt "2026-09-16T10:20:41.214976+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-16T10:20:41.214976Z"^^xsd:dateTime ;
     mem:rationale "A console-bound ledger whose model had no f:AccessPolicy rules ran 20-40x slower under an unrestricted-in-effect view; the fail-closed contract from 5593817a0 (zero rules under deny must deny) is preserved by requiring an explicit allow when any input selects policy." .
 
 mem:constraint-01m0xcxydkmh6amzdm8a62q7cc a mem:Constraint ;
@@ -3887,7 +3919,7 @@ mem:decision-01m2g43417xqdn66gd72kqp670 a mem:Decision ;
     mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
     mem:createdAt "2026-09-14T14:10:46.439856Z"^^xsd:dateTime ;
-    mem:updatedAt "2026-09-15T21:27:39.257488+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-09-15T21:27:39.257488Z"^^xsd:dateTime ;
     mem:rationale "Full StarBench ledger: predicate-only chain went from one SPOT point scan per reifier to one POST range plus the body probe (P11 4.9 -> 0.42 s, C11 8.4 -> 0.61 s, S5 6.9 -> 1.8 s); P2 on the elided chain 10.6 s vs 65 s enumerating the reverse arena; C2 162 -> 59 s; P6/P7 (endpoints read) stay on the enumeration. P3 has 3 derives_from rows on plain subjects that P2 must not count, hence the keep-one rule." ;
     mem:alternatives "Keeping the base edge and eliding only rS/rO (unsound: breaks the reifier-to-edge link); eliding inside the hash lane (unneeded, it sweeps the sidecars once)" .
 
@@ -3907,6 +3939,20 @@ mem:decision-01m2gp3mhwmw089pe9hyctq73t a mem:Decision ;
     mem:createdAt "2026-09-14T19:25:37.72427Z"^^xsd:dateTime ;
     mem:rationale "Memos keep every existing representation and plan byte-identical, so non-RDF-star queries cannot regress; the test for each memo was proven non-vacuous by disabling it." ;
     mem:alternatives "emit Binding::Sid from the enumerate lane; per-formatter memo plumbing; streaming SPARQL results writer" .
+
+mem:decision-01m2kffsngjzddf7dhjfxmye25 a mem:Decision ;
+    mem:content "The hash sidecar lane (HashAnnotationEdgeProbeOperator) must not take a chain whose reifier the child already binds (hash_lane_admits in default_graph_source.rs), mirroring choose_chain_lane. With a bound reifier and an unbound edge subject its per-row loop walks every swept edge (rows x edges), while the chain is one point probe per row: a constant annotation value driving << ?s :p ?o >> :q \"v\" over 20k edges ran 55 s on the lane vs 0.33 s on the chain (21.9 s on main before the (s,p,o)-keyed maps made each lookup costlier)." ;
+    mem:tag "edge-annotation" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "rdf12" ;
+    mem:tag "reifies" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
+    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-15T21:27:39.440094Z"^^xsd:dateTime ;
+    mem:rationale "Aaron's review of PR 1835 measured a 2.5x slowdown on a constant-annotation-value count; bisected to the hash-lane rework in 677540ee3, not the elision." .
 
 mem:fact-01m2erqe12gyekk6nm30j9saz7 a mem:Fact ;
     mem:content "StarBench P4 (`<< ?s ?p ?o >> ?d ?e`, 33.6M rows) OOMed the server at 240 GB while P6 (same rows, bound predicate) fit: `NestedLoopJoinOperator::build_output_batch` pre-allocated every output column at `ctx.batch_size` (Binding ≤ 88 B) and in per-row mode emitted one batch per left row (~22 rows) without shrinking; the delimited response path (`to_tsv_bytes`) retains every batch until it formats → ~56 KB per tiny batch × 21.4M batches. Fixed by sizing columns as min(pending rows, batch_size); dense batches unchanged. Slice A/B via the same collect-then-format code: 17 GB → 3 GB peak for 6.57M rows. Any per-row join with sparse output (unbound-predicate sibling, no batched lane) plus a collect-all consumer had this cost." ;
@@ -4074,17 +4120,3 @@ mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
     mem:branch "refactor/column-caching" ;
     mem:createdAt "2026-06-05T18:06:17.310296Z"^^xsd:dateTime ;
     mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .
-
-mem:decision-01m2kffsngjzddf7dhjfxmye25 a mem:Decision ;
-    mem:content "The hash sidecar lane (HashAnnotationEdgeProbeOperator) must not take a chain whose reifier the child already binds (hash_lane_admits in default_graph_source.rs), mirroring choose_chain_lane. With a bound reifier and an unbound edge subject its per-row loop walks every swept edge (rows x edges), while the chain is one point probe per row: a constant annotation value driving << ?s :p ?o >> :q \"v\" over 20k edges ran 55 s on the lane vs 0.33 s on the chain (21.9 s on main before the (s,p,o)-keyed maps made each lookup costlier)." ;
-    mem:tag "edge-annotation" ;
-    mem:tag "performance" ;
-    mem:tag "planner" ;
-    mem:tag "rdf12" ;
-    mem:tag "reifies" ;
-    mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
-    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
-    mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-15T21:27:39.440094+00:00"^^xsd:dateTime ;
-    mem:rationale "Aaron's review of PR 1835 measured a 2.5x slowdown on a constant-annotation-value count; bisected to the hash-lane rework in 677540ee3, not the elision." .

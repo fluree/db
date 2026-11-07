@@ -19,6 +19,12 @@
 //! the crate is empty (see Cargo.toml).
 #![cfg(feature = "extension")]
 
+// The extension's Rust allocations go to mimalloc; Python's own stay with
+// Python's allocator. See the `mimalloc` feature.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod branch;
 mod connection;
 mod convert;

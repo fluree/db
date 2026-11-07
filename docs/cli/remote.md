@@ -49,6 +49,9 @@ fluree remote add prod https://api.example.com --token eyJ...
 fluree remote add staging https://staging.example.com --token @~/.fluree/staging-token
 ```
 
+A URL whose discovery document describes an account service (such as `https://fluree.ai`) is not a Fluree server and can't
+be added as a remote; sign in to it with [`fluree login`](login.md) instead.
+
 ---
 
 ## fluree remote remove

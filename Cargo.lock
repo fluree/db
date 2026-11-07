@@ -3769,6 +3769,7 @@ dependencies = [
  "fluree-db-sparql",
  "fluree-graph-ir",
  "fluree-vocab",
+ "mimalloc",
  "pyo3",
  "pythonize",
  "serde",
@@ -4309,6 +4310,7 @@ version = "4.2.6"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "http 1.4.0",
  "http-body-util",
  "openraft",
  "postcard",

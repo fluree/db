@@ -893,12 +893,27 @@ POST /import-upload
   "source_kind": "source",       // default "flpack"
   "filename": "dump.cypher",     // extension drives format detection
   "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
-  "base_iri": "https://kb.example/" } // CSV/Cypher only; format default if omitted
+  "base_iri": "https://kb.example/", // CSV/Cypher only; format default if omitted
+  "skolem_namespace": "urn:kb" } // blank-node salt; needs "source-upload-skolem"
 ```
+
+The file is imported under its own name, so its blank nodes get the ids a direct import of that file would mint. Servers that honor `"skolem_namespace"` (the salt `--skolem-namespace` sets, in place of the ledger id) advertise `"source-upload-skolem"` in `import.modes`.
 
 Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
 
 This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
+A source upload can also fill a **new named graph of an existing ledger**, as [`fluree graph import`](../cli/graph.md#fluree-graph-import) does. Servers that support it add `"source-upload-graph"` to `import.modes`; mint with `"graph"` naming the new graph and `"ledger"` the existing ledger:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",
+  "filename": "products.ttl",
+  "graph": "http://example.org/graph/products" }
+```
+
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh.
 
 ## Storage Proxy Endpoints
 
@@ -2399,10 +2414,9 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
 
 ### POST /drop-graph
 
-Drop a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted under that graph IRI. The drop
-runs as a normal commit at `t = current_t + 1` — history at earlier `t`
-values is preserved. Admin-protected.
+Drop a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`. The drop is one commit at `t = current_t + 1` that
+retracts nothing. Admin-protected.
 
 **URL:**
 ```
@@ -2429,7 +2443,7 @@ POST /drop-graph
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -2439,24 +2453,25 @@ POST /drop-graph
 |-------|------|-------------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
 | `graph_iri` | string | Graph IRI that was dropped (echoed) |
-| `retracted` | integer | Number of flakes retracted by the drop commit; `0` for a no-op |
-| `committed` | boolean | `true` when a new commit was produced; `false` for a no-op drop on an empty graph |
-| `t` | integer | Current commit `t` for the branch after the drop |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | boolean | `true`: the drop commits |
+| `t` | integer | Commit `t` of the drop |
 
 **Behavior:**
 
-- **Transactional and history-preserving.** A query `as-of` an earlier `t` still sees the graph populated.
+- **Takes the history.** Nothing the graph held is queryable afterwards, at the head or as of an earlier `t`: a query naming the graph as of a `t` before the drop gets a 404. The commits keep the facts, so a branch created at a `t` before the drop reads them.
+- **The graph no longer exists.** `/info` leaves it out of `named-graphs`, and writing to the same IRI starts it afresh.
+- **Any size.** The drop reads none of the graph's facts, so its cost does not depend on the graph's size; `FLUREE_MAX_GRAPH_SCAN_FLAKES` does not apply.
 - **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
-- **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
-- **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+- **Refuses missing graphs.** Returns 404 when `graph` does not exist in the ledger, a dropped graph included — the call never registers a graph.
 
 **Status codes:**
 
-- `200 OK` - Drop succeeded (commit produced or no-op)
+- `200 OK` - Drop succeeded
 - `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
 - `401`/`403` - Admin token required and absent/invalid
-- `404 Not Found` - Ledger or graph IRI not found
+- `404 Not Found` - Ledger or graph not found
 - `500 Internal Server Error` - Server error
 
 **Examples:**
