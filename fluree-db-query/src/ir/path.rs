@@ -91,6 +91,12 @@ pub struct PropertyPathPattern {
     /// through a list (see [`crate::list_view`]): the path follows a list's
     /// owner edge and cells rather than its members.
     pub list_view: Option<std::sync::Arc<crate::list_view::ListView>>,
+    /// The `rdf:rest*` of a SPARQL `p/rdf:rest*/rdf:first`, the walk from a
+    /// list's owner edge to its members. That walk, with the owner edge and
+    /// the `rdf:first` step its endpoints join, reads lists as RDF cells
+    /// ([`crate::list_view::rewrite_list_walks`]); every other pattern of the
+    /// query reads members as values.
+    pub list_walk: bool,
 }
 
 impl PropertyPathPattern {
@@ -120,6 +126,7 @@ impl PropertyPathPattern {
             max_hops: None,
             object,
             list_view: None,
+            list_walk: false,
         }
     }
 
@@ -145,6 +152,7 @@ impl PropertyPathPattern {
             max_hops,
             object,
             list_view: None,
+            list_walk: false,
         }
     }
 

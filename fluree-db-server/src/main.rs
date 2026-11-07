@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo run -p fluree-db-server -- --help`
 
-// Opt-in global allocator (see the `mimalloc` feature). Kept in the binary, not
+// Global allocator (the default `mimalloc` feature). Kept in the binary, not
 // the library, so embedders of `fluree_db_server` keep their own allocator.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]

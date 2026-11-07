@@ -915,6 +915,8 @@ async fn discovery_advertises_source_upload_when_presign_enabled() {
         .filter_map(|m| m.as_str())
         .collect();
     assert!(modes.contains(&"source-upload"), "{modes:?}");
+    assert!(modes.contains(&"source-upload-graph"), "{modes:?}");
+    assert!(modes.contains(&"source-upload-skolem"), "{modes:?}");
     let formats = body["import"]["source_formats"]
         .as_array()
         .expect("source_formats");
@@ -965,4 +967,196 @@ MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {s
         .await
         .expect("cypher rel query");
     assert_eq!(result.row_count(), 1);
+}
+
+// ============================================================================
+// Source upload into a new graph of an existing ledger
+// ============================================================================
+
+const GRAPH: &str = "http://example.org/graph/extra";
+
+/// Mint a source upload with `body`'s fields, returning the response.
+async fn mint(state: &Arc<AppState>, body: JsonValue) -> (StatusCode, JsonValue) {
+    json_request(
+        state,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/import-upload")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn source_upload_imports_into_a_new_graph_of_an_existing_ledger() {
+    let (_tmp, state) = presign_test_state().await;
+    let ledger = "src-graph/data:main";
+    let base = br#"@prefix ex: <http://example.org/ns/> .
+ex:alice a ex:User ; ex:name "Alice" .
+"#
+    .to_vec();
+    let created = run_source_upload(&state, ledger, "base.ttl", base).await;
+    assert_eq!(created["status"], "succeeded", "{created:?}");
+
+    let extra = br#"@prefix ex: <http://example.org/ns/> .
+ex:widget ex:maker ex:alice ; ex:name "Widget" .
+"#
+    .to_vec();
+    let imported =
+        run_source_upload_with_options(&state, ledger, "extra.ttl", extra, json!({"graph": GRAPH}))
+            .await;
+    assert_eq!(imported["status"], "succeeded", "{imported:?}");
+    let result = &imported["result"];
+    assert_eq!(result["kind"], "graph-import");
+    assert_eq!(result["ledger_id"], ledger);
+    assert_eq!(result["graph"]["iri"], GRAPH);
+    assert_eq!(result["graph"]["g_id"], 3);
+    assert_eq!(result["graph"]["base_t"], 1);
+    assert_eq!(result["t"], 2);
+    assert_eq!(result["index_t"], 2);
+
+    // The graph holds the upload, joined to the ledger's existing subject;
+    // the default graph holds only what it did.
+    let names = |from: String| {
+        let state = Arc::clone(&state);
+        async move {
+            let query = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "from": from,
+                "select": "?name",
+                "where": { "@id": "?s", "ex:name": "?name" }
+            });
+            let handle = state.fluree.ledger(ledger).await.expect("load");
+            let mut names: Vec<String> = state
+                .fluree
+                .query_connection(&query)
+                .await
+                .expect("query")
+                .to_jsonld(&handle.snapshot)
+                .expect("to_jsonld")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|v| v.as_str().expect("name").to_string())
+                .collect();
+            names.sort();
+            names
+        }
+    };
+    assert_eq!(names(ledger.to_string()).await, ["Alice"]);
+    assert_eq!(names(format!("{ledger}#{GRAPH}")).await, ["Widget"]);
+}
+
+/// `skolem_namespace` salts a source upload's blank-node ids in place of the
+/// ledger id, so a file uploaded under one namespace names its blank nodes
+/// alike whether it creates a ledger or fills a graph of another.
+#[tokio::test]
+async fn source_uploads_salt_blank_nodes_with_the_skolem_namespace() {
+    let (_tmp, state) = presign_test_state().await;
+    let parts = br#"@prefix ex: <http://example.org/ns/> .
+ex:widget ex:part [ ex:name "Bolt" ] .
+"#;
+    let shared = json!({"skolem_namespace": "urn:test:parts"});
+    let created = run_source_upload_with_options(
+        &state,
+        "skolem/a:main",
+        "parts.ttl",
+        parts.to_vec(),
+        shared.clone(),
+    )
+    .await;
+    assert_eq!(created["status"], "succeeded", "{created:?}");
+    let base = run_source_upload(
+        &state,
+        "skolem/b:main",
+        "base.ttl",
+        b"<http://example.org/a> <http://example.org/p> \"x\" .\n".to_vec(),
+    )
+    .await;
+    assert_eq!(base["status"], "succeeded", "{base:?}");
+    let mut into_graph = shared.clone();
+    into_graph["graph"] = json!(GRAPH);
+    let imported = run_source_upload_with_options(
+        &state,
+        "skolem/b:main",
+        "parts.ttl",
+        parts.to_vec(),
+        into_graph,
+    )
+    .await;
+    assert_eq!(imported["status"], "succeeded", "{imported:?}");
+    let unsalted = run_source_upload(&state, "skolem/c:main", "parts.ttl", parts.to_vec()).await;
+    assert_eq!(unsalted["status"], "succeeded", "{unsalted:?}");
+
+    let part = |ledger: &'static str, from: String| {
+        let state = Arc::clone(&state);
+        async move {
+            let query = json!({
+                "from": from,
+                "select": "?part",
+                "where": { "@id": "http://example.org/ns/widget", "http://example.org/ns/part": "?part" }
+            });
+            let handle = state.fluree.ledger(ledger).await.expect("load");
+            let rows = state
+                .fluree
+                .query_connection(&query)
+                .await
+                .expect("query")
+                .to_jsonld(&handle.snapshot)
+                .expect("to_jsonld");
+            rows[0].as_str().expect("a blank node").to_string()
+        }
+    };
+    let in_ledger = part("skolem/a:main", "skolem/a:main".to_string()).await;
+    assert!(in_ledger.starts_with("_:"), "{in_ledger}");
+    assert_eq!(
+        part("skolem/b:main", format!("skolem/b:main#{GRAPH}")).await,
+        in_ledger
+    );
+    assert_ne!(
+        part("skolem/c:main", "skolem/c:main".to_string()).await,
+        in_ledger
+    );
+}
+
+#[tokio::test]
+async fn a_graph_upload_is_refused_at_mint_when_it_cannot_run() {
+    let (_tmp, state) = presign_test_state().await;
+    let ledger = "src-graph-refused/data:main";
+    let created = run_source_upload(
+        &state,
+        ledger,
+        "base.ttl",
+        b"<http://example.org/a> <http://example.org/p> \"x\" .\n".to_vec(),
+    )
+    .await;
+    assert_eq!(created["status"], "succeeded", "{created:?}");
+
+    let refusals = [
+        (
+            json!({"ledger": ledger, "source_kind": "flpack", "graph": GRAPH}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"ledger": "absent/data:main", "source_kind": "source",
+                   "filename": "x.ttl", "graph": GRAPH}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"ledger": ledger, "source_kind": "source", "filename": "x.ttl",
+                   "graph": "urn:default"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"ledger": ledger, "source_kind": "source", "filename": "x.ttl",
+                   "graph": format!("urn:fluree:{ledger}#txn-meta")}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (body, expected) in refusals {
+        let (status, response) = mint(&state, body.clone()).await;
+        assert_eq!(status, expected, "{body}: {response:?}");
+    }
 }

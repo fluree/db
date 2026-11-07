@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! magic:  [u8; 4]   "FHS1"
-//! version: u8       1
+//! version: u8       3
 //! padding: [u8; 3]  reserved
 //! [HistorySegment for leaflet 0]
 //! [HistorySegment for leaflet 1]
@@ -22,9 +22,12 @@
 //! [HistEntryV2 × entry_count]   — sorted by t descending (newest first)
 //! ```
 //!
-//! A pooled tree's sidecar (version 2) appends each entry's graph, so its
-//! entries are [`HIST_ENTRY_V2_G_SIZE`] bytes; a segment's entry width follows
-//! from its length and count.
+//! A pooled tree's sidecar (version 4) appends each entry's graph, so its
+//! entries are [`HIST_ENTRY_V2_G_SIZE`] bytes. A v4 index's sidecar (version
+//! one) and an earlier v5 one (version two) store a 32-bit `o_i`
+//! ([`HIST_ENTRY_V2_NARROW_SIZE`], [`HIST_ENTRY_V2_NARROW_G_SIZE`]). The
+//! four entry widths differ, so a segment's width follows from its length
+//! and count.
 
 use fluree_db_core::subject_id::SubjectId;
 
@@ -32,44 +35,57 @@ use fluree_db_core::subject_id::SubjectId;
 pub const SIDECAR_MAGIC: &[u8; 4] = b"FHS1";
 
 /// Sidecar format version.
-pub const SIDECAR_VERSION: u8 = 1;
+pub const SIDECAR_VERSION: u8 = 3;
 
 /// Sidecar format version whose entries carry their graph (pooled trees).
-pub const SIDECAR_VERSION_GRAPH: u8 = 2;
+pub const SIDECAR_VERSION_GRAPH: u8 = 4;
+
+/// The versions whose entries store a 32-bit `o_i`: a v4 index's sidecar,
+/// and an earlier v5 one with graphs. Read only.
+const SIDECAR_VERSION_NARROW: u8 = 1;
+const SIDECAR_VERSION_NARROW_GRAPH: u8 = 2;
 
 /// Header size (magic + version + padding).
 pub const SIDECAR_HEADER_SIZE: usize = 8;
 
 /// Wire size of a single `HistEntryV2` record.
 ///
-/// Layout (31 bytes):
+/// Layout (36 bytes):
 /// ```text
 /// s_id:    u64  [0..8]
 /// p_id:    u32  [8..12]
 /// o_type:  u16  [12..14]
 /// o_key:   u64  [14..22]
-/// o_i:     u32  [22..26]
-/// t:       u32  [26..30]
-/// op:      u8   [30]
+/// o_i:     u64  [22..30]
+/// t:       u32  [30..34]
+/// op:      u8   [34]
+/// reserved: u8  [35]    zero; keeps the width apart from every narrow one
 /// ```
-pub const HIST_ENTRY_V2_SIZE: usize = 31;
+pub const HIST_ENTRY_V2_SIZE: usize = 36;
 
-/// Wire size of an entry that carries its graph: the 31 bytes above, then
-/// `g_id: u32 [31..35]`.
-pub const HIST_ENTRY_V2_G_SIZE: usize = 35;
+/// [`HIST_ENTRY_V2_SIZE`] in a sidecar storing a 32-bit `o_i`: `o_i: u32
+/// [22..26]`, `t: u32 [26..30]`, `op: u8 [30]`.
+pub const HIST_ENTRY_V2_NARROW_SIZE: usize = 31;
+
+/// [`HIST_ENTRY_V2_NARROW_SIZE`] with the graph, `g_id: u32 [31..35]`.
+pub const HIST_ENTRY_V2_NARROW_G_SIZE: usize = 35;
+
+/// Wire size of an entry that carries its graph: the 36 bytes above, then
+/// `g_id: u32 [36..40]`.
+pub const HIST_ENTRY_V2_G_SIZE: usize = 40;
 
 /// A single history entry for the V2/V3 index format.
 ///
 /// Records a past assert or retract event for time-travel replay.
-/// `o_i` is always present (using the `u32::MAX` sentinel for non-list facts)
-/// so entries are fixed-size for simple offset arithmetic.
+/// `o_i` is always present (using the `LIST_INDEX_NONE` sentinel for non-list
+/// facts) so entries are fixed-size for simple offset arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistEntryV2 {
     pub s_id: SubjectId,
     pub p_id: u32,
     pub o_type: u16,
     pub o_key: u64,
-    pub o_i: u32,
+    pub o_i: u64,
     pub t: u32,
     /// 0 = retract, 1 = assert.
     pub op: u8,
@@ -79,66 +95,75 @@ pub struct HistEntryV2 {
 }
 
 impl HistEntryV2 {
-    /// Write to wire format (31 bytes, little-endian).
+    /// Write to wire format (36 bytes, little-endian).
     pub fn write_le(&self, buf: &mut [u8]) {
         debug_assert!(buf.len() >= HIST_ENTRY_V2_SIZE);
         buf[0..8].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
         buf[8..12].copy_from_slice(&self.p_id.to_le_bytes());
         buf[12..14].copy_from_slice(&self.o_type.to_le_bytes());
         buf[14..22].copy_from_slice(&self.o_key.to_le_bytes());
-        buf[22..26].copy_from_slice(&self.o_i.to_le_bytes());
-        buf[26..30].copy_from_slice(&self.t.to_le_bytes());
-        buf[30] = self.op;
+        buf[22..30].copy_from_slice(&self.o_i.to_le_bytes());
+        buf[30..34].copy_from_slice(&self.t.to_le_bytes());
+        buf[34] = self.op;
+        buf[35] = 0;
     }
 
-    /// Read from wire format (31 bytes, little-endian).
+    /// Read from wire format (36 bytes, little-endian).
     ///
     /// # Errors
     /// Returns `io::Error` if `buf` is shorter than [`HIST_ENTRY_V2_SIZE`] bytes.
     pub fn read_le(buf: &[u8]) -> std::io::Result<Self> {
-        if buf.len() < HIST_ENTRY_V2_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "HistEntryV2 requires {} bytes, got {}",
-                    HIST_ENTRY_V2_SIZE,
-                    buf.len()
-                ),
-            ));
-        }
-        Ok(Self {
-            s_id: SubjectId(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            p_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            o_type: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
-            o_key: u64::from_le_bytes(buf[14..22].try_into().unwrap()),
-            o_i: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
-            t: u32::from_le_bytes(buf[26..30].try_into().unwrap()),
-            op: buf[30],
-            g_id: 0,
-        })
+        Self::read_le_width(buf, HIST_ENTRY_V2_SIZE)
     }
 
     /// Write `width` bytes: [`HIST_ENTRY_V2_G_SIZE`] appends the graph.
     pub fn write_le_width(&self, buf: &mut [u8], width: usize) {
         self.write_le(buf);
         if width == HIST_ENTRY_V2_G_SIZE {
-            buf[31..35].copy_from_slice(&self.g_id.to_le_bytes());
+            buf[36..40].copy_from_slice(&self.g_id.to_le_bytes());
         }
     }
 
-    /// Read a `width`-byte entry (see [`Self::write_le_width`]).
+    /// Read a `width`-byte entry: one of the four widths a sidecar stores
+    /// (see [`Self::write_le_width`] and the narrow widths).
     pub fn read_le_width(buf: &[u8], width: usize) -> std::io::Result<Self> {
-        let mut entry = Self::read_le(buf)?;
-        if width == HIST_ENTRY_V2_G_SIZE {
-            let g = buf.get(31..35).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "HistEntryV2 with graph requires 35 bytes",
-                )
-            })?;
-            entry.g_id = u32::from_le_bytes(g.try_into().unwrap());
+        if buf.len() < width {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("HistEntryV2 requires {width} bytes, got {}", buf.len()),
+            ));
         }
-        Ok(entry)
+        let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
+        let narrow = matches!(
+            width,
+            HIST_ENTRY_V2_NARROW_SIZE | HIST_ENTRY_V2_NARROW_G_SIZE
+        );
+        let (o_i, t, op, g_at) = if narrow {
+            (
+                crate::format::run_record::widen_list_index(u32_at(22)),
+                u32_at(26),
+                buf[30],
+                31,
+            )
+        } else {
+            (
+                u64::from_le_bytes(buf[22..30].try_into().unwrap()),
+                u32_at(30),
+                buf[34],
+                36,
+            )
+        };
+        let with_graph = matches!(width, HIST_ENTRY_V2_G_SIZE | HIST_ENTRY_V2_NARROW_G_SIZE);
+        Ok(Self {
+            s_id: SubjectId(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
+            p_id: u32_at(8),
+            o_type: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
+            o_key: u64::from_le_bytes(buf[14..22].try_into().unwrap()),
+            o_i,
+            t,
+            op,
+            g_id: if with_graph { u32_at(g_at) } else { 0 },
+        })
     }
 }
 
@@ -151,10 +176,11 @@ pub fn decode_sidecar_entries(bytes: &[u8]) -> std::io::Result<Vec<HistEntryV2>>
             "history sidecar: bad header",
         ));
     }
-    let width = if bytes[4] == SIDECAR_VERSION_GRAPH {
-        HIST_ENTRY_V2_G_SIZE
-    } else {
-        HIST_ENTRY_V2_SIZE
+    let width = match bytes[4] {
+        SIDECAR_VERSION_GRAPH => HIST_ENTRY_V2_G_SIZE,
+        SIDECAR_VERSION_NARROW => HIST_ENTRY_V2_NARROW_SIZE,
+        SIDECAR_VERSION_NARROW_GRAPH => HIST_ENTRY_V2_NARROW_G_SIZE,
+        _ => HIST_ENTRY_V2_SIZE,
     };
     let mut out = Vec::new();
     let mut pos = SIDECAR_HEADER_SIZE;
@@ -184,15 +210,20 @@ pub fn decode_segment_bytes(bytes: &[u8]) -> std::io::Result<Vec<HistEntryV2>> {
         return Ok(Vec::new());
     }
     let body = bytes.len() - 4;
-    let width = [HIST_ENTRY_V2_SIZE, HIST_ENTRY_V2_G_SIZE]
-        .into_iter()
-        .find(|w| body == count * w)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("history segment of {body} bytes does not hold {count} entries"),
-            )
-        })?;
+    let width = [
+        HIST_ENTRY_V2_SIZE,
+        HIST_ENTRY_V2_G_SIZE,
+        HIST_ENTRY_V2_NARROW_SIZE,
+        HIST_ENTRY_V2_NARROW_G_SIZE,
+    ]
+    .into_iter()
+    .find(|w| body == count * w)
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("history segment of {body} bytes does not hold {count} entries"),
+        )
+    })?;
     (0..count)
         .map(|i| HistEntryV2::read_le_width(&bytes[4 + i * width..], width))
         .collect()
@@ -364,6 +395,7 @@ pub fn decode_history_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::run_record::LIST_INDEX_NONE;
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
 
@@ -373,7 +405,7 @@ mod tests {
             p_id,
             o_type,
             o_key,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             t,
             op,
             g_id: 0,
@@ -686,7 +718,7 @@ impl Graphs {
 }
 
 /// An event's identity: `(s_id, p_id, o_type, o_key, o_i, t, op)`.
-type EventKey = (u64, u32, u16, u64, u32, u32, u8);
+type EventKey = (u64, u32, u16, u64, u64, u32, u8);
 
 fn event_key(entry: &HistEntryV2) -> EventKey {
     (
@@ -760,7 +792,7 @@ impl HistoryDrop {
     /// The spans in `entries` of the predicates this drop covers: each
     /// assertion and the retraction that follows it, by index.
     fn spans(&self, entries: &[HistEntryV2]) -> Vec<(usize, usize)> {
-        type Fact = (u64, u32, u16, u64, u32, fluree_db_core::GraphId);
+        type Fact = (u64, u32, u16, u64, u64, fluree_db_core::GraphId);
         let mut facts: std::collections::HashMap<Fact, Vec<usize>> =
             std::collections::HashMap::new();
         for (i, e) in entries.iter().enumerate() {

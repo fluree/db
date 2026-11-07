@@ -954,3 +954,79 @@ async fn upsert_json_type_replaces_after_reindex() {
         "should have new seed value after upsert (indexed path)"
     );
 }
+
+/// An upsert on a ledger state rebuilt from a snapshot and its novelty
+/// (`LedgerState::new`) still retracts the value novelty holds. The upsert
+/// skips reading a subject its dictionary novelty does not know, which is
+/// only sound when that dictionary covers the novelty it is paired with.
+#[tokio::test]
+async fn upsert_on_a_rebuilt_state_retracts_the_value_novelty_holds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tx/upsert-rebuilt-state:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+    let ctx = json!({"ex": "http://example.org/"});
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx, "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let mut rebuilt =
+        fluree_db_api::LedgerState::new((*ledger1.snapshot).clone(), (*ledger1.novelty).clone());
+    rebuilt.head_commit_id = ledger1.head_commit_id.clone();
+    rebuilt.head_index_id = ledger1.head_index_id.clone();
+    rebuilt.ns_record = ledger1.ns_record.clone();
+
+    let result = fluree
+        .upsert(
+            rebuilt,
+            &json!({"@context": ctx, "@id": "ex:alice", "ex:name": "Alicia"}),
+        )
+        .await
+        .unwrap();
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
+    let commit = load_commit_by_id(&fluree.content_store(&namespace), &result.receipt.commit_id)
+        .await
+        .expect("load upsert commit");
+    let names: Vec<(bool, String)> = commit
+        .flakes
+        .iter()
+        .filter(|f| f.p.name.as_ref() == "name")
+        .filter_map(|f| match &f.o {
+            FlakeValue::String(s) => Some((f.op, s.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&(false, "Alice".to_string())), "{names:?}");
+    assert!(names.contains(&(true, "Alicia".to_string())), "{names:?}");
+}
+
+/// The dictionary novelty keeps covering novelty across commits, so the
+/// upsert's absence check answers new subjects with a dictionary probe rather
+/// than a seek into novelty per subject.
+#[tokio::test]
+async fn dictionary_novelty_covers_novelty_across_commits() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tx/dict-novelty-coverage:main";
+    let mut ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    assert!(ledger.dict_novelty.covers(ledger.novelty.t), "new ledger");
+    let ctx = json!({"ex": "http://example.org/"});
+    for i in 0..3 {
+        ledger = fluree
+            .upsert(
+                ledger,
+                &json!({"@context": ctx, "@id": format!("ex:s{i}"), "ex:n": i}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        assert!(
+            ledger.dict_novelty.covers(ledger.novelty.t),
+            "after commit {i} at t={}",
+            ledger.novelty.t
+        );
+    }
+}

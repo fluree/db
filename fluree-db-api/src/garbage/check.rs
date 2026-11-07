@@ -486,12 +486,12 @@ fn for_each_row(
     let Some(branch) = index.dedicated_branch(TXN_META_GRAPH_ID, RunSortOrder::Psot) else {
         return Ok(());
     };
-    let bound = |s_id: u64, o_key: u64, rest: u32, o_type: u16| RunRecordV2 {
+    let bound = |s_id: u64, o_key: u64, t: u32, o_i: u64, o_type: u16| RunRecordV2 {
         s_id: SubjectId(s_id),
         o_key,
         p_id,
-        t: rest,
-        o_i: rest,
+        t,
+        o_i,
         o_type,
         g_id: TXN_META_GRAPH_ID,
     };
@@ -499,8 +499,8 @@ fn for_each_row(
         Arc::clone(index),
         RunSortOrder::Psot,
         Arc::clone(branch),
-        &bound(0, 0, 0, 0),
-        &bound(u64::MAX, u64::MAX, u32::MAX, u16::MAX),
+        &bound(0, 0, 0, 0, 0),
+        &bound(u64::MAX, u64::MAX, u32::MAX, u64::MAX, u16::MAX),
         BinaryFilter {
             p_id: Some(p_id),
             ..Default::default()

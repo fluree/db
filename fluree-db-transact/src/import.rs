@@ -78,6 +78,16 @@ mod inner {
         Ok(Some(graph))
     }
 
+    /// The named graph a bulk import into one graph of `ledger_id` writes,
+    /// for the graph name `iri` it was handed: read through the ledger's
+    /// graph-position table as a TriG block's graph is (`L#<g>` names the
+    /// graph `<g>`). `None` when the name is the ledger's default graph;
+    /// `urn:default`, a name that is no graph, and the system graphs are
+    /// refused.
+    pub fn target_graph_iri(iri: &str, ledger_id: &str) -> Result<Option<String>> {
+        import_graph_position(iri, ledger_id, &|_: &str| None)
+    }
+
     /// Refuse a named graph a bulk import may not write, by its literal IRI:
     /// the ledger's two system graphs, mirroring the staged-write guard's
     /// shape. Bulk import bypasses staging, so that guard never sees its
@@ -287,7 +297,10 @@ mod inner {
                 crate::parse::jsonld::GraphRole::Data,
                 &mut fluree_db_query::VarRegistry::new(),
             )?,
-            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id, ledger_id)?,
+            GraphNameRef::NamedGraph(id) => {
+                let id = fluree_graph_json_ld::iri_named_graph(id).map_err(TransactError::Parse)?;
+                crate::parse::jsonld::named_graph(id, id, ledger_id)?
+            }
         };
         let iri = match &graph {
             GraphName::Default => return Ok(None),
@@ -324,8 +337,8 @@ mod inner {
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
         pub prefix_map: HashMap<String, String>,
-        /// The owners whose list a chunk has stored compactly, for chunks
-        /// that do not spool (a spooled chunk shares
+        /// The next list id of each owner a chunk has stored a list on, for
+        /// chunks that do not spool (a spooled chunk shares
         /// `SpoolConfig::list_owners`).
         pub list_owners: crate::lists::ClaimedOwners,
     }
@@ -349,6 +362,33 @@ mod inner {
                 next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
                 prefix_map: HashMap::new(),
                 list_owners: Default::default(),
+            }
+        }
+    }
+
+    impl ImportState {
+        /// Import state that continues an existing ledger's commit chain:
+        /// the first chunk commits at `t + 1` on top of `parent`, under the
+        /// ledger's namespace codes and named graphs (IRI → g_id).
+        pub fn continuing(
+            t: i64,
+            parent: CommitId,
+            ns_registry: NamespaceRegistry,
+            graph_ids: HashMap<String, fluree_db_core::GraphId>,
+        ) -> Self {
+            let next_gid = graph_ids
+                .values()
+                .map(|&g_id| g_id + 1)
+                .max()
+                .unwrap_or(0)
+                .max(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID);
+            Self {
+                t,
+                parent: Some(parent),
+                ns_registry,
+                graph_ids,
+                next_gid,
+                ..Self::new()
             }
         }
     }
@@ -922,7 +962,7 @@ mod inner {
                                 o: &o,
                                 dt: &dt,
                                 lang: lang.as_deref(),
-                                list_index: None,
+                                place: None,
                                 t: new_t,
                             },
                         )?;
@@ -1285,22 +1325,26 @@ mod inner {
             .map_err(|e| TransactError::Parse(e.to_string()))?;
         drop(_parse_span);
 
-        let (writer, prefix_map, spool_ctx) = sink
-            .into_parts()
+        // Named graphs come only from a spool config's target graph: Turtle
+        // has no syntax for one.
+        let output = sink
+            .into_output()
             .map_err(crate::import_sink::encode_failure)?;
-        let op_count = writer.op_count();
+        let op_count = output.writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
-        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
 
         Ok(ParsedChunk {
-            writer,
+            writer: output.writer,
             op_count,
             new_codes,
-            prefix_map,
+            prefix_map: output.prefix_map,
             spool_result,
             txn_meta: Vec::new(),
-            named_graphs: Vec::new(),
+            named_graphs: output.named_graphs,
         })
     }
 
@@ -1361,16 +1405,19 @@ mod inner {
         .map_err(|e| TransactError::Parse(e.to_string()))?;
         drop(_parse_span);
 
-        let (writer, _prefix_map, spool_ctx) = sink
-            .into_parts()
+        // Named graphs come only from a spool config's target graph.
+        let output = sink
+            .into_output()
             .map_err(crate::import_sink::encode_failure)?;
-        let op_count = writer.op_count();
+        let op_count = output.writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
-        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
 
         Ok(ParsedChunk {
-            writer,
+            writer: output.writer,
             op_count,
             new_codes,
             // Prelude prefixes are applied at session start; chunks should not
@@ -1378,7 +1425,7 @@ mod inner {
             prefix_map: HashMap::new(),
             spool_result,
             txn_meta: Vec::new(),
-            named_graphs: Vec::new(),
+            named_graphs: output.named_graphs,
         })
     }
 
@@ -1735,6 +1782,6 @@ mod inner {
 
 pub use inner::{
     finalize_parsed_chunk, import_commit_with_prelude, import_trig_commit, parse_chunk,
-    parse_chunk_with_prelude, parse_jsonld_chunk, ImportCommitResult, ImportState, JsonLdChunk,
-    ParsedChunk,
+    parse_chunk_with_prelude, parse_jsonld_chunk, target_graph_iri, ImportCommitResult,
+    ImportState, JsonLdChunk, ParsedChunk,
 };

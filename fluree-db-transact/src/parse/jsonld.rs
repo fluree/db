@@ -26,8 +26,8 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, is_keyword_form, node_graph, parse_context,
-    GraphValue, NodeGraph, ParsedContext,
+    classify_graph_value, expand_with_context_policy, iri_named_graph, is_keyword_form, node_graph,
+    parse_context, GraphValue, NodeGraph, ParsedContext,
 };
 use fluree_vocab::{
     rdf::{self, TYPE},
@@ -118,6 +118,25 @@ fn parse_rooted(
             .and_then(|o| o.get("validationMode"))
             .and_then(Value::as_str)
             .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+
+    // Lists read and edited as RDF (`opts.rdfLists`), same precedence; a value
+    // that is not a boolean is refused rather than read as `false`.
+    if opts.rdf_lists.is_none() {
+        opts.rdf_lists = match json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("rdfLists"))
+        {
+            None => None,
+            Some(Value::Bool(on)) => Some(*on),
+            Some(other) => {
+                return Err(TransactError::Parse(format!(
+                    "opts.rdfLists must be true or false, got {other}"
+                )))
+            }
+        };
     }
 
     // The request's own constraints (`opts.shapes`, `opts.uniqueProperties`),
@@ -1181,10 +1200,11 @@ impl<'a> TemplateParseCtx<'a> {
     }
 
     /// The scope of a JSON-LD named graph's content: the graph `name`, the
-    /// owning node's (expanded) `@id` ([`node_graph`] has checked it is not
-    /// a blank node or a variable), names. It must be an absolute IRI or an
-    /// address of this ledger. The name is checked even for empty content;
-    /// `None` then, so an empty graph is not registered as a write target.
+    /// owning node's (expanded) `@id` ([`node_graph`] and [`iri_named_graph`]
+    /// have checked it is not a variable or a blank node), names. It must be
+    /// an absolute IRI or an address of this ledger. The name is checked even
+    /// for empty content; `None` then, so an empty graph is not registered as
+    /// a write target.
     fn named_graph_scope(&mut self, name: &str, empty: bool) -> Result<Option<GraphScope>> {
         if self.fixed_root.is_some() {
             return Err(TransactError::Parse(
@@ -1776,6 +1796,7 @@ fn parse_expanded_object_with_ctx(
             &own_scope
         }
         NodeGraph::NamedGraph { name, content } => {
+            let name = iri_named_graph(name).map_err(TransactError::Parse)?;
             named_graph_content = Some((name, content));
             scope
         }

@@ -294,11 +294,10 @@ fn indexed_record(
             },
         );
     };
-    let o_i = flake
-        .m
-        .as_ref()
-        .and_then(|m| m.i)
-        .map_or(u32::MAX, |i| i as u32);
+    let o_i = flake.m.as_ref().map_or(
+        fluree_db_core::list_index::NONE,
+        fluree_db_core::FlakeMeta::packed_place,
+    );
     Ok(Indexed::At(RunRecordV2::new(
         g_id,
         SubjectId(s_id),

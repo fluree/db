@@ -754,7 +754,6 @@ pub async fn upload_dicts_from_disk(
 ) -> Result<UploadedDicts> {
     use fluree_db_binary_index::dict::branch::DictBranch;
     use fluree_db_core::{ContentKind, DictKind};
-    use std::collections::BTreeMap;
 
     // ---- 1. Read small dicts for v4 root inlining ----
     tracing::info!("reading small dictionaries for v4 root (graphs, datatypes, languages)");
@@ -1188,169 +1187,9 @@ pub async fn upload_dicts_from_disk(
             }
         },
         // Task C: Numbig arenas (per-graph subdirectories)
-        async {
-            let mut numbig: BTreeMap<String, BTreeMap<String, ContentId>> = BTreeMap::new();
-            // Scan for g_{id}/numbig/ subdirectories
-            for dir_entry in std::fs::read_dir(run_dir)
-                .map_err(|e| IndexerError::StorageRead(format!("read run_dir: {e}")))?
-            {
-                let dir_entry = dir_entry
-                    .map_err(|e| IndexerError::StorageRead(format!("read run_dir entry: {e}")))?;
-                let dir_name = dir_entry.file_name();
-                let dir_name_str = dir_name.to_string_lossy();
-                if let Some(g_id_str) = dir_name_str.strip_prefix("g_") {
-                    let nb_dir = dir_entry.path().join("numbig");
-                    if nb_dir.exists() {
-                        let mut per_pred = BTreeMap::new();
-                        for entry in std::fs::read_dir(&nb_dir).map_err(|e| {
-                            IndexerError::StorageRead(format!("read numbig dir: {e}"))
-                        })? {
-                            let entry = entry.map_err(|e| {
-                                IndexerError::StorageRead(format!("read numbig entry: {e}"))
-                            })?;
-                            let name = entry.file_name();
-                            let name_str = name.to_string_lossy();
-                            if let Some(rest) = name_str.strip_prefix("p_") {
-                                if let Some(id_str) = rest.strip_suffix(".nba") {
-                                    if let Ok(p_id) = id_str.parse::<u32>() {
-                                        let cid = upload_dict_file(
-                                            content_store,
-                                            &entry.path(),
-                                            DictKind::NumBig { p_id },
-                                            "dict artifact uploaded to CAS (from disk)",
-                                        )
-                                        .await?;
-                                        per_pred.insert(p_id.to_string(), cid);
-                                    }
-                                }
-                            }
-                        }
-                        if !per_pred.is_empty() {
-                            numbig.insert(g_id_str.to_string(), per_pred);
-                        }
-                    }
-                }
-            }
-            Ok::<_, IndexerError>(numbig)
-        },
+        upload_numbig_arenas_from_disk(content_store, run_dir),
         // Task D: Vector arenas (per-graph subdirectories)
-        async {
-            let mut vectors: BTreeMap<String, BTreeMap<String, VectorDictRef>> = BTreeMap::new();
-            // Scan for g_{id}/vectors/ subdirectories
-            for dir_entry in std::fs::read_dir(run_dir)
-                .map_err(|e| IndexerError::StorageRead(format!("read run_dir: {e}")))?
-            {
-                let dir_entry = dir_entry
-                    .map_err(|e| IndexerError::StorageRead(format!("read run_dir entry: {e}")))?;
-                let dir_name = dir_entry.file_name();
-                let dir_name_str = dir_name.to_string_lossy();
-                if let Some(g_id_str) = dir_name_str.strip_prefix("g_") {
-                    let vec_dir = dir_entry.path().join("vectors");
-                    if vec_dir.exists() {
-                        let mut per_pred = BTreeMap::new();
-                        for entry in std::fs::read_dir(&vec_dir).map_err(|e| {
-                            IndexerError::StorageRead(format!("read vectors dir: {e}"))
-                        })? {
-                            let entry = entry.map_err(|e| {
-                                IndexerError::StorageRead(format!("read vectors entry: {e}"))
-                            })?;
-                            let name = entry.file_name();
-                            let name_str = name.to_string_lossy();
-                            if let Some(rest) = name_str.strip_prefix("p_") {
-                                if let Some(id_str) = rest.strip_suffix(".vam") {
-                                    if let Ok(p_id) = id_str.parse::<u32>() {
-                                        let manifest_bytes =
-                                            tokio::fs::read(entry.path()).await.map_err(|e| {
-                                                IndexerError::StorageRead(format!(
-                                                    "read vector manifest: {e}"
-                                                ))
-                                            })?;
-                                        let manifest =
-                                            fluree_db_binary_index::arena::vector::read_vector_manifest(
-                                                &manifest_bytes,
-                                            )
-                                            .map_err(
-                                                |e| {
-                                                    IndexerError::StorageRead(format!(
-                                                        "parse vector manifest: {e}"
-                                                    ))
-                                                },
-                                            )?;
-
-                                        let mut shard_cids =
-                                            Vec::with_capacity(manifest.shards.len());
-                                        let mut shard_infos =
-                                            Vec::with_capacity(manifest.shards.len());
-                                        for (shard_idx, shard_info) in
-                                            manifest.shards.iter().enumerate()
-                                        {
-                                            let shard_path =
-                                                vec_dir.join(format!("p_{p_id}_s_{shard_idx}.vas"));
-                                            let shard_cid = upload_dict_file(
-                                                content_store,
-                                                &shard_path,
-                                                DictKind::VectorShard { p_id },
-                                                "dict artifact uploaded to CAS (from disk)",
-                                            )
-                                            .await?;
-                                            shard_infos.push(
-                                                fluree_db_binary_index::arena::vector::ShardInfo {
-                                                    cas: shard_cid.to_string(),
-                                                    count: shard_info.count,
-                                                },
-                                            );
-                                            shard_cids.push(shard_cid);
-                                        }
-
-                                        let final_manifest =
-                                            fluree_db_binary_index::arena::vector::VectorManifest {
-                                                shards: shard_infos,
-                                                ..manifest
-                                            };
-                                        let manifest_json = serde_json::to_vec_pretty(
-                                            &final_manifest,
-                                        )
-                                        .map_err(|e| {
-                                            IndexerError::StorageWrite(format!(
-                                                "serialize vector manifest: {e}"
-                                            ))
-                                        })?;
-                                        let final_manifest_path =
-                                            vec_dir.join(format!("p_{p_id}_final.vam"));
-                                        std::fs::write(&final_manifest_path, &manifest_json)
-                                            .map_err(|e| {
-                                                IndexerError::StorageWrite(format!(
-                                                    "write final vector manifest: {e}"
-                                                ))
-                                            })?;
-                                        let manifest_cid = upload_dict_file(
-                                            content_store,
-                                            &final_manifest_path,
-                                            DictKind::VectorManifest { p_id },
-                                            "dict artifact uploaded to CAS (from disk)",
-                                        )
-                                        .await?;
-
-                                        per_pred.insert(
-                                            p_id.to_string(),
-                                            VectorDictRef {
-                                                p_id,
-                                                manifest: manifest_cid,
-                                                shards: shard_cids,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        if !per_pred.is_empty() {
-                            vectors.insert(g_id_str.to_string(), per_pred);
-                        }
-                    }
-                }
-            }
-            Ok::<_, IndexerError>(vectors)
-        },
+        upload_vector_arenas_from_disk(content_store, run_dir),
     )?;
 
     let (subject_fwd_ns_packs, subject_reverse, subject_id_encoding, subject_watermarks) =
@@ -1392,6 +1231,179 @@ pub async fn upload_dicts_from_disk(
         numbig,
         vectors,
     })
+}
+
+/// Upload the numbig arenas an import wrote under `run_dir/g_{g_id}/numbig/`,
+/// keyed by graph id and then predicate id (both as decimal strings).
+pub async fn upload_numbig_arenas_from_disk(
+    content_store: &dyn ContentStore,
+    run_dir: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, ContentId>>> {
+    use fluree_db_core::DictKind;
+    use std::collections::BTreeMap;
+
+    let mut numbig: BTreeMap<String, BTreeMap<String, ContentId>> = BTreeMap::new();
+    // Scan for g_{id}/numbig/ subdirectories
+    for dir_entry in std::fs::read_dir(run_dir)
+        .map_err(|e| IndexerError::StorageRead(format!("read run_dir: {e}")))?
+    {
+        let dir_entry =
+            dir_entry.map_err(|e| IndexerError::StorageRead(format!("read run_dir entry: {e}")))?;
+        let dir_name = dir_entry.file_name();
+        let dir_name_str = dir_name.to_string_lossy();
+        if let Some(g_id_str) = dir_name_str.strip_prefix("g_") {
+            let nb_dir = dir_entry.path().join("numbig");
+            if nb_dir.exists() {
+                let mut per_pred = BTreeMap::new();
+                for entry in std::fs::read_dir(&nb_dir)
+                    .map_err(|e| IndexerError::StorageRead(format!("read numbig dir: {e}")))?
+                {
+                    let entry = entry.map_err(|e| {
+                        IndexerError::StorageRead(format!("read numbig entry: {e}"))
+                    })?;
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if let Some(rest) = name_str.strip_prefix("p_") {
+                        if let Some(id_str) = rest.strip_suffix(".nba") {
+                            if let Ok(p_id) = id_str.parse::<u32>() {
+                                let cid = upload_dict_file(
+                                    content_store,
+                                    &entry.path(),
+                                    DictKind::NumBig { p_id },
+                                    "dict artifact uploaded to CAS (from disk)",
+                                )
+                                .await?;
+                                per_pred.insert(p_id.to_string(), cid);
+                            }
+                        }
+                    }
+                }
+                if !per_pred.is_empty() {
+                    numbig.insert(g_id_str.to_string(), per_pred);
+                }
+            }
+        }
+    }
+    Ok(numbig)
+}
+
+/// Upload the vector arenas an import wrote under `run_dir/g_{g_id}/vectors/`,
+/// keyed by graph id and then predicate id (both as decimal strings).
+pub async fn upload_vector_arenas_from_disk(
+    content_store: &dyn ContentStore,
+    run_dir: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, VectorDictRef>>> {
+    use fluree_db_core::DictKind;
+    use std::collections::BTreeMap;
+
+    let mut vectors: BTreeMap<String, BTreeMap<String, VectorDictRef>> = BTreeMap::new();
+    // Scan for g_{id}/vectors/ subdirectories
+    for dir_entry in std::fs::read_dir(run_dir)
+        .map_err(|e| IndexerError::StorageRead(format!("read run_dir: {e}")))?
+    {
+        let dir_entry =
+            dir_entry.map_err(|e| IndexerError::StorageRead(format!("read run_dir entry: {e}")))?;
+        let dir_name = dir_entry.file_name();
+        let dir_name_str = dir_name.to_string_lossy();
+        if let Some(g_id_str) = dir_name_str.strip_prefix("g_") {
+            let vec_dir = dir_entry.path().join("vectors");
+            if vec_dir.exists() {
+                let mut per_pred = BTreeMap::new();
+                for entry in std::fs::read_dir(&vec_dir)
+                    .map_err(|e| IndexerError::StorageRead(format!("read vectors dir: {e}")))?
+                {
+                    let entry = entry.map_err(|e| {
+                        IndexerError::StorageRead(format!("read vectors entry: {e}"))
+                    })?;
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if let Some(rest) = name_str.strip_prefix("p_") {
+                        if let Some(id_str) = rest.strip_suffix(".vam") {
+                            if let Ok(p_id) = id_str.parse::<u32>() {
+                                let manifest_bytes =
+                                    tokio::fs::read(entry.path()).await.map_err(|e| {
+                                        IndexerError::StorageRead(format!(
+                                            "read vector manifest: {e}"
+                                        ))
+                                    })?;
+                                let manifest =
+                                    fluree_db_binary_index::arena::vector::read_vector_manifest(
+                                        &manifest_bytes,
+                                    )
+                                    .map_err(|e| {
+                                        IndexerError::StorageRead(format!(
+                                            "parse vector manifest: {e}"
+                                        ))
+                                    })?;
+
+                                let mut shard_cids = Vec::with_capacity(manifest.shards.len());
+                                let mut shard_infos = Vec::with_capacity(manifest.shards.len());
+                                for (shard_idx, shard_info) in manifest.shards.iter().enumerate() {
+                                    let shard_path =
+                                        vec_dir.join(format!("p_{p_id}_s_{shard_idx}.vas"));
+                                    let shard_cid = upload_dict_file(
+                                        content_store,
+                                        &shard_path,
+                                        DictKind::VectorShard { p_id },
+                                        "dict artifact uploaded to CAS (from disk)",
+                                    )
+                                    .await?;
+                                    shard_infos.push(
+                                        fluree_db_binary_index::arena::vector::ShardInfo {
+                                            cas: shard_cid.to_string(),
+                                            count: shard_info.count,
+                                        },
+                                    );
+                                    shard_cids.push(shard_cid);
+                                }
+
+                                let final_manifest =
+                                    fluree_db_binary_index::arena::vector::VectorManifest {
+                                        shards: shard_infos,
+                                        ..manifest
+                                    };
+                                let manifest_json = serde_json::to_vec_pretty(&final_manifest)
+                                    .map_err(|e| {
+                                        IndexerError::StorageWrite(format!(
+                                            "serialize vector manifest: {e}"
+                                        ))
+                                    })?;
+                                let final_manifest_path =
+                                    vec_dir.join(format!("p_{p_id}_final.vam"));
+                                std::fs::write(&final_manifest_path, &manifest_json).map_err(
+                                    |e| {
+                                        IndexerError::StorageWrite(format!(
+                                            "write final vector manifest: {e}"
+                                        ))
+                                    },
+                                )?;
+                                let manifest_cid = upload_dict_file(
+                                    content_store,
+                                    &final_manifest_path,
+                                    DictKind::VectorManifest { p_id },
+                                    "dict artifact uploaded to CAS (from disk)",
+                                )
+                                .await?;
+
+                                per_pred.insert(
+                                    p_id.to_string(),
+                                    VectorDictRef {
+                                        p_id,
+                                        manifest: manifest_cid,
+                                        shards: shard_cids,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                if !per_pred.is_empty() {
+                    vectors.insert(g_id_str.to_string(), per_pred);
+                }
+            }
+        }
+    }
+    Ok(vectors)
 }
 
 #[cfg(test)]

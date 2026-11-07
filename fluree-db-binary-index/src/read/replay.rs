@@ -19,11 +19,12 @@ use std::sync::Arc;
 use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
 use crate::format::leaf::LeafletDirEntryV3;
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record::LIST_INDEX_NONE;
 use crate::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use crate::read::column_types::{ColumnBatch, ColumnData};
 
 /// Sentinel for o_i when no list index is present.
-const OI_NONE: u32 = u32::MAX;
+const OI_NONE: u64 = LIST_INDEX_NONE;
 
 // ============================================================================
 // V3 Fact Key (identity for replay)
@@ -35,7 +36,7 @@ struct FactKeyV3 {
     p_id: u32,
     o_type: u16,
     o_key: u64,
-    o_i: u32,
+    o_i: u64,
     /// The graph, part of a fact's identity in a pooled leaflet (0 elsewhere).
     g_id: fluree_db_core::GraphId,
 }
@@ -340,7 +341,7 @@ pub fn replay_leaflet(
     let mut out_p: Vec<u32> = Vec::new();
     let mut out_otype: Vec<u16> = Vec::new();
     let mut out_okey: Vec<u64> = Vec::new();
-    let mut out_oi: Vec<u32> = Vec::new();
+    let mut out_oi: Vec<u64> = Vec::new();
     let mut out_t: Vec<u32> = Vec::new();
     // Graph of each row; meaningful only for a pooled leaflet.
     let mut out_g: Vec<fluree_db_core::GraphId> = Vec::new();
@@ -355,7 +356,7 @@ pub fn replay_leaflet(
                      p: &mut Vec<u32>,
                      ot: &mut Vec<u16>,
                      ok: &mut Vec<u64>,
-                     oi: &mut Vec<u32>,
+                     oi: &mut Vec<u64>,
                      t: &mut Vec<u32>,
                      g: &mut Vec<fluree_db_core::GraphId>| {
         s.push(batch.s_id.get(row));
@@ -373,7 +374,7 @@ pub fn replay_leaflet(
                         p: &mut Vec<u32>,
                         ot: &mut Vec<u16>,
                         ok: &mut Vec<u64>,
-                        oi: &mut Vec<u32>,
+                        oi: &mut Vec<u64>,
                         t: &mut Vec<u32>,
                         g: &mut Vec<fluree_db_core::GraphId>| {
         s.push(rec.s_id.as_u64());

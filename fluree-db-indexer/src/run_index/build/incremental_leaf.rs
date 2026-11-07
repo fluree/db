@@ -16,6 +16,7 @@
 //! Their `row_count=0` but `history_offset/len/min_t/max_t` are preserved so
 //! time-travel replay can discover them.
 
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::io;
 
 use fluree_db_binary_index::format::history_sidecar::{
@@ -949,7 +950,7 @@ fn zeroed_record() -> RunRecordV2 {
         o_key: 0,
         p_id: 0,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: 0,
         g_id: 0,
     }
@@ -1020,7 +1021,7 @@ mod tests {
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::ObjKey;
 
-    const OI_NONE: u32 = u32::MAX;
+    const OI_NONE: u64 = LIST_INDEX_NONE;
 
     fn rec2(s_id: u64, p_id: u32, val: i64, t: u32) -> RunRecordV2 {
         RunRecordV2 {

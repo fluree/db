@@ -4,27 +4,30 @@
 //! `o_type: u16` (`OType`). Dropping `op` from the wire format (import-only:
 //! all ops are asserts; `op` only appears in `HistEntryV2`).
 //!
-//! ## Run wire layout (30 bytes, little-endian, no g_id)
+//! ## Run wire layout (34 bytes, little-endian, no g_id)
 //!
 //! ```text
 //! s_id:    u64   [0..8]     subject ID (sid64)
 //! o_key:   u64   [8..16]    object key payload
 //! p_id:    u32   [16..20]   predicate ID
 //! t:       u32   [20..24]   transaction number
-//! o_i:     u32   [24..28]   list index (u32::MAX = none)
-//! o_type:  u16   [28..30]   unified type tag (OType)
+//! o_i:     u64   [24..32]   list place (LIST_INDEX_NONE = none)
+//! o_type:  u16   [32..34]   unified type tag (OType)
 //! ```
 //!
-//! ## Spool wire layout (32 bytes, little-endian, includes g_id)
+//! A v4 artifact stores the 30-byte layout with a 32-bit `o_i` at [24..28]
+//! ([`RunRecordV2::read_run_le_narrow`]).
+//!
+//! ## Spool wire layout (38 bytes, little-endian, includes g_id)
 //!
 //! ```text
-//! g_id:    u16   [0..2]     graph ID
-//! s_id:    u64   [2..10]    (NB: unaligned)
-//! o_key:   u64   [10..18]
-//! p_id:    u32   [18..22]
-//! t:       u32   [22..26]
-//! o_i:     u32   [26..30]
-//! o_type:  u16   [30..32]
+//! g_id:    u32   [0..4]     graph ID
+//! s_id:    u64   [4..12]
+//! o_key:   u64   [12..20]
+//! p_id:    u32   [20..24]
+//! t:       u32   [24..28]
+//! o_i:     u64   [28..36]
+//! o_type:  u16   [36..38]
 //! ```
 
 use fluree_db_core::o_type::OType;
@@ -32,19 +35,22 @@ use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::subject_id::SubjectId;
 use std::cmp::Ordering;
 
-use super::run_record::{RunRecord, RunSortOrder, LIST_INDEX_NONE};
+use super::run_record::{widen_list_index, RunRecord, RunSortOrder, LIST_INDEX_NONE};
 
 /// Wire format size of a V2 run record (no g_id, no op).
-pub const RECORD_V2_WIRE_SIZE: usize = 30;
+pub const RECORD_V2_WIRE_SIZE: usize = 34;
+
+/// [`RECORD_V2_WIRE_SIZE`] as a v4 artifact stores it, with a 32-bit `o_i`.
+pub const RECORD_V2_NARROW_WIRE_SIZE: usize = 30;
 
 /// Wire format size of a V2 run record with op byte (no g_id).
 ///
 /// Used by the rebuild pipeline where retract-winners must be identified.
 /// Import uses `RECORD_V2_WIRE_SIZE` (no op, all records are asserts).
-pub const RECORD_V2_WITH_OP_WIRE_SIZE: usize = 31;
+pub const RECORD_V2_WITH_OP_WIRE_SIZE: usize = 35;
 
 /// Wire format size of a V2 spool record (includes a `u32` g_id).
-pub const SPOOL_V2_WIRE_SIZE: usize = 34;
+pub const SPOOL_V2_WIRE_SIZE: usize = 38;
 
 /// V2 run record — `o_type` replaces `(o_kind, dt, lang_id)`.
 ///
@@ -72,15 +78,17 @@ pub struct RunRecordV2 {
     pub p_id: u32,
     /// Transaction number (data column, not part of sort key).
     pub t: u32,
-    /// List index (`u32::MAX` = not a list member).
-    pub o_i: u32,
+    /// List place (`LIST_INDEX_NONE` = not a list member): the list in the
+    /// high 32 bits, the position in the low 32
+    /// ([`fluree_db_core::list_index`]).
+    pub o_i: u64,
     /// Unified type tag (OType).
     pub o_type: u16,
     /// Graph ID (0 = default graph). Only pooled run files carry it.
     pub g_id: fluree_db_core::GraphId,
 }
 
-// Verify size: 8 + 8 + 4 + 4 + 4 + 2 + 4, padded to 40 bytes.
+// Verify size: 8 + 8 + 4 + 4 + 8 + 2 + 4, padded to 40 bytes.
 const _: () = assert!(std::mem::size_of::<RunRecordV2>() == 40);
 
 impl RunRecordV2 {
@@ -92,7 +100,7 @@ impl RunRecordV2 {
         p_id: u32,
         o_type: OType,
         o_key: u64,
-        o_i: u32,
+        o_i: u64,
         t: u32,
     ) -> Self {
         Self {
@@ -139,18 +147,18 @@ impl RunRecordV2 {
 
     // ── Wire format I/O ────────────────────────────────────────────────
 
-    /// Serialize to run wire format (30 bytes, no g_id).
+    /// Serialize to run wire format (34 bytes, no g_id).
     #[inline]
     pub fn write_run_le(&self, buf: &mut [u8; RECORD_V2_WIRE_SIZE]) {
         buf[0..8].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
         buf[8..16].copy_from_slice(&self.o_key.to_le_bytes());
         buf[16..20].copy_from_slice(&self.p_id.to_le_bytes());
         buf[20..24].copy_from_slice(&self.t.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.o_i.to_le_bytes());
-        buf[28..30].copy_from_slice(&self.o_type.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.o_i.to_le_bytes());
+        buf[32..34].copy_from_slice(&self.o_type.to_le_bytes());
     }
 
-    /// Deserialize from run wire format (30 bytes, no g_id).
+    /// Deserialize from run wire format (34 bytes, no g_id).
     #[inline]
     pub fn read_run_le(buf: &[u8; RECORD_V2_WIRE_SIZE]) -> Self {
         Self {
@@ -158,13 +166,45 @@ impl RunRecordV2 {
             o_key: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             p_id: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
             t: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            o_i: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            o_i: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            o_type: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
+            g_id: 0,
+        }
+    }
+
+    /// Serialize to the 30-byte run wire format of a v4 artifact, whose
+    /// `o_i` is a 32-bit position. A v4 artifact holds list 0 only.
+    #[inline]
+    pub fn write_run_le_narrow(&self, buf: &mut [u8; RECORD_V2_NARROW_WIRE_SIZE]) {
+        let o_i = if self.o_i == LIST_INDEX_NONE {
+            u32::MAX
+        } else {
+            u32::try_from(self.o_i).expect("a v4 artifact's list places are list 0's")
+        };
+        buf[0..8].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
+        buf[8..16].copy_from_slice(&self.o_key.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.p_id.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.t.to_le_bytes());
+        buf[24..28].copy_from_slice(&o_i.to_le_bytes());
+        buf[28..30].copy_from_slice(&self.o_type.to_le_bytes());
+    }
+
+    /// Deserialize the 30-byte run wire format of a v4 artifact, whose
+    /// `o_i` is a 32-bit position.
+    #[inline]
+    pub fn read_run_le_narrow(buf: &[u8; RECORD_V2_NARROW_WIRE_SIZE]) -> Self {
+        Self {
+            s_id: SubjectId(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
+            o_key: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            p_id: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            t: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            o_i: widen_list_index(u32::from_le_bytes(buf[24..28].try_into().unwrap())),
             o_type: u16::from_le_bytes(buf[28..30].try_into().unwrap()),
             g_id: 0,
         }
     }
 
-    /// Serialize to run wire format with op byte (31 bytes, no g_id).
+    /// Serialize to run wire format with op byte (35 bytes, no g_id).
     ///
     /// Used by the rebuild pipeline's run writer to preserve assert/retract identity.
     #[inline]
@@ -173,12 +213,12 @@ impl RunRecordV2 {
         buf[8..16].copy_from_slice(&self.o_key.to_le_bytes());
         buf[16..20].copy_from_slice(&self.p_id.to_le_bytes());
         buf[20..24].copy_from_slice(&self.t.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.o_i.to_le_bytes());
-        buf[28..30].copy_from_slice(&self.o_type.to_le_bytes());
-        buf[30] = op;
+        buf[24..32].copy_from_slice(&self.o_i.to_le_bytes());
+        buf[32..34].copy_from_slice(&self.o_type.to_le_bytes());
+        buf[34] = op;
     }
 
-    /// Deserialize from run wire format with op byte (31 bytes, no g_id).
+    /// Deserialize from run wire format with op byte (35 bytes, no g_id).
     #[inline]
     pub fn read_run_le_with_op(buf: &[u8; RECORD_V2_WITH_OP_WIRE_SIZE]) -> (Self, u8) {
         let record = Self {
@@ -186,14 +226,14 @@ impl RunRecordV2 {
             o_key: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             p_id: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
             t: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            o_i: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
-            o_type: u16::from_le_bytes(buf[28..30].try_into().unwrap()),
+            o_i: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            o_type: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
             g_id: 0,
         };
-        (record, buf[30])
+        (record, buf[34])
     }
 
-    /// Serialize to spool wire format (34 bytes, includes g_id).
+    /// Serialize to spool wire format (38 bytes, includes g_id).
     #[inline]
     pub fn write_spool_le(&self, buf: &mut [u8; SPOOL_V2_WIRE_SIZE]) {
         buf[0..4].copy_from_slice(&self.g_id.to_le_bytes());
@@ -201,11 +241,11 @@ impl RunRecordV2 {
         buf[12..20].copy_from_slice(&self.o_key.to_le_bytes());
         buf[20..24].copy_from_slice(&self.p_id.to_le_bytes());
         buf[24..28].copy_from_slice(&self.t.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.o_i.to_le_bytes());
-        buf[32..34].copy_from_slice(&self.o_type.to_le_bytes());
+        buf[28..36].copy_from_slice(&self.o_i.to_le_bytes());
+        buf[36..38].copy_from_slice(&self.o_type.to_le_bytes());
     }
 
-    /// Deserialize from spool wire format (34 bytes, includes g_id).
+    /// Deserialize from spool wire format (38 bytes, includes g_id).
     #[inline]
     pub fn read_spool_le(buf: &[u8; SPOOL_V2_WIRE_SIZE]) -> Self {
         Self {
@@ -214,16 +254,15 @@ impl RunRecordV2 {
             o_key: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
             p_id: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
             t: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
-            o_i: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
-            o_type: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
+            o_i: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
+            o_type: u16::from_le_bytes(buf[36..38].try_into().unwrap()),
         }
     }
 }
 
-/// Run-file record layout for one file: the 30-byte record, then `g_id`
+/// Run-file record layout for one file: the 34-byte record, then `g_id`
 /// (u32 LE) when the file's order is pooled, then the op byte when the file
-/// carries ops. Dedicated orders keep the 30/31-byte layouts above, so their
-/// run files are unchanged.
+/// carries ops. Dedicated orders keep the 34/35-byte layouts above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunRecordLayout {
     pooled: bool,
@@ -419,38 +458,53 @@ pub fn identity_v2_for_order(order: RunSortOrder) -> fn(&RunRecordV2, &RunRecord
 // V2 Ordered Key (for leaf/branch routing)
 // ============================================================================
 
-/// Routing key for leaf/branch routing, held in a fixed 30-byte array.
+/// Routing key for leaf/branch routing, held in a fixed 34-byte array.
 ///
 /// The field order matches the physical sort order so comparison is
 /// lexicographic on the raw bytes (memcmp). All fields are big-endian
 /// for correct byte-wise comparison.
 ///
-/// Dedicated orders use the first 26 bytes and leave the rest zero; only those
-/// 26 bytes are stored ([`ordered_key_len`]). Pooled orders add `g_id` as a
-/// u32, trailing for `SpotG`..`OpstG` and leading for `Gspo`, and store all 30.
+/// Dedicated orders use the first 30 bytes and leave the rest zero; only those
+/// 30 bytes are stored ([`ordered_key_len`]). Pooled orders add `g_id` as a
+/// u32, trailing for `SpotG`..`OpstG` and leading for `Gspo`, and store all 34.
 ///
 /// | Order | Layout |
 /// |-------|--------|
-/// | SPOT  | `s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(4)` |
-/// | PSOT  | `p_id(4) + s_id(8) + o_type(2) + o_key(8) + o_i(4)` |
-/// | POST  | `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` |
-/// | OPST  | `o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8)` |
+/// | SPOT  | `s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(8)` |
+/// | PSOT  | `p_id(4) + s_id(8) + o_type(2) + o_key(8) + o_i(8)` |
+/// | POST  | `p_id(4) + o_type(2) + o_key(8) + o_i(8) + s_id(8)` |
+/// | OPST  | `o_type(2) + o_key(8) + o_i(8) + p_id(4) + s_id(8)` |
 /// | GSPO  | `g_id(4) + ` SPOT |
-/// | xxxxG | the base order's 26 bytes `+ g_id(4)` |
-pub const ORDERED_KEY_V2_SIZE: usize = 30;
+/// | xxxxG | the base order's 30 bytes `+ g_id(4)` |
+///
+/// A v4 artifact stores keys with a 4-byte `o_i` (26 and 30 bytes);
+/// [`ordered_key_from_stored`] widens them to this form, so keys in memory
+/// always compare in one layout.
+pub const ORDERED_KEY_V2_SIZE: usize = 34;
 
 /// Stored key length of a dedicated order.
-pub const ORDERED_KEY_V2_BASE_SIZE: usize = 26;
+pub const ORDERED_KEY_V2_BASE_SIZE: usize = 30;
 
-/// Stored length of an ordered key for `order`: 26 bytes for dedicated
-/// orders, 30 for pooled ones.
+/// [`ORDERED_KEY_V2_BASE_SIZE`] in a v4 artifact.
+const ORDERED_KEY_V2_NARROW_BASE_SIZE: usize = 26;
+
+/// Stored length of an ordered key for `order`: 30 bytes for dedicated
+/// orders, 34 for pooled ones.
 #[inline]
 pub fn ordered_key_len(order: RunSortOrder) -> usize {
-    if order.is_pooled() {
-        ORDERED_KEY_V2_SIZE
+    ordered_key_stored_len(order, false)
+}
+
+/// Stored length of an ordered key for `order`, in a v4 artifact when
+/// `narrow`.
+#[inline]
+pub fn ordered_key_stored_len(order: RunSortOrder, narrow: bool) -> usize {
+    let base = if narrow {
+        ORDERED_KEY_V2_NARROW_BASE_SIZE
     } else {
         ORDERED_KEY_V2_BASE_SIZE
-    }
+    };
+    base + if order.is_pooled() { 4 } else { 0 }
 }
 
 #[inline]
@@ -461,44 +515,57 @@ fn write_base_key(order: RunSortOrder, rec: &RunRecordV2, buf: &mut [u8]) {
             buf[8..12].copy_from_slice(&rec.p_id.to_be_bytes());
             buf[12..14].copy_from_slice(&rec.o_type.to_be_bytes());
             buf[14..22].copy_from_slice(&rec.o_key.to_be_bytes());
-            buf[22..26].copy_from_slice(&rec.o_i.to_be_bytes());
+            buf[22..30].copy_from_slice(&rec.o_i.to_be_bytes());
         }
         RunSortOrder::Psot => {
             buf[0..4].copy_from_slice(&rec.p_id.to_be_bytes());
             buf[4..12].copy_from_slice(&rec.s_id.as_u64().to_be_bytes());
             buf[12..14].copy_from_slice(&rec.o_type.to_be_bytes());
             buf[14..22].copy_from_slice(&rec.o_key.to_be_bytes());
-            buf[22..26].copy_from_slice(&rec.o_i.to_be_bytes());
+            buf[22..30].copy_from_slice(&rec.o_i.to_be_bytes());
         }
         RunSortOrder::Post => {
             buf[0..4].copy_from_slice(&rec.p_id.to_be_bytes());
             buf[4..6].copy_from_slice(&rec.o_type.to_be_bytes());
             buf[6..14].copy_from_slice(&rec.o_key.to_be_bytes());
-            buf[14..18].copy_from_slice(&rec.o_i.to_be_bytes());
-            buf[18..26].copy_from_slice(&rec.s_id.as_u64().to_be_bytes());
+            buf[14..22].copy_from_slice(&rec.o_i.to_be_bytes());
+            buf[22..30].copy_from_slice(&rec.s_id.as_u64().to_be_bytes());
         }
         RunSortOrder::Opst => {
             buf[0..2].copy_from_slice(&rec.o_type.to_be_bytes());
             buf[2..10].copy_from_slice(&rec.o_key.to_be_bytes());
-            buf[10..14].copy_from_slice(&rec.o_i.to_be_bytes());
-            buf[14..18].copy_from_slice(&rec.p_id.to_be_bytes());
-            buf[18..26].copy_from_slice(&rec.s_id.as_u64().to_be_bytes());
+            buf[10..18].copy_from_slice(&rec.o_i.to_be_bytes());
+            buf[18..22].copy_from_slice(&rec.p_id.to_be_bytes());
+            buf[22..30].copy_from_slice(&rec.s_id.as_u64().to_be_bytes());
         }
         _ => unreachable!("write_base_key takes a dedicated order"),
     }
 }
 
+/// The record a base key of `order` names; `narrow` for a v4 artifact's
+/// 26-byte key.
 #[inline]
-fn read_base_key(order: RunSortOrder, buf: &[u8]) -> RunRecordV2 {
+fn read_base_key(order: RunSortOrder, buf: &[u8], narrow: bool) -> RunRecordV2 {
     let u16_at = |i: usize| u16::from_be_bytes(buf[i..i + 2].try_into().unwrap());
     let u32_at = |i: usize| u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
     let u64_at = |i: usize| u64::from_be_bytes(buf[i..i + 8].try_into().unwrap());
-    let (s_id, p_id, o_type, o_key, o_i) = match order {
-        RunSortOrder::Spot => (u64_at(0), u32_at(8), u16_at(12), u64_at(14), u32_at(22)),
-        RunSortOrder::Psot => (u64_at(4), u32_at(0), u16_at(12), u64_at(14), u32_at(22)),
-        RunSortOrder::Post => (u64_at(18), u32_at(0), u16_at(4), u64_at(6), u32_at(14)),
-        RunSortOrder::Opst => (u64_at(18), u32_at(14), u16_at(0), u64_at(2), u32_at(10)),
-        _ => unreachable!("read_base_key takes a dedicated order"),
+    let (s_id, p_id, o_type, o_key, o_i) = if narrow {
+        let o_i = |i: usize| widen_list_index(u32_at(i));
+        match order {
+            RunSortOrder::Spot => (u64_at(0), u32_at(8), u16_at(12), u64_at(14), o_i(22)),
+            RunSortOrder::Psot => (u64_at(4), u32_at(0), u16_at(12), u64_at(14), o_i(22)),
+            RunSortOrder::Post => (u64_at(18), u32_at(0), u16_at(4), u64_at(6), o_i(14)),
+            RunSortOrder::Opst => (u64_at(18), u32_at(14), u16_at(0), u64_at(2), o_i(10)),
+            _ => unreachable!("read_base_key takes a dedicated order"),
+        }
+    } else {
+        match order {
+            RunSortOrder::Spot => (u64_at(0), u32_at(8), u16_at(12), u64_at(14), u64_at(22)),
+            RunSortOrder::Psot => (u64_at(4), u32_at(0), u16_at(12), u64_at(14), u64_at(22)),
+            RunSortOrder::Post => (u64_at(22), u32_at(0), u16_at(4), u64_at(6), u64_at(14)),
+            RunSortOrder::Opst => (u64_at(22), u32_at(18), u16_at(0), u64_at(2), u64_at(10)),
+            _ => unreachable!("read_base_key takes a dedicated order"),
+        }
     };
     RunRecordV2 {
         s_id: SubjectId(s_id),
@@ -525,15 +592,15 @@ pub fn write_ordered_key_v2(
     match order {
         RunSortOrder::Gspo => {
             buf[0..4].copy_from_slice(&g);
-            write_base_key(RunSortOrder::Spot, rec, &mut buf[4..30]);
+            write_base_key(RunSortOrder::Spot, rec, &mut buf[4..34]);
         }
         o if o.is_pooled() => {
-            write_base_key(o.base(), rec, &mut buf[0..26]);
-            buf[26..30].copy_from_slice(&g);
+            write_base_key(o.base(), rec, &mut buf[0..30]);
+            buf[30..34].copy_from_slice(&g);
         }
         o => {
-            write_base_key(o, rec, &mut buf[0..26]);
-            buf[26..30].fill(0);
+            write_base_key(o, rec, &mut buf[0..30]);
+            buf[30..34].fill(0);
         }
     }
 }
@@ -544,29 +611,50 @@ pub fn write_ordered_key_v2(
 /// does `g_id` for a dedicated order.
 #[inline]
 pub fn read_ordered_key_v2(order: RunSortOrder, buf: &[u8; ORDERED_KEY_V2_SIZE]) -> RunRecordV2 {
+    read_stored_key(order, buf, false)
+}
+
+/// The record a stored key of `order` names, read from `buf` in the layout
+/// of a v4 artifact when `narrow`.
+#[inline]
+fn read_stored_key(order: RunSortOrder, buf: &[u8], narrow: bool) -> RunRecordV2 {
+    let base = if narrow {
+        ORDERED_KEY_V2_NARROW_BASE_SIZE
+    } else {
+        ORDERED_KEY_V2_BASE_SIZE
+    };
     let g_at = |i: usize| u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
     match order {
         RunSortOrder::Gspo => {
-            let mut rec = read_base_key(RunSortOrder::Spot, &buf[4..30]);
+            let mut rec = read_base_key(RunSortOrder::Spot, &buf[4..4 + base], narrow);
             rec.g_id = g_at(0);
             rec
         }
         o if o.is_pooled() => {
-            let mut rec = read_base_key(o.base(), &buf[0..26]);
-            rec.g_id = g_at(26);
+            let mut rec = read_base_key(o.base(), &buf[0..base], narrow);
+            rec.g_id = g_at(base);
             rec
         }
-        o => read_base_key(o, &buf[0..26]),
+        o => read_base_key(o, &buf[0..base], narrow),
     }
 }
 
-/// Read a stored key of `ordered_key_len(order)` bytes into the in-memory
-/// 30-byte form (zero-padded for dedicated orders).
+/// Read a stored key of `order` into the in-memory 34-byte form (zero-padded
+/// for dedicated orders). A v4 artifact's key (`narrow`) is widened, so every
+/// key in memory compares in one layout.
 #[inline]
-pub fn ordered_key_from_stored(order: RunSortOrder, bytes: &[u8]) -> [u8; ORDERED_KEY_V2_SIZE] {
+pub fn ordered_key_from_stored(
+    order: RunSortOrder,
+    bytes: &[u8],
+    narrow: bool,
+) -> [u8; ORDERED_KEY_V2_SIZE] {
     let mut key = [0u8; ORDERED_KEY_V2_SIZE];
-    let n = ordered_key_len(order);
-    key[..n].copy_from_slice(&bytes[..n]);
+    if narrow {
+        write_ordered_key_v2(order, &read_stored_key(order, bytes, true), &mut key);
+    } else {
+        let n = ordered_key_len(order);
+        key[..n].copy_from_slice(&bytes[..n]);
+    }
     key
 }
 
@@ -585,7 +673,7 @@ mod tests {
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
 
-    fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, o_i: u32, t: u32) -> RunRecordV2 {
+    fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, o_i: u64, t: u32) -> RunRecordV2 {
         RunRecordV2 {
             s_id: SubjectId(s_id),
             o_key,
@@ -741,7 +829,7 @@ mod tests {
             513,
         );
         for &order in RunSortOrder::pool_build_orders() {
-            assert_eq!(ordered_key_len(order), 30);
+            assert_eq!(ordered_key_len(order), 34);
             let mut key = [0u8; ORDERED_KEY_V2_SIZE];
             write_ordered_key_v2(order, &rec, &mut key);
             let back = read_ordered_key_v2(order, &key);
@@ -749,10 +837,10 @@ mod tests {
             assert_eq!(back.g_id, 513, "{order:?}");
         }
         for &order in RunSortOrder::all_build_orders() {
-            assert_eq!(ordered_key_len(order), 26);
+            assert_eq!(ordered_key_len(order), 30);
             let mut key = [0xFF; ORDERED_KEY_V2_SIZE];
             write_ordered_key_v2(order, &rec, &mut key);
-            assert_eq!(key[26..], [0, 0, 0, 0], "{order:?}: graph bytes stay zero");
+            assert_eq!(key[30..], [0, 0, 0, 0], "{order:?}: graph bytes stay zero");
             assert_eq!(read_ordered_key_v2(order, &key).g_id, 0);
         }
     }
@@ -811,5 +899,60 @@ mod tests {
         assert!(!same_identity_v2_g(&a, &b));
         assert!(!identity_v2_for_order(RunSortOrder::PostG)(&a, &b));
         assert!(identity_v2_for_order(RunSortOrder::Post)(&a, &b));
+    }
+
+    /// A v4 artifact's key, with a 32-bit `o_i`, reads into the same
+    /// in-memory key as the record written wide: its position is list 0's,
+    /// and `u32::MAX` is no list place.
+    #[test]
+    fn a_narrow_key_widens_to_the_wide_key() {
+        let narrow_base = |order: RunSortOrder, rec: &RunRecordV2| -> Vec<u8> {
+            let mut wide = [0u8; ORDERED_KEY_V2_SIZE];
+            write_base_key(order, rec, &mut wide);
+            let at = match order {
+                RunSortOrder::Spot | RunSortOrder::Psot => 22,
+                RunSortOrder::Post => 14,
+                _ => 10,
+            };
+            let o_i = if rec.o_i == LIST_INDEX_NONE {
+                u32::MAX
+            } else {
+                u32::try_from(rec.o_i).unwrap()
+            };
+            let mut out = wide[..at].to_vec();
+            out.extend_from_slice(&o_i.to_be_bytes());
+            out.extend_from_slice(&wide[at + 8..30]);
+            out
+        };
+        for o_i in [LIST_INDEX_NONE, 0, 7] {
+            let rec = in_graph(make_rec(7, 3, OType::XSD_INTEGER.as_u16(), 42, o_i, 1), 9);
+            for &order in RunSortOrder::all_build_orders() {
+                let mut wide = [0u8; ORDERED_KEY_V2_SIZE];
+                write_ordered_key_v2(order, &rec, &mut wide);
+                let narrow = narrow_base(order, &rec);
+                assert_eq!(narrow.len(), ordered_key_stored_len(order, true));
+                assert_eq!(
+                    ordered_key_from_stored(order, &narrow, true),
+                    wide,
+                    "{order:?}"
+                );
+            }
+            for &order in RunSortOrder::pool_build_orders() {
+                let mut wide = [0u8; ORDERED_KEY_V2_SIZE];
+                write_ordered_key_v2(order, &rec, &mut wide);
+                let g = rec.g_id.to_be_bytes();
+                let narrow = if order == RunSortOrder::Gspo {
+                    [g.as_slice(), &narrow_base(RunSortOrder::Spot, &rec)].concat()
+                } else {
+                    [narrow_base(order.base(), &rec).as_slice(), &g].concat()
+                };
+                assert_eq!(narrow.len(), ordered_key_stored_len(order, true));
+                assert_eq!(
+                    ordered_key_from_stored(order, &narrow, true),
+                    wide,
+                    "{order:?}"
+                );
+            }
+        }
     }
 }

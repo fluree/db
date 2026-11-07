@@ -606,9 +606,14 @@ pub(crate) fn term_object_binding(
     let o_type = key.o_type.as_u16();
     // An arena kind's key is not the main index's, so it binds decoded.
     if !fluree_db_core::triple_term::is_lexical_term_object(key.o_type) {
-        if let Some(b) =
-            late_materialized_object_binding(o_type, key.o_key, key.p_id, t, u32::MAX, None)
-        {
+        if let Some(b) = late_materialized_object_binding(
+            o_type,
+            key.o_key,
+            key.p_id,
+            t,
+            fluree_db_core::list_index::NONE,
+            None,
+        ) {
             return Ok(b);
         }
     }

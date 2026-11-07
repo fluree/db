@@ -189,6 +189,15 @@ pub use parse::{parse_query, parse_query_in_dataset};
 pub use var_registry::{VarId, VarRegistry};
 
 use execute::build_where_operators_seeded;
+
+/// The planner stats a transaction's WHERE plans `db` from (the
+/// novelty-merged estimates, cached per overlay content). See
+/// [`fluree_db_core::StatsView::estimates_only`] for planning a state these
+/// don't describe exactly.
+pub fn planner_stats_view(db: GraphDbRef<'_>) -> Option<Arc<fluree_db_core::StatsView>> {
+    let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+    stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
+}
 use fluree_db_core::GraphDbRef;
 use std::sync::Arc;
 
@@ -356,6 +365,24 @@ pub async fn execute_where_streaming<'a>(
             },
         });
     }
+
+    // A `p/rdf:rest*/rdf:first` walk reads lists as RDF cells, as a query's
+    // does (`crate::list_view::rewrite_list_walks`), unless the caller read
+    // every list so (`crate::list_view::rewrite_patterns`).
+    let walked;
+    let walks = list_view::has_list_walk(patterns) && !list_view::has_list_view(patterns);
+    let patterns = match walks {
+        true => match list_view::view_for(db.snapshot, db.overlay, None)? {
+            Some(view) => {
+                walked = list_view::rewrite_list_walks(patterns.to_vec(), &view, &|iri| {
+                    db.snapshot.encode_iri(iri)
+                });
+                &walked[..]
+            }
+            None => patterns,
+        },
+        false => patterns,
+    };
 
     // Plan with the same cached stats view the read path uses — without it,
     // `reorder_patterns` falls back to default selectivities, where a bound-

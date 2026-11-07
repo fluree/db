@@ -5159,14 +5159,9 @@ async fn push_refuses_a_graph_nothing_registers() {
     }
 }
 
-/// A push to another instance of the same ledger carries a commit that
-/// writes its config graph. Writing it registers the namespace of the
-/// ledger's own graph IRIs, so the txn-meta graph encodes differently once
-/// the push applies than when its metadata flakes were stamped; both are
-/// that graph.
-#[tokio::test]
-async fn push_of_a_config_write_reaches_the_same_ledger_elsewhere() {
-    let ledger_id = "it/push-config-write:main";
+/// A ledger of two commits: `ex:alice`, then a write to its config graph,
+/// which registers the namespace of the ledger's own graph IRIs.
+async fn source_with_a_config_write(ledger_id: &str) -> fluree_db_api::Fluree {
     let source = FlureeBuilder::memory().build_memory();
     source
         .create_ledger(ledger_id)
@@ -5190,35 +5185,12 @@ async fn push_of_a_config_write_reaches_the_same_ledger_elsewhere() {
         .commit()
         .await
         .expect("config write");
+    source
+}
 
-    let target = FlureeBuilder::memory().build_memory();
-    target
-        .create_ledger(ledger_id)
-        .await
-        .expect("create target");
-    let pushed = target
-        .push_commits(
-            ledger_id,
-            newest_commits(&source, ledger_id, 100).await,
-            &GovernanceOptions::default(),
-            &target.default_index_config(),
-        )
-        .await
-        .expect("push");
-    assert_eq!(pushed.accepted, 2);
-    let names = target
-        .query_connection(&json!({
-            "@context": {"ex": "http://example.org/"},
-            "from": ledger_id,
-            "select": "?name",
-            "where": {"@id": "ex:alice", "ex:name": "?name"}
-        }))
-        .await
-        .expect("query");
-    let ledger = target.ledger(ledger_id).await.expect("ledger");
-    assert_eq!(names.to_jsonld(&ledger.snapshot).unwrap(), json!(["Alice"]));
-    // Each commit's metadata is in the txn-meta graph, under either encoding.
-    let commits = target
+/// The `f:t` of each commit record in `ledger_id`'s txn-meta graph.
+async fn txn_meta_commit_ts(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> serde_json::Value {
+    let commits = fluree
         .query_connection(&json!({
             "from": format!("{ledger_id}#txn-meta"),
             "select": "?t",
@@ -5227,7 +5199,149 @@ async fn push_of_a_config_write_reaches_the_same_ledger_elsewhere() {
         }))
         .await
         .expect("txn-meta query");
-    assert_eq!(commits.to_jsonld(&ledger.snapshot).unwrap(), json!([1, 2]));
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    commits.to_jsonld(&ledger.snapshot).unwrap()
+}
+
+/// A new instance of `ledger_id` sent `request` by a push or a pull, and how
+/// many commits it took.
+async fn transfer_to_a_new_instance(
+    ledger_id: &str,
+    request: fluree_db_api::PushCommitsRequest,
+    pull: bool,
+) -> (fluree_db_api::Fluree, fluree_db_api::Result<usize>) {
+    let target = FlureeBuilder::memory().build_memory();
+    target
+        .create_ledger(ledger_id)
+        .await
+        .expect("create target");
+    let taken = if pull {
+        target
+            .import_commits_incremental(ledger_id, request)
+            .await
+            .map(|pulled| pulled.imported)
+    } else {
+        target
+            .push_commits(
+                ledger_id,
+                request,
+                &GovernanceOptions::default(),
+                &target.default_index_config(),
+            )
+            .await
+            .map(|pushed| pushed.accepted)
+    };
+    (target, taken)
+}
+
+/// A push or pull to another instance of the same ledger carries a commit
+/// that writes its config graph. That commit registers the namespace of the
+/// ledger's own graph IRIs, so the txn-meta graph has another Sid once the
+/// commits apply than before; their metadata takes the former, as a reload
+/// reads it.
+#[tokio::test]
+async fn a_config_write_pushed_or_pulled_reaches_the_same_ledger_elsewhere() {
+    let ledger_id = "it/push-config-write:main";
+    let source = source_with_a_config_write(ledger_id).await;
+
+    for pull in [false, true] {
+        let (target, taken) = transfer_to_a_new_instance(
+            ledger_id,
+            newest_commits(&source, ledger_id, 100).await,
+            pull,
+        )
+        .await;
+        assert_eq!(taken.expect("transfer"), 2, "pull: {pull}");
+        for reloaded in [false, true] {
+            if reloaded {
+                target.disconnect_ledger(ledger_id).await;
+            }
+            let names = target
+                .query_connection(&json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "from": ledger_id,
+                    "select": "?name",
+                    "where": {"@id": "ex:alice", "ex:name": "?name"}
+                }))
+                .await
+                .expect("query");
+            let ledger = target.ledger(ledger_id).await.expect("ledger");
+            assert_eq!(names.to_jsonld(&ledger.snapshot).unwrap(), json!(["Alice"]));
+            assert_eq!(
+                txn_meta_commit_ts(&target, ledger_id).await,
+                json!([1, 2]),
+                "pull: {pull}, reloaded: {reloaded}"
+            );
+        }
+    }
+}
+
+/// A commit record forged into the blob of that config write never becomes
+/// a commit, whichever Sid it names the txn-meta graph by. Under the Sid the
+/// graph has once the commits apply, it is screened out, as a reload screens
+/// it; under the one from before, it has no route and the transfer is refused
+/// before the head moves.
+#[tokio::test]
+async fn a_config_write_pushed_or_pulled_lands_no_forged_commit_record() {
+    use fluree_db_api::Base64Bytes;
+    use fluree_db_core::commit::codec::{read_commit, write_commit};
+    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_vocab::namespaces::{EMPTY, FLUREE_COMMIT, FLUREE_DB, XSD};
+
+    let ledger_id = "it/push-config-write-forged:main";
+    let source = source_with_a_config_write(ledger_id).await;
+    let request = newest_commits(&source, ledger_id, 100).await;
+    let config_write = read_commit(&request.commits[1].0).expect("read config write");
+    let txn_meta_iri = format!("urn:fluree:{ledger_id}#txn-meta");
+    let after = config_write
+        .namespace_delta
+        .iter()
+        .find_map(|(code, prefix)| {
+            let local = txn_meta_iri.strip_prefix(prefix.as_str())?;
+            Some(Sid::new(*code, local))
+        })
+        .expect("the config write registers the txn-meta graph's namespace");
+    let before = Sid::new(EMPTY, &txn_meta_iri);
+
+    // (txn-meta graph Sid, pull, lands)
+    for (graph, pull, lands) in [
+        (after.clone(), false, true),
+        (after, true, true),
+        (before.clone(), false, false),
+        (before, true, false),
+    ] {
+        let mut commit = config_write.clone();
+        let mut forged = commit.flakes[0].clone();
+        forged.g = Some(graph.clone());
+        forged.s = Sid::new(FLUREE_COMMIT, "forged");
+        forged.p = Sid::new(FLUREE_DB, "t");
+        forged.o = FlakeValue::Long(99);
+        forged.dt = Sid::new(XSD, "long");
+        forged.op = true;
+        commit.flakes.push(forged);
+        let mut request = request.clone();
+        request.commits[1] = Base64Bytes(write_commit(&commit, false, None).unwrap().bytes);
+
+        let (target, taken) = transfer_to_a_new_instance(ledger_id, request, pull).await;
+        if lands {
+            assert_eq!(taken.expect("transfer"), 2, "{graph}, pull: {pull}");
+            for reloaded in [false, true] {
+                if reloaded {
+                    target.disconnect_ledger(ledger_id).await;
+                }
+                assert_eq!(
+                    txn_meta_commit_ts(&target, ledger_id).await,
+                    json!([1, 2]),
+                    "{graph}, pull: {pull}, reloaded: {reloaded}"
+                );
+            }
+        } else {
+            assert!(taken.is_err(), "{graph}, pull: {pull}: must be refused");
+            target.disconnect_ledger(ledger_id).await;
+            let ledger = target.ledger(ledger_id).await.expect("reload");
+            assert_eq!(ledger.t(), 0, "{graph}, pull: {pull}");
+        }
+    }
 }
 
 // =============================================================================

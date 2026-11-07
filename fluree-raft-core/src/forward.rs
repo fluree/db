@@ -471,15 +471,10 @@ async fn forward_request(
     max_body_bytes: usize,
 ) -> Result<Response, ForwardError> {
     let (parts, body) = req.into_parts();
-    let original_uri = parts.extensions.get::<OriginalUri>().map(|o| &o.0);
-    let path_and_query = original_uri
-        .and_then(|uri| uri.path_and_query())
-        .or_else(|| parts.uri.path_and_query())
-        .map_or("/", axum::http::uri::PathAndQuery::as_str);
-    let leader_url = format!(
-        "{}{}",
-        leader_base_url.trim_end_matches('/'),
-        path_and_query
+    let leader_url = crate::http::outbound_url(
+        leader_base_url,
+        parts.extensions.get::<OriginalUri>().map(|o| &o.0),
+        &parts.uri,
     );
 
     let body_bytes = axum::body::to_bytes(body, max_body_bytes)

@@ -140,7 +140,7 @@ fn spot_cursor(
 ) -> BinaryCursor {
     match store.graph_tree(g_id, RunSortOrder::Spot) {
         Some(tree) if tree.g_filter.is_some() => {
-            let bound = |s: u64, p: u32, o_type: u16, o: u64, o_i: u32| RunRecordV2 {
+            let bound = |s: u64, p: u32, o_type: u16, o: u64, o_i: u64| RunRecordV2 {
                 s_id: SubjectId(s),
                 o_key: o,
                 p_id: p,
@@ -154,7 +154,7 @@ fn spot_cursor(
                 tree.order,
                 tree.branch,
                 &bound(0, 0, 0, 0, 0),
-                &bound(u64::MAX, u32::MAX, u16::MAX, u64::MAX, u32::MAX),
+                &bound(u64::MAX, u32::MAX, u16::MAX, u64::MAX, u64::MAX),
                 BinaryFilter {
                     g_id: tree.g_filter,
                     ..Default::default()
@@ -245,10 +245,10 @@ fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
     // The key is the whole of `Flake`'s fact identity — `s, p, o, dt, m` per
     // its hand-written `Eq` — so it is total over the map's own key and no
     // two surviving rows can tie into an unspecified order.
-    fn meta_key(f: &Flake) -> (Option<&str>, Option<i32>) {
+    fn meta_key(f: &Flake) -> (Option<&str>, Option<fluree_db_core::list_index::ListPlace>) {
         (
             f.m.as_ref().and_then(|m| m.lang.as_deref()),
-            f.m.as_ref().and_then(|m| m.i),
+            f.m.as_ref().and_then(fluree_db_core::FlakeMeta::place),
         )
     }
     out.sort_unstable_by(|a, b| {
@@ -635,7 +635,7 @@ async fn batch_annotations(
 /// written once its subject's last row has been read. Memory is the
 /// subject's list items.
 struct SubjectLists<T> {
-    lists: Vec<(String, Vec<(i64, T)>)>,
+    lists: Vec<(String, Vec<(u64, T)>)>,
 }
 
 impl<T> SubjectLists<T> {
@@ -647,7 +647,7 @@ impl<T> SubjectLists<T> {
         self.lists.is_empty()
     }
 
-    fn push(&mut self, p_iri: &str, index: i64, item: T) {
+    fn push(&mut self, p_iri: &str, index: u64, item: T) {
         match self.lists.iter_mut().find(|(p, _)| p == p_iri) {
             Some((_, items)) => items.push((index, item)),
             None => self.lists.push((p_iri.to_string(), vec![(index, item)])),
@@ -663,30 +663,43 @@ impl<T> SubjectLists<T> {
         }
     }
 
-    /// Each list, in the order its predicate was first seen, with its items
-    /// in index order. One predicate holds one list: items that share an
-    /// index keep scan order.
+    /// Each list, in the order its predicate was first seen and then by
+    /// list, with its items in position order. Items that share a place keep
+    /// scan order.
     fn take(&mut self) -> Vec<(String, Vec<T>)> {
-        std::mem::take(&mut self.lists)
-            .into_iter()
-            .map(|(p_iri, mut items)| {
-                items.sort_by_key(|(index, _)| *index);
-                (p_iri, items.into_iter().map(|(_, item)| item).collect())
-            })
-            .collect()
+        let mut out: Vec<(String, Vec<T>)> = Vec::new();
+        for (p_iri, mut items) in std::mem::take(&mut self.lists) {
+            items.sort_by_key(|(index, _)| *index);
+            // The list is the packed place's high half.
+            let mut list = None;
+            for (index, item) in items {
+                let here = Some(index >> 32);
+                match out.last_mut() {
+                    Some((_, members)) if here == list => members.push(item),
+                    _ => out.push((p_iri.clone(), vec![item])),
+                }
+                list = here;
+            }
+        }
+        out
     }
 }
 
-/// The list index of a scanned row, or `None` for an ordinary value.
+/// The list place of a scanned row, packed ([`fluree_db_core::list_index`]),
+/// or `None` for an ordinary value.
 #[inline]
-fn row_list_index(batch: &ColumnBatch, row: usize) -> Option<i64> {
+fn row_list_index(batch: &ColumnBatch, row: usize) -> Option<u64> {
     let index = batch.o_i.get_or(row, LIST_INDEX_NONE);
-    (index != LIST_INDEX_NONE).then_some(i64::from(index))
+    (index != LIST_INDEX_NONE).then_some(index)
 }
 
-/// The list index of an untranslated overlay flake.
-fn flake_list_index(flake: &Flake) -> Option<i64> {
-    flake.m.as_ref().and_then(|m| m.i).map(i64::from)
+/// The list place of an untranslated overlay flake, packed.
+fn flake_list_index(flake: &Flake) -> Option<u64> {
+    flake
+        .m
+        .as_ref()
+        .map(fluree_db_core::FlakeMeta::packed_place)
+        .filter(|&p| p != LIST_INDEX_NONE)
 }
 
 /// IRI → prefixed name compression for Turtle/TriG (and JSON-LD compact IRIs).
@@ -1318,10 +1331,7 @@ fn triple_term_jsonld(
     store: &BinaryIndexStore,
     prefixes: &PrefixMap,
 ) -> Option<serde_json::Value> {
-    let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
-        lang: Some(lang),
-        i: None,
-    });
+    let meta = term.lang.clone().map(fluree_db_core::FlakeMeta::with_lang);
     let object = Flake::new(
         term.s.clone(),
         term.p.clone(),
@@ -2068,7 +2078,7 @@ impl<'a> NtLists<'a> {
         Ok(())
     }
 
-    fn push(&mut self, s_iri: &str, p_iri: &str, index: i64, object: Vec<u8>) {
+    fn push(&mut self, s_iri: &str, p_iri: &str, index: u64, object: Vec<u8>) {
         if self.s_iri.is_none() {
             self.s_iri = Some(s_iri.to_string());
         }

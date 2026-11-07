@@ -2085,7 +2085,7 @@ mod tests {
             o_key: ColumnData::Block(vec![100u64, 101].into()),
             p_id: ColumnData::Const(5),
             o_type: ColumnData::Const(7),
-            o_i: ColumnData::Block(vec![0u32, 1].into()),
+            o_i: ColumnData::Block(vec![0u64, 1].into()),
             t: ColumnData::Block(vec![3u32, 4].into()),
             g_id: ColumnData::AbsentDefault,
         };
@@ -2135,7 +2135,7 @@ mod tests {
             o_key: ColumnData::Block(vec![100u64, 101].into()),
             p_id: ColumnData::Const(5),
             o_type: ColumnData::Const(7),
-            o_i: ColumnData::Block(vec![0u32, 1].into()),
+            o_i: ColumnData::Block(vec![0u64, 1].into()),
             t: ColumnData::Block(vec![3u32, 4].into()),
             g_id: ColumnData::AbsentDefault,
         };

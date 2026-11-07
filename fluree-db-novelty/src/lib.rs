@@ -68,6 +68,8 @@ pub use runtime_stats::{
 };
 pub use stats::current_stats;
 
+#[cfg(test)]
+use fact_state::fact_state_key;
 use fact_state::NoveltyFactState;
 use fluree_db_core::{Flake, GraphId, IndexType, Sid, CONFIG_GRAPH_ID};
 use std::cmp::Ordering;
@@ -186,6 +188,7 @@ impl GraphSlots {
         &mut self.slots[s as usize].1
     }
 
+    #[cfg(test)]
     #[inline]
     fn by_slot(&self, slot: usize) -> &Option<Vec<Arc<Segment>>> {
         &self.slots[slot].1
@@ -233,6 +236,16 @@ impl GraphSlots {
     }
 }
 
+/// Stale fact-state entries a commit sweeps per flake it records, and at
+/// least: enough to clear a trim's leftovers well before the next one.
+const FACT_SWEEP_PER_FLAKE: usize = 4;
+const FACT_SWEEP_MIN: usize = 4096;
+
+/// Surviving flakes, across graphs, a trim re-records into the fact state
+/// rather than leaving its stale entries for commits to sweep. The trim runs
+/// at index publish, under the ledger write lock queries wait on.
+const FACT_REBUILD_MAX: usize = 1024;
+
 /// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
 /// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
 /// novelty size with only bounded per-merge work (no full-novelty rewrite).
@@ -256,6 +269,9 @@ static NEXT_SEG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 struct Segment {
     /// Process-global unique id; stable cache identity (see [`NEXT_SEG_ID`]).
     seg_id: u64,
+    /// The planner stats sums of this segment's flakes, computed on first
+    /// use and kept with the segment: see `runtime_stats::segment_sums`.
+    planner_sums: runtime_stats::SegmentSumsSlot,
     flakes: Vec<Flake>,
     spot: Vec<u32>,
     psot: Vec<u32>,
@@ -305,6 +321,86 @@ impl Segment {
 
         Segment {
             seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            planner_sums: Default::default(),
+            flakes,
+            spot,
+            psot,
+            post,
+            opst,
+            min_t,
+            max_t,
+            size,
+        }
+    }
+
+    /// Merge segments into one, as [`Self::build`] of their flakes in this
+    /// order would: each of the four orders is a k-way merge of the parts'
+    /// own sorted orders rather than a fresh sort, so a tier merge costs
+    /// O(n log k) comparisons instead of O(n log n), four times over. A part
+    /// no one else holds gives up its flakes; a shared one is copied. The
+    /// parts must hold at most [`MAX_SEGMENT_FLAKES`] between them.
+    fn merge(parts: Vec<Arc<Segment>>) -> Self {
+        let mut bases: Vec<u32> = Vec::with_capacity(parts.len());
+        let mut total = 0usize;
+        for part in &parts {
+            bases.push(total as u32);
+            total += part.flakes.len();
+        }
+        debug_assert!(total <= MAX_SEGMENT_FLAKES);
+        let merge_order = |index: IndexType| -> Vec<u32> {
+            let mut out = Vec::with_capacity(total);
+            let mut next = vec![0usize; parts.len()];
+            let head = |i: usize, at: usize| {
+                parts[i].order(index).get(at).map(|&local| MergeHead {
+                    flake: &parts[i].flakes[local as usize],
+                    stream: i,
+                    seg_idx: i,
+                    index,
+                })
+            };
+            let mut heap: BinaryHeap<MergeHead<'_>> =
+                (0..parts.len()).filter_map(|i| head(i, 0)).collect();
+            while let Some(top) = heap.pop() {
+                let i = top.stream;
+                out.push(bases[i] + parts[i].order(index)[next[i]]);
+                next[i] += 1;
+                if let Some(h) = head(i, next[i]) {
+                    heap.push(h);
+                }
+            }
+            out
+        };
+        let ((spot, psot), (post, opst)) = rayon::join(
+            || {
+                rayon::join(
+                    || merge_order(IndexType::Spot),
+                    || merge_order(IndexType::Psot),
+                )
+            },
+            || {
+                rayon::join(
+                    || merge_order(IndexType::Post),
+                    || merge_order(IndexType::Opst),
+                )
+            },
+        );
+
+        let mut min_t = i64::MAX;
+        let mut max_t = i64::MIN;
+        let mut size = 0usize;
+        let mut flakes = Vec::with_capacity(total);
+        for part in parts {
+            min_t = min_t.min(part.min_t);
+            max_t = max_t.max(part.max_t);
+            size += part.size;
+            match Arc::try_unwrap(part) {
+                Ok(part) => flakes.extend(part.flakes),
+                Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
+            }
+        }
+        Segment {
+            seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            planner_sums: Default::default(),
             flakes,
             spot,
             psot,
@@ -349,6 +445,7 @@ impl Segment {
         };
         Some(Segment {
             seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            planner_sums: Default::default(),
             spot: filter(&self.spot),
             psot: filter(&self.psot),
             post: filter(&self.post),
@@ -672,6 +769,11 @@ pub struct Novelty {
     links_through: i64,
     /// An annotation flake has been applied; sticky.
     saw_annotations: bool,
+
+    /// Planner stats this overlay's queries plan from instead of assembling
+    /// their own ([`Self::pin_planner_stats`]). Cleared by every change to
+    /// the overlay's content.
+    planner_stats_pin: Option<Arc<fluree_db_core::StatsView>>,
 }
 
 #[inline]
@@ -745,6 +847,7 @@ impl Novelty {
             link_base: None,
             links_through: t,
             saw_annotations: false,
+            planner_stats_pin: None,
         }
     }
 
@@ -752,6 +855,23 @@ impl Novelty {
     /// a legacy `f:reifies*` bundle flake.
     pub fn has_annotations(&self) -> bool {
         self.saw_annotations
+    }
+
+    /// Plan this overlay's queries from `stats` rather than from stats
+    /// assembled over its own content, until its content next changes. For
+    /// the virtual states of one sequential write, which differ from the
+    /// state it began on by its own few flakes: assembling the stats walks
+    /// the whole novelty window, once per operation otherwise. `stats` must
+    /// carry no soundness licence ([`fluree_db_core::StatsView::estimates_only`]),
+    /// since it doesn't describe this overlay exactly.
+    pub fn pin_planner_stats(&mut self, stats: Arc<fluree_db_core::StatsView>) {
+        self.planner_stats_pin = Some(stats);
+    }
+
+    /// The stats pinned by [`Self::pin_planner_stats`], if the content hasn't
+    /// changed since.
+    pub fn planner_stats_pin(&self) -> Option<&Arc<fluree_db_core::StatsView>> {
+        self.planner_stats_pin.as_ref()
     }
 
     /// Resolve a flake's graph ID from its `Flake.g` field.
@@ -775,6 +895,7 @@ impl Novelty {
         // Drawn from the process-wide allocator shared by every overlay type
         // (see `next_overlay_content_version`); `0` = empty since construction.
         self.content_version = fluree_db_core::overlay::next_overlay_content_version();
+        self.planner_stats_pin = None;
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.
@@ -943,30 +1064,38 @@ impl Novelty {
             // sum to class K+1 exactly.
             let taken = std::mem::take(segs);
             let mut keep: Vec<Arc<Segment>> = Vec::new();
-            let mut flakes: Vec<Flake> = Vec::new();
-            let mut merged = 0usize;
+            let mut parts: Vec<Arc<Segment>> = Vec::with_capacity(tier_width);
             for seg in taken {
-                if merged < tier_width && size_class(seg.flakes.len(), tier_width) == target_class {
-                    match Arc::try_unwrap(seg) {
-                        Ok(s) => flakes.extend(s.flakes),
-                        Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
-                    }
-                    merged += 1;
+                if parts.len() < tier_width
+                    && size_class(seg.flakes.len(), tier_width) == target_class
+                {
+                    parts.push(seg);
                 } else {
                     keep.push(seg);
                 }
             }
-            // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
-            // set_graph_segments) so a tier merge whose sum
-            // exceeds the local-index width can't silently truncate FlakeIds in
-            // release. (A single class-(K+1) result above the cap becomes a few
-            // segments instead; the cascade handles them on later calls.)
-            while flakes.len() > MAX_SEGMENT_FLAKES {
-                let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+            if parts.iter().map(|part| part.flakes.len()).sum::<usize>() <= MAX_SEGMENT_FLAKES {
+                keep.push(Arc::new(Segment::merge(parts)));
+            } else {
+                let mut flakes: Vec<Flake> = Vec::new();
+                for part in parts {
+                    match Arc::try_unwrap(part) {
+                        Ok(s) => flakes.extend(s.flakes),
+                        Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
+                    }
+                }
+                // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
+                // set_graph_segments) so a tier merge whose sum
+                // exceeds the local-index width can't silently truncate FlakeIds in
+                // release. (A single class-(K+1) result above the cap becomes a few
+                // segments instead; the cascade handles them on later calls.)
+                while flakes.len() > MAX_SEGMENT_FLAKES {
+                    let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+                    keep.push(Arc::new(Segment::build(flakes, true)));
+                    flakes = tail;
+                }
                 keep.push(Arc::new(Segment::build(flakes, true)));
-                flakes = tail;
             }
-            keep.push(Arc::new(Segment::build(flakes, true)));
             *segs = keep;
             merges += 1;
             // Move up so the lowest class is touched at most once per call.
@@ -1143,11 +1272,20 @@ impl Novelty {
         // index. `record` resolves lifecycle order-independently (highest-t
         // wins, same-t assert wins), so batch order doesn't matter. After the
         // keep loop, so within-batch dedup decisions saw only prior state.
+        let mut recorded = 0usize;
         for (&g_id, batch) in &per_graph {
             for flake in batch {
                 self.fact_state.record(g_id, flake);
             }
+            recorded += batch.len();
         }
+        // Clear what the last trim left stale, a few entries per flake
+        // committed (see `clear_up_to`).
+        self.fact_state.sweep(
+            recorded
+                .saturating_mul(FACT_SWEEP_PER_FLAKE)
+                .max(FACT_SWEEP_MIN),
+        );
 
         if deduped > 0 {
             tracing::debug!(
@@ -1369,6 +1507,12 @@ impl Novelty {
     /// after each index rebuild rather than mutated in-place, so this is rarely
     /// the hot path.
     pub fn clear_up_to(&mut self, cutoff_t: i64) {
+        self.clear_up_to_rebuilding(cutoff_t, FACT_REBUILD_MAX);
+    }
+
+    /// [`Self::clear_up_to`], re-recording up to `rebuild_max` surviving
+    /// flakes into the fact state.
+    fn clear_up_to_rebuilding(&mut self, cutoff_t: i64, rebuild_max: usize) {
         // Commits at or before the cutoff have their links in the index now.
         self.trim_link_base(cutoff_t);
         self.links_through = self.links_through.max(cutoff_t.min(self.t));
@@ -1401,19 +1545,27 @@ impl Novelty {
 
         self.recompute_totals();
 
-        // Rebuild the current-state index from survivors. Per graph, record in
-        // SPOT order (t-ascending within an identity) so the latest op wins.
-        // slice_for_range returns an owned Vec, so the &self borrow ends before
-        // the &mut fact_state writes.
         self.graphs.compact();
-        let mut fs = NoveltyFactState::new();
-        for g in self.graphs.present() {
-            let ids = self.slice_for_range(g, IndexType::Spot, None, None, true);
-            for id in ids {
-                fs.record(g, self.get_flake(id));
+        // The current-state index loses the ops the trim dropped. A graph left
+        // with few flakes is rebuilt from them, so a ledger that goes idle
+        // after the publish holds none of the trimmed window. Otherwise moving
+        // its cutoff answers as rebuilding it would, without a pass over the
+        // survivors under the ledger write lock at every index publish;
+        // commits sweep the stale entries out afterwards.
+        let graphs = &self.graphs;
+        let mut budget = rebuild_max;
+        self.fact_state.trim_through(cutoff_t, |g| {
+            let segs = graphs
+                .get(g)
+                .and_then(Option::as_ref)
+                .map_or(&[][..], Vec::as_slice);
+            let survivors: usize = segs.iter().map(|s| s.flakes.len()).sum();
+            if survivors > budget {
+                return None;
             }
-        }
-        self.fact_state = fs;
+            budget -= survivors;
+            Some(segs.iter().flat_map(|s| s.flakes.iter()))
+        });
 
         self.epoch += 1;
         self.refresh_content_version();
@@ -1559,6 +1711,7 @@ impl Novelty {
     ///
     /// Crate-internal: the owned ids it returns are read-scoped (see
     /// [`Self::get_flake`]). External readers use [`Self::range_flakes`].
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn slice_for_range(
         &self,
@@ -1596,6 +1749,7 @@ impl Novelty {
     /// `pub(crate)` makes that hazard unreachable from other crates — external
     /// readers use the borrow-safe [`Self::range_flakes`] / [`Self::iter_flakes`]
     /// / `for_each_overlay_flake` which yield `&Flake` directly.
+    #[cfg(test)]
     pub(crate) fn get_flake(&self, id: FlakeId) -> &Flake {
         let segs = self
             .graphs
@@ -1857,6 +2011,171 @@ mod tests {
             op,
             None,
         )
+    }
+
+    /// The fact state after a trim answers as one rebuilt from the surviving
+    /// flakes, before its stale entries are swept and after.
+    #[test]
+    fn trimmed_fact_state_answers_as_a_rebuild_from_survivors() {
+        let mut n = Novelty::new(0);
+        // Identities re-asserted, retracted and re-asserted across commits,
+        // so some end on ops the trim drops and some on ops it keeps.
+        for t in 1..=40i64 {
+            // Early commits write keys 0..60, later ones 30..90: keys below
+            // 30 end on ops the trim at 25 drops.
+            let base = if t <= 25 { 0 } else { 30 };
+            let batch: Vec<Flake> = (0..40i64)
+                .map(|i| {
+                    let k = base + (i * 31 + t * 17) % 60;
+                    make_flake((k % 9) as u16, (k % 5) as u16, k, t, (i + t) % 3 != 0)
+                })
+                .collect();
+            n.apply_commit(batch, t, &HashMap::new()).unwrap();
+        }
+        let universe: Vec<Flake> = (0..90i64)
+            .map(|k| make_flake((k % 9) as u16, (k % 5) as u16, k, 0, true))
+            .collect();
+        let rebuilt = |n: &Novelty| {
+            let mut fs = NoveltyFactState::new();
+            for id in n.slice_for_range(0, IndexType::Spot, None, None, true) {
+                fs.record(0, n.get_flake(id));
+            }
+            fs
+        };
+        let answers = |fs: &NoveltyFactState| -> Vec<bool> {
+            universe.iter().map(|f| fs.is_asserted(0, f)).collect()
+        };
+
+        // No rebuild budget, so the trim moves the cutoff.
+        n.clear_up_to_rebuilding(25, 0);
+        let want = answers(&rebuilt(&n));
+        assert_eq!(answers(&n.fact_state), want, "unswept");
+        assert!(want.iter().any(|&a| a) && want.iter().any(|&a| !a));
+        let stale_asserted = universe[..30]
+            .iter()
+            .filter(|f| {
+                n.fact_state
+                    .graphs
+                    .get(&0)
+                    .unwrap()
+                    .get(&fact_state_key(f))
+                    .is_some_and(|&(_, op)| op)
+            })
+            .count();
+        assert!(
+            stale_asserted > 0,
+            "the trim leaves stale asserted entries to ignore"
+        );
+        n.fact_state.sweep(usize::MAX);
+        assert_eq!(answers(&n.fact_state), want, "swept");
+        n.apply_commit(vec![make_flake(1, 1, 1, 41, true)], 41, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            answers(&n.fact_state),
+            answers(&rebuilt(&n)),
+            "after a later commit"
+        );
+
+        // Trimming everything leaves no map to hold the indexed facts.
+        n.clear_up_to(41);
+        assert!(n.is_empty());
+        assert!(n.fact_state.graphs.is_empty());
+        assert!(answers(&n.fact_state).iter().all(|&a| !a));
+    }
+
+    /// A trim that leaves few flakes rebuilds the fact state from them, so a
+    /// ledger that goes idle after an index publish holds none of the trimmed
+    /// window; past the rebuild budget the window stays until commits sweep it.
+    #[test]
+    fn a_trim_leaving_few_survivors_rebuilds_the_fact_state() {
+        let window = || {
+            let mut n = Novelty::new(0);
+            for t in 1..=20i64 {
+                let batch: Vec<Flake> = (0..200i64)
+                    .map(|i| make_flake((i % 9) as u16, (i % 5) as u16, t * 1000 + i, t, true))
+                    .collect();
+                n.apply_commit(batch, t, &HashMap::new()).unwrap();
+            }
+            n.apply_commit(vec![make_flake(1, 1, 1, 21, true)], 21, &HashMap::new())
+                .unwrap();
+            n
+        };
+        let entries = |n: &Novelty| n.fact_state.graphs.get(&0).map_or(0, imbl::OrdMap::len);
+        let survivor = make_flake(1, 1, 1, 0, true);
+        let trimmed = make_flake(0, 0, 1000, 0, true);
+
+        let mut rebuilt = window();
+        rebuilt.clear_up_to(20);
+        assert_eq!(entries(&rebuilt), 1, "only the survivor's identity");
+        assert!(rebuilt.fact_state.is_asserted(0, &survivor));
+        assert!(!rebuilt.fact_state.is_asserted(0, &trimmed));
+
+        let mut cut = window();
+        cut.clear_up_to_rebuilding(20, 0);
+        assert_eq!(entries(&cut), 4001, "the trimmed window, unswept");
+        assert!(cut.fact_state.is_asserted(0, &survivor));
+        assert!(!cut.fact_state.is_asserted(0, &trimmed));
+    }
+
+    /// Merging sorted segments gives every order the flake sequence a fresh
+    /// sort of all their flakes gives, whether a part is moved or shared.
+    #[test]
+    fn segment_merge_matches_building_from_all_flakes() {
+        let flakes: Vec<Flake> = (0..4_000i64)
+            .map(|i| {
+                let k = (i * 7_919) % 4_001;
+                make_flake(
+                    (k % 13) as u16,
+                    (k % 7) as u16,
+                    k % 97,
+                    1 + i % 50,
+                    i % 5 != 0,
+                )
+            })
+            .collect();
+        let parts: Vec<Arc<Segment>> = flakes
+            .chunks(250)
+            .map(|chunk| Arc::new(Segment::build(chunk.to_vec(), false)))
+            .collect();
+        let held_by_a_reader = Arc::clone(&parts[3]);
+        let merged = Segment::merge(parts);
+        drop(held_by_a_reader);
+        let built = Segment::build(flakes, false);
+
+        assert_eq!(merged.flakes.len(), built.flakes.len());
+        assert_eq!(
+            (merged.min_t, merged.max_t, merged.size),
+            (built.min_t, built.max_t, built.size)
+        );
+        for index in [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ] {
+            let got: Vec<&Flake> = merged
+                .order(index)
+                .iter()
+                .map(|&i| &merged.flakes[i as usize])
+                .collect();
+            let want: Vec<&Flake> = built
+                .order(index)
+                .iter()
+                .map(|&i| &built.flakes[i as usize])
+                .collect();
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| index.compare(a, b) == Ordering::Equal),
+                "{index:?} order differs from a fresh sort"
+            );
+            let mut seen = merged.order(index).to_vec();
+            seen.sort_unstable();
+            assert!(
+                seen.iter().copied().eq(0..merged.flakes.len() as u32),
+                "{index:?} is a permutation"
+            );
+        }
     }
 
     fn make_flake_with_meta(
@@ -2334,6 +2653,7 @@ mod tests {
                 Some(FlakeMeta {
                     lang: Some(lang.to_string()),
                     i: Some(0),
+                    list: 0,
                 }),
             )
         };
@@ -2688,6 +3008,7 @@ mod tests {
         let at = |lang: &str, i: i32| FlakeMeta {
             lang: Some(lang.to_string()),
             i: Some(i),
+            list: 0,
         };
         let f_en0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 0)));
         let f_fr0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("fr", 0)));
@@ -3114,6 +3435,7 @@ mod tests {
             Some(FlakeMeta {
                 lang: None,
                 i: Some((sm64(rng) % 3) as i32),
+                list: 0,
             })
         } else {
             None

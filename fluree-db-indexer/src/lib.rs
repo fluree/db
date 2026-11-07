@@ -224,9 +224,21 @@ pub async fn build_index_for_record_with_tracker(
             }
         }
 
-        // Try incremental indexing if conditions are met.
+        // Try incremental indexing if conditions are met. A published index
+        // of an earlier format is rebuilt in full, so no root mixes artifacts
+        // of two formats.
+        let current_format = match &record.index_head_id {
+            Some(root_id) => published_root_is_current(content_store.as_ref(), root_id).await?,
+            None => false,
+        };
+        if !current_format && record.index_head_id.is_some() {
+            tracing::info!(
+                ledger_id = ledger_id,
+                "published index is of an earlier format; using full rebuild"
+            );
+        }
         let can_incremental = config.incremental_enabled
-            && record.index_head_id.is_some()
+            && current_format
             && record.index_t > 0
             && commit_gap <= config.incremental_max_commits as i64;
 
@@ -260,8 +272,7 @@ pub async fn build_index_for_record_with_tracker(
                     );
                 }
             }
-        } else if config.incremental_enabled && record.index_head_id.is_some() && record.index_t > 0
-        {
+        } else if config.incremental_enabled && current_format && record.index_t > 0 {
             tracing::info!(
                 commit_gap = commit_gap,
                 max = config.incremental_max_commits,
@@ -426,6 +437,19 @@ where
     .await
 }
 
+/// Whether the root `root_id` names is of the index format this build writes
+/// (see [`fluree_db_binary_index::format::index_root::is_current_format`]).
+async fn published_root_is_current(
+    content_store: &dyn fluree_db_core::ContentStore,
+    root_id: &fluree_db_core::ContentId,
+) -> Result<bool> {
+    let bytes = content_store
+        .get(root_id)
+        .await
+        .map_err(|e| IndexerError::StorageRead(format!("index root: {e}")))?;
+    Ok(fluree_db_binary_index::format::index_root::is_current_format(&bytes))
+}
+
 /// Build `record`'s index incrementally over its published index, as
 /// [`build_index_for_record`] tries first, but with no fallback to a full
 /// rebuild: an incremental failure is returned. For tests that must know the
@@ -477,6 +501,38 @@ async fn incremental_index(
 ) -> Result<IndexResult> {
     build::incremental::incremental_index(content_store, tracker, ledger_id, record, config).await
 }
+
+/// Merge already-resolved `novelty` into its base root and write the new
+/// root: the phases of an incremental build after commit resolution.
+///
+/// For a caller that produces novelty itself rather than from the commits
+/// after the published index — a bulk import into an existing ledger.
+/// `base_root_id` is the published root `novelty.base_root` derives from,
+/// and `replaced_cids` its artifacts the caller already superseded.
+pub async fn index_novelty(
+    content_store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    ledger_id: &str,
+    base_root_id: fluree_db_core::ContentId,
+    novelty: run_index::IncrementalNovelty,
+    config: IndexerConfig,
+    replaced_cids: Vec<fluree_db_core::ContentId>,
+) -> Result<IndexResult> {
+    build::incremental::index_novelty(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        base_root_id,
+        novelty,
+        config,
+        replaced_cids,
+        Default::default(),
+    )
+    .await
+}
+
+pub use build::dict_extend::extend_dicts;
+pub use build::incremental::{predicate_sids, DictNoveltyUpdate};
+pub use build::upload_dicts::{upload_numbig_arenas_from_disk, upload_vector_arenas_from_disk};
 
 /// Upload index artifacts (FLI3 leaves, FHS1 sidecars, FBR3 branches) to CAS.
 pub async fn upload_indexes_to_cas(

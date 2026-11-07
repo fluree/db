@@ -45,6 +45,7 @@
 
 use crate::error::{Result, TransactError};
 use fluree_db_core::comparator::{cmp_object, IndexType};
+use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
@@ -193,6 +194,18 @@ impl Retraction {
         self.0
     }
 
+    /// Retract at `t` a list member the WHERE read through its list view
+    /// (`fluree_db_query::list_view::ListView::read_members`), a stored fact,
+    /// in `graph` (`None` for the default graph; see `crate::cell_edits`).
+    pub(crate) fn of_list_member(member: &Flake, graph: Option<Sid>, t: i64) -> Self {
+        Retraction(Flake {
+            g: graph,
+            t,
+            op: false,
+            ..member.clone()
+        })
+    }
+
     /// Any flake, for unit tests of the retraction consumers.
     #[cfg(test)]
     pub(crate) fn for_test(flake: Flake) -> Self {
@@ -210,15 +223,37 @@ pub(crate) struct RetractIntent {
     /// The template is witnessed by a WHERE triple (`delete_witness`), so
     /// the row is the decode of a fact that WHERE matched at the same `t`.
     witnessed: bool,
+    /// The list literal this intent is a member of, by a number unique among
+    /// one batch's literals; 0 for none. Its members name a stored list
+    /// together (see [`DeleteResolver`]).
+    list: u32,
 }
 
 impl RetractIntent {
     pub(crate) fn new(flake: Flake, witnessed: bool) -> Self {
         debug_assert!(!flake.op, "a retraction intent is op = false");
-        Self { flake, witnessed }
+        Self {
+            flake,
+            witnessed,
+            list: 0,
+        }
     }
 
-    #[cfg(test)]
+    /// Member `flake` of list literal `list` (not 0), its position in the
+    /// literal as its list position. Never witnessed: no WHERE triple binds
+    /// a list position (`delete_witness`).
+    pub(crate) fn of_list(flake: Flake, list: u32) -> Self {
+        debug_assert!(list != 0 && place_of(&flake).is_some());
+        Self {
+            list,
+            ..Self::new(flake, false)
+        }
+    }
+
+    pub(crate) fn list(&self) -> u32 {
+        self.list
+    }
+
     pub(crate) fn flake(&self) -> &Flake {
         &self.flake
     }
@@ -306,8 +341,9 @@ fn lang_of(f: &Flake) -> Option<&str> {
     f.m.as_ref().and_then(|m| m.lang.as_deref())
 }
 
-fn list_index_of(f: &Flake) -> Option<i32> {
-    f.m.as_ref().and_then(|m| m.i)
+/// The list and position of a list entry.
+fn place_of(f: &Flake) -> Option<ListPlace> {
+    f.m.as_ref().and_then(FlakeMeta::place)
 }
 
 /// The same RDF term: value, datatype and language tag.
@@ -438,7 +474,7 @@ impl<'l> IndexKeys<'l> {
         }
         let dropped = {
             let mut p_ids: HashMap<&Sid, Option<u32>> = HashMap::new();
-            let mut winner: HashMap<(&Sid, IndexKey, Option<i32>), usize> = HashMap::new();
+            let mut winner: HashMap<(&Sid, IndexKey, Option<ListPlace>), usize> = HashMap::new();
             let mut dropped = vec![false; flakes.len()];
             for (n, f) in flakes.iter().enumerate() {
                 if !f.o.index_key_may_merge_terms() {
@@ -448,7 +484,7 @@ impl<'l> IndexKeys<'l> {
                 let Some(key) = self.key(g_id, p_id, f) else {
                     continue;
                 };
-                match winner.entry((&f.p, key, list_index_of(f))) {
+                match winner.entry((&f.p, key, place_of(f))) {
                     Entry::Vacant(e) => {
                         e.insert(n);
                     }
@@ -489,8 +525,8 @@ impl<'l> IndexKeys<'l> {
 pub enum FactTerm {
     /// The term of a value storage tells by term.
     Term(FlakeValue, Sid, Option<FlakeMeta>),
-    /// The key and list position of a value storage tells by key.
-    Key(FactKey, Option<i32>),
+    /// The key and list place of a value storage tells by key.
+    Key(FactKey, Option<ListPlace>),
 }
 
 /// The key storage merges the ops of a value by, for the kinds of value
@@ -507,10 +543,10 @@ pub enum FactKey {
     Index((u16, u64)),
 }
 
-/// A [`FactKey`] and list position: how storage tells apart the facts of one
+/// A [`FactKey`] and list place: how storage tells apart the facts of one
 /// `(graph, subject, predicate)` whose kind of value can merge terms
 /// ([`FactTerm::Key`]).
-pub type MergeKey = (FactKey, Option<i32>);
+pub type MergeKey = (FactKey, Option<ListPlace>);
 
 /// The identity storage gives each fact of one ledger state ([`FactTerm`]).
 ///
@@ -565,7 +601,7 @@ impl<'l> FactIdentity<'l> {
             FlakeValue::BigInt(v) if flake.o.index_keys_by_value() => FactKey::BigInt(v.clone()),
             _ => FactKey::Index(self.keys.key(g_id()?, p_id(), flake)?),
         };
-        Some((key, list_index_of(flake)))
+        Some((key, place_of(flake)))
     }
 
     /// `flake`'s identity in its own graph (`flake.g`). The graph is resolved
@@ -1188,6 +1224,12 @@ type SlotKey = (GraphId, Sid, Sid);
 ///   retracted as read. An intent that names no stored fact stages
 ///   nothing; with `unmatched`, it is also appended there as instantiated,
 ///   for the caller's modify-policy check.
+/// - The members of a list literal ([`RetractIntent::of_list`]) name a
+///   stored list together, as a scalar intent names a value: every list of
+///   their slot as long as the literal whose k-th position holds its k-th
+///   member, each member matched as a scalar intent is. Each such list is
+///   retracted whole, every entry as read; a literal naming none stages
+///   nothing, and with `unmatched` its members are appended there.
 ///
 /// A slot with more than [`NARROW_SLOT`] facts is read once per
 /// transaction and matched through an index ([`SlotFacts`]), so retracting
@@ -1218,6 +1260,8 @@ pub(crate) struct DeleteResolver<'l> {
     /// naming the same term again names the same entries, so it adds nothing
     /// (`SlotFacts::named_all`). A value no list holds is never kept here.
     expanded: HashSet<(SlotKey, Flake)>,
+    /// Whether a slot is its plain values alone ([`Self::reading_lists_as_rdf`]).
+    plain_only: bool,
     /// [`NARROW_SLOT`], or another bound for tests.
     narrow_slot: usize,
     /// A fixed [`Self::point_bound`] for tests (`Some(0)`: never).
@@ -1235,9 +1279,18 @@ impl<'l> DeleteResolver<'l> {
             wide_index: HashMap::new(),
             taken: HashMap::new(),
             expanded: HashSet::new(),
+            plain_only: false,
             narrow_slot: NARROW_SLOT,
             point_bound_override: None,
         }
+    }
+
+    /// The resolver of a write reading lists as RDF (`rdf-lists`), where a
+    /// list's members are its cells' `rdf:first`s: an intent names only the
+    /// plain values of its slot.
+    pub(crate) fn reading_lists_as_rdf(mut self) -> Self {
+        self.plain_only = true;
+        self
     }
 
     /// For each slot this batch reads (`at`'s `Read` places), the values
@@ -1253,7 +1306,8 @@ impl<'l> DeleteResolver<'l> {
         for (intent, place) in pending.iter().zip(at) {
             if let SlotAt::Read(i) = *place {
                 named[i] += 1;
-                keyable[i] &= !intent.witnessed && point_keyable(&intent.flake);
+                // A list literal is matched against whole stored lists.
+                keyable[i] &= !intent.witnessed && intent.list == 0 && point_keyable(&intent.flake);
             }
         }
         // One bound per graph and predicate; slots of one predicate tend to
@@ -1419,7 +1473,10 @@ impl<'l> DeleteResolver<'l> {
         let read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
         let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
         let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
-        for ((slot, facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
+        for ((slot, mut facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
+            if self.plain_only {
+                facts.retain(|f| place_of(&f.flake).is_none());
+            }
             let facts = SlotFacts::new(slot.g_id, slot.p.clone(), facts, self.narrow_slot);
             let key = (slot.g_id, slot.s, slot.p);
             // Facts read by value are not the slot: they stay with the batch.
@@ -1435,27 +1492,17 @@ impl<'l> DeleteResolver<'l> {
         }
 
         let keys = &self.current.keys;
+        let mut listed: Vec<(RetractIntent, SlotAt)> = Vec::new();
         for (intent, at) in pending.into_iter().zip(at) {
-            let (slot, facts) = match at {
-                SlotAt::Wide(w) => {
-                    let (key, facts) = &mut self.wide[w];
-                    (&*key, facts)
-                }
-                SlotAt::Read(i) => match read[i] {
-                    ReadSlot::Narrow(n) => {
-                        let (key, facts) = &mut narrow[n];
-                        (&*key, facts)
-                    }
-                    ReadSlot::Wide(w) => {
-                        let (key, facts) = &mut self.wide[w];
-                        (&*key, facts)
-                    }
-                },
-            };
+            if intent.list != 0 {
+                listed.push((intent, at));
+                continue;
+            }
+            let (slot, facts) = slot_facts(&mut self.wide, &mut narrow, &read, at);
             let t = intent.flake.t;
             if intent.witnessed {
                 // A row that carries its list position names it already.
-                let matched = if list_index_of(&intent.flake).is_none() {
+                let matched = if place_of(&intent.flake).is_none() {
                     let taken = &mut self.taken;
                     facts.witnessed(&intent.flake, keys, |first| {
                         let seen = taken.entry((slot.clone(), first)).or_insert(0);
@@ -1480,7 +1527,7 @@ impl<'l> DeleteResolver<'l> {
                     }
                     None => out.push(Retraction(intent.flake)),
                 }
-            } else if facts.has_entries && list_index_of(&intent.flake).is_none() {
+            } else if facts.has_entries && place_of(&intent.flake).is_none() {
                 // A value without a position is every list entry holding it
                 // (see `named_all`), unless an identical intent named them.
                 let key = (slot.clone(), intent.flake.clone());
@@ -1498,7 +1545,7 @@ impl<'l> DeleteResolver<'l> {
                 }
                 if named
                     .iter()
-                    .any(|&n| list_index_of(&facts.facts[n].flake).is_some())
+                    .any(|&n| place_of(&facts.facts[n].flake).is_some())
                 {
                     self.expanded.insert(key);
                 }
@@ -1522,8 +1569,47 @@ impl<'l> DeleteResolver<'l> {
                 }
             }
         }
+
+        // Each literal's members together, in position order; one literal's
+        // members share a slot.
+        listed.sort_by_key(|(intent, _)| (intent.list, place_of(&intent.flake)));
+        for literal in listed.chunk_by(|a, b| a.0.list == b.0.list) {
+            let (_, facts) = slot_facts(&mut self.wide, &mut narrow, &read, literal[0].1);
+            let members: Vec<&Flake> = literal.iter().map(|(intent, _)| &intent.flake).collect();
+            let named = facts.lists_named(&members, keys);
+            if named.is_empty() {
+                stats.phantom_intents += members.len();
+                if let Some(unmatched) = unmatched.as_deref_mut() {
+                    unmatched.extend(members.into_iter().cloned());
+                }
+                continue;
+            }
+            stats.matched += members.len();
+            for (n, k) in named {
+                let member = members[k];
+                out.push(facts.facts[n].retract_named(member.clone(), member.t));
+            }
+        }
         Ok((out, stats))
     }
+}
+
+/// The slot `at` places an intent in, and its facts: a wide slot of the
+/// resolver's, or one this batch read.
+fn slot_facts<'a>(
+    wide: &'a mut [(SlotKey, SlotFacts)],
+    narrow: &'a mut [(SlotKey, SlotFacts)],
+    read: &[ReadSlot],
+    at: SlotAt,
+) -> (&'a SlotKey, &'a mut SlotFacts) {
+    let (key, facts) = match at {
+        SlotAt::Wide(w) => &mut wide[w],
+        SlotAt::Read(i) => match read[i] {
+            ReadSlot::Narrow(n) => &mut narrow[n],
+            ReadSlot::Wide(w) => &mut wide[w],
+        },
+    };
+    (&*key, facts)
 }
 
 /// Where an intent's slot is: a wide slot an earlier batch read, by its
@@ -1558,8 +1644,8 @@ struct SlotFacts {
     hash: fn(&Flake) -> u64,
     /// A wide slot's facts by term.
     terms: Option<Groups<u64>>,
-    /// A wide slot's list entries, by `(position, fact)`.
-    positions: Vec<(i32, u32)>,
+    /// A wide slot's list entries, by `(place, fact)`.
+    positions: Vec<(ListPlace, u32)>,
     /// Whether any fact is a list entry.
     has_entries: bool,
     /// Each fact's index key, computed when an intent first needs one.
@@ -1586,13 +1672,13 @@ impl SlotFacts {
     ) -> Self {
         let wide = facts.len() > narrow_slot;
         let terms = wide.then(|| Groups::build(&facts, |_, f| Some(hash(&f.flake)), same_term));
-        let has_entries = facts.iter().any(|f| list_index_of(&f.flake).is_some());
+        let has_entries = facts.iter().any(|f| place_of(&f.flake).is_some());
         let mut positions = Vec::new();
         if wide {
             positions = facts
                 .iter()
                 .enumerate()
-                .filter_map(|(n, f)| Some((list_index_of(&f.flake)?, n as u32)))
+                .filter_map(|(n, f)| Some((place_of(&f.flake)?, n as u32)))
                 .collect();
             positions.sort_unstable();
         }
@@ -1673,15 +1759,15 @@ impl SlotFacts {
         }
         self.ensure_by_value();
         let fact = &self.facts[n].flake;
-        let at: HashSet<Option<i32>> = named
+        let at: HashSet<Option<ListPlace>> = named
             .iter()
-            .map(|&n| list_index_of(&self.facts[n].flake))
+            .map(|&n| place_of(&self.facts[n].flake))
             .collect();
         let named: HashSet<usize> = named.iter().copied().collect();
         let sibling = |m: usize| {
             !named.contains(&m)
                 && same_value(&self.facts[m].flake, fact)
-                && at.contains(&list_index_of(&self.facts[m].flake))
+                && at.contains(&place_of(&self.facts[m].flake))
         };
         match (&self.by_value, value_hash(fact)) {
             (Some(groups), Some(h)) => groups
@@ -1698,7 +1784,7 @@ impl SlotFacts {
 
     /// The stored fact a DELETE intent names (see [`DeleteResolver`]).
     fn named(&mut self, intent: &Flake, keys: &IndexKeys) -> Option<usize> {
-        let position = list_index_of(intent);
+        let position = place_of(intent);
         let by_term = |_: usize, f: &StoredFact| same_term(&f.flake, intent);
         let hit = match &self.terms {
             Some(terms) => self.first_in(terms.get((self.hash)(intent)), terms, position, by_term),
@@ -1772,12 +1858,76 @@ impl SlotFacts {
                 None => self.all(by_key),
             }
         };
-        let is_entry = |n: usize| list_index_of(&self.facts[n].flake).is_some();
+        let is_entry = |n: usize| place_of(&self.facts[n].flake).is_some();
         let plain = hits.iter().copied().find(|&n| !is_entry(n));
         hits.into_iter()
             .filter(|&n| is_entry(n))
             .chain(plain)
             .collect()
+    }
+
+    /// The entries of every stored list that list literal `members` (in
+    /// position order) names, each with the index of the member it holds:
+    /// lists with one position per member, the k-th holding member k as a
+    /// scalar intent names its value ([`Self::named`]: by term, else a big
+    /// integer by value, else by index key).
+    fn lists_named(&mut self, members: &[&Flake], keys: &IndexKeys) -> Vec<(usize, usize)> {
+        if !self.has_entries {
+            return Vec::new();
+        }
+        let member_keys: Vec<Option<IndexKey>> = members
+            .iter()
+            .map(|m| {
+                if m.o.index_keys_by_value() {
+                    None
+                } else {
+                    self.key_of(keys, m)
+                }
+            })
+            .collect();
+        if member_keys.iter().any(Option::is_some) {
+            self.ensure_keys(keys);
+        }
+        let narrow;
+        let entries: &[(ListPlace, u32)] = if self.is_wide() {
+            &self.positions
+        } else {
+            let mut sorted: Vec<(ListPlace, u32)> = self
+                .facts
+                .iter()
+                .enumerate()
+                .filter_map(|(n, f)| Some((place_of(&f.flake)?, n as u32)))
+                .collect();
+            sorted.sort_unstable();
+            narrow = sorted;
+            &narrow
+        };
+        let fact_keys = self.keys.as_deref();
+        let holds = |n: u32, k: usize| {
+            let (fact, member) = (&self.facts[n as usize].flake, members[k]);
+            same_term(fact, member)
+                || same_value(fact, member)
+                || member_keys[k]
+                    .is_some_and(|key| fact_keys.is_some_and(|keys| keys[n as usize] == Some(key)))
+        };
+        let mut named = Vec::new();
+        for list in entries.chunk_by(|a, b| a.0 .0 == b.0 .0) {
+            // A position holding two terms of one big integer (novelty, until
+            // the next index build) is one position.
+            let positions = || list.chunk_by(|a, b| a.0 == b.0);
+            let mut held = 0;
+            let holds_all = positions().all(|at| {
+                let k = held;
+                held += 1;
+                k < members.len() && at.iter().any(|&(_, n)| holds(n, k))
+            });
+            if holds_all && held == members.len() {
+                for (k, at) in positions().enumerate() {
+                    named.extend(at.iter().map(|&(_, n)| (n as usize, k)));
+                }
+            }
+        }
+        named
     }
 
     /// Narrow slot: every fact satisfying `pred`, in slot order.
@@ -1833,14 +1983,14 @@ impl SlotFacts {
     /// first list entry, else the first plain value, in slot order.
     fn first(
         &self,
-        position: Option<i32>,
+        position: Option<ListPlace>,
         pred: impl Fn(usize, &StoredFact) -> bool,
     ) -> Option<usize> {
-        let at = |admits: &dyn Fn(Option<i32>) -> bool| {
+        let at = |admits: &dyn Fn(Option<ListPlace>) -> bool| {
             self.facts
                 .iter()
                 .enumerate()
-                .position(|(n, f)| admits(list_index_of(&f.flake)) && pred(n, f))
+                .position(|(n, f)| admits(place_of(&f.flake)) && pred(n, f))
         };
         match position {
             Some(i) => at(&|p| p == Some(i)),
@@ -1854,7 +2004,7 @@ impl SlotFacts {
         &self,
         group: Option<Group>,
         groups: &Groups<K>,
-        position: Option<i32>,
+        position: Option<ListPlace>,
         pred: impl Fn(usize, &StoredFact) -> bool,
     ) -> Option<usize> {
         match position {
@@ -1915,7 +2065,7 @@ impl SlotFacts {
                 )
             }
             None => {
-                let is_entry = move |n: usize| list_index_of(&facts[n].flake).is_some();
+                let is_entry = move |n: usize| place_of(&facts[n].flake).is_some();
                 pick(
                     || {
                         let candidate = move |entry: bool| {
@@ -1984,7 +2134,7 @@ impl<K: Copy + Eq + Hash + Ord> Groups<K> {
         let mut keyed: Vec<(K, bool, u32)> = facts
             .iter()
             .enumerate()
-            .filter_map(|(n, f)| Some((key(n, f)?, list_index_of(&f.flake).is_none(), n as u32)))
+            .filter_map(|(n, f)| Some((key(n, f)?, place_of(&f.flake).is_none(), n as u32)))
             .collect();
         keyed.sort_unstable();
         let mut order = Vec::with_capacity(keyed.len());
@@ -2612,6 +2762,114 @@ mod tests {
                 )
                 .await,
                 vec![at("v", 0), at("v", 1), plain("v"), at("v", 1)],
+                "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// An intent's list literal number sits in the padding its `witnessed`
+    /// flag leaves: an intent is a flake and one word.
+    #[test]
+    fn an_intent_is_a_flake_and_a_word() {
+        assert_eq!(
+            std::mem::size_of::<RetractIntent>(),
+            std::mem::size_of::<Flake>() + 8
+        );
+    }
+
+    /// A list literal names every stored list it is: as long, its members in
+    /// order. A prefix, a reordering, a longer or shorter list and plain
+    /// values are not it; a literal that names no list stages nothing and is unmatched.
+    #[tokio::test]
+    async fn list_literals_name_whole_stored_lists() {
+        let entry = |o: &str, list: u32, i: i32| {
+            flake(
+                "a",
+                "items",
+                o,
+                1,
+                true,
+                FlakeMeta::from_place(None, Some((list, i))),
+            )
+        };
+        let ledger = ledger(
+            vec![vec![
+                entry("v", 1, 0),
+                entry("w", 1, 1),
+                entry("v", 2, 0),
+                entry("x", 2, 1),
+                entry("v", 3, 0),
+                entry("w", 3, 1),
+                entry("x", 3, 2),
+                entry("v", 4, 0),
+                entry("w", 4, 1),
+                flake("a", "items", "v", 1, true, None),
+                flake("a", "items", "w", 1, true, None),
+            ]],
+            &HashMap::new(),
+        );
+        let literal = |list: u32, members: &[&str]| -> Vec<RetractIntent> {
+            members
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let m = Some(FlakeMeta::with_index(i as i32));
+                    RetractIntent::of_list(flake("a", "items", o, 9, false, m), list)
+                })
+                .collect()
+        };
+        let stored = |o: &str, list: u32, i: i32| {
+            (o.to_string(), FlakeMeta::from_place(None, Some((list, i))))
+        };
+        for narrow_slot in [usize::MAX, 0] {
+            let mut resolver = DeleteResolver::new(&ledger, ListFree::check(&ledger));
+            resolver.narrow_slot = narrow_slot;
+            let mut batch = literal(1, &["v", "w"]);
+            batch.extend(literal(2, &["v"]));
+            batch.extend(literal(3, &["w", "v"]));
+            batch.extend(literal(4, &["x", "v"]));
+            // The literals' members interleaved with a scalar intent.
+            batch.insert(1, intent("other", "o", false, None));
+            batch.extend(literal(5, &["v", "x"]));
+            batch.extend(literal(6, &["v", "w", "x", "y"]));
+            let mut unmatched = Vec::new();
+            let (retractions, stats) = resolver
+                .resolve(batch, |_| Ok(0), Some(&mut unmatched))
+                .await
+                .expect("resolve");
+            let mut got: Vec<_> = retractions.iter().map(|r| term_of(r.flake())).collect();
+            got.sort_by(|a, b| a.1.cmp(&b.1));
+            assert_eq!(
+                got,
+                [
+                    stored("v", 1, 0),
+                    stored("w", 1, 1),
+                    stored("v", 2, 0),
+                    stored("x", 2, 1),
+                    stored("v", 4, 0),
+                    stored("w", 4, 1),
+                ],
+                "narrow_slot={narrow_slot}"
+            );
+            assert_eq!(
+                unmatched.iter().map(term_of).collect::<Vec<_>>(),
+                [
+                    plain("o"),
+                    at("v", 0),
+                    at("w", 0),
+                    at("v", 1),
+                    at("x", 0),
+                    at("v", 1),
+                    at("v", 0),
+                    at("w", 1),
+                    at("x", 2),
+                    at("y", 3)
+                ],
+                "narrow_slot={narrow_slot}"
+            );
+            assert_eq!(
+                (stats.matched, stats.phantom_intents),
+                (4, 10),
                 "narrow_slot={narrow_slot}"
             );
         }

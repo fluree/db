@@ -182,11 +182,12 @@ pub enum NodeGraph<'a> {
 }
 
 /// Where a node object's `@graph` places it, read the one way every writer
-/// reads it. A named graph must be named by its `@id`: Fluree has no
-/// blank-node graph names, a variable cannot name one, and a graph object
-/// without an `@id` is only meaningful as the top-level envelope (which
-/// expansion unwraps). The caller still resolves the name, and checks that
-/// it is an absolute IRI. The error is suitable for a message.
+/// reads it. A named graph must be named by its `@id`: a variable cannot
+/// name one, and a graph object without an `@id` is only meaningful as the
+/// top-level envelope (which expansion unwraps). A blank-node name is
+/// returned as written: RDF allows one, a ledger does not
+/// ([`iri_named_graph`]). The caller still resolves the name, and checks
+/// that it is an absolute IRI. The error is suitable for a message.
 pub fn node_graph(node: &Map<String, Value>) -> std::result::Result<NodeGraph<'_>, String> {
     match node.get("@graph").map(classify_graph_value) {
         None => Ok(NodeGraph::Enclosing),
@@ -199,15 +200,27 @@ pub fn node_graph(node: &Map<String, Value>) -> std::result::Result<NodeGraph<'_
                         .to_string(),
                 );
             };
-            if name.starts_with("_:") || name.starts_with('?') {
-                return Err(format!(
-                    "a JSON-LD named graph must be named by an IRI, not {name:?}"
-                ));
+            if name.starts_with('?') {
+                return Err(not_named_by_an_iri(name));
             }
             Ok(NodeGraph::NamedGraph { name, content })
         }
         Some(GraphValue::Invalid(why)) => Err(why.to_string()),
     }
+}
+
+/// A [`NodeGraph::NamedGraph`] name, for a writer whose graphs are named by
+/// IRIs: Fluree has no blank-node graph names. The error is suitable for a
+/// message.
+pub fn iri_named_graph(name: &str) -> std::result::Result<&str, String> {
+    if name.starts_with("_:") {
+        return Err(not_named_by_an_iri(name));
+    }
+    Ok(name)
+}
+
+fn not_named_by_an_iri(name: &str) -> String {
+    format!("a JSON-LD named graph must be named by an IRI, not {name:?}")
 }
 
 /// True when `key` means `@graph` under `ctx`: the keyword itself, a context

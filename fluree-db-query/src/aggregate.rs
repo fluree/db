@@ -1198,7 +1198,7 @@ mod tests {
             p_id: 0,
             dt_id: 0,
             lang_id: 0,
-            i_val: i32::MIN,
+            i_val: fluree_db_core::list_index::NONE,
             t: 0,
         };
         let double_of = |b: Binding| match b.as_lit() {

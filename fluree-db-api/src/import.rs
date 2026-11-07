@@ -643,7 +643,8 @@ pub struct EffectiveImportSettings {
 pub struct ImportResult {
     /// Ledger ID.
     pub ledger_id: String,
-    /// Final commit t (= number of imported chunks).
+    /// Final commit t: the number of imported chunks for a new ledger, or
+    /// the ledger's new head for an import into one of its graphs.
     pub t: i64,
     /// Total flake count across all commits.
     pub flake_count: u64,
@@ -651,12 +652,15 @@ pub struct ImportResult {
     pub commit_head_id: fluree_db_core::ContentId,
     /// Content identifier of the index root. `None` if `build_index == false`.
     pub root_id: Option<fluree_db_core::ContentId>,
-    /// Index t (same as `t` for fresh import). 0 if `build_index == false`.
+    /// Index t (same as `t`). 0 if `build_index == false`.
     pub index_t: i64,
     /// Optional summary of top classes, properties, and connections.
     pub summary: Option<ImportSummary>,
     /// Whether the imported dataset contains at least one edge annotation.
     /// `false` when `build_index == false`.
+    ///
+    /// For an import into a graph of an existing ledger, whether that graph
+    /// holds annotations.
     pub has_annotations: bool,
     /// Tracking tally (fuel, time) when a tracker was supplied via
     /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
@@ -667,6 +671,20 @@ pub struct ImportResult {
     /// `flake_count - duplicates_removed`. 0 when `build_index == false`
     /// (no index, nothing collapsed).
     pub duplicates_removed: u64,
+    /// The graph an import into an existing ledger filled; `None` for an
+    /// import that created its ledger.
+    pub graph: Option<ImportedGraph>,
+}
+
+/// The new named graph an import into an existing ledger filled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedGraph {
+    /// The graph's IRI.
+    pub iri: String,
+    /// The graph id the ledger gave it.
+    pub g_id: fluree_db_core::GraphId,
+    /// The ledger's `t` before the import: its commits are `base_t + 1..=t`.
+    pub base_t: i64,
 }
 
 /// Lightweight summary of the imported dataset for CLI display.
@@ -692,6 +710,10 @@ pub enum ImportError {
     /// The data holds a value the ledger refuses, refused as a transaction
     /// of it is: an `Invalid vector`, or more datatypes than a ledger holds.
     Invalid(fluree_db_transact::TransactError),
+    /// The import cannot run as asked — into a graph the ledger already
+    /// has, from a source that names graphs of its own, over a ledger whose
+    /// index trails its head — and wrote nothing. The message says why.
+    Refused(String),
     /// Storage I/O error.
     Storage(String),
     /// TTL parse / commit error.
@@ -722,6 +744,22 @@ pub enum ImportError {
     /// during an import phase with a per-chunk descriptor cost, such as the
     /// dictionary merge. Carries the observed limit and the remedy.
     FdLimit(String),
+    /// An import into a graph of an existing ledger published its commits,
+    /// through `t`, and then failed to publish its index. Unlike every other
+    /// error, the import is in the ledger: it reads from the commits until an
+    /// index covers them, which the next index build or `fluree reindex`
+    /// writes.
+    PublishedWithoutIndex { t: i64, reason: String },
+}
+
+/// A TriG or N-Quads source names graphs of its own, so it cannot be imported
+/// into one graph of an existing ledger.
+fn refuse_quads_into_graph() -> ImportError {
+    ImportError::Refused(
+        "a TriG or N-Quads source names graphs of its own; an import into one graph \
+         of an existing ledger takes Turtle, N-Triples or JSON-LD"
+            .to_string(),
+    )
 }
 
 /// Wrap an index-build I/O failure, upgrading descriptor exhaustion
@@ -745,6 +783,7 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::Api(e) => write!(f, "api: {e}"),
             Self::Invalid(e) => write!(f, "{e}"),
+            Self::Refused(msg) => write!(f, "{msg}"),
             Self::Storage(msg) => write!(f, "storage: {msg}"),
             Self::Transact(msg) => write!(f, "transact: {msg}"),
             Self::RunGeneration(msg) => write!(f, "run generation: {msg}"),
@@ -762,6 +801,12 @@ impl std::fmt::Display for ImportError {
             ),
             Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
             Self::FdLimit(msg) => write!(f, "open-file limit: {msg}"),
+            Self::PublishedWithoutIndex { t, reason } => write!(
+                f,
+                "the import is published through t={t}, but publishing its index failed \
+                 ({reason}); the ledger reads the import from its commits until an index \
+                 covers them, which `fluree reindex` builds"
+            ),
         }
     }
 }
@@ -3086,6 +3131,9 @@ pub struct ImportBuilder<'a> {
     ledger_id: String,
     source: ImportSource,
     config: ImportConfig,
+    /// The new named graph of an existing ledger the import fills, or
+    /// `None` to create the ledger.
+    into_graph: Option<String>,
 }
 
 impl<'a> ImportBuilder<'a> {
@@ -3095,6 +3143,7 @@ impl<'a> ImportBuilder<'a> {
             ledger_id,
             source: ImportSource::Local(import_path),
             config: ImportConfig::default(),
+            into_graph: None,
         }
     }
 
@@ -3109,6 +3158,7 @@ impl<'a> ImportBuilder<'a> {
             ledger_id,
             source: ImportSource::Remote { storage, source },
             config: ImportConfig::default(),
+            into_graph: None,
         }
     }
 
@@ -3131,6 +3181,7 @@ impl<'a> ImportBuilder<'a> {
             ledger_id,
             source: ImportSource::Virtual,
             config,
+            into_graph: None,
         }
     }
 
@@ -3299,14 +3350,78 @@ impl<'a> ImportBuilder<'a> {
             .ok_or_else(|| {
                 ImportError::Storage("bulk import requires a managed storage backend".into())
             })?;
+        if let Some(graph_iri) = &self.into_graph {
+            return crate::graph_import::import_into_graph(
+                self.fluree,
+                &storage,
+                &self.ledger_id,
+                graph_iri,
+                self.source,
+                &self.config,
+            )
+            .await;
+        }
         run_import_pipeline(
             &storage,
             self.fluree.publisher()?,
             &self.ledger_id,
             self.source,
             &self.config,
+            None,
         )
         .await
+    }
+}
+
+// ============================================================================
+// Graph import builder (intermediate)
+// ============================================================================
+
+/// Intermediate builder returned by `fluree.import_into_graph("mydb", graph_iri)`.
+///
+/// Bulk-imports into a new named graph of an existing ledger: `.import(path)`
+/// or `.import_from_storage(...)`, then the usual [`ImportBuilder`] tuning.
+/// The graph must not exist yet, and the source must be default-graph data
+/// (Turtle, N-Triples or JSON-LD): every statement lands in the graph. The
+/// ledger is indexed up to its head first, and held for the import — writes
+/// wait, reads go on against the head it started from — until its commit
+/// head and index are published together. `publish_every` checkpoints do
+/// not apply.
+pub struct GraphImportTarget<'a> {
+    fluree: &'a super::Fluree,
+    ledger_id: String,
+    graph_iri: String,
+}
+
+impl<'a> GraphImportTarget<'a> {
+    pub(crate) fn new(fluree: &'a super::Fluree, ledger_id: String, graph_iri: String) -> Self {
+        Self {
+            fluree,
+            ledger_id,
+            graph_iri,
+        }
+    }
+
+    /// Import local files: a directory of `.ttl`/`.nt`/`.jsonld` files
+    /// (sorted lexicographically), or a single file.
+    pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
+        ImportBuilder {
+            into_graph: Some(self.graph_iri),
+            ..ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
+        }
+    }
+
+    /// Import source bytes streamed from a remote `StorageRead` backend, as
+    /// [`CreateBuilder::import_from_storage`] does.
+    pub fn import_from_storage(
+        self,
+        storage: Arc<dyn StorageRead>,
+        source: RemoteSource,
+    ) -> ImportBuilder<'a> {
+        ImportBuilder {
+            into_graph: Some(self.graph_iri),
+            ..ImportBuilder::new_remote(self.fluree, self.ledger_id, storage, source)
+        }
     }
 }
 
@@ -3520,12 +3635,13 @@ fn discover_chunks(dir: &Path) -> std::result::Result<Vec<PathBuf>, ImportError>
 // ============================================================================
 
 /// Core import pipeline. Orchestrates all phases.
-async fn run_import_pipeline<S>(
+pub(crate) async fn run_import_pipeline<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
     import_source: ImportSource,
     config: &ImportConfig,
+    seed: Option<&crate::graph_import::GraphImportSeed>,
 ) -> std::result::Result<ImportResult, ImportError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -3580,10 +3696,15 @@ where
             })
             .map_err(|e| ImportError::Api(ApiError::from(e)))?
             .to_string();
+        // Into one graph of an existing ledger, the graph salts it too: a
+        // document imported into two graphs keeps two sets of blank nodes.
         let skolem_namespace = config
             .skolem_namespace
             .clone()
-            .unwrap_or_else(|| normalized_alias.clone());
+            .unwrap_or_else(|| match seed {
+                Some(seed) => format!("{normalized_alias} {}", seed.graph_iri),
+                None => normalized_alias.clone(),
+            });
 
         let (chunk_source, doc_ids) = match &import_source {
             ImportSource::Local(path) => {
@@ -3682,32 +3803,37 @@ where
         };
 
         // ---- Phase 1: Create the ledger, or take the empty one there ----
-        // A new ledger stays invisible until the import has published it.
-        let existing = nameservice
-            .lookup(&normalized_alias)
-            .await
-            .map_err(|e| ImportError::Storage(e.to_string()))?;
-        let (namespace, basis, mut pending) = match existing {
-            Some(record) if record.commit_t > 0 || record.commit_head_id.is_some() => {
-                return Err(ImportError::Transact(format!(
-                    "import requires a fresh ledger, but '{}' already has commits (t={})",
-                    normalized_alias, record.commit_t
-                )));
-            }
-            Some(record) if !record.retracted => (record.storage_namespace(), record.write_basis(), None),
-            _ => {
-                let id = fluree_db_core::LedgerId::parse(&normalized_alias)
-                    .map_err(|e| ImportError::Storage(e.to_string()))?;
-                let pending = crate::ledger::claim_name(nameservice, &id)
-                    .await
-                    .map_err(|e| ImportError::Storage(e.to_string()))?;
-                tracing::info!(alias = %normalized_alias, instance = %pending.instance, "claimed the name for a new ledger");
-                (
-                    pending.record.storage_namespace(),
-                    pending.record.write_basis(),
-                    Some(pending),
-                )
-            }
+        // A new ledger stays invisible until the import has published it. An
+        // import into one of an existing ledger's graphs was handed the
+        // ledger's head instead.
+        let (namespace, basis, mut pending) = match seed {
+            Some(seed) => (seed.namespace.clone(), seed.basis.clone(), None),
+            None => match nameservice
+                .lookup(&normalized_alias)
+                .await
+                .map_err(|e| ImportError::Storage(e.to_string()))?
+            {
+                Some(record) if record.commit_t > 0 || record.commit_head_id.is_some() => {
+                    return Err(ImportError::Transact(format!(
+                        "import requires a fresh ledger, but '{}' already has commits (t={})",
+                        normalized_alias, record.commit_t
+                    )));
+                }
+                Some(record) if !record.retracted => (record.storage_namespace(), record.write_basis(), None),
+                _ => {
+                    let id = fluree_db_core::LedgerId::parse(&normalized_alias)
+                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    let pending = crate::ledger::claim_name(nameservice, &id)
+                        .await
+                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    tracing::info!(alias = %normalized_alias, instance = %pending.instance, "claimed the name for a new ledger");
+                    (
+                        pending.record.storage_namespace(),
+                        pending.record.write_basis(),
+                        Some(pending),
+                    )
+                }
+            },
         };
 
         // ---- Set up session directory for runs/indexes ----
@@ -3750,6 +3876,7 @@ where
             paths,
             config,
             pipeline_start,
+            seed,
         );
         // A new ledger's claim is renewed while the import runs, which can
         // take hours, so housekeeping does not take it for abandoned.
@@ -3893,6 +4020,8 @@ struct IndexBuildInput<'a> {
     /// every parse chunk via `SpoolConfig::saw_list_meta`). Written into
     /// `IndexRoot.has_list_meta`.
     saw_list_meta: bool,
+    /// How an import into an existing ledger grew its dictionaries.
+    seeded_dicts: Option<crate::graph_import::SeededDicts>,
 }
 
 /// Run phases 2-6: import chunks, build indexes, upload to CAS, write V4 root, publish.
@@ -3911,6 +4040,7 @@ async fn run_pipeline_phases<S>(
     paths: PipelinePaths<'_>,
     config: &ImportConfig,
     pipeline_start: Instant,
+    seed: Option<&crate::graph_import::GraphImportSeed>,
 ) -> std::result::Result<ImportResult, ImportError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -3926,6 +4056,7 @@ where
         doc_ids,
         paths.run_dir,
         config,
+        seed,
     )
     .await?;
 
@@ -3962,6 +4093,7 @@ where
             named_g_ids: import_result.named_g_ids,
             ns_split_mode: import_result.ns_split_mode,
             saw_list_meta: import_result.saw_list_meta,
+            seeded_dicts: import_result.seeded_dicts,
         };
         let index_result = build_and_upload(
             storage,
@@ -3973,13 +4105,16 @@ where
             import_result.total_commit_size,
             import_result.total_asserts,
             import_result.total_retracts,
+            seed,
         )
         .await?;
 
         // Publish index CID to nameservice so the server can find the root.
         // The artifacts go to the device first: the pointer is durable and
-        // must never name files that did not make it.
-        if config.publish {
+        // must never name files that did not make it. An import into an
+        // existing ledger leaves both heads to its caller, which publishes
+        // them together.
+        if config.publish && seed.is_none() {
             storage
                 .sync()
                 .await
@@ -4012,17 +4147,20 @@ where
     }
 
     // ---- Phase 7: Persist default context from turtle prefixes ----
-    if let Err(e) = store_default_context(
-        storage,
-        nameservice,
-        alias,
-        basis,
-        namespace,
-        &import_result.prefix_map,
-    )
-    .await
-    {
-        tracing::warn!(%e, "failed to persist default context (non-fatal)");
+    // An existing ledger keeps the context it has.
+    if seed.is_none() {
+        if let Err(e) = store_default_context(
+            storage,
+            nameservice,
+            alias,
+            basis,
+            namespace,
+            &import_result.prefix_map,
+        )
+        .await
+        {
+            tracing::warn!(%e, "failed to persist default context (non-fatal)");
+        }
     }
 
     config.emit_progress(ImportPhase::Done);
@@ -4038,6 +4176,7 @@ where
         has_annotations,
         tally: config.tracker.tally(),
         duplicates_removed,
+        graph: None,
     })
 }
 
@@ -4099,6 +4238,9 @@ struct ChunkImportResult {
     /// Whether any imported record carried an RDF-list position, OR'd across
     /// every parse chunk. Recorded into `IndexRoot.has_list_meta`.
     saw_list_meta: bool,
+    /// How an import into an existing ledger grew its dictionaries; `None`
+    /// for a fresh ledger, whose dictionaries are written to `run_dir`.
+    seeded_dicts: Option<crate::graph_import::SeededDicts>,
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
@@ -4113,6 +4255,7 @@ async fn run_import_chunks<S>(
     doc_ids: &DocIds,
     run_dir: &Path,
     config: &ImportConfig,
+    seed: Option<&crate::graph_import::GraphImportSeed>,
 ) -> std::result::Result<ChunkImportResult, ImportError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -4238,6 +4381,11 @@ where
         shared_alloc: &'a Arc<fluree_db_transact::SharedNamespaceAllocator>,
         rdf_type_p_id: u32,
         import_time_epoch_ms: Option<i64>,
+        /// The commit the first chunk's commit chains onto, when the import
+        /// continues an existing ledger (its txn-meta `db:previous`).
+        chain_parent_hex: Option<String>,
+        /// Whether to publish the commit head every `publish_every` chunks.
+        publish_checkpoints: bool,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4298,7 +4446,10 @@ where
                 let ns_delta = compute_ns_delta(&parsed.new_codes, published_codes);
 
                 // Capture previous commit hex BEFORE finalize advances state.
-                let previous_commit_hex = commit_metas.last().map(|m| m.commit_hash_hex.clone());
+                let previous_commit_hex = commit_metas
+                    .last()
+                    .map(|m| m.commit_hash_hex.clone())
+                    .or_else(|| env.chain_parent_hex.clone());
 
                 // The genesis commit records the registry's split mode, but the
                 // preflight flips only the allocator — mirror it so reindex agrees.
@@ -4377,7 +4528,8 @@ where
                 });
 
                 // Periodic nameservice checkpoint
-                if env.config.publish_every > 0
+                if env.publish_checkpoints
+                    && env.config.publish_every > 0
                     && (next_expected + 1).is_multiple_of(env.config.publish_every)
                 {
                     publish_import_commit_head(
@@ -4423,7 +4575,19 @@ where
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.effective_parse_threads();
-    let mut state = ImportState::new();
+    let mut state = match seed {
+        Some(seed) => ImportState::continuing(
+            seed.head_t,
+            seed.head_commit.clone(),
+            seed.ns_registry.clone(),
+            seed.graph_ids(),
+        ),
+        None => ImportState::new(),
+    };
+    // Parse workers stamp each chunk's `t` themselves: chunk `idx` commits
+    // at `base_t + idx + 1`, after the ledger's head when there is one.
+    let base_t = state.t;
+    let chain_parent_hex = seed.map(|seed| seed.head_commit.address_digest());
     let run_start = Instant::now();
 
     // ---- Inflight permit channel (memory budget enforcement) ----
@@ -4527,10 +4691,33 @@ where
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_transact::import_sink::SpoolConfig;
 
+    // Over an existing ledger, its predicates, datatypes and graphs keep
+    // their ids and new ones follow.
+    let (predicate_alloc, datatype_alloc, graph_alloc) = match seed {
+        Some(seed) => (
+            SharedDictAllocator::from_predicate_dict(&seed.base_dicts.predicates),
+            SharedDictAllocator::from_predicate_dict(&seed.base_dicts.datatypes),
+            SharedDictAllocator::from_predicate_dict(&seed.base_dicts.graphs),
+        ),
+        None => (
+            SharedDictAllocator::new_predicate(),
+            SharedDictAllocator::new_datatype(),
+            SharedDictAllocator::new_graph(alias),
+        ),
+    };
+    if let Some(seed) = seed {
+        let g_id = graph_alloc.get_or_insert(&seed.graph_iri) + 1;
+        if g_id != seed.g_id {
+            return Err(ImportError::Transact(format!(
+                "graph <{}> would get g_id {g_id}, not the {} its import planned",
+                seed.graph_iri, seed.g_id
+            )));
+        }
+    }
     let spool_config = Arc::new(SpoolConfig {
-        predicate_alloc: Arc::new(SharedDictAllocator::new_predicate()),
-        datatype_alloc: Arc::new(SharedDictAllocator::new_datatype()),
-        graph_alloc: Arc::new(SharedDictAllocator::new_graph(alias)),
+        predicate_alloc: Arc::new(predicate_alloc),
+        datatype_alloc: Arc::new(datatype_alloc),
+        graph_alloc: Arc::new(graph_alloc),
         numbig_pool: Arc::new(SharedNumBigPool::new()),
         vector_pool: Arc::new(SharedVectorArenaPool::new()),
         ns_alloc: Arc::clone(&shared_alloc),
@@ -4540,6 +4727,7 @@ where
         // record `IndexRoot.has_list_meta` exactly.
         saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         list_owners: Default::default(),
+        target_graph: seed.map(|seed| Arc::from(seed.graph_iri.as_str())),
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.
@@ -4658,6 +4846,8 @@ where
         shared_alloc: &shared_alloc,
         rdf_type_p_id,
         import_time_epoch_ms,
+        chain_parent_hex: chain_parent_hex.clone(),
+        publish_checkpoints: seed.is_none(),
     };
 
     if is_streaming {
@@ -4733,7 +4923,7 @@ where
                             }
                         };
 
-                        let t = (idx + 1) as i64;
+                        let t = base_t + (idx + 1) as i64;
                         log_ttl_chunk(idx, &ttl);
                         // This arm streams a SINGLE local file, so every chunk
                         // belongs to the same document; `idx` is its sub-chunk
@@ -4764,11 +4954,13 @@ where
         // Forwarder thread: receive from reader thread, apply any one-time namespace
         // fallback mode before chunk 0 is parsed, then dispatch to workers.
         let forward_shared_alloc = Arc::clone(&shared_alloc);
+        // An existing ledger's split mode is fixed: its dictionary is keyed by it.
+        let split_mode_fixed = seed.is_some();
         let forward_handle = std::thread::Builder::new()
             .name("ttl-forwarder".into())
             .spawn(move || {
                 use fluree_db_core::NsSplitMode;
-                let mut ns_mode_set = false;
+                let mut ns_mode_set = split_mode_fixed;
                 loop {
                     let payload = match reader_rx.lock().unwrap().recv() {
                         Ok(p) => p,
@@ -5016,7 +5208,7 @@ where
                             }
                         };
 
-                        let t = (idx + 1) as i64;
+                        let t = base_t + (idx + 1) as i64;
                         let parse_start = Instant::now();
                         match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                             Ok(parsed) => {
@@ -5149,9 +5341,12 @@ where
 
             let content = String::from_utf8(raw_bytes)
                 .map_err(|e| ImportError::Transact(format!("chunk {idx} invalid UTF-8: {e}")))?;
-            let t = (idx + 1) as i64;
+            let t = base_t + (idx + 1) as i64;
 
             let result = if chunk_source.is_trig(idx) || chunk_source.is_nquads(idx) {
+                if seed.is_some() {
+                    return Err(refuse_quads_into_graph());
+                }
                 // N-Quads is converted to TriG up front; TriG passes through.
                 let nq_converted;
                 let trig_content: &str = if chunk_source.is_nquads(idx) {
@@ -5226,7 +5421,10 @@ where
 
             // Collect txn-meta for this commit.
             {
-                let previous_commit_hex = commit_metas.last().map(|m| m.commit_hash_hex.clone());
+                let previous_commit_hex = commit_metas
+                    .last()
+                    .map(|m| m.commit_hash_hex.clone())
+                    .or_else(|| chain_parent_hex.clone());
                 commit_metas.push(CommitMeta {
                     commit_hash_hex: result.commit_id.address_digest(),
                     t: result.t,
@@ -5258,7 +5456,10 @@ where
                 cumulative_flakes: state.cumulative_flakes,
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
-            if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
+            if seed.is_none()
+                && config.publish_every > 0
+                && (idx + 1).is_multiple_of(config.publish_every)
+            {
                 publish_import_commit_head(
                     nameservice,
                     alias,
@@ -5364,7 +5565,7 @@ where
                             };
 
                             // `Files` reads one whole file per chunk.
-                            let t = (idx + 1) as i64;
+                            let t = base_t + (idx + 1) as i64;
                             let doc = DocChunk::whole(file_doc_ids[idx]);
                             match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                                 Ok(parsed) => {
@@ -5412,9 +5613,12 @@ where
             // shared_alloc, so they must be in sync during the parse pass.
             for i in 0..estimated_total {
                 let content = chunk_source.read_chunk(i)?;
-                let t = (i + 1) as i64;
+                let t = base_t + (i + 1) as i64;
 
                 let result = if chunk_source.is_trig(i) || chunk_source.is_nquads(i) {
+                    if seed.is_some() {
+                        return Err(refuse_quads_into_graph());
+                    }
                     // TriG (and N-Quads, converted to TriG) use the dedicated
                     // commit function for named-graph handling. It allocates
                     // codes through spool_config.ns_alloc (spool prefix
@@ -5494,8 +5698,10 @@ where
 
                 // Collect txn-meta for this commit.
                 {
-                    let previous_commit_hex =
-                        commit_metas.last().map(|m| m.commit_hash_hex.clone());
+                    let previous_commit_hex = commit_metas
+                        .last()
+                        .map(|m| m.commit_hash_hex.clone())
+                        .or_else(|| chain_parent_hex.clone());
                     commit_metas.push(CommitMeta {
                         commit_hash_hex: result.commit_id.address_digest(),
                         t: result.t,
@@ -5527,7 +5733,10 @@ where
                     cumulative_flakes: state.cumulative_flakes,
                     elapsed_secs: run_start.elapsed().as_secs_f64(),
                 });
-                if config.publish_every > 0 && (i + 1).is_multiple_of(config.publish_every) {
+                if seed.is_none()
+                    && config.publish_every > 0
+                    && (i + 1).is_multiple_of(config.publish_every)
+                {
                     publish_import_commit_head(
                         nameservice,
                         alias,
@@ -5547,8 +5756,11 @@ where
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
-    publish_import_commit_head(nameservice, alias, basis, state.t, &commit_head_id).await?;
-    tracing::info!(t = state.t, "published final commit head");
+    // An import into an existing ledger publishes its head with the index.
+    if seed.is_none() {
+        publish_import_commit_head(nameservice, alias, basis, state.t, &commit_head_id).await?;
+        tracing::info!(t = state.t, "published final commit head");
+    }
 
     // ---- Spawn txn-meta "meta chunk" build in background ----
     // Build a tiny extra chunk containing commit metadata records (g_id=1).
@@ -5726,8 +5938,10 @@ where
             // — the scope is a hash, and nothing else in the ledger records
             // what was hashed.
             //
-            // Stamped at t=1: the manifest describes the import as a whole,
-            // and t=1 is the first commit any reader of the ledger can see.
+            // Stamped at the import's first commit: the manifest describes
+            // the import as a whole, and that is the first commit of it any
+            // reader of the ledger can see.
+            let manifest_t = (base_t + 1) as u32;
             let manifest_count = manifest.len();
             for (scope_label, doc_key) in &manifest {
                 let scope_s =
@@ -5739,7 +5953,7 @@ where
                     ObjKind::LEX_ID,
                     ObjKey::encode_u32_id(key_str_id),
                     DatatypeDictId::STRING,
-                    1,
+                    manifest_t,
                 ));
             }
 
@@ -5987,17 +6201,48 @@ where
     let namespace_codes_for_subj = Arc::clone(&namespace_codes);
     let run_dir_for_subj = run_dir_path.clone();
     let remap_dir_for_subj = remap_dir_path.clone();
+    // Over an existing ledger, its dictionaries name the terms they already
+    // hold, and only the rest are numbered, written to `run_dir` as the
+    // terms to add to them.
+    let subject_seed = seed.map(|seed| {
+        (
+            Arc::clone(&seed.subject_tree),
+            seed.base_root.subject_watermarks.clone(),
+        )
+    });
     let merge_parent_span = tracing::Span::current();
     let subj_span = merge_parent_span.clone();
     let subj_handle = tokio::task::spawn_blocking(move || {
         let _guard = subj_span.enter();
-        vocab_merge::merge_subject_vocabs(
-            &subj_vocab_paths_for_task,
-            &chunk_ids_for_subj,
-            &remap_dir_for_subj,
-            &run_dir_for_subj,
-            namespace_codes_for_subj.as_ref(),
-        )
+        match subject_seed {
+            None => vocab_merge::merge_subject_vocabs(
+                &subj_vocab_paths_for_task,
+                &chunk_ids_for_subj,
+                &remap_dir_for_subj,
+                &run_dir_for_subj,
+                namespace_codes_for_subj.as_ref(),
+            )
+            .map(|stats| (stats, None)),
+            Some((tree, watermarks)) => {
+                let mut lookup =
+                    |keys: &[Vec<u8>]| tree.reverse_lookup_many(keys.iter().map(Vec::as_slice));
+                vocab_merge::merge_subject_vocabs_seeded(
+                    &subj_vocab_paths_for_task,
+                    &chunk_ids_for_subj,
+                    &remap_dir_for_subj,
+                    &run_dir_for_subj.join(crate::graph_import::NEW_SUBJECTS_FILE),
+                    &watermarks,
+                    &mut lookup,
+                )
+                .map(|merged| {
+                    let stats = vocab_merge::SubjectMergeStats {
+                        total_unique: merged.total_unique,
+                        needs_wide: merged.needs_wide,
+                    };
+                    (stats, Some(merged))
+                })
+            }
+        }
     });
     // Serial mode: drain each merge before spawning the next, so only one
     // merge's per-chunk descriptors are live at a time.
@@ -6017,15 +6262,42 @@ where
     let chunk_ids_for_str = chunk_ids.clone();
     let run_dir_for_str = run_dir_path.clone();
     let remap_dir_for_str = remap_dir_path.clone();
+    let string_seed = seed.map(|seed| {
+        (
+            Arc::clone(&seed.string_tree),
+            seed.base_root.string_watermark,
+        )
+    });
     let str_span = merge_parent_span.clone();
     let str_handle = tokio::task::spawn_blocking(move || {
         let _guard = str_span.enter();
-        vocab_merge::merge_string_vocabs(
-            &str_vocab_paths_for_task,
-            &chunk_ids_for_str,
-            &remap_dir_for_str,
-            &run_dir_for_str,
-        )
+        match string_seed {
+            None => vocab_merge::merge_string_vocabs(
+                &str_vocab_paths_for_task,
+                &chunk_ids_for_str,
+                &remap_dir_for_str,
+                &run_dir_for_str,
+            )
+            .map(|stats| (stats, None)),
+            Some((tree, watermark)) => {
+                let mut lookup =
+                    |keys: &[Vec<u8>]| tree.reverse_lookup_many(keys.iter().map(Vec::as_slice));
+                vocab_merge::merge_string_vocabs_seeded(
+                    &str_vocab_paths_for_task,
+                    &chunk_ids_for_str,
+                    &remap_dir_for_str,
+                    &run_dir_for_str.join(crate::graph_import::NEW_STRINGS_FILE),
+                    watermark,
+                    &mut lookup,
+                )
+                .map(|merged| {
+                    let stats = vocab_merge::StringMergeStats {
+                        total_unique: merged.total_unique as u32,
+                    };
+                    (stats, Some(merged))
+                })
+            }
+        }
     });
     let (str_stats_serial, str_handle) = if vocab_merge_serial {
         let stats = str_handle
@@ -6040,13 +6312,22 @@ where
     };
 
     let lang_vocab_paths_for_task = lang_vocab_paths.clone();
+    let lang_base = seed.map(|seed| seed.base_dicts.languages.clone());
     let lang_span = merge_parent_span;
     let lang_handle = tokio::task::spawn_blocking(move || {
         let _guard = lang_span.enter();
-        fluree_db_indexer::run_index::build_lang_remap_from_vocabs(&lang_vocab_paths_for_task)
+        match lang_base {
+            None => fluree_db_indexer::run_index::build_lang_remap_from_vocabs(
+                &lang_vocab_paths_for_task,
+            ),
+            Some(base) => fluree_db_indexer::run_index::build_lang_remap_over(
+                base,
+                &lang_vocab_paths_for_task,
+            ),
+        }
     });
 
-    let subj_stats = match (subj_stats_serial, subj_handle) {
+    let (subj_stats, seeded_subjects) = match (subj_stats_serial, subj_handle) {
         (Some(stats), _) => stats,
         (None, Some(handle)) => handle
             .await
@@ -6056,7 +6337,7 @@ where
             .map_err(vocab_merge_error)?,
         (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
     };
-    let str_stats = match (str_stats_serial, str_handle) {
+    let (str_stats, seeded_strings) = match (str_stats_serial, str_handle) {
         (Some(stats), _) => stats,
         (None, Some(handle)) => handle
             .await
@@ -6085,6 +6366,54 @@ where
 
     // Delete .voc files now that all merges (subject, string, language) are complete.
     let _ = std::fs::remove_dir_all(&vocab_dir);
+
+    // Over an existing dictionary the remaps are not monotone, and the index
+    // build's merges need every remapped chunk stream to stay sorted:
+    // renumber each chunk's local ids by global order first.
+    let (sorted_commit_infos, lang_remaps) = if seed.is_some() {
+        let relocalize_start = Instant::now();
+        let permits = Arc::new(tokio::sync::Semaphore::new(sort_write_permits));
+        let mut handles = Vec::with_capacity(sorted_commit_infos.len());
+        for (info, lang_remap) in sorted_commit_infos.into_iter().zip(lang_remaps) {
+            let permit = Arc::clone(&permits)
+                .acquire_owned()
+                .await
+                .expect("semaphore closed");
+            let subject_remap = remap_dir.join(format!("subjects_{:05}.rmp", info.chunk_idx));
+            let string_remap = remap_dir.join(format!("strings_{:05}.rmp", info.chunk_idx));
+            let span = tracing::Span::current();
+            handles.push(tokio::task::spawn_blocking(move || {
+                let _guard = span.enter();
+                let _permit = permit;
+                fluree_db_indexer::run_index::relocalize_sorted_commit(
+                    &info,
+                    &subject_remap,
+                    &string_remap,
+                    &lang_remap,
+                )
+            }));
+        }
+        let mut infos = Vec::with_capacity(handles.len());
+        let mut remaps = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let (info, lang_remap) = handle
+                .await
+                .map_err(|e| {
+                    ImportError::RunGeneration(TaskFailure::from(e).describe("relocalize task"))
+                })?
+                .map_err(ImportError::Io)?;
+            infos.push(info);
+            remaps.push(lang_remap);
+        }
+        tracing::info!(
+            chunks = infos.len(),
+            elapsed_ms = relocalize_start.elapsed().as_millis(),
+            "relocalized sorted commits to the existing dictionary's order"
+        );
+        (infos, remaps)
+    } else {
+        (sorted_commit_infos, lang_remaps)
+    };
 
     tracing::info!(
         unique_subjects = total_unique_subjects,
@@ -6131,7 +6460,11 @@ where
     // skipped entirely and the optimized default-graph path pays nothing. g_id 1
     // (txn-meta) is built separately; g_id 2 (config) is not populated by bulk
     // RDF import.
-    let v3_named_g_ids: Vec<fluree_db_core::GraphId> = {
+    // An import into one graph of an existing ledger builds that graph as
+    // its primary pass instead (see `build_and_upload`).
+    let v3_named_g_ids: Vec<fluree_db_core::GraphId> = if seed.is_some() {
+        Vec::new()
+    } else {
         let graph_count = spool_config.graph_alloc.len();
         (fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID..=graph_count)
             .map(|g| g as fluree_db_core::GraphId)
@@ -6249,6 +6582,27 @@ where
     let p_width: u8 = 0;
     let dt_width: u8 = 0;
 
+    let seeded_dicts = match (seeded_subjects, seeded_strings) {
+        (Some(subjects), Some(strings)) => {
+            let all = |alloc: &SharedDictAllocator| -> Vec<String> {
+                (0..alloc.len())
+                    .map(|id| alloc.resolve(id).unwrap_or_default())
+                    .collect()
+            };
+            Some(crate::graph_import::SeededDicts {
+                new_subjects: subjects.new_subjects,
+                subject_watermarks: subjects.watermarks,
+                needs_wide: subjects.needs_wide,
+                new_strings: strings.new_strings,
+                string_watermark: strings.watermark,
+                predicate_iris: all(&spool_config.predicate_alloc),
+                datatype_iris: all(&spool_config.datatype_alloc),
+                graph_iris: all(&spool_config.graph_alloc),
+            })
+        }
+        _ => None,
+    };
+
     Ok(ChunkImportResult {
         final_t: state.t,
         cumulative_flakes: state.cumulative_flakes,
@@ -6274,6 +6628,7 @@ where
         saw_list_meta: spool_config
             .saw_list_meta
             .load(std::sync::atomic::Ordering::Relaxed),
+        seeded_dicts,
     })
 }
 
@@ -6311,6 +6666,7 @@ async fn build_and_upload<S>(
     total_commit_size: u64,
     total_asserts: u64,
     total_retracts: u64,
+    seed: Option<&crate::graph_import::GraphImportSeed>,
 ) -> std::result::Result<IndexUploadResult, ImportError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -6355,21 +6711,27 @@ where
         );
     }
 
-    // Shared content store for dict upload, index upload, and other CAS operations.
-    let content_store: std::sync::Arc<dyn fluree_db_core::ContentStore> = std::sync::Arc::new(
-        fluree_db_core::storage::content_store_for(storage.clone(), namespace),
-    );
+    // Shared content store for dict upload, index upload, and other CAS
+    // operations. An existing ledger's also reads the artifacts it inherits.
+    let content_store: std::sync::Arc<dyn fluree_db_core::ContentStore> = match seed {
+        Some(seed) => Arc::clone(&seed.content_store),
+        None => std::sync::Arc::new(fluree_db_core::storage::content_store_for(
+            storage.clone(),
+            namespace,
+        )),
+    };
 
     // Start dict upload (reads flat files from run_dir, builds CoW trees, uploads to CAS).
-    // This runs concurrently with the index builds below.
-    let dict_upload_handle = {
+    // This runs concurrently with the index builds below. An existing
+    // ledger's dictionaries grow once the graph is built instead.
+    let dict_upload_handle = seed.is_none().then(|| {
         let content_store = content_store.clone();
         let run_dir = input.run_dir.to_path_buf();
         let namespace_codes = input.namespace_codes.clone();
         tokio::spawn(async move {
             upload_dicts_from_disk(content_store.as_ref(), &run_dir, &namespace_codes, true).await
         })
-    };
+    });
 
     let remap_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let build_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -6408,6 +6770,29 @@ where
                 &v3_sorted_commit_infos,
             );
         let pooled_g_ids = v3_named_g_ids.clone();
+        // The graph the main pass builds: the default graph, or the one graph
+        // an import into an existing ledger fills. Only a fresh ledger's
+        // txn-meta is built here; an existing one's is merged into its index.
+        let v3_primary_g_id = seed.map_or(0, |seed| seed.g_id);
+        let v3_build_txn_meta = seed.is_none();
+        let commits: Vec<fluree_db_indexer::CommitInput> = v3_sorted_commit_infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                let remap_dir = v3_run_dir.join("remap");
+                fluree_db_indexer::CommitInput {
+                    commit_path: info.path.clone(),
+                    record_count: info.record_count,
+                    subject_remap_path: remap_dir.join(format!("subjects_{i:05}.rmp")),
+                    string_remap_path: remap_dir.join(format!("strings_{i:05}.rmp")),
+                    lang_remap: v3_lang_remaps.get(i).cloned().unwrap_or_default(),
+                    types_map_path: info.types_map_path.clone(),
+                    term_table: info.term_table.clone(),
+                }
+            })
+            .collect();
+        // The meta chunk is always the last chunk when present.
+        let txn_meta_commit = commits.last().cloned();
 
         config.emit_progress(ImportPhase::PreparingIndex {
             stage: "Generating per-order runs",
@@ -6457,23 +6842,6 @@ where
                 ),
                 ImportError,
             > {
-                let commits: Vec<fluree_db_indexer::CommitInput> = v3_sorted_commit_infos
-                    .iter()
-                    .enumerate()
-                    .map(|(i, info)| {
-                        let remap_dir = v3_run_dir.join("remap");
-                        fluree_db_indexer::CommitInput {
-                            commit_path: info.path.clone(),
-                            record_count: info.record_count,
-                            subject_remap_path: remap_dir.join(format!("subjects_{i:05}.rmp")),
-                            string_remap_path: remap_dir.join(format!("strings_{i:05}.rmp")),
-                            lang_remap: v3_lang_remaps.get(i).cloned().unwrap_or_default(),
-                            types_map_path: info.types_map_path.clone(),
-                            term_table: info.term_table.clone(),
-                        }
-                    })
-                    .collect();
-
                 let mut stats_hook = v3_collect_id_stats.then(|| {
                     let mut hook = fluree_db_indexer::stats::IdStatsHook::new();
                     hook.set_rdf_type_p_id(v3_rdf_type_p_id);
@@ -6490,7 +6858,7 @@ where
                 // The meta chunk is appended as the final "chunk" during import so that
                 // `ledger#txn-meta` queries work immediately after import without re-reading
                 // commit blobs. We build g_id=1 separately to avoid a full second pass.
-                let v3_runs_g0 = v3_run_dir.join("v3_runs_g0");
+                let v3_runs_g0 = v3_run_dir.join(format!("v3_runs_g{v3_primary_g_id}"));
                 let v3_runs_g1 = v3_run_dir.join("v3_runs_g1");
 
                 // One FD budget for every graph's build in this import: the
@@ -6505,7 +6873,7 @@ where
                 let cfg_g0 = fluree_db_indexer::BuildConfig {
                     run_dir: v3_runs_g0,
                     index_dir: v3_index_dir.clone(),
-                    g_id: 0,
+                    g_id: v3_primary_g_id,
                     leaflet_target_rows: v3_leaflet_target_rows,
                     leaf_target_rows: v3_leaf_target_rows,
                     zstd_level: 1,
@@ -6533,7 +6901,9 @@ where
                 // it BEFORE stats finalize and share the IdStatsHook so the
                 // g_id=1 records contribute to graph_flakes (otherwise the
                 // per-graph stats entry for txn-meta is missing entirely).
-                let g1_result = if let Some(meta_commit) = commits.last() {
+                let g1_result = if let Some(meta_commit) =
+                    commits.last().filter(|_| v3_build_txn_meta)
+                {
                     let cfg_g1 = fluree_db_indexer::BuildConfig {
                         run_dir: v3_runs_g1,
                         index_dir: v3_index_dir.clone(),
@@ -6801,6 +7171,62 @@ where
             }
         };
 
+        if let Some(seed) = seed {
+            // The splice merges no triple-term dictionary, so terms the build
+            // interned would be lost.
+            let interned = term_dict_builder
+                .lock()
+                .map_err(|_| ImportError::IndexBuild("term dictionary lock poisoned".into()))?
+                .len();
+            if interned > 0 {
+                return Err(ImportError::Refused(format!(
+                    "an import into a graph of an existing ledger does not support triple \
+                     terms or edge annotations yet; the source holds {interned}"
+                )));
+            }
+            config.emit_progress(ImportPhase::PreparingIndex {
+                stage: "Merging into the ledger's index",
+            });
+            let dicts = input.seeded_dicts.ok_or_else(|| {
+                ImportError::IndexBuild("a graph import left no dictionary growth".into())
+            })?;
+            let txn_meta = txn_meta_commit.ok_or_else(|| {
+                ImportError::IndexBuild("a graph import wrote no commit metadata".into())
+            })?;
+            let mut language_tags: Vec<(u16, String)> = input
+                .unified_lang_dict
+                .iter()
+                .map(|(id, tag)| (id, tag.to_string()))
+                .collect();
+            language_tags.sort_unstable_by_key(|(id, _)| *id);
+            let spliced = crate::graph_import::splice_graph_into_index(
+                seed,
+                crate::graph_import::GraphBuild {
+                    ledger_id: alias,
+                    run_dir: input.run_dir,
+                    build: &v3_result,
+                    stats: stats_output
+                        .map(|((id_stats, ..), class_stats)| (id_stats, class_stats)),
+                    dicts,
+                    namespace_codes: input.namespace_codes,
+                    language_tags: language_tags.into_iter().map(|(_, tag)| tag).collect(),
+                    txn_meta,
+                    final_t: input.final_t,
+                    total_commit_size,
+                    total_asserts,
+                    saw_list_meta: input.saw_list_meta,
+                },
+            )
+            .await?;
+            return Ok(IndexUploadResult {
+                root_id: spliced.root_id,
+                index_t: spliced.index_t,
+                summary: None,
+                has_annotations: spliced.has_annotations,
+                duplicates_removed: chunk_duplicates_removed + v3_result.duplicates_removed,
+            });
+        }
+
         // Persist the triple-term dictionary the build interned, if any.
         let term_dict_refs = {
             let builder =
@@ -6843,13 +7269,17 @@ where
         );
 
         // Wait for dict upload to complete (shared with V2 path).
-        if !dict_upload_handle.is_finished() {
+        if dict_upload_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
             config.emit_progress(ImportPhase::PreparingIndex {
                 stage: "Waiting for dictionary upload",
             });
         }
         let dict_wait_start = Instant::now();
         let uploaded_dicts = dict_upload_handle
+            .expect("a fresh import uploads its dictionaries")
             .await
             .map_err(|e| ImportError::Upload(format!("dict upload join: {e}")))?
             .map_err(|e| ImportError::Upload(e.to_string()))?;
@@ -6863,7 +7293,7 @@ where
 
         // ── V3 FIR6 root assembly ──────────────────────────────────
         use fluree_db_binary_index::format::index_root::DefaultGraphOrder;
-        use fluree_db_binary_index::{GraphArenaRefs, IndexRoot, VectorDictRef};
+        use fluree_db_binary_index::IndexRoot;
 
         config.emit_progress(ImportPhase::PreparingIndex {
             stage: "Assembling index root",
@@ -6874,52 +7304,7 @@ where
         // Extract DictRefs from uploaded dicts (arena refs are separate fields).
         let dict_refs_v6 = uploaded_dicts.dict_refs;
 
-        let mut graph_ids = std::collections::BTreeSet::new();
-        for g_id_str in uploaded_dicts.numbig.keys() {
-            if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
-                graph_ids.insert(g_id);
-            }
-        }
-        for g_id_str in uploaded_dicts.vectors.keys() {
-            if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
-                graph_ids.insert(g_id);
-            }
-        }
-        let graph_arenas_v6: Vec<GraphArenaRefs> = graph_ids
-            .into_iter()
-            .map(|g_id| {
-                let g_id_str = g_id.to_string();
-                let numbig: Vec<(u32, ContentId)> = uploaded_dicts
-                    .numbig
-                    .get(&g_id_str)
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v): (&String, _)| (k.parse::<u32>().unwrap_or(0), v.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let vectors: Vec<VectorDictRef> = uploaded_dicts
-                    .vectors
-                    .get(&g_id_str)
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v): (&String, _)| VectorDictRef {
-                                p_id: k.parse::<u32>().unwrap_or(0),
-                                manifest: v.manifest.clone(),
-                                shards: v.shards.clone(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                GraphArenaRefs {
-                    g_id,
-                    numbig,
-                    vectors,
-                    spatial: Vec::new(),
-                    fulltext: vec![],
-                }
-            })
-            .collect();
+        let graph_arenas_v6 = graph_arena_refs(&uploaded_dicts.numbig, &uploaded_dicts.vectors);
 
         let ns_codes_v6: std::collections::BTreeMap<u16, String> = input
             .namespace_codes
@@ -7217,6 +7602,58 @@ where
             duplicates_removed: chunk_duplicates_removed + v3_result.duplicates_removed,
         })
     }
+}
+
+/// Per-graph arena refs for the numbig and vector arenas an import uploaded,
+/// keyed by graph id and then predicate id (both as decimal strings).
+pub(crate) fn graph_arena_refs(
+    numbig: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, ContentId>>,
+    vectors: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, fluree_db_binary_index::VectorDictRef>,
+    >,
+) -> Vec<fluree_db_binary_index::GraphArenaRefs> {
+    use fluree_db_binary_index::{GraphArenaRefs, VectorDictRef};
+
+    let mut graph_ids = std::collections::BTreeSet::new();
+    for g_id_str in numbig.keys().chain(vectors.keys()) {
+        if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
+            graph_ids.insert(g_id);
+        }
+    }
+    graph_ids
+        .into_iter()
+        .map(|g_id| {
+            let g_id_str = g_id.to_string();
+            let numbig: Vec<(u32, ContentId)> = numbig
+                .get(&g_id_str)
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.parse::<u32>().unwrap_or(0), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let vectors: Vec<VectorDictRef> = vectors
+                .get(&g_id_str)
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| VectorDictRef {
+                            p_id: k.parse::<u32>().unwrap_or(0),
+                            manifest: v.manifest.clone(),
+                            shards: v.shards.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            GraphArenaRefs {
+                g_id,
+                numbig,
+                vectors,
+                spatial: Vec::new(),
+                fulltext: vec![],
+            }
+        })
+        .collect()
 }
 
 /// Build a lightweight import summary for CLI display.

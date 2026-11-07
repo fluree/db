@@ -55,6 +55,14 @@ pub struct TransportFlake {
     /// List index (from FlakeMeta, if present)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub i: Option<i32>,
+    /// Which list of its owner a list item is in (from FlakeMeta; 0 when
+    /// absent)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub list: u32,
+}
+
+fn is_zero(list: &u32) -> bool {
+    *list == 0
 }
 
 /// Serializable SID for transport
@@ -251,6 +259,7 @@ impl From<&Flake> for TransportFlake {
             op: f.op,
             lang: f.m.as_ref().and_then(|m| m.lang.clone()),
             i: f.m.as_ref().and_then(|m| m.i),
+            list: f.m.as_ref().map_or(0, |m| m.list),
         }
     }
 }
@@ -261,15 +270,12 @@ impl TransportFlake {
     /// Returns an error if value reconstruction fails.
     pub fn to_flake(&self, interner: &SidInterner) -> Result<Flake, FlakesTransportError> {
         let m = match (&self.lang, &self.i) {
-            (Some(lang), i) => Some(FlakeMeta {
-                lang: Some(lang.clone()),
-                i: *i,
-            }),
-            (None, Some(i)) => Some(FlakeMeta {
-                lang: None,
-                i: Some(*i),
-            }),
             (None, None) => None,
+            (lang, i) => Some(FlakeMeta {
+                lang: lang.clone(),
+                i: *i,
+                list: if i.is_some() { self.list } else { 0 },
+            }),
         };
 
         Ok(Flake {
@@ -472,6 +478,7 @@ mod tests {
         flake.m = Some(FlakeMeta {
             lang: Some("en".to_string()),
             i: Some(5),
+            list: 0,
         });
 
         let transport = TransportFlake::from(&flake);
@@ -606,6 +613,7 @@ mod tests {
             op: true,
             lang: None,
             i: None,
+            list: 0,
         };
 
         // Should return error, not panic
@@ -635,6 +643,7 @@ mod tests {
             op: true,
             lang: Some("en".to_string()),
             i: Some(5),
+            list: 0,
         };
 
         let flake = tf.to_flake(&interner).unwrap();

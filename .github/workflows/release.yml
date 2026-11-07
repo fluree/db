@@ -144,6 +144,11 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # .cargo/config.toml's deployment target. A variable a job sets, a
+      # dependency's own target or a dist upgrade could lower it with no error.
+      - name: The macOS binary targets macOS 14
+        if: runner.os == 'macOS'
+        run: vtool -show-build target/aarch64-apple-darwin/dist/fluree | grep 'minos 14.0'
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -418,8 +423,19 @@ jobs:
             name=${filename%.rb}
             version=$(echo "$release" | jq .app_version --raw-output)
 
+            # The macOS binary needs macOS 14 (.cargo/config.toml), so brew
+            # refuses it on an older one and keeps what is installed. Inside
+            # `on_macos`: a macOS requirement at the top level would make
+            # Homebrew refuse the formula on Linux.
+            formula="$RUNNER_TEMP/$filename"
+            awk '
+              { print }
+              /^  license / { print ""; print "  on_macos do"; print "    depends_on macos: :sonoma"; print "  end"; floor = 1 }
+              END { exit !floor }
+            ' "$ARTIFACTS/$filename" > "$formula"
+
             if [ "$prerelease" = false ]; then
-              cp "$ARTIFACTS/$filename" "$STAGED/$filename"
+              cp "$formula" "$STAGED/$filename"
               echo "$name $version" >> "$STAGED/manifest"
             fi
             # `<name>-beta` is Homebrew's class `<Class>Beta`. Keg-only, so it
@@ -430,7 +446,7 @@ jobs:
               { print }
               /^  license / { print "  keg_only \"it installs the same commands as the stable formula\""; keg = 1 }
               END { exit !(renamed && keg) }
-            ' "$ARTIFACTS/$filename" > "$STAGED/$name-beta.rb"
+            ' "$formula" > "$STAGED/$name-beta.rb"
             echo "$name-beta $version" >> "$STAGED/manifest"
           done
           # We avoid reformatting user-provided data such as the app description and homepage.

@@ -374,6 +374,18 @@ async fn probe_helpers_merge_novelty() {
             Engage::SpotStarWalk,
         ),
         (
+            // ex:missing is no predicate of the ledger's, so the star probe
+            // reads nothing for it while it merges the other predicates'
+            // novelty: the star matches nothing, rather than refusing.
+            "property-join-spot-walk-unknown-predicate",
+            r#"PREFIX ex: <http://example.org/ns/>
+              SELECT ?s ?v ?m
+              WHERE { ?s ex:city "Quito" . ?s ex:age ?v . ?s ex:missing ?m }
+              ORDER BY ?s ?v ?m"#,
+            0,
+            Engage::SpotStarWalk,
+        ),
+        (
             // ex:nick exists only in novelty, so the whole-star SPOT plan
             // declines and the remaining base predicates take the chunked
             // batched probes instead (the novelty-only predicate full-scans).
@@ -504,11 +516,18 @@ async fn batched_object_join_merges_novelty() {
     let receipt = fluree
         .update(
             receipt.ledger,
-            // A delete naming a list position retracts that entry alone;
-            // naming the value would retract every entry holding it.
+            // Replacing the head cell's member retracts that entry alone
+            // (`ex:carol` is in none of the queries below); naming the value
+            // would retract every entry holding it.
             &json!({
-                "@context": ctx(),
-                "delete": {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:bob"}]}}
+                "@context": {"ex": "http://example.org/ns/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+                "where": [
+                    {"@id": "ex:b5", "ex:authors": "?h"},
+                    {"@id": "?h", "rdf:first": {"@id": "ex:bob"}}
+                ],
+                "delete": {"@id": "?h", "rdf:first": {"@id": "ex:bob"}},
+                "insert": {"@id": "?h", "rdf:first": {"@id": "ex:carol"}},
+                "opts": {"rdfLists": true}
             }),
         )
         .await

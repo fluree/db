@@ -58,6 +58,8 @@ pub struct ResolvedFlake {
     pub lang: Option<String>,
     /// List index (if present)
     pub i: Option<i32>,
+    /// Which list of its owner a list item is in (0 for the first)
+    pub list: u32,
     /// Named graph IRI (if not default graph)
     pub graph: Option<String>,
 }
@@ -78,6 +80,7 @@ impl Serialize for ResolvedFlake {
             let meta = FlakeMeta {
                 lang: self.lang.as_deref(),
                 i: self.i,
+                list: self.list,
                 graph: self.graph.as_deref(),
             };
             seq.serialize_element(&meta)?;
@@ -131,6 +134,7 @@ impl Serialize for ResolvedTriple {
             seq.serialize_element(&FlakeMeta {
                 lang: Some(lang),
                 i: None,
+                list: 0,
                 graph: None,
             })?;
         }
@@ -157,8 +161,14 @@ struct FlakeMeta<'a> {
     lang: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     i: Option<i32>,
+    #[serde(skip_serializing_if = "is_first_list")]
+    list: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     graph: Option<&'a str>,
+}
+
+fn is_first_list(list: &u32) -> bool {
+    *list == 0
 }
 
 /// Full decoded commit with resolved IRIs.
@@ -436,6 +446,7 @@ pub(crate) fn resolve_flake(
 
     let lang = flake.m.as_ref().and_then(|m| m.lang.clone());
     let i = flake.m.as_ref().and_then(|m| m.i);
+    let list = flake.m.as_ref().map_or(0, |m| m.list);
     let graph = match &flake.g {
         Some(g_sid) => Some(
             compactor
@@ -453,6 +464,7 @@ pub(crate) fn resolve_flake(
         op: flake.op,
         lang,
         i,
+        list,
         graph,
     })
 }

@@ -346,7 +346,14 @@ impl EncObj {
                 o_key,
             });
         }
-        let id = match late_materialized_object_binding(o_type, o_key, p_id, 0, u32::MAX, None) {
+        let id = match late_materialized_object_binding(
+            o_type,
+            o_key,
+            p_id,
+            0,
+            fluree_db_core::list_index::NONE,
+            None,
+        ) {
             Some(Binding::EncodedSid { s_id, .. }) => EncIdentity::Ref(s_id),
             Some(Binding::EncodedLit { o_kind, .. }) => EncIdentity::Lit {
                 o_type,
@@ -386,9 +393,14 @@ impl EncObj {
     /// scan uses for these rows. The decode runs once per row that
     /// *survives* the join, not per row scanned.
     fn to_binding(self, view: Option<&BinaryGraphView>) -> Result<Binding> {
-        if let Some(binding) =
-            late_materialized_object_binding(self.o_type, self.o_key, self.p_id, 0, u32::MAX, None)
-        {
+        if let Some(binding) = late_materialized_object_binding(
+            self.o_type,
+            self.o_key,
+            self.p_id,
+            0,
+            fluree_db_core::list_index::NONE,
+            None,
+        ) {
             return Ok(binding);
         }
         let Some(view) = view else {
@@ -2756,7 +2768,14 @@ mod tests {
                 dt_id,
                 lang_id,
                 ..
-            }) = late_materialized_object_binding(raw, 1, 1, 0, u32::MAX, None)
+            }) = late_materialized_object_binding(
+                raw,
+                1,
+                1,
+                0,
+                fluree_db_core::list_index::NONE,
+                None,
+            )
             else {
                 continue;
             };

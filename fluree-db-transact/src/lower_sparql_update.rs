@@ -764,6 +764,9 @@ fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
     if opts.unique_properties.is_none() {
         opts.unique_properties = ast.pragmas.unique_properties.clone();
     }
+    if opts.rdf_lists.is_none() {
+        opts.rdf_lists = ast.pragmas.rdf_lists;
+    }
     opts
 }
 
@@ -1008,6 +1011,7 @@ fn lower_insert_data(
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         update_where_names_ledger_default: false,
+        collection_cells: Vec::new(),
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
@@ -1063,6 +1067,7 @@ fn lower_delete_data(
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         update_where_names_ledger_default: false,
+        collection_cells: Vec::new(),
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
@@ -1106,6 +1111,14 @@ fn lower_delete_where(
         &mut local_bnodes,
     )?;
 
+    // A collection reads lists as RDF (see `Txn::collection_cells`); under
+    // the pragma, every pattern does.
+    let cells = if opts.rdf_lists == Some(true) {
+        Vec::new()
+    } else {
+        collection_cells(&expanded_pattern, prologue)
+    };
+
     // `GRAPH <iri> { ... }` blocks and triple-term objects route through the
     // same Modify machinery that DELETE/INSERT ... WHERE uses (staging-time
     // SPARQL WHERE lowering + graph-scoped delete templates). The triple-only
@@ -1114,7 +1127,7 @@ fn lower_delete_where(
         QuadPatternElement::Graph { .. } => true,
         QuadPatternElement::Triple(t) => matches!(t.object, Term::TripleTerm(_)),
     }) {
-        return lower_delete_where_with_graphs(&expanded_pattern, prologue, ns, vars, opts);
+        return lower_delete_where_with_graphs(&expanded_pattern, &cells, prologue, ns, vars, opts);
     }
 
     let triples: Vec<&TriplePattern> = expanded_pattern
@@ -1153,6 +1166,10 @@ fn lower_delete_where(
             &mut bnode_vars,
         )?);
     }
+    let collection_cells = cells
+        .into_iter()
+        .map(|l| vars.get_or_insert(&bnode_vars.var_name(&BlankNodeValue::Labeled(l))))
+        .collect();
 
     Ok(Txn {
         txn_type: TxnType::Update,
@@ -1165,6 +1182,7 @@ fn lower_delete_where(
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         update_where_names_ledger_default: false,
+        collection_cells,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
@@ -1190,6 +1208,7 @@ fn lower_delete_where(
 /// through both lowerings as constants addressing the stored node.
 fn lower_delete_where_with_graphs(
     pattern: &QuadPattern,
+    cells: &[Arc<str>],
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
@@ -1218,6 +1237,15 @@ fn lower_delete_where_with_graphs(
         &mut write_graphs,
         None,
     )?;
+    // The names `rewrite_blank_nodes_to_vars` gives, as both lowerings intern them.
+    let mut namer = BlankNodeVarNamer::new();
+    let collection_cells = cells
+        .iter()
+        .map(|l| {
+            let name = namer.var_name(&BlankNodeValue::Labeled(Arc::clone(l)));
+            vars.get_or_insert(&format!("?{name}"))
+        })
+        .collect();
 
     Ok(Txn {
         txn_type: TxnType::Update,
@@ -1230,6 +1258,7 @@ fn lower_delete_where_with_graphs(
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         update_where_names_ledger_default: false,
+        collection_cells,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
@@ -1365,6 +1394,156 @@ fn quad_pattern_to_graph_pattern(pattern: &QuadPattern) -> GraphPattern {
     }
 }
 
+/// The labels of the cells of each collection `pattern` states as an
+/// owner's object: a chain of blank-node cells from an owner edge, each cell
+/// the subject of one `rdf:first` and one `rdf:rest`, the object of the edge
+/// or of the previous cell's `rdf:rest` and of nothing else, the last cell's
+/// `rdf:rest` `rdf:nil`. What `( … )` writes, or the same chain written out.
+fn collection_cells(pattern: &QuadPattern, prologue: &Prologue) -> Vec<Arc<str>> {
+    use fluree_vocab::rdf;
+    let triples: Vec<&TriplePattern> = pattern
+        .patterns
+        .iter()
+        .flat_map(|el| match el {
+            QuadPatternElement::Triple(t) => std::slice::from_ref(t.as_ref()),
+            QuadPatternElement::Graph { triples, .. } => triples.as_slice(),
+        })
+        .collect();
+    let names = |p: &PredicateTerm, iri: &str| match p {
+        PredicateTerm::Iri(i) => expand_iri(i, prologue).is_ok_and(|e| e == iri),
+        PredicateTerm::Var(_) => false,
+    };
+    let mut cells = Vec::new();
+    if !triples.iter().any(|t| names(&t.predicate, rdf::FIRST)) {
+        return cells;
+    }
+    let cell_label = |bn: &BlankNode| match &bn.value {
+        BlankNodeValue::Labeled(l)
+            if crate::namespace::stable_blank_node_sid_from_label(l).is_none() =>
+        {
+            Some(Arc::clone(l))
+        }
+        _ => None,
+    };
+    #[derive(Default)]
+    struct Uses {
+        first: usize,
+        rest: Vec<usize>,
+        subject: usize,
+        object: Vec<usize>,
+        quoted: bool,
+    }
+    let mut uses: std::collections::HashMap<Arc<str>, Uses> = std::collections::HashMap::new();
+    for (i, t) in triples.iter().enumerate() {
+        match &t.subject {
+            SubjectTerm::BlankNode(bn) => {
+                if let Some(l) = cell_label(bn) {
+                    let u = uses.entry(l).or_default();
+                    u.subject += 1;
+                    if names(&t.predicate, rdf::FIRST) {
+                        u.first += 1;
+                    } else if names(&t.predicate, rdf::REST) {
+                        u.rest.push(i);
+                    }
+                }
+            }
+            quoted => subject_blank_nodes(quoted, &mut |bn| {
+                if let Some(l) = cell_label(bn) {
+                    uses.entry(l).or_default().quoted = true;
+                }
+            }),
+        }
+        match &t.object {
+            Term::BlankNode(bn) => {
+                if let Some(l) = cell_label(bn) {
+                    uses.entry(l).or_default().object.push(i);
+                }
+            }
+            quoted => object_blank_nodes(quoted, &mut |bn| {
+                if let Some(l) = cell_label(bn) {
+                    uses.entry(l).or_default().quoted = true;
+                }
+            }),
+        }
+    }
+    let is_cell = |l: &str| {
+        uses.get(l).is_some_and(|u| {
+            u.first == 1 && u.rest.len() == 1 && u.subject == 2 && u.object.len() == 1 && !u.quoted
+        })
+    };
+    for t in &triples {
+        let Term::BlankNode(head) = &t.object else {
+            continue;
+        };
+        let Some(head) = cell_label(head) else {
+            continue;
+        };
+        // An edge from a cell is its chain's, or a nested collection's
+        // member; any other edge to a cell owns a collection, whatever its
+        // predicate.
+        let from_cell = match &t.subject {
+            SubjectTerm::BlankNode(bn) => cell_label(bn).is_some_and(|l| is_cell(&l)),
+            _ => false,
+        };
+        if !is_cell(&head) || from_cell {
+            continue;
+        }
+        // Anything but a chain of cells to `rdf:nil` is no collection.
+        let mut chain = Vec::new();
+        let mut cell = head;
+        let complete = loop {
+            let rest = uses[&cell].rest[0];
+            chain.push(Arc::clone(&cell));
+            match &triples[rest].object {
+                Term::Iri(iri) if expand_iri(iri, prologue).is_ok_and(|e| e == rdf::NIL) => {
+                    break true;
+                }
+                Term::BlankNode(next) => match cell_label(next) {
+                    Some(next) if is_cell(&next) && uses[&next].object == [rest] => cell = next,
+                    _ => break false,
+                },
+                _ => break false,
+            }
+        };
+        if complete {
+            cells.extend(chain);
+        }
+    }
+    cells
+}
+
+/// Call `f` with each blank node `subject` is or quotes.
+fn subject_blank_nodes(subject: &SubjectTerm, f: &mut impl FnMut(&BlankNode)) {
+    match subject {
+        SubjectTerm::BlankNode(bn) => f(bn),
+        SubjectTerm::QuotedTriple(q) => {
+            subject_blank_nodes(&q.subject, f);
+            object_blank_nodes(&q.object, f);
+        }
+        SubjectTerm::TripleTerm(t) => {
+            subject_blank_nodes(&t.subject, f);
+            object_blank_nodes(&t.object, f);
+        }
+        SubjectTerm::Var(_) | SubjectTerm::Iri(_) => {}
+    }
+}
+
+/// Call `f` with each blank node `object` is or quotes.
+fn object_blank_nodes(object: &Term, f: &mut impl FnMut(&BlankNode)) {
+    match object {
+        Term::BlankNode(bn) => f(bn),
+        Term::QuotedTriple(q) => {
+            subject_blank_nodes(&q.subject, f);
+            object_blank_nodes(&q.object, f);
+        }
+        Term::TripleTerm(t) => {
+            subject_blank_nodes(&t.subject, f);
+            object_blank_nodes(&t.object, f);
+        }
+        Term::Var(_) | Term::Iri(_) | Term::Literal(_) => {}
+    }
+}
+
 /// Lower Modify operation (DELETE/INSERT with WHERE).
 ///
 /// The most general update form with optional WITH, DELETE, INSERT, and WHERE clauses.
@@ -1485,6 +1664,7 @@ fn lower_modify(
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
         update_where_names_ledger_default: false,
+        collection_cells: Vec::new(),
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),

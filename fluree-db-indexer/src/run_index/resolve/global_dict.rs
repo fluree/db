@@ -1116,7 +1116,7 @@ pub struct GlobalDicts {
     /// `LIST_INDEX_NONE` in run records).
     #[allow(clippy::type_complexity)]
     pub vector_fact_handles:
-        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u32, Vec<u32>), u32>>,
+        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u64, Vec<u32>), u32>>,
 }
 
 impl GlobalDicts {

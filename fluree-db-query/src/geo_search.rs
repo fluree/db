@@ -22,10 +22,11 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::BranchManifest;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{
     resolve_overlay_ops, sort_overlay_ops, BinaryCursor, BinaryFilter, BinaryGraphView,
-    BinaryIndexStore, ColumnProjection, OverlayOp, RunSortOrder,
+    BinaryIndexStore, ColumnProjection, GraphTree, OverlayOp, RunSortOrder,
 };
 use fluree_db_core::geo::{geo_proximity_bounds, haversine_distance};
 use fluree_db_core::o_type::OType;
@@ -58,6 +59,10 @@ pub struct GeoSearchOperator {
     overlay_ops: std::sync::Arc<[OverlayOp]>,
     /// Dict overlay for ephemeral ID translation and forward resolution.
     dict_overlay: Option<crate::dict_overlay::DictOverlay>,
+    /// POST tree of the active graph (pooled graphs: the pooled POST filtered
+    /// to the graph), resolved at open. Empty for a graph the index has no
+    /// tree for, whose points are all in `overlay_ops`.
+    tree: Option<GraphTree>,
     /// Operator lifecycle state
     state: OperatorState,
     /// Variables required by downstream operators; if set, output is trimmed.
@@ -99,6 +104,7 @@ impl GeoSearchOperator {
             p_id: None,
             overlay_ops: Vec::new().into(),
             dict_overlay: None,
+            tree: None,
             state: OperatorState::Created,
             out_schema: None,
         }
@@ -159,14 +165,14 @@ impl GeoSearchOperator {
             return Ok(vec![]);
         };
 
-        let mut results: Vec<(u64, u64, f64)> = Vec::new(); // (s_id, o_key, distance)
-
-        // POST order (pooled graphs: the pooled POST filtered to the graph).
-        let tree = store.graph_tree(g_id, RunSortOrder::Post).ok_or_else(|| {
-            QueryError::Internal(format!("GeoSearch: no POST branch for g_id={g_id}"))
-        })?;
-        let branch: Arc<BranchManifest> = tree.branch;
+        let Some(tree) = self.tree.as_ref() else {
+            return Err(QueryError::Internal(
+                "GeoSearch: searched before open".to_string(),
+            ));
+        };
         let order = tree.order;
+
+        let mut results: Vec<(u64, u64, f64)> = Vec::new(); // (s_id, o_key, distance)
 
         let geo_otype = OType::GEO_POINT.as_u16();
 
@@ -189,7 +195,7 @@ impl GeoSearchOperator {
                 p_id,
                 o_type: geo_otype,
                 o_key: max_o_key,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: u32::MAX,
                 g_id,
             };
@@ -208,7 +214,7 @@ impl GeoSearchOperator {
             let mut cursor = BinaryCursor::new(
                 store.clone(),
                 order,
-                branch.clone(),
+                Arc::clone(&tree.branch),
                 &min_key,
                 &max_key,
                 filter,
@@ -354,6 +360,7 @@ impl Operator for GeoSearchOperator {
 
         // Overlay translation + DictOverlay setup (matches BinaryScanOperator's binary path).
         let g_id = ctx.binary_g_id;
+        let mut novelty_p_id = None;
         if let Some(ovl) = ctx.overlay {
             // Correctness first: GeoSearch depends on a predicate+o_type constrained overlay.
             // If we cannot translate a geo overlay flake into V3 ID space, returning
@@ -398,6 +405,8 @@ impl Operator for GeoSearchOperator {
                     "GeoSearch: failed to translate overlay flake to V3".to_string(),
                 ));
             }
+            // The id the ops carry for a predicate the index doesn't hold.
+            novelty_p_id = ephemeral_preds.get(&self.pattern.predicate).copied();
             if !ops.is_empty() {
                 sort_overlay_ops(&mut ops, RunSortOrder::Post);
                 resolve_overlay_ops(&mut ops);
@@ -412,21 +421,26 @@ impl Operator for GeoSearchOperator {
             }
         }
 
-        // Resolve predicate ID once at open (may allocate ephemeral ID if overlay present).
-        self.p_id = match self.dict_overlay.as_mut() {
-            Some(dict_ov) => {
-                let iri = ctx
-                    .active_snapshot
-                    .decode_sid(&self.pattern.predicate)
-                    .ok_or_else(|| {
-                        QueryError::Internal(
-                            "GeoSearch predicate Sid could not be decoded to an IRI".to_string(),
-                        )
-                    })?;
-                Some(dict_ov.assign_predicate_id(&iri))
-            }
-            None => store.sid_to_p_id(&self.pattern.predicate),
-        };
+        // Resolve predicate ID once at open. A predicate only novelty holds
+        // has the id the overlay translation gave its ops, the only id that
+        // finds them; none at all means neither the index nor the graph's
+        // novelty holds it.
+        self.p_id = store.sid_to_p_id(&self.pattern.predicate).or(novelty_p_id);
+
+        // A graph the index has no POST branch for (a named graph first
+        // written after the last index, or a default graph whose indexed facts
+        // are all in named graphs) has nothing indexed: its points are all in
+        // `overlay_ops`. An empty manifest gives the cursor no leaves, so it
+        // reads the overlay alone.
+        self.tree = Some(
+            store
+                .graph_tree(g_id, RunSortOrder::Post)
+                .unwrap_or_else(|| GraphTree {
+                    branch: Arc::new(BranchManifest { leaves: Vec::new() }),
+                    order: RunSortOrder::Post,
+                    g_filter: None,
+                }),
+        );
 
         self.state = OperatorState::Open;
         Ok(())

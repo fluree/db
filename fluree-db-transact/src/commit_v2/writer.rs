@@ -234,6 +234,7 @@ mod tests {
                 Some(FlakeMeta {
                     lang: Some("de".into()),
                     i: Some(1),
+                    list: 0,
                 }),
             ),
         ];

@@ -290,8 +290,27 @@ SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
 - A solution carries no position. A JSON-LD crawl, [export](../cli/export.md) and the Graph Store `GET` return each list in order.
 - A CONSTRUCT template triple that repeats a triple pattern of its WHERE (including one inside an OPTIONAL) writes the list entries it reads as the list, in order: `( … )` in Turtle, `{"@list": [...]}` in JSON-LD. DESCRIBE does too. A value stands for every entry holding it, so over the data above, `CONSTRUCT { ex:s ex:items ?x } WHERE { ex:s ex:items ?x FILTER(?x != ex:b) }` writes `ex:s ex:items ( ex:a ex:a )`, and a `LIMIT` keeping one `ex:a` writes both. A value the owner also holds outside the list is written beside it as well, so the output reads back as the data it came from.
 - A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
-- A list's `rdf:first`/`rdf:rest` cells are not triples SPARQL can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it.
+- `ex:items/rdf:rest*/rdf:first` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would, in a query and in an update's WHERE. A plain value of `ex:items` is not a member, and the query's other patterns still read members as values. Its solutions carry no order; use `ORDER BY` for one.
+- Over a dataset, the walk reads the lists of each graph it names, in that graph's own ledger and time; under a default graph spanning ledgers it is refused, as any property path is (use `GRAPH`). A history query (a `FROM … TO` range) that walks a compact list is refused with a `400`; lists stored as triples walk in history as before.
+- No other pattern matches a list's `rdf:first`/`rdf:rest` cells: another path through them, or a `( ?x ?y )` pattern, finds nothing for a list stored this way, unless the request reads lists as RDF (below). A `( … )` in a `DELETE WHERE` reads its lists so ([Writing lists](#writing-lists)).
 - A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
+
+#### Reading lists as RDF
+
+`# PRAGMA rdf-lists: true` (JSON-LD `"opts": {"rdfLists": true}`) reads every list as the RDF list it denotes: the property's value is the list's head cell, a blank node, and each cell has an `rdf:first` (its member) and an `rdf:rest` (the next cell, or `rdf:nil`). Every pattern of the request reads lists this way, so a `( ?x ?y )` pattern, a fixed `rdf:rest` step and `rdf:rest*` all match:
+
+```sparql
+# PRAGMA rdf-lists: true
+# data: ex:s ex:items (ex:a ex:b), ex:c .
+
+SELECT ?first WHERE { ex:s ex:items ?head . ?head rdf:first ?first }   # ex:a
+SELECT ?second WHERE { ex:s ex:items/rdf:rest/rdf:first ?second }      # ex:b
+SELECT ?o WHERE { ex:s ex:items ?o FILTER(!isBlank(?o)) }              # ex:c
+```
+
+- The cells are blank nodes this request names. Their labels mean nothing to another request.
+- An update reads its WHERE the same way, and can [replace a list member through its cell](#editing-a-list-through-its-cells). A `SELECT` under the pragma previews what such an update's WHERE matches.
+- A request that cannot read lists this way is refused with a `400`, never answered with members as values: a history query (a `FROM … TO` range), a dataset reading several ledgers or one ledger at several times, and, in JSON-LD, a graph crawl (`{"?s": ["*"]}`), which reads a subject's stored triples. A policy query, a rule or an `sh:select` with the pragma is refused too: each reads lists as members.
 
 ## Query Modifiers
 
@@ -1367,10 +1386,41 @@ INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
 ```
 
 - Deleting a value deletes every entry of a list that holds it, and the value where it is also stored beside the list, however the delete is written.
+- A `( … )` in a `DELETE WHERE` matches a list as the RDF list it denotes: the same members in the same order and no more. It deletes each list it matches whole, as a JSON-LD `@list` in a delete does. `DELETE WHERE { ex:s ex:items (1 2) }` deletes the list `(1 2)` and leaves `(1 2 3)`. Like any pattern, a collection that matches no list matches nothing, so the rest of its `DELETE WHERE` deletes nothing either. A member may be a variable: `( ?x 2 )` matches every two-member list that ends in `2`. The rest of the pattern reads members as values. A list stored as its triples matches as those triples, which are deleted. `()` is the IRI `rdf:nil`, a value, and matches and deletes as one, an entry of a list that holds `rdf:nil` included. `DELETE DATA` refuses a `( … )`, as SPARQL refuses blank nodes there.
 - To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
 - `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
-- A list whose cells something else names, or that carries other triples, is stored as its triples, and so is a second list on one subject and property, including one `ADD` brings into a graph that holds a list there.
+- A subject can hold several lists on one property, each in order and apart from the others, including one `ADD` brings into a graph that holds a list there. Writing a list the subject and property already hold, the same members in the same order, restates that list rather than adding another.
+- A list whose cells something else names, or that carries other triples, is stored as its triples.
 - Under a policy, a change to the cells of a list stored as its triples is judged as a change to its owner's property.
+
+#### Editing a list through its cells
+
+Under `# PRAGMA rdf-lists: true` (JSON-LD `"opts": {"rdfLists": true}`), an update's WHERE reads lists [as RDF](#reading-lists-as-rdf), and its templates can replace a member through its cell:
+
+```sparql
+# PRAGMA rdf-lists: true
+# data: ex:alice ex:colors ("red" "green" "blue") .
+
+DELETE { ?cell rdf:first ?old } INSERT { ?cell rdf:first "navy" }
+WHERE { ex:alice ex:colors ?cell . ?cell rdf:first ?old }       # ("navy" "green" "blue")
+
+DELETE { ?cell rdf:first "green" } INSERT { ?cell rdf:first "lime" }
+WHERE { ex:alice ex:colors/rdf:rest* ?cell . ?cell rdf:first "green" }   # ("navy" "lime" "blue")
+```
+
+- The WHERE is read once, and a cell's deletes and inserts are taken together across all its solutions. A cell left with one `rdf:first` other than its member replaces that member in the same list at the same position. The list's other members, the property's other lists and values, and other owners' lists are left as they are. A list stays the list it was, even when the edit leaves it equal to another.
+- A cell left with its member, or several solutions making the same replacement, changes nothing or replaces once.
+- Every other write naming a cell is refused with a `400` and the update changes nothing:
+  - a cell left with no `rdf:first`, or with two;
+  - an `rdf:rest` written, or a list's owner edge deleted;
+  - another property on a cell;
+  - a cell as a value, including as a member of a list the update writes, or as a property;
+  - a cell written in a graph other than its list's.
+  
+  To insert, remove or reorder members, write the list again in an update without the pragma.
+- A list's members are its cells' `rdf:first`s, not values of its property, so a delete naming a value of the property deletes its plain value alone: `DELETE DATA { ex:alice ex:colors "red" }` leaves the list as it is. A list in a DELETE template, which in this view is a chain of new blank nodes, is refused.
+- Modify policy judges a replacement as a change to the property holding the list, not to `rdf:first`.
+- A list stored as its triples is triples: its `rdf:first` and `rdf:rest` are written as any triple is.
 
 ### Typed Literals
 
@@ -1489,6 +1539,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 | `reasoning-time` | ISO 8601 datetime | queries | `reasoningTime` | — |
 | `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
 | `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
+| `rdf-lists` | `true` / `false` | queries and updates | `rdfLists` | — |
 | `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |
 | `meta` | `true`, `false`, or a list of `time`, `fuel`, `policy` | queries and updates | `meta` | `fluree-track-*` |
 | `max-fuel` | number | queries and updates | `max-fuel` | `fluree-max-fuel` |

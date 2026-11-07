@@ -15,7 +15,7 @@ use std::io;
 
 use super::branch::LeafEntry;
 use super::run_record::RunSortOrder;
-use super::run_record_v2::{RunRecordV2, RECORD_V2_WIRE_SIZE};
+use super::run_record_v2::{RunRecordV2, RECORD_V2_NARROW_WIRE_SIZE, RECORD_V2_WIRE_SIZE};
 use super::stats_wire;
 use super::wire_helpers::{
     ensure_bytes, io_err, read_cid, read_dict_pack_refs, read_dict_tree_refs, read_i64_at,
@@ -203,12 +203,23 @@ pub const ROOT_V6_VERSION: u8 = 2;
 
 /// The v5 (`next`) root format, `next`'s one version bump over `main`: inline
 /// `xsd:decimal` encoding, the triple-term dictionary, the pooled tree, the
-/// compressed body, graph-carrying history and 32-bit graph ids all ride on
-/// it. Every root this build writes is v5 — the first index of a `main`
-/// ledger upgrades it — and `main` refuses v5 outright rather than misreading
-/// it. The decimal policy is an extended flag, so an arena-only ledger stays
-/// arena-only until a reindex.
-pub const ROOT_V6_VERSION_V5: u8 = 3;
+/// compressed body, graph-carrying history, 32-bit graph ids and 64-bit list
+/// places all ride on it. Every root this build writes is v5, and `main`
+/// refuses v5 outright rather than misreading it. The decimal policy is an
+/// extended flag, so an arena-only ledger stays arena-only until a reindex.
+pub const ROOT_V6_VERSION_V5: u8 = 4;
+
+/// An earlier v5 root, whose artifacts store a 32-bit `o_i`. Read only.
+const ROOT_V6_VERSION_V5_NARROW: u8 = 3;
+
+/// Whether `bytes` is a root of the format this build writes.
+///
+/// A root of an earlier format (`main`'s, or an earlier v5 one) is served as
+/// it is, and its ledger's next build is a full rebuild, never an incremental
+/// one, so no root mixes artifacts of two formats.
+pub fn is_current_format(bytes: &[u8]) -> bool {
+    bytes.len() > 4 && bytes[0..4] == *ROOT_V6_MAGIC && bytes[4] == ROOT_V6_VERSION_V5
+}
 
 /// What garbage collection needs from a retired annotation-arena root
 /// section: its two branch manifests. Decoding ignores the section's other
@@ -875,15 +886,24 @@ impl IndexRoot {
         let mut sorted_default = self.default_graph_orders.clone();
         sorted_default.sort_by_key(|o| o.order.to_wire_id());
         buf.push(sorted_default.len() as u8);
-        let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
+        // `main`'s layout stores keys with a 32-bit `o_i`.
+        let write_key = |buf: &mut Vec<u8>, key: &RunRecordV2| {
+            if wide {
+                let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
+                key.write_run_le(&mut rec_buf);
+                buf.extend_from_slice(&rec_buf);
+            } else {
+                let mut rec_buf = [0u8; RECORD_V2_NARROW_WIRE_SIZE];
+                key.write_run_le_narrow(&mut rec_buf);
+                buf.extend_from_slice(&rec_buf);
+            }
+        };
         for dgo in &sorted_default {
             buf.push(dgo.order.to_wire_id());
             buf.extend_from_slice(&(dgo.leaves.len() as u32).to_le_bytes());
             for leaf in &dgo.leaves {
-                leaf.first_key.write_run_le(&mut rec_buf);
-                buf.extend_from_slice(&rec_buf);
-                leaf.last_key.write_run_le(&mut rec_buf);
-                buf.extend_from_slice(&rec_buf);
+                write_key(&mut buf, &leaf.first_key);
+                write_key(&mut buf, &leaf.last_key);
                 buf.extend_from_slice(&leaf.row_count.to_le_bytes());
                 write_cid(&mut buf, &leaf.leaf_cid);
                 if let Some(ref sidecar) = leaf.sidecar_cid {
@@ -985,9 +1005,10 @@ impl IndexRoot {
     /// The snapshot metadata this root carries, so a caller holding the
     /// decoded root does not decode the bytes a second time for the snapshot.
     /// The large sections (stats and schema) move out; everything the binary
-    /// index store reads stays in place.
+    /// index store reads stays in place. `root_id` is this root's content id.
     pub fn take_snapshot_metadata(
         &mut self,
+        root_id: &ContentId,
     ) -> io::Result<fluree_db_core::db::LedgerSnapshotMetadata> {
         let ledger_id = fluree_db_core::LedgerId::parse(&self.ledger_id).map_err(|e| {
             io::Error::new(
@@ -1014,6 +1035,7 @@ impl IndexRoot {
             needs_link_reindex: self.has_annotations && self.term_dict.is_none(),
             has_list_meta: self.has_list_meta,
             prev_index: self.prev_index.as_ref().map(|prev| prev.id.clone()),
+            index_root_id: Some(root_id.clone()),
         })
     }
 
@@ -1032,9 +1054,18 @@ impl IndexRoot {
         }
         let version = data[4];
         // `main`'s v2 roots hold 16-bit graph ids and counts; v5 roots 32-bit.
-        let wide = version == ROOT_V6_VERSION_V5;
-        // `main`'s v2 (read so its ledgers upgrade on their first index) or v5.
-        if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_V5 {
+        let wide = version != ROOT_V6_VERSION;
+        // Before version 4, a root's keys store a 32-bit `o_i`.
+        let narrow_keys = version != ROOT_V6_VERSION_V5;
+        // `main`'s v2 or an earlier v5 root (served until the ledger's next
+        // build rebuilds it; see `is_current_format`), or v5.
+        if ![
+            ROOT_V6_VERSION,
+            ROOT_V6_VERSION_V5_NARROW,
+            ROOT_V6_VERSION_V5,
+        ]
+        .contains(&version)
+        {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
         }
 
@@ -1174,8 +1205,8 @@ impl IndexRoot {
             let leaf_count = read_u32_at(data, &mut pos)? as usize;
             let mut leaves = Vec::with_capacity(leaf_count.min(data.len()));
             for _ in 0..leaf_count {
-                let first_key = read_run_record_v2(data, &mut pos)?;
-                let last_key = read_run_record_v2(data, &mut pos)?;
+                let first_key = read_run_record_v2(data, &mut pos, narrow_keys)?;
+                let last_key = read_run_record_v2(data, &mut pos, narrow_keys)?;
                 let row_count = read_u64_at(data, &mut pos)?;
                 let leaf_cid = read_cid(data, &mut pos)?;
                 let has_sidecar = read_u8_at(data, &mut pos)?;
@@ -1630,11 +1661,22 @@ fn read_graph_arenas_v5(data: &[u8], pos: &mut usize, wide: bool) -> io::Result<
     })
 }
 
-/// Read a V2 run record (30 bytes) at the current position.
-fn read_run_record_v2(data: &[u8], pos: &mut usize) -> io::Result<RunRecordV2> {
-    ensure_bytes(data, *pos, RECORD_V2_WIRE_SIZE, "RunRecordV2")?;
-    let rec = RunRecordV2::read_run_le(data[*pos..*pos + RECORD_V2_WIRE_SIZE].try_into().unwrap());
-    *pos += RECORD_V2_WIRE_SIZE;
+/// Read a V2 run record at the current position: 34 bytes, or the 30 of a
+/// root whose artifacts store a 32-bit `o_i` (`narrow`).
+fn read_run_record_v2(data: &[u8], pos: &mut usize, narrow: bool) -> io::Result<RunRecordV2> {
+    let len = if narrow {
+        RECORD_V2_NARROW_WIRE_SIZE
+    } else {
+        RECORD_V2_WIRE_SIZE
+    };
+    ensure_bytes(data, *pos, len, "RunRecordV2")?;
+    let bytes = &data[*pos..*pos + len];
+    let rec = if narrow {
+        RunRecordV2::read_run_le_narrow(bytes.try_into().unwrap())
+    } else {
+        RunRecordV2::read_run_le(bytes.try_into().unwrap())
+    };
+    *pos += len;
     Ok(rec)
 }
 
@@ -1642,6 +1684,7 @@ fn read_run_record_v2(data: &[u8], pos: &mut usize) -> io::Result<RunRecordV2> {
 mod tests {
     use super::super::wire_helpers::{DictPackRefs, DictRefs, DictTreeRefs, PackBranchEntry};
     use super::*;
+    use crate::format::run_record::LIST_INDEX_NONE;
     use fluree_db_core::subject_id::SubjectId;
     use fluree_vocab::{rdf, xsd};
 
@@ -1915,10 +1958,13 @@ mod tests {
                 )
             )
         };
-        let from_bytes = LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        let root_id = ContentId::new(fluree_db_core::ContentKind::IndexRoot, &bytes);
+        let from_bytes = LedgerSnapshot::from_root(&root_id, &bytes).unwrap();
         let mut decoded = IndexRoot::decode(&bytes).unwrap();
         let from_root =
-            LedgerSnapshot::new_meta(decoded.take_snapshot_metadata().unwrap()).unwrap();
+            LedgerSnapshot::new_meta(decoded.take_snapshot_metadata(&root_id).unwrap()).unwrap();
+        assert_eq!(from_root.index_root_id(), Some(&root_id));
+        assert_eq!(from_root.index_root_id(), from_bytes.index_root_id());
         assert_eq!(view(&from_root), view(&from_bytes));
         assert!(from_root.stats.is_some() && from_root.schema.is_some());
         let replaced = root.prev_index.map(|prev| prev.id);
@@ -2098,7 +2144,7 @@ mod tests {
                 o_key: 100,
                 p_id: 2,
                 t: 1,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 o_type: OType::XSD_INTEGER.as_u16(),
                 g_id: 0,
             },
@@ -2107,7 +2153,7 @@ mod tests {
                 o_key: 500,
                 p_id: 5,
                 t: 1,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 o_type: OType::XSD_STRING.as_u16(),
                 g_id: 0,
             },
@@ -2410,5 +2456,48 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(ids.len(), sorted.len(), "all_cas_ids has duplicates");
+    }
+
+    /// A `main`-layout root's default-graph leaf keys hold a 32-bit `o_i`:
+    /// both decoders read them, and the root is of an earlier format, so its
+    /// ledger's next build is a full rebuild. A root this build writes is of
+    /// the current format.
+    #[test]
+    fn a_main_layout_root_reads_its_narrow_keys_and_is_an_earlier_format() {
+        use super::super::branch::LeafEntry;
+        let key = |s_id: u64, o_i: u64| RunRecordV2 {
+            s_id: fluree_db_core::subject_id::SubjectId(s_id),
+            o_key: 9,
+            p_id: 2,
+            t: 1,
+            o_i,
+            o_type: 5,
+            g_id: 0,
+        };
+        let mut root = minimal_root_v6();
+        root.default_graph_orders = vec![DefaultGraphOrder {
+            order: RunSortOrder::Spot,
+            leaves: vec![LeafEntry {
+                first_key: key(1, LIST_INDEX_NONE),
+                last_key: key(8, 3),
+                row_count: 8,
+                leaf_cid: ContentId::from_address_digest(
+                    fluree_db_core::content_kind::CODEC_FLUREE_INDEX_LEAF,
+                    &fluree_db_core::sha256_hex(b"main-leaf"),
+                )
+                .unwrap(),
+                sidecar_cid: None,
+            }],
+        }];
+        for (bytes, current) in [(root.encode_main_layout(), false), (root.encode(), true)] {
+            assert_eq!(is_current_format(&bytes), current);
+            let decoded = IndexRoot::decode(&bytes).unwrap();
+            let leaf = &decoded.default_graph_orders[0].leaves[0];
+            assert_eq!(leaf.first_key.o_i, LIST_INDEX_NONE);
+            assert_eq!(leaf.last_key.o_i, 3);
+            assert_eq!(leaf.last_key.s_id.as_u64(), 8);
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes)
+                .expect("core's metadata decode skips the keys at the root's width");
+        }
     }
 }

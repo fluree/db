@@ -1,20 +1,24 @@
 //! Storing the lists a transaction writes.
 //!
 //! A list — a Turtle `( … )` or JSON-LD `@list` in object position — is
-//! stored compactly when it can be: its members become values of the owning
-//! graph, subject and predicate, each carrying its position
-//! ([`FlakeMeta::i`]). A position names no list, so only one list on a
-//! property can be stored that way. Every other list there — a second one in
-//! the transaction, or one beside list members the ledger holds and the
-//! transaction keeps — is stored as an explicit `rdf:first`/`rdf:rest` chain
-//! of fresh blank nodes. Both shapes are the same RDF; two compact lists on
-//! one property would merge into one.
+//! stored compactly: its members become values of the owning graph, subject
+//! and predicate, each carrying its place, which list of the owner it is in
+//! and its position there ([`FlakeMeta::place`]). A second list on a property,
+//! in the transaction or beside a list the ledger holds and the transaction
+//! keeps, takes the next list id, so the lists stay apart. Only a property
+//! holding every list id stores further lists as explicit
+//! `rdf:first`/`rdf:rest` chains of fresh blank nodes; both shapes are the
+//! same RDF.
 //!
 //! A list with the same members, in the same order, as a list its property
 //! already holds is that list: writing it again restates it as stored, the
-//! compact list's members at the positions they are stored at, a chain's
-//! triples with its cells, as writing a stored fact again restates the
-//! fact.
+//! compact list's members in the list and at the positions they are stored
+//! at, a chain's triples with its cells, as writing a stored fact again
+//! restates the fact.
+//!
+//! A list id is local to its owner and names nothing beyond one state: a
+//! list whose members are all deleted is gone, and when its id was the
+//! highest there, the next list written takes it again.
 
 use crate::current_facts::{CurrentFacts, ListFree, Slot};
 use crate::error::Result;
@@ -23,7 +27,7 @@ use fluree_db_core::{id_datatype_sid, Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_ledger::LedgerState;
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A list a transaction writes, before it is decided how to store it.
 #[derive(Debug, Clone)]
@@ -39,10 +43,10 @@ pub struct PendingList {
 /// The graph, subject and predicate a list belongs to.
 pub type Owner = (Option<Sid>, Sid, Sid);
 
-/// The owners whose list is stored compactly, shared by the parts of one
-/// write stored separately — the chunks of a bulk import — so a second list
-/// on one property, in any part, is stored as a chain.
-pub type ClaimedOwners = std::sync::Arc<std::sync::Mutex<HashSet<Owner>>>;
+/// The next list id of each owner a list is stored on, shared by the parts of
+/// one write stored separately — the chunks of a bulk import — so a second
+/// list on one property, in any part, takes an id of its own.
+pub type ClaimedOwners = std::sync::Arc<std::sync::Mutex<HashMap<Owner, u32>>>;
 
 impl PendingList {
     /// A list of `members`, compact assertions of one graph, subject and
@@ -54,13 +58,25 @@ impl PendingList {
         Self { members, cells }
     }
 
+    /// The members, in position order.
+    pub fn members(&self) -> &[Flake] {
+        &self.members
+    }
+
     fn owner(&self) -> Option<Owner> {
         let first = self.members.first()?;
         Some((first.g.clone(), first.s.clone(), first.p.clone()))
     }
 
-    fn into_compact(self) -> Vec<Flake> {
-        self.members
+    /// The members as list `list` of their owner.
+    fn into_compact_as(self, list: u32) -> Vec<Flake> {
+        let mut members = self.members;
+        for member in &mut members {
+            if let Some(m) = member.m.as_mut() {
+                m.list = list;
+            }
+        }
+        members
     }
 
     /// `s p cell0`, then `cellK rdf:first memberK` and `cellK rdf:rest` the
@@ -223,42 +239,55 @@ pub fn chain_lists(
     (left, lists)
 }
 
-/// The flakes that store `lists`: each compact when it is the first list on
-/// its graph, subject and predicate and the ledger holds no list members
-/// there that survive the transaction, its compact members again when it
-/// restates the compact list there, a chain otherwise.
+/// The flakes that store `lists`: each compact under the next list id of its
+/// graph, subject and predicate, past the lists there that survive the
+/// transaction, or its stored members again when it restates one of them.
 ///
 /// `retracted` says whether the transaction retracts a stored fact, and must
 /// be asked before retractions cancel against assertions: an upsert that
 /// restates a stored list retracts its members and asserts them again.
-/// Subjects that are blank nodes minted by transaction `txn_id` hold nothing
-/// stored, and are not read.
+/// `asserted` are the list members the transaction asserts outside `lists`,
+/// at places of the lists held (a cell's new member), which those lists then
+/// hold. Subjects that are blank nodes minted by transaction `txn_id` hold
+/// nothing stored, and are not read.
 pub async fn store_lists(
     ledger: &LedgerState,
     lists: Vec<PendingList>,
     txn_id: &str,
     retracted: impl Fn(&Flake) -> bool,
+    asserted: &[Flake],
 ) -> Result<Vec<Flake>> {
     if lists.is_empty() {
         return Ok(Vec::new());
     }
-    let held = lists_held(ledger, &lists, txn_id, retracted).await?;
+    let held = lists_held(ledger, &lists, txn_id, retracted, asserted).await?;
     Ok(encode(lists, held))
 }
 
-/// [`store_lists`] for a document no ledger holds: each list compact when it
-/// is the first on its graph, subject and predicate, a chain otherwise.
+/// [`store_lists`] for a document no ledger holds: each list compact, under
+/// the next list id of its graph, subject and predicate.
 pub fn store_new_lists(lists: Vec<PendingList>) -> Vec<Flake> {
     encode(lists, HashMap::new())
 }
 
-/// The lists an owner holds: its compact list's members in position order,
-/// and each list it holds as a chain, as the chain's triples: the owner's
-/// edge, then each cell's `rdf:first` and `rdf:rest`.
+/// The lists an owner holds: each compact list's members in position order,
+/// by list id, and each list it holds as a chain, as the chain's triples: the
+/// owner's edge, then each cell's `rdf:first` and `rdf:rest`.
 #[derive(Debug, Default)]
 struct Held {
-    compact: Vec<Flake>,
+    compact: BTreeMap<u32, Vec<Flake>>,
     chains: Vec<Vec<Flake>>,
+}
+
+impl Held {
+    /// The id a new compact list takes: one past the highest held, or
+    /// `None` when every id is taken.
+    fn next_list(&self) -> Option<u32> {
+        match self.compact.keys().next_back() {
+            Some(&last) => last.checked_add(1),
+            None => Some(0),
+        }
+    }
 }
 
 /// Whether `chain`, a chain's triples, holds `members` in order.
@@ -272,32 +301,33 @@ fn chain_holds(chain: &[Flake], members: &[Flake]) -> bool {
 }
 
 /// [`store_new_lists`] for one part of a write whose parts are stored
-/// separately: an owner another part has claimed is taken.
+/// separately: each list takes its owner's next id across every part.
 ///
-/// Which part's list is the compact one depends on the order parts finish,
-/// not on the data; the stored RDF is the same either way.
+/// Which list takes which id depends on the order parts finish, not on the
+/// data; the stored RDF is the same either way.
 pub fn store_lists_claiming(lists: Vec<PendingList>, claimed: &ClaimedOwners) -> Vec<Flake> {
     let mut out = Vec::new();
     for list in lists {
         let Some(owner) = list.owner() else {
             continue;
         };
-        let compact = claimed
-            .lock()
-            .map(|mut owners| owners.insert(owner))
-            .unwrap_or(false);
-        if compact {
-            out.extend(list.into_compact());
-        } else {
-            out.extend(list.into_chain());
+        let id = claimed.lock().ok().and_then(|mut owners| {
+            let next = owners.entry(owner).or_insert(0);
+            let id = *next;
+            *next = next.checked_add(1)?;
+            Some(id)
+        });
+        match id {
+            Some(id) => out.extend(list.into_compact_as(id)),
+            None => out.extend(list.into_chain()),
         }
     }
     out
 }
 
-/// Each list compact when its owner holds no list yet, restating the one
-/// there that holds the same members, a chain otherwise. `held` starts as the
-/// lists the ledger holds, by owner, and gains each stored here.
+/// Each list compact under its owner's next list id, restating the one there
+/// that holds the same members, a chain when every id is taken. `held` starts
+/// as the lists the ledger holds, by owner, and gains each stored here.
 fn encode(lists: Vec<PendingList>, mut held: HashMap<Owner, Held>) -> Vec<Flake> {
     let mut out = Vec::new();
     for list in lists {
@@ -305,13 +335,14 @@ fn encode(lists: Vec<PendingList>, mut held: HashMap<Owner, Held>) -> Vec<Flake>
             continue;
         };
         let here = held.entry(owner.clone()).or_default();
-        // The list held is restated as stored: a compact list at its own
-        // positions, which a delete can leave apart, a chain with its cells.
-        let stored = if !here.compact.is_empty() && same_members(&here.compact, &list.members) {
-            Some(&here.compact)
-        } else {
-            here.chains.iter().find(|c| chain_holds(c, &list.members))
-        };
+        // A list held is restated as stored: a compact list in its own list
+        // and at its own positions, which a delete can leave apart, a chain
+        // with its cells.
+        let stored = here
+            .compact
+            .values()
+            .find(|members| same_members(members, &list.members))
+            .or_else(|| here.chains.iter().find(|c| chain_holds(c, &list.members)));
         if let Some(stored) = stored {
             let (g, t) = (owner.0.clone(), list.members.first().map_or(0, |f| f.t));
             out.extend(stored.iter().map(|f| Flake {
@@ -320,9 +351,10 @@ fn encode(lists: Vec<PendingList>, mut held: HashMap<Owner, Held>) -> Vec<Flake>
                 op: true,
                 ..f.clone()
             }));
-        } else if here.compact.is_empty() && here.chains.is_empty() {
-            here.compact = list.members.clone();
-            out.extend(list.into_compact());
+        } else if let Some(id) = here.next_list() {
+            let members = list.into_compact_as(id);
+            here.compact.insert(id, members.clone());
+            out.extend(members);
         } else {
             let chain = list.into_chain();
             here.chains.push(chain.clone());
@@ -342,12 +374,14 @@ fn same_members(a: &[Flake], b: &[Flake]) -> bool {
 }
 
 /// The lists the ledger holds on the owners of `lists`, leaving out the
-/// members, and the chains' edges, the transaction retracts.
+/// members, and the chains' edges, the transaction retracts, and with the
+/// members it asserts at their places (see [`store_lists`]).
 async fn lists_held(
     ledger: &LedgerState,
     lists: &[PendingList],
     txn_id: &str,
     retracted: impl Fn(&Flake) -> bool,
+    asserted: &[Flake],
 ) -> Result<HashMap<Owner, Held>> {
     if ListFree::check(ledger).is_some() {
         return Ok(HashMap::new());
@@ -370,6 +404,11 @@ async fn lists_held(
     }
     let read: Vec<Slot> = slots.iter().map(|(_, slot)| slot.clone()).collect();
     let facts = CurrentFacts::new(ledger).of_slots(&read).await?;
+    let mut asserted_on: HashMap<Owner, Vec<&Flake>> = HashMap::new();
+    for f in asserted {
+        let owner = (f.g.clone(), f.s.clone(), f.p.clone());
+        asserted_on.entry(owner).or_default().push(f);
+    }
     let mut held = HashMap::new();
     for ((owner, slot), facts) in slots.into_iter().zip(facts) {
         let mut here = Held::default();
@@ -377,8 +416,8 @@ async fn lists_held(
             if retracted(f) {
                 continue;
             }
-            if f.m.as_ref().and_then(|m| m.i).is_some() {
-                here.compact.push(f.clone());
+            if let Some((list, _)) = f.m.as_ref().and_then(FlakeMeta::place) {
+                here.compact.entry(list).or_default().push(f.clone());
                 continue;
             }
             let FlakeValue::Ref(head) = &f.o else {
@@ -410,7 +449,14 @@ async fn lists_held(
             }
             here.chains.push(chain);
         }
-        here.compact.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
+        for f in asserted_on.remove(&owner).unwrap_or_default() {
+            if let Some((list, _)) = f.m.as_ref().and_then(FlakeMeta::place) {
+                here.compact.entry(list).or_default().push(f.clone());
+            }
+        }
+        for members in here.compact.values_mut() {
+            members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
+        }
         if !(here.compact.is_empty() && here.chains.is_empty()) {
             held.insert(owner, here);
         }
@@ -421,6 +467,7 @@ async fn lists_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::list_index::ListPlace;
 
     fn member(o: i64, i: i32) -> Flake {
         Flake::new(
@@ -438,53 +485,111 @@ mod tests {
         Sid::new(BLANK_NODE, format!("{BLANK_NODE_ID_PREFIX}-{name}"))
     }
 
-    /// A list with the compact list's members, in its order, is that list
-    /// and restates them; one that differs, in order alone, is a chain.
+    fn places(flakes: &[Flake]) -> Vec<(FlakeValue, Option<ListPlace>)> {
+        flakes
+            .iter()
+            .map(|f| (f.o.clone(), f.m.as_ref().and_then(FlakeMeta::place)))
+            .collect()
+    }
+
+    /// A list with a held list's members, in its order, is that list and
+    /// restates them; one that differs, in order alone, is another list.
     #[test]
-    fn a_list_restating_the_compact_one_restates_its_members() {
+    fn a_list_restating_a_held_one_restates_its_members() {
         let restated = store_new_lists(vec![
             PendingList::new(vec![member(1, 0), member(2, 1)], "t--l0-".into()),
             PendingList::new(vec![member(1, 0), member(2, 1)], "t--l1-".into()),
         ]);
-        assert_eq!(
-            restated[2..],
-            restated[..2],
-            "the same members again, no chain"
-        );
+        assert_eq!(restated[2..], restated[..2], "the same members again");
         let reordered = store_new_lists(vec![
             PendingList::new(vec![member(1, 0), member(2, 1)], "t--l0-".into()),
             PendingList::new(vec![member(2, 0), member(1, 1)], "t--l1-".into()),
         ]);
-        assert_eq!(reordered.len(), 2 + 1 + 2 * 2, "the members, then a chain");
+        let long = FlakeValue::Long;
+        assert_eq!(
+            places(&reordered),
+            [
+                (long(1), Some((0, 0))),
+                (long(2), Some((0, 1))),
+                (long(2), Some((1, 0))),
+                (long(1), Some((1, 1))),
+            ]
+        );
     }
 
-    /// The first list on a property is stored compactly; a second is the
-    /// chain a Turtle `( … )` denotes, its members with no position.
+    /// Each list on a property is stored compactly under its own list, in
+    /// the order the transaction writes them.
     #[test]
-    fn a_second_list_on_one_property_is_a_chain() {
+    fn a_second_list_on_one_property_takes_the_next_list() {
         let flakes = store_new_lists(vec![
             PendingList::new(vec![member(2, 1), member(1, 0)], "t--l0-".into()),
             PendingList::new(vec![member(3, 0), member(4, 1)], "t--l1-".into()),
         ]);
+        let long = FlakeValue::Long;
+        assert_eq!(
+            places(&flakes),
+            [
+                (long(1), Some((0, 0))),
+                (long(2), Some((0, 1))),
+                (long(3), Some((1, 0))),
+                (long(4), Some((1, 1))),
+            ]
+        );
+    }
+
+    /// The parts of a write stored separately share their owners' ids.
+    #[test]
+    fn parts_stored_separately_take_distinct_lists() {
+        let claimed = ClaimedOwners::default();
+        let one = store_lists_claiming(
+            vec![PendingList::new(vec![member(1, 0)], "t--l0-".into())],
+            &claimed,
+        );
+        let two = store_lists_claiming(
+            vec![PendingList::new(vec![member(1, 0)], "t--l1-".into())],
+            &claimed,
+        );
+        assert_eq!(places(&one), [(FlakeValue::Long(1), Some((0, 0)))]);
+        assert_eq!(places(&two), [(FlakeValue::Long(1), Some((1, 0)))]);
+    }
+
+    /// A property holding every list id stores a further list as the chain
+    /// a Turtle `( … )` denotes, its members with no place.
+    #[test]
+    fn a_property_holding_every_list_stores_a_chain() {
+        let (s, p) = (Sid::new(100, "s"), Sid::new(100, "p"));
+        let mut last = member(9, 0);
+        last.m = FlakeMeta::from_place(None, Some((u32::MAX, 0)));
+        let held = HashMap::from([(
+            (None, s.clone(), p.clone()),
+            Held {
+                compact: BTreeMap::from([(u32::MAX, vec![last])]),
+                chains: Vec::new(),
+            },
+        )]);
+        let flakes = encode(
+            vec![PendingList::new(
+                vec![member(3, 0), member(4, 1)],
+                "t--l1-".into(),
+            )],
+            held,
+        );
         let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
         let ref_o = |s: &str| FlakeValue::Ref(cell(s));
-        let triples: Vec<(Sid, Sid, FlakeValue, Option<i32>)> = flakes
+        let triples: Vec<(Sid, Sid, FlakeValue, Option<ListPlace>)> = flakes
             .iter()
             .map(|f| {
                 (
                     f.s.clone(),
                     f.p.clone(),
                     f.o.clone(),
-                    f.m.as_ref().and_then(|m| m.i),
+                    f.m.as_ref().and_then(FlakeMeta::place),
                 )
             })
             .collect();
-        let (s, p) = (Sid::new(100, "s"), Sid::new(100, "p"));
         assert_eq!(
             triples,
             [
-                (s.clone(), p.clone(), FlakeValue::Long(1), Some(0)),
-                (s.clone(), p.clone(), FlakeValue::Long(2), Some(1)),
                 (s, p, ref_o("t--l1-0"), None),
                 (cell("t--l1-0"), first.clone(), FlakeValue::Long(3), None),
                 (cell("t--l1-0"), rest.clone(), ref_o("t--l1-1"), None),

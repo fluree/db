@@ -15,6 +15,10 @@ mod it_default_context;
 mod it_graph_commit;
 #[path = "it_graph_source_bm25.rs"]
 mod it_graph_source_bm25;
+// Only a build without the iceberg reader has anything to refuse here.
+#[cfg(not(feature = "iceberg"))]
+#[path = "it_graph_source_unbuilt_reader.rs"]
+mod it_graph_source_unbuilt_reader;
 #[path = "it_jsonld_graph_scope.rs"]
 mod it_jsonld_graph_scope;
 #[path = "it_materialize_named_graph.rs"]

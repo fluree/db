@@ -71,11 +71,12 @@ async fn list_container_serialization_test() {
         "Should have one contact record"
     );
 
-    // When querying a single-value list, Fluree returns the value directly, not as a list
+    // A singleton retains its list identity even without a list-container context.
     let contact = &jsonld.as_array().unwrap()[0];
     assert_eq!(
-        contact["crm:companyIds"], "company-final",
-        "Single list value should be returned directly"
+        contact["crm:companyIds"],
+        json!({"@list": ["company-final"]}),
+        "Single list value should retain its wrapper"
     );
 }
 
@@ -137,7 +138,7 @@ async fn list_container_multiple_values_test() {
     let thing = &jsonld.as_array().unwrap()[0];
     assert_eq!(
         thing["ex:orderedItems"],
-        json!(["first", "second", "third"]),
+        json!({"@list": ["first", "second", "third"]}),
         "Ordered list values should be preserved"
     );
 }
@@ -185,7 +186,7 @@ async fn list_container_duplicate_values_at_distinct_positions_preserved() {
     let thing = &jsonld.as_array().unwrap()[0];
     assert_eq!(
         thing["ex:orderedItems"],
-        json!(["a", "b", "a"]),
+        json!({"@list": ["a", "b", "a"]}),
         "duplicate list members at distinct positions must all survive in order"
     );
 }
@@ -296,7 +297,7 @@ async fn list_container_with_objects_test() {
     assert!(!jsonld.is_null(), "Database should load successfully");
 
     let charlie = &jsonld.as_array().unwrap()[0];
-    let friends = charlie["ex:orderedFriends"].as_array().unwrap();
+    let friends = charlie["ex:orderedFriends"]["@list"].as_array().unwrap();
 
     assert_eq!(friends.len(), 2, "Should have two ordered friends");
     assert_eq!(
@@ -358,7 +359,7 @@ async fn list_container_with_blank_node_objects_test() {
         .unwrap();
 
     let recipe = &jsonld.as_array().unwrap()[0];
-    let steps = recipe["ex:steps"].as_array().unwrap();
+    let steps = recipe["ex:steps"]["@list"].as_array().unwrap();
 
     assert_eq!(steps.len(), 3, "Should have three steps");
     assert_eq!(steps[0]["schema:name"], "Boil water", "First step name");

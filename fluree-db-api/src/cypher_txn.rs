@@ -311,10 +311,12 @@ impl Fluree {
             )
             .await?;
 
+        // The rows format against the transaction's state, not the virtual one.
+        let return_result = outcome.returned.map(|answered| answered.result);
         let flake_count = self
             .pend_stage_result(txn, outcome.stage_result, &index_config)
             .await?;
-        let return_table = match outcome.return_result {
+        let return_table = match return_result {
             Some(qr) => {
                 let view = self.cypher_transaction_view(txn).await?;
                 Some(qr.to_cypher_typed_table(&view).await.map_err(|e| {

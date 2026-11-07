@@ -5,6 +5,7 @@
 //! can be checked against branch commits to detect overlapping changes.
 
 use crate::{trace_first_parent_commits_by_id, Result};
+use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
     load_commit_by_id, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
@@ -24,8 +25,8 @@ use std::collections::{BTreeSet, HashMap};
 /// This is deliberately NOT `Flake`'s own `Eq`/`Hash` (which ignore `g` by
 /// design — flake identity is graph-independent for index purposes). Netting
 /// must treat the same triple in two graphs as two distinct facts, and must
-/// keep language-tagged strings and list positions apart, so `g`, `lang`,
-/// and `i` are all part of the key.
+/// keep language-tagged strings and list places apart, so `g`, `lang`,
+/// and `place` are all part of the key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FactKey {
     g: Option<Sid>,
@@ -34,7 +35,7 @@ pub struct FactKey {
     o: FlakeValue,
     dt: Option<Sid>,
     lang: Option<String>,
-    i: Option<i32>,
+    place: Option<ListPlace>,
 }
 
 impl FactKey {
@@ -47,7 +48,7 @@ impl FactKey {
             o: flake.o.clone(),
             dt: (!flake.o.index_keys_by_value()).then(|| flake.dt.clone()),
             lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
-            i: flake.m.as_ref().and_then(|m| m.i),
+            place: flake.m.as_ref().and_then(fluree_db_core::FlakeMeta::place),
         }
     }
 }

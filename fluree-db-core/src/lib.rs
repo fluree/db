@@ -61,6 +61,7 @@ pub mod io_stats;
 pub mod ledger_config;
 pub mod ledger_id;
 pub mod link;
+pub mod list_index;
 pub mod namespaces;
 pub mod nonempty;
 pub mod ns_encoding;

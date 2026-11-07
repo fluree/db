@@ -570,6 +570,7 @@ pub fn parse_options(
         object_var_parsing: parse_object_var_parsing(obj),
         include_system_facts: parse_include_system_facts(obj),
         union_default_graph: parse_union_default_graph(obj)?,
+        rdf_lists: parse_rdf_lists(obj)?,
     })
 }
 
@@ -631,10 +632,36 @@ pub fn parse_union_default_graph(obj: &serde_json::Map<String, JsonValue>) -> Re
     })
 }
 
+/// Parse `opts.rdfLists` from the top-level query object: read every list as
+/// the RDF list it denotes, its cells joined by `rdf:first` and `rdf:rest`.
+/// `false` when absent; a value that is not a boolean is an error.
+pub fn parse_rdf_lists(obj: &serde_json::Map<String, JsonValue>) -> Result<bool> {
+    let Some(value) = obj
+        .get("opts")
+        .and_then(|v| v.as_object())
+        .and_then(|opts| opts.get("rdfLists"))
+    else {
+        return Ok(false);
+    };
+    value.as_bool().ok_or_else(|| {
+        ParseError::InvalidOption(format!("opts.rdfLists must be true or false, got {value}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rdf_lists_opt() {
+        let parse = |v: JsonValue| parse_rdf_lists(v.as_object().unwrap());
+        assert!(!parse(json!({})).unwrap());
+        assert!(parse(json!({"opts": {"rdfLists": true}})).unwrap());
+        assert!(!parse(json!({"opts": {"rdfLists": false}})).unwrap());
+        let err = parse(json!({"opts": {"rdfLists": "yes"}})).unwrap_err();
+        assert!(err.to_string().contains("rdfLists"), "{err}");
+    }
 
     #[test]
     fn union_default_graph_opt() {

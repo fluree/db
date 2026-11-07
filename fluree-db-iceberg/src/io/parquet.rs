@@ -646,7 +646,7 @@ pub fn build_columns_from_values(
 
 /// Map one column's row-collected `ColumnValue`s to the typed [`Column`] for
 /// `field_type`. Extracted verbatim from [`build_columns_from_values`] so the
-/// Arrow direct decoder ([`crate::io::arrow_reader::arrow_column_to_column`]) can
+/// Arrow direct decoder (`crate::io::arrow_reader`'s column conversion) can
 /// reuse the EXACT same `ColumnValue` -> `Column` mapping for its cross-type
 /// fallback — this keeps the direct decode path byte-identical to the two-hop path.
 pub fn column_from_values(values: &[Option<ColumnValue>], field_type: &FieldType) -> Column {

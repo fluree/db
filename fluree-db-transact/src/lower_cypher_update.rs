@@ -45,7 +45,9 @@ use fluree_db_cypher::ast::{
     RemoveItem, SetClause, SetItem, Statement, Update, Variable, WithClause, WriteClause,
 };
 
-use crate::ir::{TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{
+    RelationshipDelete, TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+};
 use crate::namespace::NamespaceRegistry;
 
 /// What a Cypher `CREATE` mints a blank node for.
@@ -344,6 +346,7 @@ impl<'a> CypherLowering<'a> {
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
             update_where_names_ledger_default: false,
+            collection_cells: Vec::new(),
             opts: self.opts,
             vars: self.vars,
             txn_meta: Vec::new(),
@@ -1246,10 +1249,20 @@ impl<'a> CypherLowering<'a> {
             // `DELETE r` — retract the base edge the relationship reifies; the
             // cascade then removes the `f:reifies*` bundle. Parallel-edge safety
             // (a shared `(s,p,o)` carrying multiple annotation SIDs) is enforced
-            // by the API-level conditional probe before this lowering runs.
+            // where the cascade runs, at staging (`relationship_deletes`).
             if let Some((s_name, p_sid, o_name)) = self.rel_var_edges.get(&target.name).cloned() {
                 let s = TemplateTerm::Var(self.vars.get_or_insert(&s_name));
                 let o = TemplateTerm::Var(self.vars.get_or_insert(&o_name));
+                // Staging refuses an edge this template retracts when it
+                // carries another relationship, which the base-edge
+                // retraction would take too.
+                self.opts
+                    .relationship_deletes
+                    .get_or_insert_with(Vec::new)
+                    .push(RelationshipDelete {
+                        var: target.name.clone(),
+                        template: self.delete_templates.len(),
+                    });
                 self.delete_templates
                     .push(TripleTemplate::new(s, TemplateTerm::Sid(p_sid), o));
                 continue;

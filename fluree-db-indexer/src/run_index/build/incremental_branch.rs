@@ -808,7 +808,7 @@ mod parity_tests {
     use fluree_db_core::value_id::ObjKey;
     use std::collections::HashMap;
 
-    const OI_NONE: u32 = u32::MAX;
+    const OI_NONE: u64 = fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 
     fn rec(s_id: u64, p_id: u32, val: i64, t: u32) -> RunRecordV2 {
         RunRecordV2 {

@@ -135,8 +135,9 @@ pub(crate) fn inject_default_prefixes(
 /// parse-then-lower wrapper over this.
 ///
 /// `rdf_list_view` reads lists as their RDF cells, for the Graph Store `GET`
-/// ([`crate::QueryExecutionOptions::with_rdf_list_view`]); SPARQL itself
-/// reads a list's members as values.
+/// ([`crate::QueryExecutionOptions::with_rdf_list_view`]); SPARQL reads them
+/// so too under `# PRAGMA rdf-lists: true`, and a list's members as values
+/// otherwise.
 pub(crate) fn lower_sparql_ast(
     mut ast: fluree_db_sparql::SparqlAst,
     snapshot: &LedgerSnapshot,
@@ -149,7 +150,7 @@ pub(crate) fn lower_sparql_ast(
     let mut vars = VarRegistry::new();
     let mut parsed =
         fluree_db_sparql::lower_sparql_with_source(&ast, snapshot, &mut vars, Some(sparql))?;
-    parsed.rdf_list_view = rdf_list_view;
+    parsed.rdf_list_view |= rdf_list_view;
     Ok((vars, parsed))
 }
 

@@ -327,15 +327,57 @@ instantiated once for each: a triple that any solution inserts is kept,
 however many solutions delete it, and a stored triple that solutions both
 delete and insert is not committed at all.
 
-Once a fact is indexed, a DELETE is matched against what the index stores,
-which is less than was written for an integer too large for 64 bits: the index
-keeps no XSD subtype. A DELETE naming the same big integer under another
-integer datatype retracts such a fact. Storage holds such an integer as one
-fact per value, indexed yet or not, so when a transaction retracts one and
+An integer too large for 64 bits is matched by its value, not by the XSD
+subtype it was written with, since the index keeps no such subtype. A DELETE
+naming the same big integer under another integer datatype retracts it,
+whether it is indexed yet or not. Storage holds such an integer as one
+fact per value, so when a transaction retracts one and
 inserts the same value, the two cancel whatever subtype the insert names:
 `DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as for any value
 that is present, and neither does a write that retracts it and inserts it
 under another subtype.
+
+### Lists
+
+A delete reaches a list's members as values of the property that holds the
+list. Deleting a value deletes every entry of a list that holds it, and the
+value where it is also stored beside the list. With
+`{"@id": "ex:s", "ex:items": {"@list": [1, 2, 1, 3]}}` stored, this leaves
+`ex:items` as the list `(2 3)`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "delete": { "@id": "ex:s", "ex:items": 1 }
+}
+```
+
+A `@list` in a delete names a list, as a value names a value: it deletes the
+property's lists that are that list, the same members in the same order and
+no more, each whole. Each member is matched as the same value deleted on its
+own would be, by RDF term, so `1` does not delete `"1"^^xsd:int`. A shorter
+or longer list, a reordering, and plain values are not it, and lose nothing.
+With `ex:items` holding the lists `(1 2)` and `(1 2 3)`, this deletes `(1 2)`
+alone:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "delete": { "@id": "ex:s", "ex:items": { "@list": [1, 2] } }
+}
+```
+
+In an update with a `where`, each solution's list is matched on its own, and
+a list with a member the solution leaves unbound names nothing.
+
+An empty list, `{"@list": []}`, is the IRI `rdf:nil`, as JSON-LD defines it,
+and is stored as that value. Deleting it deletes the value `rdf:nil`, as a
+delete naming any value does, so it also deletes an entry of a list that
+holds `rdf:nil` as a member.
+
+To remove one entry of a list, or to replace a list, upsert the list. SPARQL
+deletes behave the same way: see
+[Writing lists](../query/sparql.md#writing-lists).
 
 ### No Cascading by Default
 

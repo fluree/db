@@ -669,17 +669,9 @@ impl CommitResolver {
         let dt_id = dicts.datatypes.get_or_insert_parts(prefix, op.dt_name);
         let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
-        // 5. List index (convert Option<i32> to u32 with sentinel) — needed
-        // by vector fact-identity lookup before object encode.
-        let i = match op.i {
-            Some(idx) if idx >= 0 => idx as u32,
-            Some(idx) => {
-                return Err(CommitCodecError::InvalidOp(format!(
-                    "negative list index {idx} is invalid"
-                )));
-            }
-            None => LIST_INDEX_NONE,
-        };
+        // 5. List place (packed, `LIST_INDEX_NONE` for none) — needed by
+        // vector fact-identity lookup before object encode.
+        let i = list_place(op.place)?;
 
         // 6. Encode object -> Option<(ObjKind, ObjKey)>.
         // Pass `op.op` + `(s_ns_code, s_name, i)` so vector retractions
@@ -805,7 +797,7 @@ impl CommitResolver {
         s_ns_code: u16,
         s_name: &str,
         p_id: u32,
-        o_i: u32,
+        o_i: u64,
         _dt_id: u16,
         dicts: &mut GlobalDicts,
         is_assert: bool,
@@ -1120,7 +1112,7 @@ pub struct SharedResolverState {
     /// multi-valued vectors per s/p without list index).
     #[allow(clippy::type_complexity)]
     pub vector_fact_handles:
-        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u32, Vec<u32>), u32>>,
+        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u64, Vec<u32>), u32>>,
     /// Datatype dict ID → ValueTypeTag mapping, populated at insertion time.
     /// Indexed by dt_id (u32). Pre-seeded with reserved entries in `new()`.
     pub dt_tags: Vec<fluree_db_core::value_id::ValueTypeTag>,
@@ -1687,17 +1679,9 @@ impl SharedResolverState {
         let dt_id = self.resolve_datatype(op.dt_ns_code, op.dt_name);
         let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
-        // 5. List index — needed by vector fact-identity lookup before object encode.
-        self.saw_list_meta |= op.i.is_some();
-        let i = match op.i {
-            Some(idx) if idx >= 0 => idx as u32,
-            Some(idx) => {
-                return Err(CommitCodecError::InvalidOp(format!(
-                    "negative list index {idx} is invalid"
-                )));
-            }
-            None => LIST_INDEX_NONE,
-        };
+        // 5. List place — needed by vector fact-identity lookup before object encode.
+        self.saw_list_meta |= op.place.is_some();
+        let i = list_place(op.place)?;
 
         // 6. Encode object → Option<(ObjKind, ObjKey)>.
         // `None` = vector retraction with no matching assertion: skip emit.
@@ -1845,7 +1829,7 @@ impl SharedResolverState {
         s_ns_code: u16,
         s_name: &str,
         p_id: u32,
-        o_i: u32,
+        o_i: u64,
         _dt_id: u16,
         chunk: &mut RebuildChunk,
         is_assert: bool,
@@ -2568,6 +2552,18 @@ fn split_iri_to_value_type_tag(
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// A commit op's list place packed as a record's `i`
+/// ([`fluree_db_core::list_index`]), or `LIST_INDEX_NONE`.
+fn list_place(place: Option<(u32, i32)>) -> Result<u64, CommitCodecError> {
+    match place {
+        Some((list, idx)) if idx >= 0 => Ok(fluree_db_core::list_index::pack(list, idx)),
+        Some((_, idx)) => Err(CommitCodecError::InvalidOp(format!(
+            "negative list index {idx} is invalid"
+        ))),
+        None => Ok(LIST_INDEX_NONE),
+    }
+}
 
 #[cfg(test)]
 mod term_remap_tests {

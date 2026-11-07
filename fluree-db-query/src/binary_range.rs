@@ -3,6 +3,7 @@
 //! Plugs into `range_with_overlay()` so all 25+ callers (policy, SHACL,
 //! reasoner, property paths, API) transparently query V3 indexes.
 
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -195,6 +196,17 @@ fn range_translation_cache() -> &'static std::sync::Mutex<RangeTranslationLru> {
     &CACHE
 }
 
+/// Every `store_id` that has put an entry in [`range_translation_cache`]. A
+/// test that rules an insertion out reads this, not the LRU: other tests'
+/// insertions can evict the entry before it looks.
+#[cfg(test)]
+fn range_translation_inserted_stores() -> &'static std::sync::Mutex<std::collections::BTreeSet<u64>>
+{
+    static INSERTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    &INSERTED
+}
+
 /// Translate the full (unfiltered) overlay for `(g_id, index, to_t)`, served
 /// from [`range_translation_cache`] when the overlay reports a
 /// [`content_version`](OverlayProvider::content_version). Returns `None`
@@ -262,6 +274,11 @@ fn cached_overlay_translation(
         raw: raw.into(),
         ephemeral_p_id_to_sid: Arc::new(ephemeral_p_id_to_sid),
     });
+    #[cfg(test)]
+    range_translation_inserted_stores()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.store_id);
     range_translation_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -832,7 +849,7 @@ fn binary_range_eq_v3(
                         o_key: filter.o_key.unwrap_or(u64::MAX),
                         p_id: filter.p_id.unwrap_or(u32::MAX),
                         t: u32::MAX,
-                        o_i: u32::MAX,
+                        o_i: LIST_INDEX_NONE,
                         o_type: filter.o_type.unwrap_or(u16::MAX),
                         g_id,
                     };
@@ -958,7 +975,7 @@ fn binary_range_eq_v3(
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t = batch.t.get_or(i, 0) as i64;
-            let o_i = batch.o_i.get_or(i, u32::MAX);
+            let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
 
             // Resolve subject. Reuse the caller-supplied Sid when present —
             // the bound `match_val.s` IS the subject for every base row this
@@ -982,23 +999,7 @@ fn binary_range_eq_v3(
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
-            // Language tag.
-            let lang = store
-                .resolve_lang_tag(o_type)
-                .map(std::string::ToString::to_string);
-            // List index.
-            let meta = if lang.is_some() || o_i != u32::MAX {
-                Some(fluree_db_core::FlakeMeta {
-                    lang,
-                    i: if o_i != u32::MAX {
-                        Some(o_i as i32)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
+            let meta = fluree_db_core::FlakeMeta::from_packed(store.resolve_lang_tag(o_type), o_i);
 
             let flake = fluree_db_core::Flake {
                 g: None,
@@ -1150,7 +1151,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         o_key: u64::MAX,
         p_id,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };
@@ -1524,7 +1525,7 @@ fn binary_range_bounded_v3(
         o_key: u64::MAX,
         p_id: u32::MAX,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };
@@ -1575,7 +1576,7 @@ fn binary_range_bounded_v3(
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t = batch.t.get_or(i, 0) as i64;
-            let o_i = batch.o_i.get_or(i, u32::MAX);
+            let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
 
             let s_sid = resolve_sid(s_id, &view)?;
 
@@ -1599,21 +1600,7 @@ fn binary_range_bounded_v3(
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
-            let lang = store
-                .resolve_lang_tag(o_type)
-                .map(std::string::ToString::to_string);
-            let meta = if lang.is_some() || o_i != u32::MAX {
-                Some(fluree_db_core::FlakeMeta {
-                    lang,
-                    i: if o_i != u32::MAX {
-                        Some(o_i as i32)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
+            let meta = fluree_db_core::FlakeMeta::from_packed(store.resolve_lang_tag(o_type), o_i);
 
             let flake = Flake {
                 g: None,
@@ -2250,6 +2237,8 @@ mod tests {
     /// leave the process-wide translation LRU alone. `NoOverlay` reports a
     /// content version, so each new `to_t` used to add an empty entry, and
     /// with eight slots a few commits evicted a live query's translation.
+    /// It checks the record of insertions rather than the LRU, which other
+    /// tests' insertions can empty of this store's entries first.
     #[test]
     fn an_empty_overlay_probe_leaves_the_translation_lru_alone() {
         let store = Arc::new(BinaryIndexStore::empty());
@@ -2270,14 +2259,12 @@ mod tests {
             );
             assert!(out.ops.is_empty() && out.untranslated.is_empty());
         }
-        let entries_for_store = range_translation_cache()
+        let inserted = range_translation_inserted_stores()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(key, _)| key.store_id == store.store_id())
-            .count();
-        assert_eq!(
-            entries_for_store, 0,
+            .contains(&store.store_id());
+        assert!(
+            !inserted,
             "an empty overlay must not occupy translation LRU slots"
         );
     }

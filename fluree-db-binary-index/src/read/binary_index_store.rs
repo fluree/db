@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::format::run_record::LIST_INDEX_NONE;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
@@ -1958,14 +1959,14 @@ impl BinaryIndexStore {
     ///   predicate without a list index (all share `o_i = LIST_INDEX_NONE`),
     ///   so `(s, p, o_i)` alone is not unique.
     ///
-    /// `o_i` should be `u32::MAX` (`LIST_INDEX_NONE`) for non-list
+    /// `o_i` should be `LIST_INDEX_NONE` for non-list
     /// vector facts.
     pub fn find_vector_handle_by_fact(
         self: &Arc<Self>,
         g_id: GraphId,
         s_id: u64,
         p_id: u32,
-        o_i: u32,
+        o_i: u64,
         value: &[f32],
     ) -> io::Result<Option<u32>> {
         use crate::format::run_record::RunSortOrder;
@@ -1997,7 +1998,7 @@ impl BinaryIndexStore {
             o_key: if low { 0 } else { u64::MAX },
             p_id,
             t: if low { 0 } else { u32::MAX },
-            o_i: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u64::MAX },
             o_type: if low { 0 } else { u16::MAX },
             g_id,
         };
@@ -2016,7 +2017,7 @@ impl BinaryIndexStore {
                 if batch.s_id.get(i) == s_id
                     && batch.p_id.get(i) == p_id
                     && batch.o_type.get_or(i, 0) == OType::VECTOR.as_u16()
-                    && batch.o_i.get_or(i, u32::MAX) == o_i
+                    && batch.o_i.get_or(i, LIST_INDEX_NONE) == o_i
                 {
                     let candidate_handle = batch.o_key.get(i) as u32;
                     if let Some(arena) = arena {
@@ -2858,7 +2859,6 @@ impl BinaryIndexStore {
     pub fn list_predicate_ids(&self) -> io::Result<Arc<std::collections::HashSet<u32>>> {
         use crate::format::column_block::ColumnId;
         use crate::format::leaflet::flags::HAS_O_I;
-        use crate::format::run_record::LIST_INDEX_NONE;
         use crate::read::column_types::{ColumnProjection, ColumnSet};
 
         if let Some(ids) = self.list_predicate_ids.get() {
@@ -3001,7 +3001,7 @@ impl BinaryIndexStore {
                 o_key: if low { 0 } else { u64::MAX },
                 p_id: if low { 0 } else { u32::MAX },
                 t: if low { 0 } else { u32::MAX },
-                o_i: if low { 0 } else { u32::MAX },
+                o_i: if low { 0 } else { u64::MAX },
                 o_type: if low { 0 } else { u16::MAX },
                 g_id,
             };
@@ -3466,25 +3466,12 @@ impl BinaryIndexStore {
     ///
     /// `lang_id` is 1-based (0 means "no language tag"). `i_val` of `i32::MIN`
     /// means "no list index". Returns `None` if neither language nor index is set.
-    pub fn decode_meta(&self, lang_id: u16, i_val: i32) -> Option<FlakeMeta> {
-        let has_lang = lang_id != 0;
-        let has_idx = i_val != i32::MIN; // i32::MIN is the ListIndex::none() sentinel
-
-        if !has_lang && !has_idx {
-            return None;
-        }
-
-        let mut meta = FlakeMeta::new();
-        if has_lang {
-            // language_tags is 0-based; lang_id is 1-based
-            if let Some(tag) = self.language_tags.get((lang_id as usize).wrapping_sub(1)) {
-                meta = FlakeMeta::with_lang(tag.clone());
-            }
-        }
-        if has_idx {
-            meta.i = Some(i_val);
-        }
-        Some(meta)
+    pub fn decode_meta(&self, lang_id: u16, i_val: u64) -> Option<FlakeMeta> {
+        // language_tags is 0-based; lang_id is 1-based
+        let lang = (lang_id != 0)
+            .then(|| self.language_tags.get((lang_id as usize).wrapping_sub(1)))
+            .flatten();
+        FlakeMeta::from_packed(lang.map(String::as_str), i_val)
     }
 
     /// Decode a value from `(o_type, o_key)` without graph/predicate context.
@@ -4701,7 +4688,7 @@ pub(crate) mod tests {
             o_key,
             p_id,
             t,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type,
             g_id: 0,
         }
@@ -5458,7 +5445,7 @@ pub(crate) mod tests {
     /// leaf is fetched, even under the `Whole` policy.
     #[test]
     fn list_predicates_are_read_without_fetching_a_whole_leaf() {
-        let member = |s: u64, p: u32, o: u64, i: u32| RunRecordV2 {
+        let member = |s: u64, p: u32, o: u64, i: u64| RunRecordV2 {
             o_i: i,
             ..make_rec(s, p, OType::XSD_INTEGER.as_u16(), o, 1)
         };
@@ -5526,7 +5513,7 @@ pub(crate) mod tests {
     /// list-bearing leaflet holds none, and no whole leaf is fetched.
     #[test]
     fn a_subjects_list_rows_are_found_exactly() {
-        let member = |s: u64, o: u64, i: u32| RunRecordV2 {
+        let member = |s: u64, o: u64, i: u64| RunRecordV2 {
             o_i: i,
             ..make_rec(s, 7, OType::XSD_INTEGER.as_u16(), o, 1)
         };

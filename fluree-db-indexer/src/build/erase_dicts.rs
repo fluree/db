@@ -184,7 +184,7 @@ fn routes_here(lower: Option<&RunRecordV2>, upper: Option<&RunRecordV2>, id: u64
         let most = RunRecordV2 {
             s_id: SubjectId(u64::MAX),
             p_id: u32::MAX,
-            o_i: u32::MAX,
+            o_i: u64::MAX,
             ..least
         };
         lower.is_none_or(|k| cmp(&most, k).is_ge()) && upper.is_none_or(|k| cmp(&least, k).is_lt())

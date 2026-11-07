@@ -15,12 +15,14 @@ use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
 use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
+    BinaryCursor, BinaryFilter, BinaryIndexStore, BranchManifest, ColumnBatch, ColumnProjection,
+    ColumnSet,
 };
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
@@ -367,7 +369,7 @@ fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) 
         o_key: u64::MAX,
         p_id,
         t: u32::MAX,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };
@@ -1175,13 +1177,13 @@ impl<'a> PsotSubjectSeek<'a> {
     pub fn rows_for_subject_identity(
         &mut self,
         target_s: u64,
-        mut on_row: impl FnMut(u16, u64, u32),
+        mut on_row: impl FnMut(u16, u64, u64),
     ) -> Result<Option<u64>> {
         self.visit_subject(target_s, |batch, row| {
             on_row(
                 batch.o_type.get(row),
                 batch.o_key.get(row),
-                batch.o_i.get_or(row, u32::MAX),
+                batch.o_i.get_or(row, LIST_INDEX_NONE),
             );
         })
     }
@@ -2415,7 +2417,7 @@ impl ProbeOps {
         p_id: u32,
         o_type: u16,
         o_key: u64,
-        o_i: u32,
+        o_i: u64,
     ) -> RowFate {
         if window.is_empty() {
             return RowFate::Keep;
@@ -2465,7 +2467,7 @@ impl ProbeOps {
 struct ObjectProbeOp {
     o_key: u64,
     s_id: u64,
-    o_i: u32,
+    o_i: u64,
     /// true = assert, false = retract.
     op: bool,
 }
@@ -2533,7 +2535,7 @@ impl ObjectProbeOps {
         &mut self,
         window: &std::ops::Range<usize>,
         s_id: u64,
-        o_i: u32,
+        o_i: u64,
     ) -> RowFate {
         if window.is_empty() {
             return RowFate::Keep;
@@ -2881,6 +2883,67 @@ pub fn star_probe_lane_plan(
     }
     fluree_db_binary_index::read::types::sort_overlay_ops(&mut merged, RunSortOrder::Spot);
     Ok(ProbeLanePlan::Merge(merged.into()))
+}
+
+/// The `order` branch a batched probe reads for `g_id`, or `None` when the
+/// index holds no such branch.
+///
+/// A graph with no branch has nothing indexed, so a probe there finds
+/// nothing. That answer is complete only while no overlay merge is in play:
+/// the lane plans above decline a branchless graph whose novelty the probe
+/// would have to merge, and a probe that reached one with ops to merge would
+/// drop those rows. That case is refused, in release builds as well.
+pub(crate) fn branch_or_none(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    order: RunSortOrder,
+    merging: bool,
+) -> Result<Option<&Arc<BranchManifest>>> {
+    match store.dedicated_branch(g_id, order) {
+        Some(branch) => Ok(Some(branch)),
+        None if merging => Err(QueryError::Internal(format!(
+            "{order:?} probe has novelty to merge in graph {g_id}, which has no {order:?} branch"
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// The `p_id` a batched probe reads `pred_sid` under, or `None` when the
+/// index holds no such predicate.
+///
+/// A predicate the index doesn't hold has nothing indexed, so a probe finds
+/// nothing for it. As with [`branch_or_none`], that answer is complete only
+/// while none of the predicate's novelty is in play: the lane plans decline
+/// a novelty-only predicate whose ops the probe would merge, and a probe that
+/// reached one would drop those rows. `merges_ops` says whether the probe's
+/// merge holds ops of `pred_sid`, and is asked only when the index lacks it;
+/// when it does, the lookup refuses, in release builds as well.
+pub(crate) fn p_id_or_none(
+    store: &BinaryIndexStore,
+    pred_sid: &Sid,
+    merges_ops: impl FnOnce() -> Result<bool>,
+) -> Result<Option<u32>> {
+    match store.sid_to_p_id(pred_sid) {
+        Some(p_id) => Ok(Some(p_id)),
+        None if merges_ops()? => Err(QueryError::Internal(format!(
+            "probe has novelty to merge for {pred_sid}, a predicate the index doesn't hold"
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Whether the active graph's novelty holds ops of `pred_sid`, for a probe
+/// that merges several predicates' ops ([`p_id_or_none`]). A translation
+/// failure counts as holding some, since its lane plan declines on one.
+pub(crate) fn overlay_holds_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<bool> {
+    Ok(
+        cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+            .is_none_or(|ops| !ops.is_empty()),
+    )
 }
 
 /// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
@@ -4547,5 +4610,51 @@ mod tests {
                 "{index:?}: rhs stays below higher predicates"
             );
         }
+    }
+
+    /// A graph with no branch answers a probe with nothing only when no
+    /// overlay merge is in play; with ops to merge, that answer would drop
+    /// them, so the lookup refuses.
+    #[test]
+    fn branch_or_none_refuses_a_merge_over_a_graph_with_no_branch() {
+        let store = BinaryIndexStore::empty();
+        for order in [RunSortOrder::Psot, RunSortOrder::Opst, RunSortOrder::Spot] {
+            assert!(
+                matches!(branch_or_none(&store, 3, order, false), Ok(None)),
+                "{order:?}: no merge, no branch: nothing to read"
+            );
+            match branch_or_none(&store, 3, order, true) {
+                Err(QueryError::Internal(msg)) => {
+                    assert!(msg.contains(&format!("no {order:?} branch")), "{msg}");
+                }
+                Err(other) => panic!("{order:?}: wrong error: {other}"),
+                Ok(_) => panic!("{order:?}: a merge over a graph with no branch must refuse"),
+            }
+        }
+    }
+
+    /// A predicate the index doesn't hold answers a probe with nothing only
+    /// while none of its ops is merged; with one, that answer would drop it,
+    /// so the lookup refuses. The merge check isn't asked for a predicate the
+    /// index holds.
+    #[test]
+    fn p_id_or_none_refuses_a_merge_of_a_predicate_the_index_doesnt_hold() {
+        let store = BinaryIndexStore::empty();
+        let pred = Sid::new(100, "novelty-only");
+        assert!(
+            matches!(p_id_or_none(&store, &pred, || Ok(false)), Ok(None)),
+            "no ops of it merged: nothing to read"
+        );
+        match p_id_or_none(&store, &pred, || Ok(true)) {
+            Err(QueryError::Internal(msg)) => {
+                assert!(msg.contains("the index doesn't hold"), "{msg}");
+            }
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("a merge of a predicate the index doesn't hold must refuse"),
+        }
+        let refused = p_id_or_none(&store, &pred, || {
+            Err(QueryError::Internal("merge check failed".into()))
+        });
+        assert!(refused.is_err(), "a failed merge check fails the lookup");
     }
 }
