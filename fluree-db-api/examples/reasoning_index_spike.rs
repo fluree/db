@@ -277,10 +277,16 @@ async fn main() {
 
     let queries = load_queries(&queries_dir);
 
+    // The first query-time run of each query is timed on its own: the first
+    // of all pays for materializing the closure, which later runs read from
+    // the reasoning cache.
     let mut query_time = Vec::new();
     let mut query_time_ms = Vec::new();
+    let mut parity_run_ms = Vec::new();
     for (_, sparql) in &queries {
+        let started = std::time::Instant::now();
         let (rows, served) = run(&fluree, sparql).await;
+        parity_run_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         assert!(!served, "nothing is registered yet");
         query_time.push(rows);
         if timings_enabled() {
@@ -327,6 +333,7 @@ async fn main() {
         });
         if timings_enabled() {
             entry["query_time"] = query_time_ms[i].clone();
+            entry["query_time"]["cold_ms"] = json!(parity_run_ms[i]);
             entry["index"] = timed(&fluree, sparql).await;
         }
         per_query.push(entry);
