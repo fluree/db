@@ -619,15 +619,21 @@ fn process_literal<S: GraphSink>(
     obj: &serde_json::Map<String, Value>,
     sink: &mut S,
 ) -> Result<ProcessedValue> {
-    // Check for @type (datatype)
-    let datatype = if let Some(type_val) = obj.get("@type") {
-        if let Some(type_iri) = type_val.as_str() {
-            Datatype::from_iri(type_iri)
-        } else {
-            Datatype::xsd_string()
-        }
-    } else {
-        Datatype::xsd_string()
+    // The datatype: `@type` when given; otherwise what JSON-LD's RDF
+    // conversion gives a native value: `xsd:boolean` for a boolean,
+    // `xsd:integer` for an integral number, `xsd:double` for any other
+    // number, and `xsd:string` for a string. (A native number used to be
+    // labelled `xsd:string` here while keeping its numeric value, which a
+    // sink that writes the datatype out, like the graph collector, then
+    // printed as a string: `"0"` for `{"@value": 0}`.)
+    let datatype = match obj.get("@type").and_then(Value::as_str) {
+        Some(type_iri) => Datatype::from_iri(type_iri),
+        None => match val {
+            Value::Bool(_) => Datatype::xsd_boolean(),
+            Value::Number(n) if n.as_i64().is_some() => Datatype::xsd_integer(),
+            Value::Number(_) => Datatype::xsd_double(),
+            _ => Datatype::xsd_string(),
+        },
     };
 
     // Check for @language
@@ -785,6 +791,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A native value with no `@type` takes the datatype JSON-LD's RDF
+    /// conversion gives it, not `xsd:string`: what expansion makes of a
+    /// bare `0`, `1.5` or `true`.
+    #[test]
+    fn native_values_without_a_type_keep_their_rdf_datatype() {
+        let expanded = json!([{
+            "@id": "http://example.org/row",
+            "http://example.org/int": [{ "@value": 0 }],
+            "http://example.org/double": [{ "@value": 1.5 }],
+            "http://example.org/bool": [{ "@value": true }],
+            "http://example.org/string": [{ "@value": "0" }],
+            "http://example.org/declared": [{ "@value": 7, "@type": "http://www.w3.org/2001/XMLSchema#long" }]
+        }]);
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let datatype_of = |p: &str| {
+            sink.graph()
+                .iter()
+                .find(|t| t.predicate().as_iri() == Some(p))
+                .and_then(|t| {
+                    t.object()
+                        .as_literal()
+                        .map(|(_, dt, _)| dt.as_iri().to_string())
+                })
+                .unwrap()
+        };
+        let xsd = |local: &str| format!("http://www.w3.org/2001/XMLSchema#{local}");
+        assert_eq!(datatype_of("http://example.org/int"), xsd("integer"));
+        assert_eq!(datatype_of("http://example.org/double"), xsd("double"));
+        assert_eq!(datatype_of("http://example.org/bool"), xsd("boolean"));
+        assert_eq!(datatype_of("http://example.org/string"), xsd("string"));
+        assert_eq!(datatype_of("http://example.org/declared"), xsd("long"));
     }
 
     #[test]
