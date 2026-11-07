@@ -3,11 +3,13 @@
 //! Blocking, like [`crate::LlmClient`] and for the same reason: readings run
 //! inside a `spawn_blocking` task, and ureq carries no runtime to drop there.
 //!
-//! **Resends.** A read is resent only when the answer is a 503 that carries
-//! `Retry-After`: the endpoint saying it had no capacity (a model still
-//! starting, a full queue) and when to come back. Nothing else is resent —
-//! not a timeout, not a dropped connection, not a 503 without the header —
-//! because any of those may follow a read that ran, and a read is billed.
+//! **Resends.** A read is resent only when the answer is a 503 or a 429 that
+//! carries `Retry-After`: the endpoint saying it had no capacity (a model
+//! still starting, a full queue) or that the caller is over a rate limit,
+//! and when to come back. Both refuse before any work (RFC 9110 §15.6.4,
+//! RFC 6585 §4). Nothing else is resent — not a timeout, not a dropped
+//! connection, not a 503 or 429 without the header — because any of those
+//! may follow a read that ran, and a read is billed.
 //! Attempts and total waiting are capped, and every wait is reported through
 //! the caller's `on_wait`, so a model starting from cold shows as waiting
 //! rather than as a hang.
@@ -241,7 +243,7 @@ impl ReaderClient {
                 });
             }
             let message = error_message(&text);
-            let retry_after = (status == 503)
+            let retry_after = (status == 503 || status == 429)
                 .then(|| headers.get("retry-after"))
                 .flatten()
                 .and_then(|v| v.to_str().ok())
@@ -254,7 +256,7 @@ impl ReaderClient {
                             model: model.to_string(),
                             status,
                             message: format!(
-                                "no capacity after {}s of waiting: {message}",
+                                "still refused after {}s of waiting: {message}",
                                 waited.as_secs()
                             ),
                         });
@@ -462,18 +464,40 @@ mod tests {
         );
     }
 
-    /// Only a 503 with `Retry-After` is resent: without it the read may have
-    /// run, and the resend rule covers no other status.
     #[test]
-    fn a_503_without_retry_after_and_any_other_error_are_not_resent() {
+    fn a_429_with_retry_after_is_resent() {
+        let (url, seen) = stub(vec![
+            http(
+                "429 Too Many Requests",
+                &["Retry-After: 1"],
+                r#"{"error":{"message":"Too many","status":429,"error":"rate_limited"}}"#,
+            ),
+            http("200 OK", &["X-Fluree-Serialized-Tokens: 5"], "[]"),
+        ]);
+        let waits = Mutex::new(Vec::new());
+        let answer = ReaderClient::new(&endpoint(&url))
+            .read("x", "m", None, &|w| {
+                waits.lock().unwrap().push(w.to_string());
+            })
+            .unwrap();
+        assert_eq!(answer.resends, 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(waits.into_inner().unwrap()[0].contains("attempt 2 of 4"));
+    }
+
+    /// Only a 503 or 429 with `Retry-After` is resent: without it the read
+    /// may have run, and the resend rule covers no other status.
+    #[test]
+    fn a_503_or_429_without_retry_after_and_any_other_error_are_not_resent() {
         for response in [
             http(
                 "503 Service Unavailable",
                 &[],
                 r#"{"error":"Extraction service unavailable"}"#,
             ),
+            http("429 Too Many Requests", &[], "slow down"),
             http("504 Gateway Timeout", &["Retry-After: 1"], "timed out"),
-            http("429 Too Many Requests", &["Retry-After: 1"], "slow down"),
+            http("502 Bad Gateway", &["Retry-After: 1"], "upstream"),
         ] {
             let (url, seen) = stub(vec![response]);
             let err = ReaderClient::new(&endpoint(&url))

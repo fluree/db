@@ -6,7 +6,7 @@ Read one document with an HTTP reader (an extraction model reached over HTTP, co
 fluree doc read <FILE> --ontology <FILE|LEDGER> [OPTIONS]
 ```
 
-The file is parsed as [`parse`](parse.md) parses it, then read with the same requests `ingest` sends: cut into calls when it is long, every call carrying the ontology and the catalog, a call resent only when the reader says it has no capacity yet. No ledger is written. Files as ontology and catalog need no project; a ledger as either does.
+The file is parsed as [`parse`](parse.md) parses it, then read with the same requests `ingest` sends: cut into calls when it is long, every call carrying the ontology and the catalog, a call resent only when the reader says it has no capacity yet or is rate-limiting (a 503 or 429 with `Retry-After`). No ledger is written. Files as ontology and catalog need no project; a ledger as either does.
 
 The reader is the `[doc.reader]` of the project when there is one, and of the global config otherwise. `FLUREE_DOC_READER_URL`, `_API_KEY`, `_AUTH_HEADER`, `_MODELS` and `_CACHE` override its fields one by one, and with no config at all they are the reader.
 
