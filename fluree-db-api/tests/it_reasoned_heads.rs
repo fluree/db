@@ -1045,3 +1045,130 @@ async fn a_streaming_query_is_served_from_the_head() {
     let rows = text.lines().filter(|l| l.contains("\"row\"")).count();
     assert_eq!(rows, 10, "{text}");
 }
+
+/// A sweep keeps every file a retained generation reaches, and the
+/// manifests and derived-only sets it never lists.
+#[tokio::test]
+async fn a_sweep_keeps_what_the_heads_reach() {
+    let (writer, reader) = crate::support::instances_sharing_storage();
+    writer.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+        min_age_ms: 3_600_000,
+        max_generations_in_guard: 8,
+    });
+    let id = "heads/sweep:main";
+    let ledger = school(&writer, id).await;
+    writer
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let head = writer
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    let ledger = student_commit(&writer, ledger, "carol").await;
+    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+
+    writer.sweep_index_storage("heads/sweep").await.unwrap();
+
+    // Both retained generations still read: the current one served, and the
+    // older one through its manifest.
+    assert_eq!(chain_len(&reader, id, &head).await, 2);
+    let (people, served) = rows(&reader, id, &people_query()).await;
+    assert_eq!(served.map(|h| h.generation), Some(2));
+    assert_eq!(
+        people,
+        vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
+    );
+    // The next generation folds on the swept head.
+    let _ledger = student_commit(&writer, ledger, "dave").await;
+    let (_, kind) = published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    assert_eq!(kind, GenerationKind::Logical);
+    let (people, served) = rows(&writer, id, &people_query()).await;
+    assert_eq!(served.map(|h| h.generation), Some(3));
+    assert_eq!(people.len(), 4);
+}
+
+/// Dropping a branch deletes its reasoned heads with it.
+#[tokio::test]
+async fn a_branch_drop_deletes_its_heads() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main = "heads/branch:main";
+    let ledger = school(&fluree, main).await;
+    drop(ledger);
+    fluree
+        .create_branch("heads/branch", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = "heads/branch:dev";
+    let head = fluree
+        .register_reasoned_head(dev, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(dev, &head).await.unwrap());
+    let record = fluree.nameservice().lookup(dev).await.unwrap().unwrap();
+    let store = fluree
+        .backend()
+        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
+    let manifest = fluree.reasoned_heads(dev).await.unwrap().heads[&head]
+        .published
+        .clone()
+        .unwrap()
+        .manifest;
+    assert!(store.has(&manifest).await.unwrap());
+
+    fluree.drop_branch("heads/branch", "dev").await.unwrap();
+    assert!(
+        !store.has(&manifest).await.unwrap(),
+        "the head's files are deleted"
+    );
+    // The main branch is untouched and reasons at query time.
+    let (people, served) = rows(&fluree, main, &people_query()).await;
+    assert!(served.is_none());
+    assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
+}
+
+/// A rule that mints a constant gives the head a dictionary blob of its own,
+/// which only the head reaches; a sweep keeps it.
+#[tokio::test]
+async fn a_sweep_keeps_a_dictionary_only_the_head_reaches() {
+    let (writer, reader) = crate::support::instances_sharing_storage();
+    let id = "heads/sweep-dict:main";
+    school(&writer, id).await;
+    writer
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let rules = json!([{
+        "@id": "ex:tagRule", "@context": ctx(),
+        "where": {"@id": "?x", "@type": "ex:Student"},
+        "insert": {"@id": "?x", "ex:tag": "minted-by-the-rule-only"}
+    }]);
+    let head = writer
+        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .await
+        .unwrap();
+    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+
+    writer
+        .sweep_index_storage("heads/sweep-dict")
+        .await
+        .unwrap();
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?x", "?tag"],
+        "where": {"@id": "?x", "ex:tag": "?tag"},
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let (tagged, served) = rows(&reader, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(
+        tagged,
+        vec![
+            json!(["ex:alice", "minted-by-the-rule-only"]),
+            json!(["ex:bob", "minted-by-the-rule-only"])
+        ]
+    );
+}
