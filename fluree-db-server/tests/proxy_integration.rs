@@ -4168,9 +4168,34 @@ async fn test_proxy_peer_forwards_a_write() {
     server_handle.abort();
 }
 
+/// A stand-in prover of this release: it answers `--image-id`, which the
+/// server checks at start-up, and refuses to prove.
+#[cfg(unix)]
+fn stand_in_prover(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let image_id = fluree_db_api::retention::erasure::REDACT_IMAGE_IDS[0]
+        .iter()
+        .map(|w| format!("{w:#010x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let path = dir.join("fluree-prover");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --image-id ] && echo '{image_id}' && exit 0\n\
+             echo 'a stand-in prover proves nothing' >&2\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 /// A peer forwards removal and erasure requests to the transaction server,
 /// which writes them. Run on the peer, a removal would have no writer and an
 /// erasure no file storage.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_proxy_peer_forwards_removal_and_erasure() {
     use tokio::net::TcpListener;
@@ -4183,8 +4208,8 @@ async fn test_proxy_peer_forwards_removal_and_erasure() {
         server_role: ServerRole::Transaction,
         storage_proxy_enabled: true,
         storage_proxy_insecure_accept_any_issuer: true,
-        // Never run: acceptance does not wait for a proof.
-        erasure_prover: Some(tmp.path().join("no-prover")),
+        // Acceptance does not wait for a proof, but needs a prover.
+        erasure_prover: Some(stand_in_prover(tmp.path())),
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
