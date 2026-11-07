@@ -454,6 +454,50 @@ pub async fn compute_derived_facts(
     })
 }
 
+/// What the OWL 2 RL closure of `base_db` gains when `base_db` holds a
+/// closed state (a previous closure's asserted and derived facts) plus
+/// `inserted`, the facts asserted since: the incremental counterpart of
+/// [`compute_derived_facts`] for a program that is OWL 2 RL alone.
+///
+/// `None` when the program cannot be maintained this way: other modes or
+/// rules, the identity rules, or `owl:sameAs`. The caller computes the closure
+/// in full instead.
+pub async fn compute_derived_facts_incremental(
+    base_db: GraphDbRef<'_>,
+    reasoning: &ReasoningModes,
+    inserted: &[fluree_db_core::Flake],
+    request: QueryRequest<'_>,
+) -> crate::error::Result<Option<DerivedFactsOutcome>> {
+    if !reasoning.owl2rl || reasoning.datalog || reasoning.owl_datalog || reasoning.has_rules() {
+        return Ok(None);
+    }
+    let opts = ReasoningOptions {
+        budget: reasoning_budget(reasoning),
+        cancellation: request.cancellation.cloned().unwrap_or_default(),
+        tracker: request.tracker.cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    match fluree_db_reasoner::reason_owl2rl_incremental(base_db, inserted, &opts).await {
+        Ok(None) => Ok(None),
+        Ok(Some(result)) => Ok(Some(DerivedFactsOutcome {
+            overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
+            diagnostics: Some(result.diagnostics.clone()),
+            failed: None,
+        })),
+        Err(fluree_db_reasoner::ReasonerError::Cancelled(reason)) => {
+            Err(crate::error::QueryError::Cancelled { reason })
+        }
+        Err(fluree_db_reasoner::ReasonerError::FuelExceeded(e)) => {
+            Err(crate::error::QueryError::FuelLimitExceeded(e))
+        }
+        Err(e) => Ok(Some(DerivedFactsOutcome {
+            overlay: None,
+            diagnostics: None,
+            failed: Some(format!("OWL 2 RL materialization failed: {e}")),
+        })),
+    }
+}
+
 /// Explain the derived facts `target` names. Materializes as a query with
 /// these reasoning modes would (served from the reasoning cache when it can),
 /// then re-runs each rule that can derive the facts over the result and

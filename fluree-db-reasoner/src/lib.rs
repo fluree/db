@@ -254,6 +254,33 @@ pub async fn reason_owl2rl(
     Ok(result)
 }
 
+/// OWL 2 RL closure maintenance under insertions: what the closure of `db`
+/// gains when `db` holds a closed state plus `inserted`. `None` when the
+/// program cannot be maintained this way (see
+/// [`fixpoint::run_fixpoint_incremental`]). Never cached: the result describes
+/// a change, not a state.
+pub async fn reason_owl2rl_incremental(
+    db: GraphDbRef<'_>,
+    inserted: &[fluree_db_core::Flake],
+    opts: &ReasoningOptions,
+) -> Result<Option<Arc<ReasoningResult>>> {
+    opts.validate()?;
+    let Some((derived_flakes, diagnostics)) =
+        fixpoint::run_fixpoint_incremental(db, inserted, opts).await?
+    else {
+        return Ok(None);
+    };
+    let mut builder = DerivedFactsBuilder::with_capacity(derived_flakes.len());
+    for flake in derived_flakes {
+        builder.push(flake);
+    }
+    let derived_overlay = builder.build(FrozenSameAs::empty(), db.overlay.epoch());
+    Ok(Some(Arc::new(ReasoningResult::new(
+        derived_overlay,
+        diagnostics,
+    ))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

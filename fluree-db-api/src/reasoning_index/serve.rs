@@ -289,11 +289,25 @@ impl Fluree {
         record: &NsRecord,
         manifest: &ReasoningManifest,
     ) -> Result<LedgerState> {
+        let mut at_basis = record.clone();
+        at_basis.commit_head_id = Some(manifest.basis.commit.clone());
+        at_basis.commit_t = manifest.basis.t;
+        self.load_index_state(store, &at_basis, &manifest.root, manifest.basis.t)
+            .await
+    }
+
+    /// The ledger state `root` (indexed at `index_t`) describes with the
+    /// commits after it, up to `record`'s commit head, replayed as novelty.
+    pub(crate) async fn load_index_state(
+        &self,
+        store: Arc<dyn ContentStore>,
+        record: &NsRecord,
+        root: &ContentId,
+        index_t: i64,
+    ) -> Result<LedgerState> {
         let mut index_record = record.clone();
-        index_record.index_head_id = Some(manifest.root.clone());
-        index_record.index_t = manifest.basis.t;
-        index_record.commit_head_id = Some(manifest.basis.commit.clone());
-        index_record.commit_t = manifest.basis.t;
+        index_record.index_head_id = Some(root.clone());
+        index_record.index_t = index_t;
         let (mut state, root) = LedgerState::load_with_store_decoding_root(
             Arc::clone(&store),
             index_record,

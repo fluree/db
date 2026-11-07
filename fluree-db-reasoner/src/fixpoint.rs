@@ -48,6 +48,51 @@ pub async fn run_fixpoint(
     db: GraphDbRef<'_>,
     opts: &ReasoningOptions,
 ) -> Result<(Vec<Flake>, FrozenSameAs, ReasoningDiagnostics)> {
+    Ok(run(db, opts, None)
+        .await?
+        .expect("a full run always completes or caps"))
+}
+
+/// Maintain a closure under insertions: `db` holds a closed state (a
+/// previous closure's asserted and derived facts) plus `inserted`, the facts
+/// asserted since. Returns only what the closure gains.
+///
+/// Every rule fires from a delta fact in each of its premise positions and
+/// joins the rest against everything known, so seeding the delta with just
+/// the insertions, against the closed state, finds every new derivation.
+/// `None` when the program keeps state a delta alone cannot rebuild: the
+/// identity rules (`prp-fp`, `prp-ifp`, `prp-key`, `cls-maxc2`, `cls-maxqc`)
+/// group facts across rounds, and `owl:sameAs` canonicalization rewrites
+/// facts already derived. Callers then compute the closure in full.
+pub async fn run_fixpoint_incremental(
+    db: GraphDbRef<'_>,
+    inserted: &[Flake],
+    opts: &ReasoningOptions,
+) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
+    Ok(run(db, opts, Some(inserted))
+        .await?
+        .map(|(flakes, _, diagnostics)| (flakes, diagnostics)))
+}
+
+/// Whether the program has a rule that derives `owl:sameAs`.
+fn uses_identity_rules(ontology: &OntologyRL, restrictions: &RestrictionIndex) -> bool {
+    !ontology.functional_properties().is_empty()
+        || !ontology.inverse_functional_properties().is_empty()
+        || ontology.classes_with_keys().next().is_some()
+        || restrictions.iter().any(|r| {
+            matches!(
+                r.restriction_type,
+                crate::restrictions::RestrictionType::MaxCardinality1 { .. }
+                    | crate::restrictions::RestrictionType::MaxQualifiedCardinality1 { .. }
+            )
+        })
+}
+
+async fn run(
+    db: GraphDbRef<'_>,
+    opts: &ReasoningOptions,
+    inserted: Option<&[Flake]>,
+) -> Result<Option<(Vec<Flake>, FrozenSameAs, ReasoningDiagnostics)>> {
     let budget = &opts.budget;
     let start = Instant::now();
     let mut diagnostics = ReasoningDiagnostics::default();
@@ -63,17 +108,20 @@ pub async fn run_fixpoint(
     let mut same_as_tracker = SameAsTracker::new();
     let same_as_pairs = load_same_as_assertions(db).await?;
     let has_same_as = !same_as_pairs.is_empty();
+    if inserted.is_some() && (has_same_as || uses_identity_rules(&ontology, &restrictions)) {
+        return Ok(None);
+    }
     for (x, y) in &same_as_pairs {
         same_as_tracker.union(x, y);
     }
 
     // If no property rules, no restrictions, AND no sameAs assertions, no reasoning needed
     if ontology.is_empty() && restrictions.is_empty() && !has_same_as {
-        return Ok((
+        return Ok(Some((
             Vec::new(),
             FrozenSameAs::empty(),
             ReasoningDiagnostics::completed(0, 0, start.elapsed()),
-        ));
+        )));
     }
 
     // If only sameAs (no property rules and no restrictions), generate sameAs flakes and return
@@ -94,11 +142,11 @@ pub async fn run_fixpoint(
             })
             .collect();
         let flake_count = same_as_flakes.len();
-        return Ok((
+        return Ok(Some((
             same_as_flakes,
             frozen_same_as,
             ReasoningDiagnostics::completed(0, flake_count, start.elapsed()),
-        ));
+        )));
     }
 
     // Compile the active ontology into trigger-indexed ground rules (A1.2).
@@ -120,6 +168,21 @@ pub async fn run_fixpoint(
     // (eq-rep-s/o entailments are genuine derivations).
     for flake in delta.iter() {
         derived.register_base(flake);
+    }
+
+    // Maintaining a closed state: it is the join side from the first round,
+    // and only the insertions fire rules. They are base facts too, whatever
+    // their predicate, so none is emitted as derived.
+    if let Some(inserted) = inserted {
+        for flake in delta.iter() {
+            derived.try_add(flake.clone());
+        }
+        let mut seeded = DeltaSet::with_capacity(inserted.len());
+        for flake in inserted {
+            derived.register_base(flake);
+            seeded.push(flake.clone());
+        }
+        delta = seeded;
     }
 
     // owl:sameAs SID for rule application
@@ -367,7 +430,11 @@ pub async fn run_fixpoint(
         diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
     }
 
-    Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
+    Ok(Some((
+        derived.into_derived_flakes(),
+        frozen_same_as,
+        diagnostics,
+    )))
 }
 
 /// Fails the run once the request it serves has been cancelled. A cancelled

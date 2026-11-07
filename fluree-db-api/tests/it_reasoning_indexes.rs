@@ -1922,3 +1922,101 @@ async fn a_refresh_rebuilds_when_an_external_schema_changes() {
     assert_eq!(served.map(|h| h.generation), Some(2));
     assert_eq!(people, vec![json!("ex:anita")]);
 }
+
+fn closure_of(outcome: RefreshOutcome) -> fluree_db_core::reasoning_index::ClosureMode {
+    match outcome {
+        RefreshOutcome::Published { stats, .. } => stats.closure,
+        other => panic!("expected a published generation, got {other:?}"),
+    }
+}
+
+/// A generation maintains its predecessor's closure when the commits since
+/// only inserted data, and computes it in full when one inserted
+/// vocabulary the program reads as its definition, retracted anything, or
+/// the program is not OWL 2 RL alone. Either way it answers as query time.
+#[tokio::test]
+async fn a_generation_maintains_the_closure_only_over_inserted_data() {
+    use fluree_db_core::reasoning_index::ClosureMode;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/closure-mode:main";
+    let ledger = school(&fluree, id).await;
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    let rules = json!([{
+        "@id": "ex:peer", "@context": ctx(),
+        "where": [{"@id": "?x", "@type": "ex:Person"}, {"@id": "?y", "@type": "ex:Person"}],
+        "insert": {"@id": "?x", "ex:peerOf": {"@id": "?y"}}
+    }]);
+    let datalog = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .await
+        .unwrap();
+    assert_eq!(
+        closure_of(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        ClosureMode::Full
+    );
+    published(fluree.refresh_reasoning_index(id, &datalog).await.unwrap());
+
+    let check = |expected: Vec<&'static str>| {
+        let fluree = &fluree;
+        async move {
+            let (people, served) = rows(fluree, id, &people_query()).await;
+            assert!(served.is_some());
+            let expected: Vec<JsonValue> = expected.into_iter().map(|p| json!(p)).collect();
+            assert_eq!(people, expected);
+        }
+    };
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:carol", "@type": "ex:Student"},
+                {"@id": "ex:eve", "@type": "ex:Tutor"}
+            ]}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        closure_of(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        ClosureMode::Incremental
+    );
+    assert_eq!(
+        closure_of(fluree.refresh_reasoning_index(id, &datalog).await.unwrap()),
+        ClosureMode::Full,
+        "datalog is maintained in full"
+    );
+    check(vec!["ex:alice", "ex:bob", "ex:carol"]).await;
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(),
+                    "@id": "ex:Tutor", "rdfs:subClassOf": {"@id": "ex:Person"}}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        closure_of(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        ClosureMode::Full,
+        "an inserted axiom changes the program"
+    );
+    check(vec!["ex:alice", "ex:bob", "ex:carol", "ex:eve"]).await;
+
+    let _ledger = retract(
+        &fluree,
+        ledger,
+        json!({"@id": "ex:carol", "@type": "ex:Student"}),
+    )
+    .await;
+    assert_eq!(
+        closure_of(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        ClosureMode::Full,
+        "a retraction is maintained in full"
+    );
+    check(vec!["ex:alice", "ex:bob", "ex:eve"]).await;
+}

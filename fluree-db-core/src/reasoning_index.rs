@@ -220,6 +220,21 @@ pub struct GenerationStats {
     /// Facts the fold added and removed relative to the predecessor.
     pub added: u64,
     pub removed: u64,
+    /// How the program's output was computed.
+    #[serde(default)]
+    pub closure: ClosureMode,
+}
+
+/// How a generation's program output was computed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClosureMode {
+    /// In full, from the branch's asserted facts.
+    #[default]
+    Full,
+    /// From the predecessor's output and the facts the commits since its
+    /// basis inserted.
+    Incremental,
 }
 
 /// One published generation: content-addressed, kind

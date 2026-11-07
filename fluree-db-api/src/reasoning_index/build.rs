@@ -25,16 +25,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use fluree_db_core::reasoning_index::{
-    admit, Basis, BasisOracle, Candidate, Discard, ErasureEpoch, GenerationKind, GenerationStats,
-    ReasoningIndexEntry, ReasoningIndexId, ReasoningIndexes, ReasoningManifest, Registration,
-    RegistrationState,
+    admit, Basis, BasisOracle, Candidate, ClosureMode, Discard, ErasureEpoch, GenerationKind,
+    GenerationStats, ReasoningIndexEntry, ReasoningIndexId, ReasoningIndexes, ReasoningManifest,
+    Registration, RegistrationState,
 };
 use fluree_db_core::{
     BranchedContentStore, ContentId, ContentKind, ContentStore, Flake, GraphId, IndexType,
     LedgerId, OverlayProvider, Sid,
 };
 use fluree_db_nameservice::{NsRecord, ReasoningIndexesCasResult};
-use fluree_db_query::execute::{compute_derived_facts, QueryRequest};
+use fluree_db_query::execute::{
+    compute_derived_facts, compute_derived_facts_incremental, QueryRequest,
+};
 use fluree_db_query::schema_bundle::SchemaBundleOverlay;
 use serde_json::Value as JsonValue;
 
@@ -435,28 +437,6 @@ impl Fluree {
             modes.max_memory_mb = None;
         }
 
-        let derived = match self.complete_closure(&db, &executable.reasoning).await {
-            Ok(Ok(derived)) => derived,
-            Ok(Err(reason)) => return Ok(RefreshOutcome::Failed { reason }),
-            Err(e) => {
-                return Ok(RefreshOutcome::Failed {
-                    reason: e.to_string(),
-                })
-            }
-        };
-        let derived_total = derived.len() as u64;
-        let derived_only = asserted_filter(&db, derived, false).await?;
-        if program::serves_rewrites(&executable.reasoning) {
-            if let Some(p) = derived_hierarchy_edge(&derived_only) {
-                return Ok(RefreshOutcome::Failed {
-                    reason: format!(
-                        "the program derives {p} facts, which query-time rdfs and owl2ql \
-                         rewriting does not read; an index would answer differently"
-                    ),
-                });
-            }
-        }
-
         // The previous generation, when this one can build on it.
         let branch_store = fluree_db_nameservice::branched_content_store_for_record(
             self.backend(),
@@ -493,6 +473,66 @@ impl Fluree {
             _ => None,
         };
 
+        // The program's output: maintained from the previous generation when
+        // the window since it only inserted facts the program can fold in,
+        // otherwise computed in full.
+        let window = match &previous {
+            Some(prev) => Some(
+                window_changes(
+                    branch_store.as_ref(),
+                    &basis.commit,
+                    prev.manifest.basis.t,
+                    &db,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let incremental = match (&previous, &window) {
+            (Some(prev), Some(window)) => {
+                self.incremental_closure(
+                    &record,
+                    &index_store,
+                    prev,
+                    window,
+                    &db,
+                    &executable.reasoning,
+                )
+                .await?
+            }
+            _ => None,
+        };
+        let closure = if incremental.is_some() {
+            ClosureMode::Incremental
+        } else {
+            ClosureMode::Full
+        };
+        let derived = match incremental {
+            Some(derived) => derived,
+            None => self.complete_closure(&db, &executable.reasoning).await,
+        };
+        let derived = match derived {
+            Ok(Ok(derived)) => derived,
+            Ok(Err(reason)) => return Ok(RefreshOutcome::Failed { reason }),
+            Err(e) => {
+                return Ok(RefreshOutcome::Failed {
+                    reason: e.to_string(),
+                })
+            }
+        };
+        let derived_total = derived.len() as u64;
+        let derived_only = asserted_filter(&db, derived, false).await?;
+        if program::serves_rewrites(&executable.reasoning) {
+            if let Some(p) = derived_hierarchy_edge(&derived_only) {
+                return Ok(RefreshOutcome::Failed {
+                    reason: format!(
+                        "the program derives {p} facts, which query-time rdfs and owl2ql \
+                         rewriting does not read; an index would answer differently"
+                    ),
+                });
+            }
+        }
+
         let graph_sids = graph_sids(&db);
         let to_flake = |(g_id, mut flake): (GraphId, Flake), op: bool| {
             flake.g = graph_sids.get(&g_id).cloned().flatten();
@@ -511,6 +551,7 @@ impl Fluree {
             });
         };
         // A logical fold the indexer cannot apply is redone as a rebuild.
+        let no_retractions = HashSet::new();
         let mut previous = previous;
         let (kind, built, stats_added, stats_removed) = loop {
             let (kind, fold, stats_added, stats_removed) = match &previous {
@@ -524,13 +565,7 @@ impl Fluree {
                     (GenerationKind::Rebuild, asserts, n, 0)
                 }
                 Some(prev) => {
-                    let retracted = window_retractions(
-                        branch_store.as_ref(),
-                        &basis.commit,
-                        prev.manifest.basis.t,
-                        &db,
-                    )
-                    .await?;
+                    let retracted = window.as_ref().map_or(&no_retractions, |w| &w.retracted);
                     let mut fold = Vec::new();
                     for fact in &derived_only {
                         if !prev.derived.contains(fact) || retracted.contains(fact) {
@@ -621,6 +656,7 @@ impl Fluree {
             derived_total,
             added: stats_added,
             removed: stats_removed,
+            closure,
         };
         let candidate = Candidate {
             index_id: index_id.clone(),
@@ -771,35 +807,88 @@ impl Fluree {
             },
         )
         .await?;
-        if let Some(reason) = outcome.failed {
-            return Ok(Err(reason));
+        Ok(outcome_facts(outcome))
+    }
+
+    /// The program's output at the branch head, maintained from `prev`: its
+    /// derived-only set plus what the window's insertions add to the
+    /// closure. `None` when the program or the window rules that out, and
+    /// the output is computed in full instead:
+    ///
+    /// - the program is not OWL 2 RL alone, or uses the identity rules or
+    ///   `owl:sameAs`, whose state a delta alone cannot rebuild (P11b);
+    /// - a window commit retracted anything (P11b);
+    /// - a window commit inserted vocabulary a program reads as definition
+    ///   rather than data: RDFS or OWL terms, or RDF lists.
+    async fn incremental_closure(
+        &self,
+        record: &NsRecord,
+        index_store: &Arc<dyn ContentStore>,
+        prev: &Previous,
+        window: &Window,
+        db: &GraphDb,
+        reasoning: &fluree_db_query::ir::ReasoningConfig,
+    ) -> Result<Option<Result<std::result::Result<Vec<(GraphId, Flake)>, String>>>> {
+        let modes = &reasoning.modes;
+        if !modes.owl2rl || modes.datalog || modes.owl_datalog || modes.has_rules() {
+            return Ok(None);
         }
-        if let Some(diag) = outcome.diagnostics.as_ref().filter(|d| d.capped) {
-            return Ok(Err(format!(
-                "the closure was capped ({}); raise the program's reasoningBudget",
-                diag.capped_reason.as_deref().unwrap_or("budget")
-            )));
+        if !window.retracted.is_empty() || window.inserted.iter().any(|(_, f)| defines_program(f)) {
+            return Ok(None);
         }
-        let mut out = Vec::new();
-        if let Some(overlay) = &outcome.overlay {
-            let graphs: Vec<GraphId> = overlay.graph_ids().collect();
-            for g_id in graphs {
-                overlay.for_each_overlay_flake(
-                    g_id,
-                    IndexType::Spot,
-                    None,
-                    None,
-                    true,
-                    i64::MAX,
-                    &mut |flake| {
-                        if flake.op {
-                            out.push((g_id, flake.clone()));
-                        }
-                    },
-                );
-            }
-        }
-        Ok(Ok(out))
+        let inserted: Vec<Flake> = window
+            .inserted
+            .iter()
+            .filter(|(g_id, _)| *g_id == db.graph_id)
+            .map(|(_, flake)| flake.clone())
+            .collect();
+        // The closed state: the predecessor's index, with every commit since
+        // its basis replayed over it.
+        let state = self
+            .load_index_state(
+                Arc::clone(index_store),
+                record,
+                &prev.manifest.root,
+                prev.manifest.basis.t,
+            )
+            .await?;
+        let mut closed = GraphDb::from_ledger_state(&state);
+        closed.graph_id = db.graph_id;
+        let closed_ref = closed.as_graph_db_ref();
+        let schema = reasoning
+            .schema_bundle
+            .as_ref()
+            .filter(|bundle| !bundle.is_empty())
+            .map(|bundle| SchemaBundleOverlay::new(closed_ref.overlay, bundle.clone()));
+        let overlay: &dyn OverlayProvider = schema
+            .as_ref()
+            .map_or(closed_ref.overlay, |o| o as &dyn OverlayProvider);
+        let base = fluree_db_core::GraphDbRef::new(
+            closed_ref.snapshot,
+            closed_ref.g_id,
+            overlay,
+            closed_ref.t,
+        );
+        let outcome = match compute_derived_facts_incremental(
+            base,
+            modes,
+            &inserted,
+            QueryRequest {
+                tracker: None,
+                cancellation: None,
+            },
+        )
+        .await
+        {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Ok(None),
+            Err(e) => return Ok(Some(Err(e.into()))),
+        };
+        Ok(Some(Ok(outcome_facts(outcome).map(|gained| {
+            let mut all: Vec<(GraphId, Flake)> = prev.derived.iter().cloned().collect();
+            all.extend(gained);
+            all
+        }))))
     }
 
     /// Publish `manifest` as `candidate`'s generation: admit it against the
@@ -974,17 +1063,25 @@ async fn asserted_filter(
     Ok(out)
 }
 
-/// Facts a commit in `(after_t, head]` retracted, by graph.
-async fn window_retractions(
+/// What the commits in `(after_t, head]` asserted and retracted, by graph.
+struct Window {
+    inserted: Vec<(GraphId, Flake)>,
+    retracted: HashSet<(GraphId, Flake)>,
+}
+
+async fn window_changes(
     store: &dyn ContentStore,
     head: &ContentId,
     after_t: i64,
     db: &GraphDb,
-) -> Result<HashSet<(GraphId, Flake)>> {
+) -> Result<Window> {
     let commits = fluree_db_core::collect_first_parent_cids(store, head, after_t)
         .await
         .map_err(|e| ApiError::internal(format!("walk commits: {e}")))?;
-    let mut out = HashSet::new();
+    let mut window = Window {
+        inserted: Vec::new(),
+        retracted: HashSet::new(),
+    };
     for (_, cid) in commits {
         let bytes = store
             .get(&cid)
@@ -992,8 +1089,71 @@ async fn window_retractions(
             .map_err(|e| ApiError::internal(format!("read commit {cid}: {e}")))?;
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| ApiError::internal(format!("decode commit {cid}: {e}")))?;
-        for flake in commit.flakes.into_iter().filter(|f| !f.op) {
-            out.insert((graph_of(db, flake.g.as_ref()), flake));
+        for flake in commit.flakes {
+            let fact = (graph_of(db, flake.g.as_ref()), flake);
+            if fact.1.op {
+                window.inserted.push(fact);
+            } else {
+                window.retracted.insert(fact);
+            }
+        }
+    }
+    Ok(window)
+}
+
+/// Whether an asserted fact can change what an OWL 2 RL program is, rather
+/// than only what it reads: an RDFS or OWL term as its predicate or its
+/// type, or an RDF list cell, which axioms are built from.
+fn defines_program(flake: &Flake) -> bool {
+    use fluree_vocab::namespaces::{OWL, RDF, RDFS};
+    let p = &flake.p;
+    if p.namespace_code == RDFS || p.namespace_code == OWL {
+        return true;
+    }
+    if p.namespace_code == RDF {
+        if matches!(p.name.as_ref(), "first" | "rest") {
+            return true;
+        }
+        if p.name.as_ref() == "type" {
+            if let fluree_db_core::FlakeValue::Ref(class) = &flake.o {
+                return class.namespace_code == RDFS || class.namespace_code == OWL;
+            }
+        }
+    }
+    false
+}
+
+/// The facts a derived-facts outcome holds, by graph, or why it does not
+/// hold the program's whole output.
+fn outcome_facts(
+    outcome: fluree_db_query::execute::DerivedFactsOutcome,
+) -> std::result::Result<Vec<(GraphId, Flake)>, String> {
+    if let Some(reason) = outcome.failed {
+        return Err(reason);
+    }
+    if let Some(diag) = outcome.diagnostics.as_ref().filter(|d| d.capped) {
+        return Err(format!(
+            "the closure was capped ({}); raise the program's reasoningBudget",
+            diag.capped_reason.as_deref().unwrap_or("budget")
+        ));
+    }
+    let mut out = Vec::new();
+    if let Some(overlay) = &outcome.overlay {
+        let graphs: Vec<GraphId> = overlay.graph_ids().collect();
+        for g_id in graphs {
+            overlay.for_each_overlay_flake(
+                g_id,
+                IndexType::Spot,
+                None,
+                None,
+                true,
+                i64::MAX,
+                &mut |flake| {
+                    if flake.op {
+                        out.push((g_id, flake.clone()));
+                    }
+                },
+            );
         }
     }
     Ok(out)
@@ -1057,6 +1217,194 @@ mod tests {
 
     use super::RefreshOutcome;
     use crate::reasoning_index::PauseSeam;
+    use crate::Fluree;
+    use fluree_db_core::reasoning_index::{ClosureMode, ReasoningIndexId, ReasoningManifest};
+    use fluree_db_core::{ContentStore, Flake, Sid};
+    use std::collections::HashSet;
+
+    /// The persisted derived-only set of the index's head generation, with
+    /// each fact's graph.
+    async fn persisted_derived(
+        fluree: &Fluree,
+        id: &str,
+        index: &ReasoningIndexId,
+    ) -> HashSet<(Option<Sid>, Flake)> {
+        let doc = fluree.reasoning_indexes(id).await.unwrap();
+        let head = doc.indexes[index].head.clone().expect("published");
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.index_store(&record, index).await.unwrap();
+        let manifest =
+            ReasoningManifest::decode(&store.get(&head.manifest).await.unwrap()).unwrap();
+        super::read_derived_only(store.as_ref(), &manifest.derived)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.g.clone(), f))
+            .collect()
+    }
+
+    /// The derived-only set a full recompute of `program` gives at the
+    /// branch head: the oracle an incremental generation must equal.
+    async fn full_derived(
+        fluree: &Fluree,
+        id: &str,
+        program: &serde_json::Value,
+    ) -> HashSet<(Option<Sid>, Flake)> {
+        let db = fluree.db(id).await.unwrap();
+        let (_, parsed) = crate::query::helpers::parse_jsonld_query(
+            &super::program::settling_query(&super::program::canonical_program(program).unwrap()),
+            &db.snapshot,
+            db.default_context.as_ref(),
+            None,
+        )
+        .unwrap();
+        let executable = fluree
+            .build_executable_for_view(&db, &parsed, None)
+            .await
+            .unwrap();
+        let derived = fluree
+            .complete_closure(&db, &executable.reasoning)
+            .await
+            .unwrap()
+            .unwrap();
+        let graph_sids = super::graph_sids(&db);
+        super::asserted_filter(&db, derived, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(g_id, f)| (graph_sids.get(&g_id).cloned().flatten(), f))
+            .collect()
+    }
+
+    /// A small deterministic generator, so a failing sequence replays.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    /// Incremental OWL 2 RL maintenance under random insertions equals a
+    /// full recompute at every step, over an ontology that exercises the
+    /// property, class, restriction and chain rules.
+    #[tokio::test]
+    async fn incremental_generations_equal_a_full_recompute() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/incremental-oracle:main";
+        let ctx = json!({
+            "ex": "http://example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        });
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let mut ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@graph": [
+                    {"@id": "ex:GradStudent", "rdfs:subClassOf": {"@id": "ex:Student"}},
+                    {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                    {"@id": "ex:advisor", "rdfs:subPropertyOf": {"@id": "ex:knows"}},
+                    {"@id": "ex:knows", "@type": "owl:SymmetricProperty"},
+                    {"@id": "ex:partOf", "@type": "owl:TransitiveProperty"},
+                    {"@id": "ex:hasMember", "owl:inverseOf": {"@id": "ex:memberOf"}},
+                    {"@id": "ex:teaches", "rdfs:domain": {"@id": "ex:Faculty"},
+                     "rdfs:range": {"@id": "ex:Course"}},
+                    {"@id": "ex:Employee", "owl:equivalentClass": {"@id": "ex:WorksSomewhere"}},
+                    {"@id": "ex:WorksSomewhere", "@type": "owl:Restriction",
+                     "owl:onProperty": {"@id": "ex:worksFor"},
+                     "owl:someValuesFrom": {"@id": "ex:Org"}},
+                    {"@id": "ex:CsMember", "owl:equivalentClass": {"@id": "ex:InCs"}},
+                    {"@id": "ex:InCs", "@type": "owl:Restriction",
+                     "owl:onProperty": {"@id": "ex:memberOf"},
+                     "owl:hasValue": {"@id": "ex:cs"}},
+                    {"@id": "ex:Club", "rdfs:subClassOf": {"@id": "ex:OnlyPeople"}},
+                    {"@id": "ex:OnlyPeople", "@type": "owl:Restriction",
+                     "owl:onProperty": {"@id": "ex:hasMember"},
+                     "owl:allValuesFrom": {"@id": "ex:Person"}},
+                    {"@id": "ex:Chair", "owl:equivalentClass": {"@id": "ex:PersonHeading"}},
+                    {"@id": "ex:PersonHeading",
+                     "owl:intersectionOf": {"@list": [{"@id": "ex:Person"}, {"@id": "ex:HeadsDept"}]}},
+                    {"@id": "ex:HeadsDept", "@type": "owl:Restriction",
+                     "owl:onProperty": {"@id": "ex:headOf"},
+                     "owl:someValuesFrom": {"@id": "ex:Dept"}},
+                    {"@id": "ex:Agent",
+                     "owl:unionOf": {"@list": [{"@id": "ex:Person"}, {"@id": "ex:Org"}]}},
+                    {"@id": "ex:grandparent",
+                     "owl:propertyChainAxiom": {"@list": [{"@id": "ex:parent"}, {"@id": "ex:parent"}]}},
+                    {"@id": "ex:e0", "@type": "ex:GradStudent"}
+                ]}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        let program = json!({"reasoning": "owl2rl"});
+        let index = fluree.register_reasoning_index(id, &program).await.unwrap();
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+
+        let classes = [
+            "ex:Student",
+            "ex:GradStudent",
+            "ex:Person",
+            "ex:Org",
+            "ex:Dept",
+            "ex:Club",
+        ];
+        let properties = [
+            "ex:advisor",
+            "ex:partOf",
+            "ex:memberOf",
+            "ex:hasMember",
+            "ex:teaches",
+            "ex:worksFor",
+            "ex:headOf",
+            "ex:parent",
+            "ex:knows",
+        ];
+        let mut rng = Lcg(0x5eed);
+        for step in 0..24 {
+            let mut facts = Vec::new();
+            for _ in 0..8 {
+                let s = format!("ex:e{}", rng.next(12));
+                if rng.next(3) == 0 {
+                    facts.push(json!({"@id": s, "@type": classes[rng.next(classes.len())]}));
+                } else {
+                    let o = if rng.next(5) == 0 {
+                        "ex:cs".to_string()
+                    } else {
+                        format!("ex:e{}", rng.next(12))
+                    };
+                    facts.push(
+                        json!({"@id": s, properties[rng.next(properties.len())]: {"@id": o}}),
+                    );
+                }
+            }
+            ledger = fluree
+                .insert(ledger, &json!({"@context": ctx, "@graph": facts}))
+                .await
+                .unwrap()
+                .ledger;
+            match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
+                RefreshOutcome::Published { stats, .. } => {
+                    assert_eq!(stats.closure, ClosureMode::Incremental, "step {step}");
+                }
+                other => panic!("step {step}: {other:?}"),
+            }
+            let persisted = persisted_derived(&fluree, id, &index).await;
+            let full = full_derived(&fluree, id, &program).await;
+            assert_eq!(
+                persisted.len(),
+                full.len(),
+                "step {step}: only incremental {:?}, only full {:?}",
+                persisted.difference(&full).collect::<Vec<_>>(),
+                full.difference(&persisted).collect::<Vec<_>>()
+            );
+            assert_eq!(persisted, full, "step {step}");
+        }
+    }
 
     /// A sweep that starts while an index build has written its files and not
     /// yet published them waits for the build, so what it publishes is

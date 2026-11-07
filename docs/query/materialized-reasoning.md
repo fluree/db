@@ -62,8 +62,17 @@ one after each commit. Every minute it also checks each index against what its
 program settles to now: a schema or rules source in another ledger can change
 without the branch moving, and the index is then rebuilt at the same commit.
 Until it is, queries no longer match it and reason at query time. A refresh
-that finds a storage sweep of the ledger running defers to the next one. To
-refresh now:
+that finds a storage sweep of the ledger running defers to the next one.
+
+A new generation of an OWL 2 RL program is computed from its predecessor
+when the commits since only inserted data: only what those facts add to the
+closure is derived. The closure is computed in full instead for the first
+generation, after a retraction, when a commit inserted RDFS or OWL
+vocabulary or RDF lists (which can change the program itself), for programs
+with datalog rules, and for programs using `owl:sameAs` or the rules that
+derive it (functional, inverse-functional and key properties, maximum
+cardinality). A refresh reports which it did as `stats.closure` (`full` or
+`incremental`). To refresh now:
 
 ```bash
 curl -X POST http://localhost:8090/v1/fluree/reasoning-indexes/refresh \
