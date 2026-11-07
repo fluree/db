@@ -3343,6 +3343,16 @@ impl<'a> ImportBuilder<'a> {
 
     /// Execute the bulk import pipeline.
     pub async fn execute(self) -> std::result::Result<ImportResult, ImportError> {
+        // An import moves its ledger's heads itself, outside the branch's
+        // replicated write queue: a cluster member has no way to order it
+        // with the cluster's writes, its erasures or its collection.
+        #[cfg(feature = "native")]
+        if self.fluree.collected_by_cluster() {
+            return Err(ImportError::Refused(String::from(
+                "bulk import is not supported on a Raft cluster member: it moves the \
+                 ledger's heads outside the replicated write queue; restore a .flpack instead",
+            )));
+        }
         let storage = self
             .fluree
             .backend()
@@ -3834,6 +3844,14 @@ where
                     )
                 }
             },
+        };
+        // Garbage collection stays out of the ledger's storage until a
+        // published head names the commits this stores: an empty ledger's
+        // folders are collected like any other. An import into a graph holds
+        // it itself, through its own publish.
+        let _uncollected = match (seed, storage.blob_pins()) {
+            (None, Some(pins)) => Some(pins.hold_root(namespace.root()).await),
+            _ => None,
         };
 
         // ---- Set up session directory for runs/indexes ----
