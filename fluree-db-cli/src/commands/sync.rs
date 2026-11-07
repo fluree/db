@@ -757,20 +757,32 @@ async fn send_push(
     client
         .push_commits(remote_ledger_id, req)
         .await
-        .map_err(|e| match e {
-            // The remote advertised `push-merges`, so a 404 there most likely
-            // came from a node that has not been upgraded yet.
-            crate::remote_client::RemoteLedgerError::NotFound(msg)
-                if !req.merged_commits.is_empty() =>
-            {
-                CliError::Config(format!(
-                    "push failed: the remote answered 404 for a push containing a merge \
-                     ({msg}). It advertises support for such pushes. A node serving the \
-                     request may still run an earlier release."
-                ))
-            }
-            e => CliError::Config(format!("push failed: {e}")),
-        })
+        .map_err(|e| push_failure(e, !req.merged_commits.is_empty()))
+}
+
+/// The error a failed push reports, naming the cause where an earlier
+/// release on the remote is the likely one.
+fn push_failure(e: crate::remote_client::RemoteLedgerError, carries_merges: bool) -> CliError {
+    use crate::remote_client::RemoteLedgerError;
+    match e {
+        // The remote advertised `push-merges`, so a 404 there most likely
+        // came from a node that has not been upgraded yet.
+        RemoteLedgerError::NotFound(msg) if carries_merges => CliError::Config(format!(
+            "push failed: the remote answered 404 for a push containing a merge ({msg}). It \
+             advertises support for such pushes. A node serving the request may still run an \
+             earlier release."
+        )),
+        // A release refuses a commit flag it predates. A graph drop (0x20)
+        // is the one a push carries.
+        RemoteLedgerError::ValidationError(msg) if msg.contains("unknown envelope flags") => {
+            CliError::Config(format!(
+                "push failed: the remote cannot read these commits ({msg}). A commit that drops \
+                 a graph needs a remote on a release that supports graph drops; upgrade the \
+                 remote, then push again."
+            ))
+        }
+        e => CliError::Config(format!("push failed: {e}")),
+    }
 }
 
 /// Push a ledger to its upstream remote
@@ -2127,6 +2139,26 @@ mod tests {
     use super::*;
     use fluree_db_api::{Base64Bytes, ExportCommitsResponse};
     use fluree_db_core::{Commit, ContentId, ContentKind};
+
+    /// A remote on a release that predates graph drops refuses the commit
+    /// flag; the push names that as the cause. Other refusals pass through.
+    #[test]
+    fn a_push_refused_for_an_unknown_commit_flag_names_the_remote_release() {
+        use crate::remote_client::RemoteLedgerError;
+        let refused = RemoteLedgerError::ValidationError(
+            "invalid commit[0]: invalid commit: unknown envelope flags: 0x20".to_string(),
+        );
+        let message = push_failure(refused, false).to_string();
+        assert!(
+            message.contains("unknown envelope flags: 0x20"),
+            "{message}"
+        );
+        assert!(message.contains("upgrade the remote"), "{message}");
+
+        let other = RemoteLedgerError::ValidationError("retraction of absent fact".to_string());
+        let message = push_failure(other, false).to_string();
+        assert!(!message.contains("upgrade"), "{message}");
+    }
 
     /// Commit bytes at `t`, distinct per `tag`.
     fn commit(t: i64, tag: &str) -> Base64Bytes {
