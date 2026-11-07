@@ -122,6 +122,10 @@ pub struct GraphDb {
     /// ([`LedgerState::instance_bits`]), which tells a ledger from one
     /// dropped before it under the same name; `0` when unknown.
     pub(crate) instance_bits: u128,
+    /// The commit whose state this view is, exactly: set for a branch's
+    /// state at its head, `None` for a staged, historical or assembled
+    /// view. A reasoned head answers only a view it names.
+    pub(crate) commit_id: Option<fluree_db_core::ContentId>,
 
     /// Graph ID within the ledger (0 = default graph).
     ///
@@ -308,6 +312,7 @@ impl GraphDb {
             t,
             ledger_id: ledger_id.into(),
             instance_bits: 0,
+            commit_id: None,
             graph_id: 0,
             policy: None,
             policy_enforcer: None,
@@ -355,6 +360,7 @@ impl GraphDb {
             ledger.ledger_id(),
         );
         gdb.instance_bits = ledger.instance_bits();
+        gdb.commit_id = ledger.head_commit_id.clone();
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
         // Extract binary_store from LedgerState's TypeErasedStore

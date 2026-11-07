@@ -381,6 +381,12 @@ pub async fn prepare_execution_with_config(
             // `exact` asks for the complete answer: a capped closure is an
             // error, not a result.
             if reasoning.freshness == crate::ir::ReasoningFreshness::Exact {
+                if let Some(reason) = &derived_outcome.failed {
+                    return Err(crate::error::QueryError::Internal(format!(
+                        "{reason}, and the query asked for an exact answer \
+                         (reasoningFreshness \"exact\")"
+                    )));
+                }
                 if let Some(diag) = derived_outcome.diagnostics.as_ref().filter(|d| d.capped) {
                     return Err(crate::error::QueryError::ResourceLimit(format!(
                         "reasoning was capped ({}) and the query asked for an exact answer \

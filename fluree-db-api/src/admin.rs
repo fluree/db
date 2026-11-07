@@ -3167,10 +3167,15 @@ impl crate::Fluree {
         ledger_name: &LedgerName,
     ) -> Result<(
         Vec<MaintenanceGuard>,
+        crate::reasoned::SweepHold<'_>,
         Vec<BranchIndexHead>,
         StorageRoot,
         Vec<StorageNamespace>,
     )> {
+        // Reasoned-head builds write outside the indexer, so they are held
+        // off here: one with files written and not yet published would see
+        // them reclaimed under it.
+        let heads_hold = self.reasoned.hold_for_sweep(ledger_name.as_str()).await;
         let all = self.nameservice().all_records().await?;
         let records: Vec<_> = all
             .iter()
@@ -3223,7 +3228,7 @@ impl crate::Fluree {
         .map_err(|e| ApiError::internal(format!("read reasoned heads for the sweep: {e}")))?;
         branches.extend(heads);
 
-        Ok((guards, branches, root, nested))
+        Ok((guards, heads_hold, branches, root, nested))
     }
 
     /// The storage a sweep enumerates and deletes through.
@@ -3248,7 +3253,7 @@ impl crate::Fluree {
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, branches, root, nested) =
+        let (_guards, _heads_hold, branches, root, nested) =
             self.hold_ledger_for_maintenance(&ledger_name).await?;
         Ok(plan_sweep(&storage, &self.backend, &root, &branches, &nested).await?)
     }
@@ -3263,7 +3268,7 @@ impl crate::Fluree {
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, branches, root, nested) =
+        let (_guards, _heads_hold, branches, root, nested) =
             self.hold_ledger_for_maintenance(&ledger_name).await?;
 
         let plan = plan_sweep(&storage, &self.backend, &root, &branches, &nested).await?;

@@ -79,6 +79,69 @@ pub(crate) struct HeadState {
     /// nameservice each time. A registration here clears its ledger at once;
     /// one made elsewhere is seen within [`NO_HEADS_TTL`].
     no_heads: Mutex<HashMap<String, std::time::Instant>>,
+    /// Head builds writing files, and sweeps holding them off, by ledger
+    /// name. See [`HeadState::begin_write`].
+    writes: Mutex<HeadWrites>,
+    writes_changed: tokio::sync::Notify,
+    /// Pauses a refresh after it has written its files and before it
+    /// publishes them.
+    #[cfg(test)]
+    pub(crate) before_publish: Mutex<Option<Arc<PauseSeam>>>,
+}
+
+#[derive(Default)]
+struct HeadWrites {
+    building: HashMap<String, usize>,
+    sweeping: HashMap<String, usize>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PauseSeam {
+    pub reached: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+}
+
+/// A head build writing files under a ledger; the ledger's sweeps wait for
+/// it to drop.
+pub(crate) struct HeadWrite<'a> {
+    state: &'a HeadState,
+    ledger_name: String,
+}
+
+impl Drop for HeadWrite<'_> {
+    fn drop(&mut self) {
+        let mut writes = self.state.writes.lock();
+        if let Some(n) = writes.building.get_mut(&self.ledger_name) {
+            *n -= 1;
+            if *n == 0 {
+                writes.building.remove(&self.ledger_name);
+            }
+        }
+        drop(writes);
+        self.state.writes_changed.notify_waiters();
+    }
+}
+
+/// A sweep of a ledger: no head build of the ledger starts writing until it
+/// drops.
+pub(crate) struct SweepHold<'a> {
+    state: &'a HeadState,
+    ledger_name: String,
+}
+
+impl Drop for SweepHold<'_> {
+    fn drop(&mut self) {
+        let mut writes = self.state.writes.lock();
+        if let Some(n) = writes.sweeping.get_mut(&self.ledger_name) {
+            *n -= 1;
+            if *n == 0 {
+                writes.sweeping.remove(&self.ledger_name);
+            }
+        }
+        drop(writes);
+        self.state.writes_changed.notify_waiters();
+    }
 }
 
 /// How long an empty heads document is trusted without re-reading.
@@ -155,6 +218,45 @@ impl HeadState {
             .lock()
             .insert(key.clone())
             .then_some(Flight { state: self, key })
+    }
+
+    /// Start writing a generation's files under `ledger_name`, or `None`
+    /// while a sweep of the ledger runs. A sweep reclaims every file no
+    /// published generation references, so it must not plan while a build
+    /// has files written and not yet published.
+    pub(crate) fn begin_write(&self, ledger_name: &str) -> Option<HeadWrite<'_>> {
+        let mut writes = self.writes.lock();
+        if writes.sweeping.contains_key(ledger_name) {
+            return None;
+        }
+        *writes.building.entry(ledger_name.to_string()).or_default() += 1;
+        Some(HeadWrite {
+            state: self,
+            ledger_name: ledger_name.to_string(),
+        })
+    }
+
+    /// Hold head builds of `ledger_name` off for a sweep, once those already
+    /// writing have published or given up.
+    pub(crate) async fn hold_for_sweep(&self, ledger_name: &str) -> SweepHold<'_> {
+        *self
+            .writes
+            .lock()
+            .sweeping
+            .entry(ledger_name.to_string())
+            .or_default() += 1;
+        let hold = SweepHold {
+            state: self,
+            ledger_name: ledger_name.to_string(),
+        };
+        loop {
+            // Created before the check, so a drop in between still wakes it.
+            let changed = self.writes_changed.notified();
+            if !self.writes.lock().building.contains_key(ledger_name) {
+                return hold;
+            }
+            changed.await;
+        }
     }
 
     pub(crate) fn forget_head(&self, ledger_id: &str, head_id: &HeadId) {

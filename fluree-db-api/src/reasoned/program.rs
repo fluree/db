@@ -167,6 +167,33 @@ pub(crate) fn materializes(reasoning: &ReasoningConfig) -> bool {
     modes.owl2rl || modes.owl_datalog || modes.datalog || !modes.rules.is_empty()
 }
 
+/// Whether a query served from a head under this settled reasoning still
+/// rewrites its patterns. `rdfs` and `owl2ql` widen the query rather than
+/// materialize, so a head cannot hold what they add; OWL 2 RL
+/// materializes all of it, and the rewrite steps aside when it runs.
+pub(crate) fn serves_rewrites(reasoning: &ReasoningConfig) -> bool {
+    let modes = &reasoning.modes;
+    !modes.owl2rl && (modes.rdfs || modes.owl2ql)
+}
+
+/// The reasoning a query runs with against a head: the settled reasoning
+/// without what the head materialized.
+pub(crate) fn served_reasoning(settled: &ReasoningConfig) -> ReasoningConfig {
+    if !serves_rewrites(settled) {
+        return ReasoningConfig {
+            modes: fluree_db_query::ir::ReasoningModes::none(),
+            ..Default::default()
+        };
+    }
+    let mut served = settled.clone();
+    let modes = &mut served.modes;
+    modes.datalog = false;
+    modes.owl_datalog = false;
+    modes.rules.clear();
+    served.rules_source_g_id = None;
+    served
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,7 +46,12 @@ let head = fluree
 ```
 
 The server's background worker fills the head and refreshes it after each
-commit. To refresh now:
+commit, and every minute checks each head against what its program settles
+to now: a schema or rules source in another ledger can change without the
+branch moving, and the head is then rebuilt at the same commit. Until it
+is, queries no longer match it and reason at query time. A refresh that
+finds a storage sweep of the ledger running defers to the next one. To
+refresh now:
 
 ```bash
 curl -X POST http://localhost:8090/v1/fluree/reasoned-heads/refresh \
@@ -66,9 +71,23 @@ A query is answered from a head when all of these hold:
   sources and schema the same way the head's program was, is the same
   reasoning — modes, rules, ontology, evaluation time and reasoned graph;
 - the head's current generation was computed at exactly the commit the query
-  reads;
+  reads, and the query reads the branch's committed state at that commit. A
+  staged (uncommitted) view, or a time-travel view of an earlier commit,
+  reasons at query time; time travel to the current `t` is served;
 - the query runs without a restricting policy (a head is computed without
   policy, so a policy-restricted view always reasons at query time).
+
+`rdfs` and `owl2ql` widen a query's patterns rather than materialize facts,
+so a head holds only what the program's other modes derive. A query that
+mixes them, such as `["rdfs", "datalog"]`, is served with the rewrite still
+applied over the head. Query-time `rdfs` reads the class and property
+hierarchy from asserted facts only, so a program that derives
+`rdfs:subClassOf` or `rdfs:subPropertyOf` facts under `rdfs` or `owl2ql`
+(without `owl2rl`) publishes nothing.
+
+A head publishes only a complete result. A program whose closure hits its
+budget, or whose OWL 2 RL pass fails, publishes nothing, and the refresh
+reports why.
 
 An instance that has found a ledger with no heads does not look again for 30
 seconds, so a head registered through another server instance starts
@@ -100,7 +119,7 @@ what may answer:
 | `default` | A head at exactly the queried commit; query-time reasoning otherwise. |
 | `exact` | As `default`, but a query-time run that hits a budget is an error rather than a capped result. |
 | `strict` | Only a head at exactly the queried commit. Waits briefly for one, then fails (408). Never reasons at query time. |
-| `asOf` | The newest head generation at or before the queried commit. The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none. |
+| `asOf` | For a query of the branch's current state, the newest head generation at or before its commit. The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none. |
 
 ## Storage and retention
 

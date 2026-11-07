@@ -1592,7 +1592,12 @@ impl Fluree {
             .default
             .iter()
             .chain(dataset.named.values())
-            .all(|v| v.ledger_id == primary.ledger_id && v.t == primary.t);
+            .all(|v| {
+                v.ledger_id == primary.ledger_id
+                    && v.t == primary.t
+                    && v.commit_id == primary.commit_id
+                    && v.instance_bits == primary.instance_bits
+            });
         if dataset.is_history_mode() || !within_ledger {
             if executable.reasoning.modes.freshness
                 == fluree_db_query::ir::ReasoningFreshness::Strict
@@ -1616,10 +1621,7 @@ impl Fluree {
         for view in swapped.default.iter_mut().chain(swapped.named.values_mut()) {
             *view = crate::reasoned::serve::head_view(view, state);
         }
-        executable.reasoning = fluree_db_query::ir::ReasoningConfig {
-            modes: fluree_db_query::ir::ReasoningModes::none(),
-            ..Default::default()
-        };
+        executable.reasoning = crate::reasoned::program::served_reasoning(&executable.reasoning);
         record_served(tracker, served.tally);
         Ok(Some(swapped))
     }
@@ -1636,10 +1638,7 @@ impl Fluree {
         let Some(served) = self.reasoned_head_for(db, &executable.reasoning).await? else {
             return Ok(None);
         };
-        executable.reasoning = fluree_db_query::ir::ReasoningConfig {
-            modes: fluree_db_query::ir::ReasoningModes::none(),
-            ..Default::default()
-        };
+        executable.reasoning = crate::reasoned::program::served_reasoning(&executable.reasoning);
         record_served(tracker, served.tally);
         Ok(Some(served.view))
     }

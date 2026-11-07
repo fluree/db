@@ -99,6 +99,10 @@ pub struct DerivedFactsOutcome {
     /// were configured. Datalog-only reasoning reports its own tally here;
     /// also f:reasoningMaxMemoryMb, which the ledger-config list below omits.
     pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// Why a requested materialization did not complete, when reasoning
+    /// went on without it: an OWL 2 RL pass that failed under a positive
+    /// datalog program, which still derives what it can.
+    pub failed: Option<String>,
 }
 
 /// `rdfs` and `owl2ql` widen the query's own patterns, and rule bodies run
@@ -195,6 +199,7 @@ pub async fn compute_derived_facts(
             return Ok(DerivedFactsOutcome {
                 overlay: (!cached.overlay.is_empty()).then(|| cached.overlay.clone()),
                 diagnostics: Some(cached.diagnostics.clone()),
+                failed: None,
             });
         }
         (Some(rule_set), key)
@@ -211,7 +216,7 @@ pub async fn compute_derived_facts(
     let mut owl_overlay: Option<Arc<fluree_db_reasoner::DerivedFactsOverlay>> = None;
     // Set when an OWL pass was requested and failed; the combined cache entry
     // is keyed as if OWL had run, so it must not be written in that case.
-    let mut owl_failed = false;
+    let mut owl_failed = None;
     let mut diagnostics = None;
 
     // OWL2-RL materialization
@@ -283,6 +288,7 @@ pub async fn compute_derived_facts(
                     return Ok(DerivedFactsOutcome {
                         overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
                         diagnostics,
+                        failed: None,
                     });
                 }
 
@@ -330,7 +336,7 @@ pub async fn compute_derived_facts(
                 // signal, until the next commit or an eviction — so one
                 // transient storage error during ontology extraction would
                 // persist as quiet under-derivation.
-                owl_failed = true;
+                owl_failed = Some(format!("OWL 2 RL materialization failed: {e}"));
             }
         }
     }
@@ -432,7 +438,7 @@ pub async fn compute_derived_facts(
     let capped_by_clock = diagnostics
         .as_ref()
         .is_some_and(|d| d.capped_reason.as_deref() == Some("time"));
-    if let Some(key) = datalog_key.filter(|_| !owl_failed && !capped_by_clock) {
+    if let Some(key) = datalog_key.filter(|_| owl_failed.is_none() && !capped_by_clock) {
         cache.insert(
             key,
             Arc::new(ReasoningResult {
@@ -444,6 +450,7 @@ pub async fn compute_derived_facts(
     Ok(DerivedFactsOutcome {
         overlay: (!derived_overlay.is_empty()).then(|| derived_overlay.clone()),
         diagnostics,
+        failed: owl_failed,
     })
 }
 

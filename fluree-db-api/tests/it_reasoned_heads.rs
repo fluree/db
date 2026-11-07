@@ -1572,3 +1572,311 @@ async fn a_branch_refuses_more_active_heads_than_its_limit() {
         .unwrap_err();
     assert!(err.to_string().contains("active reasoned heads"), "{err}");
 }
+
+/// A staged view is answered from its own state, never from a head, even
+/// one published at the `t` its transaction would commit at.
+#[tokio::test]
+async fn a_staged_view_is_never_served_from_a_head() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/staged:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"},
+                {"@id": "ex:bob", "@type": "ex:Person"}
+            ]
+        }),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+
+    let staged = fluree
+        .stage_owned(ledger)
+        .insert(&json!({"@context": ctx(), "@id": "ex:staged", "@type": "ex:Student"}))
+        .stage()
+        .await
+        .unwrap();
+    let preview = fluree_db_api::GraphDb::from_staged(&staged).unwrap();
+    let preview_rows = || async {
+        let result = fluree.query(&preview, &people_query()).await.unwrap();
+        normalize_rows(&result.to_jsonld(&preview.snapshot).unwrap())
+    };
+    let expected = vec![json!("ex:alice"), json!("ex:bob"), json!("ex:staged")];
+    assert_eq!(preview_rows().await, expected);
+
+    // Another transaction commits at the staged `t`, and its head is built.
+    let ledger = fluree.ledger(id).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:committed", "@type": "ex:Student"}),
+        )
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (_, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some(), "the committed state is served");
+    assert_eq!(
+        preview_rows().await,
+        expected,
+        "the staged view still reads its own state"
+    );
+}
+
+/// `rdfs` widens a query rather than materializing, so a query that mixes
+/// it with datalog keeps the rewrite when served from the head of that
+/// program, in a single view and in a dataset.
+#[tokio::test]
+async fn a_head_keeps_the_rdfs_rewrite_of_a_mixed_program() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/rdfs-datalog:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"},
+                {"@id": "ex:bob", "ex:enrolled": {"@id": "ex:cs101"}}
+            ]
+        }),
+    )
+    .await;
+    let rules = json!([{
+        "@id": "ex:enrolledIsStudent", "@context": ctx(),
+        "where": {"@id": "?x", "ex:enrolled": "?c"},
+        "insert": {"@id": "?x", "@type": "ex:Student"}
+    }]);
+    let q = json!({
+        "@context": ctx(),
+        "select": "?p",
+        "where": {"@id": "?p", "@type": "ex:Person"},
+        "reasoning": ["rdfs", "datalog"],
+        "rules": rules
+    });
+    let dataset_q = with(q.clone(), "from", json!(id));
+    let run_dataset = |q: JsonValue| {
+        let fluree = &fluree;
+        async move {
+            let resp = fluree
+                .query_from()
+                .jsonld(&q)
+                .track_all()
+                .execute_tracked()
+                .await
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            (
+                normalize_rows(&resp.result),
+                resp.reasoning.and_then(|r| r.head).is_some(),
+            )
+        }
+    };
+    let expected = vec![json!("ex:alice"), json!("ex:bob")];
+    let (before, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_none());
+    assert_eq!(before, expected);
+    assert_eq!(
+        run_dataset(dataset_q.clone()).await,
+        (expected.clone(), false)
+    );
+
+    let head = fluree
+        .register_reasoned_head(
+            id,
+            &json!({"reasoning": ["rdfs", "datalog"], "rules": rules}),
+        )
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (after, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(after, expected);
+    assert_eq!(run_dataset(dataset_q).await, (expected, true));
+}
+
+/// Query-time `rdfs` reads the class hierarchy without derived facts, so a
+/// program that derives hierarchy edges under it publishes nothing.
+#[tokio::test]
+async fn a_program_deriving_hierarchy_edges_under_rdfs_publishes_nothing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/derived-hierarchy:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Person", "ex:narrower": {"@id": "ex:Student"}},
+                {"@id": "ex:alice", "@type": "ex:Student"}
+            ]
+        }),
+    )
+    .await;
+    let rules = json!([{
+        "@id": "ex:narrowerIsSubclass", "@context": ctx(),
+        "where": {"@id": "?c", "ex:narrower": "?d"},
+        "insert": {"@id": "?d", "rdfs:subClassOf": {"@id": "?c"}}
+    }]);
+    let head = fluree
+        .register_reasoned_head(
+            id,
+            &json!({"reasoning": ["rdfs", "datalog"], "rules": rules}),
+        )
+        .await
+        .unwrap();
+    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+        RefreshOutcome::Failed { reason } => {
+            assert!(reason.contains("rdfs:subClassOf"), "{reason}");
+        }
+        other => panic!("expected a failed refresh, got {other:?}"),
+    }
+}
+
+/// An OWL 2 RL pass that fails under a positive datalog program leaves the
+/// rules to derive what they can, which is not the program's output: the
+/// refresh publishes nothing, and an `exact` query refuses the answer.
+#[tokio::test]
+async fn a_failed_owl_pass_under_datalog_publishes_nothing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/owl-failed:main";
+    // A property expression nested past the reasoner's limit fails the
+    // OWL 2 RL pass outright.
+    let mut graph: Vec<JsonValue> = (0..12)
+        .map(|i| {
+            json!({"@id": format!("ex:p{i}"), "owl:inverseOf": {"@id": format!("ex:p{}", i + 1)}})
+        })
+        .collect();
+    graph.push(json!({
+        "@id": "ex:R", "@type": "owl:Restriction",
+        "owl:onProperty": {"@id": "ex:p0"},
+        "owl:someValuesFrom": {"@id": "ex:Thing"}
+    }));
+    graph.push(json!({"@id": "ex:a", "ex:parent": {"@id": "ex:b"}}));
+    ledger_with(&fluree, id, json!({"@context": ctx(), "@graph": graph})).await;
+    let rules = json!([{
+        "@id": "ex:child", "@context": ctx(),
+        "where": {"@id": "?x", "ex:parent": "?y"},
+        "insert": {"@id": "?y", "ex:child": {"@id": "?x"}}
+    }]);
+    let head = fluree
+        .register_reasoned_head(
+            id,
+            &json!({"reasoning": ["owl2rl", "datalog"], "rules": rules}),
+        )
+        .await
+        .unwrap();
+    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+        RefreshOutcome::Failed { reason } => {
+            assert!(reason.contains("OWL 2 RL"), "{reason}");
+        }
+        other => panic!("expected a failed refresh, got {other:?}"),
+    }
+    let q = json!({
+        "@context": ctx(),
+        "select": "?x",
+        "where": {"@id": "ex:b", "ex:child": "?x"},
+        "reasoning": ["owl2rl", "datalog"],
+        "rules": rules,
+        "reasoningFreshness": "exact"
+    });
+    let err = query_err(&fluree, id, &q).await;
+    assert!(err.contains("OWL 2 RL"), "{err}");
+}
+
+/// A schema source in another ledger can change what a program settles to
+/// without the branch moving: queries stop matching the head at once, and
+/// a refresh rebuilds it at the same commit.
+#[tokio::test]
+async fn a_refresh_rebuilds_when_an_external_schema_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "heads/schema-model:main";
+    let data_id = "heads/schema-data:main";
+    let schema = |turtle: &str| {
+        format!(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+             @prefix ex: <http://example.org/> .\n{turtle}"
+        )
+    };
+    let model = fluree.create_ledger(model_id).await.unwrap();
+    let model = fluree
+        .stage_owned(model)
+        .upsert_turtle(&schema("ex:Manager rdfs:subClassOf ex:Employee ."))
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let data = fluree.create_ledger(data_id).await.unwrap();
+    let config = format!(
+        r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        GRAPH <urn:fluree:{data_id}#config> {{
+            <urn:cfg:main>       rdf:type            f:LedgerConfig ;
+                                 f:reasoningDefaults <urn:cfg:reasoning> .
+            <urn:cfg:reasoning>  f:schemaSource      <urn:cfg:schema-ref> .
+            <urn:cfg:schema-ref> rdf:type            f:GraphRef ;
+                                 f:graphSource       <urn:cfg:schema-src> .
+            <urn:cfg:schema-src> f:ledger            <{model_id}> ;
+                                 f:graphSelector     f:defaultGraph .
+        }}"
+    );
+    let data = fluree
+        .stage_owned(data)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .insert(
+            data,
+            &json!({"@context": ctx(), "@id": "ex:anita", "@type": "ex:Manager"}),
+        )
+        .await
+        .unwrap();
+    let typed = |class: &str| {
+        json!({
+            "@context": ctx(),
+            "select": "?x",
+            "where": {"@id": "?x", "@type": class},
+            "reasoning": "owl2rl"
+        })
+    };
+
+    let head = fluree
+        .register_reasoned_head(data_id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(data_id, &head).await.unwrap());
+    let (employees, served) = rows(&fluree, data_id, &typed("ex:Employee")).await;
+    assert_eq!(served.map(|h| h.generation), Some(1));
+    assert_eq!(employees, vec![json!("ex:anita")]);
+
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&schema("ex:Employee rdfs:subClassOf ex:Person ."))
+        .execute()
+        .await
+        .unwrap();
+    let (people, served) = rows(&fluree, data_id, &typed("ex:Person")).await;
+    assert!(
+        served.is_none(),
+        "the head was settled under the old schema"
+    );
+    assert_eq!(people, vec![json!("ex:anita")]);
+
+    let (generation, kind) = published(fluree.refresh_reasoned_head(data_id, &head).await.unwrap());
+    assert_eq!((generation, kind), (2, GenerationKind::Rebuild));
+    let (people, served) = rows(&fluree, data_id, &typed("ex:Person")).await;
+    assert_eq!(served.map(|h| h.generation), Some(2));
+    assert_eq!(people, vec![json!("ex:anita")]);
+}

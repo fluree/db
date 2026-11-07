@@ -3,8 +3,9 @@
 //! A generation is servable to a query when:
 //! - its head is active and the generation belongs to the head's current
 //!   revision;
-//! - its basis is exactly the query's snapshot: the branch's commit head,
-//!   at the query's `t`;
+//! - its basis is exactly the query's snapshot: the view is the branch's
+//!   state at its commit head, of the same ledger instance. A staged view,
+//!   or one assembled from other state, is never served;
 //! - the reasoning the query settled to has the generation's settled key,
 //!   which covers the program, the reasoned graph, rule sources, the schema
 //!   bundle and the evaluation time;
@@ -112,13 +113,23 @@ impl Fluree {
                 return Ok(None);
             }
         };
+        let Some(view_commit) = db.commit_id.clone() else {
+            return Ok(None);
+        };
         let Some(record) = self.nameservice().lookup(ledger_id).await? else {
             return Ok(None);
         };
-        let Some(commit) = record.commit_head_id.clone() else {
+        let instance = record
+            .storage_root
+            .as_ref()
+            .and_then(fluree_db_core::StorageRoot::instance_bits)
+            .unwrap_or(0);
+        if instance != db.instance_bits {
             return Ok(None);
-        };
-        if !as_of && record.commit_t != db.t {
+        }
+        if !as_of
+            && (record.commit_head_id.as_ref() != Some(&view_commit) || record.commit_t != db.t)
+        {
             return Ok(None);
         }
         let settled = program::settled_key(reasoning, db.graph_id);
@@ -132,7 +143,10 @@ impl Fluree {
                 continue;
             }
             let manifest_id = if !as_of {
-                if published.basis.commit != commit || published.basis.t != db.t {
+                if published.basis.commit != view_commit
+                    || published.basis.t != db.t
+                    || published.settled != settled
+                {
                     continue;
                 }
                 published.manifest.clone()
@@ -140,7 +154,7 @@ impl Fluree {
                 match self
                     .as_of_generation(
                         &record,
-                        &commit,
+                        &view_commit,
                         head_id,
                         &published.manifest,
                         db.t,
@@ -174,12 +188,12 @@ impl Fluree {
         Ok(None)
     }
 
-    /// The newest retained generation of a head whose basis is on the
-    /// branch's line at or before `t`, computed under `settled`.
+    /// The newest retained generation of a head whose basis is on the line
+    /// of the view's commit at or before `t`, computed under `settled`.
     async fn as_of_generation(
         &self,
         record: &NsRecord,
-        branch_head: &ContentId,
+        view_commit: &ContentId,
         head_id: &HeadId,
         newest: &ContentId,
         t: i64,
@@ -198,7 +212,7 @@ impl Fluree {
             record,
         )
         .await?;
-        let line = super::build::Line::walk(branch_store.as_ref(), branch_head, oldest_t).await?;
+        let line = super::build::Line::walk(branch_store.as_ref(), view_commit, oldest_t).await?;
         Ok(generations
             .into_iter()
             .find(|g| {
@@ -294,6 +308,7 @@ pub(crate) fn head_view(base: &GraphDb, head: &LedgerState) -> GraphDb {
     let head = GraphDb::from_ledger_state(head);
     let mut view = base.clone();
     view.t = head.t;
+    view.commit_id = head.commit_id;
     view.snapshot = head.snapshot;
     view.overlay = head.overlay;
     view.novelty = head.novelty;

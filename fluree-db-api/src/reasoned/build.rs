@@ -79,6 +79,8 @@ pub enum RefreshOutcome {
     /// retention window as it may; publication waits for them to age out.
     #[serde(rename_all = "camelCase")]
     Throttled { in_guard: usize },
+    /// A storage sweep of the ledger is running; a later refresh retries.
+    Deferred { reason: String },
 }
 
 fn now_ms() -> i64 {
@@ -349,8 +351,41 @@ impl Fluree {
             });
         }
         let revision = entry.registration.revision;
+
+        // Settle the program as a query would, against the reasoned graph.
+        // Before the currency check: what the program settles to can change
+        // without the branch moving, when a schema or rules source it reads
+        // lives elsewhere.
+        let program_json = &entry.registration.program;
+        let db = match program_json.get("graph").and_then(|g| g.as_str()) {
+            Some(iri) => match db.snapshot.graph_registry.existing_graph_id(iri, db.t) {
+                Ok(Some(g_id)) => Fluree::select_graph_id(db, g_id)?,
+                Ok(None) | Err(_) => {
+                    return Ok(RefreshOutcome::Failed {
+                        reason: format!("the reasoned graph {iri} does not exist"),
+                    })
+                }
+            },
+            None => db,
+        };
+        let (_, parsed) = parse_jsonld_query(
+            &program::settling_query(program_json),
+            &db.snapshot,
+            db.default_context.as_ref(),
+            None,
+        )?;
+        let mut executable = self.build_executable_for_view(&db, &parsed, None).await?;
+        if !program::materializes(&executable.reasoning) {
+            return Ok(RefreshOutcome::Failed {
+                reason: "the program, as the branch settles it, materializes nothing".into(),
+            });
+        }
+        let settled = program::settled_key(&executable.reasoning, db.graph_id);
         if let Some(published) = &entry.published {
-            if published.revision == revision && published.basis == basis {
+            if published.revision == revision
+                && published.basis == basis
+                && published.settled == settled
+            {
                 return Ok(RefreshOutcome::Current {
                     generation: published.generation,
                 });
@@ -381,32 +416,6 @@ impl Fluree {
             }
         }
 
-        // Settle the program as a query would, against the reasoned graph.
-        let program_json = &entry.registration.program;
-        let db = match program_json.get("graph").and_then(|g| g.as_str()) {
-            Some(iri) => match db.snapshot.graph_registry.existing_graph_id(iri, db.t) {
-                Ok(Some(g_id)) => Fluree::select_graph_id(db, g_id)?,
-                Ok(None) | Err(_) => {
-                    return Ok(RefreshOutcome::Failed {
-                        reason: format!("the reasoned graph {iri} does not exist"),
-                    })
-                }
-            },
-            None => db,
-        };
-        let (_, parsed) = parse_jsonld_query(
-            &program::settling_query(program_json),
-            &db.snapshot,
-            db.default_context.as_ref(),
-            None,
-        )?;
-        let mut executable = self.build_executable_for_view(&db, &parsed, None).await?;
-        if !program::materializes(&executable.reasoning) {
-            return Ok(RefreshOutcome::Failed {
-                reason: "the program, as the branch settles it, materializes nothing".into(),
-            });
-        }
-        let settled = program::settled_key(&executable.reasoning, db.graph_id);
         let modes = &mut executable.reasoning.modes;
         if program_json.get("reasoningBudget").is_none() {
             modes.max_facts = Some(WORKER_MAX_FACTS);
@@ -425,6 +434,16 @@ impl Fluree {
         };
         let derived_total = derived.len() as u64;
         let derived_only = asserted_filter(&db, derived, false).await?;
+        if program::serves_rewrites(&executable.reasoning) {
+            if let Some(p) = derived_hierarchy_edge(&derived_only) {
+                return Ok(RefreshOutcome::Failed {
+                    reason: format!(
+                        "the program derives {p} facts, which query-time rdfs and owl2ql \
+                         rewriting does not read; a head would answer differently"
+                    ),
+                });
+            }
+        }
 
         // The previous generation, when this one can build on it.
         let branch_store = fluree_db_nameservice::branched_content_store_for_record(
@@ -440,7 +459,7 @@ impl Fluree {
             vec![BranchedContentStore::leaf(Arc::clone(&branch_store))],
         ));
         let previous = match &entry.published {
-            Some(p) if p.revision == revision => {
+            Some(p) if p.revision == revision && p.settled == settled => {
                 match load_previous(head_cs.as_ref(), &p.manifest, &db).await {
                     Ok(prev) => {
                         let line = Line::walk(
@@ -466,6 +485,13 @@ impl Fluree {
             flake.t = basis.t;
             flake.op = op;
             flake
+        };
+        // From here until publication, files are written that no published
+        // generation references yet.
+        let Some(_write) = self.reasoned.begin_write(record.ledger_id.name()) else {
+            return Ok(RefreshOutcome::Deferred {
+                reason: "a storage sweep of the ledger is running".into(),
+            });
         };
         // A logical fold the indexer cannot apply is redone as a rebuild.
         let mut previous = previous;
@@ -600,6 +626,14 @@ impl Fluree {
             derived: derived_id,
             stats: stats.clone(),
         };
+        #[cfg(test)]
+        {
+            let seam = self.reasoned.before_publish.lock().clone();
+            if let Some(seam) = seam {
+                seam.reached.notify_one();
+                seam.resume.notified().await;
+            }
+        }
         match self
             .publish_generation(
                 ledger_id,
@@ -717,15 +751,14 @@ impl Fluree {
             },
         )
         .await?;
-        if let Some(diag) = &outcome.diagnostics {
-            if diag.capped {
-                return Ok(Err(format!(
-                    "the closure was capped ({}); raise the program's reasoningBudget",
-                    diag.capped_reason.as_deref().unwrap_or("budget")
-                )));
-            }
-        } else if reasoning.modes.owl2rl {
-            return Ok(Err("OWL 2 RL materialization failed".into()));
+        if let Some(reason) = outcome.failed {
+            return Ok(Err(reason));
+        }
+        if let Some(diag) = outcome.diagnostics.as_ref().filter(|d| d.capped) {
+            return Ok(Err(format!(
+                "the closure was capped ({}); raise the program's reasoningBudget",
+                diag.capped_reason.as_deref().unwrap_or("budget")
+            )));
         }
         let mut out = Vec::new();
         if let Some(overlay) = &outcome.overlay {
@@ -847,6 +880,27 @@ async fn load_previous(
 const UNREGISTERED_GRAPH: GraphId = GraphId::MAX;
 
 /// Each graph's Sid in flake form: `None` for the default graph.
+/// The hierarchy predicate a derived-only fact of the default graph has,
+/// if one does. Query-time `rdfs` rewriting reads the class and property
+/// hierarchy without derived facts; against a head it would read them.
+fn derived_hierarchy_edge(facts: &HashSet<(GraphId, Flake)>) -> Option<&'static str> {
+    use fluree_vocab::namespaces::RDFS;
+    let sub_class = Sid::new(RDFS, "subClassOf");
+    let sub_property = Sid::new(RDFS, "subPropertyOf");
+    facts
+        .iter()
+        .filter(|(g_id, _)| *g_id == 0)
+        .find_map(|(_, flake)| {
+            if flake.p == sub_class {
+                Some("rdfs:subClassOf")
+            } else if flake.p == sub_property {
+                Some("rdfs:subPropertyOf")
+            } else {
+                None
+            }
+        })
+}
+
 fn graph_sids(db: &GraphDb) -> HashMap<GraphId, Option<Sid>> {
     let mut out = HashMap::new();
     out.insert(0, None);
@@ -971,5 +1025,101 @@ impl BasisOracle for Line {
 
     fn is_ancestor(&self, ancestor: &Basis, descendant: &Basis) -> bool {
         self.on_line(ancestor) && self.on_line(descendant) && ancestor.t <= descendant.t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::RefreshOutcome;
+    use crate::reasoned::PauseSeam;
+
+    /// A sweep that starts while a head build has written its files and not
+    /// yet published them waits for the build, so what it publishes is
+    /// there to read.
+    #[tokio::test]
+    async fn a_sweep_waits_for_a_head_build_to_publish() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "heads/sweep-race:main";
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let ctx = json!({
+            "ex": "http://example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        });
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({
+                    "@context": ctx,
+                    "@graph": [
+                        {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                        {"@id": "ex:alice", "@type": "ex:Student"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        fluree
+            .reindex(id, crate::ReindexOptions::default())
+            .await
+            .unwrap();
+        let head = fluree
+            .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+            .await
+            .unwrap();
+        // The sweep reads a head's files once it has a published generation;
+        // the next one's are the files at risk.
+        fluree.refresh_reasoned_head(id, &head).await.unwrap();
+        fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@id": "ex:bob", "@type": "ex:Student"}),
+            )
+            .await
+            .unwrap();
+
+        let seam = Arc::new(PauseSeam::default());
+        *fluree.reasoned.before_publish.lock() = Some(Arc::clone(&seam));
+        let refresh = fluree.refresh_reasoned_head(id, &head);
+        let sweep = async {
+            seam.reached.notified().await;
+            let sweep = fluree.sweep_index_storage("heads/sweep-race");
+            tokio::pin!(sweep);
+            let early = tokio::time::timeout(Duration::from_millis(300), &mut sweep).await;
+            seam.resume.notify_one();
+            match early {
+                Ok(done) => done,
+                Err(_) => sweep.await,
+            }
+        };
+        let (outcome, swept) = tokio::join!(refresh, sweep);
+        assert!(
+            matches!(outcome.unwrap(), RefreshOutcome::Published { .. }),
+            "the build publishes"
+        );
+        swept.unwrap();
+
+        let resp = fluree
+            .graph(id)
+            .query()
+            .jsonld(&json!({
+                "@context": ctx,
+                "select": "?p",
+                "where": {"@id": "?p", "@type": "ex:Person"},
+                "reasoning": "owl2rl"
+            }))
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        assert!(
+            resp.reasoning.and_then(|r| r.head).is_some(),
+            "the published generation is readable after the sweep"
+        );
     }
 }

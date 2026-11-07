@@ -172,6 +172,7 @@ pub struct HeadPointer {
     /// Copied from the manifest so admission and read paths need no fetch.
     pub revision: u64,
     pub basis: Basis,
+    pub settled: ContentId,
 }
 
 /// The per-branch document: every head of the branch, read in one
@@ -273,6 +274,7 @@ impl ReasonedManifest {
             generation: self.generation,
             revision: self.revision,
             basis: self.basis.clone(),
+            settled: self.settled.clone(),
         }
     }
 }
@@ -505,6 +507,7 @@ mod tests {
                     generation: 3,
                     revision: rev,
                     basis: basis(tag, t),
+                    settled: cid("settled"),
                 }),
             },
         );
