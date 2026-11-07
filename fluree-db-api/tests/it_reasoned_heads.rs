@@ -1335,3 +1335,81 @@ async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
         vec![json!(["ex:a", "ex:c"]), json!(["ex:b", "ex:d"])]
     );
 }
+
+/// owl:sameAs: what query-time reasoning answers through equality, a head
+/// answers the same.
+#[tokio::test]
+async fn same_as_answers_match_query_time() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/same-as:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:carol", "owl:sameAs": {"@id": "ex:carol-lynn"}},
+                {"@id": "ex:carol-lynn", "ex:age": 30, "ex:knows": {"@id": "ex:dan"}},
+                {"@id": "ex:dan", "@type": "ex:Person"},
+                {"@id": "ex:knows", "@type": "owl:SymmetricProperty"}
+            ]
+        }),
+    )
+    .await;
+    let queries = [
+        json!({"@context": ctx(), "select": "?s", "where": {"@id": "ex:carol-lynn", "owl:sameAs": "?s"}, "reasoning": "owl2rl"}),
+        json!({"@context": ctx(), "select": "?age", "where": {"@id": "ex:carol", "ex:age": "?age"}, "reasoning": "owl2rl"}),
+        json!({"@context": ctx(), "select": "?x", "where": {"@id": "ex:dan", "ex:knows": "?x"}, "reasoning": "owl2rl"}),
+        json!({"@context": ctx(), "select": ["?s", "?o"], "where": {"@id": "?s", "ex:knows": "?o"}, "reasoning": "owl2rl"}),
+    ];
+    let mut expected = Vec::new();
+    for q in &queries {
+        expected.push(rows(&fluree, id, q).await.0);
+    }
+    // The equality itself is derived (symmetry); the head must hold it.
+    assert!(
+        expected[0].contains(&json!("ex:carol")),
+        "{:?}",
+        expected[0]
+    );
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    for (q, expected) in queries.iter().zip(&expected) {
+        let (got, served) = rows(&fluree, id, q).await;
+        assert!(served.is_some());
+        assert_eq!(&got, expected, "{q}");
+    }
+}
+
+/// Two heads of one branch publish concurrently; neither entry is lost.
+#[tokio::test]
+async fn two_heads_of_a_branch_publish_concurrently() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/two:main";
+    school(&fluree, id).await;
+    let owl = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    let rules = json!([{"@context": ctx(), "where": {"@id": "?x", "@type": "ex:Student"},
+                        "insert": {"@id": "?x", "ex:enrolled": true}}]);
+    let datalog = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        fluree.refresh_reasoned_head(id, &owl),
+        fluree.refresh_reasoned_head(id, &datalog)
+    );
+    published(a.unwrap());
+    published(b.unwrap());
+    let doc = fluree.reasoned_heads(id).await.unwrap();
+    assert!(doc.heads[&owl].published.is_some());
+    assert!(doc.heads[&datalog].published.is_some());
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert_eq!(served.map(|h| h.head_id), Some(owl.to_string()));
+    assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
+}
