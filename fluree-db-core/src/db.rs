@@ -678,14 +678,11 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         ));
     }
     let version = bytes[4];
-    // FIR6 version 2 adds `lang_id` to each `FulltextArenaRef`; version 3 enables
-    // inline xsd:decimal encoding; version 4 widens the list places its
-    // artifacts store. None changes the header layout this helper reads — it
-    // only consumes the fixed header + optional-section bits, not arena refs or
-    // leaf data — so every version is accepted here. The authoritative parser
+    // `main`'s roots (FIR6 version 2 adds `lang_id` to each
+    // `FulltextArenaRef`) and v5 roots (version 4). The authoritative parser
     // (`IndexRoot::decode` in `fluree-db-binary-index`) enforces version
     // matching for the full-root deserialization path.
-    if !(1..=4).contains(&version) {
+    if !matches!(version, 1 | 2 | 4) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("FIR6: unsupported version {version}"),
@@ -716,17 +713,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     const FLAG_EXT_GRAPH_DROPS: u8 = 1 << 3;
     const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 7;
-    // An earlier v5 root (version 3) flags its term dictionary on bit 3, and
-    // carries no graph drops.
-    const FLAG_EXT_HAS_TERM_DICT_V5_NARROW: u8 = 1 << 3;
     let flags_ext = bytes[6];
-    let (term_dict_flag, graph_drops_flag) = match version {
-        3 => (FLAG_EXT_HAS_TERM_DICT_V5_NARROW, 0),
-        4 => (FLAG_EXT_HAS_TERM_DICT, FLAG_EXT_GRAPH_DROPS),
-        _ => (0, FLAG_EXT_GRAPH_DROPS),
-    };
-    let has_term_dict_section = flags_ext & term_dict_flag != 0;
-    let has_graph_drops_section = flags_ext & graph_drops_flag != 0;
+    let has_term_dict_section = version == 4 && flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
+    let has_graph_drops_section = flags_ext & FLAG_EXT_GRAPH_DROPS != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
     } else {
@@ -846,11 +835,11 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
 
     /// Skip the triple-term dictionary section. Matches
     /// `write_term_dict_refs` in binary-index: version, per-predicate forward
-    /// packs, reverse tree refs, per-predicate watermarks, term count, and
-    /// from version 2 the optional object reverse tree.
+    /// packs, reverse tree refs, per-predicate watermarks, term count, and the
+    /// optional object reverse tree.
     fn skip_term_dict_refs(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
         let version = read_u8(bytes, pos)?;
-        if !(1..=2).contains(&version) {
+        if version != 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("FIR6: unsupported term dict section version {version}"),
@@ -873,7 +862,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
             let _wm = read_u32(bytes, pos)?;
         }
         let _term_count = read_u64(bytes, pos)?;
-        if version >= 2 && read_u8(bytes, pos)? != 0 {
+        if read_u8(bytes, pos)? != 0 {
             skip_dict_tree_refs(bytes, pos)?;
         }
         Ok(())
@@ -881,7 +870,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
 
     /// A graph id or graph count: 16-bit in `main`'s v2 roots, 32-bit in v5.
     fn read_graph_width(bytes: &[u8], pos: &mut usize, version: u8) -> std::io::Result<u32> {
-        if version >= 3 {
+        if version >= 4 {
             read_u32(bytes, pos)
         } else {
             read_u16(bytes, pos).map(u32::from)
@@ -1024,7 +1013,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         let leaf_count = read_u32(bytes, &mut pos)? as usize;
         for _ in 0..leaf_count {
             // first_key + last_key (RunRecordV2 ordered key): 34 bytes, the
-            // 30 of a root before version 4, whose keys hold a 32-bit `o_i`.
+            // 30 of `main`'s roots, whose keys hold a 32-bit `o_i`.
             let record_v2_wire_size: usize = if version >= 4 { 34 } else { 30 };
             ensure(bytes, pos, record_v2_wire_size, "RunRecordV2 first_key")?;
             pos += record_v2_wire_size;

@@ -131,8 +131,7 @@ Key properties:
     readers serve the graph from novelty alone (`BinaryIndexStore::without_graphs`). The commit side
     is the envelope's `graph_drops` field, by IRI (see `Commit::graph_drops`).
   - bit 7 `HAS_TERM_DICT` — the triple-term dictionary section follows the optional sections above,
-    before `graph_drops`. An earlier v5 root (version byte 3, read only) flags it on bit 3 instead and
-    carries no graph drops.
+    before `graph_drops`.
 
 At a high level the root contains:
 

@@ -209,14 +209,11 @@ pub const ROOT_V6_VERSION: u8 = 2;
 /// extended flag, so an arena-only ledger stays arena-only until a reindex.
 pub const ROOT_V6_VERSION_V5: u8 = 4;
 
-/// An earlier v5 root, whose artifacts store a 32-bit `o_i`. Read only.
-const ROOT_V6_VERSION_V5_NARROW: u8 = 3;
-
 /// Whether `bytes` is a root of the format this build writes.
 ///
-/// A root of an earlier format (`main`'s, or an earlier v5 one) is served as
-/// it is, and its ledger's next build is a full rebuild, never an incremental
-/// one, so no root mixes artifacts of two formats.
+/// A root of `main`'s format is served as it is, and its ledger's next build
+/// is a full rebuild, never an incremental one, so no root mixes artifacts of
+/// two formats.
 pub fn is_current_format(bytes: &[u8]) -> bool {
     bytes.len() > 4 && bytes[0..4] == *ROOT_V6_MAGIC && bytes[4] == ROOT_V6_VERSION_V5
 }
@@ -712,9 +709,6 @@ impl IndexRoot {
     const FLAG_EXT_DECIMAL_ARENA_ONLY: u8 = 1 << 6;
     /// Root carries a triple-term dictionary section.
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 7;
-    /// `FLAG_EXT_HAS_TERM_DICT` in an earlier v5 root
-    /// (`ROOT_V6_VERSION_V5_NARROW`), which carries no graph drops.
-    const FLAG_EXT_HAS_TERM_DICT_V5_NARROW: u8 = 1 << 3;
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -1082,19 +1076,13 @@ impl IndexRoot {
             )));
         }
         let version = data[4];
-        // `main`'s v2 roots hold 16-bit graph ids and counts; v5 roots 32-bit.
+        // `main`'s v2 roots hold 16-bit graph ids and counts and keys with a
+        // 32-bit `o_i`; v5 roots 32-bit ids and 64-bit list places.
         let wide = version != ROOT_V6_VERSION;
-        // Before version 4, a root's keys store a 32-bit `o_i`.
-        let narrow_keys = version != ROOT_V6_VERSION_V5;
-        // `main`'s v2 or an earlier v5 root (served until the ledger's next
-        // build rebuilds it; see `is_current_format`), or v5.
-        if ![
-            ROOT_V6_VERSION,
-            ROOT_V6_VERSION_V5_NARROW,
-            ROOT_V6_VERSION_V5,
-        ]
-        .contains(&version)
-        {
+        let narrow_keys = !wide;
+        // `main`'s v2 root (served until the ledger's next build rebuilds it;
+        // see `is_current_format`), or v5.
+        if ![ROOT_V6_VERSION, ROOT_V6_VERSION_V5].contains(&version) {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
         }
 
@@ -1379,18 +1367,13 @@ impl IndexRoot {
             None
         };
 
-        let (term_dict_flag, graph_drops_flag) = match version {
-            ROOT_V6_VERSION => (0, Self::FLAG_EXT_GRAPH_DROPS),
-            ROOT_V6_VERSION_V5_NARROW => (Self::FLAG_EXT_HAS_TERM_DICT_V5_NARROW, 0),
-            _ => (Self::FLAG_EXT_HAS_TERM_DICT, Self::FLAG_EXT_GRAPH_DROPS),
-        };
-        let term_dict = if flags_ext & term_dict_flag != 0 {
+        let term_dict = if wide && flags_ext & Self::FLAG_EXT_HAS_TERM_DICT != 0 {
             Some(read_term_dict_refs(data, &mut pos)?)
         } else {
             None
         };
 
-        let graph_drops = if flags_ext & graph_drops_flag != 0 {
+        let graph_drops = if flags_ext & Self::FLAG_EXT_GRAPH_DROPS != 0 {
             fluree_db_core::graph_registry::decode_graph_drops(
                 data,
                 &mut pos,
@@ -2000,19 +1983,6 @@ mod tests {
             assert!(snap.graph_registry.visible_at(0, 7));
             assert!(snap.graph_registry.is_dropped(4));
         }
-
-        // An earlier v5 root flags its term dictionary on bit 3.
-        let mut narrow = plain.clone();
-        narrow.term_dict = with_term_dict.term_dict.clone();
-        let mut bytes = narrow.encode_raw(true);
-        bytes[4] = ROOT_V6_VERSION_V5_NARROW;
-        bytes[6] = (bytes[6] & !IndexRoot::FLAG_EXT_HAS_TERM_DICT)
-            | IndexRoot::FLAG_EXT_HAS_TERM_DICT_V5_NARROW;
-        let decoded = IndexRoot::decode(&bytes).unwrap();
-        assert_eq!(decoded.term_dict, narrow.term_dict);
-        assert!(decoded.graph_drops.is_empty());
-        let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
-        assert!(!snap.graph_registry.has_drops());
     }
 
     #[test]
