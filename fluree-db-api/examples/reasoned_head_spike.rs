@@ -14,7 +14,10 @@
 //!   shares with the base root, and the bytes of the ones it does not;
 //! - the same after one small commit folded in as a logical generation.
 //!
-//! No timings: measure those on the benchmark hosts.
+//! With `SPIKE_TIMINGS=1` it also reports wall-clock figures: the rebuild and
+//! the logical refresh, and per query the first and the median of
+//! `SPIKE_RUNS` (default 5) runs, query-time and from the head. Take timings
+//! on the benchmark hosts only.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -38,6 +41,28 @@ fn multiset(result: &JsonValue) -> Vec<String> {
     let mut out: Vec<String> = rows.iter().map(ToString::to_string).collect();
     out.sort();
     out
+}
+
+fn timings_enabled() -> bool {
+    std::env::var("SPIKE_TIMINGS").is_ok_and(|v| v == "1")
+}
+
+/// The first run's and the median run's wall-clock milliseconds.
+async fn timed(fluree: &Fluree, sparql: &str) -> JsonValue {
+    let runs: usize = std::env::var("SPIKE_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+        .max(1);
+    let mut ms = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let started = std::time::Instant::now();
+        let _ = run(fluree, sparql).await;
+        ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let first = ms[0];
+    ms.sort_by(f64::total_cmp);
+    json!({"first_ms": first, "median_ms": ms[ms.len() / 2]})
 }
 
 async fn run(fluree: &Fluree, sparql: &str) -> (Vec<String>, bool) {
@@ -190,20 +215,26 @@ async fn main() {
         .collect();
 
     let mut query_time = Vec::new();
+    let mut query_time_ms = Vec::new();
     for (_, sparql) in &queries {
         let (rows, served) = run(&fluree, sparql).await;
         assert!(!served, "nothing is registered yet");
         query_time.push(rows);
+        if timings_enabled() {
+            query_time_ms.push(timed(&fluree, sparql).await);
+        }
     }
 
     let head = fluree
         .register_reasoned_head(LEDGER, &json!({"reasoning": "owl2rl"}))
         .await
         .expect("register");
+    let rebuild_started = std::time::Instant::now();
     let rebuild = fluree
         .refresh_reasoned_head(LEDGER, &head)
         .await
         .expect("refresh");
+    let rebuild_ms = rebuild_started.elapsed().as_secs_f64() * 1000.0;
     let doc = fluree.reasoned_heads(LEDGER).await.unwrap();
     let pointer = doc.heads[&head].published.clone().expect("published");
     let manifest = {
@@ -223,14 +254,19 @@ async fn main() {
         let (rows, served) = run(&fluree, sparql).await;
         let equal = &rows == expected_rows;
         all_equal &= equal && served;
-        per_query.push(json!({
+        let mut entry = json!({
             "query": name,
             "query_time_rows": expected_rows.len(),
             "head_rows": rows.len(),
             "served_from_head": served,
             "multisets_equal": equal,
             "expected": expected.get(i).copied().flatten(),
-        }));
+        });
+        if timings_enabled() {
+            entry["query_time"] = query_time_ms[i].clone();
+            entry["head"] = timed(&fluree, sparql).await;
+        }
+        per_query.push(entry);
     }
     let storage = storage_report(&fluree, dir.path(), &head, &manifest.root).await;
 
@@ -246,10 +282,12 @@ async fn main() {
         .expect("commit")
         .ledger;
     let head_bytes_before = storage["head_bytes"].as_u64().unwrap_or(0);
+    let logical_started = std::time::Instant::now();
     let logical = fluree
         .refresh_reasoned_head(LEDGER, &head)
         .await
         .expect("refresh");
+    let logical_ms = logical_started.elapsed().as_secs_f64() * 1000.0;
     let doc = fluree.reasoned_heads(LEDGER).await.unwrap();
     let pointer = doc.heads[&head].published.clone().expect("published");
     let record = fluree.nameservice().lookup(LEDGER).await.unwrap().unwrap();
@@ -274,7 +312,7 @@ async fn main() {
         }
         total
     };
-    let report = json!({
+    let mut report = json!({
         "ledger": LEDGER,
         "rebuild": serde_json::to_value(&rebuild).unwrap(),
         "parity": {"all_equal_and_served": all_equal, "queries": per_query},
@@ -288,5 +326,8 @@ async fn main() {
             "q01_served": q1_served,
         }
     });
+    if timings_enabled() {
+        report["timings"] = json!({"rebuild_ms": rebuild_ms, "logical_refresh_ms": logical_ms});
+    }
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
