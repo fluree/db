@@ -1,0 +1,97 @@
+{
+  "_README": "SANITIZED TEMPLATE. Replace every <PLACEHOLDER> with a local value before running; nothing here is a live account, path, or secret. Substrate-A (Snowflake) targets are templates only -- the host is <SNOWFLAKE_ACCOUNT>, the OAuth secret is read from $SF_SECRET at runtime and is NEVER stored in this file. Binary/data paths use <PLACEHOLDER> tokens (point them at your local worktrees). Substrate-B (MinIO) uses minioadmin/minioadmin, the documented local MinIO default (not a real secret). See ../PROTOCOL.md and ../substrate/README.md.",
+
+  "duckdb-parquet-sf01": {
+    "engine": "duckdb",
+    "substrate": "parquet_local",
+    "read_mode": "read_parquet",
+    "bin": "<PATH_TO_DUCKDB_BIN>",
+    "arch_prefix": ["arch", "-arm64"],
+    "data_dir": "<PATH_TO_output-sf01>",
+    "note": "DuckDB-DIRECT FLOOR: raw source parquet, no catalog. Fast local ceiling; NO fluree counterpart (fluree reads only catalog-fronted Iceberg). Role: the DuckDB answer for JOIN pairs is taken here (asymmetric-substrate, labeled) when duckdb-iceberg can't join over a catalog. Native arm64 via arch -arm64 (Rosetta penalty otherwise)."
+  },
+  "duckdb-iceberg-sf01": {
+    "engine": "duckdb",
+    "substrate": "iceberg_rest",
+    "read_mode": "iceberg_rest",
+    "bin": "<PATH_TO_DUCKDB_BIN>",
+    "arch_prefix": ["arch", "-arm64"],
+    "catalog_alias": "pol_cat",
+    "schema": "DW_SF01",
+    "warehouse": "<CATALOG_WAREHOUSE>",
+    "endpoint": "https://<SNOWFLAKE_ACCOUNT>.snowflakecomputing.com/polaris/api/catalog",
+    "oauth2_server_uri": "https://<SNOWFLAKE_ACCOUNT>.snowflakecomputing.com/polaris/api/catalog/v1/oauth/tokens",
+    "oauth2_scope": "session:role:ICEBERG_READER",
+    "client_id": "",
+    "secret_env": "SF_SECRET",
+    "pragmas": [],
+    "note": "SUBSTRATE A TEMPLATE: DuckDB iceberg ext ATTACHing a Snowflake Polaris REST catalog. Secret read from env $SF_SECRET (NEVER stored). Multi-file partitioned FACT scans currently fail here on Snowflake-managed S3 (see PROTOCOL.md 'substrate field discipline' + issue #1568); this target reliably carries only catalog/manifest ops (bare COUNT) + small single-file dims. JOIN pairs additionally hit the bloom gap -- use duckdb-iceberg-sf01-nopushdown for one capped remote attempt."
+  },
+  "duckdb-iceberg-sf01-nopushdown": {
+    "engine": "duckdb",
+    "substrate": "iceberg_rest_nopushdown",
+    "read_mode": "iceberg_rest",
+    "bin": "<PATH_TO_DUCKDB_BIN>",
+    "arch_prefix": ["arch", "-arm64"],
+    "catalog_alias": "pol_cat",
+    "schema": "DW_SF01",
+    "warehouse": "<CATALOG_WAREHOUSE>",
+    "endpoint": "https://<SNOWFLAKE_ACCOUNT>.snowflakecomputing.com/polaris/api/catalog",
+    "oauth2_server_uri": "https://<SNOWFLAKE_ACCOUNT>.snowflakecomputing.com/polaris/api/catalog/v1/oauth/tokens",
+    "oauth2_scope": "session:role:ICEBERG_READER",
+    "client_id": "",
+    "secret_env": "SF_SECRET",
+    "pragmas": ["SET disabled_optimizers='join_filter_pushdown'"],
+    "note": "SUBSTRATE A join workaround TEMPLATE: join_filter_pushdown disabled so JOINs don't hit the bloom-filter gap -- but this removes the semi-join reduction (remote over-scan). One capped attempt per join pair, hard-cap 180s; on timeout record DNF. Disclosed handicap, never a headline number."
+  },
+  "duckdb-iceberg-minio-sf01": {
+    "engine": "duckdb",
+    "substrate": "iceberg_rest_minio",
+    "read_mode": "iceberg_rest",
+    "bin": "<PATH_TO_DUCKDB_BIN>",
+    "arch_prefix": ["arch", "-arm64"],
+    "catalog_alias": "b_cat",
+    "schema": "DW_SF01",
+    "warehouse": "s3://warehouse/",
+    "endpoint": "http://localhost:8181",
+    "rest_auth": "none",
+    "access_delegation": "none",
+    "s3_secret": {"key_id": "minioadmin", "secret_literal": "minioadmin", "endpoint": "localhost:9000", "url_style": "path", "use_ssl": false, "region": "us-east-1"},
+    "pragmas": [],
+    "note": "SUBSTRATE B (engine-pure, local): DuckDB over the local MinIO-backed Iceberg REST fixture (see ../substrate/). AUTHORIZATION_TYPE/ACCESS_DELEGATION_MODE none + our own S3 secret bypass the vended-cred path; unpartitioned single-file tables sidestep the many-small-files fan-out that broke substrate A. minioadmin is the documented local MinIO default. Runs the DATA-scanning wave (single-table AND joins) both engines can run."
+  },
+  "duckdb-iceberg-minio-sf01-part": {
+    "engine": "duckdb",
+    "substrate": "iceberg_rest_minio_partitioned",
+    "read_mode": "iceberg_rest",
+    "bin": "<PATH_TO_DUCKDB_BIN>",
+    "arch_prefix": ["arch", "-arm64"],
+    "catalog_alias": "bp_cat",
+    "schema": "DW_SF01_PART",
+    "warehouse": "s3://warehouse/",
+    "endpoint": "http://localhost:8181",
+    "rest_auth": "none",
+    "access_delegation": "none",
+    "s3_secret": {"key_id": "minioadmin", "secret_literal": "minioadmin", "endpoint": "localhost:9000", "url_style": "path", "use_ssl": false, "region": "us-east-1"},
+    "pragmas": [],
+    "note": "SUBSTRATE B PARTITIONED (Wave B probe): one fact table written PARTITIONED BY date onto the same MinIO/REST fixture (namespace DW_SF01_PART). Isolates whether substrate A's fact-scan failure is many-small-files-over-Snowflake-S3-specific vs a general partitioning weakness, and whether the bloom-filter JOIN gap is triggered by the partitioned multi-file layout. See ../substrate/load_tables_partitioned.py + issue #1568."
+  },
+  "fluree-minio-sf01-main": {
+    "engine": "fluree_cli",
+    "substrate": "fluree_minio_rest",
+    "fluree_bin": "<PATH_TO_fluree_bin_MAIN>",
+    "config": "<PATH_TO>/substrate/fluree-home/.fluree/config.toml",
+    "source": "enterprise-sf01-b",
+    "env": {"AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin"},
+    "note": "SUBSTRATE B Fluree leg on SHIPPED MAIN. Representative current-shipped engine. Main does NOT carry #1528 filter-over-join fusion, so the filtered-join pair declines here. Registration: fluree iceberg map enterprise-sf01-b --mode rest --catalog-uri http://127.0.0.1:8181 --r2rml ../substrate/enterprise-sf01-mapping.ttl --s3-endpoint http://127.0.0.1:9000 --s3-path-style --no-vended-credentials (127.0.0.1 not localhost -> IPv4; omit --warehouse -> empty REST prefix). engine_version auto-derived per row from the binary's worktree git commit."
+  },
+  "fluree-minio-sf01-1528": {
+    "engine": "fluree_cli",
+    "substrate": "fluree_minio_rest",
+    "fluree_bin": "<PATH_TO_fluree_bin_1528>",
+    "config": "<PATH_TO>/substrate/fluree-home/.fluree/config.toml",
+    "source": "enterprise-sf01-b",
+    "env": {"AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin"},
+    "note": "SUBSTRATE B Fluree leg WITH #1528 filter-over-join fusion (family-C). The representative-of-the-fix engine; the filtered-join pair collapses to fused-class (~sub-second) here. Same registration + mapping as fluree-minio-sf01-main. engine_version auto-derived per row."
+  }
+}

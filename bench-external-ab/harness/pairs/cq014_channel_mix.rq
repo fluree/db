@@ -1,0 +1,5 @@
+# cq014 — corpus q014_channel_mix (+ deterministic ORDER BY ?ch for compare).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?ch (COUNT(?o) AS ?n) (SUM(?tot) AS ?rev)
+WHERE { ?o a edw:Order ; edw:orderChannel ?ch ; edw:orderTotal ?tot . }
+GROUP BY ?ch ORDER BY ?ch
