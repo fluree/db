@@ -246,6 +246,40 @@ pub struct BinaryScanOperator {
     mode: crate::temporal_mode::TemporalMode,
 }
 
+/// The tag of `FILTER(LANG(?o) = "tag")`, either side order, for the object
+/// variable `o_var`: the one shape that is a test of the object's language tag.
+///
+/// The tag must be non-empty. `LANG(?o) = ""` holds for every literal without
+/// a tag (and, in JSON-LD, for an IRI), so no tag stands for it. `!=`, `<`,
+/// `langMatches`, `STRSTARTS` or any other function of `LANG(?o)` and a
+/// string is not a tag equality either. Every place that turns this filter
+/// into a check on the encoded object goes through here.
+pub(crate) fn lang_tag_equality(expr: &Expression, o_var: VarId) -> Option<&str> {
+    let Expression::Call {
+        func: Function::Eq,
+        args,
+    } = expr
+    else {
+        return None;
+    };
+    let [a, b] = args.as_slice() else {
+        return None;
+    };
+    let is_lang_o = |e: &Expression| match e {
+        Expression::Call {
+            func: Function::Lang { .. },
+            args,
+        } => matches!(args.as_slice(), [Expression::Var(v)] if *v == o_var),
+        _ => false,
+    };
+    let tag = match (a, b) {
+        (lang, Expression::Const(FlakeValue::String(tag))) if is_lang_o(lang) => tag,
+        (Expression::Const(FlakeValue::String(tag)), lang) if is_lang_o(lang) => tag,
+        _ => return None,
+    };
+    (!tag.is_empty()).then_some(tag.as_str())
+}
+
 /// A filter that can be evaluated on encoded index columns (no term decoding).
 #[derive(Clone, Debug)]
 pub(crate) enum EncodedPreFilter {
@@ -366,7 +400,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
     store: &BinaryIndexStore,
     allow_string_prefix_pushdown: bool,
 ) -> (Vec<EncodedPreFilter>, Vec<InlineOperator>) {
-    use crate::ir::{Expression, FlakeValue, Function};
+    use crate::ir::{Expression, Function};
 
     let obj_var = match &pattern.o {
         Term::Var(v) => Some(*v),
@@ -422,35 +456,12 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
             continue;
         }
 
-        // FILTER(LANG(?o) = "en")  (either side order)
-        let is_lang_o = |e: &Expression| match (e, obj_var) {
-            (Expression::Call { func, args }, Some(ov)) => {
-                matches!(func, Function::Lang { .. })
-                    && args.len() == 1
-                    && matches!(&args[0], Expression::Var(v) if *v == ov)
-            }
-            _ => false,
-        };
-        if is_lang_o(&args[0]) {
-            if let Expression::Const(FlakeValue::String(tag)) = &args[1] {
-                if let Some(lang_id) = store.resolve_lang_id(tag) {
-                    let required_otype =
-                        fluree_db_core::o_type::OType::lang_string(lang_id).as_u16();
-                    out.push(EncodedPreFilter::LangEqualsOType { required_otype });
-                    continue;
-                }
-            }
-            pruned.push(op.clone());
-            continue;
-        }
-        if is_lang_o(&args[1]) {
-            if let Expression::Const(FlakeValue::String(tag)) = &args[0] {
-                if let Some(lang_id) = store.resolve_lang_id(tag) {
-                    let required_otype =
-                        fluree_db_core::o_type::OType::lang_string(lang_id).as_u16();
-                    out.push(EncodedPreFilter::LangEqualsOType { required_otype });
-                    continue;
-                }
+        // FILTER(LANG(?o) = "en")  (either side order).
+        if let Some(tag) = obj_var.and_then(|ov| lang_tag_equality(expr.expr(), ov)) {
+            if let Some(lang_id) = store.resolve_lang_id(tag) {
+                let required_otype = fluree_db_core::o_type::OType::lang_string(lang_id).as_u16();
+                out.push(EncodedPreFilter::LangEqualsOType { required_otype });
+                continue;
             }
             pruned.push(op.clone());
             continue;
