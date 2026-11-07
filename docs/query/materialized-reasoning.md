@@ -143,7 +143,7 @@ what may answer:
 | `default` | An index whose head is at exactly the queried commit; query-time reasoning otherwise. |
 | `exact` | As `default`, but a query-time run that hits a budget, or whose OWL 2 RL pass fails, is an error rather than an incomplete result. |
 | `strict` | Only an index whose head is at exactly the queried commit. Waits briefly for one, then fails (408). Never reasons at query time. |
-| `asOf` | For a query of the branch's current state, the newest retained generation at or before its commit. The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none. |
+| `asOf` | For a query of the branch's current state, the newest retained generation at or before its commit, computed before no graph drop since (a drop takes a graph out as of every earlier `t`, and a generation holds what the graph held). The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none. |
 
 ## Storage and retention
 

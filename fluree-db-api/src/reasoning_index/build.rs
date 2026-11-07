@@ -701,9 +701,11 @@ impl Fluree {
                 });
             }
         };
-        // A logical fold the indexer cannot apply is redone as a rebuild.
+        // A logical fold the indexer cannot apply is redone as a rebuild. A
+        // fold over a drop would have to reassert what the program still
+        // derives into the dropped graphs; a rebuild needs nothing of it.
         let no_retractions = HashSet::new();
-        let mut logical = previous.is_some();
+        let mut logical = previous.is_some() && !window.as_ref().is_some_and(|w| w.drops);
         let (kind, built, stats_added, stats_removed) = loop {
             let (kind, fold, stats_added, stats_removed) = match (&previous, logical, &output) {
                 (Some(prev), false, Output::Gained(gained)) => {
@@ -1054,7 +1056,10 @@ impl Fluree {
         if !modes.owl2rl || modes.datalog || modes.owl_datalog || modes.has_rules() {
             return Ok(None);
         }
-        if !window.retracted.is_empty() || window.inserted.iter().any(|(_, f)| defines_program(f)) {
+        if window.drops
+            || !window.retracted.is_empty()
+            || window.inserted.iter().any(|(_, f)| defines_program(f))
+        {
             return Ok(None);
         }
         let inserted: Vec<Flake> = window
@@ -1305,10 +1310,13 @@ async fn asserted_filter(
     Ok(out)
 }
 
-/// What the commits in `(after_t, head]` asserted and retracted, by graph.
+/// What the commits in `(after_t, head]` asserted and retracted, by graph,
+/// and whether any of them dropped a graph.
 struct Window {
     inserted: Vec<(GraphId, Flake)>,
     retracted: HashSet<(GraphId, Flake)>,
+    /// A drop takes a graph's facts out with no retraction to show for them.
+    drops: bool,
 }
 
 async fn window_changes(
@@ -1323,6 +1331,7 @@ async fn window_changes(
     let mut window = Window {
         inserted: Vec::new(),
         retracted: HashSet::new(),
+        drops: false,
     };
     for (_, cid) in commits {
         let bytes = store
@@ -1331,6 +1340,7 @@ async fn window_changes(
             .map_err(|e| ApiError::internal(format!("read commit {cid}: {e}")))?;
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| ApiError::internal(format!("decode commit {cid}: {e}")))?;
+        window.drops |= !commit.graph_drops.is_empty();
         for flake in commit.flakes {
             let fact = (graph_of(db, flake.g.as_ref()), flake);
             if fact.1.op {
@@ -2728,6 +2738,160 @@ mod tests {
             .unwrap();
         assert!(resp.reasoning.and_then(|r| r.index).is_some(), "served");
         assert_eq!(rows(&resp.result), expected, "a dataset of its graphs");
+    }
+
+    /// A drop takes a graph's facts out with no retraction to show for them:
+    /// a refresh over it computes the closure in full and rebuilds, so what
+    /// the dropped facts supported is gone from the index.
+    #[tokio::test]
+    async fn a_refresh_over_a_graph_drop_computes_in_full() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/drop-window:main";
+        let (index, ledger) = students(&fluree, id).await;
+        let program = json!({"reasoning": "owl2rl"});
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        drop(ledger);
+        fluree
+            .graph(id)
+            .transact()
+            .sparql_update("DROP DEFAULT")
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(
+            refresh_and_compare(&fluree, id, &index, &program, None, 1).await,
+            ClosureMode::Full
+        );
+        assert_eq!(alice_classes(&fluree, id).await, (vec![], Some(2)));
+    }
+
+    /// A drop of a graph the program derives into takes the derived facts
+    /// out of the index with the rest. Written again in the same window, the
+    /// graph holds what the program derives there after the refresh.
+    #[tokio::test]
+    async fn a_graph_the_program_derives_into_holds_its_facts_after_a_drop() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/drop-derived:main";
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                r#"@prefix ex: <http://example.org/> .
+                ex:a ex:parent ex:b . ex:b ex:parent ex:c .
+                GRAPH ex:inferred { ex:seed ex:note "seed" . }"#,
+            )
+            .execute()
+            .await
+            .unwrap();
+        let ctx = json!({"ex": "http://example.org/"});
+        let rules = json!([{
+            "@context": ctx,
+            "where": [{"@id": "?x", "ex:parent": "?y"}, {"@id": "?y", "ex:parent": "?z"}],
+            "insert": {"@id": "?x", "@graph": "ex:inferred", "ex:grandparent": {"@id": "?z"}}
+        }]);
+        let index = fluree
+            .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        fluree
+            .graph(id)
+            .transact()
+            .sparql_update("DROP GRAPH <http://example.org/inferred>")
+            .commit()
+            .await
+            .unwrap();
+        // Written again in the same window: the graph exists, and the
+        // program derives into it.
+        fluree
+            .graph(id)
+            .transact()
+            .sparql_update(
+                "INSERT DATA { GRAPH <http://example.org/inferred> { \
+                 <http://example.org/seed> <http://example.org/note> \"again\" } }",
+            )
+            .commit()
+            .await
+            .unwrap();
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 2, .. }
+        ));
+        let q = json!({
+            "@context": ctx,
+            "select": ["?x", "?z"],
+            "where": [["graph", "http://example.org/inferred", {"@id": "?x", "ex:grandparent": "?z"}]],
+            "reasoning": "datalog",
+            "rules": rules
+        });
+        let resp = fluree
+            .graph(id)
+            .query()
+            .jsonld(&q)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.reasoning.and_then(|r| r.index).map(|i| i.generation),
+            Some(2)
+        );
+        assert_eq!(resp.result, json!([["ex:a", "ex:c"]]));
+    }
+
+    /// `asOf` does not take a generation from before a graph drop: it holds
+    /// what the graph held, which the drop took out as of every `t`.
+    #[tokio::test]
+    async fn as_of_skips_a_generation_from_before_a_graph_drop() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/drop-as-of:main";
+        let (index, _) = students(&fluree, id).await;
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        let as_of = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?c",
+            "where": {"@id": "ex:alice", "@type": "?c"},
+            "reasoning": "owl2rl",
+            "reasoningFreshness": "asOf"
+        });
+        let run = |q: serde_json::Value| {
+            let fluree = &fluree;
+            async move {
+                let resp = fluree
+                    .graph(id)
+                    .query()
+                    .jsonld(&q)
+                    .track_all()
+                    .execute_tracked()
+                    .await
+                    .unwrap();
+                (
+                    resp.result,
+                    resp.reasoning.and_then(|r| r.index).map(|i| i.generation),
+                )
+            }
+        };
+        // A commit that drops nothing: the generation still answers.
+        insert_student(&fluree, fluree.ledger(id).await.unwrap(), "ex:bob").await;
+        assert_eq!(run(as_of.clone()).await.1, Some(1));
+
+        fluree
+            .graph(id)
+            .transact()
+            .sparql_update("DROP DEFAULT")
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(run(as_of.clone()).await, (json!([]), None));
     }
 
     /// Insert-only refreshes under `bounds`, each compared with a full

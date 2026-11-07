@@ -175,8 +175,8 @@ impl Fluree {
                     &view_commit,
                     index_id,
                     &published.manifest,
-                    db.t,
                     &settled,
+                    db,
                 )
                 .await?
             {
@@ -208,15 +208,17 @@ impl Fluree {
     }
 
     /// The newest retained generation of an index whose basis is on the line
-    /// of the view's commit at or before `t`, computed under `settled`.
+    /// of the view's commit at or before `db`'s `t`, computed under `settled`,
+    /// and before no drop `db` records: a generation holds what a graph held
+    /// at its basis, which a later drop takes out as of every `t`.
     async fn as_of_generation(
         &self,
         record: &NsRecord,
         view_commit: &ContentId,
         index_id: &ReasoningIndexId,
         newest: &ContentId,
-        t: i64,
         settled: &ContentId,
+        db: &GraphDb,
     ) -> Result<Option<(ContentId, i64)>> {
         let store = self.index_store(record, index_id).await?;
         let generations =
@@ -236,9 +238,14 @@ impl Fluree {
         Ok(generations
             .into_iter()
             .find(|g| {
-                g.manifest.basis.t <= t
+                g.manifest.basis.t <= db.t
                     && &g.manifest.settled == settled
                     && line.on_line(&g.manifest.basis)
+                    && db
+                        .snapshot
+                        .graph_registry
+                        .dropped_after(g.manifest.basis.t)
+                        .is_empty()
             })
             .map(|g| (g.manifest_id, g.manifest.basis.t)))
     }
