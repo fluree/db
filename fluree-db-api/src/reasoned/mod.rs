@@ -17,7 +17,7 @@ pub(crate) mod program;
 pub(crate) mod serve;
 mod worker;
 
-pub use build::RefreshOutcome;
+pub use build::{RefreshOutcome, MAX_ACTIVE_HEADS};
 pub use worker::{ReasonedHeadWorker, DEFAULT_CATCHUP_INTERVAL};
 
 use std::collections::{HashMap, HashSet};

@@ -1502,3 +1502,73 @@ async fn a_new_branch_starts_with_no_heads() {
     assert!(served.is_none());
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
 }
+
+/// A retired head's files are deleted once the retention window has passed
+/// since it was retired, and then its entry; before that both stay.
+#[tokio::test]
+async fn a_retired_head_is_cleaned_up_after_the_guard() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/cleanup:main";
+    school(&fluree, id).await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let manifest = fluree.reasoned_heads(id).await.unwrap().heads[&head]
+        .published
+        .clone()
+        .unwrap()
+        .manifest;
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree
+        .backend()
+        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
+    fluree.retire_reasoned_head(id, &head).await.unwrap();
+
+    // Inside the window: kept.
+    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+        min_age_ms: 3_600_000,
+        max_generations_in_guard: 8,
+    });
+    assert!(fluree
+        .clean_retired_reasoned_heads(id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store.has(&manifest).await.unwrap());
+
+    // Past it: files, then the entry.
+    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+        min_age_ms: 0,
+        max_generations_in_guard: 8,
+    });
+    assert_eq!(
+        fluree.clean_retired_reasoned_heads(id).await.unwrap(),
+        vec![head.clone()]
+    );
+    assert!(!store.has(&manifest).await.unwrap());
+    assert!(fluree.reasoned_heads(id).await.unwrap().heads.is_empty());
+}
+
+/// A branch takes at most `MAX_ACTIVE_HEADS` active heads.
+#[tokio::test]
+async fn a_branch_refuses_more_active_heads_than_its_limit() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/limit:main";
+    school(&fluree, id).await;
+    let max = fluree_db_api::reasoned::MAX_ACTIVE_HEADS;
+    for i in 0..max {
+        let rules = json!([{"@context": ctx(), "where": {"@id": "?x", "@type": "ex:Student"},
+                            "insert": {"@id": "?x", "ex:mark": i}}]);
+        fluree
+            .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+            .await
+            .unwrap();
+    }
+    let err = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("active reasoned heads"), "{err}");
+}

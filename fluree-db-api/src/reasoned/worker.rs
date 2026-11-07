@@ -138,7 +138,26 @@ impl ReasonedHeadWorker {
         let mut out = BTreeSet::new();
         for record in records.iter().filter(|r| !r.retracted && !r.frozen) {
             let id = record.ledger_id.to_string();
-            let active = self.has_active_heads(&id).await;
+            let doc = match self.fluree.nameservice().get_reasoned_heads(&id).await {
+                Ok(Some(doc)) => doc,
+                _ => {
+                    has_heads.insert(id, false);
+                    continue;
+                }
+            };
+            let active = doc
+                .heads
+                .values()
+                .any(|e| matches!(e.registration.state, RegistrationState::Active));
+            let retired = doc
+                .heads
+                .values()
+                .any(|e| matches!(e.registration.state, RegistrationState::Retired { .. }));
+            if retired {
+                if let Err(e) = self.fluree.clean_retired_reasoned_heads(&id).await {
+                    tracing::warn!(ledger = %id, error = %e, "retired reasoned heads not cleaned");
+                }
+            }
             has_heads.insert(id.clone(), active);
             if active {
                 out.insert(id);

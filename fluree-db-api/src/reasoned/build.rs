@@ -45,6 +45,10 @@ use crate::{ApiError, Fluree, Result};
 
 const CAS_ATTEMPTS: usize = 16;
 
+/// Active heads a branch may register. Each is a complete index of the
+/// branch, refreshed after every commit.
+pub const MAX_ACTIVE_HEADS: usize = 8;
+
 /// The materialization budget a worker runs under unless the program sets
 /// one: generous, since a capped result is never published.
 const WORKER_MAX_FACTS: u64 = 100_000_000;
@@ -164,6 +168,17 @@ impl Fluree {
             }) {
                 return Ok((None, head_id.clone()));
             }
+            let active = actual
+                .heads
+                .values()
+                .filter(|e| matches!(e.registration.state, RegistrationState::Active))
+                .count();
+            if active >= MAX_ACTIVE_HEADS {
+                return Err(ApiError::invalid_query(format!(
+                    "{id} already has {active} active reasoned heads, the most a branch may \
+                     have; retire one first"
+                )));
+            }
             let head_id =
                 HeadId::parse(&ulid::Ulid::new().to_string()).map_err(ApiError::internal)?;
             let mut next = actual.clone();
@@ -209,6 +224,71 @@ impl Fluree {
         .await?;
         self.reasoned.forget_head(&id, head_id);
         Ok(())
+    }
+
+    /// Delete the files of heads retired longer than the retention window,
+    /// then their entries. Their shared dictionary blobs are left for the
+    /// sweep. Returns the heads removed.
+    pub async fn clean_retired_reasoned_heads(&self, ledger_id: &str) -> Result<Vec<HeadId>> {
+        let id = canonical_id(ledger_id)?;
+        let doc = self.reasoned_heads(&id).await?;
+        let min_age_ms = self.reasoned.retention().min_age_ms;
+        let now = now_ms();
+        let due: Vec<HeadId> = doc
+            .heads
+            .iter()
+            .filter(|(_, e)| {
+                matches!(e.registration.state, RegistrationState::Retired { at_ms } if now - at_ms >= min_age_ms)
+            })
+            .map(|(head_id, _)| head_id.clone())
+            .collect();
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(storage) = self.backend().admin_storage_cloned() else {
+            return Ok(Vec::new());
+        };
+        let record = self.branch_record(&id).await?;
+        let method = storage.storage_method().to_string();
+        let mut cleaned = Vec::new();
+        for head_id in due {
+            let ns = record.storage_namespace().reasoned_head(head_id.as_str());
+            let prefix = format!("fluree:{method}://{}/", ns.branch_prefix());
+            let files = storage
+                .list_prefix(&prefix)
+                .await
+                .map_err(|e| ApiError::internal(format!("list {prefix}: {e}")))?;
+            let mut failed = false;
+            for file in &files {
+                if let Err(e) = storage.delete(file).await {
+                    tracing::warn!(file = %file, error = %e, "could not delete a retired head's file");
+                    failed = true;
+                }
+            }
+            if !failed {
+                cleaned.push(head_id);
+            }
+        }
+        // Remove the entries only once the files are gone: a Retired entry is
+        // how a later pass finds a folder an interrupted one left.
+        let removed = self
+            .update_reasoned_heads(&id, |actual| {
+                let mut next = actual.clone();
+                let before = next.heads.len();
+                next.heads.retain(|head_id, e| {
+                    !(cleaned.contains(head_id)
+                        && matches!(e.registration.state, RegistrationState::Retired { .. }))
+                });
+                Ok((
+                    (next.heads.len() != before).then_some(next),
+                    cleaned.clone(),
+                ))
+            })
+            .await?;
+        for head_id in &removed {
+            self.reasoned.forget_head(&id, head_id);
+        }
+        Ok(removed)
     }
 
     /// Bring every active head of the branch up to its current commit.
