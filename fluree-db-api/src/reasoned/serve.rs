@@ -29,6 +29,8 @@ use crate::{ApiError, Fluree, LedgerState, Result};
 pub(crate) struct ServedHead {
     pub view: GraphDb,
     pub tally: ReasonedHeadTally,
+    /// The generation the view reads, for the other graphs of a dataset.
+    pub generation: Arc<LoadedGeneration>,
 }
 
 const STRICT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -160,6 +162,7 @@ impl Fluree {
                     basis_t: generation.manifest.basis.t,
                     basis_commit: generation.manifest.basis.commit.to_string(),
                 },
+                generation,
             }));
         }
         Ok(None)
@@ -280,8 +283,8 @@ impl Fluree {
 }
 
 /// `base` with the head's state in place of its own: the same ledger,
-/// configuration and `t`, reading the head's index.
-fn head_view(base: &GraphDb, head: &LedgerState) -> GraphDb {
+/// configuration and graph, reading the head's index at its basis.
+pub(crate) fn head_view(base: &GraphDb, head: &LedgerState) -> GraphDb {
     let head = GraphDb::from_ledger_state(head);
     let mut view = base.clone();
     view.t = head.t;

@@ -14,7 +14,7 @@
 mod build;
 pub(crate) mod derived;
 pub(crate) mod program;
-mod serve;
+pub(crate) mod serve;
 mod worker;
 
 pub use build::RefreshOutcome;

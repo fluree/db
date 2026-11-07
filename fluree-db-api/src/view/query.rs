@@ -1576,6 +1576,54 @@ impl Fluree {
         ))
     }
 
+    /// [`Self::serve_from_reasoned_head`] for a dataset: served only when
+    /// every member is a graph of the primary view's ledger at its `t`, so
+    /// the head, which holds every graph, can stand in for all of them.
+    pub(crate) async fn serve_dataset_from_reasoned_head(
+        &self,
+        dataset: &crate::view::DataSetDb,
+        executable: &mut ExecutableQuery,
+        tracker: Option<&Tracker>,
+    ) -> Result<Option<crate::view::DataSetDb>> {
+        let Some(primary) = dataset.primary() else {
+            return Ok(None);
+        };
+        let within_ledger = dataset
+            .default
+            .iter()
+            .chain(dataset.named.values())
+            .all(|v| v.ledger_id == primary.ledger_id && v.t == primary.t);
+        if dataset.is_history_mode() || !within_ledger {
+            if executable.reasoning.modes.freshness
+                == fluree_db_query::ir::ReasoningFreshness::Strict
+                && crate::reasoned::program::materializes(&executable.reasoning)
+            {
+                return Err(ApiError::ReasonedHeadNotReady {
+                    ledger_id: primary.ledger_id.to_string(),
+                    t: primary.t,
+                });
+            }
+            return Ok(None);
+        }
+        let Some(served) = self
+            .reasoned_head_for(primary, &executable.reasoning)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let state = &served.generation.state;
+        let mut swapped = dataset.clone();
+        for view in swapped.default.iter_mut().chain(swapped.named.values_mut()) {
+            *view = crate::reasoned::serve::head_view(view, state);
+        }
+        executable.reasoning = fluree_db_query::ir::ReasoningConfig {
+            modes: fluree_db_query::ir::ReasoningModes::none(),
+            ..Default::default()
+        };
+        record_served(tracker, served.tally);
+        Ok(Some(swapped))
+    }
+
     /// Swap in a reasoned head when one can answer `executable` against
     /// `db`: the head view to run it against, with reasoning turned off and
     /// the head reported in the tracker's reasoning slot.
@@ -1592,19 +1640,7 @@ impl Fluree {
             modes: fluree_db_query::ir::ReasoningModes::none(),
             ..Default::default()
         };
-        if let Some(tracker) = tracker {
-            tracker.record_reasoning(fluree_db_core::ReasoningTally {
-                capped: false,
-                capped_reason: None,
-                derived_facts: 0,
-                iterations: 0,
-                duration_ms: 0,
-                capped_rules: Vec::new(),
-                pending_rules: Vec::new(),
-                evaluation_time: None,
-                head: Some(Box::new(served.tally)),
-            });
-        }
+        record_served(tracker, served.tally);
         Ok(Some(served.view))
     }
 
@@ -2854,5 +2890,22 @@ mod graph_source_guard_tests {
             .expect("a native ledger must still evaluate `edge+`");
         let rows: usize = result.batches.iter().map(fluree_db_query::Batch::len).sum();
         assert_eq!(rows, 2, "`edge+` from n1 reaches n2 and n3");
+    }
+}
+
+/// Report in the tracker's reasoning slot that a reasoned head answered.
+fn record_served(tracker: Option<&Tracker>, head: fluree_db_core::ReasonedHeadTally) {
+    if let Some(tracker) = tracker {
+        tracker.record_reasoning(fluree_db_core::ReasoningTally {
+            capped: false,
+            capped_reason: None,
+            derived_facts: 0,
+            iterations: 0,
+            duration_ms: 0,
+            capped_rules: Vec::new(),
+            pending_rules: Vec::new(),
+            evaluation_time: None,
+            head: Some(Box::new(head)),
+        });
     }
 }

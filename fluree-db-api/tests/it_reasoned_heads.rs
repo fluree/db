@@ -1413,3 +1413,65 @@ async fn two_heads_of_a_branch_publish_concurrently() {
     assert_eq!(served.map(|h| h.head_id), Some(owl.to_string()));
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
 }
+
+/// A dataset of one ledger's graphs (`from` and `fromNamed` naming the same
+/// ledger) is answered from the head, every graph read from it.
+#[tokio::test]
+async fn a_within_ledger_dataset_is_served_from_the_head() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/dataset:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let _ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(TRIG)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let ex = json!({"ex": "http://example.org/"});
+    let rules = json!([{
+        "@context": ex,
+        "where": [{"@id": "?x", "ex:parent": "?y"}, {"@id": "?y", "ex:parent": "?z"}],
+        "insert": {"@id": "?x", "@graph": "ex:inferred", "ex:grandparent": {"@id": "?z"}}
+    }]);
+    let q = json!({
+        "@context": ex,
+        "from": id,
+        "fromNamed": [format!("{id}#http://example.org/inferred")],
+        "select": ["?x", "?z"],
+        "where": [["graph", "?g", {"@id": "?x", "ex:grandparent": "?z"}]],
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let run = |q: JsonValue| {
+        let fluree = &fluree;
+        async move {
+            let resp = fluree
+                .query_from()
+                .jsonld(&q)
+                .track_all()
+                .execute_tracked()
+                .await
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            (
+                normalize_rows(&resp.result),
+                resp.reasoning.and_then(|r| r.head).is_some(),
+            )
+        }
+    };
+    let (expected, served) = run(q.clone()).await;
+    assert!(!served);
+    assert_eq!(
+        expected,
+        vec![json!(["ex:a", "ex:c"]), json!(["ex:b", "ex:d"])]
+    );
+
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (got, served) = run(q).await;
+    assert!(served, "a dataset of one ledger's graphs is served");
+    assert_eq!(got, expected);
+}

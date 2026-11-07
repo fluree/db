@@ -183,9 +183,14 @@ impl Fluree {
         )?;
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .await?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         // 4. Execute against merged dataset
         let batches = self
@@ -297,9 +302,14 @@ impl Fluree {
         )?;
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .await?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         // 4. Execute against merged dataset
         let batches = self
@@ -439,10 +449,16 @@ impl Fluree {
         // Report the error's own status, as the single-view tracked path
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         // Execute with tracking
         let batches = self
@@ -547,10 +563,16 @@ impl Fluree {
         // Report the error's own status, as the single-view tracked path
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         let batches = self
             .execute_dataset_tracked_with_r2rml(
