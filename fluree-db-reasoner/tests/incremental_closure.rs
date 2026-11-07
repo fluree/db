@@ -176,3 +176,42 @@ async fn identity_rules_and_same_as_are_left_to_a_full_run() {
     let plain = [base, inserted.clone()].concat();
     assert!(gained(plain, &inserted).await.is_some());
 }
+
+/// A conclusion of a predicate no rule reads (a super-property, a chain's
+/// head) that the state already holds is not gained, whether asserted or
+/// derived before; one it does not hold is.
+#[tokio::test]
+async fn a_conclusion_the_state_already_holds_is_not_gained() {
+    let rdf = |l: &str| Sid::new(3, l);
+    let ontology = vec![
+        fact(ex("advisor"), Sid::new(4, "subPropertyOf"), ex("knows")),
+        fact(
+            ex("grandparent"),
+            Sid::new(6, "propertyChainAxiom"),
+            ex("l1"),
+        ),
+        fact(ex("l1"), rdf("first"), ex("parent")),
+        fact(ex("l1"), rdf("rest"), ex("l2")),
+        fact(ex("l2"), rdf("first"), ex("parent")),
+        fact(ex("l2"), rdf("rest"), rdf("nil")),
+    ];
+    let held = vec![
+        fact(ex("a"), ex("knows"), ex("b")),
+        fact(ex("b"), ex("parent"), ex("c")),
+        fact(ex("a"), ex("grandparent"), ex("c")),
+    ];
+    let inserted = vec![
+        fact(ex("a"), ex("advisor"), ex("b")),
+        fact(ex("a"), ex("parent"), ex("b")),
+        fact(ex("a"), ex("advisor"), ex("z")),
+    ];
+    let state: Vec<Flake> = ontology
+        .into_iter()
+        .chain(held)
+        .chain(inserted.iter().cloned())
+        .collect();
+
+    let gained = gained(state, &inserted).await.expect("maintainable");
+    let expected: HashSet<Flake> = [fact(ex("a"), ex("knows"), ex("z"))].into_iter().collect();
+    assert_eq!(gained, expected);
+}

@@ -1585,6 +1585,39 @@ mod tests {
     /// Every fact of the ledger with owl2rl reasoning, answered from the
     /// index when `served`, else at query time by an equivalent program the
     /// index does not match (datalog with no rules derives nothing).
+    /// Refresh, expecting a closure of kind `closure`, and compare D and the
+    /// served results with a full recompute.
+    async fn refresh_and_compare(
+        fluree: &Fluree,
+        id: &str,
+        index: &ReasoningIndexId,
+        program: &serde_json::Value,
+        closure: ClosureMode,
+        step: usize,
+    ) {
+        match fluree.refresh_reasoning_index(id, index).await.unwrap() {
+            RefreshOutcome::Published { stats, .. } => {
+                assert_eq!(stats.closure, closure, "step {step}");
+            }
+            other => panic!("step {step}: {other:?}"),
+        }
+        let persisted = persisted_derived(fluree, id, index).await;
+        let full = full_derived(fluree, id, program).await;
+        assert_eq!(
+            persisted.len(),
+            full.len(),
+            "step {step}: only incremental {:?}, only full {:?}",
+            persisted.difference(&full).collect::<Vec<_>>(),
+            full.difference(&persisted).collect::<Vec<_>>()
+        );
+        assert_eq!(persisted, full, "step {step}");
+        assert_eq!(
+            whole_graph(fluree, id, true).await,
+            whole_graph(fluree, id, false).await,
+            "step {step}"
+        );
+    }
+
     async fn whole_graph(fluree: &Fluree, id: &str, served: bool) -> Vec<String> {
         let reasoning = if served {
             json!("owl2rl")
@@ -1692,6 +1725,7 @@ mod tests {
                      "owl:unionOf": {"@list": [{"@id": "ex:Person"}, {"@id": "ex:Org"}]}},
                     {"@id": "ex:grandparent",
                      "owl:propertyChainAxiom": {"@list": [{"@id": "ex:parent"}, {"@id": "ex:parent"}]}},
+                    {"@id": "ex:mentor", "rdfs:subPropertyOf": {"@id": "ex:guides"}},
                     {"@id": "ex:e0", "@type": "ex:GradStudent"}
                 ]}),
             )
@@ -1731,11 +1765,13 @@ mod tests {
             if !asserted.is_empty() {
                 facts.push(asserted[rng.next(asserted.len())].clone());
             }
-            // Assert a fact the index holds as derived.
-            let derived: Vec<(Option<Sid>, Flake)> = persisted_derived(&fluree, id, &index)
+            // Assert a fact the index holds as derived (in a stable order,
+            // so a seed always picks the same one).
+            let mut derived: Vec<(Option<Sid>, Flake)> = persisted_derived(&fluree, id, &index)
                 .await
                 .into_iter()
                 .collect();
+            derived.sort_by_key(|(g, f)| format!("{g:?}{f:?}"));
             if !derived.is_empty() {
                 let (_, flake) = &derived[rng.next(derived.len())];
                 if let fluree_db_core::FlakeValue::Ref(o) = &flake.o {
@@ -1747,8 +1783,13 @@ mod tests {
                     transitions += 1;
                 }
             }
-            for _ in 0..8 {
-                let s = format!("ex:e{}", rng.next(12));
+            for k in 0..8 {
+                // Mostly recurring subjects; now and then a new term.
+                let s = if rng.next(6) == 0 {
+                    format!("ex:n{step}-{k}")
+                } else {
+                    format!("ex:e{}", rng.next(12))
+                };
                 if rng.next(3) == 0 {
                     facts.push(json!({"@id": s, "@type": classes[rng.next(classes.len())]}));
                 } else {
@@ -1763,34 +1804,114 @@ mod tests {
                 }
             }
             asserted.extend(facts.iter().cloned());
+            // Some windows span two commits.
+            let split = if step % 3 == 1 { facts.len() / 2 } else { 0 };
+            for part in [&facts[..split], &facts[split..]] {
+                if !part.is_empty() {
+                    ledger = fluree
+                        .insert(ledger, &json!({"@context": ctx, "@graph": part}))
+                        .await
+                        .unwrap()
+                        .ledger;
+                }
+            }
+            // Some windows also insert into a graph the program does not
+            // reason over.
+            if step % 4 == 2 {
+                ledger = fluree
+                    .insert_turtle(
+                        ledger,
+                        &format!(
+                            "@prefix ex: <http://example.org/> .\n\
+                             GRAPH ex:side {{ ex:side{step} a ex:Student ; ex:partOf ex:e1 . }}"
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .ledger;
+            }
+            refresh_and_compare(
+                &fluree,
+                id,
+                &index,
+                &program,
+                ClosureMode::Incremental,
+                step,
+            )
+            .await;
+            partitions.push(bucket_count(&fluree, id, &index).await);
+        }
+
+        // Conclusions of predicates no rule reads, already held: a derived
+        // chain head asserted and then derived again another way, and a
+        // super-property fact asserted before its sub-property fact.
+        let mut step = 24;
+        for facts in [
+            json!([{"@id": "ex:q1", "ex:parent": {"@id": "ex:q2"}},
+                   {"@id": "ex:q2", "ex:parent": {"@id": "ex:q3"}},
+                   {"@id": "ex:q5", "ex:guides": {"@id": "ex:q6"}}]),
+            json!([{"@id": "ex:q1", "ex:grandparent": {"@id": "ex:q3"}}]),
+            json!([{"@id": "ex:q1", "ex:parent": {"@id": "ex:q4"}},
+                   {"@id": "ex:q4", "ex:parent": {"@id": "ex:q3"}},
+                   {"@id": "ex:q5", "ex:mentor": {"@id": "ex:q6"}}]),
+        ] {
             ledger = fluree
                 .insert(ledger, &json!({"@context": ctx, "@graph": facts}))
                 .await
                 .unwrap()
                 .ledger;
-            match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
-                RefreshOutcome::Published { stats, .. } => {
-                    assert_eq!(stats.closure, ClosureMode::Incremental, "step {step}");
-                }
-                other => panic!("step {step}: {other:?}"),
-            }
-            let persisted = persisted_derived(&fluree, id, &index).await;
-            let full = full_derived(&fluree, id, &program).await;
-            assert_eq!(
-                persisted.len(),
-                full.len(),
-                "step {step}: only incremental {:?}, only full {:?}",
-                persisted.difference(&full).collect::<Vec<_>>(),
-                full.difference(&persisted).collect::<Vec<_>>()
-            );
-            assert_eq!(persisted, full, "step {step}");
-            assert_eq!(
-                whole_graph(&fluree, id, true).await,
-                whole_graph(&fluree, id, false).await,
-                "step {step}"
-            );
-            partitions.push(bucket_count(&fluree, id, &index).await);
+            refresh_and_compare(
+                &fluree,
+                id,
+                &index,
+                &program,
+                ClosureMode::Incremental,
+                step,
+            )
+            .await;
+            step += 1;
         }
+
+        // A retraction is maintained by a full closure, and the next
+        // insertion is incremental again over it.
+        let gone = asserted[rng.next(asserted.len())].clone();
+        ledger = fluree
+            .update(
+                ledger,
+                &json!({"@context": ctx, "delete": gone.clone(), "where": gone}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        refresh_and_compare(&fluree, id, &index, &program, ClosureMode::Full, step).await;
+        let _ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@graph": [
+                    {"@id": "ex:e3", "ex:partOf": {"@id": "ex:e4"}},
+                    {"@id": "ex:n-last", "@type": "ex:GradStudent"}
+                ]}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        refresh_and_compare(
+            &fluree,
+            id,
+            &index,
+            &program,
+            ClosureMode::Incremental,
+            step + 1,
+        )
+        .await;
+        let db = fluree.db(id).await.unwrap();
+        assert!(
+            db.snapshot
+                .graph_registry
+                .assigned_graph_id("http://example.org/side")
+                .is_some(),
+            "the side graph is a named graph"
+        );
         partitions.dedup();
         assert!(
             partitions.len() >= 3,

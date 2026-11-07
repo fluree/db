@@ -36,6 +36,7 @@ use crate::restrictions::{extract_restrictions, RestrictionIndex};
 use crate::same_as::SameAsTracker;
 use crate::{FrozenSameAs, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result};
 use fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL;
+use hashbrown::{HashMap, HashSet};
 
 /// Run OWL2-RL reasoning to fixpoint
 ///
@@ -161,7 +162,11 @@ async fn run(
 
     // Seed initial delta with all base facts for relevant predicates
     let extracted_ms = start.elapsed().as_millis() as u64;
-    let mut delta = seed_initial_delta(db, &ontology, &restrictions).await?;
+    let (mut delta, loaded) = seed_initial_delta(db, &ontology, &restrictions).await?;
+    // Maintaining a closed state, facts of the other predicates are not all
+    // known to the run: a conclusion of one is checked against the state.
+    let loaded = inserted.is_some().then_some(loaded);
+    let mut closed_state_reads = 0usize;
     let seeded_ms = start.elapsed().as_millis() as u64;
 
     // Accumulated derived facts
@@ -406,9 +411,32 @@ async fn run(
             derived.try_add(flake.clone());
         }
 
+        // A conclusion the closed state already holds is known, not derived,
+        // and its consequences are already in that state.
+        let known = match &loaded {
+            Some(loaded) => {
+                let (known, reads) =
+                    known_in_closed_state(db, &new_delta, loaded, &derived).await?;
+                closed_state_reads += reads;
+                known
+            }
+            None => HashSet::new(),
+        };
+
         // Filter new_delta to only include truly new facts
         let mut filtered_delta = DeltaSet::new();
         for flake in new_delta.iter() {
+            if !known.is_empty()
+                && known.contains(&(
+                    flake.s.clone(),
+                    flake.p.clone(),
+                    DerivedSet::object_hash(&flake.o),
+                ))
+            {
+                derived.register_base(flake);
+                derived.try_add(flake.clone());
+                continue;
+            }
             if derived.try_add(flake.clone()) {
                 filtered_delta.push(flake.clone());
             }
@@ -447,6 +475,7 @@ async fn run(
         join_index_ms = joined_ms - seeded_ms,
         rounds_ms = total_ms - joined_ms,
         convert_ms = start.elapsed().as_millis() as u64 - total_ms,
+        closed_state_reads,
         rounds = iterations,
         derived = derived_len,
         "OWL 2 RL fixpoint phases"
@@ -608,11 +637,14 @@ fn fire_class_rule(
 /// - Facts with inverse-functional properties (for prp-ifp)
 /// - Facts with restricted properties (hasValue, someValuesFrom, etc.)
 /// - owl:sameAs facts
+///
+/// Returns those predicates too: the ones whose facts are all known to the
+/// run.
 async fn seed_initial_delta(
     db: GraphDbRef<'_>,
     ontology: &OntologyRL,
     restrictions: &RestrictionIndex,
-) -> Result<DeltaSet> {
+) -> Result<(DeltaSet, HashSet<Sid>)> {
     let mut delta = DeltaSet::new();
 
     // Collect all predicates we need to query
@@ -704,6 +736,8 @@ async fn seed_initial_delta(
     let needs_type_facts =
         !key_properties.is_empty() || ontology.has_class_rules() || !restrictions.is_empty();
 
+    let mut loaded: HashSet<Sid> = predicates_to_query.iter().map(|p| (*p).clone()).collect();
+
     // Query facts for each relevant predicate using PSOT index
     for p in predicates_to_query {
         let flakes: Vec<Flake> = db
@@ -728,6 +762,7 @@ async fn seed_initial_delta(
     // Load rdf:type facts for hasKey and class hierarchy rules
     if needs_type_facts {
         let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
+        loaded.insert(rdf_type_sid.clone());
         let type_flakes: Vec<Flake> = db
             .range(
                 IndexType::Psot,
@@ -749,6 +784,7 @@ async fn seed_initial_delta(
 
     // Also seed owl:sameAs facts
     let owl_same_as_sid = owl::same_as_sid();
+    loaded.insert(owl_same_as_sid.clone());
     let same_as_flakes: Vec<Flake> = db
         .range(
             IndexType::Psot,
@@ -767,7 +803,47 @@ async fn seed_initial_delta(
         delta.push(flake);
     }
 
-    Ok(delta)
+    Ok((delta, loaded))
+}
+
+/// The keys of the `candidates` the closed state `db` already holds, among
+/// those of a predicate the run did not load (`loaded`) and not yet known to
+/// `derived`. One subject-predicate read per pair.
+async fn known_in_closed_state(
+    db: GraphDbRef<'_>,
+    candidates: &DeltaSet,
+    loaded: &HashSet<Sid>,
+    derived: &DerivedSet,
+) -> Result<(HashSet<(Sid, Sid, u64)>, usize)> {
+    let mut wanted: HashMap<(Sid, Sid), HashSet<u64>> = HashMap::new();
+    for f in candidates.iter() {
+        if !loaded.contains(&f.p) && !derived.contains(&f.s, &f.p, &f.o) {
+            wanted
+                .entry((f.s.clone(), f.p.clone()))
+                .or_default()
+                .insert(DerivedSet::object_hash(&f.o));
+        }
+    }
+    let reads = wanted.len();
+    let mut known = HashSet::new();
+    for ((s, p), objects) in wanted {
+        let held = db
+            .range(
+                IndexType::Psot,
+                RangeTest::Eq,
+                RangeMatch::subject_predicate(s.clone(), p.clone()),
+            )
+            .await?;
+        for f in held {
+            if f.op && f.s == s && f.p == p {
+                let o = DerivedSet::object_hash(&f.o);
+                if objects.contains(&o) {
+                    known.insert((s.clone(), p.clone(), o));
+                }
+            }
+        }
+    }
+    Ok((known, reads))
 }
 
 /// Generate explicit owl:sameAs flakes from the equivalence classes.
