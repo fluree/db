@@ -68,6 +68,9 @@ pub enum RefreshOutcome {
     Failed { reason: String },
     /// Another refresh of this head is under way.
     InFlight,
+    /// The head already holds as many superseded generations inside the
+    /// retention window as it may; publication waits for them to age out.
+    Throttled { in_guard: usize },
 }
 
 fn now_ms() -> i64 {
@@ -266,6 +269,30 @@ impl Fluree {
                 return Ok(RefreshOutcome::Current {
                     generation: published.generation,
                 });
+            }
+        }
+
+        // Publication waits rather than let the head collector shorten the
+        // protection of generations queries may still be reading.
+        if let Some(published) = &entry.published {
+            let retention = self.reasoned.retention();
+            let head_cs = self
+                .backend()
+                .content_store(&record.storage_namespace().reasoned_head(head_id.as_str()));
+            let generations = fluree_db_indexer::gc::heads::head_generations(
+                head_cs.as_ref(),
+                &published.manifest,
+            )
+            .await
+            .map_err(|e| ApiError::internal(format!("read head chain: {e}")))?;
+            let plan = fluree_db_indexer::gc::heads::plan_head_release(
+                generations,
+                now_ms(),
+                retention.min_age_ms,
+            );
+            let in_guard = fluree_db_indexer::gc::heads::generations_in_guard(&plan);
+            if in_guard >= retention.max_generations_in_guard {
+                return Ok(RefreshOutcome::Throttled { in_guard });
             }
         }
 
@@ -491,6 +518,12 @@ impl Fluree {
         {
             Ok(generation) => {
                 self.reasoned.forget_head(ledger_id, head_id);
+                if let Err(e) = self
+                    .collect_head(ledger_id, head_id, head_cs.as_ref())
+                    .await
+                {
+                    tracing::warn!(head = %head_id, error = %e, "reasoned-head collection failed");
+                }
                 Ok(RefreshOutcome::Published {
                     generation,
                     kind,
@@ -502,6 +535,43 @@ impl Fluree {
                 reason: discard.to_string(),
             }),
         }
+    }
+
+    /// Set how long superseded generations are kept, and how many a head
+    /// may hold inside that window before publication waits.
+    pub fn set_reasoned_head_retention(&self, retention: super::HeadRetention) {
+        self.reasoned.set_retention(retention);
+    }
+
+    /// Release a head's superseded generations once the retention window has
+    /// passed since each was superseded. Shared dictionary blobs are left for
+    /// the sweep, which sees every participant at once.
+    async fn collect_head(
+        &self,
+        ledger_id: &str,
+        head_id: &HeadId,
+        head_cs: &dyn ContentStore,
+    ) -> Result<()> {
+        let doc = self.reasoned_heads(ledger_id).await?;
+        let Some(pointer) = doc.heads.get(head_id).and_then(|e| e.published.as_ref()) else {
+            return Ok(());
+        };
+        let generations =
+            fluree_db_indexer::gc::heads::head_generations(head_cs, &pointer.manifest)
+                .await
+                .map_err(|e| ApiError::internal(format!("read head chain: {e}")))?;
+        let plan = fluree_db_indexer::gc::heads::plan_head_release(
+            generations,
+            now_ms(),
+            self.reasoned.retention().min_age_ms,
+        );
+        let released = fluree_db_indexer::gc::heads::release_head_generations(head_cs, &plan, None)
+            .await
+            .map_err(|e| ApiError::internal(format!("release head generations: {e}")))?;
+        if released.generations > 0 {
+            tracing::debug!(head = %head_id, ?released, "released superseded head generations");
+        }
+        Ok(())
     }
 
     /// The branch record and a view of the branch at exactly its commit

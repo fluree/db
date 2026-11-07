@@ -679,3 +679,101 @@ async fn the_branch_collector_keeps_dictionaries_a_head_reaches() {
         ]
     );
 }
+
+async fn student_commit(
+    fluree: &Fluree,
+    ledger: fluree_db_api::LedgerState,
+    name: &str,
+) -> fluree_db_api::LedgerState {
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": format!("ex:{name}"), "@type": "ex:Student"}),
+        )
+        .await
+        .unwrap()
+        .ledger
+}
+
+async fn chain_len(
+    fluree: &Fluree,
+    id: &str,
+    head: &fluree_db_core::reasoned_head::HeadId,
+) -> usize {
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree
+        .backend()
+        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
+    let doc = fluree.reasoned_heads(id).await.unwrap();
+    let pointer = doc.heads[head].published.clone().unwrap();
+    fluree_db_indexer::gc::heads::head_generations(store.as_ref(), &pointer.manifest)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// With no retention window, each publication releases the generations it
+/// superseded, and the head keeps answering.
+#[tokio::test]
+async fn superseded_generations_are_released_after_the_guard() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+        min_age_ms: 0,
+        max_generations_in_guard: 8,
+    });
+    let id = "heads/retention:main";
+    let mut ledger = ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}}),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    for name in ["alice", "bob", "carol"] {
+        ledger = student_commit(&fluree, ledger, name).await;
+        published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    }
+    assert_eq!(chain_len(&fluree, id, &head).await, 1);
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert_eq!(served.map(|h| h.generation), Some(3));
+    assert_eq!(
+        people,
+        vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
+    );
+}
+
+/// Inside the window nothing is released, and once the head holds as many
+/// superseded generations as it may, publication waits.
+#[tokio::test]
+async fn publication_waits_rather_than_shorten_the_guard() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+        min_age_ms: 3_600_000,
+        max_generations_in_guard: 1,
+    });
+    let id = "heads/throttle:main";
+    let mut ledger = ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}}),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    ledger = student_commit(&fluree, ledger, "alice").await;
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    ledger = student_commit(&fluree, ledger, "bob").await;
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    assert_eq!(chain_len(&fluree, id, &head).await, 2);
+    let _ledger = student_commit(&fluree, ledger, "carol").await;
+    assert_eq!(
+        fluree.refresh_reasoned_head(id, &head).await.unwrap(),
+        RefreshOutcome::Throttled { in_guard: 1 }
+    );
+    assert_eq!(chain_len(&fluree, id, &head).await, 2);
+}

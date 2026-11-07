@@ -37,12 +37,35 @@ pub(crate) struct LoadedGeneration {
 /// How many loaded generations an instance keeps.
 const LOADED_GENERATIONS: usize = 16;
 
-/// Per-instance reasoned-head state: which heads are being refreshed, and
-/// the generations loaded for serving.
+/// How long superseded generations are kept, and how many a head may
+/// accumulate inside that window before publication waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadRetention {
+    /// A superseded generation is kept until this long after its successor
+    /// was published, so queries already reading it can finish. Nothing
+    /// overrides it.
+    pub min_age_ms: i64,
+    /// Publication waits (refreshes report [`RefreshOutcome::Throttled`])
+    /// while this many superseded generations are still inside the window.
+    pub max_generations_in_guard: usize,
+}
+
+impl Default for HeadRetention {
+    fn default() -> Self {
+        Self {
+            min_age_ms: 15 * 60 * 1000,
+            max_generations_in_guard: 32,
+        }
+    }
+}
+
+/// Per-instance reasoned-head state: which heads are being refreshed, the
+/// generations loaded for serving, and the retention settings.
 #[derive(Default)]
 pub(crate) struct HeadState {
     flights: Mutex<HashSet<(String, HeadId)>>,
     loaded: Mutex<HashMap<(String, HeadId), Arc<LoadedGeneration>>>,
+    retention: Mutex<HeadRetention>,
 }
 
 impl std::fmt::Debug for HeadState {
@@ -67,6 +90,14 @@ impl Drop for Flight<'_> {
 }
 
 impl HeadState {
+    pub(crate) fn retention(&self) -> HeadRetention {
+        *self.retention.lock()
+    }
+
+    pub(crate) fn set_retention(&self, retention: HeadRetention) {
+        *self.retention.lock() = retention;
+    }
+
     pub(crate) fn begin(&self, ledger_id: &str, head_id: &HeadId) -> Option<Flight<'_>> {
         let key = (ledger_id.to_string(), head_id.clone());
         self.flights
