@@ -184,6 +184,11 @@ storage. This means:
 - **Time-travel safe** — querying a historical point in time materializes based
   on that point's data and schema.
 
+A program can also be registered as a **reasoned head**, which persists its
+derived facts in a merged index kept current in the background, so matching
+queries skip materialization entirely. See
+[Persisted reasoning](../query/reasoned-heads.md).
+
 ### owl:sameAs and identity
 
 When OWL 2 RL is enabled, the engine tracks `owl:sameAs` equivalences using an
