@@ -2202,3 +2202,55 @@ async fn a_sweep_reclaims_unpublished_index_files() {
     assert!(served.is_some());
     assert_eq!(people.len(), 3);
 }
+
+/// The same fact derived into two graphs is two facts of D: once its
+/// support is retracted, the next generation retracts it from both.
+#[tokio::test]
+async fn a_fact_derived_into_two_graphs_leaves_both_when_its_support_does() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/two-graphs:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .
+             ex:a ex:support true .
+             GRAPH ex:g { ex:marker ex:marker true . }",
+        )
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let rules = json!([
+        {"@context": ctx(), "where": {"@id": "?x", "ex:support": true},
+         "insert": {"@id": "?x", "ex:q": {"@id": "ex:o"}}},
+        {"@context": ctx(), "where": {"@id": "?x", "ex:support": true},
+         "insert": {"@id": "?x", "@graph": "ex:g", "ex:q": {"@id": "ex:o"}}}
+    ]);
+    let in_default = json!({"@context": ctx(), "select": ["?s", "?o"],
+        "where": {"@id": "?s", "ex:q": "?o"}, "reasoning": "datalog", "rules": rules});
+    let in_named = json!({"@context": ctx(), "select": ["?s", "?o"],
+        "where": [["graph", "http://example.org/g", {"@id": "?s", "ex:q": "?o"}]],
+        "reasoning": "datalog", "rules": rules});
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    for q in [&in_default, &in_named] {
+        let (got, served) = rows(&fluree, id, q).await;
+        assert!(served.is_some());
+        assert_eq!(got.len(), 1, "{q}");
+    }
+
+    let _ledger = retract(&fluree, ledger, json!({"@id": "ex:a", "ex:support": true})).await;
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    for q in [&in_default, &in_named] {
+        let (got, served) = rows(&fluree, id, q).await;
+        assert!(served.is_some());
+        assert!(
+            got.is_empty(),
+            "an unsupported fact is still served: {got:?}, {q}"
+        );
+    }
+}

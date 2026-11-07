@@ -53,10 +53,16 @@ fn bucket_of(flake: &Flake, buckets: usize) -> usize {
     (n % buckets as u64) as usize
 }
 
+/// A fact's place in a bucket. The index order ignores the graph, and the
+/// same fact in two graphs is two facts.
+fn bucket_order(a: &Flake, b: &Flake) -> std::cmp::Ordering {
+    a.g.cmp(&b.g).then_with(|| IndexType::Spot.compare(a, b))
+}
+
 /// A bucket's facts, sorted and deduplicated, as its content-addressed blob.
 fn encode_bucket(mut bucket: Vec<Flake>) -> Result<(ContentId, Vec<u8>)> {
-    bucket.sort_by(|a, b| IndexType::Spot.compare(a, b));
-    bucket.dedup_by(|a, b| IndexType::Spot.compare(a, b).is_eq());
+    bucket.sort_by(bucket_order);
+    bucket.dedup_by(|a, b| bucket_order(a, b).is_eq());
     let mut bytes = DERIVED_FACTS_MAGIC.to_vec();
     bytes.extend(encode_facts(0, bucket)?);
     Ok((ContentId::new(ContentKind::DerivedFacts, &bytes), bytes))
@@ -315,6 +321,30 @@ mod tests {
             "{changed} buckets rewritten for 3 changed facts"
         );
         assert_eq!(before.len(), after.len());
+    }
+
+    /// The same fact in two graphs, in one bucket, is held twice, and an
+    /// update that removes one keeps the other.
+    #[tokio::test]
+    async fn a_bucket_keeps_the_same_fact_in_each_graph() {
+        let store = MemoryContentStore::new();
+        let named = in_graph(fact("s", 1), "g");
+        let both = vec![fact("s", 1), named.clone()];
+        let id = write_derived_only(&store, both.clone()).await.unwrap();
+        assert_eq!(buckets(&store, &id).await.len(), 1);
+        assert_eq!(
+            keyed(read_derived_only(&store, &id).await.unwrap()),
+            keyed(both)
+        );
+
+        let (updated, facts) = update_derived_only(&store, &id, vec![fact("s", 2)], Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(facts, 1);
+        assert_eq!(
+            keyed(read_derived_only(&store, &updated).await.unwrap()),
+            keyed(vec![named])
+        );
     }
 
     /// Growing past its buckets repartitions the set, and nothing is lost.
