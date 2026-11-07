@@ -73,8 +73,12 @@ pub async fn index_generations(
     Ok(out)
 }
 
-/// Everything one generation reaches: its manifest, its root and the root's
-/// expansion, and its derived-only set.
+/// Everything one generation reaches: its manifest, its root with the root's
+/// expansion and garbage record, and its derived-only set. Not the roots
+/// behind its root: a rebuild's root is built over a copy of the branch's,
+/// whose chain leads to roots an earlier generation copied, and no reader
+/// goes past a generation's own root. The index collector and the sweep both
+/// take a generation to be exactly this.
 pub async fn generation_reach(
     store: &dyn ContentStore,
     generation: &IndexGeneration,
@@ -96,6 +100,9 @@ pub async fn generation_reach(
         .await
         .map_err(|e| IndexerError::StorageRead(format!("expand reasoning-index root: {e}")))?;
     let mut reach = ids.into_ids();
+    if let Some(garbage) = &root.garbage {
+        reach.insert(garbage.id.clone());
+    }
     reach.insert(generation.manifest.root.clone());
     reach.insert(generation.manifest.derived.clone());
     reach.insert(generation.manifest_id.clone());
@@ -175,14 +182,12 @@ pub async fn shared_refs_of_branch_indexes(
 /// What a sweep keeps and lists for the reasoning indexes of `branches`.
 #[derive(Debug, Default)]
 pub struct IndexSweepFiles {
-    /// One participant per generation still in storage, rooted in its
-    /// index's namespace, so every file a retained generation reaches is
-    /// live; and one with no root for an index that has published nothing,
-    /// so the files of a build that never published are listed too.
+    /// One participant per index, with no root: its namespace's index folder
+    /// is listed, and what is live there is in `extra`.
     pub participants: Vec<crate::gc::BranchIndexHead>,
-    /// Each index's manifests and derived-only sets, which no root reaches:
-    /// those of retained generations are live, the rest (a lost publication,
-    /// a crash) are reclaimed.
+    /// Each index's folders, with everything its retained generations reach
+    /// ([`generation_reach`]) live; the rest (a lost publication, a crash,
+    /// the base roots a rebuild copied) is reclaimed.
     pub extra: Vec<crate::gc::ExtraSweepFiles>,
 }
 
@@ -209,43 +214,35 @@ pub async fn index_sweep_files(
                 Some(pointer) => index_generations(store.as_ref(), &pointer.manifest).await?,
                 None => Vec::new(),
             };
-            let mut live = Vec::new();
+            let mut live = HashSet::new();
             for generation in &generations {
-                live.push(generation.manifest_id.clone());
-                live.push(generation.manifest.derived.clone());
-                let bytes = store.get(&generation.manifest.derived).await.map_err(|e| {
-                    IndexerError::StorageRead(format!(
-                        "derived-only set {} of a retained generation: {e}; refusing to sweep",
-                        generation.manifest.derived
+                live.extend(
+                    generation_reach(store.as_ref(), generation)
+                        .await
+                        .map_err(|e| {
+                            IndexerError::StorageRead(format!(
+                        "generation {} of reasoning index {index_id}: {e}; refusing to sweep",
+                        generation.manifest_id
                     ))
-                })?;
-                let derived = fluree_db_core::reasoning_index::DerivedIndex::decode(&bytes)
-                    .map_err(|e| IndexerError::StorageRead(format!("derived-only set: {e}")))?;
-                live.extend(derived.buckets);
-                out.participants.push(crate::gc::BranchIndexHead {
-                    ledger_id: branch.ledger_id.clone(),
-                    namespace: namespace.clone(),
-                    index_head_id: Some(generation.manifest.root.clone()),
-                });
+                        })?,
+                );
             }
-            if generations.is_empty() {
-                out.participants.push(crate::gc::BranchIndexHead {
-                    ledger_id: branch.ledger_id.clone(),
-                    namespace: namespace.clone(),
-                    index_head_id: None,
-                });
-            }
+            out.participants.push(crate::gc::BranchIndexHead {
+                ledger_id: branch.ledger_id.clone(),
+                namespace: namespace.clone(),
+                index_head_id: None,
+            });
             out.extra.push(crate::gc::ExtraSweepFiles {
                 namespace,
                 folders: vec!["manifests", "derived"],
-                live,
+                live: live.into_iter().collect(),
             });
         }
     }
     Ok(out)
 }
 
-/// Which generations an index pass keeps and which it may release./// Which generations an index pass keeps and which it may release.
+/// Which generations an index pass keeps and which it may release.
 #[derive(Debug, Default)]
 pub struct GenerationReleasePlan {
     pub retained: Vec<IndexGeneration>,

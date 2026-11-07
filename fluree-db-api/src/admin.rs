@@ -3232,10 +3232,10 @@ impl crate::Fluree {
                 index_head_id: current.and_then(|r| r.index_head_id),
             });
         }
-        // Each retained generation of each reasoning index takes part as its
-        // own chain, in its index's namespace; every registered index's
-        // folders are listed, so what a lost or unfinished publication left
-        // is reclaimed.
+        // Every registered reasoning index's folders are listed, with what
+        // its retained generations reach live, so what a lost or unfinished
+        // publication left, and the base roots a rebuild copied, is
+        // reclaimed.
         let indexes = fluree_db_indexer::gc::reasoning_indexes::index_sweep_files(
             self.backend(),
             self.nameservice(),

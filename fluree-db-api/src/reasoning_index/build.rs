@@ -2159,6 +2159,208 @@ mod tests {
         assert_eq!(alice_classes(&older, id).await.1, Some(1));
     }
 
+    /// The dictionary blobs an index root references.
+    async fn dict_blobs(
+        store: &dyn ContentStore,
+        root: &fluree_db_core::ContentId,
+    ) -> HashSet<fluree_db_core::ContentId> {
+        fluree_db_binary_index::format::index_root::IndexRoot::decode(
+            &store.get(root).await.unwrap(),
+        )
+        .unwrap()
+        .all_cas_ids()
+        .into_iter()
+        .filter(|cid| matches!(cid.content_kind(), Some(ContentKind::DictBlob { .. })))
+        .collect()
+    }
+
+    /// The head generation's manifest.
+    async fn head_manifest(
+        fluree: &Fluree,
+        id: &str,
+        index: &ReasoningIndexId,
+    ) -> (fluree_db_core::ContentId, ReasoningManifest) {
+        let head = fluree.reasoning_indexes(id).await.unwrap().indexes[index]
+            .head
+            .clone()
+            .unwrap();
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.index_store(&record, index).await.unwrap();
+        let manifest =
+            ReasoningManifest::decode(&store.get(&head.manifest).await.unwrap()).unwrap();
+        (head.manifest, manifest)
+    }
+
+    /// Dictionary blobs that only a retained, superseded generation reaches
+    /// survive the index collector, a branch collector pass that releases the
+    /// base root sharing them, and a sweep; once the generation is released,
+    /// a sweep reclaims them. Two kinds: blobs the old base root and the
+    /// generation share, and blobs only the generation wrote.
+    #[tokio::test]
+    async fn dictionaries_only_a_retained_generation_reaches_are_kept() {
+        use fluree_db_indexer::gc::{plan_garbage, release_garbage_plan, CleanGarbageConfig};
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/retained-dicts:main";
+        let (index, ledger) = students(&fluree, id).await;
+        let r0 = fluree
+            .reindex(id, crate::ReindexOptions::default())
+            .await
+            .unwrap()
+            .root_id;
+
+        // Generation 1 writes a string nothing else holds.
+        let db = fluree.db(id).await.unwrap();
+        let sid = |iri: &str| db.snapshot.encode_iri(iri).unwrap();
+        let minted = Flake::new(
+            sid("http://example.org/alice"),
+            sid("http://example.org/tag"),
+            FlakeValue::String("only-generation-one-holds-this".into()),
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::STRING,
+            ),
+            0,
+            true,
+            None,
+        );
+        *fluree.reasoning_index_state.other_engine.lock() = Some(OtherEngine {
+            version: 0,
+            extra: Some((0, minted)),
+        });
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        let (g1_manifest_id, g1) = head_manifest(&fluree, id, &index).await;
+        *fluree.reasoning_index_state.other_engine.lock() = None;
+
+        // The base moves on and is rebuilt; generation 2 is a rebuild from it.
+        fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"},
+                        "@id": "ex:carol", "@type": "ex:Student", "ex:name": "Carol"}),
+            )
+            .await
+            .unwrap();
+        let r1 = fluree
+            .reindex(id, crate::ReindexOptions::default())
+            .await
+            .unwrap()
+            .root_id;
+        match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
+            RefreshOutcome::Published {
+                generation: 2,
+                kind: GenerationKind::Rebuild,
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        let (_, g2) = head_manifest(&fluree, id, &index).await;
+
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.index_store(&record, &index).await.unwrap();
+        let (d_r0, d_g1, d_r1, d_g2) = (
+            dict_blobs(store.as_ref(), &r0).await,
+            dict_blobs(store.as_ref(), &g1.root).await,
+            dict_blobs(store.as_ref(), &r1).await,
+            dict_blobs(store.as_ref(), &g2.root).await,
+        );
+        let current: HashSet<_> = d_r1.union(&d_g2).cloned().collect();
+        let shared: Vec<_> = d_r0
+            .intersection(&d_g1)
+            .filter(|cid| !current.contains(*cid))
+            .cloned()
+            .collect();
+        let own: Vec<_> = d_g1
+            .iter()
+            .filter(|cid| !d_r0.contains(*cid) && !current.contains(*cid))
+            .cloned()
+            .collect();
+        assert!(
+            !shared.is_empty() && !own.is_empty(),
+            "shared with the old base: {}, generation 1's own: {}",
+            shared.len(),
+            own.len()
+        );
+        let all_present = |label: &'static str| {
+            let store = Arc::clone(&store);
+            let blobs: Vec<_> = shared.iter().chain(&own).cloned().collect();
+            async move {
+                for cid in blobs {
+                    assert!(store.has(&cid).await.unwrap(), "{label}: {cid} released");
+                }
+            }
+        };
+        all_present("after the index collector").await;
+
+        let ledger_id = fluree_db_core::LedgerId::parse(id).unwrap();
+        let branch_store = fluree.backend().content_store(&record.storage_namespace());
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(0),
+            min_time_garbage_mins: Some(0),
+            ..Default::default()
+        };
+        let plan = plan_garbage(branch_store.as_ref(), &r1, &config)
+            .await
+            .unwrap();
+        release_garbage_plan(
+            plan,
+            fluree.backend(),
+            fluree.nameservice(),
+            &ledger_id,
+            Some(&[]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !branch_store.has(&r0).await.unwrap(),
+            "the branch pass released the old base root"
+        );
+        all_present("after the branch collector").await;
+
+        fluree
+            .sweep_index_storage("reasoning-indexes/retained-dicts")
+            .await
+            .unwrap();
+        all_present("after a sweep").await;
+        let index_cs = fluree
+            .backend()
+            .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+        for (label, root) in [("r0", &r0), ("r1", &r1)] {
+            assert!(
+                !index_cs.has(root).await.unwrap(),
+                "the copy of base root {label} a rebuild started from is reclaimed"
+            );
+        }
+        assert_eq!(alice_classes(&fluree, id).await.1, Some(2));
+
+        // Released with generation 1, and nothing else reaches them.
+        fluree.set_reasoning_index_retention(super::super::GenerationRetention {
+            min_age_ms: 0,
+            ..Default::default()
+        });
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Current { generation: 2 }
+        ));
+        assert!(
+            !index_cs.has(&g1_manifest_id).await.unwrap(),
+            "generation 1 is released"
+        );
+        fluree
+            .sweep_index_storage("reasoning-indexes/retained-dicts")
+            .await
+            .unwrap();
+        for cid in shared.iter().chain(&own) {
+            assert!(
+                !store.has(cid).await.unwrap(),
+                "{cid} outlived the generation that reached it"
+            );
+        }
+        assert_eq!(alice_classes(&fluree, id).await.1, Some(2));
+    }
+
     /// Insert-only refreshes under `bounds`, each compared with a full
     /// recompute; each is expected to compute `incremental` when given.
     /// Returns how many computed the closure in full.
