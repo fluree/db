@@ -363,6 +363,7 @@ pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
 #[cfg(not(target_arch = "wasm32"))]
+pub use fluree_db_core::reasoned_head::ReasonedHeads;
 pub use reasoned::{HeadRetention, ReasonedHeadWorker, RefreshOutcome};
 
 #[cfg(feature = "iceberg")]

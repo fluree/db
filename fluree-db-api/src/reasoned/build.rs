@@ -51,9 +51,11 @@ const WORKER_MAX_FACTS: u64 = 100_000_000;
 const WORKER_MAX_SECONDS: u64 = 3_600;
 
 /// What a refresh of one head did.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum RefreshOutcome {
     /// A new generation was published.
+    #[serde(rename_all = "camelCase")]
     Published {
         generation: u64,
         kind: GenerationKind,
@@ -61,6 +63,7 @@ pub enum RefreshOutcome {
         stats: GenerationStats,
     },
     /// The published generation is already at the branch's head.
+    #[serde(rename_all = "camelCase")]
     Current { generation: u64 },
     /// The result was not eligible to publish; nothing was published.
     Discarded { reason: String },
@@ -70,6 +73,7 @@ pub enum RefreshOutcome {
     InFlight,
     /// The head already holds as many superseded generations inside the
     /// retention window as it may; publication waits for them to age out.
+    #[serde(rename_all = "camelCase")]
     Throttled { in_guard: usize },
 }
 
