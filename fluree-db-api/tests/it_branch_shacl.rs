@@ -891,11 +891,11 @@ async fn fast_forward_into_an_ungoverned_target_checks_only_config_settings() {
 }
 
 /// The adopted commits are checked against the config the target has before
-/// the merge, whatever they do: a branch's own config (its config graph) is
-/// not carried over, so a branch that switches SHACL off in its config and
-/// then writes what main's shapes reject is refused, naming the branch's
-/// config graph it would carry. Into a target whose config enables nothing,
-/// the same data fast-forwards unvalidated.
+/// the merge, whatever they do: a branch's own config is not carried over, so
+/// a branch that switches SHACL off in its config and then writes what main's
+/// shapes reject is refused, naming the config graph of main's it would
+/// change. Into a target whose config enables nothing, the same data
+/// fast-forwards unvalidated.
 #[tokio::test]
 async fn fast_forward_is_validated_against_the_config_it_merges_into() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -921,8 +921,13 @@ async fn fast_forward_is_validated_against_the_config_it_merges_into() {
         .merge_branch("mydb", "dev", None, ConflictStrategy::default())
         .await
         .expect_err("dev's config is not carried to main");
+    assert_eq!(err.status_code(), 409, "{err:?}");
     assert!(
-        err.to_string().contains("branch dev's config graph"),
+        err.to_string()
+            .contains(&format!("config graph <{}>", config_graph_iri("mydb:main")))
+            && err
+                .to_string()
+                .contains("configures the source branch only"),
         "config switched off on the branch: {err:?}"
     );
 
@@ -996,6 +1001,38 @@ async fn seed_unique_email(fluree: &fluree_db_api::Fluree) {
         .unwrap();
 }
 
+/// Commit a JSON-LD insert without the API's post-staging checks (SHACL,
+/// uniqueness): the way history written before those checks reaches a ledger.
+async fn commit_unchecked(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    doc: &serde_json::Value,
+) {
+    let ledger_id = ledger.snapshot.ledger_id.to_string();
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::parse_transaction(
+        doc,
+        fluree_db_transact::TxnType::Insert,
+        fluree_db_transact::TxnOpts::default(),
+        &mut ns,
+        &ledger_id,
+    )
+    .expect("parse");
+    let (view, ns) =
+        fluree_db_transact::stage(ledger, txn, ns, fluree_db_transact::StageOptions::new())
+            .await
+            .expect("stage");
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree.default_index_config(),
+            fluree_db_api::CommitOpts::default(),
+        )
+        .await
+        .expect("commit");
+}
+
 fn email(id: &str, value: &str) -> serde_json::Value {
     json!({"@context": {"ex": EX}, "@id": id, "ex:email": value})
 }
@@ -1011,20 +1048,21 @@ fn assert_unique_violation(err: &ApiError, context: &str) {
 }
 
 /// A merge runs the checks a transaction producing the merged state runs,
-/// uniqueness included: a value dev writes that main already holds under a
-/// unique constraint is refused, and the preview reports it.
+/// uniqueness included: a value dev and main each wrote since the fork, unique
+/// on each, is taken twice in the merged state, so the merge is refused and
+/// the preview reports it.
 #[tokio::test]
 async fn merge_enforces_uniqueness_like_a_transaction() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed_unique_email(&fluree).await;
     let dev = fluree.ledger("mydb:dev").await.unwrap();
     fluree
-        .insert(dev, &email("ex:u2", "a@x"))
+        .insert(dev, &email("ex:u2", "b@x"))
         .await
         .expect("dev takes the write");
     // main moves on, so the merge is a general one.
     let main = fluree.ledger("mydb:main").await.unwrap();
-    fluree.insert(main, &email("ex:u9", "z@x")).await.unwrap();
+    fluree.insert(main, &email("ex:u9", "b@x")).await.unwrap();
     let before = head_t(&fluree, "mydb:main").await;
 
     let preview = fluree
@@ -1055,17 +1093,21 @@ async fn merge_enforces_uniqueness_like_a_transaction() {
 }
 
 /// A fast-forward into a target that enforces uniqueness is checked the same
-/// way: the value dev writes is already taken on main, so the preview reports
-/// it and the fast-forward is refused.
+/// way. Dev reads the config it was branched with, so its own transactions
+/// refuse a value main already holds; one committed without the check (as
+/// history from before it was) still reaches the merge, which the preview
+/// reports and the fast-forward refuses.
 #[tokio::test]
 async fn fast_forward_into_a_target_enforcing_uniqueness_is_validated() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed_unique_email(&fluree).await;
     let dev = fluree.ledger("mydb:dev").await.unwrap();
-    fluree
-        .insert(dev, &email("ex:u2", "a@x"))
+    let err = fluree
+        .insert(dev.clone(), &email("ex:u2", "a@x"))
         .await
-        .expect("dev takes the write");
+        .expect_err("dev enforces the uniqueness it was branched with");
+    assert_unique_violation(&err, "dev's own write");
+    commit_unchecked(&fluree, dev, &email("ex:u2", "a@x")).await;
     let before = head_t(&fluree, "mydb:main").await;
 
     let preview = fluree

@@ -1647,13 +1647,12 @@ pub struct DropNamedGraphResponse {
     pub ledger_id: String,
     /// Graph IRI that was dropped (echoed)
     pub graph_iri: String,
-    /// Number of flakes retracted by the drop commit (0 when no-op).
+    /// Always `0`: a drop retracts nothing. Kept for clients of the
+    /// retracting drop, which read it.
     pub retracted: usize,
-    /// `true` when a new commit was produced; `false` when the target graph
-    /// was already empty and the call was a no-op.
+    /// `true`: the drop commits.
     pub committed: bool,
-    /// Current commit `t` for the branch after the drop (unchanged when
-    /// `committed = false`).
+    /// Commit `t` of the drop.
     pub t: i64,
 }
 
@@ -1677,8 +1676,10 @@ impl From<DropNamedGraphReport> for DropNamedGraphResponse {
 /// - `ledger`: Full ledger identifier (e.g. `"mydb"` or `"mydb:main"`)
 /// - `graph`: Full IRI of the named graph to drop
 ///
-/// Refuses the default graph, the system `txn-meta` graph, and the system
-/// `config` graph. Unknown graph IRIs return `404`.
+/// SPARQL `DROP GRAPH`: one commit, after which the graph and its history
+/// are no longer queryable. Refuses the default graph, the system `txn-meta`
+/// graph, and the system `config` graph. A graph that does not exist, a
+/// dropped one included, returns `404`.
 pub async fn drop_named_graph(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;
@@ -1729,13 +1730,7 @@ async fn drop_named_graph_local(
             }
         };
 
-        tracing::info!(
-            status = "success",
-            retracted = report.retracted,
-            committed = report.committed,
-            t = report.t,
-            "named graph dropped"
-        );
+        tracing::info!(status = "success", t = report.t, "named graph dropped");
         Ok(Json(DropNamedGraphResponse::from(report)))
     }
     .instrument(span)

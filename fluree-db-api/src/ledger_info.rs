@@ -790,7 +790,7 @@ pub(crate) fn resolve_graph_selector(
                 // Try as IRI
                 if let Some(store) = store {
                     store
-                        .graph_id_for_iri(other)
+                        .assigned_graph_id(other)
                         .ok_or_else(|| LedgerInfoError::UnknownGraph(other.to_string()))
                 } else {
                     Err(LedgerInfoError::UnknownGraph(format!(
@@ -815,7 +815,7 @@ pub(crate) fn resolve_graph_selector(
             }
             if let Some(store) = store {
                 store
-                    .graph_id_for_iri(iri)
+                    .assigned_graph_id(iri)
                     .ok_or_else(|| LedgerInfoError::UnknownGraph(iri.clone()))
             } else {
                 Err(LedgerInfoError::UnknownGraph(format!(
@@ -879,9 +879,13 @@ fn build_ledger_block(
         placement: indexed_placement(store, 0),
     });
     // Then every registered graph (txn-meta at g_id=1, config at g_id=2,
-    // user-defined at g_id>=3). `iter_entries` is dense and ordered by
-    // g_id, so the response is deterministic.
-    for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
+    // user-defined at g_id>=3) but a dropped one, which does not exist until
+    // written again. Ordered by g_id, so the response is deterministic.
+    for (g_id, iri) in ledger
+        .snapshot
+        .graph_registry
+        .iter_visible_entries(ledger.t())
+    {
         let (flakes, size) = graph_totals(g_id);
         named_graphs.push(NamedGraph {
             iri: iri.to_string(),

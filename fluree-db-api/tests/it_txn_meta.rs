@@ -253,7 +253,7 @@ async fn single_bare_reference_envelope_is_refused_like_its_array_form() {
             ledger
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri("http://example.org/X")
+                .assigned_graph_id("http://example.org/X")
                 .is_none(),
             "the reference must not become a graph"
         );

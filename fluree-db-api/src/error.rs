@@ -962,6 +962,7 @@ impl ApiError {
             ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
             ApiError::Query(e) => match e {
                 QE::Cancelled { .. } => errors::QUERY_CANCELLED,
+                QE::GraphDropped { .. } => errors::GRAPH_NOT_FOUND,
                 QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
                 QE::StorageSchemeNotServed { .. } => errors::STORAGE_SCHEME_NOT_SERVED,
                 QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
@@ -1116,6 +1117,8 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
     use fluree_db_query::QueryError as QE;
     match err {
         QE::Cancelled { .. } => 408,
+        // As a graph the ledger does not have.
+        QE::GraphDropped { .. } => 404,
         // The in-memory join/aggregate budget: distinct from the 408 timeout
         // so the caller degrades on it specifically (too memory-heavy, not
         // too slow).
@@ -1196,8 +1199,9 @@ impl From<fluree_db_core::TargetError> for ApiError {
     fn from(e: fluree_db_core::TargetError) -> Self {
         match e {
             fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
-            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
-                ApiError::invalid_query(cross.to_string())
+            other @ (fluree_db_core::TargetError::CrossLedger { .. }
+            | fluree_db_core::TargetError::OtherLedgersSystemGraph { .. }) => {
+                ApiError::invalid_query(other.to_string())
             }
         }
     }

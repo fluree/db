@@ -2544,6 +2544,7 @@ mod tests {
             prev_index,
             term_dict: None,
             pooled_graphs: Vec::new(),
+            graph_drops: Vec::new(),
         }
     }
 

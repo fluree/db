@@ -545,7 +545,7 @@ async fn graph_id(fluree: &Fluree, id: &str, graph: Option<&str>) -> GraphId {
             .expect("load")
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("a registered graph"),
     }
 }

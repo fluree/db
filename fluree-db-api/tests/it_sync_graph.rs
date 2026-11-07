@@ -632,11 +632,26 @@ async fn graph_management_verbs_work_on_indexed_data() {
                 .execute()
                 .await
                 .expect("MOVE on indexed graphs");
-            assert_eq!(
-                graph_counts(&fluree, ledger_id).await,
-                (1, 1, 0),
-                "MOVE emptied the source"
-            );
+            // MOVE drops its source: the graph is gone, not emptied.
+            let source_gone = |fluree: &fluree_db_api::Fluree| {
+                let q = json!({
+                    "from": format!("{ledger_id}#{OTHER_IRI}"),
+                    "select": ["?s"],
+                    "where": {"@id": "?s", "?p": "?o"}
+                });
+                let fluree = fluree.clone();
+                async move { fluree.query_connection(&q).await.unwrap_err().to_string() }
+            };
+            assert_eq!(count_in_graph(&fluree, ledger_id, None).await, 1);
+            assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 1);
+            assert!(source_gone(&fluree).await.contains("dropped"));
+
+            // And stays gone once the index holds the drop.
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            assert_eq!(count_in_graph(&fluree, ledger_id, None).await, 1);
+            assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 1);
+            assert!(source_gone(&fluree).await.contains("dropped"));
         })
         .await;
 }

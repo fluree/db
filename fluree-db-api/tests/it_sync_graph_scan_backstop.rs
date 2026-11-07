@@ -123,29 +123,20 @@ async fn whole_graph_scan_backstop_fails_loud_before_materializing() {
         .expect_err("CLEAR shares the scan and the backstop");
     assert!(clear.to_string().contains("FLUREE_MAX_GRAPH_SCAN_FLAKES"));
 
-    // So does the drop behind `fluree graph drop` and the HTTP drop route,
-    // rather than matching every fact first.
-    let drop = fluree
-        .drop_named_graph(ledger_id, ONT_IRI)
-        .await
-        .expect_err("a drop over the cap must fail loud");
-    assert!(
-        drop.to_string().contains("FLUREE_MAX_GRAPH_SCAN_FLAKES"),
-        "{drop}"
-    );
-
-    // 0 disables; the identical resync is a no-op again, and the drop
-    // retracts all three facts the refusals left in place.
+    // 0 disables; the identical resync is a no-op again.
     std::env::set_var("FLUREE_MAX_GRAPH_SCAN_FLAKES", "0");
     let report = fluree
         .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
         .await
         .expect("disabled cap syncs normally");
     assert!(!report.committed);
+
+    // A drop reads none of the graph, so the cap never applies to it.
+    std::env::set_var("FLUREE_MAX_GRAPH_SCAN_FLAKES", "2");
     let dropped = fluree
         .drop_named_graph(ledger_id, ONT_IRI)
         .await
-        .expect("disabled cap drops normally");
-    assert_eq!(dropped.retracted, 3);
+        .expect("a drop over the cap");
+    assert!(dropped.committed);
     std::env::remove_var("FLUREE_MAX_GRAPH_SCAN_FLAKES");
 }

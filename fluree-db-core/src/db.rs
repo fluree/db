@@ -75,6 +75,9 @@ pub struct LedgerSnapshotMetadata {
     pub has_list_meta: Option<bool>,
     /// The root this index's root replaced, by its `prev_index` link.
     pub prev_index: Option<ContentId>,
+    /// Graphs dropped at or before `t`, from the root (see
+    /// `IndexRoot.graph_drops` in `fluree-db-binary-index`).
+    pub graph_drops: Vec<(crate::GraphId, crate::GraphDrop)>,
     /// Content id of the index root this metadata was decoded from; `None`
     /// when the caller doesn't have it.
     pub index_root_id: Option<ContentId>,
@@ -287,6 +290,8 @@ impl LedgerSnapshot {
             GraphRegistry::seed_from_root_iris(&meta.graph_iris)
                 .map_err(|e| Error::invalid_index(format!("graph registry seed from root: {e}")))?
         };
+        let mut graph_registry = graph_registry;
+        graph_registry.set_graph_drops(meta.graph_drops.iter().copied());
 
         let namespace_reverse = build_namespace_reverse(&meta.namespace_codes);
         Ok(Self {
@@ -423,6 +428,11 @@ impl LedgerSnapshot {
                 return Err(Error::invalid_index(format!(
                     "Sid collision: graph IRIs for g_id={prev_g_id} and g_id={g_id} encode to same Sid '{sid}'"
                 )));
+            }
+        }
+        for (g_id, iri) in self.graph_registry.iter_aliases() {
+            if let Some(sid) = self.encode_iri(iri) {
+                map.insert(sid, g_id);
             }
         }
         Ok(map)
@@ -568,6 +578,54 @@ impl LedgerSnapshot {
         Ok(())
     }
 
+    /// Record a commit's graph drops at `t` (see `Commit::graph_drops`): the
+    /// registry marks them, and their index statistics go, since the index
+    /// facts they count are no longer visible. Applies before the commit's
+    /// own writes; see [`Self::revive_graphs`] for those.
+    pub fn apply_graph_drops(&mut self, g_ids: &[crate::GraphId], t: i64) {
+        if g_ids.is_empty() {
+            return;
+        }
+        self.graph_registry.apply_drops(g_ids, t);
+        self.forget_graph_stats(g_ids);
+    }
+
+    /// Record that a commit at `t` wrote `graph_iris` (its `graph_delta`)
+    /// after its drops applied: each dropped graph among them exists again.
+    pub fn revive_graphs<'a>(&mut self, graph_iris: impl IntoIterator<Item = &'a str>, t: i64) {
+        self.graph_registry.revive(graph_iris, t);
+    }
+
+    /// Forget the index statistics of `g_ids`: a reader answering from them
+    /// (the count shortcuts) would count facts a drop took. They come back
+    /// with the next index build, which counts what the graphs hold then.
+    pub fn forget_graph_stats(&mut self, g_ids: &[crate::GraphId]) {
+        let Some(stats) = self.stats.as_mut() else {
+            return;
+        };
+        let held = stats
+            .graphs
+            .as_ref()
+            .is_some_and(|graphs| graphs.iter().any(|g| g_ids.contains(&g.g_id)));
+        if !held {
+            return;
+        }
+        let stats = Arc::make_mut(stats);
+        let (mut flakes, mut size) = (0u64, 0u64);
+        if let Some(graphs) = stats.graphs.as_mut() {
+            graphs.retain(|g| {
+                let dropped = g_ids.contains(&g.g_id);
+                if dropped {
+                    flakes += g.flakes;
+                    size += g.size;
+                }
+                !dropped
+            });
+        }
+        stats.flakes = stats.flakes.saturating_sub(flakes);
+        stats.size = stats.size.saturating_sub(size);
+    }
+
     /// Whether user namespace codes have been allocated (any code >= USER_START).
     ///
     /// Once user codes exist, the `ns_split_mode` is locked — changing it would
@@ -655,10 +713,20 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     // binary-index IndexRoot's `FLAG_EXT_*` set). Bit 0 is retired.
     const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
-    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
+    const FLAG_EXT_GRAPH_DROPS: u8 = 1 << 3;
     const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
+    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 7;
+    // An earlier v5 root (version 3) flags its term dictionary on bit 3, and
+    // carries no graph drops.
+    const FLAG_EXT_HAS_TERM_DICT_V5_NARROW: u8 = 1 << 3;
     let flags_ext = bytes[6];
-    let has_term_dict_section = flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
+    let (term_dict_flag, graph_drops_flag) = match version {
+        3 => (FLAG_EXT_HAS_TERM_DICT_V5_NARROW, 0),
+        4 => (FLAG_EXT_HAS_TERM_DICT, FLAG_EXT_GRAPH_DROPS),
+        _ => (0, FLAG_EXT_GRAPH_DROPS),
+    };
+    let has_term_dict_section = flags_ext & term_dict_flag != 0;
+    let has_graph_drops_section = flags_ext & graph_drops_flag != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
     } else {
@@ -1062,13 +1130,26 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         skip_term_dict_refs(bytes, &mut pos)?;
     }
 
+    let graph_drops = if has_graph_drops_section {
+        crate::graph_registry::decode_graph_drops(
+            bytes,
+            &mut pos,
+            crate::stats_wire::GraphWidth::for_root_version(version),
+        )?
+    } else {
+        Vec::new()
+    };
+
     // Trailing-byte sentinel: any unread bytes after the last section
-    // indicate a future format extension or a writer bug.
-    // Surface that explicitly rather than silently drop the bytes.
+    // indicate a future format extension or a writer bug. Surface that
+    // explicitly rather than silently drop the bytes.
     if pos != bytes.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("FIR6: trailing bytes ({} unread)", bytes.len() - pos),
+            format!(
+                "FIR6: trailing bytes after the last section ({} unread)",
+                bytes.len() - pos
+            ),
         ));
     }
 
@@ -1087,6 +1168,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         needs_link_reindex: has_annotations && !has_term_dict_section,
         has_list_meta,
         prev_index,
+        graph_drops,
         index_root_id: None,
     })
 }
@@ -1152,6 +1234,7 @@ mod tests {
             needs_link_reindex: false,
             has_list_meta: None,
             prev_index: None,
+            graph_drops: Vec::new(),
             index_root_id: None,
         })
         .unwrap();

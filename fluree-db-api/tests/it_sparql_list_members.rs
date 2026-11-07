@@ -617,7 +617,7 @@ async fn adding_beside_another_list_keeps_both() {
     let g2 = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri("http://example.org/g2")
+        .assigned_graph_id("http://example.org/g2")
         .expect("g2");
     let held = support::stored_int_lists_in(
         &ledger,

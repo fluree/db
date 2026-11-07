@@ -20,6 +20,7 @@
 use crate::commit_data::NetChange;
 use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
+use fluree_db_core::graph_registry::{names_config_graph, CONFIG_GRAPH_ID};
 use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_transact::TransactError;
@@ -95,23 +96,35 @@ impl BranchOpValidation {
     }
 }
 
-/// Named graphs in `graph_iris` that `state` has not registered, as
-/// provisional graph id -> (graph Sid, IRI): the id the commit's registration
-/// will assign. The Sid is resolved against the state's namespaces plus
-/// `namespace_delta`, the codes the incoming commits introduced, so it
-/// matches the Sid their flakes carry.
-fn unregistered_graphs(
+/// Route, in `reverse_graph`, the graphs in `graph_iris` that it cannot route
+/// yet: a graph `state` has not registered by the id the commit's
+/// registration will assign it, and another ledger's config graph IRI to the
+/// config graph. Returns the new graphs' IRIs by that id. The Sids are
+/// resolved against the state's namespaces plus `namespace_delta`, the codes
+/// the incoming commits introduced, so they match the Sids their flakes carry.
+fn route_incoming_graphs(
     state: &LedgerState,
     namespace_delta: &HashMap<u16, String>,
     graph_iris: &BTreeSet<String>,
-) -> Result<HashMap<GraphId, (Sid, String)>> {
+    reverse_graph: &mut HashMap<Sid, GraphId>,
+) -> Result<HashMap<GraphId, String>> {
     let registry = &state.snapshot.graph_registry;
     let new: Vec<String> = graph_iris
         .iter()
-        .filter(|iri| registry.graph_id_for_iri(iri).is_none())
+        .filter(|iri| registry.assigned_graph_id(iri).is_none())
         .cloned()
         .collect();
-    if new.is_empty() {
+    let aliases: Vec<&String> = graph_iris
+        .iter()
+        .filter(|iri| {
+            names_config_graph(iri)
+                && state
+                    .snapshot
+                    .encode_iri(iri)
+                    .is_none_or(|sid| !reverse_graph.contains_key(&sid))
+        })
+        .collect();
+    if new.is_empty() && aliases.is_empty() {
         return Ok(HashMap::new());
     }
     let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&state.snapshot);
@@ -122,14 +135,20 @@ fn unregistered_graphs(
             ))
         })?;
     let ids = registry.provisional_ids(&new);
-    Ok(new
-        .into_iter()
-        .filter_map(|iri| {
-            let g_id = *ids.get(iri.as_str())?;
-            let sid = ns.lookup_sid_for_iri(&iri)?;
-            Some((g_id, (sid, iri)))
-        })
-        .collect())
+    let mut named = HashMap::new();
+    for iri in new {
+        let (Some(&g_id), Some(sid)) = (ids.get(iri.as_str()), ns.lookup_sid_for_iri(&iri)) else {
+            continue;
+        };
+        reverse_graph.insert(sid, g_id);
+        named.insert(g_id, iri);
+    }
+    for iri in aliases {
+        if let Some(sid) = ns.lookup_sid_for_iri(iri) {
+            reverse_graph.insert(sid, CONFIG_GRAPH_ID);
+        }
+    }
+    Ok(named)
 }
 
 /// A merge's or revert's net change, named as `state` stores each fact, for
@@ -265,13 +284,15 @@ impl crate::Fluree {
         graph_iris: &BTreeSet<String>,
         op: &'static str,
     ) -> Result<(StagedLedger, BranchOpValidation)> {
-        self.stage_validated_with(state, flakes, namespace_delta, graph_iris, op, None)
+        self.stage_validated_with(state, flakes, namespace_delta, graph_iris, op, None, None)
             .await
     }
 
-    /// [`Self::stage_validated`], with the target's config when the caller
-    /// has already read it (a fast-forward reads it to learn whether the
-    /// target governs writes), so the checks do not read it again.
+    /// [`Self::stage_validated`], for a merge from `merge_source` and with
+    /// the target's config when the caller has already read it (a
+    /// fast-forward reads it to learn whether the target governs writes), so
+    /// the checks do not read it again.
+    #[allow(clippy::too_many_arguments)]
     async fn stage_validated_with(
         &self,
         state: LedgerState,
@@ -279,35 +300,37 @@ impl crate::Fluree {
         namespace_delta: &HashMap<u16, String>,
         graph_iris: &BTreeSet<String>,
         op: &'static str,
+        merge_source: Option<&str>,
         config: Option<&crate::tx::ConfigRead>,
     ) -> Result<(StagedLedger, BranchOpValidation)> {
         let mut reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
             ApiError::internal(format!("Failed to build reverse graph during {op}: {e}"))
         })?;
-        // Graphs the incoming commits created that this state has not
-        // registered, routed by the id the commit will give them.
-        let new_graphs = unregistered_graphs(&state, namespace_delta, graph_iris)?;
-        for (g_id, (sid, _)) in &new_graphs {
-            reverse_graph.insert(sid.clone(), *g_id);
-        }
+        let new_graph_iris =
+            route_incoming_graphs(&state, namespace_delta, graph_iris, &mut reverse_graph)?;
         let mut view = StagedLedger::new(state, flakes, &reverse_graph)
             .map_err(|e| ApiError::internal(format!("Failed to stage flakes during {op}: {e}")))?;
-        let new_graph_iris: HashMap<GraphId, String> = new_graphs
-            .into_iter()
-            .map(|(g_id, (_, iri))| (g_id, iri))
-            .collect();
         let outcome = self
-            .validate_branch_op_view(&mut view, namespace_delta, &new_graph_iris, op, config)
+            .validate_branch_op_view(
+                &mut view,
+                namespace_delta,
+                &new_graph_iris,
+                op,
+                merge_source,
+                config,
+            )
             .await?;
         Ok((view, outcome))
     }
 
     /// The merge's staging, shared by the merge itself and its preview:
-    /// resolve `source_flakes` under `strategy` against `target_state`, then
-    /// stage and validate the result.
+    /// resolve `source_flakes` from `source_branch` under `strategy` against
+    /// `target_state`, then stage and validate the result.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_merge(
         &self,
         target_state: LedgerState,
+        source_branch: &str,
         source_flakes: Vec<Flake>,
         conflicts: &[ConflictKey],
         strategy: &ConflictStrategy,
@@ -318,8 +341,16 @@ impl crate::Fluree {
             .apply_two_way_strategy(source_flakes, conflicts, strategy, &target_state)
             .await?;
         let resolved = as_stored(&target_state, resolved).await?;
-        self.stage_validated(target_state, resolved, namespace_delta, graph_iris, "merge")
-            .await
+        self.stage_validated_with(
+            target_state,
+            resolved,
+            namespace_delta,
+            graph_iris,
+            "merge",
+            Some(source_branch),
+            None,
+        )
+        .await
     }
 
     /// Revert's staging, shared by the revert itself and its preview:
@@ -390,21 +421,26 @@ impl crate::Fluree {
         })
     }
 
-    /// Check a fast-forward onto `base` (from [`Self::fast_forward_base`]):
-    /// stage the adopted commits' net change (the source's line since the
-    /// target's head) onto it and run the transaction checks under its
-    /// configuration. `None` when there is nothing to check: the target
-    /// governs no writes and the change carries no config settings, so it
-    /// fast-forwards as before.
+    /// Check a fast-forward from `source_branch` onto `base` (from
+    /// [`Self::fast_forward_base`]): stage the adopted commits' net change
+    /// (the source's line since the target's head) onto it and run the
+    /// transaction checks under its configuration. `None` when there is
+    /// nothing to check: the target governs no writes and the change carries
+    /// no config settings, so it fast-forwards as before.
     pub(crate) async fn validate_fast_forward(
         &self,
         base: FastForwardBase,
+        source_branch: &str,
         source_store: &impl fluree_db_core::ContentStore,
         diff: &fluree_db_core::BranchDiff,
     ) -> Result<Option<BranchOpValidation>> {
-        let (data, _keys) =
-            crate::merge::collect_commit_data(source_store, &diff.source.commits, &diff.source.own)
-                .await?;
+        let (data, _keys) = crate::merge::collect_commit_data(
+            source_store,
+            &diff.source.commits,
+            &diff.source.own,
+            &mut crate::commit_data::ConfigGraphs::for_target(&base.state),
+        )
+        .await?;
         if !base.governed && !carries_config_settings(&base.state, &data) {
             return Ok(None);
         }
@@ -415,6 +451,7 @@ impl crate::Fluree {
                 &data.namespace_delta,
                 &data.graph_iris,
                 "merge",
+                Some(source_branch),
                 Some(&base.config),
             )
             .await?;
@@ -427,13 +464,14 @@ impl crate::Fluree {
     /// config, and the staged-config guard's re-check of the target's config
     /// groups. `new_graph_iris` names graphs the incoming commits create,
     /// which the target's registry does not know yet; `op` names the
-    /// operation in refusals.
+    /// operation in refusals, and `merge_source` the branch a merge takes.
     async fn validate_branch_op_view(
         &self,
         view: &mut StagedLedger,
         namespace_delta: &HashMap<u16, String>,
         new_graph_iris: &HashMap<GraphId, String>,
         op: &'static str,
+        merge_source: Option<&str>,
         config: Option<&crate::tx::ConfigRead>,
     ) -> Result<BranchOpValidation> {
         use crate::config_guard::GuardScope;
@@ -443,7 +481,10 @@ impl crate::Fluree {
         if !view.has_staged() {
             return Ok(BranchOpValidation::default());
         }
-        if let Some(refusal) = self.system_graph_write(view, new_graph_iris, op).await? {
+        if let Some(refusal) = self
+            .system_graph_write(view, new_graph_iris, op, merge_source)
+            .await?
+        {
             return Ok(BranchOpValidation {
                 rejection: Some(Rejection::Config(refusal)),
             });
@@ -516,36 +557,41 @@ impl crate::Fluree {
 impl crate::Fluree {
     /// Why a branch operation may not write a system graph, if it does.
     ///
-    /// A merge stages what another branch wrote, so it may not change the
-    /// target's own config or txn-meta graph at all (asserting or
-    /// retracting): the target's system graph IRIs name ordinary graphs on
-    /// every other branch, and what a branch writes there is data, written
-    /// under that branch's rules, not a change to the target's config or
-    /// commit metadata. Config is changed on the branch it configures.
+    /// A merge may change the target's config graph (asserting or
+    /// retracting) only from a branch the target was created from, directly
+    /// or not: the target took that branch's config at the fork, and its
+    /// later config changes reach the target the same way. What any other
+    /// branch wrote there configures that branch; config is changed on the
+    /// branch it configures. A merge never changes the target's txn-meta
+    /// graph.
     ///
-    /// No branch operation may write another branch's system graph: config
-    /// (or commit metadata) written on a branch is named for that branch
-    /// (`urn:fluree:<name>:<branch>#config`) and configures that branch
-    /// only, so carried to another branch it would land in an ordinary
-    /// graph, never as that branch's config. A branch the target was created
-    /// from (directly or not) is the exception: its system graphs are
-    /// already ordinary graphs on the target, copied at the fork.
-    /// Retractions (a revert cleaning such a graph up) are allowed.
+    /// No branch operation may write another branch's txn-meta graph, which
+    /// is named for that branch and holds its commit metadata, unless the
+    /// target was created from that branch: it is then an ordinary graph on
+    /// the target, copied at the fork. Retractions (a revert cleaning such a
+    /// graph up) are allowed.
     async fn system_graph_write(
         &self,
         view: &StagedLedger,
         new_graph_iris: &HashMap<GraphId, String>,
         op: &str,
+        merge_source: Option<&str>,
     ) -> Result<Option<String>> {
         use fluree_db_core::graph_registry::{CONFIG_GRAPH_ID, TXN_META_GRAPH_ID};
         let base = view.base();
         let ledger_id = base.snapshot.ledger_id.to_string();
-        if op == "merge" {
-            let own = view
-                .staged_flakes_by_graph()
-                .map(|(g_id, _)| g_id)
-                .find(|g_id| matches!(*g_id, CONFIG_GRAPH_ID | TXN_META_GRAPH_ID));
-            if let Some(g_id) = own {
+        if let Some(source) = merge_source {
+            let writes = |g| view.staged_flakes_by_graph().any(|(g_id, _)| g_id == g);
+            let refused = if writes(TXN_META_GRAPH_ID) {
+                Some(TXN_META_GRAPH_ID)
+            } else if writes(CONFIG_GRAPH_ID)
+                && !self.is_ancestor_branch(&ledger_id, source).await?
+            {
+                Some(CONFIG_GRAPH_ID)
+            } else {
+                None
+            };
+            if let Some(g_id) = refused {
                 let role = if g_id == CONFIG_GRAPH_ID {
                     fluree_db_core::GraphSel::Config
                 } else {
@@ -553,8 +599,8 @@ impl crate::Fluree {
                 };
                 return Ok(Some(format!(
                     "the merge would change this branch's {role} graph <{}> with what the \
-                     source branch wrote to it as an ordinary graph; change this branch's \
-                     {role} on this branch itself",
+                     source branch wrote there, which configures the source branch only; \
+                     change this branch's {role} on this branch itself",
                     base.snapshot
                         .graph_registry
                         .iri_for_graph_id(g_id)

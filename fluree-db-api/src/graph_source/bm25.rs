@@ -4,7 +4,7 @@
 //! BM25 full-text search indexes.
 
 use crate::graph_source::config::Bm25CreateConfig;
-use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map};
+use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map, latest_drop_read};
 use crate::graph_source::result::{
     Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck, Bm25SyncResult, SnapshotSelection,
 };
@@ -1144,6 +1144,22 @@ impl crate::Fluree {
             });
         }
 
+        // A drop names graphs, not the facts it took, so the commit walk below
+        // cannot find the documents it took. A drop since the last sync of a
+        // graph the query reads takes the full rebuild, which also retires the
+        // snapshots from before it.
+        if let Some(floor) =
+            latest_drop_read(&ledger.snapshot, &query).filter(|floor| *floor > old_watermark)
+        {
+            info!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                drop_t = floor,
+                "A graph the indexing query reads was dropped since the last sync; running a full resync"
+            );
+            return self.resync_bm25_index(graph_source_id).await;
+        }
+
         // 4. Get head commit CID for tracing
         let head_commit_id = ledger
             .ns_record
@@ -1445,10 +1461,16 @@ impl crate::Fluree {
         // 6. Persist updated index blob
         let new_snapshot_id = self.write_bm25_snapshot(graph_source_id, &index).await?;
 
-        // 7. Update manifest, trim old snapshots, and publish
+        // 7. Update manifest, retire and trim old snapshots, and publish.
+        //    The snapshots from before a drop of a graph the query reads hold
+        //    what it took; this rebuild covers the drop, so they leave in the
+        //    same publish that adds it.
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
-        let removed = manifest.trim(snapshot_retention());
+        let mut removed = latest_drop_read(&ledger.snapshot, &query)
+            .map(|floor| manifest.retire_before(floor))
+            .unwrap_or_default();
+        removed.extend(manifest.trim(snapshot_retention()));
         self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
             .await?;
 
@@ -1657,10 +1679,16 @@ impl crate::Fluree {
         // 6. Persist versioned snapshot blob
         let snapshot_id = self.write_bm25_snapshot(graph_source_id, &index).await?;
 
-        // 7. Update manifest, trim old snapshots, and publish
+        // 7. Update manifest, retire and trim old snapshots, and publish. As
+        //    in a full resync, the snapshots from before a drop of a graph the
+        //    query reads leave; a drop after `target_t` took everything the
+        //    snapshots before this one hold of the graph.
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(target_t, snapshot_id));
-        let removed = manifest.trim(snapshot_retention());
+        let mut removed = latest_drop_read(&view.snapshot, &query)
+            .map(|floor| manifest.retire_before(floor.min(target_t)))
+            .unwrap_or_default();
+        removed.extend(manifest.trim(snapshot_retention()));
         let effective_t = manifest.head().map(|h| h.index_t).unwrap_or(target_t);
         self.publish_bm25_manifest(graph_source_id, &manifest, effective_t)
             .await?;

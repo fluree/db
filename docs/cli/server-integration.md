@@ -516,11 +516,11 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 
 - `POST {api_base_url}/drop-graph` with `{ ledger, graph }`
 
-Drops a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted in it. History is preserved —
-queries `as-of` an earlier `t` still see the graph populated. The graph IRI
-remains registered so it can be re-populated by a later insert. Refuses the
-default graph and the system `txn-meta` / `config` graphs. Same admin auth
+Drops a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`, one commit that retracts nothing. A query naming the
+graph as of an earlier `t` is refused afterwards; a later write to the IRI
+starts the graph afresh. Refuses the default graph and the system
+`txn-meta` / `config` graphs. Same admin auth
 bracket as `/create`, `/drop`, `/reindex`. See
 [Drop Named Graph Contract](#drop-named-graph-contract).
 
@@ -1458,24 +1458,21 @@ The reference server's `Fluree::drop_named_graph`:
    - the default graph (empty / `g_id == 0`),
    - the `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`, `g_id == 1`),
    - the `config` graph (`urn:fluree:{ledger_id}#config`, `g_id == 2`).
-3. **Resolves** `graph` against the snapshot's `GraphRegistry`. An unknown
-   IRI returns `404` rather than silently registering a new graph slot.
-4. **Stages and commits** a SPARQL UPDATE equivalent to
-   `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }`
-   through the same pipeline used by user updates. This produces one new
-   commit at `t = current_t + 1` whose flakes are retractions only.
-5. **Reports a no-op** (`committed: false`, `retracted: 0`) when the graph
-   was already empty — no new commit is created.
+3. **Resolves** `graph` against the snapshot's `GraphRegistry`. A graph
+   that does not exist, a dropped one included, returns `404`.
+4. **Stages and commits** SPARQL `DROP GRAPH <iri>` through the same
+   pipeline used by user updates: one new commit at `t = current_t + 1`
+   that records the drop and retracts nothing.
 
 Key properties:
 
-- **History preserving.** A query `as-of` an earlier `t` still sees every
-  triple that was previously asserted in the graph.
+- **Takes the history.** Nothing the graph held is queryable afterwards; a
+  query naming it as of a `t` before the drop is refused. The commits keep
+  the facts, so a branch created before the drop has them.
 - **Per-branch scope.** Drops only affect the branch in `ledger`. Sibling
   branches that share the same graph IRI are not touched.
-- **Registry stable.** The graph IRI keeps its `g_id`; a subsequent
-  insert into the same IRI lands in the same logical graph rather than a
-  new slot.
+- **Same IRI, fresh graph.** A later write to the IRI starts the graph
+  afresh, holding only what is written from then on.
 
 ### Response (`200 OK`)
 
@@ -1483,7 +1480,7 @@ Key properties:
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -1493,13 +1490,12 @@ Key properties:
 |-------|------|-------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted. |
 | `graph_iri` | string | Graph IRI that was dropped (echoed). |
-| `retracted` | integer | Number of flakes retracted by the drop commit. `0` when the graph was already empty. |
-| `committed` | bool | `true` when a new commit was produced; `false` for a no-op drop on an empty graph. |
-| `t` | integer | Current commit `t` for the branch after the drop. Equal to the pre-drop `t` when `committed` is `false`. |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | bool | `true`: the drop commits. A server whose drop retracts the graph's facts reports `false` for an empty graph, and the CLI prints that as a no-op. |
+| `t` | integer | Commit `t` of the drop. |
 
 The CLI's `fluree graph drop` printer (`commands/graph.rs`) reads
-`ledger_id`, `graph_iri`, `retracted`, `committed`, and `t` — populate
-them all.
+`ledger_id`, `graph_iri`, `committed`, and `t` — populate them all.
 
 ### Error responses
 
@@ -1507,8 +1503,8 @@ them all.
 |--------|------|
 | `400` | `graph` is empty, has whitespace or any IRI-excluded character, lacks a `<scheme>:<rest>` head (relative reference), or names a system graph (default, `txn-meta`, `config`); malformed JSON body. |
 | `401` / `403` | Admin token required and absent/invalid. |
-| `404` | Ledger does not exist; or `graph` is not registered in the ledger's graph registry. |
-| `5xx` | Storage / nameservice / commit-write errors during the retract commit. |
+| `404` | Ledger does not exist; or `graph` does not exist in it. |
+| `5xx` | Storage / nameservice / commit-write errors during the drop commit. |
 
 ### Reference implementation
 
@@ -2013,7 +2009,7 @@ A source upload may instead fill a new named graph of an existing ledger, which 
 
 - **Discovery:** add `"source-upload-graph"` to `import.modes` alongside `"source-upload"`. The CLI checks it before uploading: a server that ignores an unknown `"graph"` field would create a ledger instead.
 - **Mint:** `"graph": "<iri>"` with `"source_kind": "source"`; `"ledger"` names the existing ledger. Reject `"graph"` on a `.flpack` mint, the default graph and the ledger's system graphs with `400`, and a ledger that does not exist with `404`, before the upload.
-- **Complete:** run `Fluree::import_into_graph(ledger, graph).import(path)` rather than `create`. On success, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`, where the import's commits run from `base_t + 1` to `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written. One failure leaves the import in the ledger: `ImportError::PublishedWithoutIndex`, an index publish that failed after the import's commits were published. Its message says so; report it as is, not as an import that wrote nothing.
+- **Complete:** run `Fluree::import_into_graph(ledger, graph).import(path)` rather than `create`. On success, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`, where the import's commits run from `base_t + 1` to `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh. One failure leaves the import in the ledger: `ImportError::PublishedWithoutIndex`, an index publish that failed after the import's commits were published. Its message says so; report it as is, not as an import that wrote nothing.
 - No reindex follows an annotated graph: it would rebuild the whole ledger's index. `has_annotations: true` tells the client the ledger's annotation index waits for one.
 
 Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::upload_source_import`, called by `run_remote_source_import` and `fluree-db-cli/src/commands/graph.rs`.

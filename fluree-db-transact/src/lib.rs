@@ -106,7 +106,8 @@ pub use stage::{
     DELETE_WITNESSED_SITE,
 };
 pub use staged_dicts::{
-    attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
+    attach_binary_provider, attach_staged_dicts, detach_binary_provider, graphs_to_hide,
+    hide_dropped_graphs, staged_dicts, store_without_dropped_graphs, StagedDicts,
 };
 pub use template_sink::{RdfTextParts, TemplateSink};
 

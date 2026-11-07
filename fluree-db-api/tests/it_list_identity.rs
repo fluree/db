@@ -593,7 +593,7 @@ async fn a_deleted_list_in_a_graph_block_is_that_graphs() {
     let g = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(&format!("{EX}g"))
+        .assigned_graph_id(&format!("{EX}g"))
         .expect("graph");
     let (s, p) = (format!("{EX}s"), format!("{EX}p"));
     assert_eq!(
@@ -653,7 +653,7 @@ async fn add_merges_a_second_list_copy_replaces() {
         ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(&format!("{EX}{name}"))
+            .assigned_graph_id(&format!("{EX}{name}"))
             .expect("graph")
     };
     let in_graph = |ledger: &LedgerState, name: &str| {

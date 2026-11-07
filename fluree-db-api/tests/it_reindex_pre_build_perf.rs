@@ -182,7 +182,7 @@ async fn first_t_where_graph_registered_no_full_reads_when_iri_absent() {
     let head = record.commit_head_id.expect("head");
 
     let cfg_iri = config_graph_iri(ledger_id);
-    let probe = first_t_where_graph_registered(&counted, &head, &cfg_iri)
+    let probe = first_t_where_graph_registered(&counted, &head, |iri| iri == cfg_iri)
         .await
         .expect("envelope walk");
 
@@ -277,7 +277,7 @@ async fn first_t_where_graph_registered_returns_lowest_t_when_iri_present() {
     let probe = first_t_where_graph_registered(
         &fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         &head,
-        &cfg_iri,
+        |iri| iri == cfg_iri,
     )
     .await
     .expect("envelope walk");

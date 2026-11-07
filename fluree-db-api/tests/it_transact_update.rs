@@ -3400,7 +3400,7 @@ async fn no_match_update_naming_a_new_graph_commits_its_registration() {
             .ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(new_graph)
+            .assigned_graph_id(new_graph)
             .is_some(),
         "the named graph is registered"
     );

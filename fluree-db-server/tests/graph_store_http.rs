@@ -294,11 +294,22 @@ async fn request_errors() {
             "{base}?graph={}",
             urlencoding::encode("urn:fluree:gsp:main#txn-meta")
         ),
+        format!(
+            "{base}?graph={}",
+            urlencoding::encode("urn:fluree:gsp:main#config")
+        ),
+        // Another ledger's config graph IRI names this ledger's config graph.
+        format!(
+            "{base}?graph={}",
+            urlencoding::encode("urn:fluree:elsewhere:main#config")
+        ),
     ] {
         let (status, body) = send(&app, "GET", &uri, None, "", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
-        let (status, body) = send(&app, "PUT", &uri, TTL, spec, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        for method in ["PUT", "POST"] {
+            let (status, body) = send(&app, method, &uri, TTL, spec, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+        }
     }
 
     let (status, body) = send(

@@ -1806,11 +1806,12 @@ pub enum GraphAction {
 
     /// Drop a named graph from a single branch of a ledger
     ///
-    /// Issues a transactional retract: every triple currently asserted
-    /// in the target graph is retracted in one new commit. History is
-    /// preserved — queries `as-of` an earlier `t` still see the graph
-    /// populated. The graph IRI remains registered so it can be
-    /// re-populated by a later insert.
+    /// SPARQL `DROP GRAPH`: one new commit, after which the graph and its
+    /// history are no longer queryable — a query `as-of` an earlier `t`
+    /// naming it is refused. The commits that wrote it keep its facts, so
+    /// a branch from before the drop still has them. Writing to the IRI
+    /// again starts the graph afresh. Use `CLEAR GRAPH` (SPARQL) to
+    /// retract the facts and keep their history instead.
     ///
     /// Refuses the default graph and the system `txn-meta` / `config`
     /// graphs.

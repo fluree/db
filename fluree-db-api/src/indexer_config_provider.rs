@@ -18,7 +18,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_core::{config_graph_iri, first_t_where_graph_registered, GraphRegistrationProbe};
+use fluree_db_core::graph_registry::names_config_graph;
+use fluree_db_core::{first_t_where_graph_registered, GraphRegistrationProbe};
 use fluree_db_indexer::{LedgerConfigProvider, LedgerIndexingConfig};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NameServiceLookup;
@@ -45,11 +46,12 @@ impl ApiLedgerConfigProvider {
     async fn resolve(&self, ledger_id: &str) -> Result<LedgerIndexingConfig, String> {
         // 0. Envelope-only short-circuit.
         //
-        // The config graph (`config_graph_iri(ledger_id)`) must be
-        // registered in some commit's `graph_delta` before any flake can
-        // belong to it. Probe the chain envelope-only (byte-range
-        // ~128 KiB per commit on range-capable backends) — if the IRI
-        // never appears, no `f:LedgerConfig` can exist and we can return
+        // The config graph must be registered in some commit's
+        // `graph_delta` before any flake can belong to it, under any
+        // ledger's config graph IRI: a branch or a copy registered its
+        // source's. Probe the chain envelope-only (byte-range
+        // ~128 KiB per commit on range-capable backends) — if none
+        // ever appears, no `f:LedgerConfig` can exist and we can return
         // immediately without paying for `LedgerState::load`'s full
         // chain walk + novelty build.
         //
@@ -90,15 +92,14 @@ impl ApiLedgerConfigProvider {
                 } else {
                     self.backend.content_store(&record.storage_namespace())
                 };
-                let cfg_iri = config_graph_iri(ledger_id);
-                let probe = first_t_where_graph_registered(cs.as_ref(), head_id, &cfg_iri)
-                    .await
-                    .map_err(|e| format!("envelope walk for config graph: {e}"))?;
+                let probe =
+                    first_t_where_graph_registered(cs.as_ref(), head_id, names_config_graph)
+                        .await
+                        .map_err(|e| format!("envelope walk for config graph: {e}"))?;
                 match probe {
                     GraphRegistrationProbe::NotFound => {
                         tracing::debug!(
                             ledger_id,
-                            cfg_iri = %cfg_iri,
                             "ledger config provider: config graph never registered; \
                              skipping LedgerState::load + resolve_ledger_config"
                         );
@@ -119,7 +120,6 @@ impl ApiLedgerConfigProvider {
                         // public API to support that work.
                         tracing::debug!(
                             ledger_id,
-                            cfg_iri = %cfg_iri,
                             first_t = t,
                             "ledger config provider: config graph registered; \
                              proceeding with full state load + resolve"
@@ -128,7 +128,6 @@ impl ApiLedgerConfigProvider {
                     GraphRegistrationProbe::Inconclusive => {
                         tracing::debug!(
                             ledger_id,
-                            cfg_iri = %cfg_iri,
                             "ledger config provider: envelope-only probe inconclusive \
                              (v3 envelope on chain); falling through to full state load"
                         );

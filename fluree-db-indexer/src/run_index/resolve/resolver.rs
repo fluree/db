@@ -732,7 +732,7 @@ impl CommitResolver {
         // +1 to reserve 0 for default graph
         dicts
             .graphs
-            .get_or_insert_parts(prefix, name)
+            .graph_dict_id_or_insert_parts(prefix, name)
             .checked_add(1)
             .ok_or_else(|| io::Error::other("graph count exceeds u32::MAX"))
     }
@@ -1141,6 +1141,13 @@ pub struct SharedResolverState {
     /// Sticky: any resolved user-data op carried a list index (`@list`
     /// value). Feeds `IndexRoot.has_list_meta` at root assembly.
     pub saw_list_meta: bool,
+    /// The `t` of each graph's latest drop among the commits this run
+    /// indexes, by graph IRI ([`fluree_db_core::DEFAULT_GRAPH_IRI`] for the
+    /// default graph): an op on a graph before its drop is not indexed. See
+    /// [`Self::set_graph_floors`].
+    graph_floors: HashMap<String, i64>,
+    /// [`Self::graph_floors`] by this run's graph ids, filled as ops meet them.
+    graph_floor_ids: HashMap<GraphId, Option<i64>>,
 }
 
 impl SharedResolverState {
@@ -1190,6 +1197,8 @@ impl SharedResolverState {
             decimal_encoding: fluree_db_core::DecimalEncoding::default(),
             saw_list_meta: false,
             link_synth: super::link_synth::LinkSynth::new(),
+            graph_floors: HashMap::new(),
+            graph_floor_ids: HashMap::new(),
         }
     }
 
@@ -1199,9 +1208,12 @@ impl SharedResolverState {
     /// from the root's inline vectors using `from_ordered_vec()` for exact
     /// ID stability. Validates critical invariants:
     /// - First 14 datatypes match `new_datatype_dict()` reserved order
-    /// - `graph_iris[0]` is the txn-meta graph IRI
+    /// - `graph_iris[0]` is a txn-meta graph IRI
+    ///
+    /// The system graphs take `ledger_id`'s IRIs, the ledger being built.
     pub fn from_index_root(
         root: &fluree_db_binary_index::format::index_root::IndexRoot,
+        ledger_id: &str,
     ) -> Result<Self, ResolverError> {
         use fluree_db_core::value_id::ValueTypeTag;
         use std::sync::Arc;
@@ -1228,14 +1240,28 @@ impl SharedResolverState {
             .collect();
         let predicates = super::global_dict::PredicateDict::from_ordered_iris(pred_iris);
 
-        let expected_txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(&root.ledger_id);
-        if root.graph_iris.is_empty() || root.graph_iris[0] != expected_txn_meta {
+        use fluree_db_core::graph_registry::{
+            config_graph_iri, names_config_graph, names_txn_meta_graph, txn_meta_graph_iri,
+        };
+        // Any ledger's txn-meta IRI: a copy under another name, a branch, or
+        // a ledger that adopted a branch's index starts from another's root.
+        let expected_txn_meta = txn_meta_graph_iri(ledger_id);
+        if root.graph_iris.is_empty()
+            || (root.graph_iris[0] != expected_txn_meta
+                && !names_txn_meta_graph(&root.graph_iris[0]))
+        {
             return Err(ResolverError::Resolve(format!(
                 "graph_iris[0] must be txn-meta IRI '{}', got: {:?}",
                 expected_txn_meta,
                 root.graph_iris.first()
             )));
         }
+        // An index built before config graphs were read across ledgers may
+        // hold another ledger's config graph as a user graph. It keeps that
+        // graph, as the query side reads it, until a rebuild from the commits.
+        // The system graphs under this ledger's own IRIs, which the root this
+        // build writes then carries.
+        //
         // Upgrade legacy roots that only contain txn-meta by inserting the config graph IRI
         // into slot 1 (g_id=2). This aligns indexed graph IDs with in-memory graph ID
         // allocation (`GraphRegistry::apply_delta` starts user graphs at g_id=3).
@@ -1247,9 +1273,12 @@ impl SharedResolverState {
             .iter()
             .map(|s| Arc::from(s.as_str()))
             .collect();
-        if graph_iris.len() == 1 {
-            let config_iri = fluree_db_core::graph_registry::config_graph_iri(&root.ledger_id);
-            graph_iris.push(Arc::from(config_iri.as_str()));
+        graph_iris[0] = Arc::from(expected_txn_meta.as_str());
+        let own_config: Arc<str> = Arc::from(config_graph_iri(ledger_id).as_str());
+        match graph_iris.get_mut(1) {
+            Some(config) if names_config_graph(config) => *config = own_config,
+            Some(_) => {}
+            None => graph_iris.push(own_config),
         }
         let graphs = super::global_dict::PredicateDict::from_ordered_iris(graph_iris);
 
@@ -1322,6 +1351,8 @@ impl SharedResolverState {
             decimal_encoding: root.decimal_encoding(),
             saw_list_meta: false,
             link_synth: super::link_synth::LinkSynth::new(),
+            graph_floors: HashMap::new(),
+            graph_floor_ids: HashMap::new(),
         })
     }
 
@@ -1396,7 +1427,7 @@ impl SharedResolverState {
                     config.add_per_graph(1, p_id);
                 }
                 ConfiguredFulltextScope::NamedGraph(iri) => {
-                    let Some(g_id) = self.graphs.get_or_insert(iri).checked_add(1) else {
+                    let Some(g_id) = self.graphs.graph_dict_id_or_insert(iri).checked_add(1) else {
                         tracing::warn!(
                             graph_iri = %iri,
                             "configure_fulltext_properties: graph count exceeds u32::MAX — skipping"
@@ -1408,6 +1439,38 @@ impl SharedResolverState {
             }
         }
         self.fulltext_hook_config = config;
+    }
+
+    /// Skip every op on a graph from before the graph's latest drop among the
+    /// commits this run indexes (`Commit::graph_drops`): `floors` gives that
+    /// drop's `t` by graph IRI. Set before the first commit resolves.
+    pub fn set_graph_floors(&mut self, floors: HashMap<String, i64>) {
+        self.graph_floors = floors;
+        self.graph_floor_ids.clear();
+    }
+
+    /// Whether `op`, committed at `t`, is on a graph a later drop took.
+    fn dropped_later(&mut self, op: &RawOp<'_>, t: u32) -> Result<bool, CommitCodecError> {
+        if self.graph_floors.is_empty() {
+            return Ok(false);
+        }
+        let g_id = self
+            .resolve_graph(op.g_ns_code, op.g_name)
+            .map_err(|e| CommitCodecError::InvalidOp(format!("graph resolve: {e}")))?;
+        let floor = match self.graph_floor_ids.get(&g_id) {
+            Some(floor) => *floor,
+            None => {
+                let iri = if g_id == 0 {
+                    Some(fluree_db_core::DEFAULT_GRAPH_IRI)
+                } else {
+                    self.graphs.resolve(g_id - 1)
+                };
+                let floor = iri.and_then(|iri| self.graph_floors.get(iri).copied());
+                self.graph_floor_ids.insert(g_id, floor);
+                floor
+            }
+        };
+        Ok(floor.is_some_and(|floor| i64::from(t) < floor))
     }
 
     /// Resolve a single commit's ops into chunk-local RunRecords, appending to
@@ -1440,6 +1503,11 @@ impl SharedResolverState {
 
         // Resolve user-data ops into chunk-local records.
         let walked = commit_ops.for_each_op(|raw_op: RawOp<'_>| {
+            // An op a later drop took feeds nothing: no record, no schema,
+            // no spatial or full-text entry.
+            if self.dropped_later(&raw_op, t)? {
+                return Ok(());
+            }
             // Schema extraction (rebuild only): capture class/property hierarchy
             // directly from commit ops before dict remap.
             if let Some(ref mut schema) = self.schema_hook {
@@ -1702,7 +1770,7 @@ impl SharedResolverState {
             .map(std::string::String::as_str)
             .unwrap_or("");
         self.graphs
-            .get_or_insert_parts(prefix, name)
+            .graph_dict_id_or_insert_parts(prefix, name)
             .checked_add(1)
             .ok_or_else(|| io::Error::other("graph count exceeds u32::MAX"))
     }
@@ -2561,6 +2629,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let mut envelope_bytes = Vec::new();
         encode_envelope_fields(&envelope, &mut envelope_bytes).unwrap();
@@ -2943,6 +3012,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let count = resolver
@@ -3048,6 +3118,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let count = resolver
@@ -3117,6 +3188,7 @@ mod tests {
             ],
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let count = resolver

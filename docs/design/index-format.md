@@ -122,7 +122,17 @@ Key properties:
     per-retraction list-meta hydration when novelty agrees. `Some(true)` is sticky. A zero byte decodes
     to `None` (untracked — legacy roots, bulk import) and consumers must assume lists may exist; a full
     rebuild, or any incremental pass that sees a list row, moves the root out of that state.
-  - bit 3 `HAS_TERM_DICT` — the root ends with the triple-term dictionary section.
+  - bit 3 `GRAPH_DROPS` — as in `main`'s roots, a `graph_drops` section follows the last optional
+    section (16-bit graph ids in a v2 root, 32-bit in v5): per dropped graph,
+    `g_id`, the `t` of its latest drop (its *floor*) and, when written again since, the `t` of that
+    write. A dropped graph keeps its `graph_iris` entry; the index holds none of its facts from before
+    the floor, and readers refuse a query naming it as of a `t` before the floor. A drop the root does
+    not cover yet (floor above `index_t`) is known from the commits after it; until a build covers it,
+    readers serve the graph from novelty alone (`BinaryIndexStore::without_graphs`). The commit side
+    is the envelope's `graph_drops` field, by IRI (see `Commit::graph_drops`).
+  - bit 7 `HAS_TERM_DICT` — the triple-term dictionary section follows the optional sections above,
+    before `graph_drops`. An earlier v5 root (version byte 3, read only) flags it on bit 3 instead and
+    carries no graph drops.
 
 At a high level the root contains:
 

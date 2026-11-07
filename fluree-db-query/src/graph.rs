@@ -941,6 +941,7 @@ impl Operator for GraphOperator {
                             // Single-db: a registered user graph, a name of
                             // the default graph (`single_db_names_default_graph`),
                             // or an R2RML graph source.
+                            ctx.refuse_dropped_graph(iri)?;
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
                             let is_alias = ctx.single_db_names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph

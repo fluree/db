@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_bm25_graph_drop.rs"]
+mod it_bm25_graph_drop;
 #[path = "it_config_graph.rs"]
 mod it_config_graph;
 #[path = "it_constraints_cross_ledger.rs"]

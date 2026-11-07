@@ -215,7 +215,7 @@ async fn ledger_info_resolves_reserved_graphs_by_exact_iri_not_suffix() {
     support::build_and_publish_index(&fluree, lid).await;
 
     let view = fluree.db(lid).await.expect("db");
-    let g_of = |iri: &str| view.snapshot.graph_registry.graph_id_for_iri(iri);
+    let g_of = |iri: &str| view.snapshot.graph_registry.assigned_graph_id(iri);
     let evil_g = g_of(evil).expect("the evil graph is registered");
     let evil_tm_g = g_of(evil_tm).expect("the evil txn-meta graph is registered");
     assert!(

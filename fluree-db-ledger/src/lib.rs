@@ -30,12 +30,12 @@ mod historical;
 mod staged;
 
 pub use error::{LedgerError, Result};
-pub use historical::HistoricalLedgerView;
+pub use historical::{HeadDrops, HistoricalLedgerView};
 pub use staged::StagedLedger;
 
 use fluree_db_core::{
-    BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake, GraphDbRef, GraphId,
-    LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
+    BranchedContentStore, CommitGraphLifecycle, ContentId, ContentStore, DictNovelty, Flake,
+    GraphDbRef, GraphId, LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
 };
 use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
@@ -233,6 +233,97 @@ pub struct LedgerState {
     /// the head commit once and caches the result here. Kept current by
     /// `apply_single_commit` and the commit build path.
     pub head_temporal: Option<HeadTemporal>,
+}
+
+/// Apply walked commits' graph lifecycles to `snapshot` in commit order — each
+/// commit's drops, then its revivals — given newest first, as walks yield
+/// them, after `apply_envelope_deltas` registered every graph they write.
+/// Returns each dropped graph's latest floor.
+pub(crate) fn apply_commit_lifecycles(
+    snapshot: &mut LedgerSnapshot,
+    newest_first: &[CommitGraphLifecycle],
+) -> std::collections::HashMap<fluree_db_core::GraphId, i64> {
+    let mut floors = std::collections::HashMap::new();
+    for lifecycle in newest_first.iter().rev() {
+        let g_ids = snapshot.graph_registry.graph_ids_of_drops(&lifecycle.drops);
+        snapshot.apply_graph_drops(&g_ids, lifecycle.t);
+        snapshot.revive_graphs(lifecycle.written.iter().map(String::as_str), lifecycle.t);
+        for g_id in g_ids {
+            floors.insert(g_id, lifecycle.t);
+        }
+    }
+    floors
+}
+
+/// Carry the drops `old`, a registry at the head, knows into `new`, the
+/// snapshot of an index root behind that head: the root knows the drops
+/// through its own `t`, the head those after it too. Matched by IRI, since a
+/// rebuilt root may number the graphs differently. A graph dropped after the
+/// root still has what it held before the drop counted in the root's
+/// statistics.
+fn carry_graph_drops(old: &fluree_db_core::GraphRegistry, new: &mut LedgerSnapshot) {
+    if !old.has_drops() {
+        return;
+    }
+    new.graph_registry.merge_graph_drops_by_iri(old);
+    let later = new.graph_registry.dropped_after(new.t);
+    new.forget_graph_stats(&later);
+}
+
+/// Take from `flakes`, committed at `t`, those of a graph a later drop took
+/// (`floors`, by graph), and return them. A drop's own commit writes after
+/// it, so its flakes stay.
+///
+/// Replaying them would show facts the drop took — and, novelty being a set,
+/// would also swallow the same facts written after the drop as restatements.
+pub(crate) fn take_dropped_flakes(
+    flakes: &mut Vec<Flake>,
+    t: i64,
+    floors: &std::collections::HashMap<fluree_db_core::GraphId, i64>,
+    reverse_graph: &std::collections::HashMap<fluree_db_core::Sid, fluree_db_core::GraphId>,
+) -> Vec<Flake> {
+    if !floors.values().any(|floor| t < *floor) {
+        return Vec::new();
+    }
+    let (kept, gone): (Vec<Flake>, Vec<Flake>) =
+        std::mem::take(flakes).into_iter().partition(|flake| {
+            let g_id = match &flake.g {
+                None => fluree_db_core::DEFAULT_GRAPH_ID,
+                Some(g_sid) => match reverse_graph.get(g_sid) {
+                    Some(g_id) => *g_id,
+                    None => return true,
+                },
+            };
+            floors.get(&g_id).is_none_or(|floor| t >= *floor)
+        });
+    *flakes = kept;
+    gone
+}
+
+/// The graph lifecycles of the commits after `index_t` on `head_cid`'s
+/// first-parent line, newest first, read from their envelopes alone.
+pub(crate) async fn window_lifecycles<C: ContentStore + ?Sized>(
+    store: &C,
+    head_cid: &ContentId,
+    index_t: i64,
+) -> Result<Vec<CommitGraphLifecycle>> {
+    let mut lifecycles = Vec::new();
+    let mut next = Some(head_cid.clone());
+    while let Some(cid) = next {
+        let envelope = fluree_db_core::load_commit_envelope_by_id(store, &cid).await?;
+        if envelope.t <= index_t {
+            break;
+        }
+        if !envelope.graph_drops.is_empty() || !envelope.graph_delta.is_empty() {
+            lifecycles.push(CommitGraphLifecycle {
+                t: envelope.t,
+                drops: envelope.graph_drops,
+                written: envelope.graph_delta.into_values().collect(),
+            });
+        }
+        next = envelope.parents.into_iter().next();
+    }
+    Ok(lifecycles)
 }
 
 impl LedgerState {
@@ -502,6 +593,9 @@ impl LedgerState {
         // This is required because per-graph novelty routing needs reverse_graph,
         // which depends on namespace_codes from apply_envelope_deltas().
         let mut commit_batches: Vec<(Vec<Flake>, i64)> = Vec::new();
+        // Each commit's drops and the graphs it wrote, newest first like the
+        // walk: applied oldest first once the registry knows every graph.
+        let mut lifecycle: Vec<CommitGraphLifecycle> = Vec::new();
 
         let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
@@ -529,6 +623,13 @@ impl LedgerState {
             }
 
             // Collect graph IRIs from graph_delta values
+            if !commit.graph_drops.is_empty() || !commit.graph_delta.is_empty() {
+                lifecycle.push(CommitGraphLifecycle {
+                    t: commit.t,
+                    drops: commit.graph_drops,
+                    written: commit.graph_delta.values().cloned().collect(),
+                });
+            }
             for iri in commit.graph_delta.into_values() {
                 all_graph_iris.insert(iri);
             }
@@ -541,6 +642,9 @@ impl LedgerState {
 
         // Apply all accumulated deltas to the snapshot in one shot.
         snapshot.apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)?;
+
+        // Then each commit's drops and revivals, in commit order.
+        let floors = apply_commit_lifecycles(snapshot, &lifecycle);
 
         // Stamp commit metadata flakes with txn-meta graph SID now that
         // namespace_codes are complete — and, in the same pass, drop any flake
@@ -584,6 +688,17 @@ impl LedgerState {
         // Replay oldest→newest (walk was HEAD→oldest, so reverse).
         commit_batches.reverse();
 
+        // A dropped graph's flakes from before its latest drop are not
+        // replayed, as the drop took them from novelty when it committed.
+        // Left in, they would also swallow the same facts written afterwards,
+        // which novelty's set semantics would read as restatements.
+        let mut forgotten: Vec<Flake> = Vec::new();
+        if !floors.is_empty() {
+            for (flakes, t) in &mut commit_batches {
+                forgotten.extend(take_dropped_flakes(flakes, *t, &floors, &reverse_graph));
+            }
+        }
+
         // Populate dict_novelty in commit order so overlay translation can
         // resolve IDs for unindexed commits. Doing this before bulk-apply
         // matches the ordering invariants the per-commit `apply_commit`
@@ -591,6 +706,9 @@ impl LedgerState {
         for (flakes, _t) in &commit_batches {
             dict_novelty.populate_from_flakes(flakes);
         }
+        // A dropped flake's terms stay in the dictionary novelty, as they do
+        // when the drop commits: entries name terms, not facts.
+        dict_novelty.populate_from_flakes(&forgotten);
 
         // Bulk-load mode: previously this loop called `Novelty::apply_commit`
         // per commit, whose `merge_batch_into_index` is `O(target+batch)`
@@ -777,7 +895,7 @@ impl LedgerState {
     /// - `Core` errors from loading the index
     pub async fn apply_index(&mut self, index_id: &ContentId, cs: &dyn ContentStore) -> Result<()> {
         let root_bytes = cs.get(index_id).await?;
-        let new_snapshot = LedgerSnapshot::from_root(index_id, &root_bytes)?;
+        let mut new_snapshot = LedgerSnapshot::from_root(index_id, &root_bytes)?;
 
         // Verify ledger ID matches
         if new_snapshot.ledger_id != self.snapshot.ledger_id {
@@ -827,6 +945,7 @@ impl LedgerState {
         }
 
         // Update state
+        carry_graph_drops(&self.snapshot.graph_registry, &mut new_snapshot);
         self.snapshot = Arc::new(new_snapshot);
         drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
         self.dict_novelty = Arc::new(new_dict_novelty);
@@ -941,6 +1060,7 @@ impl LedgerState {
             // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
             merged_snapshot.graph_registry.apply_delta(&old_graph_iris);
         }
+        carry_graph_drops(&self.snapshot.graph_registry, &mut merged_snapshot);
         // The old snapshot goes first: its range provider holds the
         // dictionary novelty, and while it lives the retire below would copy
         // the whole dictionary instead of trimming it in place.
@@ -1070,6 +1190,39 @@ impl LedgerState {
         Ok(())
     }
 
+    /// Apply a commit's graph drops at `t`, ahead of its own flakes (see
+    /// `Commit::graph_drops`): the registry marks them, their index
+    /// statistics go, and novelty forgets every flake they hold, the
+    /// `rdf:reifies` links and annotations of their edges among them.
+    ///
+    /// What the index holds of them is left to the caller, which owns the
+    /// store type: `fluree_db_transact::hide_dropped_graphs` swaps in a store
+    /// without them.
+    pub fn apply_graph_drops(&mut self, g_ids: &[fluree_db_core::GraphId], t: i64) {
+        if g_ids.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.snapshot).apply_graph_drops(g_ids, t);
+        Arc::make_mut(&mut self.novelty).drop_graphs(g_ids);
+    }
+
+    /// Record that a commit at `t` wrote `graph_iris` after its drops: each
+    /// dropped graph among them exists again. Leaves the snapshot unshared
+    /// when none is dropped, which is nearly always.
+    pub fn revive_graphs<'a>(
+        &mut self,
+        graph_iris: impl IntoIterator<Item = &'a str> + Clone,
+        t: i64,
+    ) {
+        if self
+            .snapshot
+            .graph_registry
+            .would_revive(graph_iris.clone())
+        {
+            Arc::make_mut(&mut self.snapshot).revive_graphs(graph_iris, t);
+        }
+    }
+
     /// Apply a single commit to the existing ledger state (incremental update).
     ///
     /// This is the fast path for `UpdatePlan::CommitCatchUp` — loads one commit's
@@ -1141,6 +1294,14 @@ impl LedgerState {
         // Apply namespace + graph deltas to snapshot
         Arc::make_mut(&mut self.snapshot)
             .apply_envelope_deltas(&commit.namespace_delta, &graph_iris)?;
+        // Then the commit's drops, ahead of its own flakes, and the dropped
+        // graphs it writes again.
+        let dropped = self
+            .snapshot
+            .graph_registry
+            .graph_ids_of_drops(&commit.graph_drops);
+        self.apply_graph_drops(&dropped, commit_t);
+        self.revive_graphs(graph_iris.iter().map(String::as_str), commit_t);
 
         // Generate commit metadata flakes
         let mut meta_flakes = generate_commit_flakes(&commit, ledger_id, commit_t);
@@ -1349,11 +1510,11 @@ mod tests {
     /// Used by `test_apply_index_equal_t_noop` to produce two FIR6
     /// blobs with the same `index_t` but different CIDs without
     /// resorting to trailing-byte padding (which the strict
-    /// `FIR6: trailing bytes` check rejects).
+    /// `FIR6: trailing bytes after the last section` check rejects).
     fn build_test_fir6_with_base(ledger_id: &str, index_t: i64, base_t: i64) -> Vec<u8> {
         // Mirror `fluree-db-core::db::decode_fir6_metadata` exactly.
         // The decoder now enforces a strict trailing-byte check
-        // (`FIR6: trailing bytes`), so any
+        // (`FIR6: trailing bytes after the last section`), so any
         // section that doesn't exactly match what the decoder reads
         // will surface either as truncation or trailing-byte error.
         // Keep this skeleton in lockstep with the decoder.
@@ -2307,5 +2468,28 @@ mod tests {
             !state.snapshot.namespaces().contains_key(&200),
             "old namespace codes should not leak into new snapshot when novelty is empty"
         );
+    }
+
+    /// A rebuilt root numbers the graphs as it met them, which need not be
+    /// the order the state registered them in: the drops the state knows go
+    /// to the same graphs by IRI.
+    #[test]
+    fn installing_a_renumbered_root_keeps_drops_on_their_graphs() {
+        let (a, z) = ("http://example.org/a", "http://example.org/z");
+        let mut state = LedgerState::new(LedgerSnapshot::genesis("test:main"), Novelty::new(0));
+        let snapshot = Arc::make_mut(&mut state.snapshot);
+        snapshot.graph_registry.apply_delta([a, z]);
+        let dropped = snapshot.graph_registry.assigned_graph_id(a).unwrap();
+        snapshot.apply_graph_drops(&[dropped], 2);
+
+        let mut rebuilt = LedgerSnapshot::genesis("test:main");
+        rebuilt.t = 1;
+        rebuilt.graph_registry.apply_delta([z]);
+        rebuilt.graph_registry.apply_delta([a]);
+        state.apply_loaded_db(rebuilt, None).unwrap();
+
+        let registry = &state.snapshot.graph_registry;
+        assert!(registry.is_dropped(registry.assigned_graph_id(a).unwrap()));
+        assert!(!registry.is_dropped(registry.assigned_graph_id(z).unwrap()));
     }
 }

@@ -403,6 +403,66 @@ async fn appending_to_a_pooled_graph_updates_the_pool() {
     );
 }
 
+/// A dropped pooled graph leaves the pool: before a build, the store no
+/// longer routes it to the pooled tree, and the build after the drop rebuilds
+/// rather than fold the window into a pool still holding its rows. Written
+/// again, it holds only what was written since.
+#[tokio::test]
+async fn a_dropped_pooled_graph_holds_only_what_is_written_after() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-drop:main";
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    assert!(
+        pooled_size(&latest_root(db_dir.path()), "g2").is_some(),
+        "g2 is pooled"
+    );
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/> DROP GRAPH ex:g2",
+    )
+    .await;
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/> INSERT DATA { GRAPH ex:g2 { ex:new ex:val 9 . } }",
+    )
+    .await;
+    let counts = format!(
+        "{PREFIXES}SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }} GROUP BY ?g"
+    );
+    let expected = vec![
+        "g=http://example.org/g1 n=3",
+        "g=http://example.org/g2 n=1",
+        "g=http://example.org/g3 n=2",
+    ];
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    assert_eq!(
+        select(&fluree, &ledger, &counts).await,
+        expected,
+        "before a build"
+    );
+
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    let g2 = root
+        .graph_iris
+        .iter()
+        .position(|g| g == "http://example.org/g2")
+        .expect("g2 keeps its registration") as fluree_db_core::GraphId
+        + 1;
+    assert!(
+        root.graph_drops.iter().any(|(g_id, _)| *g_id == g2),
+        "the root records the drop"
+    );
+    assert_eq!(
+        select(&fluree, &ledger, &counts).await,
+        expected,
+        "after the build"
+    );
+}
+
 /// Values of `?o` for `s p ?o` in graph `g`, as of `t` (`None`: current).
 async fn objects_at(
     fluree: &fluree_db_api::Fluree,
@@ -465,7 +525,7 @@ async fn history_events_via(
         .downcast::<fluree_db_binary_index::BinaryIndexStore>()
         .unwrap();
     let g_id = store
-        .graph_id_for_iri(&format!("http://example.org/{graph}"))
+        .assigned_graph_id(&format!("http://example.org/{graph}"))
         .expect("graph id");
     assert!(store.is_pooled(g_id), "the scan must read the pooled tree");
     let mut vars = VarRegistry::new();

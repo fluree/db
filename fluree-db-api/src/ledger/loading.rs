@@ -115,11 +115,24 @@ impl Fluree {
         ledger_id: &str,
         target_t: i64,
     ) -> Result<HistoricalLedgerView> {
-        let view = HistoricalLedgerView::load_at(
+        self.ledger_view_at_from_head(ledger_id, target_t, None)
+            .await
+    }
+
+    /// [`Self::ledger_view_at`], taking the drops after the index from
+    /// `head`, a state in hand, when it is at the ledger's head commit.
+    pub(crate) async fn ledger_view_at_from_head(
+        &self,
+        ledger_id: &str,
+        target_t: i64,
+        head: Option<fluree_db_ledger::HeadDrops<'_>>,
+    ) -> Result<HistoricalLedgerView> {
+        let view = HistoricalLedgerView::load_at_from_head(
             &self.nameservice_mode,
             ledger_id,
             self.backend(),
             target_t,
+            head,
         )
         .await?;
 
