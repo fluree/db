@@ -920,7 +920,7 @@ impl<F: Fn(&str) -> Option<GraphId>> GraphNameTable for F {
 
 impl GraphNameTable for GraphRegistry {
     fn graph_id(&self, iri: &str) -> Option<GraphId> {
-        self.graph_id_for_iri(iri)
+        self.assigned_graph_id(iri)
     }
 
     fn reserved_iri(&self, g_id: GraphId) -> Option<&str> {
@@ -2075,7 +2075,7 @@ mod tests {
         }
         // A table that names no reserved IRI is asked for the ledger's own,
         // which is the config graph as any ledger's is.
-        let by_iri = |iri: &str| registry.graph_id_for_iri(iri);
+        let by_iri = |iri: &str| registry.assigned_graph_id(iri);
         assert_eq!(
             TargetLedger::new(&id, &by_iri).graph_position("L:feature#config"),
             GraphPosition::Registered {

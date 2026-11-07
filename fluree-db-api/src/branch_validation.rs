@@ -111,7 +111,7 @@ fn route_incoming_graphs(
     let registry = &state.snapshot.graph_registry;
     let new: Vec<String> = graph_iris
         .iter()
-        .filter(|iri| registry.graph_id_for_iri(iri).is_none())
+        .filter(|iri| registry.assigned_graph_id(iri).is_none())
         .cloned()
         .collect();
     let aliases: Vec<&String> = graph_iris

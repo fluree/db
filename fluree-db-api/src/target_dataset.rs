@@ -20,7 +20,7 @@ use serde_json::{Map, Value as JsonValue};
 
 /// A lookup of the target ledger's registered graph IRIs. Surfaces pass a
 /// borrowed read of the ledger's snapshot
-/// ([`LedgerView::graph_id_for_iri`](crate::LedgerView::graph_id_for_iri)), so
+/// ([`LedgerView::assigned_graph_id`](crate::LedgerView::assigned_graph_id)), so
 /// each reference costs one lookup and the registry is never copied.
 pub type GraphLookup<'a> = &'a dyn Fn(&str) -> Option<GraphId>;
 

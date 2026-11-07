@@ -258,7 +258,7 @@ impl ConfigGraphs {
                 // ordinary graph.
                 let config = self.ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
                     self.registry
-                        .graph_id_for_iri(&format!("{prefix}{}", g.name.as_ref()))
+                        .assigned_graph_id(&format!("{prefix}{}", g.name.as_ref()))
                         == Some(CONFIG_GRAPH_ID)
                 });
                 self.known.insert(g.clone(), config);

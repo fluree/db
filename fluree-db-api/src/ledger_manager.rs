@@ -890,6 +890,7 @@ impl LedgerHandle {
             annotation_index: root.annotation_index.clone(),
             had_annotation_arena: root.had_annotation_arena,
             has_list_meta: root.has_list_meta,
+            graph_drops: root.graph_drops.clone(),
             index_root_id: Some(index_id.clone()),
         };
         tracing::Span::current().record("index_t", meta.t);
@@ -941,7 +942,10 @@ impl LedgerHandle {
 
             let sync_ns_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
-            let arc_store = Arc::new(store);
+            let arc_store = Arc::new(fluree_db_transact::store_without_dropped_graphs(
+                store,
+                &state.snapshot.graph_registry,
+            ));
             crate::runtime_dicts::reseed_runtime_small_dicts_from_previous(&mut state, &arc_store);
             let reseed_us = phase.elapsed().as_micros() as u64;
 
@@ -1412,7 +1416,10 @@ pub(crate) async fn load_and_attach_binary_store(
     let novelty_t = state.novelty.t;
     Arc::make_mut(&mut state.dict_novelty).mark_covered_through(novelty_t);
 
-    let arc_store = Arc::new(store);
+    let arc_store = Arc::new(fluree_db_transact::store_without_dropped_graphs(
+        store,
+        &state.snapshot.graph_registry,
+    ));
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
     let ns_fallback = Some(state.snapshot.shared_namespaces());
     let provider = BinaryRangeProvider::new(
@@ -2762,6 +2769,14 @@ impl LedgerManager {
                                 runtime_small_dicts,
                                 ns_fallback,
                             )));
+                    }
+
+                    // A commit that dropped a graph leaves the store still
+                    // holding it.
+                    if fluree_db_transact::hide_dropped_graphs(write_guard.state_mut()) {
+                        handle
+                            .sync_binary_store_from_state(write_guard.state())
+                            .await;
                     }
 
                     if let Some(e) = apply_err {
