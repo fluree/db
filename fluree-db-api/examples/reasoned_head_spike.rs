@@ -35,7 +35,7 @@ fn multiset(result: &JsonValue) -> Vec<String> {
             other => vec![other.clone()],
         },
     };
-    let mut out: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+    let mut out: Vec<String> = rows.iter().map(ToString::to_string).collect();
     out.sort();
     out
 }
