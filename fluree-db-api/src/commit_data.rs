@@ -9,7 +9,7 @@
 //! then restored folds to nothing. The netting contract is
 //! [`NetChangeAccumulator`]'s.
 
-use fluree_db_core::graph_registry::{names_config_graph, CONFIG_GRAPH_ID};
+use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
 use fluree_db_core::{Commit, ConflictKey, ContentId, Flake, Sid};
 use fluree_db_novelty::NetChangeAccumulator;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -193,6 +193,7 @@ where
 /// its state resolves.
 pub(crate) struct ConfigGraphs {
     ns: fluree_db_transact::NamespaceRegistry,
+    registry: fluree_db_core::GraphRegistry,
     canonical: Option<Sid>,
     known: FxHashMap<Sid, bool>,
 }
@@ -200,8 +201,13 @@ pub(crate) struct ConfigGraphs {
 impl ConfigGraphs {
     /// For a change staged on `target`.
     pub(crate) fn for_target(target: &fluree_db_ledger::LedgerState) -> Self {
-        let ns = fluree_db_transact::NamespaceRegistry::from_db(&target.snapshot);
-        let registry = &target.snapshot.graph_registry;
+        Self::for_snapshot(&target.snapshot)
+    }
+
+    /// For a change staged on a target whose head is `snapshot`.
+    pub(crate) fn for_snapshot(snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+        let ns = fluree_db_transact::NamespaceRegistry::from_db(snapshot);
+        let registry = &snapshot.graph_registry;
         let canonical = registry
             .iri_for_graph_id(CONFIG_GRAPH_ID)
             .into_iter()
@@ -209,6 +215,7 @@ impl ConfigGraphs {
             .find_map(|iri| ns.lookup_sid_for_iri(iri));
         Self {
             ns,
+            registry: registry.clone(),
             canonical,
             known: FxHashMap::default(),
         }
@@ -246,8 +253,13 @@ impl ConfigGraphs {
         let config = match self.known.get(g) {
             Some(config) => *config,
             None => {
+                // As the target's registry reads it: an index built before
+                // config graphs were read across ledgers holds one as an
+                // ordinary graph.
                 let config = self.ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
-                    names_config_graph(&format!("{prefix}{}", g.name.as_ref()))
+                    self.registry
+                        .assigned_graph_id(&format!("{prefix}{}", g.name.as_ref()))
+                        == Some(CONFIG_GRAPH_ID)
                 });
                 self.known.insert(g.clone(), config);
                 config

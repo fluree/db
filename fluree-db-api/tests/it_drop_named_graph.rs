@@ -1,14 +1,13 @@
 //! Drop named graph integration tests.
 //!
-//! `drop_named_graph` is a transactional retract: it produces one normal
-//! commit at `t = current + 1` whose flakes are retractions of every
-//! triple currently asserted in the target graph. History at earlier `t`
-//! values is preserved.
+//! `drop_named_graph` is SPARQL `DROP GRAPH`: one commit at `t = current + 1`
+//! that retracts nothing, after which the graph and its history are no longer
+//! queryable. The SPARQL forms are covered in `it_graph_drop.rs`.
 
 #![cfg(feature = "native")]
 
 use crate::support::genesis_ledger;
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, GraphSel};
 use serde_json::json;
 
 const ALPHA_IRI: &str = "http://example.org/graphs/alpha";
@@ -67,8 +66,15 @@ async fn count_in_graph(
     rows.as_array().map(|arr| arr.len() as i64).unwrap_or(0)
 }
 
+async fn graph_exists(fluree: &fluree_db_api::Fluree, ledger_id: &str, graph_iri: &str) -> bool {
+    fluree
+        .graph_exists(ledger_id, &GraphSel::Graph(graph_iri.to_string()))
+        .await
+        .expect("graph_exists")
+}
+
 #[tokio::test]
-async fn drop_named_graph_retracts_only_target_graph() {
+async fn drop_named_graph_drops_only_the_target_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/drop-named-graph/basic:main";
 
@@ -87,40 +93,55 @@ async fn drop_named_graph_retracts_only_target_graph() {
 
     assert_eq!(report.ledger_id, ledger_id);
     assert_eq!(report.graph_iri, ALPHA_IRI);
-    assert_eq!(report.retracted, 2, "should retract both alpha triples");
-    assert!(report.committed, "non-empty graph drop produces a commit");
+    assert_eq!(report.retracted, 0, "a drop retracts nothing");
+    assert!(report.committed);
     assert_eq!(report.t, pre_drop_t + 1);
 
-    // Alpha is empty at HEAD; beta and default are untouched.
-    assert_eq!(count_in_graph(&fluree, ledger_id, Some(ALPHA_IRI)).await, 0);
+    // Alpha no longer exists; beta and default are untouched.
+    assert!(!graph_exists(&fluree, ledger_id, ALPHA_IRI).await);
     assert_eq!(count_in_graph(&fluree, ledger_id, Some(BETA_IRI)).await, 1);
     assert_eq!(count_in_graph(&fluree, ledger_id, None).await, 1);
 }
 
 #[tokio::test]
-async fn drop_named_graph_is_idempotent_when_empty() {
+async fn a_dropped_graph_cannot_be_dropped_again() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/drop-named-graph/idempotent:main";
+    let ledger_id = "it/drop-named-graph/twice:main";
 
     seed_two_graphs(&fluree, ledger_id).await;
 
-    let first = fluree
+    fluree
         .drop_named_graph(ledger_id, ALPHA_IRI)
         .await
         .expect("first drop");
-    assert!(first.committed);
-    assert_eq!(first.retracted, 2);
-
-    let second = fluree
+    let err = fluree
         .drop_named_graph(ledger_id, ALPHA_IRI)
         .await
-        .expect("second drop");
-    assert_eq!(second.retracted, 0);
-    assert!(!second.committed, "no-op drop must not produce a commit");
-    assert_eq!(
-        second.t, first.t,
-        "no-op drop should report the unchanged t"
-    );
+        .expect_err("the graph no longer exists");
+    assert!(err.to_string().contains("does not exist"), "{err}");
+}
+
+#[tokio::test]
+async fn an_emptied_graph_still_drops() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/drop-named-graph/emptied:main";
+    seed_two_graphs(&fluree, ledger_id).await;
+
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let cleared = fluree
+        .stage_owned(ledger)
+        .txn(fluree_db_transact::Txn::clear_graph(ALPHA_IRI))
+        .execute()
+        .await
+        .expect("clear")
+        .receipt
+        .t;
+    let report = fluree
+        .drop_named_graph(ledger_id, ALPHA_IRI)
+        .await
+        .expect("drop the emptied graph");
+    assert!(report.committed);
+    assert_eq!(report.t, cleared + 1);
 }
 
 #[tokio::test]
@@ -247,10 +268,10 @@ async fn drop_named_graph_rejects_relative_iri() {
     );
 }
 
-/// Drop is history-preserving: querying the same ledger at the pre-drop `t`
-/// must still see every triple in the graph.
+/// Drop takes the graph's history: querying it as of the pre-drop `t` is
+/// refused rather than answered from what the drop took.
 #[tokio::test]
-async fn drop_named_graph_preserves_history_at_older_t() {
+async fn drop_named_graph_takes_its_history() {
     use fluree_db_api::{DatasetSpec, GraphSource, TimeSpec};
 
     let fluree = FlureeBuilder::memory().build_memory();
@@ -270,37 +291,23 @@ async fn drop_named_graph_preserves_history_at_older_t() {
     assert!(report.committed);
     assert_eq!(report.t, pre_drop_t + 1);
 
-    // HEAD: alpha is empty.
-    assert_eq!(count_in_graph(&fluree, ledger_id, Some(ALPHA_IRI)).await, 0,);
+    // HEAD: alpha does not exist.
+    assert!(!graph_exists(&fluree, ledger_id, ALPHA_IRI).await);
 
-    // pre-drop t via DatasetSpec: alpha is still populated.
+    // Pre-drop t via DatasetSpec: refused, since the drop took that state.
     let alpha_alias = format!("{ledger_id}#{ALPHA_IRI}");
     let spec = DatasetSpec::new().with_default(
         GraphSource::parse(&alpha_alias)
             .unwrap()
             .with_time(TimeSpec::AtT(pre_drop_t)),
     );
-    let dataset = fluree
-        .build_dataset_view(&spec)
-        .await
-        .expect("dataset at pre-drop t");
-    let q = serde_json::json!({
-        "select": ["?s", "?p", "?o"],
-        "where": {"@id": "?s", "?p": "?o"}
-    });
-    let pre_drop_result = fluree
-        .query_dataset(&dataset, &q)
-        .await
-        .expect("history query");
-    let primary = dataset.primary().expect("primary view");
-    let rows = pre_drop_result
-        .to_jsonld(primary.snapshot.as_ref())
-        .expect("to_jsonld");
-    let rows = rows.as_array().expect("array");
-    assert_eq!(
-        rows.len(),
-        2,
-        "pre-drop snapshot must still expose every flake in alpha; got {rows:?}",
+    let Err(err) = fluree.build_dataset_view(&spec).await else {
+        panic!("the dropped graph as of before the drop");
+    };
+    assert!(
+        err.to_string()
+            .contains(&format!("dropped at t={}", pre_drop_t + 1)),
+        "{err}"
     );
 }
 
@@ -355,11 +362,10 @@ async fn drop_named_graph_other_branches_unaffected() {
         .drop_named_graph(ledger_id, ALPHA_IRI)
         .await
         .expect("drop alpha on main");
-    assert_eq!(report.retracted, 2);
     assert!(report.committed);
 
     // Sibling branch's alpha graph is untouched.
-    assert_eq!(count_in_graph(&fluree, ledger_id, Some(ALPHA_IRI)).await, 0);
+    assert!(!graph_exists(&fluree, ledger_id, ALPHA_IRI).await);
     assert_eq!(
         count_in_graph(&fluree, &sibling_id, Some(ALPHA_IRI)).await,
         3,

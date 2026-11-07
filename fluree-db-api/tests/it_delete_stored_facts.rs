@@ -218,7 +218,7 @@ async fn deleting_an_absent_fact_commits_nothing() {
 #[tokio::test]
 async fn a_delete_in_a_new_graph_commits_nothing() {
     const NEW: &str = "http://example.org/new";
-    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.graph_id_for_iri(NEW);
+    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.assigned_graph_id(NEW);
     for indexed in [false, true] {
         let seed = json!({"@id": "ex:s", "ex:p": "present"});
 
@@ -1667,7 +1667,8 @@ async fn transfer_seed(
 /// a name the identity may change beside the salary it may not. A fact the
 /// destination holds is restated, not skipped unseen: when the identity
 /// cannot view it, both sides go to the modify check, as for upsert and
-/// sync. (MOVE also retracts the source, which this identity may not.)
+/// sync. MOVE drops its source, which only an identity without a restricting
+/// policy may do, so it is refused before either graph is read.
 #[tokio::test]
 async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
     let mut failures = Vec::new();
@@ -1768,7 +1769,7 @@ async fn a_delete_naming_a_graph_the_ledger_lacks_commits_nothing() {
         ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .is_some()
     };
     for indexed in [false, true] {
@@ -1842,7 +1843,7 @@ async fn graph_objects(ledger: &LedgerState, iri: Option<&str>) -> Vec<String> {
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph"),
     };
     let s = ledger.snapshot.encode_iri(&format!("{EX}s")).expect("s");
@@ -1939,7 +1940,7 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
             ledger
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri(&id)
+                .assigned_graph_id(&id)
                 .is_some(),
             "the fixture registers a graph under the ledger's address"
         );

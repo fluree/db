@@ -421,6 +421,7 @@ mod tests {
             legacy_annotation_arena: None,
             term_dict: None,
             has_list_meta: None,
+            graph_drops: Vec::new(),
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,

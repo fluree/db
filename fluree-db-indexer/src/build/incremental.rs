@@ -1175,6 +1175,7 @@ async fn incremental_index_with(
         IncrementalResolveError::Resolve(crate::run_index::ResolverError::Unindexable(msg)) => {
             IndexerError::Unindexable(msg)
         }
+        IncrementalResolveError::NeedsRebuild(why) => IndexerError::IncrementalAbort(why),
         e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
     })?;
 
@@ -1221,7 +1222,7 @@ async fn incremental_index_with(
         novelty.max_t = novelty.max_t.max(novelty.base_root.index_t);
     }
 
-    if novelty.records.is_empty() && erased_events.is_empty() {
+    if novelty.records.is_empty() && erased_events.is_empty() && novelty.purged_graphs.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
         // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
@@ -1242,6 +1243,7 @@ async fn incremental_index_with(
         "V6 Phase 1 complete: incremental resolve"
     );
 
+    let purged_cids = std::mem::take(&mut novelty.purged_cids);
     index_novelty(
         content_store,
         tracker,
@@ -1249,7 +1251,7 @@ async fn incremental_index_with(
         base_root_id,
         novelty,
         config,
-        Vec::new(),
+        purged_cids,
         erased_events,
     )
     .await
@@ -1327,6 +1329,18 @@ pub(crate) async fn index_novelty(
     let base_pool = base_root.pool.as_ref();
     let has_own_trees: std::collections::HashSet<fluree_db_core::GraphId> =
         base_root.named_graphs.iter().map(|ng| ng.g_id).collect();
+    // Pooled graphs a drop in the window took (`novelty.purged_graphs`): they
+    // leave the pool with nothing of what they held, and one the window
+    // writes again is placed as a graph new to the index.
+    let pool_purge: Vec<fluree_db_core::GraphId> = base_pool.map_or_else(Vec::new, |pool| {
+        novelty
+            .purged_graphs
+            .iter()
+            .copied()
+            .filter(|g| pool.contains(*g))
+            .collect()
+    });
+    let purged = |g: fluree_db_core::GraphId| pool_purge.binary_search(&g).is_ok();
     let mut pool_writes: Vec<fluree_db_core::GraphId> = Vec::new();
     let mut promote: Vec<fluree_db_core::GraphId> = Vec::new();
     for (&g_id, indices) in &by_graph {
@@ -1335,7 +1349,9 @@ pub(crate) async fn index_novelty(
         {
             continue;
         }
-        let pooled = base_pool.and_then(|p| p.member(g_id));
+        let pooled = base_pool
+            .and_then(|p| p.member(g_id))
+            .filter(|_| !purged(g_id));
         let size = window_size(
             pooled.map_or(GraphSize::default(), |m| GraphSize {
                 rows: m.rows.into(),
@@ -1351,13 +1367,25 @@ pub(crate) async fn index_novelty(
         }
     }
     if let Some(pool) = base_pool {
-        promote.extend(
-            pool.graph_ids()
-                .filter(|g| !by_graph.contains_key(g) && placement.pinned_dedicated(*g)),
-        );
+        promote.extend(pool.graph_ids().filter(|g| {
+            !by_graph.contains_key(g) && placement.pinned_dedicated(*g) && !purged(*g)
+        }));
     }
     promote.sort_unstable();
     let promoted = read_pooled_graph_logs(&content_store, base_root, &promote).await?;
+    let purged_logs = read_pooled_graph_logs(&content_store, base_root, &pool_purge).await?;
+    // Every graph whose pooled rows and history this build drops.
+    let mut leaving: Vec<fluree_db_core::GraphId> =
+        promote.iter().chain(&pool_purge).copied().collect();
+    leaving.sort_unstable();
+    leaving.dedup();
+    for &g_id in &pool_purge {
+        // One the pool takes again keeps its membership: the GSPO merge's
+        // tally takes it from its old size to what the window wrote.
+        if pool_writes.binary_search(&g_id).is_err() {
+            root_builder.remove_from_pool(g_id);
+        }
+    }
 
     let concurrency = config.incremental_max_concurrency.max(1);
     // Graphs holding erased events have a task each, novelty or not. Never
@@ -1501,10 +1529,10 @@ pub(crate) async fn index_novelty(
     }
 
     // The pool: one update per pooled order for every pooled graph this
-    // window writes, which also drops the promoted graphs. Each promoted
-    // identity rides along as an `OP_PURGE` marker so the update touches
+    // window writes, which also drops the graphs leaving it. Each of their
+    // identities rides along as an `OP_PURGE` marker so the update touches
     // every leaflet that holds it.
-    if !pool_writes.is_empty() || !promote.is_empty() {
+    if !pool_writes.is_empty() || !leaving.is_empty() {
         pool_drop = novelty
             .shared
             .pool_history_drop(&config.history_suppression);
@@ -1523,7 +1551,7 @@ pub(crate) async fn index_novelty(
             .filter(|(rec, _)| pooled_write(rec))
             .map(|(rec, &op)| (*rec, op))
             .collect();
-        for log in promoted.values() {
+        for log in promoted.values().chain(purged_logs.values()) {
             let mut seen: std::collections::HashSet<FactIdentityKey> =
                 std::collections::HashSet::new();
             for rec in log
@@ -1536,7 +1564,7 @@ pub(crate) async fn index_novelty(
                 }
             }
         }
-        let purge = Arc::new(promote.clone());
+        let purge = Arc::new(leaving.clone());
         // No pool yet: write one from this window's pooled graphs alone.
         let fresh_pool = base_pool.is_none().then(|| {
             Arc::new(
@@ -1565,12 +1593,12 @@ pub(crate) async fn index_novelty(
                                 pool.delta(order),
                                 window_events,
                                 base_rows,
-                                !promote.is_empty(),
+                                !leaving.is_empty(),
                             )
                     })
                     .map(|&order| (order, pool.delta(order)))
                     .collect();
-                delta_run_events(content_store.as_ref(), &folds, &promote).await?
+                delta_run_events(content_store.as_ref(), &folds, &leaving).await?
             }
             None => Vec::new(),
         };
@@ -2775,6 +2803,9 @@ pub(crate) async fn index_novelty(
         // clamp applies on every incremental (not just the fallback) so ndv
         // survives register loss in a previously fallback-seeded sketch.
         let mut prior_properties = prior_properties;
+        // A purged graph starts from nothing: what the sketch counted of it
+        // the drop took.
+        prior_properties.retain(|key, _| !novelty.purged_graphs.contains(&key.g_id));
         let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
             std::collections::HashMap::new();
         if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {

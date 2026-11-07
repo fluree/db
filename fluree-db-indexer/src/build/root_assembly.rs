@@ -228,6 +228,9 @@ pub(crate) struct Fir6Inputs {
     /// Triple-term dictionary interned by this build, if any reification
     /// links were synthesized.
     pub term_dict: Option<fluree_db_binary_index::TermDictRefs>,
+    /// The graphs a commit in the build dropped, with what each latest drop
+    /// left, by this build's graph ids (`IndexRoot.graph_drops`).
+    pub graph_drops: Vec<(fluree_db_core::GraphId, fluree_db_core::GraphDrop)>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -325,6 +328,7 @@ pub(crate) async fn encode_and_write_root_v6(
         term_dict: inputs.term_dict,
         has_list_meta: Some(inputs.saw_list_meta),
         pool,
+        graph_drops: inputs.graph_drops,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
@@ -465,6 +469,7 @@ mod tests {
             has_list_meta: None,
             legacy_annotation_arena: None,
             term_dict: None,
+            graph_drops: Vec::new(),
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,

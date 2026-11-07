@@ -1,7 +1,8 @@
-//! A deterministic pause immediately before the merge's ref CAS, an opt-in
-//! listing failure, an opt-in loss of every commit-head race, and an opt-in
-//! pause before, or failure of, an index publish. All other operations use
-//! the real nameservice, including rollback.
+//! A deterministic pause immediately before the merge's ref CAS, or instead
+//! just after its lookup of the target, an opt-in listing failure, an opt-in
+//! loss of every commit-head race, and an opt-in pause before, or failure of,
+//! an index publish. All other operations use the real nameservice, including
+//! rollback.
 
 // Compiled into more than one test group, each using some of it; `allow`,
 // not `expect`, for the reason `support/mod.rs` gives.
@@ -28,6 +29,7 @@ use tokio::sync::Notify;
 pub(super) struct PausingNameService {
     inner: Arc<dyn NameServicePublisher>,
     armed: AtomicBool,
+    pausing_lookup: AtomicBool,
     failing_listings: AtomicBool,
     losing_commits: AtomicBool,
     pausing_index: AtomicBool,
@@ -43,6 +45,7 @@ impl PausingNameService {
         Self {
             inner,
             armed: AtomicBool::new(true),
+            pausing_lookup: AtomicBool::new(false),
             failing_listings: AtomicBool::new(false),
             losing_commits: AtomicBool::new(false),
             pausing_index: AtomicBool::new(false),
@@ -52,6 +55,13 @@ impl PausingNameService {
             index_entered: Notify::new(),
             index_resume: Notify::new(),
         }
+    }
+
+    /// Hold the next lookup of `mydb:main` once it has read the record, until
+    /// `resume`, signalling `entered`, instead of the next ref CAS.
+    pub(super) fn pause_after_next_lookup(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        self.pausing_lookup.store(true, Ordering::SeqCst);
     }
 
     /// Hold the next index publish until `index_resume`, signalling
@@ -127,7 +137,12 @@ impl ConfigLookup for PausingNameService {
 #[async_trait]
 impl NameServiceLookup for PausingNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        self.inner.lookup(ledger_id).await
+        let record = self.inner.lookup(ledger_id).await?;
+        if ledger_id == "mydb:main" && self.pausing_lookup.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(record)
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {

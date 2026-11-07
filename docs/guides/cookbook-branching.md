@@ -167,7 +167,7 @@ The server's Raft merge path uses `QueuedTransactor::merge`, which queues the me
 
 ### A target that adopted another branch's index
 
-Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. The target reads its config under those labels, since any ledger's config graph IRI names the config graph, and its next index build relabels both graphs with the target's own IRIs. `fluree reindex mydb:main` relabels them at once.
+Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. The target's config still governs it, and a query or write names its system graphs as `config` and `txn-meta` or by the target's own IRIs, not by the source's labels; its next index build relabels both graphs with the target's own IRIs. `fluree reindex mydb:main` relabels them at once.
 
 ### Compare branches
 

@@ -175,6 +175,7 @@ pub(crate) fn read_commit_replacement(bytes: &[u8]) -> Result<Commit, CommitCode
         commit_signatures: Vec::new(),
         txn_meta: envelope.txn_meta,
         graph_delta: envelope.graph_delta,
+        graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
         redaction: Some(Redaction {
             slots: r.survivors.iter().map(|(slot, _)| *slot).collect(),
@@ -195,6 +196,7 @@ pub(crate) fn read_envelope_replacement(bytes: &[u8]) -> Result<CommitEnvelope, 
         namespace_delta: env.namespace_delta,
         txn_meta: env.txn_meta,
         graph_delta: env.graph_delta,
+        graph_drops: env.graph_drops,
         ns_split_mode: env.ns_split_mode,
     })
 }

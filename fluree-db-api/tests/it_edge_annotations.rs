@@ -2395,7 +2395,7 @@ async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
         ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri("http://example.org/hr-graph")
+            .assigned_graph_id("http://example.org/hr-graph")
             .expect("named graph registered")
     };
     let alice = after_reinsert
@@ -3931,7 +3931,7 @@ async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
     let g_id = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(graph_iri)
+        .assigned_graph_id(graph_iri)
         .expect("named graph registered");
     let subject_sid = ledger
         .snapshot
@@ -5311,7 +5311,7 @@ fn graph_id(ledger: &MemoryLedger, iri: &str) -> fluree_db_core::GraphId {
     ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .unwrap_or_else(|| panic!("graph {iri} must be registered"))
 }
 

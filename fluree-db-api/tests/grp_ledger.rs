@@ -22,6 +22,8 @@ mod it_drop_named_graph;
 mod it_dropped_ledgers;
 #[path = "it_garbage.rs"]
 mod it_garbage;
+#[path = "it_graph_drop.rs"]
+mod it_graph_drop;
 #[path = "it_graph_scoped_writes.rs"]
 mod it_graph_scoped_writes;
 #[path = "it_json_canonicalization.rs"]

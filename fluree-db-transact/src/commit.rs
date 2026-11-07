@@ -595,60 +595,6 @@ pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>>
         })
 }
 
-/// One of the config graph's IRIs in `graph_iris`, as a commit's `graph_delta`
-/// lists graphs by id: the one its slot is registered by when the commit
-/// writes under it, else the first. Flakes under the others (a merge of a
-/// branch that wrote under its source's config graph IRI and then its own)
-/// move to it. `ns_delta` holds the codes a merge brings in, which its flakes
-/// may name graphs by.
-fn one_config_graph_iri(
-    mut flakes: Vec<Flake>,
-    graph_iris: &mut Vec<String>,
-    registry: &fluree_db_core::GraphRegistry,
-    ns: &NamespaceRegistry,
-    ns_delta: Option<&HashMap<u16, String>>,
-) -> Result<Vec<Flake>> {
-    use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
-    let named: Vec<String> = graph_iris
-        .iter()
-        .filter(|iri| registry.graph_id_for_iri(iri) == Some(CONFIG_GRAPH_ID))
-        .cloned()
-        .collect();
-    if named.len() < 2 {
-        return Ok(flakes);
-    }
-    let mut ns = ns.clone();
-    if let Some(delta) = ns_delta {
-        ns.adopt_delta_for_persistence(delta)
-            .map_err(|e| TransactError::FlakeGeneration(e.to_string()))?;
-    }
-    // An IRI with no Sid names no flake.
-    let config: Vec<(&String, fluree_db_core::Sid)> = named
-        .iter()
-        .filter_map(|iri| ns.lookup_sid_for_iri(iri).map(|sid| (iri, sid)))
-        .collect();
-    let slot = registry.iri_for_graph_id(CONFIG_GRAPH_ID);
-    let keep = config
-        .iter()
-        .find(|(iri, _)| Some(iri.as_str()) == slot)
-        .or(config.first());
-    let keep_iri = keep.map_or(&named[0], |(iri, _)| *iri).clone();
-    if let Some((_, kept)) = keep {
-        let moved: Vec<&fluree_db_core::Sid> = config
-            .iter()
-            .filter(|(_, sid)| sid != kept)
-            .map(|(_, sid)| sid)
-            .collect();
-        for flake in &mut flakes {
-            if flake.g.as_ref().is_some_and(|g| moved.contains(&g)) {
-                flake.g = Some(kept.clone());
-            }
-        }
-    }
-    graph_iris.retain(|iri| *iri == keep_iri || !named.contains(iri));
-    Ok(flakes)
-}
-
 /// Refuse a staged view holding a retraction and an assertion of one fact
 /// ([`FactIdentity`]) in one graph: every staged flake carries one `t`, and
 /// a commit built here may not hold such a pair (`fluree_db_core::same_t`).
@@ -737,6 +683,60 @@ pub(crate) fn graph_ids(snapshot: &LedgerSnapshot) -> Result<HashMap<Sid, GraphI
     Ok(graph_ids)
 }
 
+/// One of the config graph's IRIs in `graph_iris`, as a commit's `graph_delta`
+/// lists graphs by id: the one its slot is registered by when the commit
+/// writes under it, else the first. Flakes under the others (a merge of a
+/// branch that wrote under its source's config graph IRI and then its own)
+/// move to it. `ns_delta` holds the codes a merge brings in, which its flakes
+/// may name graphs by.
+fn one_config_graph_iri(
+    mut flakes: Vec<Flake>,
+    graph_iris: &mut Vec<String>,
+    registry: &fluree_db_core::GraphRegistry,
+    ns: &NamespaceRegistry,
+    ns_delta: Option<&HashMap<u16, String>>,
+) -> Result<Vec<Flake>> {
+    use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
+    let named: Vec<String> = graph_iris
+        .iter()
+        .filter(|iri| registry.assigned_graph_id(iri) == Some(CONFIG_GRAPH_ID))
+        .cloned()
+        .collect();
+    if named.len() < 2 {
+        return Ok(flakes);
+    }
+    let mut ns = ns.clone();
+    if let Some(delta) = ns_delta {
+        ns.adopt_delta_for_persistence(delta)
+            .map_err(|e| TransactError::FlakeGeneration(e.to_string()))?;
+    }
+    // An IRI with no Sid names no flake.
+    let config: Vec<(&String, fluree_db_core::Sid)> = named
+        .iter()
+        .filter_map(|iri| ns.lookup_sid_for_iri(iri).map(|sid| (iri, sid)))
+        .collect();
+    let slot = registry.iri_for_graph_id(CONFIG_GRAPH_ID);
+    let keep = config
+        .iter()
+        .find(|(iri, _)| Some(iri.as_str()) == slot)
+        .or(config.first());
+    let keep_iri = keep.map_or(&named[0], |(iri, _)| *iri).clone();
+    if let Some((_, kept)) = keep {
+        let moved: Vec<&fluree_db_core::Sid> = config
+            .iter()
+            .filter(|(_, sid)| sid != kept)
+            .map(|(_, sid)| sid)
+            .collect();
+        for flake in &mut flakes {
+            if flake.g.as_ref().is_some_and(|g| moved.contains(&g)) {
+                flake.g = Some(kept.clone());
+            }
+        }
+    }
+    graph_iris.retain(|iri| *iri == keep_iri || !named.contains(iri));
+    Ok(flakes)
+}
+
 /// Commit a staged transaction
 ///
 /// This function:
@@ -777,6 +777,7 @@ pub async fn build_commit(
     // 1. Extract flakes from view
     let mut view = view;
     let system_txn_meta = view.take_system_txn_meta();
+    let mut graph_drops = view.graph_drops().to_vec();
     let (mut base, flakes) = view.into_parts();
     // The checks below read the base's index; refuse before they fail on one
     // this process has not loaded. Merge, rebase and revert reach here
@@ -854,13 +855,25 @@ pub async fn build_commit(
     //    listed — they are seeded in memory at genesis, so the commit that
     //    writes one is the durable record the registration probe, merge and
     //    config readers look for.
+    //
+    //    A commit that drops a graph is valid with nothing else in it: the
+    //    drop is the change (`CLEAR GRAPH <g> ; DROP GRAPH <g>` stages no
+    //    flake at all). Its drops apply here, ahead of everything else the
+    //    commit does — so a graph it drops and writes again reads as one to
+    //    register, below, and its flakes land after the drop.
+    graph_drops.sort_unstable();
+    graph_drops.dedup();
+    if !graph_drops.is_empty() {
+        base.apply_graph_drops(&graph_drops, base.t() + 1);
+        crate::staged_dicts::hide_dropped_graphs(&mut base);
+    }
     let registry = &base.snapshot.graph_registry;
     let registers_new_graph = registry.has_unregistered(graph_iris.iter().map(String::as_str));
     let mut graph_iris = graph_iris;
     graph_iris.retain(|iri| {
-        registry
-            .graph_id_for_iri(iri)
-            .is_none_or(|g_id| g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+        registry.assigned_graph_id(iri).is_none_or(|g_id| {
+            g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID || registry.is_dropped(g_id)
+        })
     });
     graph_iris.sort_unstable();
     graph_iris.dedup();
@@ -871,7 +884,12 @@ pub async fn build_commit(
         &ns_registry,
         override_ns_delta.as_ref(),
     )?;
-    if flakes.is_empty() && merge_parents.is_empty() && !registers_new_graph && !control {
+    if flakes.is_empty()
+        && merge_parents.is_empty()
+        && !registers_new_graph
+        && graph_drops.is_empty()
+        && !control
+    {
         return Err(TransactError::EmptyTransaction);
     }
 
@@ -981,6 +999,7 @@ pub async fn build_commit(
             &ns_delta,
             graph_iris.iter().map(std::string::String::as_str),
         );
+        base.revive_graphs(graph_iris.iter().map(String::as_str), new_t);
         if let Some(provider) = put_back {
             Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
         }
@@ -1044,7 +1063,7 @@ pub async fn build_commit(
             let g_id = base
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri(&iri)
+                .assigned_graph_id(&iri)
                 .ok_or_else(|| {
                     TransactError::FlakeGeneration(format!(
                         "graph <{iri}> was written but is not in the registry after apply"
@@ -1053,6 +1072,7 @@ pub async fn build_commit(
             Ok((g_id, iri))
         })
         .collect::<Result<_>>()?;
+    commit_record.graph_drops = base.snapshot.graph_registry.drop_record(&graph_drops);
     if let Some(split_mode) = ns_split_mode_for_genesis {
         commit_record.ns_split_mode = Some(split_mode);
     }

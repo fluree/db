@@ -7576,6 +7576,7 @@ where
             // `i: LIST_INDEX_NONE`) are the only other rows in the root, and
             // they are never list rows.
             has_list_meta: Some(input.saw_list_meta),
+            graph_drops: Vec::new(),
             ns_split_mode: input.ns_split_mode,
             // Same source as the spool object resolution (SpoolConfig): the root
             // version must match how the import encoded decimals.

@@ -1035,3 +1035,101 @@ async fn a_recreated_ledger_is_not_reasoned_over_with_the_dropped_ones_schema() 
         "the recreated ledger's schema makes ex:Employee an ex:Agent, not an ex:Person"
     );
 }
+
+// ============================================================================
+// A schema graph a later commit dropped
+// ============================================================================
+
+async fn persons(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    t: Option<i64>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let view = match t {
+        Some(t) => {
+            fluree
+                .db_at(ledger_id, fluree_db_api::TimeSpec::AtT(t))
+                .await?
+        }
+        None => fluree.db(ledger_id).await?,
+    };
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?s",
+        "where": {"@id": "?s", "@type": "ex:Person"},
+        "reasoning": "rdfs"
+    });
+    let rows = fluree.query(&view, &q).await?.to_jsonld(&view.snapshot)?;
+    Ok(support::normalize_rows(&rows))
+}
+
+async fn drop_graph(fluree: &fluree_db_api::Fluree, ledger_id: &str, target: &str) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(&format!("DROP {target}"))
+        .commit()
+        .await
+        .expect("drop commits");
+}
+
+/// Config whose `f:schemaSource` selects `selector`.
+fn schema_source_config(ledger_id: &str, selector: &str) -> String {
+    let config_iri = config_graph_iri(ledger_id);
+    format!(
+        r"
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:schemaSource <urn:config:schema-ref> .
+            <urn:config:schema-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:schema-source> .
+            <urn:config:schema-source> f:graphSelector <{selector}> .
+        }}
+        "
+    )
+}
+
+const PREFIXES: &str = r"
+    @prefix f: <https://ns.flur.ee/db#> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+    @prefix ex: <http://example.org/> .
+";
+
+/// Reasoning as of a `t` before the drop of its schema graph is refused, as a
+/// `GRAPH` naming the graph as of that `t` is, even after a query as of that
+/// `t` from before the drop cached the schema. At the head the dropped graph
+/// does not exist, which fails closed as a schema source never written does.
+#[tokio::test]
+async fn reasoning_as_of_before_a_schema_graph_drop_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-imports-dropped-schema:main";
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    let ontology = "http://example.org/ontology/core";
+    let trig = format!(
+        "{PREFIXES}
+        ex:alice rdf:type ex:Employee .
+        GRAPH <{ontology}> {{ ex:Employee rdfs:subClassOf ex:Person . }}
+        {}",
+        schema_source_config(ledger_id, ontology)
+    );
+    let t1 = apply_trig(&fluree, ledger, &trig).await.t();
+    assert_eq!(
+        persons(&fluree, ledger_id, Some(t1)).await.unwrap(),
+        [json!("ex:alice")]
+    );
+
+    drop_graph(&fluree, ledger_id, &format!("GRAPH <{ontology}>")).await;
+
+    let err = persons(&fluree, ledger_id, Some(t1)).await.unwrap_err();
+    assert!(
+        matches!(err, ApiError::GraphNotFound(ref msg) if msg.contains("was dropped")),
+        "{err}"
+    );
+    let err = persons(&fluree, ledger_id, None).await.unwrap_err();
+    assert!(
+        matches!(err, ApiError::OntologyImport(ref msg) if msg.contains("not a named graph")),
+        "{err}"
+    );
+}

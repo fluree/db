@@ -952,7 +952,10 @@ impl LedgerHandle {
 
             let sync_ns_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
-            let arc_store = Arc::new(store);
+            let arc_store = Arc::new(fluree_db_transact::store_without_dropped_graphs(
+                store,
+                &state.snapshot.graph_registry,
+            ));
             let links = install_link_base(&mut state, &arc_store)?;
             if !links.is_empty() {
                 fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
@@ -1449,7 +1452,10 @@ pub(crate) async fn attach_binary_store_from(
     // Sync namespace codes between store and snapshot (bimap validation).
     crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
 
-    let arc_store = Arc::new(store);
+    let arc_store = Arc::new(fluree_db_transact::store_without_dropped_graphs(
+        store,
+        &state.snapshot.graph_registry,
+    ));
     install_link_base(state, &arc_store)?;
 
     // Re-populate DictNovelty from already-loaded novelty flakes, but *only* for
@@ -2878,6 +2884,14 @@ impl LedgerManager {
                                 runtime_small_dicts,
                                 ns_fallback,
                             )));
+                    }
+
+                    // A commit that dropped a graph leaves the store still
+                    // holding it.
+                    if fluree_db_transact::hide_dropped_graphs(write_guard.state_mut()) {
+                        handle
+                            .sync_binary_store_from_state(write_guard.state())
+                            .await;
                     }
 
                     if let Some(e) = apply_err {

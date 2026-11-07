@@ -192,7 +192,7 @@ async fn min_count_follows_the_views_graph() {
     let g = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri("http://example.org/g")
+        .assigned_graph_id("http://example.org/g")
         .expect("ex:g is registered");
 
     let sdl = schema_sdl(&view(&ledger)).await.expect("sdl");

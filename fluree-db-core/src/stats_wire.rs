@@ -58,7 +58,7 @@ pub enum GraphWidth {
 impl GraphWidth {
     /// The width a root of format `version` holds.
     pub fn for_root_version(version: u8) -> Self {
-        if version >= 3 {
+        if version >= 4 {
             Self::Wide
         } else {
             Self::Narrow

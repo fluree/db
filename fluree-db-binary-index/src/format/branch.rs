@@ -1,6 +1,6 @@
 //! V3 branch manifest (`FBR3`) — single-level routing for the FLI3 index format.
 //!
-//! Uses V2 record keys (34 bytes; 30 in a v4 or earlier v5 branch, whose
+//! Uses V2 record keys (34 bytes; 30 in a v4 branch, whose
 //! `o_i` is 32-bit) and carries `sidecar_cid` for each leaf (the single
 //! source of truth for locating a leaf's history sidecar).
 //!
@@ -43,10 +43,6 @@ const BRANCH_V3_MAGIC: [u8; 4] = *b"FBR3";
 /// `main`'s branch header: `g_id: u16` at bytes 6..8, and keys with a 32-bit
 /// `o_i`. Read, never written.
 const BRANCH_V3_VERSION_MAIN: u8 = 1;
-
-/// An earlier v5 branch: the v5 header, and keys with a 32-bit `o_i`. Read,
-/// never written.
-const BRANCH_V3_VERSION_NARROW: u8 = 2;
 
 /// The v5 branch header: bytes 6..8 reserved, `g_id: u32` at 12..16; keys
 /// hold a 64-bit list place.
@@ -217,19 +213,13 @@ pub fn read_branch_from_bytes(data: &[u8]) -> io::Result<BranchManifest> {
         ));
     }
     let version = data[4];
-    if ![
-        BRANCH_V3_VERSION,
-        BRANCH_V3_VERSION_NARROW,
-        BRANCH_V3_VERSION_MAIN,
-    ]
-    .contains(&version)
-    {
+    if ![BRANCH_V3_VERSION, BRANCH_V3_VERSION_MAIN].contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("branch v3: unsupported version {version}"),
         ));
     }
-    let narrow = version != BRANCH_V3_VERSION;
+    let narrow = version == BRANCH_V3_VERSION_MAIN;
 
     let pooled = RunSortOrder::from_wire_id(data[5]).is_some_and(RunSortOrder::is_pooled);
     let rec_len = if narrow {

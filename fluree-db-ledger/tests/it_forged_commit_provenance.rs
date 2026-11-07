@@ -60,6 +60,7 @@ fn commit_carrying(flakes: Vec<Flake>) -> Commit {
         txn_meta: Vec::new(),
         graph_delta: std::collections::HashMap::new(),
         ns_split_mode: None,
+        graph_drops: Vec::new(),
     }
 }
 

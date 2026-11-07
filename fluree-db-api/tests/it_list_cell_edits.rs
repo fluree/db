@@ -470,7 +470,7 @@ async fn a_cell_is_edited_in_its_lists_graph() {
     let g = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(&format!("{EX}g"))
+        .assigned_graph_id(&format!("{EX}g"))
         .expect("graph");
     let err = update(
         &fluree,

@@ -172,23 +172,11 @@ pub(crate) fn config_graph_may_hold_data(
 
 /// Every `f:LedgerConfig` subject in the config graph as-of `to_t`, ordered by
 /// decoded IRI (the first is the one the reader uses).
-///
-/// Fails while the index root holds a config graph IRI as an ordinary graph:
-/// its rows are where the config graph is not read, so the config would read
-/// as absent.
 pub(crate) async fn ledger_config_subjects(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Vec<Sid>> {
-    if let Some(iri) = snapshot.graph_registry.config_in_user_slot() {
-        let ledger = &snapshot.ledger_id;
-        return Err(crate::error::ApiError::ConfigUnavailable(format!(
-            "{ledger}'s index holds its config graph <{iri}> as an ordinary graph, from before \
-             every ledger's config graph IRI named the config graph, so its config cannot be \
-             read: rebuild the index (`fluree reindex {ledger}`)"
-        )));
-    }
     // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
     // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
     // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
@@ -736,7 +724,11 @@ pub(crate) async fn unenforced_shapes(
             Some(sel) if sel == config_iris::DEFAULT_GRAPH => {
                 Some(fluree_db_core::DEFAULT_GRAPH_ID)
             }
-            Some(sel) => snapshot.graph_registry.graph_id_for_iri(sel),
+            Some(sel) => snapshot
+                .graph_registry
+                .existing_graph_id(sel, to_t)
+                .ok()
+                .flatten(),
         },
         None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
     };

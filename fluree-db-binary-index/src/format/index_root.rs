@@ -209,14 +209,11 @@ pub const ROOT_V6_VERSION: u8 = 2;
 /// extended flag, so an arena-only ledger stays arena-only until a reindex.
 pub const ROOT_V6_VERSION_V5: u8 = 4;
 
-/// An earlier v5 root, whose artifacts store a 32-bit `o_i`. Read only.
-const ROOT_V6_VERSION_V5_NARROW: u8 = 3;
-
 /// Whether `bytes` is a root of the format this build writes.
 ///
-/// A root of an earlier format (`main`'s, or an earlier v5 one) is served as
-/// it is, and its ledger's next build is a full rebuild, never an incremental
-/// one, so no root mixes artifacts of two formats.
+/// A root of `main`'s format is served as it is, and its ledger's next build
+/// is a full rebuild, never an incremental one, so no root mixes artifacts of
+/// two formats.
 pub fn is_current_format(bytes: &[u8]) -> bool {
     bytes.len() > 4 && bytes[0..4] == *ROOT_V6_MAGIC && bytes[4] == ROOT_V6_VERSION_V5
 }
@@ -361,6 +358,16 @@ pub struct IndexRoot {
     /// (`FLAG_EXT_LIST_META_TRACKED`, `FLAG_EXT_HAS_LIST_META`) so a
     /// legacy zero byte reads as "untracked" rather than "none".
     pub has_list_meta: Option<bool>,
+
+    /// The graphs a commit at or before `index_t` dropped, ascending by g_id,
+    /// with what each latest drop left. The index holds none of a dropped
+    /// graph's facts from before its floor; this is what tells a reader that
+    /// the graph does not exist (until revived) and that its history before
+    /// the floor is gone rather than empty.
+    ///
+    /// Carried in the root's last section, flagged by `FLAG_EXT_GRAPH_DROPS`
+    /// as in `main`'s roots. Empty on every ledger that never dropped a graph.
+    pub graph_drops: Vec<(fluree_db_core::GraphId, fluree_db_core::GraphDrop)>,
 }
 
 /// Decode the two-bit `has_list_meta` state from the FIR6 extended-flags
@@ -692,14 +699,16 @@ impl IndexRoot {
     /// Extended-flags bit: at least one indexed row carries a list index.
     /// Only meaningful when `FLAG_EXT_LIST_META_TRACKED` is set.
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
-    /// Root carries a triple-term dictionary section, the root's last.
-    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
+    /// Root ends with the `graph_drops` section: the bit `main`'s roots use.
+    const FLAG_EXT_GRAPH_DROPS: u8 = 1 << 3;
     /// Root carries a pool routing section after the named-graph routing.
     const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
     // Bit 5 marks a zstd-compressed body: `fluree_db_core::fir6_frame`.
     /// v5 root whose decimals are arena-only (a `main` ledger not yet
     /// reindexed); clear means inline-when-fits.
     const FLAG_EXT_DECIMAL_ARENA_ONLY: u8 = 1 << 6;
+    /// Root carries a triple-term dictionary section.
+    const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 7;
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -723,7 +732,7 @@ impl IndexRoot {
     /// read path a `main` ledger's first v5 index takes.
     #[cfg(test)]
     pub(crate) fn encode_main_layout(&self) -> Vec<u8> {
-        assert!(self.pool.is_none() && self.stats.is_none());
+        assert!(self.pool.is_none() && self.stats.is_none() && self.term_dict.is_none());
         self.encode_raw(false)
     }
 
@@ -794,6 +803,9 @@ impl IndexRoot {
         }
         if wide && self.decimal_encoding == fluree_db_core::DecimalEncoding::ArenaOnly {
             flags_ext |= Self::FLAG_EXT_DECIMAL_ARENA_ONLY;
+        }
+        if !self.graph_drops.is_empty() {
+            flags_ext |= Self::FLAG_EXT_GRAPH_DROPS;
         }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
@@ -999,6 +1011,16 @@ impl IndexRoot {
             write_term_dict_refs(&mut buf, td);
         }
 
+        // ---- Optional: graph_drops ----
+        if !self.graph_drops.is_empty() {
+            let width = if wide {
+                stats_wire::GraphWidth::Wide
+            } else {
+                stats_wire::GraphWidth::Narrow
+            };
+            fluree_db_core::graph_registry::encode_graph_drops(&self.graph_drops, width, &mut buf);
+        }
+
         buf
     }
 
@@ -1035,6 +1057,7 @@ impl IndexRoot {
             needs_link_reindex: self.has_annotations && self.term_dict.is_none(),
             has_list_meta: self.has_list_meta,
             prev_index: self.prev_index.as_ref().map(|prev| prev.id.clone()),
+            graph_drops: self.graph_drops.clone(),
             index_root_id: Some(root_id.clone()),
         })
     }
@@ -1053,19 +1076,13 @@ impl IndexRoot {
             )));
         }
         let version = data[4];
-        // `main`'s v2 roots hold 16-bit graph ids and counts; v5 roots 32-bit.
+        // `main`'s v2 roots hold 16-bit graph ids and counts and keys with a
+        // 32-bit `o_i`; v5 roots 32-bit ids and 64-bit list places.
         let wide = version != ROOT_V6_VERSION;
-        // Before version 4, a root's keys store a 32-bit `o_i`.
-        let narrow_keys = version != ROOT_V6_VERSION_V5;
-        // `main`'s v2 or an earlier v5 root (served until the ledger's next
-        // build rebuilds it; see `is_current_format`), or v5.
-        if ![
-            ROOT_V6_VERSION,
-            ROOT_V6_VERSION_V5_NARROW,
-            ROOT_V6_VERSION_V5,
-        ]
-        .contains(&version)
-        {
+        let narrow_keys = !wide;
+        // `main`'s v2 root (served until the ledger's next build rebuilds it;
+        // see `is_current_format`), or v5.
+        if ![ROOT_V6_VERSION, ROOT_V6_VERSION_V5].contains(&version) {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
         }
 
@@ -1350,10 +1367,20 @@ impl IndexRoot {
             None
         };
 
-        let term_dict = if flags_ext & Self::FLAG_EXT_HAS_TERM_DICT != 0 {
+        let term_dict = if wide && flags_ext & Self::FLAG_EXT_HAS_TERM_DICT != 0 {
             Some(read_term_dict_refs(data, &mut pos)?)
         } else {
             None
+        };
+
+        let graph_drops = if flags_ext & Self::FLAG_EXT_GRAPH_DROPS != 0 {
+            fluree_db_core::graph_registry::decode_graph_drops(
+                data,
+                &mut pos,
+                stats_wire::GraphWidth::for_root_version(version),
+            )?
+        } else {
+            Vec::new()
         };
 
         // All optional sections consumed. `pos` should now equal the
@@ -1364,7 +1391,7 @@ impl IndexRoot {
         // silent compatibility break.
         if pos != data.len() {
             return Err(io_err(&format!(
-                "root v6: trailing bytes ({} unread)",
+                "root v6: trailing bytes after the last section ({} unread)",
                 data.len() - pos
             )));
         }
@@ -1402,6 +1429,7 @@ impl IndexRoot {
             legacy_annotation_arena,
             term_dict,
             has_list_meta,
+            graph_drops,
         })
     }
     /// Collect all CAS content-artifact CIDs referenced **directly** by this root.
@@ -1755,6 +1783,7 @@ mod tests {
             legacy_annotation_arena: None,
             term_dict: None,
             has_list_meta: None,
+            graph_drops: Vec::new(),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
             pool: None,
@@ -1893,6 +1922,67 @@ mod tests {
 
         let reencoded = raw(&decoded.encode());
         assert_eq!(reencoded, current, "re-encoding drops the legacy section");
+    }
+
+    #[test]
+    fn fir6_round_trip_graph_drops() {
+        use fluree_db_core::GraphDrop;
+
+        let drops = vec![
+            (
+                0,
+                GraphDrop {
+                    floor: 7,
+                    revived: Some(7),
+                },
+            ),
+            (
+                4,
+                GraphDrop {
+                    floor: 9,
+                    revived: None,
+                },
+            ),
+        ];
+        let plain = minimal_root_v6();
+        assert_eq!(plain.encode()[6] & IndexRoot::FLAG_EXT_GRAPH_DROPS, 0);
+
+        let mut root = minimal_root_v6();
+        root.graph_drops = drops.clone();
+        // The section comes last.
+        let (plain_raw, raw) = (plain.encode_raw(true), root.encode_raw(true));
+        assert_eq!(&raw[..plain_raw.len()][8..], &plain_raw[8..]);
+
+        // Drops take bit 3 in a v5 root, beside a term dictionary, and in
+        // `main`'s v2 root, with 16-bit graph ids.
+        let mut with_term_dict = root.clone();
+        with_term_dict.term_dict = Some(crate::format::wire_helpers::TermDictRefs {
+            forward_packs: vec![],
+            reverse: crate::format::wire_helpers::DictTreeRefs {
+                branch: ContentId::new(fluree_db_core::ContentKind::Commit, b"branch"),
+                leaves: vec![],
+            },
+            watermarks: vec![],
+            term_count: 0,
+            object_reverse: None,
+        });
+        for (bytes, term_dict) in [
+            (root.encode(), false),
+            (with_term_dict.encode(), true),
+            (root.encode_main_layout(), false),
+        ] {
+            assert_ne!(bytes[6] & IndexRoot::FLAG_EXT_GRAPH_DROPS, 0);
+            assert_eq!(bytes[6] & IndexRoot::FLAG_EXT_HAS_TERM_DICT != 0, term_dict);
+
+            let decoded = IndexRoot::decode(&bytes).unwrap();
+            assert_eq!(decoded.graph_drops, drops);
+            assert_eq!(decoded.term_dict.is_some(), term_dict);
+
+            let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+            assert!(!snap.graph_registry.visible_at(0, 6));
+            assert!(snap.graph_registry.visible_at(0, 7));
+            assert!(snap.graph_registry.is_dropped(4));
+        }
     }
 
     #[test]

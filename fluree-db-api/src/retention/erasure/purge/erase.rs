@@ -258,7 +258,7 @@ fn indexed_record(
         None => 0,
         Some(g) => match snapshot
             .decode_sid(g)
-            .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+            .and_then(|iri| snapshot.graph_registry.assigned_graph_id(&iri))
         {
             Some(g_id) => g_id,
             None => return Ok(Indexed::Absent),
