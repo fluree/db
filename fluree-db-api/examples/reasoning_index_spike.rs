@@ -359,6 +359,14 @@ async fn main() {
         .await
         .expect("commit")
         .ledger;
+    // The index now lags the branch, so these reason at query time: the
+    // oracle for the generation the refresh below publishes.
+    let mut after_commit = Vec::with_capacity(queries.len());
+    for (_, sparql) in &queries {
+        let (rows, served) = run(&fluree, sparql).await;
+        assert!(!served, "a lagging index is not served");
+        after_commit.push(rows);
+    }
     let index_bytes_before = storage["index_bytes"].as_u64().unwrap_or(0);
     let logical_started = std::time::Instant::now();
     let logical = fluree
@@ -377,7 +385,20 @@ async fn main() {
     )
     .unwrap();
     let storage2 = storage_report(&fluree, &dir, &index, &manifest2.root).await;
-    let (q1_rows, q1_served) = run(&fluree, &queries[0].1).await;
+    let mut parity_after = Vec::with_capacity(queries.len());
+    let mut all_equal_after = true;
+    for ((name, sparql), expected_rows) in queries.iter().zip(&after_commit) {
+        let (rows, served) = run(&fluree, sparql).await;
+        let equal = &rows == expected_rows;
+        all_equal_after &= equal && served;
+        parity_after.push(json!({
+            "query": name,
+            "query_time_rows": expected_rows.len(),
+            "index_rows": rows.len(),
+            "served_from_index": served,
+            "multisets_equal": equal,
+        }));
+    }
 
     let derived_set_bytes = {
         let index = fluree_db_core::reasoning_index::DerivedIndex::decode(
@@ -400,8 +421,7 @@ async fn main() {
             "storage": storage2,
             "index_bytes_written": storage2["index_bytes"].as_u64().unwrap_or(0).saturating_sub(index_bytes_before),
             "derived_set_bytes": derived_set_bytes,
-            "q01_rows_after": q1_rows.len(),
-            "q01_served": q1_served,
+            "parity": {"all_equal_and_served": all_equal_after, "queries": parity_after},
         }
     });
     if timings_enabled() {

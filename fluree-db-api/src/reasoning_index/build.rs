@@ -40,7 +40,7 @@ use fluree_db_query::execute::{
 use fluree_db_query::schema_bundle::SchemaBundleOverlay;
 use serde_json::Value as JsonValue;
 
-use super::derived::{encode_facts, read_derived_only, write_derived_only};
+use super::derived::{encode_facts, read_derived_only, update_derived_only, write_derived_only};
 use super::program;
 use crate::query::helpers::parse_jsonld_query;
 use crate::view::GraphDb;
@@ -484,7 +484,7 @@ impl Fluree {
         ));
         let previous = match &entry.head {
             Some(p) if p.revision == revision && p.settled == settled => {
-                match load_previous(index_cs.as_ref(), &p.manifest, &db).await {
+                match load_previous(index_cs.as_ref(), &p.manifest).await {
                     Ok(prev) => {
                         let line = Line::walk(
                             branch_store.as_ref(),
@@ -540,11 +540,14 @@ impl Fluree {
             ClosureMode::Full
         };
         let derived = match incremental {
-            Some(derived) => derived,
-            None => self.complete_closure(&db, &executable.reasoning).await,
+            Some(gained) => gained.map(|r| r.map(Output::Gained)),
+            None => self
+                .complete_closure(&db, &executable.reasoning)
+                .await
+                .map(|r| r.map(|c| Output::Whole(c.into_iter().collect()))),
         };
-        let derived = match derived {
-            Ok(Ok(derived)) => derived,
+        let mut output = match derived {
+            Ok(Ok(output)) => output,
             Ok(Err(reason)) => return Ok(RefreshOutcome::Failed { reason }),
             Err(e) => {
                 return Ok(RefreshOutcome::Failed {
@@ -553,19 +556,33 @@ impl Fluree {
             }
         };
         phases.mark("closure");
-        let derived_total = derived.len() as u64;
-        let derived_only = asserted_filter(&db, derived, false).await?;
+        let derived_total = match &output {
+            Output::Whole(c) => c.len() as u64,
+            Output::Gained(gained) => gained.len() as u64,
+        };
+        // A full closure holds facts also asserted; D is what is not.
+        if let Output::Whole(c) = output {
+            output = Output::Whole(asserted_filter(&db, c.into_iter().collect(), false).await?);
+        }
         phases.mark("asserted_filter");
-        if program::serves_rewrites(&executable.reasoning) {
-            if let Some(p) = derived_hierarchy_edge(&derived_only) {
-                return Ok(RefreshOutcome::Failed {
-                    reason: format!(
-                        "the program derives {p} facts, which query-time rdfs and owl2ql \
-                         rewriting does not read; an index would answer differently"
-                    ),
-                });
+        if let Output::Whole(derived_only) = &output {
+            if program::serves_rewrites(&executable.reasoning) {
+                if let Some(p) = derived_hierarchy_edge(derived_only) {
+                    return Ok(RefreshOutcome::Failed {
+                        reason: format!(
+                            "the program derives {p} facts, which query-time rdfs and owl2ql \
+                             rewriting does not read; an index would answer differently"
+                        ),
+                    });
+                }
             }
         }
+        // The facts the window asserted: an incremental generation takes any
+        // of them D holds out of it, matching by graph.
+        let asserted_in_window: Vec<(GraphId, Flake)> = window
+            .as_ref()
+            .map(|w| w.inserted.clone())
+            .unwrap_or_default();
 
         let graph_sids = graph_sids(&db);
         let to_flake = |(g_id, mut flake): (GraphId, Flake), op: bool| {
@@ -617,10 +634,20 @@ impl Fluree {
         };
         // A logical fold the indexer cannot apply is redone as a rebuild.
         let no_retractions = HashSet::new();
-        let mut previous = previous;
+        let mut logical = previous.is_some();
         let (kind, built, stats_added, stats_removed) = loop {
-            let (kind, fold, stats_added, stats_removed) = match &previous {
-                None => {
+            let (kind, fold, stats_added, stats_removed) = match (&previous, logical, &output) {
+                (Some(prev), false, Output::Gained(gained)) => {
+                    // A rebuild needs D whole.
+                    let mut whole = previous_derived(index_cs.as_ref(), prev, &db).await?;
+                    for fact in &asserted_in_window {
+                        whole.remove(fact);
+                    }
+                    whole.extend(gained.iter().cloned());
+                    output = Output::Whole(whole);
+                    continue;
+                }
+                (_, false, Output::Whole(derived_only)) => {
                     let asserts: Vec<Flake> = derived_only
                         .iter()
                         .cloned()
@@ -629,17 +656,24 @@ impl Fluree {
                     let n = asserts.len() as u64;
                     (GenerationKind::Rebuild, asserts, n, 0)
                 }
-                Some(prev) => {
+                (_, true, Output::Gained(gained)) => {
+                    // Insert-only: D gains these, and nothing derived is lost.
+                    let fold: Vec<Flake> =
+                        gained.iter().cloned().map(|f| to_flake(f, true)).collect();
+                    let n = fold.len() as u64;
+                    (GenerationKind::Logical, fold, n, 0)
+                }
+                (Some(prev), true, Output::Whole(derived_only)) => {
+                    let prev_derived = previous_derived(index_cs.as_ref(), prev, &db).await?;
                     let retracted = window.as_ref().map_or(&no_retractions, |w| &w.retracted);
                     let mut fold = Vec::new();
-                    for fact in &derived_only {
-                        if !prev.derived.contains(fact) || retracted.contains(fact) {
+                    for fact in derived_only {
+                        if !prev_derived.contains(fact) || retracted.contains(fact) {
                             fold.push(to_flake(fact.clone(), true));
                         }
                     }
                     let added = fold.len() as u64;
-                    let lost: HashSet<(GraphId, Flake)> = prev
-                        .derived
+                    let lost: HashSet<(GraphId, Flake)> = prev_derived
                         .iter()
                         .filter(|f| !derived_only.contains(*f) && !retracted.contains(*f))
                         .cloned()
@@ -655,13 +689,20 @@ impl Fluree {
                     }
                     (GenerationKind::Logical, fold, added, removed)
                 }
+                (None, _, Output::Gained(_)) | (None, true, _) => {
+                    unreachable!("an incremental closure or a logical fold has a predecessor")
+                }
             };
 
             phases.mark("fold_diff");
             // Build the merged root in the index's namespace.
             let mut index_record = record.clone();
-            match &previous {
-                None => {
+            match (&previous, logical) {
+                (Some(prev), true) => {
+                    index_record.index_head_id = Some(prev.manifest.root.clone());
+                    index_record.index_t = prev.manifest.basis.t;
+                }
+                _ => {
                     index_record.index_head_id = base_index.0.clone();
                     index_record.index_t = base_index.1;
                     if let Some(base_root) = &base_index.0 {
@@ -669,61 +710,75 @@ impl Fluree {
                             .await?;
                     }
                 }
-                Some(prev) => {
-                    index_record.index_head_id = Some(prev.manifest.root.clone());
-                    index_record.index_t = prev.manifest.basis.t;
-                }
             }
             let mut config = crate::build_indexer_config(&self.config);
             config.incremental_retype_max_subjects = usize::MAX;
             config.incremental_max_commits = 1 << 40;
             config.incremental_max_commit_bytes = None;
             config.derived_facts = Some(Arc::new(encode_facts(basis.t, fold)?));
-            let built = match &previous {
-                None => {
-                    fluree_db_indexer::build_index_for_record(
-                        Arc::clone(&index_store),
-                        &index_record,
-                        config,
-                    )
-                    .await
-                }
-                Some(_) => {
-                    fluree_db_indexer::fold_index_for_record(
-                        Arc::clone(&index_store),
-                        &index_record,
-                        config,
-                    )
-                    .await
-                }
+            let built = if logical {
+                fluree_db_indexer::fold_index_for_record(
+                    Arc::clone(&index_store),
+                    &index_record,
+                    config,
+                )
+                .await
+            } else {
+                fluree_db_indexer::build_index_for_record(
+                    Arc::clone(&index_store),
+                    &index_record,
+                    config,
+                )
+                .await
             };
             match built {
                 Ok(built) => break (kind, built, stats_added, stats_removed),
-                Err(e) if previous.is_some() => {
+                Err(e) if logical => {
                     tracing::warn!(
                         index = %index_id,
                         error = %e,
                         "logical fold failed; rebuilding the index from the base"
                     );
-                    previous = None;
+                    logical = false;
                 }
                 Err(e) => return Err(ApiError::internal(format!("reasoning-index build: {e}"))),
             }
         };
         phases.mark("index_build");
 
-        let derived_only_flakes: Vec<Flake> = derived_only
-            .iter()
-            .cloned()
-            .map(|f| to_flake(f, true))
-            .collect();
-        let derived_count = derived_only_flakes.len() as u64;
-        let derived_id = write_derived_only(index_cs.as_ref(), derived_only_flakes).await?;
+        let (derived_id, derived_count) = match (&previous, &output) {
+            (Some(prev), Output::Gained(gained)) => {
+                update_derived_only(
+                    index_cs.as_ref(),
+                    &prev.manifest.derived,
+                    asserted_in_window
+                        .iter()
+                        .cloned()
+                        .map(|f| to_flake(f, true))
+                        .collect(),
+                    gained.iter().cloned().map(|f| to_flake(f, true)).collect(),
+                )
+                .await?
+            }
+            (_, Output::Whole(derived_only)) => {
+                let flakes: Vec<Flake> = derived_only
+                    .iter()
+                    .cloned()
+                    .map(|f| to_flake(f, true))
+                    .collect();
+                let count = flakes.len() as u64;
+                (write_derived_only(index_cs.as_ref(), flakes).await?, count)
+            }
+            (None, Output::Gained(_)) => unreachable!("an incremental closure has a predecessor"),
+        };
         phases.mark("derived_write");
 
         let stats = GenerationStats {
             derived_only: derived_count,
-            derived_total,
+            derived_total: match closure {
+                ClosureMode::Full => derived_total,
+                ClosureMode::Incremental => derived_count,
+            },
             added: stats_added,
             removed: stats_removed,
             closure,
@@ -906,10 +961,9 @@ impl Fluree {
         Ok(outcome_facts(outcome))
     }
 
-    /// The program's output at the branch head, maintained from `prev`: its
-    /// derived-only set plus what the window's insertions add to the
-    /// closure. `None` when the program or the window rules that out, and
-    /// the output is computed in full instead:
+    /// What the program's output at the branch head gains over `prev`'s from
+    /// the window's insertions. `None` when the program or the window rules
+    /// that out, and the output is computed in full instead:
     ///
     /// - the program is not OWL 2 RL alone, or uses the identity rules or
     ///   `owl:sameAs`, whose state a delta alone cannot rebuild (P11b);
@@ -988,11 +1042,7 @@ impl Fluree {
             fixpoint_ms = started.elapsed().as_millis() as u64 - loaded_ms,
             "incremental closure"
         );
-        Ok(Some(Ok(outcome_facts(outcome).map(|gained| {
-            let mut all: Vec<(GraphId, Flake)> = prev.derived.iter().cloned().collect();
-            all.extend(gained);
-            all
-        }))))
+        Ok(Some(Ok(outcome_facts(outcome))))
     }
 
     /// Publish `manifest` as `candidate`'s generation: admit it against the
@@ -1057,14 +1107,32 @@ impl Fluree {
 /// A previous generation, as the next one builds on it.
 struct Previous {
     manifest: ReasoningManifest,
-    derived: HashSet<(GraphId, Flake)>,
 }
 
-async fn load_previous(
+/// The program's output at the basis.
+enum Output {
+    /// The derived-only set D, whole.
+    Whole(HashSet<(GraphId, Flake)>),
+    /// What D gains over the predecessor's, from an incremental closure over
+    /// an insert-only window. D also loses the facts the window asserted:
+    /// their assertion keeps them in the index, so they are not retracted.
+    Gained(Vec<(GraphId, Flake)>),
+}
+
+/// The predecessor's derived-only set, by graph.
+async fn previous_derived(
     store: &dyn ContentStore,
-    manifest_id: &ContentId,
+    prev: &Previous,
     db: &GraphDb,
-) -> Result<Previous> {
+) -> Result<HashSet<(GraphId, Flake)>> {
+    Ok(read_derived_only(store, &prev.manifest.derived)
+        .await?
+        .into_iter()
+        .map(|flake| (graph_of(db, flake.g.as_ref()), flake))
+        .collect())
+}
+
+async fn load_previous(store: &dyn ContentStore, manifest_id: &ContentId) -> Result<Previous> {
     let bytes = store
         .get(manifest_id)
         .await
@@ -1080,12 +1148,7 @@ async fn load_previous(
             manifest.root, manifest.generation
         )));
     }
-    let derived = read_derived_only(store, &manifest.derived)
-        .await?
-        .into_iter()
-        .map(|flake| (graph_of(db, flake.g.as_ref()), flake))
-        .collect();
-    Ok(Previous { manifest, derived })
+    Ok(Previous { manifest })
 }
 
 /// The id of a graph whose IRI the branch no longer registers: no fact of
@@ -1516,12 +1579,75 @@ mod tests {
         }
     }
 
-    /// Incremental OWL 2 RL maintenance under random insertions equals a
-    /// full recompute at every step, over an ontology that exercises the
-    /// property, class, restriction and chain rules.
+    /// Every fact of the ledger with owl2rl reasoning, answered from the
+    /// index when `served`, else at query time by an equivalent program the
+    /// index does not match (datalog with no rules derives nothing).
+    async fn whole_graph(fluree: &Fluree, id: &str, served: bool) -> Vec<String> {
+        let reasoning = if served {
+            json!("owl2rl")
+        } else {
+            json!(["owl2rl", "datalog"])
+        };
+        let resp = fluree
+            .graph(id)
+            .query()
+            .jsonld(&json!({
+                "select": ["?s", "?p", "?o"],
+                "where": {"@id": "?s", "?p": "?o"},
+                "reasoning": reasoning
+            }))
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.reasoning.and_then(|r| r.index).is_some(),
+            served,
+            "served from the index: {served}"
+        );
+        let mut rows: Vec<String> = resp
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    async fn bucket_count(fluree: &Fluree, id: &str, index: &ReasoningIndexId) -> usize {
+        let doc = fluree.reasoning_indexes(id).await.unwrap();
+        let head = doc.indexes[index].head.clone().unwrap();
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.index_store(&record, index).await.unwrap();
+        let manifest =
+            ReasoningManifest::decode(&store.get(&head.manifest).await.unwrap()).unwrap();
+        fluree_db_core::reasoning_index::DerivedIndex::decode(
+            &store.get(&manifest.derived).await.unwrap(),
+        )
+        .unwrap()
+        .buckets
+        .len()
+    }
+
+    /// Incremental OWL 2 RL maintenance equals a full recompute at every
+    /// step, in its derived-only set and in what queries answer, over an
+    /// ontology that exercises the property, class, restriction and chain
+    /// rules, under random insertions that also re-assert asserted facts,
+    /// assert derived ones, and grow the set across bucket partitions; and a
+    /// second instance opening the same storage answers the same.
     #[tokio::test]
     async fn incremental_generations_equal_a_full_recompute() {
-        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let storage = fluree_db_core::MemoryStorage::new();
+        let nameservice = Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+        let instance = || {
+            crate::FlureeBuilder::memory().build_with(
+                storage.clone(),
+                crate::NameServiceMode::ReadWrite(nameservice.clone()),
+            )
+        };
+        let fluree = instance();
         let id = "reasoning-indexes/incremental-oracle:main";
         let ctx = json!({
             "ex": "http://example.org/",
@@ -1593,8 +1719,31 @@ mod tests {
             "ex:knows",
         ];
         let mut rng = Lcg(0x5eed);
+        let mut asserted: Vec<serde_json::Value> = Vec::new();
+        let mut partitions = vec![bucket_count(&fluree, id, &index).await];
+        let mut transitions = 0;
         for step in 0..24 {
             let mut facts = Vec::new();
+            // Re-assert a fact already asserted.
+            if !asserted.is_empty() {
+                facts.push(asserted[rng.next(asserted.len())].clone());
+            }
+            // Assert a fact the index holds as derived.
+            let derived: Vec<(Option<Sid>, Flake)> = persisted_derived(&fluree, id, &index)
+                .await
+                .into_iter()
+                .collect();
+            if !derived.is_empty() {
+                let (_, flake) = &derived[rng.next(derived.len())];
+                if let fluree_db_core::FlakeValue::Ref(o) = &flake.o {
+                    let db = fluree.db(id).await.unwrap();
+                    let decode = |sid: &Sid| db.snapshot.decode_sid(sid).unwrap();
+                    facts.push(
+                        json!({"@id": decode(&flake.s), decode(&flake.p): {"@id": decode(o)}}),
+                    );
+                    transitions += 1;
+                }
+            }
             for _ in 0..8 {
                 let s = format!("ex:e{}", rng.next(12));
                 if rng.next(3) == 0 {
@@ -1610,6 +1759,7 @@ mod tests {
                     );
                 }
             }
+            asserted.extend(facts.iter().cloned());
             ledger = fluree
                 .insert(ledger, &json!({"@context": ctx, "@graph": facts}))
                 .await
@@ -1631,7 +1781,26 @@ mod tests {
                 full.difference(&persisted).collect::<Vec<_>>()
             );
             assert_eq!(persisted, full, "step {step}");
+            assert_eq!(
+                whole_graph(&fluree, id, true).await,
+                whole_graph(&fluree, id, false).await,
+                "step {step}"
+            );
+            partitions.push(bucket_count(&fluree, id, &index).await);
         }
+        partitions.dedup();
+        assert!(
+            partitions.len() >= 3,
+            "repartitioned as D grew: {partitions:?}"
+        );
+        assert!(transitions >= 20, "derived facts asserted: {transitions}");
+
+        let reopened = instance();
+        assert_eq!(
+            whole_graph(&reopened, id, true).await,
+            whole_graph(&fluree, id, false).await,
+            "a second instance answers from the stored index"
+        );
     }
 
     /// A sweep that starts while an index build has written its files and not

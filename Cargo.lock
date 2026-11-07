@@ -3886,6 +3886,7 @@ dependencies = [
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

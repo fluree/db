@@ -155,7 +155,9 @@ async fn run(
     let compiled = compile(&ontology, &restrictions, opts);
 
     // Seed initial delta with all base facts for relevant predicates
+    let extracted_ms = start.elapsed().as_millis() as u64;
     let mut delta = seed_initial_delta(db, &ontology, &restrictions).await?;
+    let seeded_ms = start.elapsed().as_millis() as u64;
 
     // Accumulated derived facts
     let mut derived = DerivedSet::new();
@@ -184,6 +186,7 @@ async fn run(
         }
         delta = seeded;
     }
+    let joined_ms = start.elapsed().as_millis() as u64;
 
     // owl:sameAs SID for rule application
     let owl_same_as_sid = owl::same_as_sid();
@@ -429,6 +432,17 @@ async fn run(
     if !diagnostics.capped {
         diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
     }
+    let total_ms = start.elapsed().as_millis() as u64;
+    tracing::debug!(
+        incremental = inserted.is_some(),
+        extract_ms = extracted_ms,
+        seed_scan_ms = seeded_ms - extracted_ms,
+        join_index_ms = joined_ms - seeded_ms,
+        rounds_ms = total_ms - joined_ms,
+        rounds = iterations,
+        derived = derived.derived_len(),
+        "OWL 2 RL fixpoint phases"
+    );
 
     Ok(Some((
         derived.into_derived_flakes(),

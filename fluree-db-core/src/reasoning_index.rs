@@ -215,7 +215,8 @@ pub enum GenerationKind {
 pub struct GenerationStats {
     /// Facts present only because they were derived (|D|).
     pub derived_only: u64,
-    /// Facts the program derived, including those also asserted (|C|).
+    /// Facts the program derived, including those also asserted (|C|). An
+    /// incremental generation does not compute C, and reports |D|.
     pub derived_total: u64,
     /// Facts the fold added and removed relative to the predecessor.
     pub added: u64,
