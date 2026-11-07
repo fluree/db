@@ -296,6 +296,11 @@ struct LedgerHandleInner {
     /// path holds it alone until it installs that head, so queries go on
     /// reading `state` meanwhile ([`LedgerHandle::exclude_writers`]).
     writer: Arc<tokio::sync::Mutex<()>>,
+    /// Held by [`LedgerManager::notify`] from its plan to its last apply, so a
+    /// reader behind the head watermark waits for the catch-up in flight
+    /// rather than starting another ([`LedgerManager::get_or_load`]). Taken
+    /// before `state`, and never while holding `entries`.
+    catch_up: tokio::sync::Mutex<()>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: LedgerId,
     /// Last access time (monotonic secs since process start)
@@ -472,6 +477,7 @@ impl LedgerHandle {
             inner: Arc::new(LedgerHandleInner {
                 state: Arc::new(RwLock::new(state)),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
+                catch_up: tokio::sync::Mutex::new(()),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
@@ -1526,7 +1532,7 @@ pub struct LedgerManager {
     /// Highest commit `t` reported per alias by head-advancing
     /// components outside this manager's own load/commit pipeline
     /// (see [`Self::note_head_advance`]). [`Self::get_or_load`]
-    /// treats a cached handle behind its alias's watermark as stale.
+    /// brings a cached handle behind its alias's watermark up to it.
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
@@ -1642,8 +1648,10 @@ impl LedgerManager {
     /// that advance heads outside that pipeline (a raft state
     /// machine applying replicated commits) call it synchronously
     /// at each advance, upholding the invariant that whoever moves
-    /// a head keeps this cache coherent. Cache hits behind the
-    /// watermark reload; the reload cost stays on the read path.
+    /// a head keeps this cache coherent. A read that finds its cached
+    /// handle behind the watermark brings it up by the commits it
+    /// lacks, or waits for the catch-up already doing so; that cost
+    /// stays on the read path.
     pub fn note_head_advance(&self, ledger_id: &LedgerId, commit_t: i64) {
         let mut watermarks = self
             .head_watermarks
@@ -1701,24 +1709,36 @@ impl LedgerManager {
         &self.config
     }
 
-    /// Compare the cached handle's `t` against the alias's head
-    /// watermark ([`Self::note_head_advance`]) and report whether
-    /// the cache is behind.
-    ///
-    /// A pure in-memory comparison — no nameservice involvement, so
-    /// it costs the same under every nameservice implementation. An
-    /// alias with no watermark is never stale: its heads only move
-    /// through this manager's own pipeline, which keeps the cache
-    /// coherent by construction.
-    async fn cached_handle_is_stale(&self, handle: &LedgerHandle) -> bool {
-        let cached_t = handle.t().await;
-        let watermark = self
-            .head_watermarks
-            .read()
-            .expect("head watermark lock never poisoned: no panics inside critical section")
-            .get(handle.id())
-            .copied();
-        matches!(watermark, Some(w) if w > cached_t)
+    /// Whether `handle` holds every commit up to `target`, the head
+    /// watermark ([`Self::note_head_advance`]) a read found when it
+    /// arrived. Without one the alias's heads move only through this
+    /// manager's own pipeline, which keeps the cache coherent by
+    /// construction.
+    async fn holds(handle: &LedgerHandle, target: Option<i64>) -> bool {
+        match target {
+            Some(target) => handle.t().await >= target,
+            None => true,
+        }
+    }
+
+    /// Bring `handle` up to `target` ([`Self::holds`]) by the commits it
+    /// lacks, through the same plan as [`Self::notify`], or wait for the
+    /// catch-up already in flight on it. `false` when the handle is still
+    /// behind afterwards: it was evicted, or the record was behind `target`.
+    async fn catch_up(&self, handle: &LedgerHandle, target: Option<i64>) -> Result<bool> {
+        if Self::holds(handle, target).await {
+            return Ok(true);
+        }
+        let _in_flight = handle.inner.catch_up.lock().await;
+        if Self::holds(handle, target).await {
+            return Ok(true);
+        }
+        let notify = NsNotify {
+            ledger_id: handle.id().clone(),
+            record: None,
+        };
+        let result = self.notify_handle(handle.clone(), notify).await?;
+        Ok(result != NotifyResult::Evicted && Self::holds(handle, target).await)
     }
 
     /// Return a read-only `LedgerView` for a currently-loaded ledger
@@ -1775,6 +1795,10 @@ impl LedgerManager {
         // Normalize ledger_id to canonical form for consistent cache keys
         // This ensures "mydb" and "mydb:main" use the same cache entry
         let canonical_alias = ledger_id.clone();
+        // The head this node had applied when the request arrived. Commits
+        // applied after it are not waited for, so a reader never chases
+        // a head that steady writes keep moving.
+        let target = self.head_watermark(&canonical_alias);
 
         // A pass returns, or ends with this caller leading a load. It repeats
         // when the load this caller joined ended without a result — its
@@ -1784,34 +1808,37 @@ impl LedgerManager {
             // Fast path: already loaded
             {
                 let entries = self.entries.read().await;
-                if let Some(LoadState::Ready(handle)) = entries.get(&canonical_alias) {
-                    let handle = handle.clone();
-                    drop(entries);
-                    if !self.cached_handle_is_stale(&handle).await {
-                        return Ok(handle);
+                let cached = match entries.get(&canonical_alias) {
+                    // A reload in flight serves the state it replaces.
+                    Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
+                        Some(handle.clone())
                     }
-                    // Stale: evict it and fall through to the load path — if
-                    // it is still the entry. The check waited on the handle's
-                    // state lock, and meanwhile another caller may have
-                    // evicted it and begun a load or reload, whose waiters a
-                    // removal would cancel, or published a newer handle.
+                    Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                        return Err(ApiError::http(error.status_code(), error.to_string()));
+                    }
+                    _ => None,
+                };
+                drop(entries);
+                if let Some(handle) = cached {
+                    match self.catch_up(&handle, target).await {
+                        Ok(true) => return Ok(handle),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::debug!(alias = %canonical_alias, %error, "ledger.catch_up.failed");
+                        }
+                    }
+                    // Still behind: evict it and fall through to the load
+                    // path — if it is still the entry. The catch-up waited on
+                    // the handle's locks, and meanwhile another caller may
+                    // have evicted it and begun a load or reload, whose
+                    // waiters a removal would cancel, or published a newer
+                    // handle.
                     let mut entries = self.entries.write().await;
                     if matches!(
                         entries.get(&canonical_alias),
                         Some(LoadState::Ready(cached)) if cached.is_same(&handle)
                     ) {
                         entries.remove(&canonical_alias);
-                    }
-                } else if let Some(LoadState::Reloading { handle, .. }) =
-                    entries.get(&canonical_alias)
-                {
-                    // Handle is valid even during reload
-                    return Ok(handle.clone());
-                } else if let Some(LoadState::Failed { error, retry_at }) =
-                    entries.get(&canonical_alias)
-                {
-                    if Instant::now() < *retry_at {
-                        return Err(ApiError::http(error.status_code(), error.to_string()));
                     }
                 }
             }
@@ -2657,7 +2684,12 @@ impl LedgerManager {
                 _ => return Ok(NotifyResult::NotLoaded),
             }
         };
+        let _in_flight = handle.inner.catch_up.lock().await;
+        self.notify_handle(handle.clone(), input).await
+    }
 
+    /// [`Self::notify`] for a cached `handle`, under its `catch_up` lock.
+    async fn notify_handle(&self, handle: LedgerHandle, input: NsNotify) -> Result<NotifyResult> {
         // Get fresh record from nameservice if not provided
         let ns_record = match input.record {
             Some(r) => r,
@@ -3465,7 +3497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_handle_is_stale_follows_head_watermark() {
+    async fn the_head_watermark_marks_a_cached_handle_behind() {
         use fluree_db_core::{LedgerSnapshot, MemoryStorage};
         use fluree_db_ledger::LedgerState;
         use fluree_db_nameservice::memory::MemoryNameService;
@@ -3479,30 +3511,33 @@ mod tests {
         let handle = LedgerHandle::new(id("test:main"), state, None);
 
         let mgr = LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default());
+        async fn behind(mgr: &LedgerManager, handle: &LedgerHandle) -> bool {
+            !LedgerManager::holds(handle, mgr.head_watermark(handle.id())).await
+        }
 
         // No watermark: never stale. Heads that only move through
         // this manager's own pipeline keep the cache coherent by
         // construction, so nothing reports advances and hits serve
         // as-is — the single-node behavior.
-        assert!(!mgr.cached_handle_is_stale(&handle).await);
+        assert!(!behind(&mgr, &handle).await);
 
         // A watermark at the cached `t` is still fresh.
         mgr.note_head_advance(&id("test:main"), 5);
-        assert!(!mgr.cached_handle_is_stale(&handle).await);
+        assert!(!behind(&mgr, &handle).await);
 
         // A head-advancer reporting past the cached `t` marks it stale.
         mgr.note_head_advance(&id("test:main"), 12);
-        assert!(mgr.cached_handle_is_stale(&handle).await);
+        assert!(behind(&mgr, &handle).await);
 
         // Monotonic: a late, lower report can't roll the watermark back.
         mgr.note_head_advance(&id("test:main"), 3);
-        assert!(mgr.cached_handle_is_stale(&handle).await);
+        assert!(behind(&mgr, &handle).await);
 
         // Disconnect clears the watermark with the entry, so a
         // ledger re-created under the same alias isn't permanently
         // flagged stale by a leftover high watermark.
         mgr.disconnect(&id("test:main")).await;
-        assert!(!mgr.cached_handle_is_stale(&handle).await);
+        assert!(!behind(&mgr, &handle).await);
     }
 
     #[tokio::test]
@@ -4173,6 +4208,40 @@ mod tests {
                 .is_some_and(|h| same(&h, &stale)),
             "the reload was displaced by a load"
         );
+    }
+
+    /// A reader whose cached handle is behind the head while a catch-up is
+    /// applying the missing commit waits for that catch-up and reads the
+    /// handle it brought up, rather than loading the ledger again.
+    #[tokio::test]
+    async fn a_reader_behind_the_head_waits_for_the_catch_up_in_flight() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let cached = make_test_handle("x:main");
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(cached.clone()));
+        mgr.note_head_advance(&alias, 1);
+
+        let in_flight = cached.inner.catch_up.lock().await;
+        let holders = Arc::strong_count(&cached.inner);
+        let reading = spawn_get(&mgr, &alias);
+        let held = &cached.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+
+        *cached.inner.state.write().await =
+            LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        drop(in_flight);
+
+        let read = reading
+            .await
+            .unwrap()
+            .expect("the reader gets the handle the catch-up brought up");
+        assert!(same(&read, &cached), "the reader loaded the ledger again");
+        assert_eq!(read.t().await, 1);
     }
 
     /// A reader that joined a load still wants the ledger when the load's
