@@ -4,6 +4,7 @@
 //! and [`ImportSink`](crate::import_sink::ImportSink) to convert parsed
 //! literal values into `FlakeValue` + datatype `Sid`.
 
+use crate::error::TransactError;
 use crate::generate::{
     DT_BOOLEAN, DT_DATE, DT_DATE_TIME, DT_DAY_TIME_DURATION, DT_DECIMAL, DT_DOUBLE, DT_DURATION,
     DT_G_DAY, DT_G_MONTH, DT_G_MONTH_DAY, DT_G_YEAR, DT_G_YEAR_MONTH, DT_INTEGER, DT_JSON,
@@ -46,18 +47,70 @@ fn cached_dt_sid(dt_iri: &str) -> Option<Sid> {
     }
 }
 
+/// What a write does with a literal whose lexical form is not in its
+/// datatype's lexical space (`"landed"^^xsd:integer`). Each caller of
+/// [`convert_string_literal`] names it, so the choice is made where the
+/// write path is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiteralCheck {
+    /// Refuse it with the insert's error ([`typed_lexical`]). Every
+    /// transaction: Turtle, TriG and N-Triples insert and upsert, graph sync,
+    /// graph insert.
+    Strict,
+    /// Store it as text under its declared datatype ([`lenient_value`]).
+    /// Bulk import only, the one lenient write path: it loads RDF text from
+    /// elsewhere, which often carries ill-typed literals, in one pass.
+    #[cfg_attr(
+        not(feature = "import"),
+        expect(
+            dead_code,
+            reason = "bulk import, its only user, needs the `import` feature"
+        )
+    )]
+    Lenient,
+}
+
+/// Parse `value` as a lexical form of the datatype `dt_iri`, as every write
+/// path that refuses an ill-typed literal does.
+///
+/// Delegates to [`fluree_db_core::coerce::coerce_string_value`], the parser
+/// the JSON-LD insert and SPARQL `INSERT DATA` use, and fails with the error
+/// they give. A string-like or unrecognized datatype takes any string.
+pub(crate) fn typed_lexical(value: &str, dt_iri: &str) -> Result<FlakeValue, TransactError> {
+    fluree_db_core::coerce::coerce_string_value(value, dt_iri)
+        .map_err(|e| TransactError::Parse(e.message))
+}
+
 /// Convert a string literal with an explicit datatype IRI to (FlakeValue, dt Sid).
 ///
 /// For well-known XSD types, parses the string into the native FlakeValue variant.
 /// Unknown types are stored as FlakeValue::String with the declared dt Sid.
+/// An ill-typed literal is refused or kept as `check` says.
 pub(crate) fn convert_string_literal(
     value: &str,
     dt_iri: &str,
     ns: &mut NsAllocator<'_>,
-) -> (FlakeValue, Sid) {
+    check: LiteralCheck,
+) -> Result<(FlakeValue, Sid), TransactError> {
+    let fv = match check {
+        LiteralCheck::Lenient => lenient_value(value, dt_iri),
+        // The language tag rides on the flake's metadata; the value is text.
+        LiteralCheck::Strict if dt_iri == rdf::LANG_STRING => FlakeValue::String(value.to_string()),
+        LiteralCheck::Strict => typed_lexical(value, dt_iri)?,
+    };
     let dt_sid = cached_dt_sid(dt_iri).unwrap_or_else(|| ns.sid_for_iri(dt_iri));
 
-    let fv = match dt_iri {
+    // Always preserve the declared datatype from the Turtle source.
+    // Normalization (e.g., xsd:long → xsd:integer) only applies to native
+    // literals (term_literal_value) where the parser infers type from syntax.
+    Ok((fv, dt_sid))
+}
+
+/// The lenient parse of a typed lexical form: a well-known datatype's
+/// native value, or, for a lexical form that does not parse, the text
+/// itself.
+fn lenient_value(value: &str, dt_iri: &str) -> FlakeValue {
+    match dt_iri {
         xsd::STRING | xsd::NORMALIZED_STRING | xsd::TOKEN | xsd::LANGUAGE | xsd::ANY_URI => {
             FlakeValue::String(value.to_string())
         }
@@ -154,12 +207,7 @@ pub(crate) fn convert_string_literal(
             // Unknown datatype — store as string, preserve the dt Sid
             FlakeValue::String(value.to_string())
         }
-    };
-
-    // Always preserve the declared datatype from the Turtle source.
-    // Normalization (e.g., xsd:long → xsd:integer) only applies to native
-    // literals (term_literal_value) where the parser infers type from syntax.
-    (fv, dt_sid)
+    }
 }
 
 /// Parse a typed XSD-style lexical form into the matching

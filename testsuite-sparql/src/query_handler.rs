@@ -143,37 +143,45 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
 /// Create the test ledger and load initial state: default graph data plus
 /// named graphs. Returns the resulting ledger state.
 ///
-/// Named graphs are loaded as TriG `GRAPH <name> { ... }` blocks through the
-/// alias-based transact builder (`upsert_turtle`), which parses the document
-/// once with the Turtle parser. Each file's `@prefix`/`@base` directives are
-/// hoisted above the GRAPH block (a directive cannot sit inside a block),
-/// and each graph loads in its own transaction so prefix declarations can't
-/// collide across files.
+/// The data loads through bulk import, Fluree's one lenient write path. W3C
+/// test data carries ill-typed literals on purpose (`open-eq-07`..`12`,
+/// `eq-bool`: `"xyz"^^xsd:integer`, `"yes"^^xsd:boolean`), which a
+/// transaction refuses and import keeps as written, so the query-semantics
+/// tests over them still run.
+///
+/// Each file becomes one TriG file in a scratch directory, imported in name
+/// order, one file at a time: the default graph as written (Turtle and
+/// N-Triples are TriG), each named graph as a `GRAPH <name> { ... }` block.
+/// Each file's `@prefix`/`@base` directives are hoisted above its GRAPH
+/// block (a directive cannot sit inside a block), and every file is its own
+/// document, so prefixes and blank-node labels stay per file. Some W3C files
+/// (e.g., empty.ttl) have valid syntax but no triples; they are skipped, and
+/// with no data at all the ledger is created empty.
 async fn setup_graph_store(
     fluree: &Fluree,
     data_url: Option<&str>,
     graph_data: &[(String, String)],
 ) -> Result<LedgerState> {
-    let ledger = fluree
-        .create_ledger(TEST_LEDGER)
-        .await
-        .context("Failed to create test ledger")?;
+    let dir = tempfile::tempdir().context("Creating the import directory")?;
+    let mut files = 0usize;
+    let mut write = |trig: String| -> Result<()> {
+        let path = dir.path().join(format!("{files:04}.trig"));
+        std::fs::write(&path, trig).with_context(|| format!("Writing {}", path.display()))?;
+        files += 1;
+        Ok(())
+    };
 
     // Default graph data (.ttl or .rdf).
     // For .ttl: prepend @base so relative IRIs resolve correctly.
     // For .rdf: convert RDF/XML to N-Triples (absolute IRIs) first.
-    // Some W3C tests (e.g., empty.ttl) have valid syntax but no triples —
-    // Fluree rejects these as empty transactions, so we skip gracefully.
-    let mut current = ledger;
     if let Some(data_url) = data_url {
         let raw = read_file_to_string(data_url)
             .with_context(|| format!("Reading test data: {data_url}"))?;
         if !raw.trim().is_empty() {
-            let turtle = prepare_for_insert(&raw, data_url)?;
-            match fluree.insert_turtle(current.clone(), &turtle).await {
-                Ok(result) => current = result.ledger,
-                Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
-                Err(e) => return Err(e).with_context(|| format!("Loading test data: {data_url}")),
+            let content = prepare_for_insert(&raw, data_url)?;
+            let (_, body) = split_turtle_directives(&content);
+            if !body.trim().is_empty() {
+                write(content)?;
             }
         }
     }
@@ -190,29 +198,31 @@ async fn setup_graph_store(
         if body.trim().is_empty() {
             continue;
         }
-        let trig = format!("{directives}GRAPH <{graph_name}> {{\n{body}}}\n");
-        // Either verb reads a TriG body; upsert keeps a repeated load of the
-        // same graph from accumulating copies.
-        match fluree
-            .graph(TEST_LEDGER)
-            .transact()
-            .upsert_turtle(&trig)
-            .commit()
-            .await
-        {
-            Ok(_) => {
-                current = fetch_state(fluree).await?;
-            }
-            Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Loading named graph data: {graph_url} as <{graph_name}>")
-                })
-            }
-        }
+        write(format!("{directives}GRAPH <{graph_name}> {{\n{body}}}\n"))?;
     }
 
-    Ok(current)
+    if files == 0 {
+        return fluree
+            .create_ledger(TEST_LEDGER)
+            .await
+            .context("Failed to create test ledger");
+    }
+    match fluree
+        .create(TEST_LEDGER)
+        .import(dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+    {
+        Ok(_) => fetch_state(fluree).await,
+        // A file of directives and comments only has no triples.
+        Err(e) if e.to_string().contains("no triples") || e.to_string().contains("Empty") => fluree
+            .create_ledger(TEST_LEDGER)
+            .await
+            .context("Failed to create test ledger"),
+        Err(e) => Err(anyhow::anyhow!("Loading test data by import: {e}")),
+    }
 }
 
 /// Fetch the latest committed state of the test ledger by alias.

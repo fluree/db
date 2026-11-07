@@ -10,7 +10,7 @@
 //!   to bare values — opt-in scalar output.
 
 use super::config::FormatterConfig;
-use super::datatype::is_inferable_datatype;
+use super::datatype::may_print_bare;
 use super::iri::IriCompactor;
 use super::json_write::{push_bool, push_f64, push_i64, push_json_string, push_value};
 use super::{materialize, FormatError, Result};
@@ -337,7 +337,7 @@ fn write_lit(
     }
 
     // Inferable datatypes emit a bare value (no @type wrapper).
-    if is_inferable_datatype(&dt_full) {
+    if may_print_bare(&dt_full, val) {
         return write_scalar(out, val, false);
     }
 
@@ -467,7 +467,7 @@ fn format_binding(
             }
 
             // Inferable datatypes can omit @type annotation.
-            if is_inferable_datatype(&dt_full) {
+            if may_print_bare(&dt_full, val) {
                 return match val {
                     FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
                     FlakeValue::Long(n) => Ok(json!(n)),
