@@ -843,6 +843,7 @@ fn stored_shacl_policy(
                         additional_data_g_ids: resolve_additional_data_g_ids(
                             resolved.shacl.as_ref(),
                             &view.base().snapshot,
+                            view.base().t(),
                             ctx.graph_delta,
                         )?,
                     },
@@ -1231,19 +1232,21 @@ pub(crate) fn resolve_shapes_source_g_ids(
         source,
         snapshot,
         "f:shapesSource",
+        t,
     )?])
 }
 
-/// Resolve a graph's `f:additionalDataSource` graphs: the graphs read with
-/// it when its nodes are checked. A graph this transaction creates resolves
-/// through its routing, so the write that creates a source graph is checked
-/// against it. A graph neither the ledger nor the transaction knows is an
-/// error, as are the txn-meta and config graphs, which hold no data to check
-/// against.
+/// Resolve a graph's `f:additionalDataSource` graphs as of `t`: the graphs
+/// read with it when its nodes are checked. A graph this transaction creates
+/// resolves through its routing, so the write that creates a source graph is
+/// checked against it. A graph neither the ledger nor the transaction knows
+/// is an error, as are the txn-meta and config graphs, which hold no data to
+/// check against.
 #[cfg(feature = "shacl")]
 pub(crate) fn resolve_additional_data_g_ids(
     shacl: Option<&fluree_db_core::ledger_config::ShaclDefaults>,
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
     graph_delta: Option<&FxHashMap<u16, String>>,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     const SETTING: &str = "f:additionalDataSource";
@@ -1261,7 +1264,7 @@ pub(crate) fn resolve_additional_data_g_ids(
             Some(iri) if iri == config_iris::TXN_META_GRAPH => {
                 Some(fluree_db_core::TXN_META_GRAPH_ID)
             }
-            Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri).or_else(|| {
+            Some(iri) => existing_source_graph(snapshot, iri, t)?.or_else(|| {
                 graph_delta?
                     .iter()
                     .find(|(_, routed)| routed.as_str() == iri)
@@ -1291,6 +1294,7 @@ fn resolve_shacl_graph_source(
     source: &fluree_db_core::ledger_config::GraphSourceRef,
     snapshot: &fluree_db_core::LedgerSnapshot,
     setting: &str,
+    t: i64,
 ) -> std::result::Result<GraphId, fluree_db_transact::TransactError> {
     reject_unsupported_graph_ref(source, setting)?;
     match source.graph_selector.as_deref() {
@@ -1852,6 +1856,7 @@ fn inline_shapes_policy(
             additional_data_g_ids = resolve_additional_data_g_ids(
                 resolved.shacl.as_ref(),
                 &view.base().snapshot,
+                view.base().t(),
                 ctx.graph_delta,
             )?;
         }

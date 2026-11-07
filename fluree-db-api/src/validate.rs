@@ -570,7 +570,7 @@ async fn validate_view_inner(
                 .then(|| snapshot.graph_registry.iri_for_graph_id(data_g_id))
                 .flatten();
             let resolved = crate::config_resolver::resolve_effective_config(config, graph_iri);
-            crate::tx::resolve_additional_data_g_ids(resolved.shacl.as_ref(), snapshot, None)?
+            crate::tx::resolve_additional_data_g_ids(resolved.shacl.as_ref(), snapshot, to_t, None)?
         }
         None => Vec::new(),
     };
