@@ -112,6 +112,7 @@ xxhash-rust.workspace = true
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
+ulid = { workspace = true }
 # Fast integer formatting for TSV output (zero-alloc); doubles use the
 # canonical xsd:double writer from fluree-graph-ir
 itoa.workspace = true

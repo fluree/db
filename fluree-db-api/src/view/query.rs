@@ -472,7 +472,7 @@ impl Fluree {
         // execution completes, so it cannot be re-run transparently and is
         // excluded on residency-mode peers.
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-        let (batches, plan_ms, exec_ms) = {
+        let (batches, plan_ms, exec_ms, served) = {
             let _ = &tracker;
             let residency_cs = residency_content_store(db);
             let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
@@ -514,7 +514,7 @@ impl Fluree {
             }
         };
         #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
-        let (batches, plan_ms, exec_ms) = self
+        let (batches, plan_ms, exec_ms, served) = self
             .plan_and_execute_round(db, &vars, &parsed, &tracker, &options)
             .await?;
 
@@ -526,6 +526,7 @@ impl Fluree {
         );
 
         // 5. Build result
+        let db = served.as_ref().unwrap_or(db);
         Ok(build_query_result(
             vars,
             parsed,
@@ -1103,10 +1104,14 @@ impl Fluree {
         // ledger's config defaults, so a fault in the config graph surfaces
         // here; a blanket 400 would tell the caller their request was bad
         // when nothing about the request is.
-        let executable =
+        let mut executable =
             Box::pin(self.build_executable_for_view(db, &parsed, options.server_identity.as_ref()))
                 .await
                 .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_from_reasoned_head(db, &mut executable, Some(&tracker))
+            .await;
+        let db = served.as_ref().unwrap_or(db);
 
         // Execute with tracking
         let batches =
@@ -1542,22 +1547,62 @@ impl Fluree {
         parsed: &fluree_db_query::ir::Query,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> Result<(Vec<crate::Batch>, f64, f64)> {
+    ) -> Result<(Vec<crate::Batch>, f64, f64, Option<GraphDb>)> {
         let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_from_reasoned_head(db, &mut executable, Some(tracker))
+            .await;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
         let batches = self
-            .execute_view_internal(db, vars, &executable, tracker, options)
+            .execute_view_internal(
+                served.as_ref().unwrap_or(db),
+                vars,
+                &executable,
+                tracker,
+                options,
+            )
             .await?;
         Ok((
             batches,
             plan_ms,
             exec_start.elapsed().as_secs_f64() * 1000.0,
+            served,
         ))
+    }
+
+    /// Swap in a reasoned head when one can answer `executable` against
+    /// `db`: the head view to run it against, with reasoning turned off and
+    /// the head reported in the tracker's reasoning slot.
+    pub(crate) async fn serve_from_reasoned_head(
+        &self,
+        db: &GraphDb,
+        executable: &mut ExecutableQuery,
+        tracker: Option<&Tracker>,
+    ) -> Option<GraphDb> {
+        let served = self.reasoned_head_for(db, &executable.reasoning).await?;
+        executable.reasoning = fluree_db_query::ir::ReasoningConfig {
+            modes: fluree_db_query::ir::ReasoningModes::none(),
+            ..Default::default()
+        };
+        if let Some(tracker) = tracker {
+            tracker.record_reasoning(fluree_db_core::ReasoningTally {
+                capped: false,
+                capped_reason: None,
+                derived_facts: 0,
+                iterations: 0,
+                duration_ms: 0,
+                capped_rules: Vec::new(),
+                pending_rules: Vec::new(),
+                evaluation_time: None,
+                head: Some(served.tally),
+            });
+        }
+        Some(served.view)
     }
 
     /// Build an executable for a single view.

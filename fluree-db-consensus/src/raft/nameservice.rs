@@ -2782,6 +2782,7 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
+                head: None,
             }),
             sql: None,
             sql_elided: None,
@@ -2865,6 +2866,7 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
+                head: None,
             }),
             sql: None,
             sql_elided: None,
@@ -3131,6 +3133,7 @@ mod tests {
             capped_rules: vec!["ex:rule".to_string()],
             pending_rules: vec!["ex:later".to_string()],
             evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
+            head: None,
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -3217,7 +3220,9 @@ mod tests {
             capped_rules: rt_capped_rules,
             pending_rules: rt_pending_rules,
             evaluation_time: rt_evaluation_time,
+            head: rt_head,
         } = rt_reasoning.expect("reasoning Some on round-trip");
+        assert_eq!(rt_head, None);
         // Not carried by the recorded mirror: adding them would change the
         // wire form of records already in the log.
         assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());

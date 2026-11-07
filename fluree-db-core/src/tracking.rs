@@ -607,6 +607,20 @@ pub struct ReasoningTally {
     /// a rule called either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_time: Option<String>,
+    /// Set when a persisted reasoned head answered the query instead of
+    /// query-time reasoning: which head, which generation, and its basis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<ReasonedHeadTally>,
+}
+
+/// The reasoned head that served a query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasonedHeadTally {
+    pub head_id: String,
+    pub generation: u64,
+    /// The `t` of the commit the generation was computed from.
+    pub basis_t: i64,
 }
 
 fn format_time_ms(duration: Duration) -> String {

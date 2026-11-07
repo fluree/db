@@ -91,6 +91,7 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             capped_rules: Vec::new(),
             pending_rules: Vec::new(),
             evaluation_time: None,
+            head: None,
         }
     }
 }

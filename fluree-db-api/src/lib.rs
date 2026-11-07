@@ -106,6 +106,7 @@ pub mod policy_view;
 pub mod profile;
 pub mod query;
 pub mod rdf;
+pub mod reasoned;
 mod rebase;
 pub mod remote_service;
 mod revert;
@@ -3562,6 +3563,7 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             identity,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            reasoned: Arc::default(),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }
@@ -3924,6 +3926,8 @@ pub struct Fluree {
     identity: fluree_db_iceberg::IdentityContext,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
+    /// Reasoned heads being refreshed, and generations loaded for serving.
+    reasoned: Arc<reasoned::HeadState>,
     /// What this instance holds of its file storage root.
     #[cfg(feature = "native")]
     root: RootHold,
@@ -3979,6 +3983,7 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            reasoned: Arc::default(),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }

@@ -299,6 +299,7 @@ mod tests {
                     reasoned_graph: None,
                     clock: ClockPolicy::SnapshotCommitTime,
                 },
+                settled: cid("settled"),
                 basis: Basis {
                     commit: cid("c"),
                     t: n as i64,

@@ -965,6 +965,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             capped_rules: diag.capped_rules.clone(),
             pending_rules: diag.pending_rules.clone(),
             evaluation_time: diag.evaluation_time.clone(),
+            head: None,
         });
     }
 

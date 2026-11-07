@@ -21,3 +21,5 @@ mod it_query_seq_path_count_repro;
 mod it_query_shortest_path;
 #[path = "it_query_subclass.rs"]
 mod it_query_subclass;
+#[path = "it_reasoned_heads.rs"]
+mod it_reasoned_heads;

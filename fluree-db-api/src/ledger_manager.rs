@@ -1349,10 +1349,9 @@ pub(crate) async fn load_and_attach_binary_store(
         Some(r) => r,
         None => return Ok(None),
     };
-    let index_cid = match record.index_head_id.as_ref() {
-        Some(cid) => cid.clone(),
-        None => return Ok(None),
-    };
+    if record.index_head_id.is_none() {
+        return Ok(None);
+    }
 
     // Branch-aware store: walks branch ancestry on read miss so a fresh
     // branch can read leaf/branch/history blobs written under the source
@@ -1362,6 +1361,27 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
+    attach_binary_store_from(cs, state, leaflet_cache, prev, root).await
+}
+
+/// [`load_and_attach_binary_store`] reading the index through `cs`, for a
+/// state whose index does not live in its record's own namespace (a
+/// reasoned head's).
+pub(crate) async fn attach_binary_store_from(
+    cs: Arc<dyn ContentStore>,
+    state: &mut LedgerState,
+    leaflet_cache: Option<Arc<LeafletCache>>,
+    prev: Option<&BinaryIndexStore>,
+    root: Option<DecodedIndexRoot<IndexRoot>>,
+) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
+    let record = match state.ns_record.as_ref() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let index_cid = match record.index_head_id.as_ref() {
+        Some(cid) => cid.clone(),
+        None => return Ok(None),
+    };
     let root = match root {
         Some((id, root)) if id == index_cid => root,
         _ => {

@@ -234,6 +234,10 @@ pub struct ReasonedManifest {
     pub kind: GenerationKind,
     pub revision: u64,
     pub semantics: SemanticKey,
+    /// Digest of the reasoning the worker settled the program to, against the
+    /// branch's configuration at the basis. A query is served only when its
+    /// own settled reasoning has the same digest.
+    pub settled: ContentId,
     pub basis: Basis,
     /// The merged index root, in the head's namespace.
     pub root: ContentId,
@@ -600,6 +604,7 @@ mod tests {
             kind: GenerationKind::Logical,
             revision: 1,
             semantics: key(),
+            settled: cid("settled"),
             basis: basis("c1", 1),
             root: cid("root"),
             derived: cid("derived"),
