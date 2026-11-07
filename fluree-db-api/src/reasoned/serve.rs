@@ -19,7 +19,7 @@ use std::sync::Arc;
 use fluree_db_core::reasoned_head::{HeadId, ReasonedManifest, RegistrationState};
 use fluree_db_core::{BranchedContentStore, ContentId, ContentStore, ReasonedHeadTally};
 use fluree_db_nameservice::NsRecord;
-use fluree_db_query::ir::ReasoningConfig;
+use fluree_db_query::ir::{ReasoningConfig, ReasoningFreshness};
 
 use super::{program, LoadedGeneration};
 use crate::view::GraphDb;
@@ -31,18 +31,58 @@ pub(crate) struct ServedHead {
     pub tally: ReasonedHeadTally,
 }
 
+const STRICT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl Fluree {
     /// The head generation that can answer a query with settled
-    /// `reasoning` against `db`, if any.
+    /// `reasoning` against `db`, if any, as the query's freshness mode
+    /// allows. Only a `strict` query fails for want of one.
     pub(crate) async fn reasoned_head_for(
         &self,
         db: &GraphDb,
         reasoning: &ReasoningConfig,
-    ) -> Option<ServedHead> {
+    ) -> Result<Option<ServedHead>> {
+        let strict = || ApiError::ReasonedHeadNotReady {
+            ledger_id: db.ledger_id.to_string(),
+            t: db.t,
+        };
+        let freshness = reasoning.modes.freshness;
         if !program::materializes(reasoning) || !db.is_root() {
-            return None;
+            return match freshness {
+                ReasoningFreshness::Strict if program::materializes(reasoning) => Err(strict()),
+                _ => Ok(None),
+            };
         }
-        match self.try_reasoned_head_for(db, reasoning).await {
+        match freshness {
+            ReasoningFreshness::Default | ReasoningFreshness::Exact => {
+                Ok(self.servable(db, reasoning, false).await)
+            }
+            ReasoningFreshness::AsOf => match self.servable(db, reasoning, false).await {
+                Some(served) => Ok(Some(served)),
+                None => Ok(self.servable(db, reasoning, true).await),
+            },
+            ReasoningFreshness::Strict => {
+                let deadline = std::time::Instant::now() + self.reasoned.strict_wait();
+                loop {
+                    if let Some(served) = self.servable(db, reasoning, false).await {
+                        return Ok(Some(served));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(strict());
+                    }
+                    tokio::time::sleep(STRICT_POLL).await;
+                }
+            }
+        }
+    }
+
+    async fn servable(
+        &self,
+        db: &GraphDb,
+        reasoning: &ReasoningConfig,
+        as_of: bool,
+    ) -> Option<ServedHead> {
+        match self.try_servable(db, reasoning, as_of).await {
             Ok(served) => served,
             Err(e) => {
                 tracing::debug!(ledger = %db.ledger_id, error = %e, "reasoned head not served");
@@ -51,10 +91,13 @@ impl Fluree {
         }
     }
 
-    async fn try_reasoned_head_for(
+    /// A generation at exactly `db`'s snapshot, or with `as_of` the newest
+    /// one whose basis is at or before it on the branch's line.
+    async fn try_servable(
         &self,
         db: &GraphDb,
         reasoning: &ReasoningConfig,
+        as_of: bool,
     ) -> Result<Option<ServedHead>> {
         let ledger_id = db.ledger_id.as_ref();
         let doc = match self.nameservice().get_reasoned_heads(ledger_id).await? {
@@ -64,10 +107,10 @@ impl Fluree {
         let Some(record) = self.nameservice().lookup(ledger_id).await? else {
             return Ok(None);
         };
-        let Some(commit) = record.commit_head_id.as_ref() else {
+        let Some(commit) = record.commit_head_id.clone() else {
             return Ok(None);
         };
-        if record.commit_t != db.t {
+        if !as_of && record.commit_t != db.t {
             return Ok(None);
         }
         let settled = program::settled_key(reasoning, db.graph_id);
@@ -77,15 +120,36 @@ impl Fluree {
             };
             if !matches!(entry.registration.state, RegistrationState::Active)
                 || published.revision != entry.registration.revision
-                || &published.basis.commit != commit
-                || published.basis.t != db.t
             {
                 continue;
             }
+            let manifest_id = if !as_of {
+                if published.basis.commit != commit || published.basis.t != db.t {
+                    continue;
+                }
+                published.manifest.clone()
+            } else {
+                match self
+                    .as_of_generation(
+                        &record,
+                        &commit,
+                        head_id,
+                        &published.manifest,
+                        db.t,
+                        &settled,
+                    )
+                    .await?
+                {
+                    Some(id) => id,
+                    None => continue,
+                }
+            };
             let generation = self
-                .loaded_generation(&record, head_id, &published.manifest)
+                .loaded_generation(&record, head_id, &manifest_id)
                 .await?;
-            if generation.manifest.settled != settled {
+            if generation.manifest.settled != settled
+                || generation.manifest.revision != entry.registration.revision
+            {
                 continue;
             }
             return Ok(Some(ServedHead {
@@ -94,10 +158,46 @@ impl Fluree {
                     head_id: head_id.to_string(),
                     generation: generation.manifest.generation,
                     basis_t: generation.manifest.basis.t,
+                    basis_commit: generation.manifest.basis.commit.to_string(),
                 },
             }));
         }
         Ok(None)
+    }
+
+    /// The newest retained generation of a head whose basis is on the
+    /// branch's line at or before `t`, computed under `settled`.
+    async fn as_of_generation(
+        &self,
+        record: &NsRecord,
+        branch_head: &ContentId,
+        head_id: &HeadId,
+        newest: &ContentId,
+        t: i64,
+        settled: &ContentId,
+    ) -> Result<Option<ContentId>> {
+        let store = self.head_store(record, head_id).await?;
+        let generations = fluree_db_indexer::gc::heads::head_generations(store.as_ref(), newest)
+            .await
+            .map_err(|e| ApiError::internal(format!("read head chain: {e}")))?;
+        let Some(oldest_t) = generations.iter().map(|g| g.manifest.basis.t).min() else {
+            return Ok(None);
+        };
+        let branch_store = fluree_db_nameservice::branched_content_store_for_record(
+            self.backend(),
+            self.nameservice(),
+            record,
+        )
+        .await?;
+        let line = super::build::Line::walk(branch_store.as_ref(), branch_head, oldest_t).await?;
+        Ok(generations
+            .into_iter()
+            .find(|g| {
+                g.manifest.basis.t <= t
+                    && &g.manifest.settled == settled
+                    && line.on_line(&g.manifest.basis)
+            })
+            .map(|g| g.manifest_id))
     }
 
     async fn loaded_generation(
@@ -184,6 +284,7 @@ impl Fluree {
 fn head_view(base: &GraphDb, head: &LedgerState) -> GraphDb {
     let head = GraphDb::from_ledger_state(head);
     let mut view = base.clone();
+    view.t = head.t;
     view.snapshot = head.snapshot;
     view.overlay = head.overlay;
     view.novelty = head.novelty;

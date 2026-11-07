@@ -499,6 +499,17 @@ pub enum ApiError {
     /// The nameservice was polled and any available commits were applied,
     /// but the ledger's `t` is still below the caller's `min_t` threshold.
     /// The caller should decide whether to retry (with backoff) or give up.
+    #[error(
+        "No reasoned head of {ledger_id} answers this query at t={t} yet; it was asked for \
+         with reasoningFreshness \"strict\", which never reasons at query time"
+    )]
+    ReasonedHeadNotReady {
+        /// The ledger queried.
+        ledger_id: String,
+        /// The `t` of the snapshot queried.
+        t: i64,
+    },
+
     #[error("Ledger has not reached t={requested}, current t={current}")]
     AwaitTNotReached {
         /// The `t` value the caller asked for.
@@ -760,7 +771,7 @@ impl ApiError {
 
             // Read-after-write: the ledger has not caught up to the `t` the
             // caller asked for.
-            ApiError::AwaitTNotReached { .. } => 408,
+            ApiError::AwaitTNotReached { .. } | ApiError::ReasonedHeadNotReady { .. } => 408,
             ApiError::IndexTimeout(_) => 504,
 
             // 503 + retryable: capacity that clears on its own (the indexer
@@ -958,6 +969,7 @@ impl ApiError {
             ApiError::CypherLower(_) | ApiError::CypherUpdateLower(_) => errors::CYPHER_LOWER,
 
             ApiError::AwaitTNotReached { .. } => errors::READ_AFTER_WRITE_TIMEOUT,
+            ApiError::ReasonedHeadNotReady { .. } => errors::REASONED_HEAD_NOT_READY,
             ApiError::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
             ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
             ApiError::Query(e) => match e {
@@ -1525,6 +1537,14 @@ mod tests {
                 408,
                 READ_AFTER_WRITE_TIMEOUT,
             ),
+            (
+                ApiError::ReasonedHeadNotReady {
+                    ledger_id: "db:main".into(),
+                    t: 3,
+                },
+                408,
+                REASONED_HEAD_NOT_READY,
+            ),
             (conflict(), 409, COMMIT_CONFLICT),
             (
                 ApiError::Transact(TE::CommitIdMismatch {
@@ -1801,6 +1821,7 @@ mod tests {
                 | ApiError::IndexingDisabled
                 | ApiError::StorageInUse { .. }
                 | ApiError::AwaitTNotReached { .. }
+                | ApiError::ReasonedHeadNotReady { .. }
                 | ApiError::CommitContention { .. }
                 | ApiError::ReindexConflict { .. }
                 | ApiError::Policy(_)

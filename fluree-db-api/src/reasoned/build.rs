@@ -538,6 +538,12 @@ impl Fluree {
         }
     }
 
+    /// Set how long a query with `reasoningFreshness: "strict"` waits for a
+    /// reasoned head at its snapshot before it fails. Ten seconds unless set.
+    pub fn set_reasoned_head_strict_wait(&self, wait: std::time::Duration) {
+        self.reasoned.set_strict_wait(wait);
+    }
+
     /// Set how long superseded generations are kept, and how many a head
     /// may hold inside that window before publication waits.
     pub fn set_reasoned_head_retention(&self, retention: super::HeadRetention) {
@@ -842,13 +848,17 @@ fn graph_of(db: &GraphDb, g: Option<&Sid>) -> GraphId {
 
 /// Commits on the branch's first-parent line from its head back to a `t`.
 #[derive(Default)]
-struct Line {
+pub(super) struct Line {
     commits: HashMap<ContentId, i64>,
     floor_t: i64,
 }
 
 impl Line {
-    async fn walk(store: &dyn ContentStore, head: &ContentId, down_to_t: i64) -> Result<Self> {
+    pub(super) async fn walk(
+        store: &dyn ContentStore,
+        head: &ContentId,
+        down_to_t: i64,
+    ) -> Result<Self> {
         let stop = (down_to_t - 1).max(0);
         let commits = fluree_db_core::collect_first_parent_cids(store, head, stop)
             .await
@@ -859,7 +869,7 @@ impl Line {
         })
     }
 
-    fn on_line(&self, basis: &Basis) -> bool {
+    pub(super) fn on_line(&self, basis: &Basis) -> bool {
         basis.t >= self.floor_t && self.commits.get(&basis.commit) == Some(&basis.t)
     }
 }

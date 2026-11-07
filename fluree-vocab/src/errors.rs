@@ -362,6 +362,9 @@ pub const BM25: &str = "err:system/Bm25Error";
 /// Index timeout
 pub const INDEX_TIMEOUT: &str = "err:system/IndexTimeout";
 
+/// A `strict` reasoning query found no reasoned head at its snapshot in time
+pub const REASONED_HEAD_NOT_READY: &str = "err:query/ReasonedHeadNotReady";
+
 /// Indexing disabled
 pub const INDEXING_DISABLED: &str = "err:system/IndexingDisabled";
 

@@ -619,8 +619,11 @@ pub struct ReasoningTally {
 pub struct ReasonedHeadTally {
     pub head_id: String,
     pub generation: u64,
-    /// The `t` of the commit the generation was computed from.
+    /// The `t` of the commit the generation was computed from: the `t` the
+    /// whole query read at.
     pub basis_t: i64,
+    /// That commit's content id.
+    pub basis_commit: String,
 }
 
 fn format_time_ms(duration: Duration) -> String {

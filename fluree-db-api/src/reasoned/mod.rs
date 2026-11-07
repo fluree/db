@@ -72,6 +72,8 @@ pub(crate) struct HeadState {
     /// looked, and the signal that wakes it.
     registered_ledgers: Mutex<HashSet<String>>,
     pub(crate) registered: tokio::sync::Notify,
+    /// How long a `strict` query waits for a generation at its snapshot.
+    strict_wait: Mutex<Option<std::time::Duration>>,
 }
 
 impl std::fmt::Debug for HeadState {
@@ -102,6 +104,16 @@ impl HeadState {
 
     pub(crate) fn set_retention(&self, retention: HeadRetention) {
         *self.retention.lock() = retention;
+    }
+
+    pub(crate) fn strict_wait(&self) -> std::time::Duration {
+        self.strict_wait
+            .lock()
+            .unwrap_or(std::time::Duration::from_secs(10))
+    }
+
+    pub(crate) fn set_strict_wait(&self, wait: std::time::Duration) {
+        *self.strict_wait.lock() = Some(wait);
     }
 
     pub(crate) fn note_registered(&self, ledger_id: &str) {

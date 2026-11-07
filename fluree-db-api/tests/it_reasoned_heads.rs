@@ -823,3 +823,175 @@ async fn the_worker_follows_commits() {
     assert_eq!(served_at(2).await, vec![json!("ex:alice"), json!("ex:bob")]);
     worker.abort();
 }
+
+fn with(mut query: JsonValue, key: &str, value: JsonValue) -> JsonValue {
+    query.as_object_mut().unwrap().insert(key.into(), value);
+    query
+}
+
+async fn query_err(fluree: &Fluree, ledger_id: &str, query: &JsonValue) -> String {
+    match fluree
+        .graph(ledger_id)
+        .query()
+        .jsonld(query)
+        .track_all()
+        .execute_tracked()
+        .await
+    {
+        Ok(resp) => panic!("expected an error, got {}", resp.result),
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+async fn school(fluree: &Fluree, id: &str) -> fluree_db_api::LedgerState {
+    ledger_with(
+        fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:Person", "rdfs:subClassOf": {"@id": "ex:Agent"}},
+                {"@id": "ex:alice", "@type": "ex:Student"},
+                {"@id": "ex:bob", "@type": "ex:Student"}
+            ]
+        }),
+    )
+    .await
+}
+
+/// `exact` refuses a capped query-time answer, and a head answers it
+/// completely whatever the budget: budgets bound the reasoner, not a head.
+#[tokio::test]
+async fn exact_refuses_a_capped_answer_and_a_head_gives_the_complete_one() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/exact:main";
+    school(&fluree, id).await;
+    let q = with(
+        with(people_query(), "reasoningBudget", json!({"maxFacts": 1})),
+        "reasoningFreshness",
+        json!("exact"),
+    );
+    let err = query_err(&fluree, id, &q).await;
+    assert!(err.contains("exact"), "{err}");
+
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let (people, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
+}
+
+/// `strict` never reasons at query time: it waits for a generation at its
+/// snapshot, and fails when none arrives.
+#[tokio::test]
+async fn strict_waits_for_a_head_and_never_reasons_at_query_time() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.set_reasoned_head_strict_wait(std::time::Duration::from_millis(100));
+    let id = "heads/strict:main";
+    let ledger = school(&fluree, id).await;
+    let q = with(people_query(), "reasoningFreshness", json!("strict"));
+    let err = query_err(&fluree, id, &q).await;
+    assert!(
+        err.contains("status: 408") && err.contains("strict"),
+        "{err}"
+    );
+
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let (people, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
+
+    // A newer commit with no generation yet: strict fails again rather than
+    // answer from an older snapshot.
+    let _ledger = student_commit(&fluree, ledger, "carol").await;
+    let err = query_err(&fluree, id, &q).await;
+    assert!(
+        err.contains("status: 408") && err.contains("strict"),
+        "{err}"
+    );
+}
+
+/// `asOf` answers from the newest generation at or before the snapshot,
+/// reading the whole query at that generation's basis, and says so.
+#[tokio::test]
+async fn as_of_reads_the_whole_query_at_the_generation_basis() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/as-of:main";
+    let ledger = school(&fluree, id).await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let _ledger = student_commit(&fluree, ledger, "carol").await;
+
+    let as_of = with(people_query(), "reasoningFreshness", json!("asOf"));
+    let (people, served) = rows(&fluree, id, &as_of).await;
+    let served = served.expect("the older generation answers");
+    assert_eq!(served.basis_t, 1);
+    assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
+
+    // Asserted data comes from the basis too: carol's own type is not read.
+    let plain_types = with(
+        json!({"@context": ctx(), "select": "?p", "where": {"@id": "?p", "@type": "ex:Student"}}),
+        "reasoning",
+        json!("owl2rl"),
+    );
+    let (students, served) = rows(
+        &fluree,
+        id,
+        &with(plain_types, "reasoningFreshness", json!("asOf")),
+    )
+    .await;
+    assert_eq!(served.map(|s| s.basis_t), Some(1));
+    assert_eq!(students, vec![json!("ex:alice"), json!("ex:bob")]);
+
+    // The default mode reasons at query time instead, at the current commit.
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_none());
+    assert_eq!(
+        people,
+        vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
+    );
+}
+
+/// The SPARQL pragma carries freshness as the JSON-LD key does.
+#[tokio::test]
+async fn the_sparql_freshness_pragma_is_honored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.set_reasoned_head_strict_wait(std::time::Duration::from_millis(50));
+    let id = "heads/sparql-strict:main";
+    school(&fluree, id).await;
+    let sparql = "# PRAGMA reasoning: owl2rl\n# PRAGMA reasoning-freshness: strict\n\
+                  PREFIX ex: <http://example.org/>\nSELECT ?p WHERE { ?p a ex:Person }";
+    let refused = fluree
+        .graph(id)
+        .query()
+        .sparql(sparql)
+        .track_all()
+        .execute_tracked()
+        .await;
+    assert_eq!(refused.err().map(|e| e.status), Some(408));
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let resp = fluree
+        .graph(id)
+        .query()
+        .sparql(sparql)
+        .track_all()
+        .execute_tracked()
+        .await
+        .unwrap();
+    assert!(resp.reasoning.and_then(|r| r.head).is_some());
+}

@@ -1110,7 +1110,8 @@ impl Fluree {
                 .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let served = self
             .serve_from_reasoned_head(db, &mut executable, Some(&tracker))
-            .await;
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let db = served.as_ref().unwrap_or(db);
 
         // Execute with tracking
@@ -1554,7 +1555,7 @@ impl Fluree {
             .await?;
         let served = self
             .serve_from_reasoned_head(db, &mut executable, Some(tracker))
-            .await;
+            .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
@@ -1583,8 +1584,10 @@ impl Fluree {
         db: &GraphDb,
         executable: &mut ExecutableQuery,
         tracker: Option<&Tracker>,
-    ) -> Option<GraphDb> {
-        let served = self.reasoned_head_for(db, &executable.reasoning).await?;
+    ) -> Result<Option<GraphDb>> {
+        let Some(served) = self.reasoned_head_for(db, &executable.reasoning).await? else {
+            return Ok(None);
+        };
         executable.reasoning = fluree_db_query::ir::ReasoningConfig {
             modes: fluree_db_query::ir::ReasoningModes::none(),
             ..Default::default()
@@ -1602,7 +1605,7 @@ impl Fluree {
                 head: Some(served.tally),
             });
         }
-        Some(served.view)
+        Ok(Some(served.view))
     }
 
     /// Build an executable for a single view.
@@ -1682,15 +1685,17 @@ impl Fluree {
                 // wrapper modes come from config mode strings and never carry
                 // a budget, so anything dropped here is silently lost and the
                 // query's own ceiling never applies.
-                let (max_facts, max_seconds, max_memory_mb) = (
+                let (max_facts, max_seconds, max_memory_mb, freshness) = (
                     executable.reasoning.modes.max_facts,
                     executable.reasoning.modes.max_seconds,
                     executable.reasoning.modes.max_memory_mb,
+                    executable.reasoning.modes.freshness,
                 );
                 executable.reasoning.modes = effective.clone();
                 executable.reasoning.modes.max_facts = max_facts;
                 executable.reasoning.modes.max_seconds = max_seconds;
                 executable.reasoning.modes.max_memory_mb = max_memory_mb;
+                executable.reasoning.modes.freshness = freshness;
             }
         }
 

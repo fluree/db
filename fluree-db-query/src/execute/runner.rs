@@ -378,6 +378,18 @@ pub async fn prepare_execution_with_config(
                 config.request,
             )
             .await?;
+            // `exact` asks for the complete answer: a capped closure is an
+            // error, not a result.
+            if reasoning.freshness == crate::ir::ReasoningFreshness::Exact {
+                if let Some(diag) = derived_outcome.diagnostics.as_ref().filter(|d| d.capped) {
+                    return Err(crate::error::QueryError::ResourceLimit(format!(
+                        "reasoning was capped ({}) and the query asked for an exact answer \
+                         (reasoningFreshness \"exact\"); raise the reasoning budget, or \
+                         register the program as a reasoned head",
+                        diag.capped_reason.as_deref().unwrap_or("budget")
+                    )));
+                }
+            }
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome

@@ -108,6 +108,44 @@ pub struct ReasoningModes {
     /// `"reasoningTime"` / SPARQL `# PRAGMA reasoning-time:`, an ISO 8601
     /// datetime.
     pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
+
+    /// How a query may be answered from a persisted reasoned head. Query key
+    /// `"reasoningFreshness"` / SPARQL `# PRAGMA reasoning-freshness:`.
+    pub freshness: ReasoningFreshness,
+}
+
+/// How a reasoning query may be answered when a reasoned head is
+/// registered for its program.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ReasoningFreshness {
+    /// A generation at exactly the queried snapshot when there is one;
+    /// query-time reasoning otherwise.
+    #[default]
+    Default,
+    /// As `Default`, but a query-time run that hits a reasoning budget is an
+    /// error rather than a capped result.
+    Exact,
+    /// Only a generation at exactly the queried snapshot: wait up to the
+    /// request's timeout for one, then fail. Never reasons at query time.
+    Strict,
+    /// The newest generation whose basis is at or before the queried
+    /// snapshot, the whole query read at that basis; `Default` when there is
+    /// none.
+    AsOf,
+}
+
+impl ReasoningFreshness {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "default" => Ok(Self::Default),
+            "exact" => Ok(Self::Exact),
+            "strict" => Ok(Self::Strict),
+            "asOf" | "as-of" => Ok(Self::AsOf),
+            other => Err(format!(
+                "unknown reasoning freshness '{other}', expected: default, exact, strict, asOf"
+            )),
+        }
+    }
 }
 
 impl ReasoningModes {
@@ -299,6 +337,13 @@ impl ReasoningModes {
         // Like the budget, the evaluation time enables no mode by itself.
         if let Some(time) = query.get("reasoningTime") {
             modes.evaluation_time = Self::parse_evaluation_time(time)?;
+        }
+
+        if let Some(freshness) = query.get("reasoningFreshness") {
+            let value = freshness
+                .as_str()
+                .ok_or_else(|| "reasoningFreshness must be a string".to_string())?;
+            modes.freshness = ReasoningFreshness::parse(value)?;
         }
 
         Ok(modes)
