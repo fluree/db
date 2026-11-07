@@ -5,7 +5,7 @@
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
 use crate::dataset::{DataSet, MemberKind};
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::ir::Query;
@@ -179,6 +179,9 @@ pub struct PrepareConfig<'a> {
     pub binary_scans: bool,
     /// The request being prepared for (see [`QueryRequest`]).
     pub request: QueryRequest<'a>,
+    /// The dataset the query reads, when it names one; `db` is its primary
+    /// graph. Read for the lists its graphs hold ([`crate::list_view`]).
+    pub dataset: Option<&'a DataSet<'a>>,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -194,6 +197,7 @@ impl<'a> PrepareConfig<'a> {
             planning: crate::temporal_mode::PlanningContext::current(),
             binary_scans: true,
             request: QueryRequest::default(),
+            dataset: None,
         }
     }
 
@@ -211,6 +215,7 @@ impl<'a> PrepareConfig<'a> {
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
             binary_scans: true,
             request: QueryRequest::default(),
+            dataset: None,
         }
     }
 
@@ -226,7 +231,14 @@ impl<'a> PrepareConfig<'a> {
             planning: crate::temporal_mode::PlanningContext::history(),
             binary_scans: true,
             request: QueryRequest::default(),
+            dataset: None,
         }
+    }
+
+    /// Prepare for a query reading `dataset` (see [`Self::dataset`]).
+    pub fn with_dataset(mut self, dataset: &'a DataSet<'a>) -> Self {
+        self.dataset = Some(dataset);
+        self
     }
 
     /// Execution will give operators no binary store (see
@@ -529,15 +541,46 @@ pub async fn prepare_execution_with_config(
             );
 
             // SPARQL's view of RDF lists (`crate::list_view`), for a ledger
-            // that may hold list members. History reads keep the stored rows.
-            let list_view = if query.query.rdf_list_view && !planning.is_history() {
-                crate::list_view::view_for(db.snapshot, db.overlay, binary_store)?
+            // that may hold list members: the whole query in it, or only its
+            // `p/rdf:rest*/rdf:first` walks. History reads keep the stored rows.
+            let whole_view = query.query.rdf_list_view;
+            if whole_view && planning.is_history() {
+                return Err(QueryError::UnsupportedFeature(
+                    "rdf-lists reads the lists of one point in time; a history query \
+                     (a from–to range) reads their stored members"
+                        .to_string(),
+                ));
+            }
+            let walks = !whole_view && crate::list_view::query_has_list_walk(&query.query);
+            let list_view = if whole_view || walks {
+                crate::list_view::view_for_dataset(
+                    db.snapshot,
+                    db.overlay,
+                    binary_store,
+                    config.dataset,
+                )?
             } else {
                 None
             };
+            // A walk reaches a compact list's members through its cells, which
+            // a history range has none of. A walk over lists stored as triples
+            // (no view) reads them as any path does.
+            if list_view.is_some() && planning.is_history() {
+                return Err(QueryError::UnsupportedFeature(
+                    "p/rdf:rest*/rdf:first reads the lists of one point in time; a \
+                     history query (a from–to range) reads a list's members as values \
+                     of p"
+                        .to_string(),
+                ));
+            }
             let encode = |iri: &str| db.snapshot.encode_iri(iri);
             let rewritten_patterns = match &list_view {
-                Some(view) => crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode),
+                Some(view) if whole_view => {
+                    crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode)
+                }
+                Some(view) => {
+                    crate::list_view::rewrite_list_walks(rewritten_patterns, view, &encode)
+                }
                 None => rewritten_patterns,
             };
 
@@ -565,7 +608,15 @@ pub async fn prepare_execution_with_config(
             if let Some(view) = &list_view {
                 // The WHERE is rewritten above; this reaches the `EXISTS` of
                 // the grouping and ordering expressions.
-                crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+                if whole_view {
+                    crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+                } else {
+                    crate::list_view::rewrite_list_walks_of_modifiers(
+                        &mut rewritten,
+                        view,
+                        &encode,
+                    );
+                }
             }
             rewritten
         };
@@ -1115,6 +1166,9 @@ pub async fn execute<'a>(
             .dataset
             .is_some_and(|ds| ds.default_graphs().len() >= 2),
     );
+    if let Some(dataset) = config.dataset {
+        prepare_config = prepare_config.with_dataset(dataset);
+    }
     let prepared = prepare_execution_with_config(db, query, &prepare_config)
         .await
         .map_err(|e| e.name_variables(vars))?;

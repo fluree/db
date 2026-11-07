@@ -16,6 +16,7 @@
 //! 4. **Dict updates**: Update reverse trees + forward packs for new subjects/strings
 //! 5. **Root assembly**: `IncrementalRootBuilder` → encode → CAS write → publish
 
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -516,7 +517,7 @@ struct Phase2Task {
 }
 
 /// Graph-scoped V2 fact identity: `(g_id, s_id, p_id, o_type, o_key, o_i)`.
-type FactIdentityKey = (fluree_db_core::GraphId, u64, u32, u16, u64, u32);
+type FactIdentityKey = (fluree_db_core::GraphId, u64, u32, u16, u64, u64);
 
 fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
     (
@@ -2783,7 +2784,7 @@ pub(crate) async fn index_novelty(
                             o_key: u64::MAX,
                             p_id: rdf_type_p_id,
                             t: 0,
-                            o_i: u32::MAX,
+                            o_i: LIST_INDEX_NONE,
                             o_type: u16::MAX,
                             g_id: scan_g_id,
                         };
@@ -4252,6 +4253,11 @@ pub async fn compact_pool_deltas(
         .get(&base_root_id)
         .await
         .map_err(|e| IndexerError::StorageRead(format!("index root: {e}")))?;
+    // A root of an earlier format is rebuilt in full by the ledger's next
+    // build; compacting under it would write this format's leaves there.
+    if !fluree_db_binary_index::format::index_root::is_current_format(&root_bytes) {
+        return Ok(None);
+    }
     let base_root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes)
         .map_err(|e| IndexerError::StorageRead(format!("index root: {e}")))?;
     let Some(pool) = base_root.pool.as_ref() else {
@@ -5654,7 +5660,7 @@ async fn read_pooled_graph_logs(
             o_key: if low { 0 } else { u64::MAX },
             p_id: if low { 0 } else { u32::MAX },
             t: if low { 0 } else { u32::MAX },
-            o_i: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u64::MAX },
             o_type: if low { 0 } else { u16::MAX },
             g_id,
         };
@@ -5681,7 +5687,7 @@ async fn read_pooled_graph_logs(
                     o_key: batch.o_key.get(i),
                     p_id: batch.p_id.get_or(i, 0),
                     t: batch.t.get_or(i, 0),
-                    o_i: batch.o_i.get_or(i, u32::MAX),
+                    o_i: batch.o_i.get_or(i, LIST_INDEX_NONE),
                     o_type: batch.o_type.get_or(i, 0),
                     g_id,
                 });
@@ -6606,7 +6612,7 @@ mod warm_tests {
             o_key: ObjKey::encode_i64(0).as_u64(),
             p_id: 1,
             t,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type: OType::XSD_INTEGER.as_u16(),
             g_id: 0,
         }

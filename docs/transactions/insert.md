@@ -443,7 +443,7 @@ GRAPH <http://example.org/graphs/hr> {
 
 A body with graph blocks is read as TriG even when sent as `text/turtle`. From the CLI, `fluree insert -f data.trig` does the same. See [Turtle and TriG](turtle.md) for the syntax, the TriG rules, and querying named graphs.
 
-A list, a Turtle `( … )` or the same list written out as `rdf:first` / `rdf:rest` triples over the document's own blank nodes (N-Triples has no `( … )`), is stored as a JSON-LD `@list` is. A second list on one subject and property, or one whose cells carry other triples, is stored as its triples.
+A list, a Turtle `( … )` or the same list written out as `rdf:first` / `rdf:rest` triples over the document's own blank nodes (N-Triples has no `( … )`), is stored as a JSON-LD `@list` is. A subject can hold several lists on one property; each keeps its own members in order. A list whose cells carry other triples is stored as its triples.
 
 Inserting a list that a subject and property already hold, the same members in the same order, restates it, as inserting a stored fact does. A different list is a second list on the property, beside the first. To replace a list, upsert it.
 

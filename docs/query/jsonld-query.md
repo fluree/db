@@ -85,6 +85,35 @@ Specifies what to return in results. The shape of `select` determines the shape 
 
 The array value is the selection spec — `"*"` for all forward properties, `"@id"` for the subject IRI, `"@type"` (equivalently `"rdf:type"`) for the subject's types, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
 
+**Lists inside an expansion.** Stored lists retain their boundaries and member
+order, including repeated members. A single list is an `@list` object, even
+when it has only one member or is empty. Several lists on one property are
+separate objects:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:colors": [{"@list": ["red", "blue"]}, {"@list": ["green"]}],
+  "ex:steps": {"@list": ["start"]},
+  "ex:empty": {"@list": []},
+  "ex:mixed": [{"@list": [1, 2]}, 3]
+}
+```
+
+Nested selections expand references inside each list. Ordinary multivalued
+properties keep their usual array representation. This applies to subject
+expansions in `select` and `selectOne`; selecting a variable bound to a
+list-valued property still returns its individual members.
+
+If the query context explicitly defines the property's term with
+`"@container": "@list"`, a sole list compacts to its member array, including
+`[]` and single-member arrays. When that property holds several lists, or a
+list alongside plain values, the result uses the full predicate IRI and
+explicit `@list` objects to avoid interpreting them as one list. An `@set`
+container or `normalizeArrays` keeps the outer property array without
+removing the list wrappers. A list-valued `rdf:type` uses the full predicate
+IRI, since the `@type` keyword accepts IRI strings rather than list objects.
+
 **Ordering and paging inside an expansion.** A nested selection's value may be an object instead of an array, adding `orderBy`, `limit` and `offset` around its `select`:
 
 ```json
@@ -121,6 +150,12 @@ A key with several values sorts by its first. Values missing the sort key sort l
 ```
 
 Reverse selections (`@reverse`) do not accept these yet.
+
+For a list-valued property, these modifiers apply to the members of each
+list independently, before its `@list` wrapper is added. Plain values beside
+lists are ordered and paged together separately. Without modifiers, each
+list keeps its stored order; the outer collection of lists has no defined
+order.
 
 **Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
 
@@ -275,6 +310,22 @@ Specifies which ledger(s) to query:
   "where": { "@id": "?person", "ex:name": "?name" }
 }
 ```
+
+**Lists as RDF:** `opts.rdfLists: true` reads every list as the RDF list it denotes, an owner edge to a chain of `rdf:first`/`rdf:rest` cells, as `# PRAGMA rdf-lists: true` does in SPARQL (see [Reading lists as RDF](sparql.md#reading-lists-as-rdf)). A property's list is then its head cell, a blank node:
+
+```json
+{
+  "@context": { "ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#" },
+  "opts": { "rdfLists": true },
+  "select": ["?first"],
+  "where": [
+    { "@id": "ex:s", "ex:items": "?head" },
+    { "@id": "?head", "rdf:first": "?first" }
+  ]
+}
+```
+
+A graph crawl (`{"?s": ["*"]}`) reads a subject's stored triples, which a cell has none of, so it is refused with a `400` under `rdfLists`; select variables instead. A value that is not a boolean is refused too.
 
 ### where
 
@@ -1077,7 +1128,9 @@ Array form:
 
 Multiple alternative steps are supported: `"(ex:a|ex:b)/(ex:c|ex:d)"` expands to 4 chains. A safety limit of 64 expanded chains is enforced to prevent combinatorial explosion.
 
-Each step must be a simple predicate (`ex:p`), inverse simple predicate (`^ex:p`), or an alternative of simple predicates (`(ex:a|ex:b)`). Transitive (`+`/`*`) and nested sequence modifiers are not allowed inside sequence steps.
+Each step may be a simple predicate (`ex:p`), an inverse simple predicate (`^ex:p`), an alternative of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`). Nested sequences are not allowed inside sequence steps.
+
+`"ex:items/rdf:rest*/rdf:first"` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would. A plain value of `ex:items` is not a member. No other path reaches into a list's `rdf:first`/`rdf:rest` cells, unless the query reads lists as RDF (`opts.rdfLists`). Over a dataset the walk reads each graph's lists in that graph's ledger and time, a `from` spanning ledgers is refused as for any path, and so is a history range over a compact list.
 
 **Rules:**
 

@@ -69,9 +69,10 @@ pub struct ConstructTemplate {
 }
 
 /// The variables a CONSTRUCT template triple's list entries are bound to
-/// (`crate::list_entries`): the positions of the entries of the owner's list
-/// that hold the triple's object (an empty list when an earlier solution
-/// named them), and whether the owner also holds the object beside the list.
+/// (`crate::list_entries`): the packed places of the entries of the owner's
+/// lists that hold the triple's object (an empty list when an earlier
+/// solution named them), and whether the owner also holds the object beside
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListEntryVars {
     pub positions: VarId,

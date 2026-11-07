@@ -352,8 +352,31 @@ value where it is also stored beside the list. With
 }
 ```
 
-To remove one entry of a list that repeats a value, or to replace a list,
-upsert the list. SPARQL deletes behave the same way: see
+A `@list` in a delete names a list, as a value names a value: it deletes the
+property's lists that are that list, the same members in the same order and
+no more, each whole. Each member is matched as the same value deleted on its
+own would be, by RDF term, so `1` does not delete `"1"^^xsd:int`. A shorter
+or longer list, a reordering, and plain values are not it, and lose nothing.
+With `ex:items` holding the lists `(1 2)` and `(1 2 3)`, this deletes `(1 2)`
+alone:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "delete": { "@id": "ex:s", "ex:items": { "@list": [1, 2] } }
+}
+```
+
+In an update with a `where`, each solution's list is matched on its own, and
+a list with a member the solution leaves unbound names nothing.
+
+An empty list, `{"@list": []}`, is the IRI `rdf:nil`, as JSON-LD defines it,
+and is stored as that value. Deleting it deletes the value `rdf:nil`, as a
+delete naming any value does, so it also deletes an entry of a list that
+holds `rdf:nil` as a member.
+
+To remove one entry of a list, or to replace a list, upsert the list. SPARQL
+deletes behave the same way: see
 [Writing lists](../query/sparql.md#writing-lists).
 
 ### No Cascading by Default

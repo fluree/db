@@ -28,6 +28,7 @@ use crate::format::leaf::{
     DecodedLeafDirV3, LeafletDirEntryV3, LEAFLET_DIR_HISTORY_SIZE,
 };
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record::{widen_list_index, LIST_INDEX_NONE};
 
 use super::column_loader::load_leaflet_columns;
 use super::column_types::{ColumnBatch, ColumnProjection};
@@ -577,10 +578,22 @@ impl LeafHandle for RangeReadLeafHandle {
         };
 
         let o_i = if eff.contains(ColumnId::OI) {
-            if entry.flags & FLAG_HAS_O_I != 0 {
-                ColumnData::Block(Arc::from(find_and_decode_u32(ColumnId::OI)?))
+            let narrow = entry
+                .column_refs
+                .iter()
+                .any(|r| r.col_id == ColumnId::OI.to_u16() && r.elem_width == 4);
+            if entry.flags & FLAG_HAS_O_I == 0 {
+                ColumnData::Const(LIST_INDEX_NONE)
+            } else if narrow {
+                // A v4 leaflet's 32-bit positions, widened to list places.
+                ColumnData::Block(
+                    find_and_decode_u32(ColumnId::OI)?
+                        .into_iter()
+                        .map(widen_list_index)
+                        .collect(),
+                )
             } else {
-                ColumnData::Const(u32::MAX)
+                ColumnData::Block(Arc::from(find_and_decode_u64(ColumnId::OI)?))
             }
         } else {
             ColumnData::AbsentDefault
@@ -719,7 +732,7 @@ mod tests {
             o_key,
             p_id,
             t,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type,
             g_id: 0,
         }
@@ -897,7 +910,7 @@ mod tests {
                 p_id: 1,
                 o_type: OType::XSD_INTEGER.as_u16(),
                 o_key: 100,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: 5,
                 op: 1, // assert,
                 g_id: 0,
@@ -907,7 +920,7 @@ mod tests {
                 p_id: 1,
                 o_type: OType::XSD_INTEGER.as_u16(),
                 o_key: 50,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: 3,
                 op: 0, // retract,
                 g_id: 0,
@@ -985,7 +998,7 @@ mod tests {
             p_id: 3,
             o_type: OType::XSD_STRING.as_u16(),
             o_key: 200,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             t: 10,
             op: 1, // assert,
             g_id: 0,

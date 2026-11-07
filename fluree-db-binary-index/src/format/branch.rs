@@ -1,23 +1,23 @@
 //! V3 branch manifest (`FBR3`) — single-level routing for the FLI3 index format.
 //!
-//! Uses V2 record keys (30 bytes) and carries
-//! `sidecar_cid` for each leaf (the single source of truth for locating
-//! a leaf's history sidecar).
+//! Uses V2 record keys (34 bytes; 30 in a v4 or earlier v5 branch, whose
+//! `o_i` is 32-bit) and carries `sidecar_cid` for each leaf (the single
+//! source of truth for locating a leaf's history sidecar).
 //!
 //! ## Binary format
 //!
 //! ```text
 //! [Header: 16 bytes]
 //!   magic: "FBR3" (4B)
-//!   version: u8 (= 1)
+//!   version: u8 (= 3; 1 is main's, with `g_id: u16` at 6..8)
 //!   order_id: u8
-//!   g_id: u16 (LE)
+//!   _reserved: u16
 //!   leaf_count: u32 (LE)
-//!   _reserved: u32 (= 0)
+//!   g_id: u32 (LE)
 //! [Leaf entries: leaf_count × variable]
-//!   first_key: RunRecordV2 (30B, LE, graphless)
+//!   first_key: RunRecordV2 (34B, LE, graphless)
 //!   [if order is pooled] first_key g_id: u32 (LE)
-//!   last_key: RunRecordV2 (30B, LE, graphless)
+//!   last_key: RunRecordV2 (34B, LE, graphless)
 //!   [if order is pooled] last_key g_id: u32 (LE)
 //!   row_count: u64 (LE)
 //!   leaf_cid_len: u16 (LE)
@@ -29,7 +29,9 @@
 //! ```
 
 use super::run_record::RunSortOrder;
-use super::run_record_v2::{cmp_v2_for_order, RunRecordV2, RECORD_V2_WIRE_SIZE};
+use super::run_record_v2::{
+    cmp_v2_for_order, RunRecordV2, RECORD_V2_NARROW_WIRE_SIZE, RECORD_V2_WIRE_SIZE,
+};
 use fluree_db_core::ContentId;
 use std::cmp::Ordering;
 use std::io;
@@ -38,11 +40,17 @@ use std::ops::Range;
 /// Magic bytes for a V3 branch manifest.
 const BRANCH_V3_MAGIC: [u8; 4] = *b"FBR3";
 
-/// `main`'s branch header: `g_id: u16` at bytes 6..8. Read, never written.
+/// `main`'s branch header: `g_id: u16` at bytes 6..8, and keys with a 32-bit
+/// `o_i`. Read, never written.
 const BRANCH_V3_VERSION_MAIN: u8 = 1;
 
-/// The v5 branch header: bytes 6..8 reserved, `g_id: u32` at 12..16.
-const BRANCH_V3_VERSION: u8 = 2;
+/// An earlier v5 branch: the v5 header, and keys with a 32-bit `o_i`. Read,
+/// never written.
+const BRANCH_V3_VERSION_NARROW: u8 = 2;
+
+/// The v5 branch header: bytes 6..8 reserved, `g_id: u32` at 12..16; keys
+/// hold a 64-bit list place.
+const BRANCH_V3_VERSION: u8 = 3;
 
 /// Size of the branch header in bytes.
 const BRANCH_V3_HEADER_LEN: usize = 16;
@@ -209,15 +217,27 @@ pub fn read_branch_from_bytes(data: &[u8]) -> io::Result<BranchManifest> {
         ));
     }
     let version = data[4];
-    if version != BRANCH_V3_VERSION && version != BRANCH_V3_VERSION_MAIN {
+    if ![
+        BRANCH_V3_VERSION,
+        BRANCH_V3_VERSION_NARROW,
+        BRANCH_V3_VERSION_MAIN,
+    ]
+    .contains(&version)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("branch v3: unsupported version {version}"),
         ));
     }
+    let narrow = version != BRANCH_V3_VERSION;
 
     let pooled = RunSortOrder::from_wire_id(data[5]).is_some_and(RunSortOrder::is_pooled);
-    let key_len = RECORD_V2_WIRE_SIZE + if pooled { 4 } else { 0 };
+    let rec_len = if narrow {
+        RECORD_V2_NARROW_WIRE_SIZE
+    } else {
+        RECORD_V2_WIRE_SIZE
+    };
+    let key_len = rec_len + if pooled { 4 } else { 0 };
     let read_key = |pos: usize, what: &str| -> io::Result<RunRecordV2> {
         if pos + key_len > data.len() {
             return Err(io::Error::new(
@@ -225,10 +245,14 @@ pub fn read_branch_from_bytes(data: &[u8]) -> io::Result<BranchManifest> {
                 format!("FBR3: truncated at {what}"),
             ));
         }
-        let mut rec =
-            RunRecordV2::read_run_le(data[pos..pos + RECORD_V2_WIRE_SIZE].try_into().unwrap());
+        let bytes = &data[pos..pos + rec_len];
+        let mut rec = if narrow {
+            RunRecordV2::read_run_le_narrow(bytes.try_into().unwrap())
+        } else {
+            RunRecordV2::read_run_le(bytes.try_into().unwrap())
+        };
         if pooled {
-            let at = pos + RECORD_V2_WIRE_SIZE;
+            let at = pos + rec_len;
             rec.g_id = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
         }
         Ok(rec)
@@ -492,26 +516,67 @@ mod tests {
         assert_eq!(read_branch_g_id(&bytes).unwrap(), 70_000);
     }
 
-    /// `main`'s branches (header version 1, 16-bit graph) still decode, so a
-    /// `main` ledger's untouched trees carry over its first v5 index.
+    /// `main`'s branch bytes for `leaves` of a dedicated order: header
+    /// version 1 with a 16-bit graph, and 30-byte keys whose `o_i` is a
+    /// 32-bit position (`u32::MAX` for none).
+    fn main_branch_bytes(order: RunSortOrder, g_id: u16, leaves: &[LeafEntry]) -> Vec<u8> {
+        let wide = build_branch_bytes(order, 0, leaves);
+        let mut out = wide[..BRANCH_V3_HEADER_LEN].to_vec();
+        out[4] = BRANCH_V3_VERSION_MAIN;
+        out[6..8].copy_from_slice(&g_id.to_le_bytes());
+        out[12..16].fill(0);
+        let mut pos = BRANCH_V3_HEADER_LEN;
+        for leaf in leaves {
+            for _ in 0..2 {
+                let key = &wide[pos..pos + RECORD_V2_WIRE_SIZE];
+                let o_i = u64::from_le_bytes(key[24..32].try_into().unwrap());
+                let narrow = if o_i == LIST_INDEX_NONE {
+                    u32::MAX
+                } else {
+                    u32::try_from(o_i).unwrap()
+                };
+                out.extend_from_slice(&key[..24]);
+                out.extend_from_slice(&narrow.to_le_bytes());
+                out.extend_from_slice(&key[32..34]);
+                pos += RECORD_V2_WIRE_SIZE;
+            }
+            let cid = 8 + 2 + leaf.leaf_cid.to_bytes().len();
+            let sidecar = 1 + leaf
+                .sidecar_cid
+                .as_ref()
+                .map_or(0, |sc| 2 + sc.to_bytes().len());
+            out.extend_from_slice(&wide[pos..pos + cid + sidecar]);
+            pos += cid + sidecar;
+        }
+        assert_eq!(pos, wide.len());
+        out
+    }
+
+    /// `main`'s branches (header version 1, 16-bit graph, 32-bit `o_i` in
+    /// their keys) still decode, so a v4 index is served until its ledger's
+    /// first v5 build rebuilds it. A key's position reads as list 0.
     #[test]
     fn a_main_branch_decodes() {
         let leaves = vec![LeafEntry {
             first_key: make_rec(1, 1, OType::XSD_INTEGER.as_u16(), 0, 1),
-            last_key: make_rec(9, 1, OType::XSD_INTEGER.as_u16(), 9, 1),
+            last_key: RunRecordV2 {
+                o_i: 3,
+                ..make_rec(9, 1, OType::XSD_INTEGER.as_u16(), 9, 1)
+            },
             row_count: 9,
             leaf_cid: make_leaf_cid(0),
-            sidecar_cid: None,
+            sidecar_cid: Some(make_sidecar_cid(0)),
         }];
-        let mut bytes = build_branch_bytes(RunSortOrder::Spot, 0, &leaves);
-        bytes[4] = BRANCH_V3_VERSION_MAIN;
-        bytes[6..8].copy_from_slice(&42u16.to_le_bytes());
-        bytes[12..16].fill(0);
+        let bytes = main_branch_bytes(RunSortOrder::Spot, 42, &leaves);
         assert_eq!(read_branch_g_id(&bytes).unwrap(), 42);
         let decoded = read_branch_from_bytes(&bytes).unwrap();
         assert_eq!(decoded.leaves.len(), 1);
         assert_eq!(decoded.leaves[0].row_count, 9);
         assert_eq!(decoded.leaves[0].leaf_cid, leaves[0].leaf_cid);
+        assert_eq!(decoded.leaves[0].sidecar_cid, leaves[0].sidecar_cid);
+        assert_eq!(decoded.leaves[0].first_key.o_i, LIST_INDEX_NONE);
+        assert_eq!(decoded.leaves[0].last_key.o_i, 3);
+        assert_eq!(decoded.leaves[0].last_key.s_id, SubjectId(9));
     }
 
     #[test]

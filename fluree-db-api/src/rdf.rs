@@ -221,7 +221,7 @@ fn read_jsonld(
         None => fluree_graph_json_ld::expand(&doc),
     }
     .map_err(|e| invalid(&e))?;
-    fluree_graph_json_ld::adapter::to_dataset_events(&expanded, sink).map_err(|e| invalid(&e))
+    fluree_graph_json_ld::adapter::to_graph_events(&expanded, sink).map_err(|e| invalid(&e))
 }
 
 /// JSON-LD reads a `@list` as positioned members, the form Fluree ingests.

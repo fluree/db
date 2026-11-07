@@ -292,6 +292,10 @@ impl<'a> FlakeGenerator<'a> {
 
     /// [`Self::generate_retract_intents`], calling `note` with each intent and
     /// the index of the template it came from.
+    ///
+    /// The templates of one list literal instantiate, in each row, as that
+    /// row's literal ([`RetractIntent::of_list`]). A literal with a member
+    /// left unbound names no list and yields nothing.
     pub(crate) fn generate_retract_intents_noting(
         &mut self,
         templates: &[TripleTemplate],
@@ -300,15 +304,48 @@ impl<'a> FlakeGenerator<'a> {
         mut note: impl FnMut(usize, &Flake),
     ) -> Result<Vec<RetractIntent>> {
         debug_assert_eq!(templates.len(), witnessed.len());
+        // A row's literals are numbered `1 + row * span + ordinal`.
+        let ordinal = |t: &TripleTemplate| {
+            t.list_index
+                .map(|_| t.list_id.map_or(0, |l| u64::from(l) + 1))
+        };
+        let span = templates
+            .iter()
+            .filter_map(ordinal)
+            .max()
+            .map(|max| max + 1);
+        let mut unbound: Vec<u32> = Vec::new();
         let mut intents = Vec::new();
         for row_idx in 0..Self::solution_rows(bindings) {
+            let row_start = intents.len();
             for (i, (template, &witnessed)) in templates.iter().zip(witnessed).enumerate() {
-                if let Some(flake) =
-                    self.materialize_template(template, bindings, row_idx, false)?
-                {
-                    note(i, &flake);
-                    intents.push(RetractIntent::new(flake, witnessed));
-                }
+                let flake = self.materialize_template(template, bindings, row_idx, false)?;
+                let literal = match span {
+                    Some(span) => ordinal(template)
+                        .map(|ordinal| {
+                            u32::try_from(1 + row_idx as u64 * span + ordinal).map_err(|_| {
+                                TransactError::FlakeGeneration(
+                                    "too many list literals in one DELETE batch".to_string(),
+                                )
+                            })
+                        })
+                        .transpose()?,
+                    None => None,
+                };
+                let Some(flake) = flake else {
+                    unbound.extend(literal);
+                    continue;
+                };
+                note(i, &flake);
+                intents.push(match literal {
+                    Some(list) => RetractIntent::of_list(flake, list),
+                    None => RetractIntent::new(flake, witnessed),
+                });
+            }
+            if !unbound.is_empty() {
+                let row = intents.split_off(row_start);
+                intents.extend(row.into_iter().filter(|i| !unbound.contains(&i.list())));
+                unbound.clear();
             }
         }
         Ok(intents)
@@ -1039,6 +1076,53 @@ mod tests {
             infer_datatype(&FlakeValue::Boolean(true)).name.as_ref(),
             "boolean"
         );
+    }
+
+    /// The members of a DELETE list literal instantiate as one literal per
+    /// row, apart from the row's other literals and from every other row's;
+    /// a literal with a member unbound in a row yields nothing there, and
+    /// leaves the row's other intents.
+    #[test]
+    fn delete_list_literals_are_one_per_row() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+        let v = VarId(0);
+        let batch = Batch::new(
+            Arc::new([v]),
+            vec![vec![Binding::sid(Sid::new(1, "ex:x")), Binding::Unbound]],
+        )
+        .unwrap();
+        let template = |p: &str, o: TemplateTerm| {
+            TripleTemplate::new(
+                TemplateTerm::Sid(Sid::new(1, "ex:s")),
+                TemplateTerm::Sid(Sid::new(1, p)),
+                o,
+            )
+        };
+        let value = |s: &str| TemplateTerm::Value(FlakeValue::String(s.to_string()));
+        let templates = vec![
+            template("ex:a", value("1")).in_list(0, 0),
+            template("ex:a", TemplateTerm::Var(v)).in_list(0, 1),
+            template("ex:b", value("2")).in_list(1, 0),
+            template("ex:c", TemplateTerm::Var(v)),
+        ];
+        let intents = generator
+            .generate_retract_intents(&templates, &[false; 4], &batch)
+            .unwrap();
+        let got: Vec<(&str, u32)> = intents
+            .iter()
+            .map(|i| (i.flake().p.name.as_ref(), i.list()))
+            .collect();
+        let preds: Vec<&str> = got.iter().map(|g| g.0).collect();
+        // Row 2: `ex:a`'s second member is unbound.
+        assert_eq!(preds, ["ex:a", "ex:a", "ex:b", "ex:c", "ex:b"]);
+        let lists: Vec<u32> = got.iter().map(|g| g.1).collect();
+        assert_eq!(lists[0], lists[1], "one literal");
+        assert_eq!(lists[3], 0, "no literal");
+        let literals: std::collections::HashSet<u32> =
+            [lists[0], lists[2], lists[4]].into_iter().collect();
+        assert_eq!(literals.len(), 3, "{lists:?}");
+        assert!(!literals.contains(&0), "{lists:?}");
     }
 
     #[test]

@@ -4499,7 +4499,7 @@ mod tests {
             p_id: 3,
             dt_id: fluree_db_core::DatatypeDictId::STRING.as_u16(),
             lang_id: 0,
-            i_val: i32::MIN,
+            i_val: fluree_db_core::list_index::NONE,
             t: 0,
         };
         let free = Some(vec![b'u']);

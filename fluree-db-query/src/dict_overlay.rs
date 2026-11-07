@@ -26,7 +26,6 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::vec_bi_dict::VecBiDict;
 use fluree_db_core::GraphId;
-use fluree_db_core::ListIndex;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -649,36 +648,22 @@ impl DictOverlay {
     ///
     /// Handles both persisted lang_ids (delegated to store) and ephemeral
     /// lang_ids allocated by `assign_lang_id()`.
-    pub fn decode_meta(&self, lang_id: u16, i_val: i32) -> Option<FlakeMeta> {
-        let has_lang = lang_id != 0;
-        let has_idx = i_val != ListIndex::none().as_i32();
-
-        if !has_lang && !has_idx {
-            return None;
-        }
-
-        let mut meta = FlakeMeta::new();
-        if has_lang {
-            let tag = if lang_id < self.ext_lang_tags.base_id() {
-                // Persisted lang_id — delegate to store
-                self.graph_view
-                    .store()
-                    .decode_meta(lang_id, ListIndex::none().as_i32())
-                    .and_then(|m| m.lang)
-            } else {
-                // Ephemeral lang_id
-                self.ext_lang_tags
-                    .resolve(lang_id)
-                    .map(std::string::ToString::to_string)
-            };
-            if let Some(tag) = tag {
-                meta = FlakeMeta::with_lang(tag);
-            }
-        }
-        if has_idx {
-            meta.i = Some(i_val);
-        }
-        Some(meta)
+    pub fn decode_meta(&self, lang_id: u16, i_val: u64) -> Option<FlakeMeta> {
+        let tag = if lang_id == 0 {
+            None
+        } else if lang_id < self.ext_lang_tags.base_id() {
+            // Persisted lang_id — delegate to store
+            self.graph_view
+                .store()
+                .decode_meta(lang_id, fluree_db_core::list_index::NONE)
+                .and_then(|m| m.lang)
+        } else {
+            // Ephemeral lang_id
+            self.ext_lang_tags
+                .resolve(lang_id)
+                .map(std::string::ToString::to_string)
+        };
+        FlakeMeta::from_packed(tag.as_deref(), i_val)
     }
 
     /// Check if a value needs early materialization.

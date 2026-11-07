@@ -174,6 +174,44 @@ async fn sparql_rule_unsupported_construct_rejected_loudly() {
     );
 }
 
+/// A rule reads lists as members, as the derivations it writes store them:
+/// one asking for cells, which would derive facts about cells nothing
+/// stores, is refused and fails the query rather than being read otherwise.
+#[tokio::test]
+async fn sparql_rule_asking_for_list_cells_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-rdf-lists").await;
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@id": "http://example.org/cellRule",
+        "f:rule": {
+            "@type": "https://ns.flur.ee/db#sparql",
+            "@value": "# PRAGMA rdf-lists: true\n\
+                       PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?x ex:hasA true } WHERE { ?x ex:a ?y }"
+        }
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+    let data = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:thing", "ex:a": 1
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?x",
+        "where": {"@id": "?x", "ex:hasA": true},
+        "reasoning": "datalog"
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect_err("a rule asking for list cells must fail the query");
+    assert!(
+        err.to_string().contains("rdf-lists does not apply"),
+        "{err}"
+    );
+}
+
 /// SPARQL twin of `datalog_rule_literal_bound_property_variable_does_not_abort_other_rules`
 /// in `it_datalog_rules.rs`. `TermResolution::Incompatible` is shared engine
 /// code below both front-ends, and a SPARQL rule can put a variable in

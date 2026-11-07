@@ -659,7 +659,7 @@ impl TermComponentsOperator {
                     p_id: self.reifies_p_id,
                     dt_id: 0,
                     lang_id: 0,
-                    i_val: i32::MIN,
+                    i_val: fluree_db_core::list_index::NONE,
                     t,
                 },
                 // As a scan binds a link object novelty holds.

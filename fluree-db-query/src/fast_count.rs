@@ -22,6 +22,7 @@ use crate::var_registry::VarId;
 use fluree_db_binary_index::arena::numbig::{NumBigArena, NumBigRepr, StoredBigValue};
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
@@ -2246,7 +2247,7 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
         o_key: u64::MAX,
         p_id: u32::MAX,
         t: u32::MAX,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };

@@ -22,11 +22,11 @@ use std::path::Path;
 /// Magic bytes for a V2 run file.
 pub const RUN_V2_MAGIC: [u8; 4] = *b"FRN2";
 
-/// V2 run file version (30-byte records, no op).
-pub const RUN_V2_VERSION: u8 = 1;
+/// V2 run file version (34-byte records, no op).
+pub const RUN_V2_VERSION: u8 = 3;
 
-/// V2 run file version with op sideband (31-byte records: 30 record + 1 op).
-pub const RUN_V2_VERSION_WITH_OP: u8 = 2;
+/// V2 run file version with op sideband (35-byte records: 34 record + 1 op).
+pub const RUN_V2_VERSION_WITH_OP: u8 = 4;
 
 /// Run file flags.
 const RUN_FLAG_ZSTD_BLOCKS: u8 = 1 << 0;

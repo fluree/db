@@ -165,7 +165,7 @@ fn lang_of_binding(
         Some(Binding::EncodedLit { lang_id, .. }) => {
             if let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) {
                 store
-                    .decode_meta(*lang_id, i32::MIN)
+                    .decode_meta(*lang_id, fluree_db_core::list_index::NONE)
                     .and_then(|m| m.lang)
                     .unwrap_or_default()
             } else {

@@ -174,7 +174,7 @@ fn build_novelty_delta(
     // List index distinguishes multiple values of the same string on one subject
     // (e.g., JSON-LD arrays where the same text appears at different positions).
     // Value: (t, op, string_text)
-    type TripleKey = (Sid, u32, Option<i32>);
+    type TripleKey = (Sid, u32, Option<fluree_db_core::list_index::ListPlace>);
     let mut latest_ops: HashMap<TripleKey, (i64, bool, String)> = HashMap::new();
 
     overlay.for_each_overlay_flake(
@@ -221,8 +221,8 @@ fn build_novelty_delta(
                 return;
             };
 
-            // Include list index for multi-valued properties
-            let list_idx = flake.m.as_ref().and_then(|m| m.i);
+            // Include the list place for multi-valued properties
+            let list_idx = flake.m.as_ref().and_then(fluree_db_core::FlakeMeta::place);
             let triple_key = (flake.s.clone(), string_id, list_idx);
 
             keep_latest_op(&mut latest_ops, triple_key, flake.t, flake.op, text);
@@ -1209,7 +1209,7 @@ mod tests {
         // Two assertions of the same string on the same subject but at different
         // list indices should be counted as separate triples (triple_count_delta = +2).
         //
-        // This tests the de-staling key shape: (Sid, string_id, Option<i32>).
+        // This tests the de-staling key shape: (Sid, string_id, list place).
         // Without list_index in the key, these would collapse to a single entry.
         use fluree_db_core::flake::{Flake, FlakeMeta};
 
@@ -1230,6 +1230,7 @@ mod tests {
             m: Some(FlakeMeta {
                 lang: None,
                 i: Some(0),
+                list: 0,
             }),
         };
         let flake_i1 = Flake {
@@ -1243,15 +1244,16 @@ mod tests {
             m: Some(FlakeMeta {
                 lang: None,
                 i: Some(1),
+                list: 0,
             }),
         };
 
         // Build the de-staling map the same way build_novelty_delta does
-        type TripleKey = (Sid, u32, Option<i32>);
+        type TripleKey = (Sid, u32, Option<fluree_db_core::list_index::ListPlace>);
         let mut latest_ops: HashMap<TripleKey, (i64, bool, String)> = HashMap::new();
 
         for flake in [&flake_i0, &flake_i1] {
-            let list_idx = flake.m.as_ref().and_then(|m| m.i);
+            let list_idx = flake.m.as_ref().and_then(fluree_db_core::FlakeMeta::place);
             let triple_key = (flake.s.clone(), 42_u32, list_idx); // string_id = 42 (mock)
             keep_latest_op(&mut latest_ops, triple_key, flake.t, flake.op, text.clone());
         }

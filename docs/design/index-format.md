@@ -296,8 +296,11 @@ entirely when its value is constant for the leaflet or absent for every row:
 - **OPST** leaflets are type-homogeneous by segmentation design, so `o_type` is always
   hoisted to `o_type_const`. Other orders hoist it too when the leaflet is single-typed
   (common for a single-datatype predicate); `HAS_O_TYPE_COL` marks the mixed case.
-- **`o_i`** (list index) is only materialized when at least one row is a list member —
-  `HAS_O_I`.
+- **`o_i`** (list place) is only materialized when at least one row is a list member —
+  `HAS_O_I`. It packs which of its subject and predicate's lists the row is in (high 32
+  bits) and its position there (low 32), `LIST_INDEX_NONE` (`u64::MAX`) for a value that is
+  no list member; a leaf from a v4 index stores it in 32 bits, its position alone, read as
+  list 0.
 
 Readers use the constants instead of decoding a block, and decode only the columns a
 given query actually projects or filters on.
@@ -336,7 +339,7 @@ since it is cold-path.
 
 ```text
 magic:   [u8; 4]   "FHS1"
-version: u8        1
+version: u8        3 (4 when entries carry their graph)
 padding: [u8; 3]   reserved
 [HistorySegment for leaflet 0]
 [HistorySegment for leaflet 1]
@@ -351,17 +354,22 @@ entry_count: u32
 [HistEntryV2 × entry_count]     // sorted by t DESCENDING (newest first)
 ```
 
-`HistEntryV2` wire layout (31 bytes, little-endian):
+`HistEntryV2` wire layout (36 bytes, little-endian; 40 with a trailing `g_id: u32`):
 
 ```text
-s_id:   u64
-p_id:   u32
-o_type: u16
-o_key:  u64
-o_i:    u32
-t:      u32
-op:     u8      // 0 = retract, 1 = assert
+s_id:     u64
+p_id:     u32
+o_type:   u16
+o_key:    u64
+o_i:      u64
+t:        u32
+op:       u8      // 0 = retract, 1 = assert
+reserved: u8      // zero
 ```
+
+A v4 index's sidecar (version 1, or 2 with the graph) stores a 32-bit `o_i` (31 and 35
+bytes). The reserved byte keeps every width distinct, so a segment's width follows from its
+length and entry count.
 
 ### Semantics
 
@@ -602,9 +610,13 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
 
 ## Versioning notes
 
-- Fact artifacts:
-  - branch: magic `FBR3`, version `1`
-  - leaf: magic `FLI3`, version `1`
+- Fact artifacts (an index from v4 carries the earlier version, with a 32-bit `o_i`, and is
+  read as list 0; a root of an earlier format is served, and the next build is a full
+  rebuild):
+  - root: magic `FIR6`, version `4` (v4: `2`)
+  - branch: magic `FBR3`, version `3` (v4: `1`)
+  - leaf: magic `FLI3`, version `2` (v4: `1`)
+  - history sidecar: magic `FHS1`, version `3`/`4` (v4: `1`/`2`)
 - Dictionary tree artifacts:
   - branch: magic `DTB1`
   - reverse leaves: magic `DLR1`

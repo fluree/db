@@ -497,8 +497,7 @@ async fn wildcard_joins_keep_list_members_in_json_ld() {
     set_fast_paths_disabled(false);
     assert_eq!(normalized(&rows), normalized(&generic));
 
-    // SPARQL reads the list's members as values, as JSON-LD does, so it
-    // takes the lane too: the name and every member, for each driving row.
+    // SPARQL reads the same members, through the same lane.
     use Routing::*;
     let sparql = check(
         &fluree,

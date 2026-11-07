@@ -2981,6 +2981,7 @@ fn test_request_option_pragmas() {
          # PRAGMA default-allow: FALSE\n\
          # PRAGMA include-system-facts: true\n\
          # PRAGMA union-default-graph: false\n\
+         # PRAGMA rdf-lists: true\n\
          SELECT * WHERE { }",
     );
     let p = &ast.pragmas;
@@ -3009,6 +3010,7 @@ fn test_request_option_pragmas() {
     assert_eq!(p.default_allow, Some(false));
     assert_eq!(p.include_system_facts, Some(true));
     assert_eq!(p.union_default_graph, Some(false));
+    assert_eq!(p.rdf_lists, Some(true));
     assert!(p.has_policy_selection());
 
     let all = assert_parses("# PRAGMA meta: true\nSELECT * WHERE { }");
@@ -3037,6 +3039,7 @@ fn test_malformed_pragma_values_rejected() {
         ("default-allow: yes", "true or false"),
         ("include-system-facts:", "true or false"),
         ("union-default-graph: yes", "true or false"),
+        ("rdf-lists: cells", "true or false"),
         ("identity: did:a did:b", "one IRI"),
         ("identity:", "one IRI"),
         ("policy-class:", "at least one IRI"),
@@ -3058,10 +3061,12 @@ fn test_update_pragmas() {
          # PRAGMA event-time: 2024-01-02T03:04:05Z\n\
          # PRAGMA validation-mode: Warn\n\
          # PRAGMA unique-properties: ex:email, <http://ex.org/ssn>\n\
+         # PRAGMA rdf-lists: true\n\
          INSERT DATA { ex:a ex:email \"a@ex.org\" }",
     );
     let p = &ast.pragmas;
     assert_eq!(p.event_time.as_deref(), Some("2024-01-02T03:04:05Z"));
+    assert_eq!(p.rdf_lists, Some(true));
     assert_eq!(p.validation_mode.as_deref(), Some("warn"));
     assert_eq!(
         p.unique_properties,

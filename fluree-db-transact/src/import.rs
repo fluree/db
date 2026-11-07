@@ -293,7 +293,10 @@ mod inner {
                 crate::parse::jsonld::GraphRole::Data,
                 &mut fluree_db_query::VarRegistry::new(),
             )?,
-            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id, ledger_id)?,
+            GraphNameRef::NamedGraph(id) => {
+                let id = fluree_graph_json_ld::iri_named_graph(id).map_err(TransactError::Parse)?;
+                crate::parse::jsonld::named_graph(id, id, ledger_id)?
+            }
         };
         let iri = match &graph {
             GraphName::Default => return Ok(None),
@@ -330,8 +333,8 @@ mod inner {
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
         pub prefix_map: HashMap<String, String>,
-        /// The owners whose list a chunk has stored compactly, for chunks
-        /// that do not spool (a spooled chunk shares
+        /// The next list id of each owner a chunk has stored a list on, for
+        /// chunks that do not spool (a spooled chunk shares
         /// `SpoolConfig::list_owners`).
         pub list_owners: crate::lists::ClaimedOwners,
     }
@@ -955,7 +958,7 @@ mod inner {
                                 o: &o,
                                 dt: &dt,
                                 lang: lang.as_deref(),
-                                list_index: None,
+                                place: None,
                                 t: new_t,
                             },
                         )?;

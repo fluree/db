@@ -133,7 +133,7 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 **Arithmetic over offset-carrying `xsd:date` / `xsd:time` operands (deviation from XPath):** follows from the paragraph above. XPath anchors each such operand in its own timezone; Fluree has already discarded it, so `"2026-01-01+05:00" - "2026-01-01Z"` is `PT0S` where XPath says `-PT5H`, and XPath's own `op:subtract-times` example `"17:00:00-06:00" - "08:00:00+09:00"` answers `PT9H` rather than `P1D`. `xsd:dateTime` arithmetic matches XPath exactly, since the instant is the value. Pinned across both storage lanes by `it_temporal_lane_stability`.
 
-**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it (W3C tests `list-2` to `list-4`). The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
+**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so a `( ?x ?y )` pattern finds nothing for it (W3C tests `list-2` to `list-4`). The exceptions are `ex:items/rdf:rest*/rdf:first`, which reaches each member, and a `( … )` in a `DELETE WHERE`, which matches a list whole. A request that sets `# PRAGMA rdf-lists: true` (JSON-LD `opts.rdfLists`) reads every list as RDF, cells included. The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
 
 **Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
 
@@ -168,9 +168,13 @@ Differences from the specification:
 - The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
   management operations
 - A list is written and deleted through its members: deleting a value deletes
-  every entry of a list that holds it, and a compact list's cells cannot be
-  edited one by one; a list stored as its triples, such as a second list on one
-  property, is edited as triples ([Writing lists](../query/sparql.md#writing-lists))
+  every entry of a list that holds it, and a `( … )` in `DELETE WHERE` deletes
+  the lists that are it, whole ([Writing lists](../query/sparql.md#writing-lists)).
+  Under `# PRAGMA rdf-lists: true`, an update can replace a member through its
+  cell's `rdf:first`; other cell edits are refused
+  ([Editing a list through its cells](../query/sparql.md#editing-a-list-through-its-cells))
+- Inserting a list a subject and property already hold, the same members in
+  the same order, restates it rather than adding a second list there
 - `ADD` of a list the destination already holds restates it, and so does
   `ADD` of the same list again beside another list there
 
@@ -441,9 +445,17 @@ A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest`
 - A CONSTRUCT whose template repeats the WHERE triple that read a list, and DESCRIBE, write the list as `( … )` or `{"@list": [...]}`, in order and with repeats; they wrote its members as repeated values. `fluree export` writes lists the same way, in list order; it wrote them as repeated values in index order.
 - OWL 2 RL reasoning reads list axioms written as a Turtle `( … )` or a JSON-LD `@list`. It used to read only lists stored as triples, so such axioms were ignored.
 
+#### A second list on a property is stored as a list
+
+A second, different list on one subject and property used to be stored beside the first as its triples. It is now stored as a list of its own, as the first is: `ex:s ex:items ?o` binds its members, and it is written whole and in order wherever the first is. A second list already stored as its triples stays so, and reads as those triples. See [Writing lists](../query/sparql.md#writing-lists).
+
 #### Deleting a value a list repeats deletes every entry holding it
 
 A delete naming a value, without a list position, used to delete the first entry of a list holding it, unless its WHERE clause handed each stored entry over (`DELETE { ex:s ex:items ?o } WHERE { ex:s ex:items ?o FILTER(?o = 1) }`), which deleted every one. It now deletes every entry of a list that holds the value, and the value where it is also stored beside the list, however it is written: SPARQL `DELETE DATA`, `DELETE WHERE`, a WHERE with `VALUES`, and a JSON-LD `delete`. A value that is no list entry is deleted as before. To remove one entry of a list that repeats a value, upsert the list.
+
+#### A list in a delete names the whole list
+
+A `@list` in a JSON-LD `delete` used to delete, at each of its positions, the entry of the property's list holding that member there: `{"@list": ["a"]}` deleted the first entry of `("a" "b" "a")`. It now names a list as a delete names a value: it deletes the property's lists that are it, the same members in the same order and no more, each whole, and nothing else. In an update with a `where`, each solution's list is matched on its own. A `( … )` in a SPARQL `DELETE WHERE` used to match only a list stored as its triples. It now matches every list that is it, and deletes each whole; its members may be variables. To remove one entry of a list, upsert the list. See [Lists](../transactions/retractions.md#lists) and [Writing lists](../query/sparql.md#writing-lists).
 
 #### An update keeps a stored triple it both deletes and inserts
 

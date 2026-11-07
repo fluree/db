@@ -2,16 +2,17 @@
 //!
 //! A list has two stored shapes. A Turtle `( … )` or JSON-LD `@list` in object
 //! position is stored compactly: its members are values of the owning subject
-//! and predicate, each carrying its position in [`FlakeMeta::i`]. Anything
-//! else — a list written out as `rdf:first`/`rdf:rest` triples, a second list
-//! on one property, a nested list — is stored as that explicit chain. Both
-//! are the same RDF, so a reader of a list-valued property reads both.
+//! and predicate, each carrying its place, which of the owner's lists it is in
+//! and its position there ([`FlakeMeta::place`]). Anything else — a list
+//! written out as `rdf:first`/`rdf:rest` triples, a nested list — is stored as
+//! that explicit chain. Both are the same RDF, so a reader of a list-valued
+//! property reads both.
 //!
-//! [`FlakeMeta::i`]: crate::flake::FlakeMeta::i
+//! [`FlakeMeta::place`]: crate::flake::FlakeMeta::place
 
 use crate::comparator::IndexType;
 use crate::error::Result;
-use crate::flake::Flake;
+use crate::flake::{Flake, FlakeMeta};
 use crate::graph_db_ref::GraphDbRef;
 use crate::namespaces::is_rdf_nil;
 use crate::query_bounds::{RangeMatch, RangeTest};
@@ -19,7 +20,7 @@ use crate::sid::Sid;
 use crate::value::FlakeValue;
 use fluree_vocab::namespaces::RDF;
 use fluree_vocab::predicates::{RDF_FIRST, RDF_REST};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Cells walked before a chain is taken to be malformed.
 const MAX_CHAIN_LEN: usize = 100_000;
@@ -27,8 +28,8 @@ const MAX_CHAIN_LEN: usize = 100_000;
 /// The RDF lists among the values of one subject and predicate.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Lists {
-    /// Each list's members in order: the compact list first, then each chain
-    /// in value order. The empty list, `rdf:nil`, has no members.
+    /// Each list's members in order: the compact lists first, by list, then
+    /// each chain in value order. The empty list, `rdf:nil`, has no members.
     pub lists: Vec<Vec<FlakeValue>>,
     /// Values heading an `rdf:first`/`rdf:rest` chain that does not reach
     /// `rdf:nil`: a cell without exactly one `rdf:first` and one `rdf:rest`,
@@ -55,20 +56,20 @@ impl Lists {
 /// Read `values`, the flakes of one subject and predicate, as RDF lists,
 /// walking any explicit chain through `db`. Retractions are ignored.
 pub async fn read_lists(db: GraphDbRef<'_>, values: &[Flake]) -> Result<Lists> {
-    let mut members: Vec<(i32, &FlakeValue)> = Vec::new();
+    let mut compact: BTreeMap<u32, Vec<(i32, &FlakeValue)>> = BTreeMap::new();
     let mut out = Lists::default();
     for flake in values.iter().filter(|f| f.op) {
-        if let Some(index) = flake.m.as_ref().and_then(|m| m.i) {
-            members.push((index, &flake.o));
+        if let Some((list, index)) = flake.m.as_ref().and_then(FlakeMeta::place) {
+            compact.entry(list).or_default().push((index, &flake.o));
         }
     }
-    if !members.is_empty() {
+    for mut members in compact.into_values() {
         members.sort_by_key(|(index, _)| *index);
         out.lists
             .push(members.into_iter().map(|(_, o)| o.clone()).collect());
     }
     for flake in values.iter().filter(|f| f.op) {
-        if flake.m.as_ref().and_then(|m| m.i).is_some() {
+        if flake.m.as_ref().and_then(FlakeMeta::place).is_some() {
             continue;
         }
         match &flake.o {

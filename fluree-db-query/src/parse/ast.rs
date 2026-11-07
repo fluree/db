@@ -721,6 +721,8 @@ pub struct UnresolvedOptions {
     /// Parsed from `opts.unionDefaultGraph`. See
     /// [`crate::ir::Query::union_default_graph`].
     pub union_default_graph: Option<bool>,
+    /// Parsed from `opts.rdfLists`. See [`crate::ir::Query::rdf_list_view`].
+    pub rdf_lists: bool,
 }
 
 impl UnresolvedOptions {
@@ -744,6 +746,7 @@ impl Default for UnresolvedOptions {
             object_var_parsing: true,
             include_system_facts: false,
             union_default_graph: None,
+            rdf_lists: false,
         }
     }
 }

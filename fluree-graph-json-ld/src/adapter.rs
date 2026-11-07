@@ -28,7 +28,8 @@
 //! [`to_graph_events_scoped`] writes the statements of a named graph as quads
 //! ([`fluree_graph_ir::GraphSink::emit_quad`]) and asks the caller to resolve
 //! each graph name. [`to_graph_events`] writes a JSON-LD named graph under
-//! its `@id` and refuses a graph selector, which only a ledger can resolve.
+//! its `@id`, an IRI or a blank node, and refuses a graph selector, which
+//! only a ledger can resolve.
 //! A sink without quad support refuses any named graph with
 //! [`AdapterError::Unsupported`], as it refuses reifiers it cannot hold:
 //! folding the statements into the default graph would lose data. (A
@@ -62,7 +63,7 @@
 //! assert_eq!(graph.len(), 1);
 //! ```
 
-use crate::graph_shape::{dataset_node_graph, node_graph, NodeGraph};
+use crate::graph_shape::{node_graph, NodeGraph};
 use crate::is_keyword_form;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
 use fluree_vocab::rdf;
@@ -122,7 +123,8 @@ pub enum GraphNameRef<'a> {
     /// relative or absolute, or a keyword such as `default`.
     Selector(&'a str),
     /// The (expanded) `@id` of a JSON-LD named graph, already checked by
-    /// [`node_graph`]: not a blank node and not a variable.
+    /// [`node_graph`]: an IRI or a blank node (`_:label`), not a variable.
+    /// A ledger writer refuses a blank node ([`crate::iri_named_graph`]).
     NamedGraph(&'a str),
 }
 
@@ -142,7 +144,7 @@ enum ProcessedValue {
 #[derive(Debug, Clone, Copy)]
 enum Scope {
     Default,
-    /// A named graph, by its IRI term.
+    /// A named graph, by its IRI or blank-node term.
     Named(TermId),
 }
 
@@ -150,8 +152,8 @@ enum Scope {
 ///
 /// The input must be expanded JSON-LD (output of `expand()`). This function
 /// walks the expanded structure and emits triple events to the sink. A
-/// JSON-LD named graph is written under its `@id`; a graph selector is
-/// refused, and [`to_graph_events_scoped`] writes it.
+/// JSON-LD named graph is written under its `@id`, an IRI or a blank node; a
+/// graph selector is refused, and [`to_graph_events_scoped`] writes it.
 ///
 /// # Arguments
 ///
@@ -186,35 +188,14 @@ pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<(
     })
 }
 
-/// [`to_graph_events`] for a reader of RDF datasets, where a blank node may
-/// also name a graph (a ledger holds no such graph, so the writers refuse
-/// one).
-pub fn to_dataset_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<()> {
-    walk(expanded, sink, true, |name| match name {
-        GraphNameRef::NamedGraph(iri) => Ok(Some(iri.to_string())),
-        GraphNameRef::Selector(_) => Err(AdapterError::Unsupported(
-            "a JSON-LD `@graph` graph selector is not supported here".to_string(),
-        )),
-    })
-}
-
 /// Convert expanded JSON-LD to GraphSink events, writing each statement to
 /// its graph (see the [module docs](self)).
 ///
 /// `resolve` names each graph the document writes: `Ok(None)` is the default
-/// graph, `Ok(Some(iri))` the named graph `iri` (absolute), and an error
-/// refuses the document. A named graph needs a sink that supports quads.
+/// graph, `Ok(Some(name))` the named graph `name` (an absolute IRI, or a
+/// blank node `_:label`), and an error refuses the document. A named graph
+/// needs a sink that supports quads.
 pub fn to_graph_events_scoped<S, F>(expanded: &Value, sink: &mut S, resolve: F) -> Result<()>
-where
-    S: GraphSink,
-    F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
-{
-    walk(expanded, sink, false, resolve)
-}
-
-/// The walk behind both entry points; `blank_graph_names` lets a blank node
-/// name a graph.
-fn walk<S, F>(expanded: &Value, sink: &mut S, blank_graph_names: bool, resolve: F) -> Result<()>
 where
     S: GraphSink,
     F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
@@ -222,7 +203,6 @@ where
     let mut walk = Walk {
         sink,
         resolve,
-        blank_graph_names,
         selectors: HashMap::new(),
         named_graphs: HashMap::new(),
     };
@@ -249,8 +229,6 @@ where
 struct Walk<'s, S, F> {
     sink: &'s mut S,
     resolve: F,
-    /// A blank node may name a graph (see [`to_dataset_events`]).
-    blank_graph_names: bool,
     /// The scope each graph name opened, by name as written: a document
     /// names few graphs, often on every node. A term stays valid for the
     /// whole walk (producers may keep IRI terms across statements, and the
@@ -273,21 +251,15 @@ where
         if let Some(&scope) = opened.get(raw) {
             return Ok(scope);
         }
-        // A blank node names a graph only in a dataset walk, and is the
-        // graph's name as written: nothing to resolve.
-        let resolved = match name {
-            GraphNameRef::NamedGraph(raw) if raw.starts_with("_:") => Some(raw.to_string()),
-            _ => (self.resolve)(name)?,
-        };
-        let scope = match resolved {
+        let scope = match (self.resolve)(name)? {
             None => Scope::Default,
-            Some(iri) => {
+            Some(name) => {
                 if !self.sink.supports_quads() {
                     return Err(AdapterError::Unsupported(format!(
-                        "JSON-LD `@graph` names graph <{iri}>, which this destination cannot hold"
+                        "JSON-LD `@graph` names graph <{name}>, which this destination cannot hold"
                     )));
                 }
-                Scope::Named(node_term(&iri, self.sink))
+                Scope::Named(node_term(&name, self.sink))
             }
         };
         match name {
@@ -359,12 +331,7 @@ where
         // content nodes are written to the graph its `@id` names (after the
         // properties, below).
         let mut named_graph_content: Option<(&str, &[Value])> = None;
-        let graph = if self.blank_graph_names {
-            dataset_node_graph(obj)
-        } else {
-            node_graph(obj)
-        };
-        let scope = match graph.map_err(AdapterError::InvalidStructure)? {
+        let scope = match node_graph(obj).map_err(AdapterError::InvalidStructure)? {
             NodeGraph::Enclosing => scope,
             NodeGraph::Selector(raw) => self.open(GraphNameRef::Selector(raw))?,
             NodeGraph::NamedGraph { name, content } => {
@@ -1604,33 +1571,34 @@ mod tests {
         );
     }
 
-    /// A blank node names a graph in a dataset walk, the same node a
-    /// statement can name; the writers' walk refuses it.
+    /// RDF names a graph by a blank node too: the graph's name is the node
+    /// its `@id` labels, which also carries the graph's own properties.
     #[test]
-    fn a_blank_node_names_a_graph_only_in_a_dataset_walk() {
+    fn named_graph_named_by_a_blank_node() {
         let expanded = json!([{
             "@id": "_:g",
+            "http://example.org/label": [{"@value": "G"}],
             "@graph": [{
-                "@id": "_:g",
-                "http://example.org/label": [{"@value": "G"}]
+                "@id": "http://example.org/x",
+                "http://example.org/p": [{"@value": "in-g"}]
             }]
         }]);
 
         let mut sink = GraphCollectorSink::with_named_graphs();
-        to_dataset_events(&expanded, &mut sink).unwrap();
+        to_graph_events(&expanded, &mut sink).unwrap();
         let dataset = sink.into_dataset();
-        assert!(dataset.default.is_empty());
+        let label = dataset
+            .default
+            .iter()
+            .next()
+            .expect("the graph's own label");
         let (name, graph) = dataset.named.iter().next().expect("the named graph");
         assert!(matches!(name, Term::BlankNode(_)), "{name:?}");
-        assert_eq!(graph.len(), 1);
-        assert_eq!(&graph.iter().next().unwrap().s, name);
-
-        let err =
-            to_graph_events(&expanded, &mut GraphCollectorSink::with_named_graphs()).unwrap_err();
-        assert!(
-            matches!(&err, AdapterError::InvalidStructure(msg) if msg.contains("named by an IRI")),
-            "{err:?}"
+        assert_eq!(
+            &label.s, name,
+            "one node names the graph and carries its label"
         );
+        assert_eq!(graph.len(), 1);
     }
 
     /// `_:-b1` is a legal JSON-LD blank node, and stays apart from the
@@ -1857,7 +1825,8 @@ mod tests {
     }
 
     /// A graph name the resolver refuses refuses the document, and so does
-    /// a named graph without an IRI name.
+    /// a nested named graph without an `@id`. A blank-node name reaches the
+    /// resolver, which a ledger's refuses ([`crate::iri_named_graph`]).
     #[test]
     fn a_graph_that_cannot_be_named_is_refused() {
         let ctx = json!({"ex": "http://example.org/"});
@@ -1871,16 +1840,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.to_string(), "no such graph");
 
-        for doc in [
-            json!({"@context": ctx, "@graph": [{"ex:q": 1, "@graph": [{"@id": "ex:a", "ex:q": 2}]}]}),
-            json!({"@context": ctx, "@id": "_:g", "@graph": [{"@id": "ex:a", "ex:q": 2}]}),
-        ] {
-            let err = scoped(doc.clone()).unwrap_err();
-            assert!(
-                matches!(err, AdapterError::InvalidStructure(_)),
-                "{doc}: {err}"
-            );
-        }
+        let doc = json!({"@context": ctx, "@graph": [{"ex:q": 1, "@graph": [{"@id": "ex:a", "ex:q": 2}]}]});
+        let err = scoped(doc.clone()).unwrap_err();
+        assert!(
+            matches!(err, AdapterError::InvalidStructure(_)),
+            "{doc}: {err}"
+        );
+
+        let doc = json!({"@context": ctx, "@id": "_:g", "@graph": [{"@id": "ex:a", "ex:q": 2}]});
+        let kept = scoped(doc.clone()).unwrap();
+        assert!(
+            kept.len() == 1 && kept[0].starts_with("_: ex:a ex:q"),
+            "a resolver that keeps the name: {kept:?}"
+        );
+        let err = to_graph_events_scoped(&crate::expand(&doc).unwrap(), &mut sink, |name| {
+            let GraphNameRef::NamedGraph(name) = name else {
+                unreachable!("{name:?}")
+            };
+            crate::iri_named_graph(name)
+                .map(|iri| Some(iri.to_string()))
+                .map_err(AdapterError::InvalidStructure)
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("named by an IRI"), "{err}");
     }
 
     /// A sink without quads refuses a named graph; the default graph needs

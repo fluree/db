@@ -23,7 +23,7 @@ pub struct FactKeyV3 {
     pub p_id: u32,
     pub o_type: u16,
     pub o_key: u64,
-    pub o_i: u32,
+    pub o_i: u64,
 }
 
 // ============================================================================
@@ -37,7 +37,7 @@ pub struct DecodedRowV3 {
     pub p_id: u32,
     pub o_type: u16,
     pub o_key: u64,
-    pub o_i: u32,
+    pub o_i: u64,
     pub t: i64,
 }
 
@@ -70,7 +70,7 @@ pub struct OverlayOp {
     pub p_id: u32,
     pub o_type: u16,
     pub o_key: u64,
-    pub o_i: u32,
+    pub o_i: u64,
     pub t: i64,
     /// true = assert, false = retract.
     pub op: bool,
@@ -104,7 +104,7 @@ struct KeyFields {
     p_id: u32,
     o_type: u16,
     o_key: u64,
-    o_i: u32,
+    o_i: u64,
     g_id: GraphId,
 }
 
@@ -300,7 +300,7 @@ pub fn cmp_row_vs_overlay(
     p_id: u32,
     o_type: u16,
     o_key: u64,
-    o_i: u32,
+    o_i: u64,
     g_id: GraphId,
     ov: &OverlayOp,
     order: RunSortOrder,
@@ -360,6 +360,7 @@ pub fn overlay_window_for_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::run_record::LIST_INDEX_NONE;
 
     #[test]
     fn fact_key_equality() {
@@ -368,7 +369,7 @@ mod tests {
             p_id: 2,
             o_type: 3,
             o_key: 4,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
         };
         let k2 = k1;
         assert_eq!(k1, k2);
@@ -382,7 +383,7 @@ mod tests {
                 p_id: 1,
                 o_type: 0,
                 o_key: 0,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: 1,
                 op: true,
                 g_id: 0,
@@ -392,7 +393,7 @@ mod tests {
                 p_id: 1,
                 o_type: 0,
                 o_key: 0,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: 1,
                 op: true,
                 g_id: 0,
@@ -411,7 +412,7 @@ mod tests {
                 p_id: 2,
                 o_type: 0,
                 o_key: 10,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: 1,
                 op: true,
                 g_id: 0,
@@ -421,7 +422,7 @@ mod tests {
                 p_id: 2,
                 o_type: 0,
                 o_key: 5,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 t: 1,
                 op: true,
                 g_id: 0,

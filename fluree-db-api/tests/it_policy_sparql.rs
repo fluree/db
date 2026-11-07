@@ -184,6 +184,8 @@ async fn sparql_policy_invalid_fails_closed() {
         "THIS IS NOT SPARQL",
         // Valid SPARQL, but not ASK/SELECT — rejected at policy build
         "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+        // A policy query reads lists as members; asking for cells is refused
+        "# PRAGMA rdf-lists: true\nASK { $this <http://example.org/ns/level> 0 }",
     ] {
         let policy = json!([{
             "@id": "ex:badPolicy",

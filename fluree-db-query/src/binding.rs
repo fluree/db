@@ -138,7 +138,9 @@ pub enum Binding {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
-        i_val: i32,
+        /// The list place, packed ([`fluree_db_core::list_index`]):
+        /// `list_index::NONE` for a value that is no list member.
+        i_val: u64,
         t: i64,
     },
     /// Encoded subject/predicate/ref-object ID (late materialization).
