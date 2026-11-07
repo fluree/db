@@ -86,6 +86,29 @@ pub enum RefreshOutcome {
     Deferred { reason: String },
 }
 
+/// Wall-clock milliseconds a refresh spends in each phase, for the debug
+/// log.
+struct Phases {
+    last: fluree_db_core::clock::Instant,
+    spent: Vec<(&'static str, u64)>,
+}
+
+impl Phases {
+    fn new() -> Self {
+        Self {
+            last: fluree_db_core::clock::Instant::now(),
+            spent: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = fluree_db_core::clock::Instant::now();
+        self.spent
+            .push((phase, now.duration_since(self.last).as_millis() as u64));
+        self.last = now;
+    }
+}
+
 fn now_ms() -> i64 {
     use fluree_db_core::clock::SystemTime;
     SystemTime::now()
@@ -340,7 +363,9 @@ impl Fluree {
         ledger_id: &str,
         index_id: &ReasoningIndexId,
     ) -> Result<RefreshOutcome> {
+        let mut phases = Phases::new();
         let (record, db) = self.consistent_base(ledger_id).await?;
+        phases.mark("base");
         let Some(commit) = record.commit_head_id.clone() else {
             return Ok(RefreshOutcome::Failed {
                 reason: "the branch has no commits".into(),
@@ -387,6 +412,7 @@ impl Fluree {
             None,
         )?;
         let mut executable = self.build_executable_for_view(&db, &parsed, None).await?;
+        phases.mark("settle");
         if !program::materializes(&executable.reasoning) {
             return Ok(RefreshOutcome::Failed {
                 reason: "the program, as the branch settles it, materializes nothing".into(),
@@ -476,6 +502,7 @@ impl Fluree {
             }
             _ => None,
         };
+        phases.mark("previous");
 
         // The program's output: maintained from the previous generation when
         // the window since it only inserted facts the program can fold in,
@@ -492,6 +519,7 @@ impl Fluree {
             ),
             None => None,
         };
+        phases.mark("window");
         let incremental = match (&previous, &window) {
             (Some(prev), Some(window)) => {
                 self.incremental_closure(
@@ -524,8 +552,10 @@ impl Fluree {
                 })
             }
         };
+        phases.mark("closure");
         let derived_total = derived.len() as u64;
         let derived_only = asserted_filter(&db, derived, false).await?;
+        phases.mark("asserted_filter");
         if program::serves_rewrites(&executable.reasoning) {
             if let Some(p) = derived_hierarchy_edge(&derived_only) {
                 return Ok(RefreshOutcome::Failed {
@@ -627,6 +657,7 @@ impl Fluree {
                 }
             };
 
+            phases.mark("fold_diff");
             // Build the merged root in the index's namespace.
             let mut index_record = record.clone();
             match &previous {
@@ -679,6 +710,7 @@ impl Fluree {
                 Err(e) => return Err(ApiError::internal(format!("reasoning-index build: {e}"))),
             }
         };
+        phases.mark("index_build");
 
         let derived_only_flakes: Vec<Flake> = derived_only
             .iter()
@@ -687,6 +719,7 @@ impl Fluree {
             .collect();
         let derived_count = derived_only_flakes.len() as u64;
         let derived_id = write_derived_only(index_cs.as_ref(), derived_only_flakes).await?;
+        phases.mark("derived_write");
 
         let stats = GenerationStats {
             derived_only: derived_count,
@@ -735,8 +768,18 @@ impl Fluree {
             .await?
         {
             Ok(generation) => {
+                phases.mark("publish");
                 self.reasoning_index_state.forget_index(ledger_id, index_id);
                 self.collect_quietly(ledger_id, &record, index_id).await;
+                phases.mark("collect");
+                tracing::debug!(
+                    index = %index_id,
+                    generation,
+                    ?kind,
+                    ?closure,
+                    phases_ms = ?phases.spent,
+                    "reasoning-index refresh phases"
+                );
                 Ok(RefreshOutcome::Published {
                     generation,
                     kind,
@@ -897,6 +940,7 @@ impl Fluree {
             .collect();
         // The closed state: the predecessor's index, with every commit since
         // its basis replayed over it.
+        let started = fluree_db_core::clock::Instant::now();
         let state = self
             .load_index_state(
                 Arc::clone(index_store),
@@ -922,6 +966,7 @@ impl Fluree {
             overlay,
             closed_ref.t,
         );
+        let loaded_ms = started.elapsed().as_millis() as u64;
         let outcome = match compute_derived_facts_incremental(
             base,
             modes,
@@ -937,6 +982,12 @@ impl Fluree {
             Ok(None) => return Ok(None),
             Err(e) => return Ok(Some(Err(e.into()))),
         };
+        tracing::debug!(
+            inserted = inserted.len(),
+            state_load_ms = loaded_ms,
+            fixpoint_ms = started.elapsed().as_millis() as u64 - loaded_ms,
+            "incremental closure"
+        );
         Ok(Some(Ok(outcome_facts(outcome).map(|gained| {
             let mut all: Vec<(GraphId, Flake)> = prev.derived.iter().cloned().collect();
             all.extend(gained);

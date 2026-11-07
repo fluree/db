@@ -219,6 +219,14 @@ async fn reopen(dir: &Path, queries_dir: &Path) {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    // `RUST_LOG` (for instance `fluree_db_api::reasoning_index=debug`) logs to
+    // stderr, which carries each refresh's phase timings.
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let args: Vec<String> = std::env::args().collect();
     let ttl_path = args
         .get(1)
