@@ -403,64 +403,78 @@ async fn appending_to_a_pooled_graph_updates_the_pool() {
     );
 }
 
-/// A dropped pooled graph leaves the pool: before a build, the store no
-/// longer routes it to the pooled tree, and the build after the drop rebuilds
-/// rather than fold the window into a pool still holding its rows. Written
-/// again, it holds only what was written since.
+/// A pooled graph a drop takes leaves the pool without a full rebuild. Before
+/// a build the store no longer routes it to the pooled tree; the incremental
+/// build drops its rows and history from the pool and keeps the other
+/// graphs'. Written again since the drop, it holds only what was written and
+/// stays pooled at that size; otherwise it is no longer a member.
 #[tokio::test]
-async fn a_dropped_pooled_graph_holds_only_what_is_written_after() {
-    let db_dir = tempfile::tempdir().unwrap();
-    let data_dir = tempfile::tempdir().unwrap();
-    let ledger_id = "test/pool-drop:main";
-    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
-    assert!(
-        pooled_size(&latest_root(db_dir.path()), "g2").is_some(),
-        "g2 is pooled"
-    );
+async fn a_dropped_pooled_graph_leaves_the_pool_incrementally() {
+    for rewrite in [true, false] {
+        let db_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let ledger_id = if rewrite {
+            "test/pool-drop-rewrite:main"
+        } else {
+            "test/pool-drop:main"
+        };
+        let (fluree, _) =
+            import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+        assert!(
+            pooled_size(&latest_root(db_dir.path()), "g2").is_some(),
+            "g2 is pooled"
+        );
 
-    sparql_update(
-        &fluree,
-        ledger_id,
-        "PREFIX ex: <http://example.org/> DROP GRAPH ex:g2",
-    )
-    .await;
-    sparql_update(
-        &fluree,
-        ledger_id,
-        "PREFIX ex: <http://example.org/> INSERT DATA { GRAPH ex:g2 { ex:new ex:val 9 . } }",
-    )
-    .await;
-    let counts = format!(
-        "{PREFIXES}SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }} GROUP BY ?g"
-    );
-    let expected = vec![
-        "g=http://example.org/g1 n=3",
-        "g=http://example.org/g2 n=1",
-        "g=http://example.org/g3 n=2",
-    ];
-    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
-    assert_eq!(
-        select(&fluree, &ledger, &counts).await,
-        expected,
-        "before a build"
-    );
+        sparql_update(
+            &fluree,
+            ledger_id,
+            "PREFIX ex: <http://example.org/> DROP GRAPH ex:g2",
+        )
+        .await;
+        let mut expected = vec!["g=http://example.org/g1 n=3", "g=http://example.org/g3 n=2"];
+        if rewrite {
+            sparql_update(
+                &fluree,
+                ledger_id,
+                "PREFIX ex: <http://example.org/> INSERT DATA { GRAPH ex:g2 { ex:new ex:val 9 . } }",
+            )
+            .await;
+            expected.insert(1, "g=http://example.org/g2 n=1");
+        }
+        let counts = format!(
+            "{PREFIXES}SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }} GROUP BY ?g"
+        );
+        let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+        assert_eq!(
+            select(&fluree, &ledger, &counts).await,
+            expected,
+            "before a build (rewrite: {rewrite})"
+        );
 
-    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
-    let g2 = root
-        .graph_iris
-        .iter()
-        .position(|g| g == "http://example.org/g2")
-        .expect("g2 keeps its registration") as fluree_db_core::GraphId
-        + 1;
-    assert!(
-        root.graph_drops.iter().any(|(g_id, _)| *g_id == g2),
-        "the root records the drop"
-    );
-    assert_eq!(
-        select(&fluree, &ledger, &counts).await,
-        expected,
-        "after the build"
-    );
+        support::build_incrementally_and_publish_index(&fluree, ledger_id).await;
+        let root = latest_root(db_dir.path());
+        let g2 = root
+            .graph_iris
+            .iter()
+            .position(|g| g == "http://example.org/g2")
+            .expect("g2 keeps its registration") as fluree_db_core::GraphId
+            + 1;
+        assert!(
+            root.graph_drops.iter().any(|(g_id, _)| *g_id == g2),
+            "the root records the drop"
+        );
+        assert_eq!(
+            ["g1", "g2", "g3"].map(|g| pooled_size(&root, g).map(|(rows, _)| rows)),
+            [Some(3), rewrite.then_some(1), Some(2)],
+            "pool members after the build (rewrite: {rewrite})"
+        );
+        let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+        assert_eq!(
+            select(&fluree, &ledger, &counts).await,
+            expected,
+            "after the build (rewrite: {rewrite})"
+        );
+    }
 }
 
 /// Values of `?o` for `s p ?o` in graph `g`, as of `t` (`None`: current).

@@ -1256,8 +1256,9 @@ pub(crate) fn apply_lifecycles(
 /// by position, and values nothing references are harmless.
 ///
 /// The ledger-wide class/property hierarchy is not per graph, so a dropped
-/// graph that may have contributed to it needs a full rebuild. So does a
-/// pooled graph: its rows share the pooled tree with other graphs' rows.
+/// graph that may have contributed to it needs a full rebuild. A pooled
+/// graph keeps its pool membership here: its rows share the pooled tree, and
+/// the pool update drops them (`index_novelty`).
 fn purge_dropped_graphs(
     lifecycles: &[CommitLifecycle],
     root: &mut IndexRoot,
@@ -1290,15 +1291,6 @@ fn purge_dropped_graphs(
     {
         return Err(IncrementalResolveError::NeedsRebuild(format!(
             "dropped graph {g_id} may have contributed to the class/property hierarchy"
-        )));
-    }
-    if let Some(g_id) = purged
-        .iter()
-        .copied()
-        .find(|g_id| root.pool.as_ref().is_some_and(|pool| pool.contains(*g_id)))
-    {
-        return Err(IncrementalResolveError::NeedsRebuild(format!(
-            "dropped graph {g_id} is pooled"
         )));
     }
 
@@ -1345,6 +1337,7 @@ fn graph_may_hold_schema(root: &IndexRoot, g_id: fluree_db_core::GraphId) -> boo
         !root.default_graph_orders.is_empty()
     } else {
         root.named_graphs.iter().any(|ng| ng.g_id == g_id)
+            || root.pool.as_ref().is_some_and(|pool| pool.contains(g_id))
     };
     if !indexed {
         return false;
