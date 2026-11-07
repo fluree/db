@@ -515,10 +515,12 @@ impl HeadGraphs {
                         rule.name
                     ))
                 };
-                let g_id = db
-                    .snapshot
-                    .graph_registry
-                    .graph_id_for_iri(iri)
+                // A graph a drop after `t` took was there as of `t` to derive
+                // into; one dropped by then, and not written since, is not.
+                let registry = &db.snapshot.graph_registry;
+                let g_id = registry
+                    .existing_graph_id(iri, db.t)
+                    .unwrap_or_else(|_| registry.assigned_graph_id(iri))
                     .ok_or_else(|| {
                         refuse(
                             "which this ledger does not have. A rule derives only into an \
@@ -563,7 +565,7 @@ pub fn derived_fact_graph(
             .g
             .as_ref()
             .and_then(|g| snapshot.decode_sid(g))
-            .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+            .and_then(|iri| snapshot.graph_registry.assigned_graph_id(&iri))
             .unwrap_or(default)
     }
 }

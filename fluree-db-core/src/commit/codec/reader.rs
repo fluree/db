@@ -168,6 +168,7 @@ pub(crate) fn read_commit_v4(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         commit_signatures,
         txn_meta: envelope.txn_meta,
         graph_delta: envelope.graph_delta,
+        graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
     })
 }
@@ -206,6 +207,7 @@ pub(crate) fn read_commit_envelope_v4(bytes: &[u8]) -> Result<CommitEnvelope, Co
         namespace_delta: env.namespace_delta,
         txn_meta: env.txn_meta,
         graph_delta: env.graph_delta,
+        graph_drops: env.graph_drops,
         ns_split_mode: env.ns_split_mode,
     })
 }

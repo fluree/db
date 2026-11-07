@@ -444,21 +444,10 @@ async fn run_drop(
 }
 
 fn print_local_report(report: &fluree_db_api::DropNamedGraphReport) {
-    if report.committed {
-        println!(
-            "Dropped graph <{}> from '{}' — retracted {} flake{} (t={}).",
-            report.graph_iri,
-            report.ledger_id,
-            report.retracted,
-            if report.retracted == 1 { "" } else { "s" },
-            report.t,
-        );
-    } else {
-        println!(
-            "Graph <{}> in '{}' was already empty — no commit produced (t={}).",
-            report.graph_iri, report.ledger_id, report.t,
-        );
-    }
+    println!(
+        "Dropped graph <{}> from '{}' (t={}).",
+        report.graph_iri, report.ledger_id, report.t,
+    );
 }
 
 fn print_remote_response(value: &serde_json::Value) {
@@ -470,10 +459,6 @@ fn print_remote_response(value: &serde_json::Value) {
         .get("ledger_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<unknown>");
-    let retracted = value
-        .get("retracted")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
     let committed = value
         .get("committed")
         .and_then(serde_json::Value::as_bool)
@@ -483,11 +468,9 @@ fn print_remote_response(value: &serde_json::Value) {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
     if committed {
-        println!(
-            "Dropped graph <{graph_iri}> from '{ledger_id}' — retracted {retracted} flake{plural} (t={t}).",
-            plural = if retracted == 1 { "" } else { "s" },
-        );
+        println!("Dropped graph <{graph_iri}> from '{ledger_id}' (t={t}).");
     } else {
+        // Only a server whose drop retracts the graph's facts reports this.
         println!(
             "Graph <{graph_iri}> in '{ledger_id}' was already empty — no commit produced (t={t}).",
         );

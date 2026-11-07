@@ -404,7 +404,7 @@ impl Fluree {
         // commits write, with the id the ledger gives it once they apply.
         let routing =
             derive_graph_routing(&base_state, &decoded).map_err(PushError::into_api_error)?;
-        let mut reverse_graph = reverse_graph_lookup(&routing.graph_sids);
+        let mut reverse_graph = routing.graph_ids.clone();
         reverse_graph
             .entry(txn_meta_g.clone())
             .or_insert(TXN_META_GRAPH_ID);
@@ -504,7 +504,7 @@ impl Fluree {
                 &c.commit.flakes,
                 index_config,
                 policy_ctx.as_ref(),
-                &routing.graph_sids,
+                &routing.graph_ids,
             )
             .await
             {
@@ -790,8 +790,9 @@ impl PushError {
 /// The graph routing of a push: every graph the pushed commits' flakes
 /// write, with its ledger graph id.
 struct GraphRoutingResult {
-    /// Graph id → graph Sid, for staging.
-    graph_sids: HashMap<GraphId, Sid>,
+    /// Graph Sid → graph id, for staging. Several Sids can name one graph:
+    /// any ledger's config graph IRI is the config graph.
+    graph_ids: HashMap<Sid, GraphId>,
 
     /// Graph id → graph IRI, for per-graph SHACL config during replay.
     #[cfg(feature = "shacl")]
@@ -815,7 +816,7 @@ fn derive_graph_routing(
     decoded: &[PushCommitDecoded],
 ) -> std::result::Result<GraphRoutingResult, PushError> {
     let mut routing = GraphRoutingResult {
-        graph_sids: HashMap::new(),
+        graph_ids: HashMap::new(),
         #[cfg(feature = "shacl")]
         graph_iris: rustc_hash::FxHashMap::default(),
     };
@@ -860,9 +861,17 @@ fn derive_graph_routing(
                  pushed commits register"
             ))
         })?;
-        routing.graph_sids.insert(g_id, g_sid.clone());
+        routing.graph_ids.insert(g_sid.clone(), g_id);
+        // The IRI the ledger registers the graph by, whichever names it here.
         #[cfg(feature = "shacl")]
-        routing.graph_iris.insert(g_id, iri);
+        routing.graph_iris.insert(
+            g_id,
+            state
+                .snapshot
+                .graph_registry
+                .iri_for_graph_id(g_id)
+                .map_or(iri, str::to_owned),
+        );
     }
     Ok(routing)
 }
@@ -905,12 +914,20 @@ fn txn_meta_sid_after(
     ))
 }
 
-/// Build a reverse lookup from graph Sid → GraphId.
-fn reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
-    graph_sids
-        .iter()
-        .map(|(&g_id, sid)| (sid.clone(), g_id))
-        .collect()
+/// Refuse a transferred commit that drops graphs: commit transfer validates
+/// each commit against the state the earlier ones leave, which does not yet
+/// apply a drop.
+fn refuse_graph_drops(
+    commit: &fluree_db_core::Commit,
+    which: &str,
+) -> std::result::Result<(), PushError> {
+    if commit.graph_drops.is_empty() {
+        return Ok(());
+    }
+    Err(PushError::Invalid(format!(
+        "{which} (t={}) drops graphs, which pushing and pulling commits does not support yet",
+        commit.t
+    )))
 }
 
 fn decode_and_validate_commit_chain(
@@ -926,6 +943,7 @@ fn decode_and_validate_commit_chain(
         let bytes = b64.0.clone();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
+        refuse_graph_drops(&commit, &format!("commit[{idx}]"))?;
 
         // Reject empty commits (no flakes) - keep semantics clear. A merge
         // commit is exempt: it records the merge even when the strategy
@@ -1003,6 +1021,7 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
+            refuse_graph_drops(&commit, &format!("merged_commits[{idx}]"))?;
             let digest_hex = fluree_db_core::sha256_hex(&bytes);
             Ok(PushCommitDecoded {
                 commit,
@@ -1225,11 +1244,11 @@ async fn stage_commit_flakes(
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: Option<&PolicyContext>,
-    graph_sids: &HashMap<GraphId, Sid>,
+    graph_ids: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids)
+        .with_graph_ids(graph_ids)
         // Push applies commits that were authored and written elsewhere, so
         // authoring invariants are advisory here. See
         // `StageOptions::replaying_commit`.
@@ -1410,6 +1429,14 @@ fn apply_pushed_commits_to_state(
         std::sync::Arc::make_mut(&mut base.snapshot)
             .apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)
             .map_err(|e| PushError::Internal(format!("apply_envelope_deltas failed: {e}")))?;
+        // A graph the ledger dropped exists again from the commit that writes
+        // it, as replay finds.
+        for c in decoded {
+            base.revive_graphs(
+                c.commit.graph_delta.values().map(String::as_str),
+                c.commit.t,
+            );
+        }
     }
 
     // Build reverse_graph now that namespace_codes and graph_registry are

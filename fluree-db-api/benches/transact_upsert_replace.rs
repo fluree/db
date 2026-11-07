@@ -318,7 +318,11 @@ fn build_fixture(rt: &tokio::runtime::Runtime, scenario: Scenario, n: usize) -> 
 
         if let Some(g) = scenario.graph() {
             assert!(
-                ledger.snapshot.graph_registry.graph_id_for_iri(g).is_some(),
+                ledger
+                    .snapshot
+                    .graph_registry
+                    .assigned_graph_id(g)
+                    .is_some(),
                 "{}: the named graph must be registered before the upsert",
                 scenario.name()
             );

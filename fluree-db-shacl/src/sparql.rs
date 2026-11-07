@@ -583,6 +583,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
         | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::GraphDropped { .. }
         | QueryError::GraphSourceUnmapped { .. }
         | QueryError::GraphSourceUnsupported { .. }
         | QueryError::R2rml(_)
@@ -1005,6 +1006,9 @@ mod tests {
             QueryError::OperatorNotOpened => true, [QueryError::OperatorNotOpened];
             QueryError::OperatorAlreadyOpened => true, [QueryError::OperatorAlreadyOpened];
             QueryError::OperatorClosed => true, [QueryError::OperatorClosed];
+            QueryError::GraphDropped { .. } => true, [
+                QueryError::GraphDropped { graph: s(), floor: 2, t: 1 },
+            ];
             QueryError::InvalidQuery(_) => false, [QueryError::InvalidQuery(s())];
             QueryError::UngroupedRead(_) => false, [
                 QueryError::UngroupedRead(fluree_db_query::ir::UngroupedRead {
