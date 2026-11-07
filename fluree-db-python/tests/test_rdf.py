@@ -240,7 +240,8 @@ def test_quads_write_to_a_ledger():
 def test_a_collection_writes_to_a_ledger_as_its_text_does():
     """Quads holding a collection write to a ledger as the document's own
     ``( … )`` does: as a list, whose members JSON-LD and SPARQL read as
-    values of the predicate, not as ``rdf:first``/``rdf:rest`` triples."""
+    values of the predicate, and which the list walk
+    ``ex:list/rdf:rest*/rdf:first`` reaches member by member."""
     doc = PREFIXES + "ex:s ex:list ( 1 2 ) . ex:g { ex:s ex:list ( ex:a ex:b ) }"
     context = {"ex": EX}
     with fluree.connect(":memory:") as conn:
@@ -260,12 +261,12 @@ def test_a_collection_writes_to_a_ledger_as_its_text_does():
             assert sorted(in_g) == ["ex:a", "ex:b"]
             items = ledger.query(PREFIXES + "SELECT ?o WHERE { ex:s ex:list ?o }")
             assert sorted(row.o for row in items) == [1, 2]
-            cells = ledger.query(
+            walked = ledger.query(
                 PREFIXES
                 + "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n"
                 + "SELECT ?o WHERE { ex:s ex:list/rdf:rest*/rdf:first ?o }"
             )
-            assert list(cells) == []
+            assert sorted(row.o for row in walked) == [1, 2]
         text_out, quads_out = (
             fluree.parse(ledger.export(format="nquads", all_graphs=True), "nquads") for ledger in (text, quads)
         )
