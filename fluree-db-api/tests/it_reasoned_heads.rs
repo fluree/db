@@ -169,3 +169,427 @@ async fn a_head_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
         RefreshOutcome::Current { generation: 3 }
     );
 }
+
+async fn ledger_with(fluree: &Fluree, id: &str, data: JsonValue) -> fluree_db_api::LedgerState {
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    fluree.insert(ledger, &data).await.unwrap().ledger
+}
+
+async fn retract(
+    fluree: &Fluree,
+    ledger: fluree_db_api::LedgerState,
+    fact: JsonValue,
+) -> fluree_db_api::LedgerState {
+    fluree
+        .update(
+            ledger,
+            &json!({"@context": ctx(), "delete": fact.clone(), "where": fact}),
+        )
+        .await
+        .unwrap()
+        .ledger
+}
+
+/// A fact both asserted and derived stays when it loses either support: its
+/// assertion (it is still derived, so it moves into the derived-only set) or
+/// its derivation (it is still asserted).
+#[tokio::test]
+async fn an_asserted_and_derived_fact_survives_losing_either_support() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/overlap:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": ["ex:Student", "ex:Person"]}
+            ]
+        }),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+        RefreshOutcome::Published { stats, .. } => {
+            assert_eq!(
+                stats.derived_only, 0,
+                "alice is asserted a Person: {stats:?}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Lose the assertion: still derived.
+    let ledger = retract(
+        &fluree,
+        ledger,
+        json!({"@id": "ex:alice", "@type": "ex:Person"}),
+    )
+    .await;
+    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+        RefreshOutcome::Published { stats, kind, .. } => {
+            assert_eq!(kind, GenerationKind::Logical);
+            assert_eq!(stats.derived_only, 1, "{stats:?}");
+            assert_eq!(stats.removed, 0, "{stats:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some());
+    assert_eq!(people, vec![json!("ex:alice")]);
+
+    // In one window, assert it again and lose the derivation: still
+    // asserted, so the fold must not retract it.
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "@type": "ex:Person"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let _ledger = retract(
+        &fluree,
+        ledger,
+        json!({"@id": "ex:alice", "@type": "ex:Student"}),
+    )
+    .await;
+    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+        RefreshOutcome::Published { stats, .. } => {
+            assert_eq!(stats.derived_only, 0, "{stats:?}");
+            assert_eq!(
+                stats.removed, 0,
+                "an asserted fact is never retracted: {stats:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some());
+    assert_eq!(people, vec![json!("ex:alice")]);
+}
+
+/// A transitive chain whose support is retracted loses the facts derived
+/// through it: each generation recomputes the closure from the inputs rather
+/// than from the previous closure.
+#[tokio::test]
+async fn a_chain_loses_what_its_retracted_link_supported() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/chain:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:partOf", "@type": "owl:TransitiveProperty"},
+                {"@id": "ex:a", "ex:partOf": {"@id": "ex:b"}},
+                {"@id": "ex:b", "ex:partOf": {"@id": "ex:c"}},
+                {"@id": "ex:c", "ex:partOf": {"@id": "ex:d"}}
+            ]
+        }),
+    )
+    .await;
+    let q = json!({
+        "@context": ctx(),
+        "select": "?o",
+        "where": {"@id": "ex:a", "ex:partOf": "?o"},
+        "reasoning": "owl2rl"
+    });
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let (reached, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(reached, vec![json!("ex:b"), json!("ex:c"), json!("ex:d")]);
+
+    let _ledger = retract(
+        &fluree,
+        ledger,
+        json!({"@id": "ex:b", "ex:partOf": {"@id": "ex:c"}}),
+    )
+    .await;
+    let (expected, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_none());
+    assert_eq!(expected, vec![json!("ex:b")]);
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let (reached, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(reached, expected);
+}
+
+/// Datalog programs: query-time rules in the program are part of what a
+/// query must carry to be served; a different rule set is not served.
+#[tokio::test]
+async fn a_datalog_program_is_served_only_to_queries_with_its_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/datalog:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:a", "ex:parent": {"@id": "ex:b"}},
+                {"@id": "ex:b", "ex:parent": {"@id": "ex:c"}}
+            ]
+        }),
+    )
+    .await;
+    let rules = json!([
+        {"@id": "ex:base", "@context": ctx(),
+         "where": {"@id": "?x", "ex:parent": "?y"},
+         "insert": {"@id": "?x", "ex:ancestor": {"@id": "?y"}}},
+        {"@id": "ex:step", "@context": ctx(),
+         "where": [{"@id": "?x", "ex:parent": "?y"}, {"@id": "?y", "ex:ancestor": "?z"}],
+         "insert": {"@id": "?x", "ex:ancestor": {"@id": "?z"}}}
+    ]);
+    let program = json!({"reasoning": "datalog", "rules": rules});
+    let q = json!({
+        "@context": ctx(),
+        "select": "?z",
+        "where": {"@id": "ex:a", "ex:ancestor": "?z"},
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let (expected, _) = rows(&fluree, id, &q).await;
+    assert_eq!(expected, vec![json!("ex:b"), json!("ex:c")]);
+
+    let head = fluree.register_reasoned_head(id, &program).await.unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (served_rows, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(served_rows, expected);
+
+    // One rule only: a different program, reasoned at query time.
+    let mut partial = q.clone();
+    partial["rules"] = json!([rules[0].clone()]);
+    let (partial_rows, served) = rows(&fluree, id, &partial).await;
+    assert!(served.is_none());
+    assert_eq!(partial_rows, vec![json!("ex:b")]);
+
+    // The chain grows; the next generation folds it in.
+    let _ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:c", "ex:parent": {"@id": "ex:d"}}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let (_, kind) = published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    assert_eq!(kind, GenerationKind::Logical);
+    let (served_rows, served) = rows(&fluree, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(
+        served_rows,
+        vec![json!("ex:b"), json!("ex:c"), json!("ex:d")]
+    );
+}
+
+/// A stored rule that derives into a graph the ledger does not have fails
+/// the run, and nothing is published.
+#[tokio::test]
+async fn a_rule_into_a_missing_graph_publishes_nothing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/missing-graph:main";
+    let _ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {"@id": "ex:graphHead", "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { GRAPH ex:inferred { ?x ex:derived ?y } } \
+                               WHERE { ?x ex:a ?y }"
+                }},
+                {"@id": "ex:thing", "ex:a": 1}
+            ]
+        }),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "datalog"}))
+        .await
+        .unwrap();
+    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+        RefreshOutcome::Failed { reason } => {
+            assert!(reason.contains("inferred"), "{reason}")
+        }
+        other => panic!("expected a failed run, got {other:?}"),
+    }
+    let doc = fluree.reasoned_heads(id).await.unwrap();
+    assert!(doc.heads[&head].published.is_none());
+}
+
+/// SPARQL reasoning queries are served from the same head as JSON-LD ones.
+#[tokio::test]
+async fn a_sparql_reasoning_query_is_served_from_the_head() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/sparql:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"}
+            ]
+        }),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    let sparql = "# PRAGMA reasoning: owl2rl\nPREFIX ex: <http://example.org/>\n\
+                  SELECT ?p WHERE { ?p a ex:Person }";
+    let resp = fluree
+        .graph(id)
+        .query()
+        .sparql(sparql)
+        .track_all()
+        .execute_tracked()
+        .await
+        .unwrap();
+    let head_tally = resp.reasoning.and_then(|r| r.head);
+    assert_eq!(head_tally.map(|h| h.head_id), Some(head.to_string()));
+    let text = resp.result.to_string();
+    assert!(text.contains("alice"), "{text}");
+}
+
+/// A base that has its own index: the first generation copies it into the
+/// head's folder and folds the derived facts in; the base keeps answering
+/// unreasoned queries from its own index.
+#[tokio::test]
+async fn a_head_builds_on_an_indexed_base() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/indexed:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"},
+                {"@id": "ex:bob", "@type": "ex:Person"}
+            ]
+        }),
+    )
+    .await;
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let _ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:carol", "@type": "ex:Student"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let (expected, _) = rows(&fluree, id, &people_query()).await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    let (_, kind) = published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    assert_eq!(kind, GenerationKind::Rebuild);
+    let (served_rows, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some());
+    assert_eq!(served_rows, expected);
+    assert_eq!(
+        served_rows,
+        vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
+    );
+}
+
+/// A retired head is never served, and refreshing it publishes nothing.
+#[tokio::test]
+async fn a_retired_head_is_not_served() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/retired:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"}
+            ]
+        }),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    assert!(rows(&fluree, id, &people_query()).await.1.is_some());
+    fluree.retire_reasoned_head(id, &head).await.unwrap();
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_none());
+    assert_eq!(people, vec![json!("ex:alice")]);
+    assert!(matches!(
+        fluree.refresh_reasoned_head(id, &head).await.unwrap(),
+        RefreshOutcome::Discarded { .. }
+    ));
+}
+
+/// A derived-only fact that a window both asserts and retracts is still
+/// derived, so it is still present: applying the window's commits alone
+/// would have removed it.
+#[tokio::test]
+async fn a_derived_fact_retracted_in_the_window_stays_while_derived() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/window-retract:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"}
+            ]
+        }),
+    )
+    .await;
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "@type": "ex:Person"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let _ledger = retract(
+        &fluree,
+        ledger,
+        json!({"@id": "ex:alice", "@type": "ex:Person"}),
+    )
+    .await;
+    let (_, kind) = published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    assert_eq!(kind, GenerationKind::Logical);
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some());
+    assert_eq!(people, vec![json!("ex:alice")]);
+}
