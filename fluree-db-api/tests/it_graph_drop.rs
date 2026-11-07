@@ -710,6 +710,359 @@ async fn a_transferred_write_brings_a_dropped_graph_back() {
     assert!(listed_graphs(&fluree, main).await.contains(&G.to_string()));
 }
 
+const N: &str = "http://example.org/graphs/n";
+
+/// What a reader of `ledger_id` gets from each graph as of each `t` in `ts`:
+/// its sorted objects, or why the read was refused.
+async fn reads_as_of(fluree: &Fluree, ledger_id: &str, ts: &[i64]) -> Vec<String> {
+    let mut reads = Vec::new();
+    for &t in ts {
+        let db = at(fluree, ledger_id, t).await;
+        for query in [
+            DEFAULT_GRAPH.to_string(),
+            in_graph(G),
+            in_graph(H),
+            in_graph(N),
+            GRAPHS.to_string(),
+        ] {
+            let read = match objects(fluree, &db, &query).await {
+                Ok(values) => values.join(" "),
+                Err(e) => e.to_string(),
+            };
+            reads.push(format!("t={t} {query} -> {read}"));
+        }
+    }
+    reads
+}
+
+/// The commits `ledger_id` holds above `base`, oldest first, as a push or a
+/// pull carries them.
+async fn commits_above(
+    fluree: &Fluree,
+    ledger_id: &str,
+    base: &fluree_db_api::ContentId,
+) -> fluree_db_api::ExportCommitsResponse {
+    let mut page = fluree
+        .export_commit_range(
+            &fluree.ledger_cached(ledger_id).await.unwrap(),
+            &fluree_db_api::ExportCommitsRequest {
+                lineage: true,
+                base_id: Some(base.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("export");
+    page.commits.reverse();
+    page
+}
+
+/// Push and pull carry drops: the receiver applies each commit's drops
+/// before its flakes, as the writer did, so it reads what the writer reads,
+/// at the head and as of every `t`, and again once a reload replays the
+/// commits. The receivers start from an index that holds the graphs the
+/// commits drop, and one of them indexes the commits afterward. The commits
+/// hold a drop alone, a write of the dropped graph again, a graph they
+/// register, drop and write again in one commit, and `DROP DEFAULT`; one
+/// pull takes them a commit at a time.
+#[tokio::test]
+async fn push_and_pull_apply_drops_as_the_writer_did() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    let name = "it/graph-drop/push-pull";
+    let main = "it/graph-drop/push-pull:main";
+    let receivers = ["pushed", "pulled", "paged"];
+    let (seeded, base) = local
+        .run_until(async {
+            let seeded = seed(&fluree, main).await;
+            index_through(&fluree, &handle, main, seeded).await;
+            let base = fluree
+                .ledger(main)
+                .await
+                .unwrap()
+                .head_commit_id
+                .expect("seeded head");
+            for branch in receivers {
+                fluree
+                    .create_branch(name, branch, None, None)
+                    .await
+                    .unwrap();
+            }
+            (seeded, base)
+        })
+        .await;
+    // The receivers keep the index they start from until the test builds
+    // one: the transfers must not start builds of their own.
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Disabled);
+
+    local
+        .run_until(async {
+            for branch in receivers {
+                let receiver = fluree.ledger(&format!("{name}:{branch}")).await.unwrap();
+                assert_eq!(receiver.index_t(), seeded, "{branch} starts from the index");
+            }
+            let ins = |graph: &str, facts: &str| {
+                format!(
+                    "PREFIX ex: <http://example.org/> INSERT DATA {{ GRAPH <{graph}> {{ {facts} }} }}"
+                )
+            };
+            let mut ts = vec![seeded];
+            for sparql in [
+                format!("DROP GRAPH <{G}>"),
+                ins(G, "ex:a ex:v \"a\" . ex:c ex:v \"c\" ."),
+                ins(N, "ex:n ex:v \"old\" ."),
+                format!(
+                    "PREFIX ex: <http://example.org/> \
+                     DROP GRAPH <{N}> ; INSERT DATA {{ GRAPH <{N}> {{ ex:n ex:v \"new\" }} }}"
+                ),
+                "DROP DEFAULT".to_string(),
+            ] {
+                ts.push(update(&fluree, main, &sparql).await.expect(&sparql));
+            }
+            let head_t = *ts.last().unwrap();
+            let written = reads_as_of(&fluree, main, &ts).await;
+            let at_head = |query: &str| {
+                written
+                    .iter()
+                    .find(|read| read.starts_with(&format!("t={head_t} {query} -> ")))
+                    .unwrap()
+                    .clone()
+            };
+            assert!(at_head(DEFAULT_GRAPH).ends_with("-> "));
+            assert!(at_head(&in_graph(G)).ends_with("-> \"a\" \"c\""));
+            assert!(at_head(&in_graph(N)).ends_with("-> \"new\""));
+            assert!(written.iter().any(|read| {
+                read.starts_with(&format!("t={seeded} {} -> ", in_graph(G)))
+                    && read.contains(&format!("graph <{G}> was dropped at t={}", ts[1]))
+            }));
+
+            let page = commits_above(&fluree, main, &base).await;
+            assert_eq!(page.commits.len(), ts.len() - 1);
+            let pushed = fluree
+                .push_commits(
+                    &format!("{name}:pushed"),
+                    fluree_db_api::PushCommitsRequest {
+                        commits: page.commits.clone(),
+                        blobs: page.blobs.clone(),
+                        missing_blobs: Vec::new(),
+                        merged_commits: Vec::new(),
+                    },
+                    &fluree_db_api::GovernanceOptions::default(),
+                    &fluree.default_index_config(),
+                )
+                .await
+                .expect("push");
+            assert_eq!(pushed.head.t, head_t);
+            fluree
+                .import_commits_incremental(
+                    &format!("{name}:pulled"),
+                    page.commits.clone(),
+                    Vec::new(),
+                    page.blobs.clone(),
+                )
+                .await
+                .expect("pull");
+            for commit in &page.commits {
+                fluree
+                    .import_commits_incremental(
+                        &format!("{name}:paged"),
+                        vec![commit.clone()],
+                        Vec::new(),
+                        page.blobs.clone(),
+                    )
+                    .await
+                    .expect("pull a commit at a time");
+            }
+
+            for branch in receivers {
+                let receiver = format!("{name}:{branch}");
+                assert_eq!(fluree.ledger(&receiver).await.unwrap().index_t(), seeded);
+                assert_eq!(
+                    reads_as_of(&fluree, &receiver, &ts).await,
+                    written,
+                    "{branch}"
+                );
+                fluree.disconnect_ledger(&receiver).await;
+                assert_eq!(
+                    reads_as_of(&fluree, &receiver, &ts).await,
+                    written,
+                    "{branch}, reloaded"
+                );
+            }
+
+            // An index the receiver builds over the commits leaves out what
+            // their drops took.
+            let pushed = format!("{name}:pushed");
+            index_through(&fluree, &handle, &pushed, head_t).await;
+            let now = |reads: &[String]| -> Vec<String> {
+                reads
+                    .iter()
+                    .filter(|read| read.starts_with(&format!("t={head_t} ")))
+                    .cloned()
+                    .collect()
+            };
+            assert_eq!(
+                now(&reads_as_of(&fluree, &pushed, &[head_t]).await),
+                now(&written),
+                "indexed"
+            );
+        })
+        .await;
+}
+
+/// A push that drops validates each commit against the state the drops
+/// leave, as the writer staged it: a vector written at a new length into a
+/// graph whose vectors of the old length the drop took is accepted, not
+/// refused as a second length.
+#[tokio::test]
+async fn a_push_validates_a_commit_after_its_drop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/graph-drop/push-validates";
+    let main = "it/graph-drop/push-validates:main";
+    fluree.create_ledger(main).await.unwrap();
+    let vector = |len: usize| {
+        let parts: Vec<String> = (1..=len).map(|i| format!("{i}.0")).collect();
+        format!(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ GRAPH <{G}> {{ ex:a ex:embedding \"[{}]\"^^f:embeddingVector }} }}",
+            parts.join(", ")
+        )
+    };
+    update(&fluree, main, &vector(3)).await.unwrap();
+    let base = fluree
+        .ledger(main)
+        .await
+        .unwrap()
+        .head_commit_id
+        .expect("head");
+    fluree
+        .create_branch(name, "pushed", None, None)
+        .await
+        .unwrap();
+    update(&fluree, main, &format!("DROP GRAPH <{G}>"))
+        .await
+        .unwrap();
+    let head_t = update(&fluree, main, &vector(4))
+        .await
+        .expect("a new length after the drop");
+
+    let page = commits_above(&fluree, main, &base).await;
+    let pushed = fluree
+        .push_commits(
+            "it/graph-drop/push-validates:pushed",
+            fluree_db_api::PushCommitsRequest {
+                commits: page.commits,
+                blobs: page.blobs,
+                missing_blobs: Vec::new(),
+                merged_commits: Vec::new(),
+            },
+            &fluree_db_api::GovernanceOptions::default(),
+            &fluree.default_index_config(),
+        )
+        .await
+        .expect("the push validates the write after the drop");
+    assert_eq!(pushed.head.t, head_t);
+}
+
+/// Only an identity without a restricting policy may push a drop, as only
+/// one may drop locally. The policy is the one in force before the commit:
+/// a `DROP DEFAULT` that takes the default graph's policies is still refused,
+/// though the state after it would hold none to restrict the identity.
+#[tokio::test]
+async fn a_push_that_drops_needs_an_identity_without_a_restricting_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/graph-drop/push-policy";
+    let main = "it/graph-drop/push-policy:main";
+    let target = "it/graph-drop/push-policy:target";
+    fluree.create_ledger(main).await.unwrap();
+    update(
+        &fluree,
+        main,
+        "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#> \
+         INSERT DATA { ex:noSsnEdits a ex:Restricted ; f:action f:modify ; \
+         f:onProperty ex:ssn ; f:allow false . ex:d ex:v \"default\" }",
+    )
+    .await
+    .unwrap();
+    let base = fluree
+        .ledger(main)
+        .await
+        .unwrap()
+        .head_commit_id
+        .expect("head");
+    fluree
+        .create_branch(name, "target", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch(name, "plain", None, None)
+        .await
+        .unwrap();
+    update(&fluree, main, "DROP DEFAULT").await.unwrap();
+    update(
+        &fluree,
+        &format!("{name}:plain"),
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:p ex:v \"plain\" }",
+    )
+    .await
+    .unwrap();
+
+    let restricted = fluree_db_api::GovernanceOptions {
+        policy_class: Some(vec!["http://example.org/Restricted".to_string()]),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let push = |from: String| {
+        let fluree = &fluree;
+        let base = &base;
+        let restricted = &restricted;
+        async move {
+            let page = commits_above(fluree, &from, base).await;
+            fluree
+                .push_commits(
+                    target,
+                    fluree_db_api::PushCommitsRequest {
+                        commits: page.commits,
+                        blobs: page.blobs,
+                        missing_blobs: Vec::new(),
+                        merged_commits: Vec::new(),
+                    },
+                    restricted,
+                    &fluree.default_index_config(),
+                )
+                .await
+        }
+    };
+    let err = push(main.to_string())
+        .await
+        .expect_err("a restricted identity pushing DROP DEFAULT");
+    assert_eq!(err.status_code(), 403, "{err}");
+    assert!(
+        err.to_string()
+            .contains("Policy enforcement prevents modification"),
+        "{err}"
+    );
+    assert_eq!(
+        objects(&fluree, &head(&fluree, target).await, DEFAULT_GRAPH)
+            .await
+            .unwrap()
+            .len(),
+        5,
+        "nothing applied"
+    );
+    push(format!("{name}:plain"))
+        .await
+        .expect("the same identity pushes a commit that drops nothing");
+}
+
 /// A restart with nothing indexed replays the whole history, the writes
 /// before the drop included: they stay out, and the fact written again after
 /// the drop is there.
