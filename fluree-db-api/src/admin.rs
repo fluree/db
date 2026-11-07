@@ -1807,20 +1807,38 @@ impl crate::Fluree {
         record: &NsRecord,
         warnings: &mut Vec<String>,
     ) -> HashSet<ContentId> {
-        if record.index_head_id.is_none() {
-            return HashSet::new();
-        }
         let backend = self.backend();
         let own = BranchIndexHead::of(record);
-        match shared_refs_of_branches(backend, &[own]).await {
+        // The branch's reasoned heads go with it, so what only they reach is
+        // released too.
+        let mut refs = match fluree_db_indexer::gc::heads::shared_refs_of_branch_heads(
+            backend,
+            self.nameservice(),
+            std::slice::from_ref(&own),
+        )
+        .await
+        {
             Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read the branch's reasoned heads; their dictionary blobs are left for a sweep: {e}"
+                ));
+                HashSet::new()
+            }
+        };
+        if record.index_head_id.is_none() {
+            return refs;
+        }
+        match shared_refs_of_branches(backend, &[own]).await {
+            Ok(own_refs) => refs.extend(own_refs),
             Err(e) => {
                 warnings.push(format!(
                     "Could not read the branch's index chain; its dictionary blobs are left for a sweep: {e}"
                 ));
-                HashSet::new()
+                return HashSet::new();
             }
         }
+        refs
     }
 
     /// The blobs in `referenced` that no surviving branch of `ledger_id`'s
@@ -1863,7 +1881,7 @@ impl crate::Fluree {
                 return Vec::new();
             }
         };
-        let elsewhere = match shared_refs_of_branches(backend, &survivors).await {
+        let mut elsewhere = match shared_refs_of_branches(backend, &survivors).await {
             Ok(refs) => refs,
             Err(e) => {
                 warnings.push(format!(
@@ -1872,6 +1890,21 @@ impl crate::Fluree {
                 return Vec::new();
             }
         };
+        match fluree_db_indexer::gc::heads::shared_refs_of_branch_heads(
+            backend,
+            self.nameservice(),
+            &survivors,
+        )
+        .await
+        {
+            Ok(refs) => elsewhere.extend(refs),
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read a sibling branch's reasoned heads; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        }
         let mut unique: Vec<ContentId> = referenced.difference(&elsewhere).cloned().collect();
         unique.sort();
         unique
@@ -1951,6 +1984,11 @@ impl crate::Fluree {
             format!("fluree:{storage_method}://{branch_prefix}/index/"),
             format!("fluree:{storage_method}://{branch_prefix}/config/"),
             format!("fluree:{storage_method}://{branch_prefix}/blob/"),
+            // Every reasoned head of the branch, files and manifests.
+            format!(
+                "fluree:{storage_method}://{branch_prefix}/{}/",
+                fluree_db_core::address_path::REASONED_SEGMENT
+            ),
         ];
 
         let mut total = 0usize;
@@ -3173,6 +3211,17 @@ impl crate::Fluree {
                 index_head_id: current.and_then(|r| r.index_head_id),
             });
         }
+        // Each retained generation of each reasoned head takes part as its
+        // own chain, in its head's namespace: its files and the dictionaries
+        // it shares are live, and what a lost publish left is reclaimed.
+        let heads = fluree_db_indexer::gc::heads::head_sweep_participants(
+            self.backend(),
+            self.nameservice(),
+            &branches,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("read reasoned heads for the sweep: {e}")))?;
+        branches.extend(heads);
 
         Ok((guards, branches, root, nested))
     }

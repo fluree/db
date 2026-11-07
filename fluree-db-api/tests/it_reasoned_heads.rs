@@ -593,3 +593,89 @@ async fn a_derived_fact_retracted_in_the_window_stays_while_derived() {
     assert!(served.is_some());
     assert_eq!(people, vec![json!("ex:alice")]);
 }
+
+/// The branch's own collector keeps the dictionary blobs a head still
+/// reaches: a head starts from a copy of the base index, which shares the
+/// base's dictionaries, and the base's later builds retire them.
+#[tokio::test]
+async fn the_branch_collector_keeps_dictionaries_a_head_reaches() {
+    use fluree_db_indexer::gc::{plan_garbage, release_garbage_plan, CleanGarbageConfig};
+    let (writer, reader) = crate::support::instances_sharing_storage();
+    let id = "heads/gc:main";
+    let ledger = ledger_with(
+        &writer,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student", "ex:name": "Alice"},
+                {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"}
+            ]
+        }),
+    )
+    .await;
+    writer
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let head = writer
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+
+    // The base moves on and rebuilds; its collector retires the old index.
+    let ledger = writer
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:carol", "@type": "ex:Student", "ex:name": "Carol"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let rebuilt = writer
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let record = writer.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = writer.backend().content_store(&record.storage_namespace());
+    let config = CleanGarbageConfig {
+        max_old_indexes: Some(0),
+        min_time_garbage_mins: Some(0),
+        ..Default::default()
+    };
+    let plan = plan_garbage(store.as_ref(), &rebuilt.root_id, &config)
+        .await
+        .unwrap();
+    release_garbage_plan(
+        plan,
+        writer.backend(),
+        writer.nameservice(),
+        &fluree_db_core::LedgerId::parse(id).unwrap(),
+        Some(&[]),
+    )
+    .await
+    .unwrap();
+
+    // Bring the head to the new commit, then read it from an instance that
+    // has nothing cached.
+    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    drop(ledger);
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?p", "?name"],
+        "where": [{"@id": "?p", "@type": "ex:Person"}, {"@id": "?p", "ex:name": "?name"}],
+        "reasoning": "owl2rl"
+    });
+    let (people, served) = rows(&reader, id, &q).await;
+    assert!(served.is_some());
+    assert_eq!(
+        people,
+        vec![
+            json!(["ex:alice", "Alice"]),
+            json!(["ex:bob", "Bob"]),
+            json!(["ex:carol", "Carol"])
+        ]
+    );
+}

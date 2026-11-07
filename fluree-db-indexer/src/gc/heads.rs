@@ -140,7 +140,63 @@ pub async fn shared_refs_of_heads(
     Ok(refs)
 }
 
-/// Which generations a head pass keeps and which it may release.
+/// Every shared dictionary blob the reasoned heads of `branches` reach, read
+/// from each branch's heads document as it stands. A branch whose document
+/// cannot be read fails the call.
+pub async fn shared_refs_of_branch_heads(
+    backend: &StorageBackend,
+    nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
+    branches: &[crate::gc::BranchIndexHead],
+) -> Result<HashSet<ContentId>> {
+    let mut refs = HashSet::new();
+    for branch in branches {
+        let doc = nameservice
+            .get_reasoned_heads(branch.ledger_id.as_str())
+            .await
+            .map_err(|e| IndexerError::NameService(e.to_string()))?;
+        if let Some(doc) = doc {
+            refs.extend(shared_refs_of_heads(backend, &branch.namespace, &doc).await?);
+        }
+    }
+    Ok(refs)
+}
+
+/// The reasoned heads of `branches` as sweep participants: one per
+/// generation still in storage, rooted in its head's namespace, so the sweep
+/// counts every file a retained generation reaches as live.
+pub async fn head_sweep_participants(
+    backend: &StorageBackend,
+    nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
+    branches: &[crate::gc::BranchIndexHead],
+) -> Result<Vec<crate::gc::BranchIndexHead>> {
+    let mut out = Vec::new();
+    for branch in branches {
+        let doc = nameservice
+            .get_reasoned_heads(branch.ledger_id.as_str())
+            .await
+            .map_err(|e| IndexerError::NameService(e.to_string()))?;
+        let Some(doc) = doc else {
+            continue;
+        };
+        for (head_id, entry) in &doc.heads {
+            let Some(pointer) = &entry.published else {
+                continue;
+            };
+            let namespace = branch.namespace.reasoned_head(head_id.as_str());
+            let store = backend.content_store(&namespace);
+            for generation in head_generations(store.as_ref(), &pointer.manifest).await? {
+                out.push(crate::gc::BranchIndexHead {
+                    ledger_id: branch.ledger_id.clone(),
+                    namespace: namespace.clone(),
+                    index_head_id: Some(generation.manifest.root),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Which generations a head pass keeps and which it may release./// Which generations a head pass keeps and which it may release.
 #[derive(Debug, Default)]
 pub struct HeadReleasePlan {
     pub retained: Vec<HeadGeneration>,
