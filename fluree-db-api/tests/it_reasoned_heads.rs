@@ -1172,3 +1172,53 @@ async fn a_sweep_keeps_a_dictionary_only_the_head_reaches() {
         ]
     );
 }
+
+/// A rebase replaces the commits under a published generation: the
+/// generation is obsolete, never served, and the next one is a rebuild.
+#[tokio::test]
+async fn a_rebase_under_a_head_selects_the_rebuild_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main = school(&fluree, "heads/rebase:main").await;
+    fluree
+        .create_branch("heads/rebase", "dev", None, None)
+        .await
+        .unwrap();
+    let dev_id = "heads/rebase:dev";
+    let dev = fluree.ledger(dev_id).await.unwrap();
+    let _dev = student_commit(&fluree, dev, "dana").await;
+    let head = fluree
+        .register_reasoned_head(dev_id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(dev_id, &head).await.unwrap());
+    assert!(rows(&fluree, dev_id, &people_query()).await.1.is_some());
+
+    let _main = student_commit(&fluree, main, "mo").await;
+    fluree
+        .rebase_branch(
+            "heads/rebase",
+            "dev",
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .unwrap();
+
+    let (people, served) = rows(&fluree, dev_id, &people_query()).await;
+    assert!(
+        served.is_none(),
+        "the generation's basis is off the rebased line"
+    );
+    let expected = vec![
+        json!("ex:alice"),
+        json!("ex:bob"),
+        json!("ex:dana"),
+        json!("ex:mo"),
+    ];
+    assert_eq!(people, expected);
+
+    let (generation, kind) = published(fluree.refresh_reasoned_head(dev_id, &head).await.unwrap());
+    assert_eq!((generation, kind), (2, GenerationKind::Rebuild));
+    let (people, served) = rows(&fluree, dev_id, &people_query()).await;
+    assert_eq!(served.map(|h| h.generation), Some(2));
+    assert_eq!(people, expected);
+}
