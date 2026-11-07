@@ -100,13 +100,13 @@ pub(crate) struct ReasoningIndexState {
     pub(crate) other_engine: Mutex<Option<OtherEngine>>,
 }
 
-/// An engine of another semantics version, whose closures also hold a fact
-/// this one does not derive.
+/// An engine of another semantics version, whose closures may also hold a
+/// fact this one does not derive.
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct OtherEngine {
     pub version: u32,
-    pub extra: (fluree_db_core::GraphId, fluree_db_core::Flake),
+    pub extra: Option<(fluree_db_core::GraphId, fluree_db_core::Flake)>,
 }
 
 #[derive(Default)]

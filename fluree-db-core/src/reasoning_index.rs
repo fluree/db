@@ -385,6 +385,8 @@ pub struct Candidate {
     pub kind: GenerationKind,
     pub revision: u64,
     pub basis: Basis,
+    /// The [`ENGINE_SEMANTICS`] it was computed under.
+    pub engine: u32,
 }
 
 /// Why a candidate was not published. A discard never deletes files.
@@ -417,6 +419,12 @@ pub struct Admitted {
 
 /// Apply the publication rules to `candidate` against `actual`, the document
 /// as last read: eligibility first, then the basis, then progress.
+///
+/// A candidate computed under older engine semantics than the published
+/// generation's is not eligible, so instances of two versions sharing a
+/// branch do not keep replacing each other's generations: the newest engine
+/// maintains the index. A registration change lifts this, as it makes the
+/// published generation obsolete.
 pub fn admit(
     actual: &ReasoningIndexes,
     candidate: &Candidate,
@@ -434,6 +442,14 @@ pub fn admit(
             "computed for revision {}, registered at {}",
             candidate.revision, entry.registration.revision
         )));
+    }
+    if let Some(current) = &entry.head {
+        if current.revision == entry.registration.revision && current.engine > candidate.engine {
+            return Err(Discard::NotEligible(format!(
+                "computed under engine semantics {}, and the index is published under {}",
+                candidate.engine, current.engine
+            )));
+        }
     }
     if candidate.basis.epoch < entry.floor {
         return Err(Discard::BasisInvalid(format!(
@@ -577,6 +593,7 @@ mod tests {
             kind,
             revision,
             basis: b,
+            engine: ENGINE_SEMANTICS,
         }
     }
 
@@ -665,6 +682,41 @@ mod tests {
             admit(&doc, &c, &line),
             Err(Discard::BasisInvalid(_))
         ));
+    }
+
+    #[test]
+    fn an_older_engine_does_not_replace_a_newer_one() {
+        let line = Line::new(&[("c1", 1)], &[], "c1");
+        let (mut doc, id) = doc(1, Some(("c1", 1, 1)));
+        doc.indexes
+            .get_mut(&id)
+            .unwrap()
+            .head
+            .as_mut()
+            .unwrap()
+            .engine = 2;
+        let mut c = candidate(&id, GenerationKind::Rebuild, 1, basis("c1", 1));
+        c.engine = 1;
+        assert!(matches!(
+            admit(&doc, &c, &line),
+            Err(Discard::NotEligible(_))
+        ));
+        c.engine = 2;
+        assert!(admit(&doc, &c, &line).is_ok());
+        c.engine = 3;
+        assert!(admit(&doc, &c, &line).is_ok());
+        // Published for an earlier registration: any engine replaces it.
+        let (mut doc, id) = self::doc(2, Some(("c1", 1, 1)));
+        doc.indexes
+            .get_mut(&id)
+            .unwrap()
+            .head
+            .as_mut()
+            .unwrap()
+            .engine = 2;
+        let mut c = candidate(&id, GenerationKind::Rebuild, 2, basis("c1", 1));
+        c.engine = 1;
+        assert!(admit(&doc, &c, &line).is_ok());
     }
 
     #[test]

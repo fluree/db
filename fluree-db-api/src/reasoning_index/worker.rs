@@ -187,6 +187,14 @@ impl ReasoningIndexWorker {
                             removed = stats.removed,
                             "reasoning index published"
                         ),
+                        RefreshOutcome::NewerEngine { published, engine } => tracing::warn!(
+                            ledger = ledger_id,
+                            index = %index_id,
+                            published,
+                            engine,
+                            "reasoning index published under newer engine semantics; not \
+                             refreshed here (after a downgrade, retire and register it again)"
+                        ),
                         RefreshOutcome::Failed { reason } => tracing::warn!(
                             ledger = ledger_id,
                             index = %index_id,

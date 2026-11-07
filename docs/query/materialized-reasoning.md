@@ -97,7 +97,9 @@ A query is answered from an index when all of these hold:
   staged (uncommitted) view, or a time-travel view of an earlier commit,
   reasons at query time; time travel to the current `t` is served;
 - the query runs without a restricting policy (an index is computed without
-  policy, so a policy-restricted view always reasons at query time).
+  policy, so a policy-restricted view always reasons at query time);
+- the index's head was computed under the engine semantics version the
+  answering instance runs (see [Upgrades](#upgrades)).
 
 `rdfs` and `owl2ql` widen a query's patterns rather than materialize facts,
 so an index holds only what the program's other modes derive. A query that
@@ -155,3 +157,17 @@ sweeps, branch drops and ledger drop/restore all account for indexes.
 
 Reasoning indexes are derived state: they are not transferred by clone, pull
 or export, and are rebuilt where they are registered.
+
+## Upgrades
+
+Each generation records the engine semantics version it was computed under
+(`engine` in `/reasoning-indexes/list`). A release that changes what the
+engine derives, or how an index is stored or read, raises it. The worker then
+rebuilds every index at the commit it was at, with no transaction needed, and
+queries reason at query time until the rebuild is published.
+
+While instances of two versions share a ledger, as during a rolling upgrade,
+each reasons at query time over indexes the other version computed, and only
+the newer version refreshes them. A refresh by the older one does nothing and
+reports `newerEngine`. After a downgrade, an index the newer version published
+stays unrefreshed: retire it and register its program again.

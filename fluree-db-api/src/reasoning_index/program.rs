@@ -134,6 +134,21 @@ pub(crate) fn settling_query(canonical_program: &JsonValue) -> JsonValue {
 /// are left out: an index holds only complete results, so a budget never
 /// changes what it holds.
 pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId, engine: u32) -> ContentId {
+    let mut settled = settled_value(reasoning, g_id);
+    settled["engine"] = engine.into();
+    ContentId::new(ContentKind::LedgerConfig, &canonical_bytes(&settled))
+}
+
+/// The settled key a build before engine versioning digested.
+#[cfg(test)]
+pub(crate) fn unversioned_settled_key(reasoning: &ReasoningConfig, g_id: GraphId) -> ContentId {
+    ContentId::new(
+        ContentKind::LedgerConfig,
+        &canonical_bytes(&settled_value(reasoning, g_id)),
+    )
+}
+
+fn settled_value(reasoning: &ReasoningConfig, g_id: GraphId) -> JsonValue {
     let modes = &reasoning.modes;
     let schema_digest = reasoning
         .schema_bundle
@@ -146,7 +161,7 @@ pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId, engine: u3
             }
             hex::encode(hasher.finalize())
         });
-    let settled = serde_json::json!({
+    serde_json::json!({
         "rdfs": modes.rdfs,
         "owl2ql": modes.owl2ql,
         "datalog": modes.datalog,
@@ -158,9 +173,7 @@ pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId, engine: u3
         "rulesSource": reasoning.rules_source_g_id,
         "graph": g_id,
         "schema": schema_digest,
-        "engine": engine,
-    });
-    ContentId::new(ContentKind::LedgerConfig, &canonical_bytes(&settled))
+    })
 }
 
 /// Whether settled reasoning runs anything an index could hold.

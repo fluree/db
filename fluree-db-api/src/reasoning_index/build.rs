@@ -84,6 +84,11 @@ pub enum RefreshOutcome {
     Throttled { in_guard: usize },
     /// A storage sweep of the ledger is running; a later refresh retries.
     Deferred { reason: String },
+    /// The index is published under newer engine semantics than this
+    /// instance runs, so only an instance at least as new refreshes it. After
+    /// a downgrade, retire the index and register the program again.
+    #[serde(rename_all = "camelCase")]
+    NewerEngine { published: u32, engine: u32 },
 }
 
 /// Wall-clock milliseconds a refresh spends in each phase, for the debug
@@ -421,6 +426,14 @@ impl Fluree {
         let engine = self.reasoning_index_state.engine_semantics();
         let settled = program::settled_key(&executable.reasoning, db.graph_id, engine);
         if let Some(published) = &entry.head {
+            // Not even retention: an older collector would act on files a
+            // newer engine wrote.
+            if published.revision == revision && published.engine > engine {
+                return Ok(RefreshOutcome::NewerEngine {
+                    published: published.engine,
+                    engine,
+                });
+            }
             if published.revision == revision
                 && published.basis == basis
                 && published.settled == settled
@@ -432,7 +445,7 @@ impl Fluree {
                     generation: published.generation,
                 });
             }
-            if published.engine != engine {
+            if published.engine < engine {
                 tracing::info!(
                     ledger = ledger_id,
                     index = %index_id,
@@ -567,12 +580,18 @@ impl Fluree {
         };
         phases.mark("closure");
         #[cfg(test)]
-        if let Some(other) = self.reasoning_index_state.other_engine.lock().clone() {
+        if let Some(extra) = self
+            .reasoning_index_state
+            .other_engine
+            .lock()
+            .as_ref()
+            .and_then(|other| other.extra.clone())
+        {
             match &mut output {
                 Output::Whole(c) => {
-                    c.insert(other.extra);
+                    c.insert(extra);
                 }
-                Output::Gained(gained) => gained.push(other.extra),
+                Output::Gained(gained) => gained.push(extra),
             }
         }
         let derived_total = match &output {
@@ -807,6 +826,7 @@ impl Fluree {
             kind,
             revision,
             basis: basis.clone(),
+            engine,
         };
         let manifest = ReasoningManifest {
             index_id: index_id.clone(),
@@ -1410,9 +1430,10 @@ mod tests {
     use crate::reasoning_index::{OtherEngine, PauseSeam};
     use crate::Fluree;
     use fluree_db_core::reasoning_index::{
-        ClosureMode, GenerationKind, ReasoningIndexId, ReasoningManifest, ENGINE_SEMANTICS,
+        ClosureMode, GenerationKind, HeadPointer, ReasoningIndexId, ReasoningManifest,
+        ENGINE_SEMANTICS,
     };
-    use fluree_db_core::{ContentStore, Flake, FlakeValue, Sid};
+    use fluree_db_core::{ContentKind, ContentStore, Flake, FlakeValue, Sid};
     use fluree_db_query::reasoning::MaintenanceBounds;
     use std::collections::HashSet;
 
@@ -1437,6 +1458,26 @@ mod tests {
             .collect()
     }
 
+    /// The reasoning `program` settles to on `db`, as the worker settles it.
+    async fn settled_reasoning(
+        fluree: &Fluree,
+        db: &crate::view::GraphDb,
+        program: &serde_json::Value,
+    ) -> fluree_db_query::ir::ReasoningConfig {
+        let (_, parsed) = crate::query::helpers::parse_jsonld_query(
+            &super::program::settling_query(&super::program::canonical_program(program).unwrap()),
+            &db.snapshot,
+            db.default_context.as_ref(),
+            None,
+        )
+        .unwrap();
+        fluree
+            .build_executable_for_view(db, &parsed, None)
+            .await
+            .unwrap()
+            .reasoning
+    }
+
     /// The derived-only set a full recompute of `program` gives at the
     /// branch head: the oracle an incremental generation must equal.
     async fn full_derived(
@@ -1445,19 +1486,9 @@ mod tests {
         program: &serde_json::Value,
     ) -> HashSet<(Option<Sid>, Flake)> {
         let db = fluree.db(id).await.unwrap();
-        let (_, parsed) = crate::query::helpers::parse_jsonld_query(
-            &super::program::settling_query(&super::program::canonical_program(program).unwrap()),
-            &db.snapshot,
-            db.default_context.as_ref(),
-            None,
-        )
-        .unwrap();
-        let executable = fluree
-            .build_executable_for_view(&db, &parsed, None)
-            .await
-            .unwrap();
+        let reasoning = settled_reasoning(fluree, &db, program).await;
         let derived = fluree
-            .complete_closure(&db, &executable.reasoning)
+            .complete_closure(&db, &reasoning)
             .await
             .unwrap()
             .unwrap();
@@ -1756,13 +1787,9 @@ mod tests {
         (classes, served)
     }
 
-    /// A ledger whose owl2rl index was computed under engine semantics 0, by
-    /// an engine that also derived `ex:alice a ex:Org`; this instance runs
-    /// the current semantics again on return.
-    async fn indexed_by_an_older_engine(
-        fluree: &Fluree,
-        id: &str,
-    ) -> (ReasoningIndexId, crate::LedgerState) {
+    /// A ledger with a student and an organization, and an owl2rl index
+    /// registered on it.
+    async fn students(fluree: &Fluree, id: &str) -> (ReasoningIndexId, crate::LedgerState) {
         let ctx = json!({
             "ex": "http://example.org/",
             "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
@@ -1784,6 +1811,43 @@ mod tests {
             .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
             .await
             .unwrap();
+        (index, ledger)
+    }
+
+    async fn insert_student(
+        fluree: &Fluree,
+        ledger: crate::LedgerState,
+        student: &str,
+    ) -> crate::LedgerState {
+        fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"},
+                        "@id": student, "@type": "ex:Student"}),
+            )
+            .await
+            .unwrap()
+            .ledger
+    }
+
+    /// How a generation of older engine semantics is written.
+    #[derive(Clone, Copy)]
+    enum Older {
+        /// Under engine semantics 0, versioned as this build versions them.
+        Versioned,
+        /// As a build before versioning wrote it.
+        Unversioned,
+    }
+
+    /// A ledger whose owl2rl index was computed under engine semantics 0, by
+    /// an engine that also derived `ex:alice a ex:Org`; this instance runs
+    /// the current semantics again on return.
+    async fn indexed_by_an_older_engine(
+        fluree: &Fluree,
+        id: &str,
+        older: Older,
+    ) -> (ReasoningIndexId, crate::LedgerState) {
+        let (index, ledger) = students(fluree, id).await;
         let db = fluree.db(id).await.unwrap();
         let sid = |iri: &str| db.snapshot.encode_iri(iri).unwrap();
         let wrong = Flake::new(
@@ -1800,7 +1864,7 @@ mod tests {
         );
         *fluree.reasoning_index_state.other_engine.lock() = Some(OtherEngine {
             version: 0,
-            extra: (0, wrong),
+            extra: Some((0, wrong)),
         });
         assert!(matches!(
             fluree.refresh_reasoning_index(id, &index).await.unwrap(),
@@ -1810,7 +1874,56 @@ mod tests {
         assert_eq!(served, Some(1));
         assert!(classes.contains(&"ex:Org".to_string()), "{classes:?}");
         *fluree.reasoning_index_state.other_engine.lock() = None;
+        if let Older::Unversioned = older {
+            as_written_before_versioning(fluree, id, &index).await;
+        }
         (index, ledger)
+    }
+
+    /// Rewrite the index's head as a build before engine versioning wrote
+    /// it: no `engine` in its manifest or its pointer, and the settled key
+    /// digested without one.
+    async fn as_written_before_versioning(fluree: &Fluree, id: &str, index: &ReasoningIndexId) {
+        let db = fluree.db(id).await.unwrap();
+        let reasoning = settled_reasoning(fluree, &db, &json!({"reasoning": "owl2rl"})).await;
+        let settled = serde_json::to_value(super::program::unversioned_settled_key(
+            &reasoning,
+            db.graph_id,
+        ))
+        .unwrap();
+        let head = fluree.reasoning_indexes(id).await.unwrap().indexes[index]
+            .head
+            .clone()
+            .unwrap();
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let index_cs = fluree
+            .backend()
+            .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+        let bytes = index_cs.get(&head.manifest).await.unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&bytes[4..]).unwrap();
+        manifest.as_object_mut().unwrap().remove("engine").unwrap();
+        manifest["settled"] = settled.clone();
+        let mut bytes = b"FRM1".to_vec();
+        serde_json::to_writer(&mut bytes, &manifest).unwrap();
+        assert_eq!(ReasoningManifest::decode(&bytes).unwrap().engine, 0);
+        let manifest_id = index_cs
+            .put(ContentKind::ReasoningManifest, &bytes)
+            .await
+            .unwrap();
+        let mut pointer = serde_json::to_value(&head).unwrap();
+        pointer.as_object_mut().unwrap().remove("engine").unwrap();
+        pointer["settled"] = settled;
+        pointer["manifest"] = serde_json::to_value(&manifest_id).unwrap();
+        let pointer: HeadPointer = serde_json::from_value(pointer).unwrap();
+        assert_eq!(pointer.engine, 0);
+        fluree
+            .update_reasoning_indexes(id, |actual| {
+                let mut next = actual.clone();
+                next.indexes.get_mut(index).unwrap().head = Some(pointer.clone());
+                Ok((Some(next), ()))
+            })
+            .await
+            .unwrap();
     }
 
     /// A generation computed under other engine semantics is not served
@@ -1818,9 +1931,18 @@ mod tests {
     /// and the rebuild is served.
     #[tokio::test]
     async fn a_generation_of_other_engine_semantics_is_rebuilt_at_its_basis() {
+        rebuilt_at_its_basis(Older::Versioned).await;
+    }
+
+    #[tokio::test]
+    async fn a_generation_written_before_versioning_is_rebuilt_at_its_basis() {
+        rebuilt_at_its_basis(Older::Unversioned).await;
+    }
+
+    async fn rebuilt_at_its_basis(older: Older) {
         let fluree = crate::FlureeBuilder::memory().build_memory();
         let id = "reasoning-indexes/engine-rebuild:main";
-        let (index, _) = indexed_by_an_older_engine(&fluree, id).await;
+        let (index, _) = indexed_by_an_older_engine(&fluree, id, older).await;
 
         let (classes, served) = alice_classes(&fluree, id).await;
         assert_eq!(served, None, "served across engine semantics");
@@ -1862,31 +1984,26 @@ mod tests {
     /// the next insertion builds on the rebuilt one.
     #[tokio::test]
     async fn an_insertion_does_not_build_on_other_engine_semantics() {
+        not_built_on(Older::Versioned).await;
+    }
+
+    #[tokio::test]
+    async fn an_insertion_does_not_build_on_a_generation_written_before_versioning() {
+        not_built_on(Older::Unversioned).await;
+    }
+
+    async fn not_built_on(older: Older) {
         let fluree = crate::FlureeBuilder::memory().build_memory();
         let id = "reasoning-indexes/engine-seed:main";
-        let (index, ledger) = indexed_by_an_older_engine(&fluree, id).await;
+        let (index, ledger) = indexed_by_an_older_engine(&fluree, id, older).await;
         let program = json!({"reasoning": "owl2rl"});
-        let ctx = json!({"ex": "http://example.org/"});
 
-        let ledger = fluree
-            .insert(
-                ledger,
-                &json!({"@context": ctx, "@id": "ex:bob", "@type": "ex:Student"}),
-            )
-            .await
-            .unwrap()
-            .ledger;
+        let ledger = insert_student(&fluree, ledger, "ex:bob").await;
         refresh_and_compare(&fluree, id, &index, &program, Some(ClosureMode::Full), 1).await;
         let (classes, _) = alice_classes(&fluree, id).await;
         assert_eq!(classes, ["ex:Person", "ex:Student"]);
 
-        fluree
-            .insert(
-                ledger,
-                &json!({"@context": ctx, "@id": "ex:carol", "@type": "ex:Student"}),
-            )
-            .await
-            .unwrap();
+        insert_student(&fluree, ledger, "ex:carol").await;
         refresh_and_compare(
             &fluree,
             id,
@@ -1896,6 +2013,150 @@ mod tests {
             2,
         )
         .await;
+    }
+
+    /// Two instances over one storage and nameservice: the first runs engine
+    /// semantics 0, the second the current ones.
+    fn older_and_newer() -> (Fluree, Fluree) {
+        let storage = fluree_db_core::MemoryStorage::new();
+        let nameservice = Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+        let instance = || {
+            crate::FlureeBuilder::memory().build_with(
+                storage.clone(),
+                crate::NameServiceMode::ReadWrite(nameservice.clone()),
+            )
+        };
+        let older = instance();
+        *older.reasoning_index_state.other_engine.lock() = Some(OtherEngine {
+            version: 0,
+            extra: None,
+        });
+        (older, instance())
+    }
+
+    /// Instances of an older and a newer engine sharing a branch, whichever
+    /// refreshes first: the newer one's generation stays published, and the
+    /// older one leaves it, and the commits after it, to the newer one.
+    #[tokio::test]
+    async fn an_older_engine_leaves_an_index_to_a_newer_one_in_either_order() {
+        let declined = RefreshOutcome::NewerEngine {
+            published: ENGINE_SEMANTICS,
+            engine: 0,
+        };
+        for older_first in [true, false] {
+            let (older, newer) = older_and_newer();
+            let id = "reasoning-indexes/engine-rolling:main";
+            let (index, ledger) = students(&newer, id).await;
+            let mut generation = 1;
+            if older_first {
+                assert!(matches!(
+                    older.refresh_reasoning_index(id, &index).await.unwrap(),
+                    RefreshOutcome::Published { generation: 1, .. }
+                ));
+                generation = 2;
+            }
+            match newer.refresh_reasoning_index(id, &index).await.unwrap() {
+                RefreshOutcome::Published { generation: g, .. } => {
+                    assert_eq!(g, generation, "older first: {older_first}");
+                }
+                other => panic!("older first: {older_first}: {other:?}"),
+            }
+            assert_eq!(
+                older.refresh_reasoning_index(id, &index).await.unwrap(),
+                declined,
+                "older first: {older_first}"
+            );
+            assert_eq!(alice_classes(&newer, id).await.1, Some(generation));
+
+            insert_student(&newer, ledger, "ex:bob").await;
+            // As a notified peer or a Raft follower learns of the commit.
+            older.refresh(id, Default::default()).await.unwrap();
+            assert_eq!(
+                older.refresh_reasoning_index(id, &index).await.unwrap(),
+                declined,
+                "older first: {older_first}"
+            );
+            match newer.refresh_reasoning_index(id, &index).await.unwrap() {
+                RefreshOutcome::Published {
+                    generation: g,
+                    stats,
+                    ..
+                } => assert_eq!(
+                    (g, stats.closure),
+                    (generation + 1, ClosureMode::Incremental),
+                    "older first: {older_first}"
+                ),
+                other => panic!("older first: {older_first}: {other:?}"),
+            }
+            assert_eq!(alice_classes(&newer, id).await.1, Some(generation + 1));
+        }
+    }
+
+    /// An older engine's generation, computed while a newer engine published
+    /// one, is refused at publication.
+    #[tokio::test]
+    async fn an_older_engine_s_generation_is_refused_once_a_newer_one_publishes() {
+        let (older, newer) = older_and_newer();
+        let id = "reasoning-indexes/engine-race:main";
+        let (index, _) = students(&newer, id).await;
+        let seam = Arc::new(PauseSeam::default());
+        *older.reasoning_index_state.before_publish.lock() = Some(Arc::clone(&seam));
+        let newer_publishes = async {
+            seam.reached.notified().await;
+            let outcome = newer.refresh_reasoning_index(id, &index).await.unwrap();
+            seam.resume.notify_one();
+            outcome
+        };
+        let (older_outcome, newer_outcome) =
+            tokio::join!(older.refresh_reasoning_index(id, &index), newer_publishes);
+        assert!(matches!(
+            newer_outcome,
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        match older_outcome.unwrap() {
+            RefreshOutcome::Discarded { reason } => {
+                assert!(reason.contains("engine semantics"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let head = newer.reasoning_indexes(id).await.unwrap().indexes[&index]
+            .head
+            .clone()
+            .unwrap();
+        assert_eq!((head.generation, head.engine), (1, ENGINE_SEMANTICS));
+        assert_eq!(alice_classes(&newer, id).await.1, Some(1));
+    }
+
+    /// After a downgrade, an index a newer engine published is retired and
+    /// its program registered again; the older engine maintains the new
+    /// index.
+    #[tokio::test]
+    async fn after_a_downgrade_an_index_is_registered_again() {
+        let (older, newer) = older_and_newer();
+        let id = "reasoning-indexes/engine-downgrade:main";
+        let (index, _) = students(&newer, id).await;
+        assert!(matches!(
+            newer.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        drop(newer);
+        assert!(matches!(
+            older.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::NewerEngine { .. }
+        ));
+        assert_eq!(alice_classes(&older, id).await.1, None);
+
+        older.retire_reasoning_index(id, &index).await.unwrap();
+        let again = older
+            .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+            .await
+            .unwrap();
+        assert_ne!(again, index);
+        assert!(matches!(
+            older.refresh_reasoning_index(id, &again).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        assert_eq!(alice_classes(&older, id).await.1, Some(1));
     }
 
     /// Insert-only refreshes under `bounds`, each compared with a full
