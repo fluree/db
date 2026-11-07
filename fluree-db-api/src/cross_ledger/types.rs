@@ -659,8 +659,12 @@ impl<'a> ResolveCtx<'a> {
         if at_head(&state) {
             return Ok(GraphDb::from_ledger_state(&state));
         }
+        let drops = fluree_db_ledger::HeadDrops::of(
+            state.head_commit_id.as_ref(),
+            &state.snapshot.graph_registry,
+        );
         self.fluree
-            .load_graph_db_historical(canonical_model_ledger_id, head.t)
+            .load_graph_db_historical(canonical_model_ledger_id, head.t, drops)
             .await
     }
 

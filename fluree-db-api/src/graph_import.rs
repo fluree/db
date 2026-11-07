@@ -45,8 +45,12 @@ use crate::{ApiError, Fluree, IndexingMode};
 pub(crate) struct GraphImportSeed {
     /// The named graph the import fills.
     pub graph_iri: String,
-    /// The g_id that graph gets: the next free one.
+    /// The g_id that graph gets: the next free one, or the id of the dropped
+    /// graph it refills.
     pub g_id: u16,
+    /// Whether the graph was dropped and the import writes it afresh: its
+    /// first commit names it in its `graph_delta`, which brings it back.
+    pub refills: bool,
     /// The ledger's head, which the import's first commit chains onto.
     pub head_t: i64,
     pub head_commit: ContentId,
@@ -69,11 +73,13 @@ pub(crate) struct GraphImportSeed {
 }
 
 impl GraphImportSeed {
-    /// The ledger's graphs, IRI → g_id.
+    /// The ledger's graphs, IRI → g_id, less a dropped graph the import
+    /// refills: the import's commits register that one again.
     pub(crate) fn graph_ids(&self) -> HashMap<String, u16> {
         let graphs = &self.base_dicts.graphs;
         (0..graphs.len())
             .filter_map(|id| Some((graphs.resolve(id)?.to_string(), (id + 1) as u16)))
+            .filter(|(iri, _)| !(self.refills && *iri == self.graph_iri))
             .collect()
     }
 }
@@ -225,6 +231,26 @@ pub(crate) async fn splice_graph_into_index(
     );
 
     let mut root = base.clone();
+    if seed.refills {
+        // What the drop left of the graph — the arenas a purge keeps — goes,
+        // and the graph exists again from the import's first commit.
+        root.graph_arenas.retain(|a| {
+            if a.g_id != seed.g_id {
+                return true;
+            }
+            replaced_cids.extend(a.numbig.iter().map(|(_, cid)| cid.clone()));
+            for v in &a.vectors {
+                replaced_cids.push(v.manifest.clone());
+                replaced_cids.extend(v.shards.iter().cloned());
+            }
+            false
+        });
+        for (g_id, drop) in &mut root.graph_drops {
+            if *g_id == seed.g_id {
+                drop.revived = Some(seed.head_t + 1);
+            }
+        }
+    }
     root.named_graphs.push(routing);
     root.named_graphs.sort_by_key(|ng| ng.g_id);
     if let Some(arena) = arenas.into_iter().find(|a| a.g_id == seed.g_id) {
@@ -285,6 +311,8 @@ pub(crate) async fn splice_graph_into_index(
         base_vector_counts: HashMap::new(),
         base_numbig_counts: HashMap::new(),
         fulltext_string_bytes: HashMap::new(),
+        purged_graphs: Vec::new(),
+        purged_cids: Vec::new(),
     };
     // The ledger's annotation arena still covers every annotation when the
     // graph adds none; otherwise it is dropped, and annotations read by
@@ -764,14 +792,30 @@ async fn load_seed(
     let base_dicts = SharedResolverState::from_index_root(&base_root, &record.ledger_id)
         .map_err(|e| ImportError::Storage(format!("index root dictionaries: {e}")))?;
 
-    if base_dicts.graphs.get(&graph_iri).is_some() {
-        return Err(ImportError::Refused(format!(
-            "{} already has the graph <{graph_iri}>; an import fills a new graph only",
-            record.ledger_id
-        )));
-    }
-    let g_id = u16::try_from(base_dicts.graphs.len() + 1)
-        .map_err(|_| ImportError::Transact("the ledger has no graph id left".into()))?;
+    // A graph a drop left keeps its id, and the import fills it afresh; a
+    // graph the ledger holds is refused.
+    let no_id_left = || ImportError::Transact("the ledger has no graph id left".into());
+    let (g_id, refills) = match base_dicts.graphs.get(&graph_iri) {
+        Some(dict_id) => {
+            let g_id = u16::try_from(dict_id + 1).map_err(|_| no_id_left())?;
+            let dropped = base_root
+                .graph_drops
+                .iter()
+                .any(|(dropped, drop)| *dropped == g_id && drop.revived.is_none());
+            if !dropped {
+                return Err(ImportError::Refused(format!(
+                    "{} already has the graph <{graph_iri}>; an import fills a new or \
+                     dropped graph only",
+                    record.ledger_id
+                )));
+            }
+            (g_id, true)
+        }
+        None => (
+            u16::try_from(base_dicts.graphs.len() + 1).map_err(|_| no_id_left())?,
+            false,
+        ),
+    };
 
     let mut ns_registry = NamespaceRegistry::new();
     for (&code, prefix) in &base_root.namespace_codes {
@@ -811,6 +855,7 @@ async fn load_seed(
     Ok(GraphImportSeed {
         graph_iri,
         g_id,
+        refills,
         head_t: record.commit_t,
         head_commit,
         ns_registry,

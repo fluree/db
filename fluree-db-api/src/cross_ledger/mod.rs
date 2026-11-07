@@ -40,14 +40,15 @@ pub use types::{
 /// - Named graph IRI the snapshot's registry reads as its txn-meta or
 ///   config graph, in any spelling (any ledger's config graph IRI is
 ///   the config graph) → `Err(ReservedGraphSelected)`.
-/// - Other named graph IRI present in the snapshot's registry →
-///   `Ok(Some(g_id))`.
-/// - Otherwise → `Ok(None)`; callers map to
-///   [`CrossLedgerError::GraphMissingAtT`] with the full context
+/// - Other named graph IRI that exists as of `t` in the snapshot's
+///   registry → `Ok(Some(g_id))`.
+/// - Otherwise → `Ok(None)`, a graph a drop took among them; callers map
+///   to [`CrossLedgerError::GraphMissingAtT`] with the full context
 ///   (ledger id, resolved_t) that this helper doesn't carry.
 pub(crate) fn resolve_selector_g_id(
     snapshot: &fluree_db_core::LedgerSnapshot,
     graph_iri: &str,
+    t: i64,
 ) -> Result<Option<fluree_db_core::GraphId>, CrossLedgerError> {
     if graph_iri == fluree_vocab::config_iris::DEFAULT_GRAPH {
         return Ok(Some(0u16));
@@ -58,11 +59,12 @@ pub(crate) fn resolve_selector_g_id(
             graph_iri: graph_iri.to_string(),
         });
     }
-    match snapshot.graph_registry.graph_id_for_iri(graph_iri) {
+    let registry = &snapshot.graph_registry;
+    match registry.assigned_graph_id(graph_iri) {
         Some(TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) => Err(CrossLedgerError::ReservedGraphSelected {
             graph_iri: graph_iri.to_string(),
         }),
-        g_id => Ok(g_id),
+        _ => Ok(registry.existing_graph_id(graph_iri, t).unwrap_or(None)),
     }
 }
 
@@ -169,14 +171,14 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    resolve_selector_g_id(&snapshot, iri),
+                    resolve_selector_g_id(&snapshot, iri, 0),
                     Err(CrossLedgerError::ReservedGraphSelected { .. })
                 ),
                 "{iri}"
             );
         }
         assert!(matches!(
-            resolve_selector_g_id(&snapshot, "http://example.org/policy"),
+            resolve_selector_g_id(&snapshot, "http://example.org/policy", 0),
             Ok(None)
         ));
     }

@@ -25,6 +25,11 @@ use tracing::Instrument;
 // ============================================================================
 
 /// A view of a cached handle's head, with its binary store attached.
+/// The drops the cached head `snap` knows, for a view below its index.
+fn head_drops(snap: &LedgerView) -> Option<fluree_db_ledger::HeadDrops<'_>> {
+    fluree_db_ledger::HeadDrops::of(snap.head_commit_id.as_ref(), &snap.snapshot.graph_registry)
+}
+
 fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
     let binary_store = snap.binary_store.clone();
     let ledger = snap.to_ledger_state();
@@ -77,7 +82,24 @@ impl Fluree {
     }
 
     /// Re-scope a view to a graph id already resolved against its ledger.
+    ///
+    /// A graph dropped as of the view is not there to select: a 404, saying
+    /// so when the view is from before the drop, whose history it took.
     pub(crate) fn select_graph_id(mut view: GraphDb, g_id: GraphId) -> Result<GraphDb> {
+        let registry = &view.snapshot.graph_registry;
+        if g_id != DEFAULT_GRAPH_ID && !registry.visible_at(g_id, view.t) {
+            let iri = registry.iri_for_graph_id(g_id).unwrap_or_default();
+            return Err(ApiError::GraphNotFound(
+                match registry.drop_after(g_id, view.t) {
+                    Some(floor) => format!(
+                        "graph <{iri}> was dropped at t={floor}; what it held as of t={} is no \
+                         longer queryable",
+                        view.t
+                    ),
+                    None => format!("graph <{iri}> was dropped and does not exist"),
+                },
+            ));
+        }
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {
             let store = view.binary_store.clone().unwrap();
             let dict_novelty = view.dict_novelty.clone().unwrap();
@@ -159,7 +181,7 @@ impl Fluree {
         // let a typo or premature feature use silently disable
         // governance the operator believed to be in effect.
         let rules_source_g_id =
-            resolve_local_rules_source_g_id(resolved.datalog.as_ref(), &view.snapshot)?;
+            resolve_local_rules_source_g_id(resolved.datalog.as_ref(), &view.snapshot, view.t)?;
 
         Ok(view
             .with_ledger_config(config)
@@ -331,7 +353,8 @@ impl Fluree {
             return Ok(graph_db_from_cached_head(snap));
         }
 
-        self.load_graph_db_historical(ledger_id, target_t).await
+        self.load_graph_db_historical(ledger_id, target_t, head_drops(&snap))
+            .await
     }
 
     /// Load a ledger at `t`, where its head commit is `commit_id`.
@@ -353,18 +376,24 @@ impl Fluree {
             return Ok(graph_db_from_cached_head(snap));
         }
 
-        self.load_graph_db_historical(ledger_id, t).await
+        self.load_graph_db_historical(ledger_id, t, head_drops(&snap))
+            .await
     }
 
     /// Open a ledger at a past `t` through the historical loader: no ledger
     /// cache, so no cache lock is taken. [`Self::load_graph_db_at_t`] uses
-    /// this once it knows `t` is not the cached head.
+    /// this once it knows `t` is not the cached head. `head`, a state the
+    /// caller holds, spares the loader reading the commits after the index
+    /// for their drops when it is at the ledger's head commit.
     pub(crate) async fn load_graph_db_historical(
         &self,
         ledger_id: &str,
         target_t: i64,
+        head: Option<fluree_db_ledger::HeadDrops<'_>>,
     ) -> Result<GraphDb> {
-        let historical = self.ledger_view_at(ledger_id, target_t).await?;
+        let historical = self
+            .ledger_view_at_from_head(ledger_id, target_t, head)
+            .await?;
         let mut view = GraphDb::from_historical(&historical);
 
         // Attach dict_novelty derived from the historical Db's watermarks.
@@ -426,6 +455,11 @@ impl Fluree {
                         .augment_namespace_codes(view.snapshot.namespaces())
                         .map_err(|e| ApiError::internal(format!("augment namespace codes: {e}")))?;
                     store.set_ns_split_mode(view.snapshot.ns_split_mode());
+                    // What the root still holds of a graph dropped after it.
+                    let store = fluree_db_transact::store_without_dropped_graphs(
+                        store,
+                        &view.snapshot.graph_registry,
+                    );
 
                     // Populate dict novelty safely (persisted dict wins).
                     populate_dict_novelty_from_view(
@@ -634,7 +668,8 @@ impl Fluree {
                 if t == snapshot.t {
                     graph_db_from_cached_head(snapshot)
                 } else {
-                    self.load_graph_db_historical(ledger_id, t).await?
+                    self.load_graph_db_historical(ledger_id, t, head_drops(&snapshot))
+                        .await?
                 }
             }
         };
@@ -1080,7 +1115,7 @@ impl Fluree {
                 .policy
                 .as_ref()
                 .and_then(|p| p.policy_source.as_ref());
-            crate::policy_builder::resolve_policy_source_g_ids(source, &view.snapshot)?
+            crate::policy_builder::resolve_policy_source_g_ids(source, &view.snapshot, view.t)?
         } else {
             vec![0]
         };
@@ -1328,6 +1363,7 @@ impl Fluree {
 fn resolve_local_rules_source_g_id(
     datalog: Option<&fluree_db_core::ledger_config::DatalogDefaults>,
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
 ) -> Result<Option<fluree_db_core::GraphId>> {
     let Some(src) = datalog.and_then(|d| d.rules_source.as_ref()) else {
         return Ok(None);
@@ -1353,7 +1389,12 @@ fn resolve_local_rules_source_g_id(
     }
     let g_id = match src.graph_selector.as_deref() {
         Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        Some(iri) => snapshot
+            .graph_registry
+            .existing_graph_id(iri, t)
+            .map_err(|floor| {
+                crate::policy_builder::dropped_source("f:rulesSource", iri, floor, t)
+            })?,
         None => Some(0u16),
     };
     match g_id {

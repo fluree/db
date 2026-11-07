@@ -257,6 +257,7 @@ pub fn read_commit_v3(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         commit_signatures,
         txn_meta,
         graph_delta: envelope.graph_delta,
+        graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
     })
 }
@@ -306,6 +307,7 @@ pub fn read_commit_envelope_v3(bytes: &[u8]) -> Result<CommitEnvelope, CommitCod
         // empty so envelope-only callers don't have to special-case the
         // version.
         graph_delta: std::collections::HashMap::new(),
+        graph_drops: Vec::new(),
         ns_split_mode: env.ns_split_mode,
     })
 }
@@ -853,6 +855,7 @@ mod tests {
             txn_signature: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
+            graph_drops: Vec::new(),
             ns_split_mode: None,
         };
         let mut envelope_bytes = Vec::new();

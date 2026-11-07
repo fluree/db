@@ -426,7 +426,7 @@ async fn validate_view_inner(
 
     let data_g_id = match options.graph.as_deref() {
         None => 0u16,
-        Some(iri) => resolve_graph_iri(snapshot, iri)?,
+        Some(iri) => resolve_graph_iri(snapshot, iri, to_t)?,
     };
 
     // Holders declared before `shape_dbs` so the borrows they hand out
@@ -481,7 +481,8 @@ async fn validate_view_inner(
             // Sids through the snapshot namespace map.
             cross_membership = Some(model.membership(snapshot.namespaces()));
         } else {
-            let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
+            let shapes_g_ids =
+                crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot, to_t)?;
             for g_id in &shapes_g_ids {
                 shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
             }
@@ -492,7 +493,7 @@ async fn validate_view_inner(
     match &options.shapes {
         ShapesSource::Attached => {}
         ShapesSource::Graph(iri) => {
-            let g_id = resolve_graph_iri(snapshot, iri)?;
+            let g_id = resolve_graph_iri(snapshot, iri, to_t)?;
             if !membership.contains(&g_id) {
                 shape_dbs.push(GraphDbRef::new(snapshot, g_id, novelty, to_t));
                 membership.push(g_id);
@@ -621,13 +622,23 @@ fn empty_shapes_doc() -> ApiError {
     ))
 }
 
-fn resolve_graph_iri(snapshot: &LedgerSnapshot, iri: &str) -> Result<GraphId> {
+/// The graph `iri` names as of `t`: one a drop after `t` took is refused, as
+/// a query naming it as of `t` is, and one that does not exist then is not
+/// found.
+fn resolve_graph_iri(snapshot: &LedgerSnapshot, iri: &str, t: i64) -> Result<GraphId> {
     if iri == config_iris::DEFAULT_GRAPH {
         return Ok(0);
     }
     snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .existing_graph_id(iri, t)
+        .map_err(|floor| {
+            ApiError::Query(fluree_db_query::QueryError::GraphDropped {
+                graph: iri.to_string(),
+                floor,
+                t,
+            })
+        })?
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "graph '{iri}' not found in this ledger's graph registry"
