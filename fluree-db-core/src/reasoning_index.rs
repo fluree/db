@@ -114,6 +114,27 @@ pub struct SemanticKey {
     pub clock: ClockPolicy,
 }
 
+/// The version of what a generation means, as this build computes and reads
+/// it. It is part of the settled key builders and queries compare, so a
+/// generation computed under another version is neither served nor built on,
+/// and is rebuilt at its own basis without a new commit.
+///
+/// Bump it with any change after which a generation computed before it could
+/// differ from one computed after it, for the same program and basis, or be
+/// read differently:
+/// - what a program derives: rule semantics, settling defaults, Datalog
+///   evaluation, the value, datatype and metadata of derived facts;
+/// - the derived-only set: what counts as derived-only, and how facts are
+///   keyed, bucketed and deduplicated;
+/// - incremental maintenance: what an incremental closure gains or keeps;
+/// - how a served query reads a generation, including what it still rewrites;
+/// - the encoding of a generation's manifest, derived-only set or index root,
+///   unless this build reads every earlier encoding the same.
+///
+/// A change that leaves what every generation holds, and how it is read, the
+/// same (a faster closure with the same output) does not bump it.
+pub const ENGINE_SEMANTICS: u32 = 1;
+
 /// The content id a canonical program encoding is known by.
 pub fn program_id(canonical: &[u8]) -> ContentId {
     ContentId::new(ContentKind::LedgerConfig, canonical)
@@ -176,6 +197,9 @@ pub struct HeadPointer {
     pub revision: u64,
     pub basis: Basis,
     pub settled: ContentId,
+    /// The generation's [`ENGINE_SEMANTICS`]; 0 before versioning.
+    #[serde(default)]
+    pub engine: u32,
 }
 
 /// The per-branch document: every index of the branch, read in one
@@ -256,8 +280,12 @@ pub struct ReasoningManifest {
     pub semantics: SemanticKey,
     /// Digest of the reasoning the worker settled the program to, against the
     /// branch's configuration at the basis. A query is served only when its
-    /// own settled reasoning has the same digest.
+    /// own settled reasoning has the same digest. The digest includes
+    /// `engine`.
     pub settled: ContentId,
+    /// The [`ENGINE_SEMANTICS`] it was computed under; 0 before versioning.
+    #[serde(default)]
+    pub engine: u32,
     pub basis: Basis,
     /// The merged index root, in the index's namespace.
     pub root: ContentId,
@@ -294,6 +322,7 @@ impl ReasoningManifest {
             revision: self.revision,
             basis: self.basis.clone(),
             settled: self.settled.clone(),
+            engine: self.engine,
         }
     }
 }
@@ -530,6 +559,7 @@ mod tests {
                     revision: rev,
                     basis: basis(tag, t),
                     settled: cid("settled"),
+                    engine: ENGINE_SEMANTICS,
                 }),
             },
         );
@@ -662,6 +692,7 @@ mod tests {
             revision: 1,
             semantics: key(),
             settled: cid("settled"),
+            engine: ENGINE_SEMANTICS,
             basis: basis("c1", 1),
             root: cid("root"),
             derived: cid("derived"),
@@ -680,5 +711,15 @@ mod tests {
             serde_json::from_str::<ReasoningIndexes>(&json).unwrap(),
             doc
         );
+    }
+
+    #[test]
+    fn a_head_written_before_versioning_reads_as_engine_zero() {
+        let (doc, id) = doc(1, Some(("c1", 1, 1)));
+        let mut json = serde_json::to_value(&doc).unwrap();
+        let head = &mut json["indexes"][id.as_str()]["head"];
+        assert!(head.as_object_mut().unwrap().remove("engine").is_some());
+        let read: ReasoningIndexes = serde_json::from_value(json).unwrap();
+        assert_eq!(read.indexes[&id].head.as_ref().unwrap().engine, 0);
     }
 }

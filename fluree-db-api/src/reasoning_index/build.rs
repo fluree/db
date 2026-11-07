@@ -418,7 +418,8 @@ impl Fluree {
                 reason: "the program, as the branch settles it, materializes nothing".into(),
             });
         }
-        let settled = program::settled_key(&executable.reasoning, db.graph_id);
+        let engine = self.reasoning_index_state.engine_semantics();
+        let settled = program::settled_key(&executable.reasoning, db.graph_id, engine);
         if let Some(published) = &entry.head {
             if published.revision == revision
                 && published.basis == basis
@@ -430,6 +431,15 @@ impl Fluree {
                 return Ok(RefreshOutcome::Current {
                     generation: published.generation,
                 });
+            }
+            if published.engine != engine {
+                tracing::info!(
+                    ledger = ledger_id,
+                    index = %index_id,
+                    published = published.engine,
+                    engine,
+                    "reasoning index computed under other engine semantics; rebuilding"
+                );
             }
         }
 
@@ -556,6 +566,15 @@ impl Fluree {
             }
         };
         phases.mark("closure");
+        #[cfg(test)]
+        if let Some(other) = self.reasoning_index_state.other_engine.lock().clone() {
+            match &mut output {
+                Output::Whole(c) => {
+                    c.insert(other.extra);
+                }
+                Output::Gained(gained) => gained.push(other.extra),
+            }
+        }
         let derived_total = match &output {
             Output::Whole(c) => c.len() as u64,
             Output::Gained(gained) => gained.len() as u64,
@@ -799,6 +818,7 @@ impl Fluree {
             revision,
             semantics: entry.registration.semantics.clone(),
             settled,
+            engine,
             basis: basis.clone(),
             root: built.root_id,
             derived: derived_id,
@@ -1387,10 +1407,12 @@ mod tests {
     use serde_json::json;
 
     use super::RefreshOutcome;
-    use crate::reasoning_index::PauseSeam;
+    use crate::reasoning_index::{OtherEngine, PauseSeam};
     use crate::Fluree;
-    use fluree_db_core::reasoning_index::{ClosureMode, ReasoningIndexId, ReasoningManifest};
-    use fluree_db_core::{ContentStore, Flake, Sid};
+    use fluree_db_core::reasoning_index::{
+        ClosureMode, GenerationKind, ReasoningIndexId, ReasoningManifest, ENGINE_SEMANTICS,
+    };
+    use fluree_db_core::{ContentStore, Flake, FlakeValue, Sid};
     use fluree_db_query::reasoning::MaintenanceBounds;
     use std::collections::HashSet;
 
@@ -1704,6 +1726,176 @@ mod tests {
         };
         let full = oracle(Some(bounds), None).await;
         assert!(full >= 20, "{full} refreshes fell back to a full closure");
+    }
+
+    /// The classes of `ex:alice` under owl2rl, and the generation that
+    /// answered, if one did.
+    async fn alice_classes(fluree: &Fluree, id: &str) -> (Vec<String>, Option<u64>) {
+        let resp = fluree
+            .graph(id)
+            .query()
+            .jsonld(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": "?c",
+                "where": {"@id": "ex:alice", "@type": "?c"},
+                "reasoning": "owl2rl"
+            }))
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        let served = resp.reasoning.and_then(|r| r.index).map(|i| i.generation);
+        let mut classes: Vec<String> = resp
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        classes.sort();
+        (classes, served)
+    }
+
+    /// A ledger whose owl2rl index was computed under engine semantics 0, by
+    /// an engine that also derived `ex:alice a ex:Org`; this instance runs
+    /// the current semantics again on return.
+    async fn indexed_by_an_older_engine(
+        fluree: &Fluree,
+        id: &str,
+    ) -> (ReasoningIndexId, crate::LedgerState) {
+        let ctx = json!({
+            "ex": "http://example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        });
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@graph": [
+                    {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                    {"@id": "ex:alice", "@type": "ex:Student"},
+                    {"@id": "ex:acme", "@type": "ex:Org"}
+                ]}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        let index = fluree
+            .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+            .await
+            .unwrap();
+        let db = fluree.db(id).await.unwrap();
+        let sid = |iri: &str| db.snapshot.encode_iri(iri).unwrap();
+        let wrong = Flake::new(
+            sid("http://example.org/alice"),
+            sid(fluree_vocab::rdf::TYPE),
+            FlakeValue::Ref(sid("http://example.org/Org")),
+            Sid::new(
+                fluree_vocab::namespaces::JSON_LD,
+                fluree_vocab::jsonld_names::ID,
+            ),
+            0,
+            true,
+            None,
+        );
+        *fluree.reasoning_index_state.other_engine.lock() = Some(OtherEngine {
+            version: 0,
+            extra: (0, wrong),
+        });
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published { generation: 1, .. }
+        ));
+        let (classes, served) = alice_classes(fluree, id).await;
+        assert_eq!(served, Some(1));
+        assert!(classes.contains(&"ex:Org".to_string()), "{classes:?}");
+        *fluree.reasoning_index_state.other_engine.lock() = None;
+        (index, ledger)
+    }
+
+    /// A generation computed under other engine semantics is not served
+    /// and not current: it is rebuilt at its own basis, with no new commit,
+    /// and the rebuild is served.
+    #[tokio::test]
+    async fn a_generation_of_other_engine_semantics_is_rebuilt_at_its_basis() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/engine-rebuild:main";
+        let (index, _) = indexed_by_an_older_engine(&fluree, id).await;
+
+        let (classes, served) = alice_classes(&fluree, id).await;
+        assert_eq!(served, None, "served across engine semantics");
+        assert_eq!(classes, ["ex:Person", "ex:Student"]);
+
+        let head = fluree.reasoning_indexes(id).await.unwrap().indexes[&index]
+            .head
+            .clone()
+            .unwrap();
+        assert_eq!(head.engine, 0);
+        match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
+            RefreshOutcome::Published {
+                generation,
+                kind,
+                basis_t,
+                stats,
+            } => assert_eq!(
+                (generation, kind, basis_t, stats.closure),
+                (2, GenerationKind::Rebuild, head.basis.t, ClosureMode::Full)
+            ),
+            other => panic!("{other:?}"),
+        }
+        let head = fluree.reasoning_indexes(id).await.unwrap().indexes[&index]
+            .head
+            .clone()
+            .unwrap();
+        assert_eq!(head.engine, ENGINE_SEMANTICS);
+        let (classes, served) = alice_classes(&fluree, id).await;
+        assert_eq!(served, Some(2));
+        assert_eq!(classes, ["ex:Person", "ex:Student"]);
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Current { generation: 2 }
+        ));
+    }
+
+    /// An insertion after a generation of other engine semantics computes
+    /// its closure in full rather than maintain that generation's facts;
+    /// the next insertion builds on the rebuilt one.
+    #[tokio::test]
+    async fn an_insertion_does_not_build_on_other_engine_semantics() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/engine-seed:main";
+        let (index, ledger) = indexed_by_an_older_engine(&fluree, id).await;
+        let program = json!({"reasoning": "owl2rl"});
+        let ctx = json!({"ex": "http://example.org/"});
+
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@id": "ex:bob", "@type": "ex:Student"}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        refresh_and_compare(&fluree, id, &index, &program, Some(ClosureMode::Full), 1).await;
+        let (classes, _) = alice_classes(&fluree, id).await;
+        assert_eq!(classes, ["ex:Person", "ex:Student"]);
+
+        fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@id": "ex:carol", "@type": "ex:Student"}),
+            )
+            .await
+            .unwrap();
+        refresh_and_compare(
+            &fluree,
+            id,
+            &index,
+            &program,
+            Some(ClosureMode::Incremental),
+            2,
+        )
+        .await;
     }
 
     /// Insert-only refreshes under `bounds`, each compared with a full

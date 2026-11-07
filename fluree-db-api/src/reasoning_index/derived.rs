@@ -6,7 +6,9 @@
 //! buckets of facts by subject, each its own content-addressed blob behind
 //! [`DERIVED_FACTS_MAGIC`], listed by a [`DerivedIndex`]. Facts are stored at
 //! `t` 0 and sorted, so a bucket whose facts did not change has the same
-//! content id in the next generation and is not written again.
+//! content id in the next generation and is not written again. A change to
+//! what D holds or how it is encoded bumps
+//! [`ENGINE_SEMANTICS`](fluree_db_core::reasoning_index::ENGINE_SEMANTICS).
 
 use fluree_db_core::commit::codec::{read_commit, write_commit};
 use fluree_db_core::reasoning_index::{DerivedIndex, DERIVED_FACTS_MAGIC};

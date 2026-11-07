@@ -8,6 +8,9 @@
 //! - Union-find based owl:sameAs equivalence tracking
 //! - Time/memory/fact budgets for termination control
 //!
+//! Reasoning indexes persist what this crate derives. A change to what it
+//! derives bumps `fluree_db_core::reasoning_index::ENGINE_SEMANTICS`.
+//!
 //! ## Key Types
 //!
 //! - [`ReasoningCache`]: LRU cache for derived facts, keyed by database state

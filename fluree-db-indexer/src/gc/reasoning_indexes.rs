@@ -405,6 +405,7 @@ mod tests {
                     clock: ClockPolicy::SnapshotCommitTime,
                 },
                 settled: cid("settled"),
+                engine: 1,
                 basis: Basis {
                     commit: cid("c"),
                     t: n as i64,

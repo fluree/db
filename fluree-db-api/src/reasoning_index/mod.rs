@@ -95,6 +95,18 @@ pub(crate) struct ReasoningIndexState {
     /// Bounds an incremental closure runs under, in place of the defaults.
     #[cfg(test)]
     pub(crate) maintenance: Mutex<Option<fluree_db_query::reasoning::MaintenanceBounds>>,
+    /// Builds and serves as an engine of another version would.
+    #[cfg(test)]
+    pub(crate) other_engine: Mutex<Option<OtherEngine>>,
+}
+
+/// An engine of another semantics version, whose closures also hold a fact
+/// this one does not derive.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct OtherEngine {
+    pub version: u32,
+    pub extra: (fluree_db_core::GraphId, fluree_db_core::Flake),
 }
 
 #[derive(Default)]
@@ -192,6 +204,15 @@ impl ReasoningIndexState {
             return bounds;
         }
         Default::default()
+    }
+
+    /// The engine semantics version this instance builds and serves under.
+    pub(crate) fn engine_semantics(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(other) = &*self.other_engine.lock() {
+            return other.version;
+        }
+        fluree_db_core::reasoning_index::ENGINE_SEMANTICS
     }
 
     pub(crate) fn strict_wait(&self) -> std::time::Duration {

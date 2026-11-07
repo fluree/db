@@ -8,7 +8,10 @@
 //!   or one assembled from other state, is never served;
 //! - the reasoning the query settled to has the generation's settled key,
 //!   which covers the program, the reasoned graph, rule sources, the schema
-//!   bundle and the evaluation time;
+//!   bundle, the evaluation time and the engine semantics version. A query
+//!   is served only under the version it runs itself, so while instances of
+//!   two versions run, each reasons at query time over the other's
+//!   generations;
 //! - the view is unrestricted. An index is materialized without policy, so a
 //!   policy-restricted view always reasons at query time.
 //!
@@ -135,7 +138,11 @@ impl Fluree {
         {
             return Ok(None);
         }
-        let settled = program::settled_key(reasoning, db.graph_id);
+        let settled = program::settled_key(
+            reasoning,
+            db.graph_id,
+            self.reasoning_index_state.engine_semantics(),
+        );
         // Every index's eligible generation, newest basis first: two programs
         // can settle to the same reasoning, and `asOf` takes the newest.
         let mut candidates = Vec::new();

@@ -130,9 +130,10 @@ pub(crate) fn settling_query(canonical_program: &JsonValue) -> JsonValue {
 }
 
 /// The digest of settled reasoning, as a query and the worker both reach it,
-/// for the graph `g_id` it reasons against. Budgets are left out: an index
-/// holds only complete results, so a budget never changes what it holds.
-pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId) -> ContentId {
+/// for the graph `g_id` it reasons against, under `engine` semantics. Budgets
+/// are left out: an index holds only complete results, so a budget never
+/// changes what it holds.
+pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId, engine: u32) -> ContentId {
     let modes = &reasoning.modes;
     let schema_digest = reasoning
         .schema_bundle
@@ -157,6 +158,7 @@ pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId) -> Content
         "rulesSource": reasoning.rules_source_g_id,
         "graph": g_id,
         "schema": schema_digest,
+        "engine": engine,
     });
     ContentId::new(ContentKind::LedgerConfig, &canonical_bytes(&settled))
 }
