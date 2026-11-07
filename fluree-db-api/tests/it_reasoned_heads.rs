@@ -995,3 +995,53 @@ async fn the_sparql_freshness_pragma_is_honored() {
         .unwrap();
     assert!(resp.reasoning.and_then(|r| r.head).is_some());
 }
+
+/// The streaming query path is answered from a head too: under a budget that
+/// caps query-time reasoning, the stream still returns the complete answer.
+#[tokio::test]
+async fn a_streaming_query_is_served_from_the_head() {
+    use fluree_db_api::{OwnedStreamQuery, QueryExecutionOptions, Tracker};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "heads/stream:main";
+    let students: Vec<JsonValue> = (0..10)
+        .map(|i| json!({"@id": format!("ex:s{i}"), "@type": "ex:Student"}))
+        .collect();
+    let mut graph = vec![json!({"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}})];
+    graph.extend(students);
+    ledger_with(&fluree, id, json!({"@context": ctx(), "@graph": graph})).await;
+    let capped = with(people_query(), "reasoningBudget", json!({"maxFacts": 1}));
+    let (query_time, _) = rows(&fluree, id, &capped).await;
+    assert!(
+        query_time.len() < 10,
+        "the budget caps query-time reasoning"
+    );
+
+    let head = fluree
+        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+
+    let db = fluree.db(id).await.unwrap();
+    let plan = fluree
+        .plan_stream_query(&db, &OwnedStreamQuery::JsonLd(capped))
+        .await
+        .unwrap();
+    let ledger = fluree.ledger(id).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+    fluree
+        .run_stream_query(
+            ledger,
+            plan,
+            Tracker::disabled(),
+            QueryExecutionOptions::default(),
+            tx,
+        )
+        .await;
+    let mut text = String::new();
+    while let Some(chunk) = rx.recv().await {
+        text.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    let rows = text.lines().filter(|l| l.contains("\"row\"")).count();
+    assert_eq!(rows, 10, "{text}");
+}

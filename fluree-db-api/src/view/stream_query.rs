@@ -60,6 +60,9 @@ pub struct StreamQueryPlan {
     vars: VarRegistry,
     parsed: fluree_db_query::ir::Query,
     executable: ExecutableQuery,
+    /// The reasoned head that answers the query, when one does: execution
+    /// reads it in place of the ledger state handed to the run.
+    served: Option<GraphDb>,
 }
 
 /// A parsed, validated, planned streaming query against a dataset (connection /
@@ -133,14 +136,18 @@ impl Fluree {
 
         ensure_streamable(&mut parsed, &vars)?;
 
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
+            .await?;
+        let served = self
+            .serve_from_reasoned_head(db, &mut executable, None)
             .await?;
 
         Ok(StreamQueryPlan {
             vars,
             parsed,
             executable,
+            served,
         })
     }
 
@@ -180,7 +187,10 @@ impl Fluree {
             return;
         }
 
-        let graph = GraphDb::from_ledger_state(&ledger);
+        let graph = match plan.served {
+            Some(head) => head,
+            None => GraphDb::from_ledger_state(&ledger),
+        };
 
         // Metadata-only result: carries vars/output/context/binary_graph for the
         // formatter; batches stream separately and are never collected here.
