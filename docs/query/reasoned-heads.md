@@ -27,6 +27,16 @@ Program keys: `reasoning`, `rules`, `ontology`, `reasoningTime`,
 `reasoningBudget`, `@context`, `graph`. Registering a program the branch
 already has active returns its existing head.
 
+From the CLI (a local ledger, or a server with `--remote`):
+
+```bash
+fluree reasoned-heads register mydb --reasoning owl2rl
+fluree reasoned-heads register mydb --program '{"reasoning": "datalog", "rules": [...]}'
+fluree reasoned-heads refresh mydb
+fluree reasoned-heads list mydb
+fluree reasoned-heads retire 01JC... -l mydb
+```
+
 From Rust:
 
 ```rust
