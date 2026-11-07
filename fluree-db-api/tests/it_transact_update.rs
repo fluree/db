@@ -3272,6 +3272,52 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
     );
 }
 
+/// Each anonymous `[]` in a `DELETE WHERE` with no GRAPH block is one
+/// existential, which its template deletes by: as subject, as object, and
+/// with several in one pattern.
+#[tokio::test]
+async fn sparql_delete_where_anonymous_blank_nodes_without_a_graph_block() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "delwhere-anon:main";
+    fluree.create_ledger(id).await.expect("create ledger");
+    let update = |body: &str| {
+        let text = format!("PREFIX ex: <http://example.org/ns/>\n{body}");
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(id)
+                .transact()
+                .sparql_update(&text)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .receipt
+                .retract_count
+        }
+    };
+    update(
+        r#"INSERT DATA { ex:a ex:p "one" . ex:b ex:p "two" . ex:c ex:q ex:d .
+                         ex:e ex:r ex:f ; ex:mark "m" . ex:g ex:keep "kept" }"#,
+    )
+    .await;
+    assert_eq!(update("DELETE WHERE { [] ex:p ?o }").await, 2, "as subject");
+    assert_eq!(
+        update("DELETE WHERE { ex:c ex:q [] }").await,
+        1,
+        "as object"
+    );
+    assert_eq!(
+        update(r#"DELETE WHERE { [] ex:r [] . [] ex:mark "m" }"#).await,
+        2,
+        "several in one pattern"
+    );
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let left = support::query_sparql_formatted(&fluree, &ledger, "SELECT ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("query");
+    assert_eq!(left, json!([["http://example.org/ns/keep", "kept"]]));
+}
+
 /// An update whose WHERE matches nothing succeeds without a commit on the
 /// tracked path, as it does on the plain one. The tracked path (also the
 /// path every policy-carrying builder write takes) used to commit the empty
