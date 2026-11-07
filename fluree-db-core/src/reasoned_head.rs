@@ -277,9 +277,36 @@ impl ReasonedManifest {
     }
 }
 
-/// Magic prefix of a derived-only set blob; the body is a commit-codec blob
-/// holding the facts.
+/// Magic prefix of one bucket of a derived-only set; the body is a
+/// commit-codec blob holding the bucket's facts.
 pub const DERIVED_FACTS_MAGIC: &[u8; 4] = b"FDS1";
+
+/// A generation's derived-only set: buckets of facts by subject, each its
+/// own content-addressed blob, so a generation that changes a few subjects
+/// writes only their buckets. Kind [`ContentKind::DerivedFacts`], like its
+/// buckets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedIndex {
+    pub facts: u64,
+    pub buckets: Vec<ContentId>,
+}
+
+const DERIVED_INDEX_MAGIC: &[u8; 4] = b"FDI1";
+
+impl DerivedIndex {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = DERIVED_INDEX_MAGIC.to_vec();
+        serde_json::to_writer(&mut out, self).expect("derived index serializes");
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let body = bytes
+            .strip_prefix(DERIVED_INDEX_MAGIC.as_slice())
+            .ok_or_else(|| "not a derived-only set index (bad magic)".to_string())?;
+        serde_json::from_slice(body).map_err(|e| format!("derived-only set index: {e}"))
+    }
+}
 
 // ============================================================================
 // Admission

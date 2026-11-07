@@ -263,11 +263,17 @@ async fn main() {
     let storage2 = storage_report(&fluree, dir.path(), &head, &manifest2.root).await;
     let (q1_rows, q1_served) = run(&fluree, &queries[0].1).await;
 
-    let derived_set_bytes = head_store
-        .get(&manifest2.derived)
-        .await
-        .map(|b| b.len())
-        .unwrap_or(0);
+    let derived_set_bytes = {
+        let index = fluree_db_core::reasoned_head::DerivedIndex::decode(
+            &head_store.get(&manifest2.derived).await.unwrap(),
+        )
+        .unwrap();
+        let mut total = 0usize;
+        for bucket in &index.buckets {
+            total += head_store.get(bucket).await.map(|b| b.len()).unwrap_or(0);
+        }
+        total
+    };
     let report = json!({
         "ledger": LEDGER,
         "rebuild": serde_json::to_value(&rebuild).unwrap(),

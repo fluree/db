@@ -97,6 +97,15 @@ pub async fn generation_reach(
     reach.insert(generation.manifest.root.clone());
     reach.insert(generation.manifest.derived.clone());
     reach.insert(generation.manifest_id.clone());
+    let derived = store.get(&generation.manifest.derived).await.map_err(|e| {
+        IndexerError::StorageRead(format!(
+            "derived-only set {}: {e}",
+            generation.manifest.derived
+        ))
+    })?;
+    let index = fluree_db_core::reasoned_head::DerivedIndex::decode(&derived)
+        .map_err(IndexerError::StorageRead)?;
+    reach.extend(index.buckets);
     Ok(reach)
 }
 

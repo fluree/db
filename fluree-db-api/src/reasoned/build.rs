@@ -37,7 +37,7 @@ use fluree_db_query::execute::{compute_derived_facts, QueryRequest};
 use fluree_db_query::schema_bundle::SchemaBundleOverlay;
 use serde_json::Value as JsonValue;
 
-use super::derived::{decode_derived_only, encode_derived_only, encode_facts};
+use super::derived::{encode_facts, read_derived_only, write_derived_only};
 use super::program;
 use crate::query::helpers::parse_jsonld_query;
 use crate::view::GraphDb;
@@ -491,13 +491,7 @@ impl Fluree {
             .map(|f| to_flake(f, true))
             .collect();
         let derived_count = derived_only_flakes.len() as u64;
-        let derived_id = head_cs
-            .put(
-                ContentKind::DerivedFacts,
-                &encode_derived_only(basis.t, derived_only_flakes)?,
-            )
-            .await
-            .map_err(|e| ApiError::internal(format!("write derived-only set: {e}")))?;
+        let derived_id = write_derived_only(head_cs.as_ref(), derived_only_flakes).await?;
 
         let stats = GenerationStats {
             derived_only: derived_count,
@@ -760,11 +754,8 @@ async fn load_previous(
             manifest.root, manifest.generation
         )));
     }
-    let derived_bytes = store
-        .get(&manifest.derived)
-        .await
-        .map_err(|e| ApiError::internal(format!("read derived-only set: {e}")))?;
-    let derived = decode_derived_only(&derived_bytes)?
+    let derived = read_derived_only(store, &manifest.derived)
+        .await?
         .into_iter()
         .map(|flake| (graph_of(db, flake.g.as_ref()), flake))
         .collect();
