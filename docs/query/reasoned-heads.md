@@ -54,8 +54,9 @@ curl -X POST http://localhost:8090/v1/fluree/reasoned-heads/refresh \
 ```
 
 `/reasoned-heads/list` returns the branch's heads; `/reasoned-heads/retire`
-with `{"ledger", "headId"}` stops a head from being served or refreshed. All
-four routes are admin routes.
+with `{"ledger", "headId"}` stops a head from being served or refreshed, and
+its files are deleted once the retention window has passed. A branch takes at
+most eight active heads. All four routes are admin routes.
 
 ## Which queries a head answers
 
@@ -80,8 +81,9 @@ the `x-fdb-reasoning` header):
 "reasoning": {"head": {"headId": "01JC...", "generation": 4, "basisT": 12, "basisCommit": "bafy..."}}
 ```
 
-JSON-LD, SPARQL and streaming queries are served from heads. Dataset queries
-reason at query time.
+JSON-LD, SPARQL and streaming queries are served from heads, and so are
+dataset queries whose graphs all belong to the one ledger. A dataset that
+reaches other ledgers reasons at query time.
 
 ## Freshness
 
