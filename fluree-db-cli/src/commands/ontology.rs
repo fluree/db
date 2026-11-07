@@ -186,6 +186,13 @@ fn print_report(file: &Path, report: &Report, names: &Names) {
         count(report.classes, "class", "classes"),
         count(report.properties, "property", "properties")
     );
+    if report.event_classes > 0 {
+        head.push_str(&format!(
+            " ({} with {})",
+            count(report.event_classes, "event class", "event classes"),
+            count(report.event_kinds, "kind", "kinds")
+        ));
+    }
     if report.records > 0 {
         head.push_str(&format!(
             ", {}",

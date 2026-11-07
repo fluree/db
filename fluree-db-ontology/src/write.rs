@@ -8,8 +8,9 @@
 //! blank-node constructs are dropped. A label that reads as an identifier
 //! (`employer_id`, `AboutPage`) is rewritten in words (`employer id`,
 //! `about page`). Domains, ranges and other axioms stay: the model doesn't
-//! see them, but a reading is still checked against them. An optional slice
-//! cuts the vocabulary first.
+//! see them, but a reading is still checked against them. What a reader
+//! refuses wherever it appears (`xt:example`, extraction results) is
+//! dropped. An optional slice cuts the vocabulary first.
 //!
 //! The catalog, if the file has one, is kept, except that a record with
 //! `rdfs:label` and no SKOS label (a vocabulary's enumeration members) gets
@@ -20,8 +21,8 @@ use crate::policy;
 use crate::read::{Parsed, Quad};
 use crate::slice::{self, Slice, UnknownSeed};
 use crate::vocab::{
-    RDFS_COMMENT, RDFS_LABEL, SKOS_ALT_LABEL, SKOS_DEFINITION, SKOS_HIDDEN_LABEL, SKOS_PREF_LABEL,
-    WELL_KNOWN_PREFIXES,
+    RDFS_COMMENT, RDFS_LABEL, RESULT_PREDICATES, SKOS_ALT_LABEL, SKOS_DEFINITION,
+    SKOS_HIDDEN_LABEL, SKOS_PREF_LABEL, WELL_KNOWN_PREFIXES, XT_EXAMPLE,
 };
 use crate::words;
 use fluree_graph_format::{
@@ -105,6 +106,21 @@ pub fn rewrite(parsed: &Parsed, seeds: &[String], depth: usize) -> Result<Rewrit
     }
     let records = crate::check::records(&catalog).len();
     quads.extend(catalog);
+    // refused wherever they appear: they go, counted
+    let before = quads.len();
+    quads.retain(|q| &*q.predicate != XT_EXAMPLE);
+    let examples = before - quads.len();
+    let before = quads.len();
+    quads.retain(|q| !RESULT_PREDICATES.contains(&&*q.predicate));
+    let annotations = before - quads.len();
+    for (key, n) in [
+        (EXAMPLES_DROPPED, examples),
+        (ANNOTATIONS_DROPPED, annotations),
+    ] {
+        if n > 0 {
+            counts.insert(key.to_string(), n);
+        }
+    }
     for q in &mut quads {
         q.graph = None;
     }
@@ -124,6 +140,8 @@ pub const OWL_AXIOMS_DROPPED: &str = "OWL axioms dropped";
 pub const DECLARATIONS_DROPPED: &str = "annotation property and datatype declarations dropped";
 pub const RECORD_LABELS: &str = "skos:prefLabel from rdfs:label (catalog)";
 pub const RECORD_DEFINITIONS: &str = "skos:definition from rdfs:comment (catalog)";
+pub const EXAMPLES_DROPPED: &str = "xt:example dropped";
+pub const ANNOTATIONS_DROPPED: &str = "extraction annotations dropped";
 
 /// Rewrite shown terms' labels that read as identifiers into words; how
 /// many were.
@@ -314,6 +332,41 @@ pub fn serialize(
 mod tests {
     use super::*;
     use crate::read::{parse, RdfFormat};
+
+    #[test]
+    fn what_a_reader_refuses_is_dropped() {
+        let parsed = parse(
+            r#"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+               @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+               @prefix xt: <https://ns.flur.ee/extract#> .
+               @prefix ex: <https://ex.com/> .
+               ex:Commitment a rdfs:Class, xt:EventClass ; rdfs:label "commitment" ;
+                 xt:example "I'll call you back", "we will send the quote" .
+               ex:callback a ex:Commitment ; skos:prefLabel "callback" ;
+                 xt:accepted true ; xt:linkConfidence 0.8 ."#,
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let out = rewrite(&parsed, &[], 1).unwrap();
+        assert_eq!(out.adapted.get(EXAMPLES_DROPPED), Some(&2));
+        assert_eq!(out.adapted.get(ANNOTATIONS_DROPPED), Some(&2));
+        // the event class keeps its declaration
+        assert!(out
+            .quads
+            .iter()
+            .any(|q| q.object.as_iri() == Some(crate::vocab::XT_EVENT_CLASS)));
+        let ttl = serialize(
+            &out.quads,
+            &used_prefixes(&out.quads, &parsed.prefixes),
+            OutputFormat::Turtle,
+        )
+        .unwrap();
+        let again = parse(&ttl, RdfFormat::Turtle, None).unwrap();
+        let report = crate::check::check(&again, &Default::default()).unwrap();
+        assert!(report.passes(), "{:?}", report.will_fail);
+        assert_eq!(report.event_classes, 1);
+    }
 
     #[test]
     fn skos_and_owl_become_what_the_model_reads() {

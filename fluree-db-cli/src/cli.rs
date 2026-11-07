@@ -2780,7 +2780,8 @@ pub enum OntologyAction {
     /// model reached over HTTP, `fluree doc ingest`'s [doc.reader]) locally,
     /// and reports what a request carrying this ontology (and catalog) would
     /// fail for, what the reader reads another way, what it never sees, and
-    /// advice. Nothing is sent anywhere. Exits 1 when a request would be
+    /// advice, including whether it finds the events of each event class
+    /// (xt:EventClass) and their kinds. Nothing is sent anywhere. Exits 1 when a request would be
     /// refused. The language-model extractor of `fluree doc ingest` reads more
     /// of an ontology (domains, ranges, every parent class).
     ///
