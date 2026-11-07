@@ -69,9 +69,14 @@ pub async fn run_fixpoint_incremental(
     inserted: &[Flake],
     opts: &ReasoningOptions,
 ) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
-    Ok(run(db, opts, Some(inserted))
-        .await?
-        .map(|(flakes, _, diagnostics)| (flakes, diagnostics)))
+    let start = Instant::now();
+    let out = run(db, opts, Some(inserted)).await?;
+    // Past the phases: dropping the join indexes and the closed state.
+    tracing::debug!(
+        returned_ms = start.elapsed().as_millis() as u64,
+        "OWL 2 RL incremental fixpoint returned"
+    );
+    Ok(out.map(|(flakes, _, diagnostics)| (flakes, diagnostics)))
 }
 
 /// Whether the program has a rule that derives `owl:sameAs`.
@@ -433,22 +438,21 @@ async fn run(
         diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
     }
     let total_ms = start.elapsed().as_millis() as u64;
+    let derived_len = derived.derived_len();
+    let derived_flakes = derived.into_derived_flakes();
     tracing::debug!(
         incremental = inserted.is_some(),
         extract_ms = extracted_ms,
         seed_scan_ms = seeded_ms - extracted_ms,
         join_index_ms = joined_ms - seeded_ms,
         rounds_ms = total_ms - joined_ms,
+        convert_ms = start.elapsed().as_millis() as u64 - total_ms,
         rounds = iterations,
-        derived = derived.derived_len(),
+        derived = derived_len,
         "OWL 2 RL fixpoint phases"
     );
 
-    Ok(Some((
-        derived.into_derived_flakes(),
-        frozen_same_as,
-        diagnostics,
-    )))
+    Ok(Some((derived_flakes, frozen_same_as, diagnostics)))
 }
 
 /// Fails the run once the request it serves has been cancelled. A cancelled

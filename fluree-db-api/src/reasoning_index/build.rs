@@ -1036,13 +1036,16 @@ impl Fluree {
             Ok(None) => return Ok(None),
             Err(e) => return Ok(Some(Err(e.into()))),
         };
+        let computed_ms = started.elapsed().as_millis() as u64;
+        let facts = outcome_facts(outcome);
         tracing::debug!(
             inserted = inserted.len(),
             state_load_ms = loaded_ms,
-            fixpoint_ms = started.elapsed().as_millis() as u64 - loaded_ms,
+            fixpoint_ms = computed_ms - loaded_ms,
+            collect_ms = started.elapsed().as_millis() as u64 - computed_ms,
             "incremental closure"
         );
-        Ok(Some(Ok(outcome_facts(outcome))))
+        Ok(Some(Ok(facts)))
     }
 
     /// Publish `manifest` as `candidate`'s generation: admit it against the

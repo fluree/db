@@ -105,6 +105,69 @@ fn dir_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+/// Every file under `path`, with its size.
+fn file_sizes(path: &Path, out: &mut std::collections::HashMap<PathBuf, u64>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            file_sizes(&p, out);
+        } else {
+            out.insert(p, entry.metadata().map(|m| m.len()).unwrap_or(0));
+        }
+    }
+}
+
+/// The ledger's index-side files: a reasoning index's folder and the
+/// shared dictionaries.
+fn index_side_files(dir: &Path) -> std::collections::HashMap<PathBuf, u64> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(branch) = find_dir(dir, "main") {
+        file_sizes(&branch.join("@reasoning"), &mut out);
+    }
+    if let Some(shared) = find_dir(dir, "@shared") {
+        file_sizes(&shared, &mut out);
+    }
+    out
+}
+
+/// The bytes of files new since `before`, by what they hold.
+fn new_bytes_by_kind(
+    before: &std::collections::HashMap<PathBuf, u64>,
+    after: &std::collections::HashMap<PathBuf, u64>,
+) -> JsonValue {
+    let mut by_kind: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+    for (path, size) in after {
+        if before.contains_key(path) {
+            continue;
+        }
+        let p = path.to_string_lossy();
+        let kind = [
+            ("/@shared/", "shared_dicts"),
+            ("/index/objects/leaves/", "leaves"),
+            ("/index/objects/branches/", "branches"),
+            ("/index/objects/history/", "history_sidecars"),
+            ("/index/roots/", "roots"),
+            ("/index/stats/", "stats"),
+            ("/derived/", "derived"),
+            ("/manifests/", "manifests"),
+        ]
+        .into_iter()
+        .find(|(part, _)| p.contains(part))
+        .map_or("other", |(_, kind)| kind);
+        let entry = by_kind.entry(kind).or_default();
+        entry.0 += 1;
+        entry.1 += size;
+    }
+    by_kind
+        .into_iter()
+        .map(|(kind, (files, bytes))| (kind.to_string(), json!({"files": files, "bytes": bytes})))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
     for entry in std::fs::read_dir(root).ok()?.flatten() {
         let path = entry.path();
@@ -368,6 +431,7 @@ async fn main() {
         after_commit.push(rows);
     }
     let index_bytes_before = storage["index_bytes"].as_u64().unwrap_or(0);
+    let files_before = index_side_files(&dir);
     let logical_started = std::time::Instant::now();
     let logical = fluree
         .refresh_reasoning_index(LEDGER, &index)
@@ -385,6 +449,7 @@ async fn main() {
     )
     .unwrap();
     let storage2 = storage_report(&fluree, &dir, &index, &manifest2.root).await;
+    let written_by_kind = new_bytes_by_kind(&files_before, &index_side_files(&dir));
     let mut parity_after = Vec::with_capacity(queries.len());
     let mut all_equal_after = true;
     for ((name, sparql), expected_rows) in queries.iter().zip(&after_commit) {
@@ -421,6 +486,7 @@ async fn main() {
             "storage": storage2,
             "index_bytes_written": storage2["index_bytes"].as_u64().unwrap_or(0).saturating_sub(index_bytes_before),
             "derived_set_bytes": derived_set_bytes,
+            "new_files_by_kind": written_by_kind,
             "parity": {"all_equal_and_served": all_equal_after, "queries": parity_after},
         }
     });

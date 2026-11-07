@@ -270,11 +270,16 @@ pub async fn reason_owl2rl_incremental(
     else {
         return Ok(None);
     };
+    let start = fluree_db_core::clock::Instant::now();
     let mut builder = DerivedFactsBuilder::with_capacity(derived_flakes.len());
     for flake in derived_flakes {
         builder.push(flake);
     }
     let derived_overlay = builder.build(FrozenSameAs::empty(), db.overlay.epoch());
+    tracing::debug!(
+        overlay_ms = start.elapsed().as_millis() as u64,
+        "OWL 2 RL incremental overlay"
+    );
     Ok(Some(Arc::new(ReasoningResult::new(
         derived_overlay,
         diagnostics,
