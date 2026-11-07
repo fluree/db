@@ -124,7 +124,7 @@ pub struct GraphDb {
     pub(crate) instance_bits: u128,
     /// The commit whose state this view is, exactly: set for a branch's
     /// state at its head, `None` for a staged, historical or assembled
-    /// view. A reasoned head answers only a view it names.
+    /// view. A reasoning index answers only a view it names.
     pub(crate) commit_id: Option<fluree_db_core::ContentId>,
 
     /// Graph ID within the ledger (0 = default graph).

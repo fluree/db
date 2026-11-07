@@ -233,13 +233,13 @@ impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsLookup for ProxyNameService {
-    async fn get_reasoned_heads(
+impl fluree_db_nameservice::ReasoningIndexesLookup for ProxyNameService {
+    async fn get_reasoning_indexes(
         &self,
         _ledger_id: &str,
-    ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
         Err(NameServiceError::storage(
-            "get_reasoned_heads not supported in proxy mode".to_string(),
+            "get_reasoning_indexes not supported in proxy mode".to_string(),
         ))
     }
 }

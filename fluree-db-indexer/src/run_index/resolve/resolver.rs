@@ -1487,7 +1487,7 @@ impl SharedResolverState {
         self.resolve_ops_into_chunk(bytes, Some(commit_hash_hex), chunk)
     }
 
-    /// Resolve a reasoned head's derived facts, carried in commit-codec
+    /// Resolve a reasoning index's derived facts, carried in commit-codec
     /// form, into `chunk`. They are facts, not a commit: nothing is written
     /// to the txn-meta graph for them.
     pub fn resolve_derived_into_chunk(

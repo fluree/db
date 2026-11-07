@@ -2162,21 +2162,21 @@ impl ConfigPublisher for RaftNameService {
 }
 
 fn heads_from_stored(
-    stored: Option<&crate::raft::state_machine::StoredReasonedHeads>,
-) -> Result<fluree_db_nameservice::ReasonedHeads> {
+    stored: Option<&crate::raft::state_machine::StoredReasoningIndexes>,
+) -> Result<fluree_db_nameservice::ReasoningIndexes> {
     match stored {
         Some(stored) if !stored.json.is_empty() => serde_json::from_str(&stored.json)
-            .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}"))),
-        _ => Ok(fluree_db_nameservice::ReasonedHeads::default()),
+            .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}"))),
+        _ => Ok(fluree_db_nameservice::ReasoningIndexes::default()),
     }
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsLookup for RaftNameService {
-    async fn get_reasoned_heads(
+impl fluree_db_nameservice::ReasoningIndexesLookup for RaftNameService {
+    async fn get_reasoning_indexes(
         &self,
         ledger_id: &str,
-    ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let canonical = format_ledger_id(&name, &branch);
         let state = self.state.read().await;
@@ -2187,44 +2187,46 @@ impl fluree_db_nameservice::ReasonedHeadsLookup for RaftNameService {
         if !branch_registered {
             return Ok(None);
         }
-        heads_from_stored(state.reasoned_heads.get(&canonical)).map(Some)
+        heads_from_stored(state.reasoning_indexes.get(&canonical)).map(Some)
     }
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsPublisher for RaftNameService {
-    async fn push_reasoned_heads_fenced(
+impl fluree_db_nameservice::ReasoningIndexesPublisher for RaftNameService {
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &fluree_db_nameservice::ReasonedHeads,
-    ) -> Result<fluree_db_nameservice::ReasonedHeadsCasResult> {
-        use fluree_db_nameservice::ReasonedHeadsCasResult;
+        new: &fluree_db_nameservice::ReasoningIndexes,
+    ) -> Result<fluree_db_nameservice::ReasoningIndexesCasResult> {
+        use fluree_db_nameservice::ReasoningIndexesCasResult;
         let (name, branch) = split_ledger_id(ledger_id)?;
         let json = serde_json::to_string(new)
-            .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}")))?;
+            .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}")))?;
         let cmd = fenced_command(
             ledger_id,
-            SmCommand::PushReasonedHeads {
+            SmCommand::PushReasoningIndexes {
                 ledger_id: format_ledger_id(&name, &branch),
                 expected_v,
-                new: crate::raft::state_machine::StoredReasonedHeads { v: new.v, json },
+                new: crate::raft::state_machine::StoredReasoningIndexes { v: new.v, json },
             },
             fence,
         )?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         match response {
-            SmResponse::ReasonedHeadsUpdated => Ok(ReasonedHeadsCasResult::Updated),
-            SmResponse::ReasonedHeadsConflict { actual } => Ok(ReasonedHeadsCasResult::Conflict {
-                actual: match actual {
-                    Some(stored) => Some(heads_from_stored(Some(&stored))?),
-                    None => None,
-                },
-            }),
+            SmResponse::ReasoningIndexesUpdated => Ok(ReasoningIndexesCasResult::Updated),
+            SmResponse::ReasoningIndexesConflict { actual } => {
+                Ok(ReasoningIndexesCasResult::Conflict {
+                    actual: match actual {
+                        Some(stored) => Some(heads_from_stored(Some(&stored))?),
+                        None => None,
+                    },
+                })
+            }
             other => Err(NameServiceError::storage(format!(
-                "unexpected Response variant for PushReasonedHeads: {other:?}"
+                "unexpected Response variant for PushReasoningIndexes: {other:?}"
             ))),
         }
     }
@@ -2782,7 +2784,7 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
-                head: None,
+                index: None,
             }),
             sql: None,
             sql_elided: None,
@@ -2866,7 +2868,7 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
-                head: None,
+                index: None,
             }),
             sql: None,
             sql_elided: None,
@@ -3133,7 +3135,7 @@ mod tests {
             capped_rules: vec!["ex:rule".to_string()],
             pending_rules: vec!["ex:later".to_string()],
             evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
-            head: None,
+            index: None,
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -3220,9 +3222,9 @@ mod tests {
             capped_rules: rt_capped_rules,
             pending_rules: rt_pending_rules,
             evaluation_time: rt_evaluation_time,
-            head: rt_head,
+            index: rt_index,
         } = rt_reasoning.expect("reasoning Some on round-trip");
-        assert_eq!(rt_head, None);
+        assert_eq!(rt_index, None);
         // Not carried by the recorded mirror: adding them would change the
         // wire form of records already in the log.
         assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());

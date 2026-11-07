@@ -126,14 +126,14 @@ pub(crate) struct NsFileV2 {
     #[serde(rename = "f:fence", default, skip_serializing_if = "Option::is_none")]
     pub fence: Option<Fence>,
 
-    /// The branch's reasoned-heads document; absent until a head is
+    /// The branch's reasoning-indexes document; absent until an index is
     /// registered.
     #[serde(
-        rename = "f:reasonedHeads",
+        rename = "f:reasoningIndexes",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub reasoned_heads: Option<crate::ReasonedHeads>,
+    pub reasoning_indexes: Option<crate::ReasoningIndexes>,
 
     /// Fields this binary does not know, kept so that rewriting the record
     /// preserves what a newer binary added.
@@ -175,7 +175,7 @@ impl NsFileV2 {
             branch_point: None,
             branches: record.branches,
             fence: record.fence,
-            reasoned_heads: None,
+            reasoning_indexes: None,
             extra: Default::default(),
         }
     }
@@ -471,7 +471,7 @@ mod tests {
             branch_point: None,
             branches: 0,
             fence: None,
-            reasoned_heads: None,
+            reasoning_indexes: None,
             extra: Default::default(),
         }
     }

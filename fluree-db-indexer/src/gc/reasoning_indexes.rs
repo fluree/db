@@ -1,6 +1,6 @@
-//! Garbage collection for reasoned heads.
+//! Garbage collection for reasoning indexes.
 //!
-//! A head lives in its own namespace, `{root}/{branch}/@reasoned/{head_id}`,
+//! An index lives in its own namespace, `{root}/{branch}/@reasoning/{index_id}`,
 //! and shares only dictionary blobs with the rest of the ledger. Its chain is
 //! its **manifest chain**: each published generation names its predecessor
 //! by `prev_manifest`. One reachable set per generation serves every path:
@@ -10,16 +10,16 @@
 //! - its derived-only set.
 //!
 //! Two uses:
-//! - [`shared_refs_of_heads`]: the dictionary blobs a branch's heads reach,
+//! - [`shared_refs_of_indexes`]: the dictionary blobs a branch's indexes reach,
 //!   which every pass that releases a shared blob must treat as live.
-//! - [`plan_head_release`] / [`release_head_generations`]: the head's own
+//! - [`plan_generation_release`] / [`release_generations`]: the index's own
 //!   collector, which never overrides the age guard.
 
 use crate::error::{IndexerError, Result};
 use crate::gc::collector::is_shared_across_branches;
 use fluree_db_binary_index::format::expanded_cas::ChainCasIds;
 use fluree_db_binary_index::format::index_root::IndexRoot;
-use fluree_db_core::reasoned_head::{HeadId, ReasonedHeads, ReasonedManifest};
+use fluree_db_core::reasoning_index::{ReasoningIndexId, ReasoningIndexes, ReasoningManifest};
 use fluree_db_core::{ContentId, ContentStore, StorageBackend, StorageNamespace};
 use std::collections::HashSet;
 
@@ -29,41 +29,42 @@ fn decode_root(bytes: &[u8]) -> std::result::Result<IndexRoot, String> {
 
 /// One published generation, as GC reads it back from storage.
 #[derive(Debug, Clone)]
-pub struct HeadGeneration {
+pub struct IndexGeneration {
     pub manifest_id: ContentId,
-    pub manifest: ReasonedManifest,
+    pub manifest: ReasoningManifest,
 }
 
-/// The generations of a head still in storage, newest first, starting at
+/// The generations of an index still in storage, newest first, starting at
 /// `newest`.
 ///
 /// The walk ends at a `prev_manifest` that is absent, which is how a chain
 /// looks once its oldest generations are released. A manifest that exists but
 /// cannot be read fails the walk: a shorter chain would lose references a
 /// retained generation still holds.
-pub async fn head_generations(
+pub async fn index_generations(
     store: &dyn ContentStore,
     newest: &ContentId,
-) -> Result<Vec<HeadGeneration>> {
+) -> Result<Vec<IndexGeneration>> {
     let mut out = Vec::new();
     let mut next = Some(newest.clone());
     while let Some(id) = next.take() {
         let bytes = match store.get(&id).await {
             Ok(bytes) => bytes,
             Err(e) if !out.is_empty() && !store.has(&id).await.unwrap_or(true) => {
-                tracing::debug!(manifest = %id, error = %e, "head chain ends at a released manifest");
+                tracing::debug!(manifest = %id, error = %e, "manifest chain ends at a released manifest");
                 break;
             }
             Err(e) => {
                 return Err(IndexerError::StorageRead(format!(
-                    "reasoned-head manifest {id}: {e}"
+                    "reasoning-index manifest {id}: {e}"
                 )))
             }
         };
-        let manifest = ReasonedManifest::decode(&bytes)
-            .map_err(|e| IndexerError::StorageRead(format!("reasoned-head manifest {id}: {e}")))?;
+        let manifest = ReasoningManifest::decode(&bytes).map_err(|e| {
+            IndexerError::StorageRead(format!("reasoning-index manifest {id}: {e}"))
+        })?;
         next = manifest.prev_manifest.clone();
-        out.push(HeadGeneration {
+        out.push(IndexGeneration {
             manifest_id: id,
             manifest,
         });
@@ -75,24 +76,24 @@ pub async fn head_generations(
 /// expansion, and its derived-only set.
 pub async fn generation_reach(
     store: &dyn ContentStore,
-    generation: &HeadGeneration,
+    generation: &IndexGeneration,
 ) -> Result<HashSet<ContentId>> {
     let root_bytes = store.get(&generation.manifest.root).await.map_err(|e| {
         IndexerError::StorageRead(format!(
-            "reasoned-head root {}: {e}",
+            "reasoning-index root {}: {e}",
             generation.manifest.root
         ))
     })?;
     let root = decode_root(&root_bytes).map_err(|e| {
         IndexerError::StorageRead(format!(
-            "reasoned-head root {}: {e}",
+            "reasoning-index root {}: {e}",
             generation.manifest.root
         ))
     })?;
     let mut ids = ChainCasIds::new();
     ids.add_root(store, &root)
         .await
-        .map_err(|e| IndexerError::StorageRead(format!("expand reasoned-head root: {e}")))?;
+        .map_err(|e| IndexerError::StorageRead(format!("expand reasoning-index root: {e}")))?;
     let mut reach = ids.into_ids();
     reach.insert(generation.manifest.root.clone());
     reach.insert(generation.manifest.derived.clone());
@@ -103,7 +104,7 @@ pub async fn generation_reach(
             generation.manifest.derived
         ))
     })?;
-    let index = fluree_db_core::reasoned_head::DerivedIndex::decode(&derived)
+    let index = fluree_db_core::reasoning_index::DerivedIndex::decode(&derived)
         .map_err(IndexerError::StorageRead)?;
     reach.extend(index.buckets);
     Ok(reach)
@@ -114,9 +115,9 @@ async fn root_dict_refs(store: &dyn ContentStore, root_id: &ContentId) -> Result
     let bytes = store
         .get(root_id)
         .await
-        .map_err(|e| IndexerError::StorageRead(format!("reasoned-head root {root_id}: {e}")))?;
+        .map_err(|e| IndexerError::StorageRead(format!("reasoning-index root {root_id}: {e}")))?;
     let root = decode_root(&bytes)
-        .map_err(|e| IndexerError::StorageRead(format!("reasoned-head root {root_id}: {e}")))?;
+        .map_err(|e| IndexerError::StorageRead(format!("reasoning-index root {root_id}: {e}")))?;
     Ok(root
         .all_cas_ids()
         .into_iter()
@@ -124,35 +125,35 @@ async fn root_dict_refs(store: &dyn ContentStore, root_id: &ContentId) -> Result
         .collect())
 }
 
-/// Every shared dictionary blob any generation of any head in `heads`
+/// Every shared dictionary blob any generation of any index in `indexes`
 /// still reaches. `branch` is the namespace of the branch that owns the
-/// document. Retired heads count until their files are cleaned up: they are
+/// document. Retired indexes count until their files are cleaned up: they are
 /// participants.
 ///
 /// Any unreadable generation fails the call, so a caller defers rather than
-/// releases blobs a head may still read.
-pub async fn shared_refs_of_heads(
+/// releases blobs an index may still read.
+pub async fn shared_refs_of_indexes(
     backend: &StorageBackend,
     branch: &StorageNamespace,
-    heads: &ReasonedHeads,
+    indexes: &ReasoningIndexes,
 ) -> Result<HashSet<ContentId>> {
     let mut refs = HashSet::new();
-    for (head_id, entry) in &heads.heads {
-        let Some(pointer) = &entry.published else {
+    for (index_id, entry) in &indexes.indexes {
+        let Some(pointer) = &entry.head else {
             continue;
         };
-        let store = backend.content_store(&branch.reasoned_head(head_id.as_str()));
-        for generation in head_generations(store.as_ref(), &pointer.manifest).await? {
+        let store = backend.content_store(&branch.reasoning_index(index_id.as_str()));
+        for generation in index_generations(store.as_ref(), &pointer.manifest).await? {
             refs.extend(root_dict_refs(store.as_ref(), &generation.manifest.root).await?);
         }
     }
     Ok(refs)
 }
 
-/// Every shared dictionary blob the reasoned heads of `branches` reach, read
-/// from each branch's heads document as it stands. A branch whose document
+/// Every shared dictionary blob the reasoning indexes of `branches` reach, read
+/// from each branch's reasoning-indexes document as it stands. A branch whose document
 /// cannot be read fails the call.
-pub async fn shared_refs_of_branch_heads(
+pub async fn shared_refs_of_branch_indexes(
     backend: &StorageBackend,
     nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
     branches: &[crate::gc::BranchIndexHead],
@@ -160,20 +161,20 @@ pub async fn shared_refs_of_branch_heads(
     let mut refs = HashSet::new();
     for branch in branches {
         let doc = nameservice
-            .get_reasoned_heads(branch.ledger_id.as_str())
+            .get_reasoning_indexes(branch.ledger_id.as_str())
             .await
             .map_err(|e| IndexerError::NameService(e.to_string()))?;
         if let Some(doc) = doc {
-            refs.extend(shared_refs_of_heads(backend, &branch.namespace, &doc).await?);
+            refs.extend(shared_refs_of_indexes(backend, &branch.namespace, &doc).await?);
         }
     }
     Ok(refs)
 }
 
-/// The reasoned heads of `branches` as sweep participants: one per
-/// generation still in storage, rooted in its head's namespace, so the sweep
+/// The reasoning indexes of `branches` as sweep participants: one per
+/// generation still in storage, rooted in its index's namespace, so the sweep
 /// counts every file a retained generation reaches as live.
-pub async fn head_sweep_participants(
+pub async fn index_sweep_participants(
     backend: &StorageBackend,
     nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
     branches: &[crate::gc::BranchIndexHead],
@@ -181,19 +182,19 @@ pub async fn head_sweep_participants(
     let mut out = Vec::new();
     for branch in branches {
         let doc = nameservice
-            .get_reasoned_heads(branch.ledger_id.as_str())
+            .get_reasoning_indexes(branch.ledger_id.as_str())
             .await
             .map_err(|e| IndexerError::NameService(e.to_string()))?;
         let Some(doc) = doc else {
             continue;
         };
-        for (head_id, entry) in &doc.heads {
-            let Some(pointer) = &entry.published else {
+        for (index_id, entry) in &doc.indexes {
+            let Some(pointer) = &entry.head else {
                 continue;
             };
-            let namespace = branch.namespace.reasoned_head(head_id.as_str());
+            let namespace = branch.namespace.reasoning_index(index_id.as_str());
             let store = backend.content_store(&namespace);
-            for generation in head_generations(store.as_ref(), &pointer.manifest).await? {
+            for generation in index_generations(store.as_ref(), &pointer.manifest).await? {
                 out.push(crate::gc::BranchIndexHead {
                     ledger_id: branch.ledger_id.clone(),
                     namespace: namespace.clone(),
@@ -205,11 +206,11 @@ pub async fn head_sweep_participants(
     Ok(out)
 }
 
-/// Which generations a head pass keeps and which it may release./// Which generations a head pass keeps and which it may release.
+/// Which generations an index pass keeps and which it may release./// Which generations an index pass keeps and which it may release.
 #[derive(Debug, Default)]
-pub struct HeadReleasePlan {
-    pub retained: Vec<HeadGeneration>,
-    pub released: Vec<HeadGeneration>,
+pub struct GenerationReleasePlan {
+    pub retained: Vec<IndexGeneration>,
+    pub released: Vec<IndexGeneration>,
 }
 
 /// Split `generations` (newest first) into what a pass keeps and releases.
@@ -219,12 +220,12 @@ pub struct HeadReleasePlan {
 /// `min_age_ms`. Supersession times are read from storage, so a restart or a
 /// configuration change cannot shorten the protection of generations already
 /// published. Nothing overrides the guard; publication is throttled instead.
-pub fn plan_head_release(
-    generations: Vec<HeadGeneration>,
+pub fn plan_generation_release(
+    generations: Vec<IndexGeneration>,
     now_ms: i64,
     min_age_ms: i64,
-) -> HeadReleasePlan {
-    let mut plan = HeadReleasePlan::default();
+) -> GenerationReleasePlan {
+    let mut plan = GenerationReleasePlan::default();
     let mut successor_published_at: Option<i64> = None;
     let mut guard_passed = false;
     for generation in generations {
@@ -246,13 +247,13 @@ pub fn plan_head_release(
 
 /// Generations still inside the guard besides the newest, for the
 /// publication throttle.
-pub fn generations_in_guard(plan: &HeadReleasePlan) -> usize {
+pub fn generations_in_guard(plan: &GenerationReleasePlan) -> usize {
     plan.retained.len().saturating_sub(1)
 }
 
-/// What a head pass released.
+/// What an index pass released.
 #[derive(Debug, Default)]
-pub struct HeadReleaseResult {
+pub struct GenerationReleaseResult {
     pub generations: usize,
     pub released: usize,
     pub deferred_dicts: usize,
@@ -262,16 +263,16 @@ pub struct HeadReleaseResult {
 /// Release `plan.released`: `reach(released) − reach(retained)`. Shared
 /// dictionary blobs among them are released only when absent from
 /// `referenced_elsewhere`, the refs of every other participant (the owning
-/// branch, its siblings, and the other heads); `None` defers them all.
+/// branch, its siblings, and the other indexes); `None` defers them all.
 ///
 /// Manifests go last, oldest first, so a crash leaves a chain whose oldest
 /// manifest still names files that may be gone; the next walk tolerates it.
-pub async fn release_head_generations(
+pub async fn release_generations(
     store: &dyn ContentStore,
-    plan: &HeadReleasePlan,
+    plan: &GenerationReleasePlan,
     referenced_elsewhere: Option<&HashSet<ContentId>>,
-) -> Result<HeadReleaseResult> {
-    let mut result = HeadReleaseResult {
+) -> Result<GenerationReleaseResult> {
+    let mut result = GenerationReleaseResult {
         generations: plan.released.len(),
         ..Default::default()
     };
@@ -290,7 +291,7 @@ pub async fn release_head_generations(
             Err(e) => {
                 // A generation an earlier pass half-released: its manifest is
                 // all that is left to name it.
-                tracing::debug!(manifest = %generation.manifest_id, error = %e, "partial head generation");
+                tracing::debug!(manifest = %generation.manifest_id, error = %e, "partial index generation");
                 HashSet::from([generation.manifest_id.clone()])
             }
         };
@@ -323,23 +324,23 @@ pub async fn release_head_generations(
     Ok(result)
 }
 
-/// The namespaces of every head a branch document names, for listings that
+/// The namespaces of every index a branch document names, for listings that
 /// must cover them (drop, sweep).
-pub fn head_namespaces(
+pub fn index_namespaces(
     branch: &StorageNamespace,
-    heads: &ReasonedHeads,
-) -> Vec<(HeadId, StorageNamespace)> {
-    heads
-        .heads
+    indexes: &ReasoningIndexes,
+) -> Vec<(ReasoningIndexId, StorageNamespace)> {
+    indexes
+        .indexes
         .keys()
-        .map(|id| (id.clone(), branch.reasoned_head(id.as_str())))
+        .map(|id| (id.clone(), branch.reasoning_index(id.as_str())))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::reasoned_head::{
+    use fluree_db_core::reasoning_index::{
         Basis, ClockPolicy, ErasureEpoch, GenerationKind, GenerationStats, SemanticKey,
     };
     use fluree_db_core::ContentKind;
@@ -348,11 +349,11 @@ mod tests {
         ContentId::new(ContentKind::Commit, tag.as_bytes())
     }
 
-    fn generation(n: u64, published_at_ms: i64) -> HeadGeneration {
-        HeadGeneration {
+    fn generation(n: u64, published_at_ms: i64) -> IndexGeneration {
+        IndexGeneration {
             manifest_id: cid(&format!("m{n}")),
-            manifest: ReasonedManifest {
-                head_id: HeadId::parse("01JC0000000000000000000000").unwrap(),
+            manifest: ReasoningManifest {
+                index_id: ReasoningIndexId::parse("01JC0000000000000000000000").unwrap(),
                 ledger_id: "db:main".into(),
                 generation: n,
                 prev_manifest: None,
@@ -377,13 +378,13 @@ mod tests {
         }
     }
 
-    fn numbers(gens: &[HeadGeneration]) -> Vec<u64> {
+    fn numbers(gens: &[IndexGeneration]) -> Vec<u64> {
         gens.iter().map(|g| g.manifest.generation).collect()
     }
 
     #[test]
     fn the_newest_generation_is_always_kept() {
-        let plan = plan_head_release(vec![generation(3, 0)], 1_000_000, 10);
+        let plan = plan_generation_release(vec![generation(3, 0)], 1_000_000, 10);
         assert_eq!(numbers(&plan.retained), [3]);
         assert!(plan.released.is_empty());
     }
@@ -393,7 +394,7 @@ mod tests {
         // Generation 3 published at 950 superseded 2; 2 published at 500
         // superseded 1; 1 published at 100 superseded nothing older.
         let gens = vec![generation(3, 950), generation(2, 500), generation(1, 100)];
-        let plan = plan_head_release(gens, 1000, 100);
+        let plan = plan_generation_release(gens, 1000, 100);
         assert_eq!(numbers(&plan.retained), [3, 2]);
         assert_eq!(numbers(&plan.released), [1]);
     }
@@ -402,7 +403,7 @@ mod tests {
     fn nothing_overrides_the_guard() {
         // Many generations, all superseded within the guard: all kept.
         let gens: Vec<_> = (1..=50).rev().map(|n| generation(n, 990)).collect();
-        let plan = plan_head_release(gens, 1000, 100);
+        let plan = plan_generation_release(gens, 1000, 100);
         assert_eq!(plan.retained.len(), 50);
         assert_eq!(generations_in_guard(&plan), 49);
     }

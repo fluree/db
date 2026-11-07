@@ -1366,7 +1366,7 @@ pub(crate) async fn load_and_attach_binary_store(
 
 /// [`load_and_attach_binary_store`] reading the index through `cs`, for a
 /// state whose index does not live in its record's own namespace (a
-/// reasoned head's).
+/// reasoning index's).
 pub(crate) async fn attach_binary_store_from(
     cs: Arc<dyn ContentStore>,
     state: &mut LedgerState,

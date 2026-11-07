@@ -515,12 +515,12 @@ where
     .await
 }
 
-/// A branch's reasoned-heads document, read from its main file: `None` when
+/// A branch's reasoning-indexes document, read from its main file: `None` when
 /// the record is missing or deleted, an empty document when none was written.
-pub(crate) async fn read_reasoned_heads<S>(
+pub(crate) async fn read_reasoning_indexes<S>(
     storage: &S,
     main_key: &str,
-) -> Result<Option<crate::ReasonedHeads>>
+) -> Result<Option<crate::ReasoningIndexes>>
 where
     S: StorageRead + ?Sized,
 {
@@ -531,19 +531,19 @@ where
     if file.is_deleted() {
         return Ok(None);
     }
-    Ok(Some(file.reasoned_heads.unwrap_or_default()))
+    Ok(Some(file.reasoning_indexes.unwrap_or_default()))
 }
 
-/// Compare-and-swap a branch's reasoned-heads document in its main file,
+/// Compare-and-swap a branch's reasoning-indexes document in its main file,
 /// checked against the fence and the document's version only.
-pub(crate) async fn push_reasoned_heads<S>(
+pub(crate) async fn push_reasoning_indexes<S>(
     storage: &S,
     main_key: &str,
     ledger_id: &str,
     fence: Option<Fence>,
     expected_v: i64,
-    new: &crate::ReasonedHeads,
-) -> Result<crate::ReasonedHeadsCasResult>
+    new: &crate::ReasoningIndexes,
+) -> Result<crate::ReasoningIndexesCasResult>
 where
     S: StorageCas + ?Sized,
 {
@@ -555,16 +555,16 @@ where
                 return Ok(CasAction::Abort(Err(FenceRefused)));
             }
             let mut file = existing.expect("admitted, so present");
-            let current = file.reasoned_heads.clone().unwrap_or_default();
-            if let Some(conflict) = crate::reasoned_heads_conflict(&current, expected_v, &new) {
+            let current = file.reasoning_indexes.clone().unwrap_or_default();
+            if let Some(conflict) = crate::reasoning_indexes_conflict(&current, expected_v, &new) {
                 return Ok(CasAction::Abort(Ok(conflict)));
             }
-            file.reasoned_heads = Some(new.clone());
+            file.reasoning_indexes = Some(new.clone());
             Ok(CasAction::Write(serialize_json(&file)?))
         })
         .await?;
     match outcome {
-        CasOutcome::Written => Ok(crate::ReasonedHeadsCasResult::Updated),
+        CasOutcome::Written => Ok(crate::ReasoningIndexesCasResult::Updated),
         CasOutcome::Aborted(Ok(result)) => Ok(result),
         CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
     }

@@ -20,11 +20,11 @@ use fluree_db_core::{ContentId, InstanceId, LedgerId, LedgerName, StorageRoot};
 
 /// A backend the protocols can drive.
 pub trait LifecycleStore:
-    LedgerRegistry + BranchRecordStore + crate::ReasonedHeadsPublisher
+    LedgerRegistry + BranchRecordStore + crate::ReasoningIndexesPublisher
 {
 }
-impl<T: LedgerRegistry + BranchRecordStore + crate::ReasonedHeadsPublisher + ?Sized> LifecycleStore
-    for T
+impl<T: LedgerRegistry + BranchRecordStore + crate::ReasoningIndexesPublisher + ?Sized>
+    LifecycleStore for T
 {
 }
 
@@ -929,10 +929,10 @@ fn dropped_entry(
     name: &LedgerName,
     binding: &NameBinding,
     hard: bool,
-    (records, reasoned_heads): CopiedRecords,
+    (records, reasoning_indexes): CopiedRecords,
 ) -> DroppedLedger {
     DroppedLedger {
-        reasoned_heads,
+        reasoning_indexes,
         extra: crate::binding::ExtraFields::new(),
         instance: binding.instance.clone(),
         state: if hard {
@@ -965,7 +965,7 @@ async fn records_to_copy<S: LifecycleStore + ?Sized>(
             .filter(|r| r.fence == Some(b.fence))
         {
             if let Some(doc) = store
-                .get_reasoned_heads(id.as_str())
+                .get_reasoning_indexes(id.as_str())
                 .await?
                 .filter(|doc| !doc.is_empty())
             {
@@ -979,10 +979,10 @@ async fn records_to_copy<S: LifecycleStore + ?Sized>(
     Ok((records, heads))
 }
 
-/// The branch records a drop keeps, and their reasoned-heads documents.
+/// The branch records a drop keeps, and their reasoning-indexes documents.
 type CopiedRecords = (
     Vec<NsRecord>,
-    std::collections::BTreeMap<String, crate::ReasonedHeads>,
+    std::collections::BTreeMap<String, crate::ReasoningIndexes>,
 );
 
 /// [`drop_ledger`] with `start: Some(hard)`; [`resume_drop_ledger`] with
@@ -1211,7 +1211,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
         record.retracted = false;
         match insert_fenced(store, &record).await {
             Ok(()) => {
-                restore_reasoned_heads(store, &entry, &record).await?;
+                restore_reasoning_indexes(store, &entry, &record).await?;
             }
             // A record from before name bindings holds the key, and is never
             // deleted to make room: no attempt can finish this restore, and
@@ -1243,32 +1243,34 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
     Ok(Some(records))
 }
 
-/// Write a restored branch's reasoned-heads document back, under its fresh
+/// Write a restored branch's reasoning-indexes document back, under its fresh
 /// fence. A restore repeated after a crash finds it already written.
-async fn restore_reasoned_heads<S: LifecycleStore + ?Sized>(
+async fn restore_reasoning_indexes<S: LifecycleStore + ?Sized>(
     store: &S,
     entry: &DroppedLedger,
     record: &NsRecord,
 ) -> Result<()> {
-    let Some(saved) = entry.reasoned_heads.get(&record.branch) else {
+    let Some(saved) = entry.reasoning_indexes.get(&record.branch) else {
         return Ok(());
     };
-    let doc = crate::ReasonedHeads {
+    let doc = crate::ReasoningIndexes {
         v: 1,
-        heads: saved.heads.clone(),
+        indexes: saved.indexes.clone(),
     };
     match store
-        .push_reasoned_heads_fenced(record.ledger_id.as_str(), record.fence, 0, &doc)
+        .push_reasoning_indexes_fenced(record.ledger_id.as_str(), record.fence, 0, &doc)
         .await?
     {
-        crate::ReasonedHeadsCasResult::Updated => Ok(()),
-        crate::ReasonedHeadsCasResult::Conflict {
+        crate::ReasoningIndexesCasResult::Updated => Ok(()),
+        crate::ReasoningIndexesCasResult::Conflict {
             actual: Some(actual),
-        } if actual.heads == doc.heads => Ok(()),
-        crate::ReasonedHeadsCasResult::Conflict { .. } => Err(NameServiceError::conflict(format!(
-            "the reasoned heads of {} changed while it was being restored",
-            record.ledger_id
-        ))),
+        } if actual.indexes == doc.indexes => Ok(()),
+        crate::ReasoningIndexesCasResult::Conflict { .. } => {
+            Err(NameServiceError::conflict(format!(
+                "the reasoning indexes of {} changed while it was being restored",
+                record.ledger_id
+            )))
+        }
     }
 }
 
@@ -1576,7 +1578,7 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
     let instance = legacy_instance(name);
     let entry = DroppedLedger {
         extra: crate::binding::ExtraFields::new(),
-        reasoned_heads: Default::default(),
+        reasoning_indexes: Default::default(),
         instance: instance.clone(),
         state: DroppedState::Dropped,
         dropped_at: now_ms(),
@@ -1679,26 +1681,26 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::ReasonedHeadsLookup for TestStore {
-        async fn get_reasoned_heads(
+    impl crate::ReasoningIndexesLookup for TestStore {
+        async fn get_reasoning_indexes(
             &self,
             ledger_id: &str,
-        ) -> Result<Option<crate::ReasonedHeads>> {
-            self.inner.get_reasoned_heads(ledger_id).await
+        ) -> Result<Option<crate::ReasoningIndexes>> {
+            self.inner.get_reasoning_indexes(ledger_id).await
         }
     }
 
     #[async_trait]
-    impl crate::ReasonedHeadsPublisher for TestStore {
-        async fn push_reasoned_heads_fenced(
+    impl crate::ReasoningIndexesPublisher for TestStore {
+        async fn push_reasoning_indexes_fenced(
             &self,
             ledger_id: &str,
             fence: Option<Fence>,
             expected_v: i64,
-            new: &crate::ReasonedHeads,
-        ) -> Result<crate::ReasonedHeadsCasResult> {
+            new: &crate::ReasoningIndexes,
+        ) -> Result<crate::ReasoningIndexesCasResult> {
             self.inner
-                .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+                .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
                 .await
         }
     }

@@ -1,5 +1,5 @@
-//! Reasoned-head administration: register a reasoning program for
-//! persistence on a branch, list a branch's heads, retire one, and refresh
+//! Reasoning-index administration: register a reasoning program for
+//! persistence on a branch, list a branch's indexes, retire one, and refresh
 //! them now rather than wait for the background worker.
 //!
 //! Every route here publishes through the nameservice (or reads what it
@@ -11,8 +11,8 @@ use crate::state::AppState;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluree_db_api::{ReasonedHeads, RefreshOutcome};
-use fluree_db_core::reasoned_head::HeadId;
+use fluree_db_api::{ReasoningIndexes, RefreshOutcome};
+use fluree_db_core::reasoning_index::ReasoningIndexId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -29,20 +29,20 @@ pub struct RegisterRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterResponse {
     pub ledger: String,
-    pub head_id: String,
+    pub index_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HeadRequest {
+pub struct IndexRequest {
     pub ledger: String,
-    pub head_id: Option<String>,
+    pub index_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshResult {
-    pub head_id: String,
+    pub index_id: String,
     #[serde(flatten)]
     pub outcome: RefreshOutcome,
 }
@@ -62,8 +62,8 @@ async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T> {
         .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))
 }
 
-fn head_id(raw: &str) -> Result<HeadId> {
-    HeadId::parse(raw).map_err(ServerError::bad_request)
+fn index_id(raw: &str) -> Result<ReasoningIndexId> {
+    ReasoningIndexId::parse(raw).map_err(ServerError::bad_request)
 }
 
 macro_rules! peer_forwards {
@@ -74,33 +74,33 @@ macro_rules! peer_forwards {
     };
 }
 
-/// `POST /reasoned-heads/register`: `{"ledger", "program"}` → the head id.
+/// `POST /reasoning-indexes/register`: `{"ledger", "program"}` → the index id.
 pub async fn register(State(state): State<Arc<AppState>>, request: Request) -> Response {
     peer_forwards!(state, request);
     async move {
         let req: RegisterRequest = body(request).await?;
-        let head = state
+        let index = state
             .fluree
-            .register_reasoned_head(&req.ledger, &req.program)
+            .register_reasoning_index(&req.ledger, &req.program)
             .await
             .map_err(ServerError::Api)?;
         Ok::<_, ServerError>(Json(RegisterResponse {
             ledger: req.ledger,
-            head_id: head.to_string(),
+            index_id: index.to_string(),
         }))
     }
     .await
     .into_response()
 }
 
-/// `POST /reasoned-heads/list`: `{"ledger"}` → the branch's heads document.
+/// `POST /reasoning-indexes/list`: `{"ledger"}` → the branch's reasoning-indexes document.
 pub async fn list(State(state): State<Arc<AppState>>, request: Request) -> Response {
     peer_forwards!(state, request);
     async move {
-        let req: HeadRequest = body(request).await?;
-        let doc: ReasonedHeads = state
+        let req: IndexRequest = body(request).await?;
+        let doc: ReasoningIndexes = state
             .fluree
-            .reasoned_heads(&req.ledger)
+            .reasoning_indexes(&req.ledger)
             .await
             .map_err(ServerError::Api)?;
         Ok::<_, ServerError>(Json(doc))
@@ -109,49 +109,49 @@ pub async fn list(State(state): State<Arc<AppState>>, request: Request) -> Respo
     .into_response()
 }
 
-/// `POST /reasoned-heads/retire`: `{"ledger", "headId"}`.
+/// `POST /reasoning-indexes/retire`: `{"ledger", "indexId"}`.
 pub async fn retire(State(state): State<Arc<AppState>>, request: Request) -> Response {
     peer_forwards!(state, request);
     async move {
-        let req: HeadRequest = body(request).await?;
+        let req: IndexRequest = body(request).await?;
         let raw = req
-            .head_id
+            .index_id
             .as_deref()
-            .ok_or_else(|| ServerError::bad_request("headId is required"))?;
-        let head = head_id(raw)?;
+            .ok_or_else(|| ServerError::bad_request("indexId is required"))?;
+        let index = index_id(raw)?;
         state
             .fluree
-            .retire_reasoned_head(&req.ledger, &head)
+            .retire_reasoning_index(&req.ledger, &index)
             .await
             .map_err(ServerError::Api)?;
         Ok::<_, ServerError>(Json(RegisterResponse {
             ledger: req.ledger,
-            head_id: head.to_string(),
+            index_id: index.to_string(),
         }))
     }
     .await
     .into_response()
 }
 
-/// `POST /reasoned-heads/refresh`: `{"ledger", "headId"?}` → what each
-/// refresh did. Without `headId`, every active head of the branch.
+/// `POST /reasoning-indexes/refresh`: `{"ledger", "indexId"?}` → what each
+/// refresh did. Without `indexId`, every active index of the branch.
 pub async fn refresh(State(state): State<Arc<AppState>>, request: Request) -> Response {
     peer_forwards!(state, request);
     async move {
-        let req: HeadRequest = body(request).await?;
-        let results = match req.head_id.as_deref() {
+        let req: IndexRequest = body(request).await?;
+        let results = match req.index_id.as_deref() {
             Some(raw) => {
-                let head = head_id(raw)?;
+                let index = index_id(raw)?;
                 let outcome = state
                     .fluree
-                    .refresh_reasoned_head(&req.ledger, &head)
+                    .refresh_reasoning_index(&req.ledger, &index)
                     .await
                     .map_err(ServerError::Api)?;
-                vec![(head, outcome)]
+                vec![(index, outcome)]
             }
             None => state
                 .fluree
-                .refresh_reasoned_heads(&req.ledger)
+                .refresh_reasoning_indexes(&req.ledger)
                 .await
                 .map_err(ServerError::Api)?,
         };
@@ -159,8 +159,8 @@ pub async fn refresh(State(state): State<Arc<AppState>>, request: Request) -> Re
             ledger: req.ledger,
             results: results
                 .into_iter()
-                .map(|(head, outcome)| RefreshResult {
-                    head_id: head.to_string(),
+                .map(|(index, outcome)| RefreshResult {
+                    index_id: index.to_string(),
                     outcome,
                 })
                 .collect(),

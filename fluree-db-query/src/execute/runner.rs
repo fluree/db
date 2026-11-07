@@ -391,7 +391,7 @@ pub async fn prepare_execution_with_config(
                     return Err(crate::error::QueryError::ResourceLimit(format!(
                         "reasoning was capped ({}) and the query asked for an exact answer \
                          (reasoningFreshness \"exact\"); raise the reasoning budget, or \
-                         register the program as a reasoned head",
+                         register the program as a reasoning index",
                         diag.capped_reason.as_deref().unwrap_or("budget")
                     )));
                 }
@@ -983,7 +983,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             capped_rules: diag.capped_rules.clone(),
             pending_rules: diag.pending_rules.clone(),
             evaluation_time: diag.evaluation_time.clone(),
-            head: None,
+            index: None,
         });
     }
 

@@ -351,11 +351,11 @@ pub struct IndexerConfig {
     /// identity.
     pub warm_cache_source: Option<Arc<dyn WarmCacheSource>>,
 
-    /// A reasoned head's derived facts, as a commit-codec blob whose `t` is
+    /// A reasoning index's derived facts, as a commit-codec blob whose `t` is
     /// the window's last commit. A build resolves them after the window's
     /// commits, as facts rather than a commit (no txn-meta), so the root it
     /// writes holds the asserted state at that `t` merged with them. Only the
-    /// reasoned-head worker sets it.
+    /// reasoning-index worker sets it.
     pub derived_facts: Option<Arc<Vec<u8>>>,
 }
 

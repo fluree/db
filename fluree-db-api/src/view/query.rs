@@ -1109,7 +1109,7 @@ impl Fluree {
                 .await
                 .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let served = self
-            .serve_from_reasoned_head(db, &mut executable, Some(&tracker))
+            .serve_from_reasoning_index(db, &mut executable, Some(&tracker))
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let db = served.as_ref().unwrap_or(db);
@@ -1554,7 +1554,7 @@ impl Fluree {
             .build_executable_for_view(db, parsed, options.server_identity.as_ref())
             .await?;
         let served = self
-            .serve_from_reasoned_head(db, &mut executable, Some(tracker))
+            .serve_from_reasoning_index(db, &mut executable, Some(tracker))
             .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1576,10 +1576,10 @@ impl Fluree {
         ))
     }
 
-    /// [`Self::serve_from_reasoned_head`] for a dataset: served only when
+    /// [`Self::serve_from_reasoning_index`] for a dataset: served only when
     /// every member is a graph of the primary view's ledger at its `t`, so
     /// the head, which holds every graph, can stand in for all of them.
-    pub(crate) async fn serve_dataset_from_reasoned_head(
+    pub(crate) async fn serve_dataset_from_reasoning_index(
         &self,
         dataset: &crate::view::DataSetDb,
         executable: &mut ExecutableQuery,
@@ -1601,9 +1601,9 @@ impl Fluree {
         if dataset.is_history_mode() || !within_ledger {
             if executable.reasoning.modes.freshness
                 == fluree_db_query::ir::ReasoningFreshness::Strict
-                && crate::reasoned::program::materializes(&executable.reasoning)
+                && crate::reasoning_index::program::materializes(&executable.reasoning)
             {
-                return Err(ApiError::ReasonedHeadNotReady {
+                return Err(ApiError::ReasoningIndexNotReady {
                     ledger_id: primary.ledger_id.to_string(),
                     t: primary.t,
                 });
@@ -1611,7 +1611,7 @@ impl Fluree {
             return Ok(None);
         }
         let Some(served) = self
-            .reasoned_head_for(primary, &executable.reasoning)
+            .reasoning_index_for(primary, &executable.reasoning)
             .await?
         else {
             return Ok(None);
@@ -1619,26 +1619,28 @@ impl Fluree {
         let state = &served.generation.state;
         let mut swapped = dataset.clone();
         for view in swapped.default.iter_mut().chain(swapped.named.values_mut()) {
-            *view = crate::reasoned::serve::head_view(view, state);
+            *view = crate::reasoning_index::serve::generation_view(view, state);
         }
-        executable.reasoning = crate::reasoned::program::served_reasoning(&executable.reasoning);
+        executable.reasoning =
+            crate::reasoning_index::program::served_reasoning(&executable.reasoning);
         record_served(tracker, served.tally);
         Ok(Some(swapped))
     }
 
-    /// Swap in a reasoned head when one can answer `executable` against
-    /// `db`: the head view to run it against, with reasoning turned off and
-    /// the head reported in the tracker's reasoning slot.
-    pub(crate) async fn serve_from_reasoned_head(
+    /// Swap in a reasoning index when one can answer `executable` against
+    /// `db`: the generation's view to run it against, with reasoning turned off
+    /// and the index reported in the tracker's reasoning slot.
+    pub(crate) async fn serve_from_reasoning_index(
         &self,
         db: &GraphDb,
         executable: &mut ExecutableQuery,
         tracker: Option<&Tracker>,
     ) -> Result<Option<GraphDb>> {
-        let Some(served) = self.reasoned_head_for(db, &executable.reasoning).await? else {
+        let Some(served) = self.reasoning_index_for(db, &executable.reasoning).await? else {
             return Ok(None);
         };
-        executable.reasoning = crate::reasoned::program::served_reasoning(&executable.reasoning);
+        executable.reasoning =
+            crate::reasoning_index::program::served_reasoning(&executable.reasoning);
         record_served(tracker, served.tally);
         Ok(Some(served.view))
     }
@@ -2892,8 +2894,8 @@ mod graph_source_guard_tests {
     }
 }
 
-/// Report in the tracker's reasoning slot that a reasoned head answered.
-fn record_served(tracker: Option<&Tracker>, head: fluree_db_core::ReasonedHeadTally) {
+/// Report in the tracker's reasoning slot that a reasoning index answered.
+fn record_served(tracker: Option<&Tracker>, tally: fluree_db_core::ReasoningIndexTally) {
     if let Some(tracker) = tracker {
         tracker.record_reasoning(fluree_db_core::ReasoningTally {
             capped: false,
@@ -2904,7 +2906,7 @@ fn record_served(tracker: Option<&Tracker>, head: fluree_db_core::ReasonedHeadTa
             capped_rules: Vec::new(),
             pending_rules: Vec::new(),
             evaluation_time: None,
-            head: Some(Box::new(head)),
+            index: Some(Box::new(tally)),
         });
     }
 }

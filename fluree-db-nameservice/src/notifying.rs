@@ -436,29 +436,32 @@ where
 }
 
 #[async_trait]
-impl<N> crate::ReasonedHeadsLookup for NotifyingNameService<N>
+impl<N> crate::ReasoningIndexesLookup for NotifyingNameService<N>
 where
-    N: crate::ReasonedHeadsLookup,
+    N: crate::ReasoningIndexesLookup,
 {
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
-        self.inner.get_reasoned_heads(ledger_id).await
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
+        self.inner.get_reasoning_indexes(ledger_id).await
     }
 }
 
 #[async_trait]
-impl<N> crate::ReasonedHeadsPublisher for NotifyingNameService<N>
+impl<N> crate::ReasoningIndexesPublisher for NotifyingNameService<N>
 where
-    N: crate::ReasonedHeadsPublisher,
+    N: crate::ReasoningIndexesPublisher,
 {
-    async fn push_reasoned_heads_fenced(
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &crate::ReasonedHeads,
-    ) -> Result<crate::ReasonedHeadsCasResult> {
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
         self.inner
-            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
             .await
     }
 }

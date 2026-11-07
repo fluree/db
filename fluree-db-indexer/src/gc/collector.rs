@@ -776,7 +776,7 @@ pub async fn release_garbage_plan(
             match super::current_sibling_heads(nameservice, ledger_id, candidates).await {
                 Ok(siblings) => {
                     let policy = super::shared_blob_policy_for(backend, &siblings, ledger_id).await;
-                    // Reasoned heads of this branch and its siblings share the
+                    // Reasoning indexes of this branch and its siblings share the
                     // dictionaries too, through every retained generation.
                     let mut participants = siblings;
                     participants.push(super::BranchIndexHead {
@@ -784,7 +784,14 @@ pub async fn release_garbage_plan(
                         namespace: namespace.clone(),
                         index_head_id: Some(head.clone()),
                     });
-                    with_head_refs(policy, backend, nameservice, &participants, ledger_id).await
+                    with_reasoning_index_refs(
+                        policy,
+                        backend,
+                        nameservice,
+                        &participants,
+                        ledger_id,
+                    )
+                    .await
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -802,10 +809,10 @@ pub async fn release_garbage_plan(
     plan.release(store.as_ref(), &head, &shared_blobs).await
 }
 
-/// `policy` with the dictionary blobs of `participants`' reasoned heads
+/// `policy` with the dictionary blobs of `participants`' reasoning indexes
 /// added to what is referenced elsewhere; deferred when a head cannot be
 /// read.
-async fn with_head_refs(
+async fn with_reasoning_index_refs(
     policy: SharedBlobPolicy,
     backend: &fluree_db_core::StorageBackend,
     nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
@@ -818,7 +825,13 @@ async fn with_head_refs(
     else {
         return SharedBlobPolicy::Defer;
     };
-    match super::heads::shared_refs_of_branch_heads(backend, nameservice, participants).await {
+    match super::reasoning_indexes::shared_refs_of_branch_indexes(
+        backend,
+        nameservice,
+        participants,
+    )
+    .await
+    {
         Ok(head_refs) => {
             referenced_elsewhere.extend(head_refs);
             SharedBlobPolicy::Release {
@@ -829,7 +842,7 @@ async fn with_head_refs(
             tracing::warn!(
                 ledger_id = %ledger_id,
                 error = %e,
-                "could not read a reasoned head; deferring shared blobs this pass"
+                "could not read a reasoning index; deferring shared blobs this pass"
             );
             SharedBlobPolicy::Defer
         }

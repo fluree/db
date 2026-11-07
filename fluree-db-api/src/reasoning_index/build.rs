@@ -1,8 +1,8 @@
-//! Registering reasoned heads, and building and publishing their
+//! Registering reasoning indexes, and building and publishing their
 //! generations.
 //!
 //! A generation is the branch at a basis commit S, every graph, merged with
-//! the complete output C of the head's program at S:
+//! the complete output C of the index's program at S:
 //!
 //! > M_h(S) = A_h(S) ∪ C_h(P, g, S)
 //!
@@ -24,15 +24,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use fluree_db_core::reasoned_head::{
+use fluree_db_core::reasoning_index::{
     admit, Basis, BasisOracle, Candidate, Discard, ErasureEpoch, GenerationKind, GenerationStats,
-    HeadEntry, HeadId, ReasonedHeads, ReasonedManifest, Registration, RegistrationState,
+    ReasoningIndexEntry, ReasoningIndexId, ReasoningIndexes, ReasoningManifest, Registration,
+    RegistrationState,
 };
 use fluree_db_core::{
     BranchedContentStore, ContentId, ContentKind, ContentStore, Flake, GraphId, IndexType,
     LedgerId, OverlayProvider, Sid,
 };
-use fluree_db_nameservice::{NsRecord, ReasonedHeadsCasResult};
+use fluree_db_nameservice::{NsRecord, ReasoningIndexesCasResult};
 use fluree_db_query::execute::{compute_derived_facts, QueryRequest};
 use fluree_db_query::schema_bundle::SchemaBundleOverlay;
 use serde_json::Value as JsonValue;
@@ -45,16 +46,16 @@ use crate::{ApiError, Fluree, Result};
 
 const CAS_ATTEMPTS: usize = 16;
 
-/// Active heads a branch may register. Each is a complete index of the
+/// Active indexes a branch may register. Each is a complete index of the
 /// branch, refreshed after every commit.
-pub const MAX_ACTIVE_HEADS: usize = 8;
+pub const MAX_ACTIVE_INDEXES: usize = 8;
 
 /// The materialization budget a worker runs under unless the program sets
 /// one: generous, since a capped result is never published.
 const WORKER_MAX_FACTS: u64 = 100_000_000;
 const WORKER_MAX_SECONDS: u64 = 3_600;
 
-/// What a refresh of one head did.
+/// What a refresh of one index did.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum RefreshOutcome {
@@ -73,9 +74,9 @@ pub enum RefreshOutcome {
     Discarded { reason: String },
     /// The program could not be computed completely; nothing was published.
     Failed { reason: String },
-    /// Another refresh of this head is under way.
+    /// Another refresh of this index is under way.
     InFlight,
-    /// The head already holds as many superseded generations inside the
+    /// The index already holds as many superseded generations inside the
     /// retention window as it may; publication waits for them to age out.
     #[serde(rename_all = "camelCase")]
     Throttled { in_guard: usize },
@@ -98,11 +99,11 @@ fn canonical_id(ledger_id: &str) -> Result<String> {
 }
 
 impl Fluree {
-    /// The branch's reasoned-heads document.
-    pub async fn reasoned_heads(&self, ledger_id: &str) -> Result<ReasonedHeads> {
+    /// The branch's reasoning-indexes document.
+    pub async fn reasoning_indexes(&self, ledger_id: &str) -> Result<ReasoningIndexes> {
         let id = canonical_id(ledger_id)?;
         self.nameservice()
-            .get_reasoned_heads(&id)
+            .get_reasoning_indexes(&id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("ledger {id} not found")))
     }
@@ -114,15 +115,15 @@ impl Fluree {
             .ok_or_else(|| ApiError::NotFound(format!("ledger {ledger_id} not found")))
     }
 
-    /// Apply `change` to the branch's heads document by compare-and-swap,
+    /// Apply `change` to the branch's reasoning-indexes document by compare-and-swap,
     /// retrying from the document as it stands on a conflict.
-    async fn update_reasoned_heads<T>(
+    async fn update_reasoning_indexes<T>(
         &self,
         ledger_id: &str,
-        mut change: impl FnMut(&ReasonedHeads) -> Result<(Option<ReasonedHeads>, T)>,
+        mut change: impl FnMut(&ReasoningIndexes) -> Result<(Option<ReasoningIndexes>, T)>,
     ) -> Result<T> {
         let record = self.branch_record(ledger_id).await?;
-        let mut actual = self.reasoned_heads(ledger_id).await?;
+        let mut actual = self.reasoning_indexes(ledger_id).await?;
         for _ in 0..CAS_ATTEMPTS {
             let (next, value) = change(&actual)?;
             let Some(mut next) = next else {
@@ -131,62 +132,62 @@ impl Fluree {
             next.v = actual.v + 1;
             match self
                 .publisher()?
-                .push_reasoned_heads_fenced(ledger_id, record.fence, actual.v, &next)
+                .push_reasoning_indexes_fenced(ledger_id, record.fence, actual.v, &next)
                 .await?
             {
-                ReasonedHeadsCasResult::Updated => return Ok(value),
-                ReasonedHeadsCasResult::Conflict { actual: Some(now) } => actual = now,
-                ReasonedHeadsCasResult::Conflict { actual: None } => {
+                ReasoningIndexesCasResult::Updated => return Ok(value),
+                ReasoningIndexesCasResult::Conflict { actual: Some(now) } => actual = now,
+                ReasoningIndexesCasResult::Conflict { actual: None } => {
                     return Err(ApiError::NotFound(format!("ledger {ledger_id} not found")))
                 }
             }
         }
         Err(ApiError::internal(format!(
-            "the reasoned-heads document of {ledger_id} kept changing; gave up after \
+            "the reasoning-indexes document of {ledger_id} kept changing; gave up after \
              {CAS_ATTEMPTS} attempts"
         )))
     }
 
     /// Register a reasoning program for persistence on a branch, returning
-    /// its head's id. Registering a program the branch already has active is
-    /// a no-op that returns the existing head.
+    /// its index's id. Registering a program the branch already has active is
+    /// a no-op that returns the existing index.
     ///
     /// `program` carries the reasoning keys a query would (`reasoning`,
     /// `rules`, `ontology`, `reasoningTime`, `reasoningBudget`, `@context`)
     /// and optionally `graph`, the IRI of the graph to reason against. The
-    /// head fills on the next [`Self::refresh_reasoned_heads`].
-    pub async fn register_reasoned_head(
+    /// index fills on the next [`Self::refresh_reasoning_indexes`].
+    pub async fn register_reasoning_index(
         &self,
         ledger_id: &str,
         program: &JsonValue,
-    ) -> Result<HeadId> {
+    ) -> Result<ReasoningIndexId> {
         let id = canonical_id(ledger_id)?;
         let canonical = program::canonical_program(program)?;
         let key = program::registration_key(&canonical);
-        self.update_reasoned_heads(&id, |actual| {
-            if let Some((head_id, _)) = actual.heads.iter().find(|(_, e)| {
+        self.update_reasoning_indexes(&id, |actual| {
+            if let Some((index_id, _)) = actual.indexes.iter().find(|(_, e)| {
                 matches!(e.registration.state, RegistrationState::Active)
                     && e.registration.semantics == key
             }) {
-                return Ok((None, head_id.clone()));
+                return Ok((None, index_id.clone()));
             }
             let active = actual
-                .heads
+                .indexes
                 .values()
                 .filter(|e| matches!(e.registration.state, RegistrationState::Active))
                 .count();
-            if active >= MAX_ACTIVE_HEADS {
+            if active >= MAX_ACTIVE_INDEXES {
                 return Err(ApiError::invalid_query(format!(
-                    "{id} already has {active} active reasoned heads, the most a branch may \
+                    "{id} already has {active} active reasoning indexes, the most a branch may \
                      have; retire one first"
                 )));
             }
-            let head_id =
-                HeadId::parse(&ulid::Ulid::new().to_string()).map_err(ApiError::internal)?;
+            let index_id = ReasoningIndexId::parse(&ulid::Ulid::new().to_string())
+                .map_err(ApiError::internal)?;
             let mut next = actual.clone();
-            next.heads.insert(
-                head_id.clone(),
-                HeadEntry {
+            next.indexes.insert(
+                index_id.clone(),
+                ReasoningIndexEntry {
                     registration: Registration {
                         revision: 1,
                         semantics: key.clone(),
@@ -194,55 +195,62 @@ impl Fluree {
                         state: RegistrationState::Active,
                     },
                     floor: ErasureEpoch::default(),
-                    published: None,
+                    head: None,
                 },
             );
-            Ok((Some(next), head_id))
+            Ok((Some(next), index_id))
         })
         .await
-        .inspect(|_| self.reasoned.note_registered(&id))
+        .inspect(|_| self.reasoning_index_state.note_registered(&id))
     }
 
-    /// Retire a head: from now on workers are refused and queries stop being
+    /// Retire an index: from now on workers are refused and queries stop being
     /// served from it. Its files stay until a cleanup pass removes them.
-    pub async fn retire_reasoned_head(&self, ledger_id: &str, head_id: &HeadId) -> Result<()> {
+    pub async fn retire_reasoning_index(
+        &self,
+        ledger_id: &str,
+        index_id: &ReasoningIndexId,
+    ) -> Result<()> {
         let id = canonical_id(ledger_id)?;
         let at_ms = now_ms();
-        self.update_reasoned_heads(&id, |actual| {
-            let Some(entry) = actual.heads.get(head_id) else {
+        self.update_reasoning_indexes(&id, |actual| {
+            let Some(entry) = actual.indexes.get(index_id) else {
                 return Err(ApiError::NotFound(format!(
-                    "reasoned head {head_id} is not registered on {id}"
+                    "reasoning index {index_id} is not registered on {id}"
                 )));
             };
             if matches!(entry.registration.state, RegistrationState::Retired { .. }) {
                 return Ok((None, ()));
             }
             let mut next = actual.clone();
-            let entry = next.heads.get_mut(head_id).expect("present above");
+            let entry = next.indexes.get_mut(index_id).expect("present above");
             entry.registration.revision += 1;
             entry.registration.state = RegistrationState::Retired { at_ms };
             Ok((Some(next), ()))
         })
         .await?;
-        self.reasoned.forget_head(&id, head_id);
+        self.reasoning_index_state.forget_index(&id, index_id);
         Ok(())
     }
 
-    /// Delete the files of heads retired longer than the retention window,
+    /// Delete the files of indexes retired longer than the retention window,
     /// then their entries. Their shared dictionary blobs are left for the
-    /// sweep. Returns the heads removed.
-    pub async fn clean_retired_reasoned_heads(&self, ledger_id: &str) -> Result<Vec<HeadId>> {
+    /// sweep. Returns the indexes removed.
+    pub async fn clean_retired_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Vec<ReasoningIndexId>> {
         let id = canonical_id(ledger_id)?;
-        let doc = self.reasoned_heads(&id).await?;
-        let min_age_ms = self.reasoned.retention().min_age_ms;
+        let doc = self.reasoning_indexes(&id).await?;
+        let min_age_ms = self.reasoning_index_state.retention().min_age_ms;
         let now = now_ms();
-        let due: Vec<HeadId> = doc
-            .heads
+        let due: Vec<ReasoningIndexId> = doc
+            .indexes
             .iter()
             .filter(|(_, e)| {
                 matches!(e.registration.state, RegistrationState::Retired { at_ms } if now - at_ms >= min_age_ms)
             })
-            .map(|(head_id, _)| head_id.clone())
+            .map(|(index_id, _)| index_id.clone())
             .collect();
         if due.is_empty() {
             return Ok(Vec::new());
@@ -253,8 +261,10 @@ impl Fluree {
         let record = self.branch_record(&id).await?;
         let method = storage.storage_method().to_string();
         let mut cleaned = Vec::new();
-        for head_id in due {
-            let ns = record.storage_namespace().reasoned_head(head_id.as_str());
+        for index_id in due {
+            let ns = record
+                .storage_namespace()
+                .reasoning_index(index_id.as_str());
             let prefix = format!("fluree:{method}://{}/", ns.branch_prefix());
             let files = storage
                 .list_prefix(&prefix)
@@ -263,70 +273,70 @@ impl Fluree {
             let mut failed = false;
             for file in &files {
                 if let Err(e) = storage.delete(file).await {
-                    tracing::warn!(file = %file, error = %e, "could not delete a retired head's file");
+                    tracing::warn!(file = %file, error = %e, "could not delete a retired index's file");
                     failed = true;
                 }
             }
             if !failed {
-                cleaned.push(head_id);
+                cleaned.push(index_id);
             }
         }
         // Remove the entries only once the files are gone: a Retired entry is
         // how a later pass finds a folder an interrupted one left.
         let removed = self
-            .update_reasoned_heads(&id, |actual| {
+            .update_reasoning_indexes(&id, |actual| {
                 let mut next = actual.clone();
-                let before = next.heads.len();
-                next.heads.retain(|head_id, e| {
-                    !(cleaned.contains(head_id)
+                let before = next.indexes.len();
+                next.indexes.retain(|index_id, e| {
+                    !(cleaned.contains(index_id)
                         && matches!(e.registration.state, RegistrationState::Retired { .. }))
                 });
                 Ok((
-                    (next.heads.len() != before).then_some(next),
+                    (next.indexes.len() != before).then_some(next),
                     cleaned.clone(),
                 ))
             })
             .await?;
-        for head_id in &removed {
-            self.reasoned.forget_head(&id, head_id);
+        for index_id in &removed {
+            self.reasoning_index_state.forget_index(&id, index_id);
         }
         Ok(removed)
     }
 
-    /// Bring every active head of the branch up to its current commit.
-    pub async fn refresh_reasoned_heads(
+    /// Bring every active index of the branch up to its current commit.
+    pub async fn refresh_reasoning_indexes(
         &self,
         ledger_id: &str,
-    ) -> Result<Vec<(HeadId, RefreshOutcome)>> {
-        let doc = self.reasoned_heads(ledger_id).await?;
+    ) -> Result<Vec<(ReasoningIndexId, RefreshOutcome)>> {
+        let doc = self.reasoning_indexes(ledger_id).await?;
         let mut out = Vec::new();
-        for (head_id, entry) in &doc.heads {
+        for (index_id, entry) in &doc.indexes {
             if matches!(entry.registration.state, RegistrationState::Active) {
-                let outcome = self.refresh_reasoned_head(ledger_id, head_id).await?;
-                out.push((head_id.clone(), outcome));
+                let outcome = self.refresh_reasoning_index(ledger_id, index_id).await?;
+                out.push((index_id.clone(), outcome));
             }
         }
         Ok(out)
     }
 
-    /// Bring one head up to the branch's current commit: compute its program,
+    /// Bring one index up to the branch's current commit: compute its program,
     /// fold the result into a new generation, and publish it.
-    pub async fn refresh_reasoned_head(
+    pub async fn refresh_reasoning_index(
         &self,
         ledger_id: &str,
-        head_id: &HeadId,
+        index_id: &ReasoningIndexId,
     ) -> Result<RefreshOutcome> {
         let id = canonical_id(ledger_id)?;
-        let Some(_flight) = self.reasoned.begin(&id, head_id) else {
+        let Some(_flight) = self.reasoning_index_state.begin(&id, index_id) else {
             return Ok(RefreshOutcome::InFlight);
         };
-        self.refresh_head_exclusive(&id, head_id).await
+        self.refresh_index_exclusive(&id, index_id).await
     }
 
-    async fn refresh_head_exclusive(
+    async fn refresh_index_exclusive(
         &self,
         ledger_id: &str,
-        head_id: &HeadId,
+        index_id: &ReasoningIndexId,
     ) -> Result<RefreshOutcome> {
         let (record, db) = self.consistent_base(ledger_id).await?;
         let Some(commit) = record.commit_head_id.clone() else {
@@ -339,15 +349,15 @@ impl Fluree {
             t: record.commit_t,
             epoch: ErasureEpoch::default(),
         };
-        let doc = self.reasoned_heads(ledger_id).await?;
-        let Some(entry) = doc.heads.get(head_id) else {
+        let doc = self.reasoning_indexes(ledger_id).await?;
+        let Some(entry) = doc.indexes.get(index_id) else {
             return Err(ApiError::NotFound(format!(
-                "reasoned head {head_id} is not registered on {ledger_id}"
+                "reasoning index {index_id} is not registered on {ledger_id}"
             )));
         };
         if !matches!(entry.registration.state, RegistrationState::Active) {
             return Ok(RefreshOutcome::Discarded {
-                reason: "the head is retired".into(),
+                reason: "the index is retired".into(),
             });
         }
         let revision = entry.registration.revision;
@@ -381,7 +391,7 @@ impl Fluree {
             });
         }
         let settled = program::settled_key(&executable.reasoning, db.graph_id);
-        if let Some(published) = &entry.published {
+        if let Some(published) = &entry.head {
             if published.revision == revision
                 && published.basis == basis
                 && published.settled == settled
@@ -392,25 +402,27 @@ impl Fluree {
             }
         }
 
-        // Publication waits rather than let the head collector shorten the
+        // Publication waits rather than let the index collector shorten the
         // protection of generations queries may still be reading.
-        if let Some(published) = &entry.published {
-            let retention = self.reasoned.retention();
-            let head_cs = self
-                .backend()
-                .content_store(&record.storage_namespace().reasoned_head(head_id.as_str()));
-            let generations = fluree_db_indexer::gc::heads::head_generations(
-                head_cs.as_ref(),
+        if let Some(published) = &entry.head {
+            let retention = self.reasoning_index_state.retention();
+            let index_cs = self.backend().content_store(
+                &record
+                    .storage_namespace()
+                    .reasoning_index(index_id.as_str()),
+            );
+            let generations = fluree_db_indexer::gc::reasoning_indexes::index_generations(
+                index_cs.as_ref(),
                 &published.manifest,
             )
             .await
-            .map_err(|e| ApiError::internal(format!("read head chain: {e}")))?;
-            let plan = fluree_db_indexer::gc::heads::plan_head_release(
+            .map_err(|e| ApiError::internal(format!("read index chain: {e}")))?;
+            let plan = fluree_db_indexer::gc::reasoning_indexes::plan_generation_release(
                 generations,
                 now_ms(),
                 retention.min_age_ms,
             );
-            let in_guard = fluree_db_indexer::gc::heads::generations_in_guard(&plan);
+            let in_guard = fluree_db_indexer::gc::reasoning_indexes::generations_in_guard(&plan);
             if in_guard >= retention.max_generations_in_guard {
                 return Ok(RefreshOutcome::Throttled { in_guard });
             }
@@ -439,7 +451,7 @@ impl Fluree {
                 return Ok(RefreshOutcome::Failed {
                     reason: format!(
                         "the program derives {p} facts, which query-time rdfs and owl2ql \
-                         rewriting does not read; a head would answer differently"
+                         rewriting does not read; an index would answer differently"
                     ),
                 });
             }
@@ -452,15 +464,17 @@ impl Fluree {
             &record,
         )
         .await?;
-        let head_ns = record.storage_namespace().reasoned_head(head_id.as_str());
-        let head_cs = self.backend().content_store(&head_ns);
-        let head_store: Arc<dyn ContentStore> = Arc::new(BranchedContentStore::with_parents(
-            Arc::clone(&head_cs),
+        let index_ns = record
+            .storage_namespace()
+            .reasoning_index(index_id.as_str());
+        let index_cs = self.backend().content_store(&index_ns);
+        let index_store: Arc<dyn ContentStore> = Arc::new(BranchedContentStore::with_parents(
+            Arc::clone(&index_cs),
             vec![BranchedContentStore::leaf(Arc::clone(&branch_store))],
         ));
-        let previous = match &entry.published {
+        let previous = match &entry.head {
             Some(p) if p.revision == revision && p.settled == settled => {
-                match load_previous(head_cs.as_ref(), &p.manifest, &db).await {
+                match load_previous(index_cs.as_ref(), &p.manifest, &db).await {
                     Ok(prev) => {
                         let line = Line::walk(
                             branch_store.as_ref(),
@@ -471,7 +485,7 @@ impl Fluree {
                         line.is_ancestor(&p.basis, &basis).then_some(prev)
                     }
                     Err(e) => {
-                        tracing::warn!(head = %head_id, error = %e, "previous generation unreadable; rebuilding");
+                        tracing::warn!(index = %index_id, error = %e, "previous generation unreadable; rebuilding");
                         None
                     }
                 }
@@ -488,7 +502,10 @@ impl Fluree {
         };
         // From here until publication, files are written that no published
         // generation references yet.
-        let Some(_write) = self.reasoned.begin_write(record.ledger_id.name()) else {
+        let Some(_write) = self
+            .reasoning_index_state
+            .begin_write(record.ledger_id.name())
+        else {
             return Ok(RefreshOutcome::Deferred {
                 reason: "a storage sweep of the ledger is running".into(),
             });
@@ -540,18 +557,18 @@ impl Fluree {
                 }
             };
 
-            // Build the merged root in the head's namespace.
-            let mut head_record = record.clone();
+            // Build the merged root in the index's namespace.
+            let mut index_record = record.clone();
             match &previous {
                 None => {
                     if let Some(base_root) = &record.index_head_id {
-                        self.copy_index_to_branch(ledger_id, &head_ns, base_root)
+                        self.copy_index_to_branch(ledger_id, &index_ns, base_root)
                             .await?;
                     }
                 }
                 Some(prev) => {
-                    head_record.index_head_id = Some(prev.manifest.root.clone());
-                    head_record.index_t = prev.manifest.basis.t;
+                    index_record.index_head_id = Some(prev.manifest.root.clone());
+                    index_record.index_t = prev.manifest.basis.t;
                 }
             }
             let mut config = crate::build_indexer_config(&self.config);
@@ -562,16 +579,16 @@ impl Fluree {
             let built = match &previous {
                 None => {
                     fluree_db_indexer::build_index_for_record(
-                        Arc::clone(&head_store),
-                        &head_record,
+                        Arc::clone(&index_store),
+                        &index_record,
                         config,
                     )
                     .await
                 }
                 Some(_) => {
                     fluree_db_indexer::fold_index_for_record(
-                        Arc::clone(&head_store),
-                        &head_record,
+                        Arc::clone(&index_store),
+                        &index_record,
                         config,
                     )
                     .await
@@ -581,13 +598,13 @@ impl Fluree {
                 Ok(built) => break (kind, built, stats_added, stats_removed),
                 Err(e) if previous.is_some() => {
                     tracing::warn!(
-                        head = %head_id,
+                        index = %index_id,
                         error = %e,
-                        "logical fold failed; rebuilding the head from the base"
+                        "logical fold failed; rebuilding the index from the base"
                     );
                     previous = None;
                 }
-                Err(e) => return Err(ApiError::internal(format!("reasoned-head build: {e}"))),
+                Err(e) => return Err(ApiError::internal(format!("reasoning-index build: {e}"))),
             }
         };
 
@@ -597,7 +614,7 @@ impl Fluree {
             .map(|f| to_flake(f, true))
             .collect();
         let derived_count = derived_only_flakes.len() as u64;
-        let derived_id = write_derived_only(head_cs.as_ref(), derived_only_flakes).await?;
+        let derived_id = write_derived_only(index_cs.as_ref(), derived_only_flakes).await?;
 
         let stats = GenerationStats {
             derived_only: derived_count,
@@ -606,13 +623,13 @@ impl Fluree {
             removed: stats_removed,
         };
         let candidate = Candidate {
-            head_id: head_id.clone(),
+            index_id: index_id.clone(),
             kind,
             revision,
             basis: basis.clone(),
         };
-        let manifest = ReasonedManifest {
-            head_id: head_id.clone(),
+        let manifest = ReasoningManifest {
+            index_id: index_id.clone(),
             ledger_id: ledger_id.to_string(),
             generation: 0,
             prev_manifest: None,
@@ -628,7 +645,7 @@ impl Fluree {
         };
         #[cfg(test)]
         {
-            let seam = self.reasoned.before_publish.lock().clone();
+            let seam = self.reasoning_index_state.before_publish.lock().clone();
             if let Some(seam) = seam {
                 seam.reached.notify_one();
                 seam.resume.notified().await;
@@ -637,7 +654,7 @@ impl Fluree {
         match self
             .publish_generation(
                 ledger_id,
-                head_cs.as_ref(),
+                index_cs.as_ref(),
                 branch_store.as_ref(),
                 &candidate,
                 manifest,
@@ -645,12 +662,12 @@ impl Fluree {
             .await?
         {
             Ok(generation) => {
-                self.reasoned.forget_head(ledger_id, head_id);
+                self.reasoning_index_state.forget_index(ledger_id, index_id);
                 if let Err(e) = self
-                    .collect_head(ledger_id, head_id, head_cs.as_ref())
+                    .collect_generations(ledger_id, index_id, index_cs.as_ref())
                     .await
                 {
-                    tracing::warn!(head = %head_id, error = %e, "reasoned-head collection failed");
+                    tracing::warn!(index = %index_id, error = %e, "reasoning-index collection failed");
                 }
                 Ok(RefreshOutcome::Published {
                     generation,
@@ -666,50 +683,53 @@ impl Fluree {
     }
 
     /// Set how long a query with `reasoningFreshness: "strict"` waits for a
-    /// reasoned head at its snapshot before it fails. Ten seconds unless set.
-    pub fn set_reasoned_head_strict_wait(&self, wait: std::time::Duration) {
-        self.reasoned.set_strict_wait(wait);
+    /// reasoning index at its snapshot before it fails. Ten seconds unless set.
+    pub fn set_reasoning_index_strict_wait(&self, wait: std::time::Duration) {
+        self.reasoning_index_state.set_strict_wait(wait);
     }
 
-    /// Set how long superseded generations are kept, and how many a head
+    /// Set how long superseded generations are kept, and how many an index
     /// may hold inside that window before publication waits.
-    pub fn set_reasoned_head_retention(&self, retention: super::HeadRetention) {
-        self.reasoned.set_retention(retention);
+    pub fn set_reasoning_index_retention(&self, retention: super::GenerationRetention) {
+        self.reasoning_index_state.set_retention(retention);
     }
 
-    /// Release a head's superseded generations once the retention window has
+    /// Release an index's superseded generations once the retention window has
     /// passed since each was superseded. Shared dictionary blobs are left for
     /// the sweep, which sees every participant at once.
-    async fn collect_head(
+    async fn collect_generations(
         &self,
         ledger_id: &str,
-        head_id: &HeadId,
-        head_cs: &dyn ContentStore,
+        index_id: &ReasoningIndexId,
+        index_cs: &dyn ContentStore,
     ) -> Result<()> {
-        let doc = self.reasoned_heads(ledger_id).await?;
-        let Some(pointer) = doc.heads.get(head_id).and_then(|e| e.published.as_ref()) else {
+        let doc = self.reasoning_indexes(ledger_id).await?;
+        let Some(pointer) = doc.indexes.get(index_id).and_then(|e| e.head.as_ref()) else {
             return Ok(());
         };
-        let generations =
-            fluree_db_indexer::gc::heads::head_generations(head_cs, &pointer.manifest)
-                .await
-                .map_err(|e| ApiError::internal(format!("read head chain: {e}")))?;
-        let plan = fluree_db_indexer::gc::heads::plan_head_release(
+        let generations = fluree_db_indexer::gc::reasoning_indexes::index_generations(
+            index_cs,
+            &pointer.manifest,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("read index chain: {e}")))?;
+        let plan = fluree_db_indexer::gc::reasoning_indexes::plan_generation_release(
             generations,
             now_ms(),
-            self.reasoned.retention().min_age_ms,
+            self.reasoning_index_state.retention().min_age_ms,
         );
-        let released = fluree_db_indexer::gc::heads::release_head_generations(head_cs, &plan, None)
-            .await
-            .map_err(|e| ApiError::internal(format!("release head generations: {e}")))?;
+        let released =
+            fluree_db_indexer::gc::reasoning_indexes::release_generations(index_cs, &plan, None)
+                .await
+                .map_err(|e| ApiError::internal(format!("release index generations: {e}")))?;
         if released.generations > 0 {
-            tracing::debug!(head = %head_id, ?released, "released superseded head generations");
+            tracing::debug!(index = %index_id, ?released, "released superseded index generations");
         }
         Ok(())
     }
 
     /// The branch record and a view of the branch at exactly its commit
-    /// head.
+    /// index.
     async fn consistent_base(&self, ledger_id: &str) -> Result<(NsRecord, GraphDb)> {
         for _ in 0..CAS_ATTEMPTS {
             let record = self.branch_record(ledger_id).await?;
@@ -719,7 +739,7 @@ impl Fluree {
             }
         }
         Err(ApiError::internal(format!(
-            "{ledger_id} kept moving while its reasoned heads were refreshed"
+            "{ledger_id} kept moving while its reasoning indexes were refreshed"
         )))
     }
 
@@ -783,28 +803,28 @@ impl Fluree {
     }
 
     /// Publish `manifest` as `candidate`'s generation: admit it against the
-    /// heads document as it stands, write the manifest with its place in the
+    /// reasoning-indexes document as it stands, write the manifest with its place in the
     /// chain, and compare-and-swap, retrying from the actual document.
     async fn publish_generation(
         &self,
         ledger_id: &str,
-        head_cs: &dyn ContentStore,
+        index_cs: &dyn ContentStore,
         branch_store: &dyn ContentStore,
         candidate: &Candidate,
-        mut manifest: ReasonedManifest,
+        mut manifest: ReasoningManifest,
     ) -> Result<std::result::Result<u64, Discard>> {
         for _ in 0..CAS_ATTEMPTS {
             let record = self.branch_record(ledger_id).await?;
-            let actual = self.reasoned_heads(ledger_id).await?;
+            let actual = self.reasoning_indexes(ledger_id).await?;
             let published_t = actual
-                .heads
-                .get(&candidate.head_id)
-                .and_then(|e| e.published.as_ref())
+                .indexes
+                .get(&candidate.index_id)
+                .and_then(|e| e.head.as_ref())
                 .map(|p| p.basis.t)
                 .unwrap_or(candidate.basis.t);
             let line = match &record.commit_head_id {
-                Some(head) => {
-                    Line::walk(branch_store, head, published_t.min(candidate.basis.t)).await?
+                Some(index) => {
+                    Line::walk(branch_store, index, published_t.min(candidate.basis.t)).await?
                 }
                 None => Line::default(),
             };
@@ -816,34 +836,34 @@ impl Fluree {
             manifest.prev_manifest = admitted.prev_manifest;
             manifest.published_at_ms = now_ms();
             let bytes = manifest.encode();
-            let manifest_id = head_cs
-                .put(ContentKind::ReasonedManifest, &bytes)
+            let manifest_id = index_cs
+                .put(ContentKind::ReasoningManifest, &bytes)
                 .await
                 .map_err(|e| ApiError::internal(format!("write manifest: {e}")))?;
             let mut next = actual.clone();
             next.v = actual.v + 1;
-            next.heads
-                .get_mut(&candidate.head_id)
+            next.indexes
+                .get_mut(&candidate.index_id)
                 .expect("admitted, so present")
-                .published = Some(manifest.pointer(manifest_id));
+                .head = Some(manifest.pointer(manifest_id));
             match self
                 .publisher()?
-                .push_reasoned_heads_fenced(ledger_id, record.fence, actual.v, &next)
+                .push_reasoning_indexes_fenced(ledger_id, record.fence, actual.v, &next)
                 .await?
             {
-                ReasonedHeadsCasResult::Updated => return Ok(Ok(manifest.generation)),
-                ReasonedHeadsCasResult::Conflict { .. } => continue,
+                ReasoningIndexesCasResult::Updated => return Ok(Ok(manifest.generation)),
+                ReasoningIndexesCasResult::Conflict { .. } => continue,
             }
         }
         Err(ApiError::internal(format!(
-            "the reasoned-heads document of {ledger_id} kept changing; gave up publishing"
+            "the reasoning-indexes document of {ledger_id} kept changing; gave up publishing"
         )))
     }
 }
 
 /// A previous generation, as the next one builds on it.
 struct Previous {
-    manifest: ReasonedManifest,
+    manifest: ReasoningManifest,
     derived: HashSet<(GraphId, Flake)>,
 }
 
@@ -856,7 +876,7 @@ async fn load_previous(
         .get(manifest_id)
         .await
         .map_err(|e| ApiError::internal(format!("read manifest {manifest_id}: {e}")))?;
-    let manifest = ReasonedManifest::decode(&bytes).map_err(ApiError::internal)?;
+    let manifest = ReasoningManifest::decode(&bytes).map_err(ApiError::internal)?;
     if !store
         .has(&manifest.root)
         .await
@@ -882,7 +902,7 @@ const UNREGISTERED_GRAPH: GraphId = GraphId::MAX;
 /// Each graph's Sid in flake form: `None` for the default graph.
 /// The hierarchy predicate a derived-only fact of the default graph has,
 /// if one does. Query-time `rdfs` rewriting reads the class and property
-/// hierarchy without derived facts; against a head it would read them.
+/// hierarchy without derived facts; against an index it would read them.
 fn derived_hierarchy_edge(facts: &HashSet<(GraphId, Flake)>) -> Option<&'static str> {
     use fluree_vocab::namespaces::RDFS;
     let sub_class = Sid::new(RDFS, "subClassOf");
@@ -1036,15 +1056,15 @@ mod tests {
     use serde_json::json;
 
     use super::RefreshOutcome;
-    use crate::reasoned::PauseSeam;
+    use crate::reasoning_index::PauseSeam;
 
-    /// A sweep that starts while a head build has written its files and not
+    /// A sweep that starts while an index build has written its files and not
     /// yet published them waits for the build, so what it publishes is
     /// there to read.
     #[tokio::test]
-    async fn a_sweep_waits_for_a_head_build_to_publish() {
+    async fn a_sweep_waits_for_an_index_build_to_publish() {
         let fluree = crate::FlureeBuilder::memory().build_memory();
-        let id = "heads/sweep-race:main";
+        let id = "reasoning-indexes/sweep-race:main";
         let ledger = fluree.create_ledger(id).await.unwrap();
         let ctx = json!({
             "ex": "http://example.org/",
@@ -1068,13 +1088,13 @@ mod tests {
             .reindex(id, crate::ReindexOptions::default())
             .await
             .unwrap();
-        let head = fluree
-            .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        let index = fluree
+            .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
             .await
             .unwrap();
-        // The sweep reads a head's files once it has a published generation;
+        // The sweep reads an index's files once it has a published generation;
         // the next one's are the files at risk.
-        fluree.refresh_reasoned_head(id, &head).await.unwrap();
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
         fluree
             .insert(
                 ledger,
@@ -1084,11 +1104,11 @@ mod tests {
             .unwrap();
 
         let seam = Arc::new(PauseSeam::default());
-        *fluree.reasoned.before_publish.lock() = Some(Arc::clone(&seam));
-        let refresh = fluree.refresh_reasoned_head(id, &head);
+        *fluree.reasoning_index_state.before_publish.lock() = Some(Arc::clone(&seam));
+        let refresh = fluree.refresh_reasoning_index(id, &index);
         let sweep = async {
             seam.reached.notified().await;
-            let sweep = fluree.sweep_index_storage("heads/sweep-race");
+            let sweep = fluree.sweep_index_storage("reasoning-indexes/sweep-race");
             tokio::pin!(sweep);
             let early = tokio::time::timeout(Duration::from_millis(300), &mut sweep).await;
             seam.resume.notify_one();
@@ -1118,7 +1138,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            resp.reasoning.and_then(|r| r.head).is_some(),
+            resp.reasoning.and_then(|r| r.index).is_some(),
             "the published generation is readable after the sweep"
         );
     }

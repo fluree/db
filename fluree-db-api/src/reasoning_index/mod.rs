@@ -1,12 +1,17 @@
-//! Reasoned heads: persisted, background-maintained results of registered
-//! reasoning programs.
+//! Materialized reasoning: reasoning indexes, the persisted and
+//! background-maintained results of registered reasoning programs.
 //!
-//! A head is a complete merged index of a branch — every graph's asserted
-//! facts plus the program's derived ones — pinned to a basis commit and
-//! stored under `{branch}/@reasoned/{head_id}/`. A reasoning query whose
-//! settled program matches a head published at exactly the query's commit is
-//! answered by an ordinary query against the head, with reasoning off;
-//! anything else runs reasoning at query time, as before.
+//! - A **reasoning program** is the registered rules and options.
+//! - A **reasoning index** is what a branch maintains for one program: the
+//!   branch's asserted facts together with the program's derived facts, every
+//!   graph, stored under `{branch}/@reasoning/{index_id}/`.
+//! - A **generation** is one immutable build of an index, at a basis commit.
+//! - The **head** points at an index's currently published generation.
+//!
+//! A reasoning query whose settled program matches an index whose head is at
+//! exactly the query's commit is answered by an ordinary query against that
+//! generation, with reasoning off; anything else reasons at query time, as
+//! before.
 //!
 //! - [`build`]: registration, and building and publishing generations.
 //! - [`serve`]: matching a query to a servable generation.
@@ -17,13 +22,13 @@ pub(crate) mod program;
 pub(crate) mod serve;
 mod worker;
 
-pub use build::{RefreshOutcome, MAX_ACTIVE_HEADS};
-pub use worker::{ReasonedHeadWorker, DEFAULT_CATCHUP_INTERVAL};
+pub use build::{RefreshOutcome, MAX_ACTIVE_INDEXES};
+pub use worker::{ReasoningIndexWorker, DEFAULT_CATCHUP_INTERVAL};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use fluree_db_core::reasoned_head::{HeadId, ReasonedManifest};
+use fluree_db_core::reasoning_index::{ReasoningIndexId, ReasoningManifest};
 use fluree_db_core::ContentId;
 use parking_lot::Mutex;
 
@@ -32,17 +37,17 @@ use crate::LedgerState;
 /// A published generation, loaded for serving.
 pub(crate) struct LoadedGeneration {
     pub manifest_id: ContentId,
-    pub manifest: ReasonedManifest,
+    pub manifest: ReasoningManifest,
     pub state: LedgerState,
 }
 
 /// How many loaded generations an instance keeps.
 const LOADED_GENERATIONS: usize = 16;
 
-/// How long superseded generations are kept, and how many a head may
+/// How long superseded generations are kept, and how many an index may
 /// accumulate inside that window before publication waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeadRetention {
+pub struct GenerationRetention {
     /// A superseded generation is kept until this long after its successor
     /// was published, so queries already reading it can finish. Nothing
     /// overrides it.
@@ -52,7 +57,7 @@ pub struct HeadRetention {
     pub max_generations_in_guard: usize,
 }
 
-impl Default for HeadRetention {
+impl Default for GenerationRetention {
     fn default() -> Self {
         Self {
             min_age_ms: 15 * 60 * 1000,
@@ -61,27 +66,27 @@ impl Default for HeadRetention {
     }
 }
 
-/// Per-instance reasoned-head state: which heads are being refreshed, the
+/// Per-instance reasoning-index state: which indexes are being refreshed, the
 /// generations loaded for serving, and the retention settings.
 #[derive(Default)]
-pub(crate) struct HeadState {
-    flights: Mutex<HashSet<(String, HeadId)>>,
-    loaded: Mutex<HashMap<(String, HeadId), Arc<LoadedGeneration>>>,
-    retention: Mutex<HeadRetention>,
-    /// Ledgers that registered a head in this process since the worker last
+pub(crate) struct ReasoningIndexState {
+    flights: Mutex<HashSet<(String, ReasoningIndexId)>>,
+    loaded: Mutex<HashMap<(String, ReasoningIndexId), Arc<LoadedGeneration>>>,
+    retention: Mutex<GenerationRetention>,
+    /// Ledgers that registered an index in this process since the worker last
     /// looked, and the signal that wakes it.
     registered_ledgers: Mutex<HashSet<String>>,
     pub(crate) registered: tokio::sync::Notify,
     /// How long a `strict` query waits for a generation at its snapshot.
     strict_wait: Mutex<Option<std::time::Duration>>,
-    /// Ledgers whose heads document was empty when last read, and when, so a
-    /// reasoning query on a ledger with no heads does not read the
+    /// Ledgers whose reasoning-indexes document was empty when last read, and when, so a
+    /// reasoning query on a ledger with no indexes does not read the
     /// nameservice each time. A registration here clears its ledger at once;
-    /// one made elsewhere is seen within [`NO_HEADS_TTL`].
-    no_heads: Mutex<HashMap<String, std::time::Instant>>,
-    /// Head builds writing files, and sweeps holding them off, by ledger
-    /// name. See [`HeadState::begin_write`].
-    writes: Mutex<HeadWrites>,
+    /// one made elsewhere is seen within [`NO_INDEXES_TTL`].
+    no_indexes: Mutex<HashMap<String, std::time::Instant>>,
+    /// Index builds writing files, and sweeps holding them off, by ledger
+    /// name. See [`ReasoningIndexState::begin_write`].
+    writes: Mutex<IndexWrites>,
     writes_changed: tokio::sync::Notify,
     /// Pauses a refresh after it has written its files and before it
     /// publishes them.
@@ -90,7 +95,7 @@ pub(crate) struct HeadState {
 }
 
 #[derive(Default)]
-struct HeadWrites {
+struct IndexWrites {
     building: HashMap<String, usize>,
     sweeping: HashMap<String, usize>,
 }
@@ -102,14 +107,14 @@ pub(crate) struct PauseSeam {
     pub resume: tokio::sync::Notify,
 }
 
-/// A head build writing files under a ledger; the ledger's sweeps wait for
+/// An index build writing files under a ledger; the ledger's sweeps wait for
 /// it to drop.
-pub(crate) struct HeadWrite<'a> {
-    state: &'a HeadState,
+pub(crate) struct IndexWrite<'a> {
+    state: &'a ReasoningIndexState,
     ledger_name: String,
 }
 
-impl Drop for HeadWrite<'_> {
+impl Drop for IndexWrite<'_> {
     fn drop(&mut self) {
         let mut writes = self.state.writes.lock();
         if let Some(n) = writes.building.get_mut(&self.ledger_name) {
@@ -123,10 +128,10 @@ impl Drop for HeadWrite<'_> {
     }
 }
 
-/// A sweep of a ledger: no head build of the ledger starts writing until it
+/// A sweep of a ledger: no index build of the ledger starts writing until it
 /// drops.
 pub(crate) struct SweepHold<'a> {
-    state: &'a HeadState,
+    state: &'a ReasoningIndexState,
     ledger_name: String,
 }
 
@@ -144,22 +149,22 @@ impl Drop for SweepHold<'_> {
     }
 }
 
-/// How long an empty heads document is trusted without re-reading.
-pub(crate) const NO_HEADS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long an empty reasoning-indexes document is trusted without re-reading.
+pub(crate) const NO_INDEXES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-impl std::fmt::Debug for HeadState {
+impl std::fmt::Debug for ReasoningIndexState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeadState")
+        f.debug_struct("ReasoningIndexState")
             .field("flights", &self.flights.lock().len())
             .field("loaded", &self.loaded.lock().len())
             .finish()
     }
 }
 
-/// Holds a head's refresh slot; one refresh per head at a time.
+/// Holds an index's refresh slot; one refresh per index at a time.
 pub(crate) struct Flight<'a> {
-    state: &'a HeadState,
-    key: (String, HeadId),
+    state: &'a ReasoningIndexState,
+    key: (String, ReasoningIndexId),
 }
 
 impl Drop for Flight<'_> {
@@ -168,12 +173,12 @@ impl Drop for Flight<'_> {
     }
 }
 
-impl HeadState {
-    pub(crate) fn retention(&self) -> HeadRetention {
+impl ReasoningIndexState {
+    pub(crate) fn retention(&self) -> GenerationRetention {
         *self.retention.lock()
     }
 
-    pub(crate) fn set_retention(&self, retention: HeadRetention) {
+    pub(crate) fn set_retention(&self, retention: GenerationRetention) {
         *self.retention.lock() = retention;
     }
 
@@ -188,32 +193,32 @@ impl HeadState {
     }
 
     pub(crate) fn note_registered(&self, ledger_id: &str) {
-        self.no_heads.lock().remove(ledger_id);
+        self.no_indexes.lock().remove(ledger_id);
         self.registered_ledgers.lock().insert(ledger_id.to_string());
         self.registered.notify_one();
     }
 
-    pub(crate) fn known_to_have_no_heads(&self, ledger_id: &str) -> bool {
-        self.no_heads
+    pub(crate) fn known_to_have_no_indexes(&self, ledger_id: &str) -> bool {
+        self.no_indexes
             .lock()
             .get(ledger_id)
-            .is_some_and(|read_at| read_at.elapsed() < NO_HEADS_TTL)
+            .is_some_and(|read_at| read_at.elapsed() < NO_INDEXES_TTL)
     }
 
-    pub(crate) fn note_no_heads(&self, ledger_id: &str) {
-        let mut no_heads = self.no_heads.lock();
-        if no_heads.len() > 4096 {
-            no_heads.retain(|_, read_at| read_at.elapsed() < NO_HEADS_TTL);
+    pub(crate) fn note_no_indexes(&self, ledger_id: &str) {
+        let mut no_indexes = self.no_indexes.lock();
+        if no_indexes.len() > 4096 {
+            no_indexes.retain(|_, read_at| read_at.elapsed() < NO_INDEXES_TTL);
         }
-        no_heads.insert(ledger_id.to_string(), std::time::Instant::now());
+        no_indexes.insert(ledger_id.to_string(), std::time::Instant::now());
     }
 
     pub(crate) fn take_registered(&self) -> Vec<String> {
         self.registered_ledgers.lock().drain().collect()
     }
 
-    pub(crate) fn begin(&self, ledger_id: &str, head_id: &HeadId) -> Option<Flight<'_>> {
-        let key = (ledger_id.to_string(), head_id.clone());
+    pub(crate) fn begin(&self, ledger_id: &str, index_id: &ReasoningIndexId) -> Option<Flight<'_>> {
+        let key = (ledger_id.to_string(), index_id.clone());
         self.flights
             .lock()
             .insert(key.clone())
@@ -224,19 +229,19 @@ impl HeadState {
     /// while a sweep of the ledger runs. A sweep reclaims every file no
     /// published generation references, so it must not plan while a build
     /// has files written and not yet published.
-    pub(crate) fn begin_write(&self, ledger_name: &str) -> Option<HeadWrite<'_>> {
+    pub(crate) fn begin_write(&self, ledger_name: &str) -> Option<IndexWrite<'_>> {
         let mut writes = self.writes.lock();
         if writes.sweeping.contains_key(ledger_name) {
             return None;
         }
         *writes.building.entry(ledger_name.to_string()).or_default() += 1;
-        Some(HeadWrite {
+        Some(IndexWrite {
             state: self,
             ledger_name: ledger_name.to_string(),
         })
     }
 
-    /// Hold head builds of `ledger_name` off for a sweep, once those already
+    /// Hold index builds of `ledger_name` off for a sweep, once those already
     /// writing have published or given up.
     pub(crate) async fn hold_for_sweep(&self, ledger_name: &str) -> SweepHold<'_> {
         *self
@@ -259,32 +264,37 @@ impl HeadState {
         }
     }
 
-    pub(crate) fn forget_head(&self, ledger_id: &str, head_id: &HeadId) {
+    pub(crate) fn forget_index(&self, ledger_id: &str, index_id: &ReasoningIndexId) {
         self.loaded
             .lock()
-            .remove(&(ledger_id.to_string(), head_id.clone()));
+            .remove(&(ledger_id.to_string(), index_id.clone()));
     }
 
     fn loaded(
         &self,
         ledger_id: &str,
-        head_id: &HeadId,
+        index_id: &ReasoningIndexId,
         manifest_id: &ContentId,
     ) -> Option<Arc<LoadedGeneration>> {
         self.loaded
             .lock()
-            .get(&(ledger_id.to_string(), head_id.clone()))
+            .get(&(ledger_id.to_string(), index_id.clone()))
             .filter(|g| &g.manifest_id == manifest_id)
             .cloned()
     }
 
-    fn keep(&self, ledger_id: &str, head_id: &HeadId, generation: Arc<LoadedGeneration>) {
+    fn keep(
+        &self,
+        ledger_id: &str,
+        index_id: &ReasoningIndexId,
+        generation: Arc<LoadedGeneration>,
+    ) {
         let mut loaded = self.loaded.lock();
         if loaded.len() >= LOADED_GENERATIONS {
             if let Some(key) = loaded.keys().next().cloned() {
                 loaded.remove(&key);
             }
         }
-        loaded.insert((ledger_id.to_string(), head_id.clone()), generation);
+        loaded.insert((ledger_id.to_string(), index_id.clone()), generation);
     }
 }

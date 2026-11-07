@@ -1735,27 +1735,37 @@ impl StatusPublisher for FileNameService {
 }
 
 #[async_trait]
-impl crate::ReasonedHeadsLookup for FileNameService {
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+impl crate::ReasoningIndexesLookup for FileNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = Self::ns_address(&ledger_name, &branch);
-        crate::ns_cas::read_reasoned_heads(&self.storage, &key).await
+        crate::ns_cas::read_reasoning_indexes(&self.storage, &key).await
     }
 }
 
 #[async_trait]
-impl crate::ReasonedHeadsPublisher for FileNameService {
-    async fn push_reasoned_heads_fenced(
+impl crate::ReasoningIndexesPublisher for FileNameService {
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &crate::ReasonedHeads,
-    ) -> Result<crate::ReasonedHeadsCasResult> {
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = Self::ns_address(&ledger_name, &branch);
-        crate::ns_cas::push_reasoned_heads(&self.storage, &key, ledger_id, fence, expected_v, new)
-            .await
+        crate::ns_cas::push_reasoning_indexes(
+            &self.storage,
+            &key,
+            ledger_id,
+            fence,
+            expected_v,
+            new,
+        )
+        .await
     }
 }
 

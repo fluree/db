@@ -4205,12 +4205,12 @@ mod source_lookups_fail {
     }
 
     #[async_trait]
-    impl fluree_db_nameservice::ReasonedHeadsLookup for SourceLookupsFail {
-        async fn get_reasoned_heads(
+    impl fluree_db_nameservice::ReasoningIndexesLookup for SourceLookupsFail {
+        async fn get_reasoning_indexes(
             &self,
             id: &str,
-        ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
-            self.0.get_reasoned_heads(id).await
+        ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+            self.0.get_reasoning_indexes(id).await
         }
     }
 

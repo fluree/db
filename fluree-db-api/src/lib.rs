@@ -106,7 +106,7 @@ pub mod policy_view;
 pub mod profile;
 pub mod query;
 pub mod rdf;
-pub mod reasoned;
+pub mod reasoning_index;
 mod rebase;
 pub mod remote_service;
 mod revert;
@@ -363,8 +363,8 @@ pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use fluree_db_core::reasoned_head::ReasonedHeads;
-pub use reasoned::{HeadRetention, ReasonedHeadWorker, RefreshOutcome};
+pub use fluree_db_core::reasoning_index::ReasoningIndexes;
+pub use reasoning_index::{GenerationRetention, ReasoningIndexWorker, RefreshOutcome};
 
 #[cfg(feature = "iceberg")]
 pub use materialize_worker::{
@@ -830,15 +830,15 @@ impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsLookup for NameServiceMode {
-    async fn get_reasoned_heads(
+impl fluree_db_nameservice::ReasoningIndexesLookup for NameServiceMode {
+    async fn get_reasoning_indexes(
         &self,
         ledger_id: &str,
     ) -> std::result::Result<
-        Option<fluree_db_nameservice::ReasonedHeads>,
+        Option<fluree_db_nameservice::ReasoningIndexes>,
         fluree_db_nameservice::NameServiceError,
     > {
-        self.reader().get_reasoned_heads(ledger_id).await
+        self.reader().get_reasoning_indexes(ledger_id).await
     }
 }
 
@@ -3565,7 +3565,7 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             identity,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
-            reasoned: Arc::default(),
+            reasoning_index_state: Arc::default(),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }
@@ -3928,8 +3928,8 @@ pub struct Fluree {
     identity: fluree_db_iceberg::IdentityContext,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
-    /// Reasoned heads being refreshed, and generations loaded for serving.
-    reasoned: Arc<reasoned::HeadState>,
+    /// Reasoning indexes being refreshed, and generations loaded for serving.
+    reasoning_index_state: Arc<reasoning_index::ReasoningIndexState>,
     /// What this instance holds of its file storage root.
     #[cfg(feature = "native")]
     root: RootHold,
@@ -3985,7 +3985,7 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
-            reasoned: Arc::default(),
+            reasoning_index_state: Arc::default(),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }

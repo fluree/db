@@ -268,15 +268,15 @@ pub struct DroppedLedger {
     /// marked retracted is a branch dropped before its ledger, which a
     /// restore brings back still dropped.
     pub branches: Vec<NsRecord>,
-    /// Each branch's reasoned-heads document, by branch, as it was when the
+    /// Each branch's reasoning-indexes document, by branch, as it was when the
     /// ledger was dropped; a restore writes it back under the fresh fences.
     /// The heads' files stay under the instance root meanwhile.
     #[serde(
-        rename = "reasonedHeads",
+        rename = "reasoningIndexes",
         default,
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
-    pub reasoned_heads: std::collections::BTreeMap<String, crate::ReasonedHeads>,
+    pub reasoning_indexes: std::collections::BTreeMap<String, crate::ReasoningIndexes>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -291,8 +291,8 @@ struct DroppedLedgerFields {
     root: StorageRoot,
     root_branch: String,
     branches: Vec<NsRecord>,
-    #[serde(rename = "reasonedHeads", default)]
-    reasoned_heads: std::collections::BTreeMap<String, crate::ReasonedHeads>,
+    #[serde(rename = "reasoningIndexes", default)]
+    reasoning_indexes: std::collections::BTreeMap<String, crate::ReasoningIndexes>,
     #[serde(flatten)]
     extra: ExtraFields,
 }
@@ -308,7 +308,7 @@ impl From<DroppedLedgerFields> for DroppedLedger {
             root: f.root,
             root_branch: f.root_branch,
             branches: f.branches,
-            reasoned_heads: f.reasoned_heads,
+            reasoning_indexes: f.reasoning_indexes,
         }
     }
 }
@@ -636,7 +636,7 @@ mod tests {
                 name: "mydb".into(),
                 root_branch: "main".into(),
                 branches: vec![record.clone()],
-                reasoned_heads: Default::default(),
+                reasoning_indexes: Default::default(),
             };
             let json = serde_json::to_string(&entry).unwrap();
             assert_eq!(serde_json::from_str::<DroppedLedger>(&json).unwrap(), entry);

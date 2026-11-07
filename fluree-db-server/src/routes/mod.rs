@@ -26,7 +26,7 @@ mod pack;
 mod policy_auth;
 mod push;
 pub(crate) mod query;
-mod reasoned_heads;
+mod reasoning_indexes;
 pub(crate) mod serving;
 mod show;
 mod sparql_protocol;
@@ -153,12 +153,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `PublishGraphSource` / `PublishGraphSourceIndex` — so they have to
         // originate on the leader. Listing, inspection, and drop reuse the
         // graph-source fallbacks in `/ledgers`, `/info`, and `/drop`.
-        // Reasoned heads publish their registrations and generations
+        // Reasoning indexes publish their registrations and generations
         // through the nameservice, so they originate on the leader.
-        .route("/reasoned-heads/register", post(reasoned_heads::register))
-        .route("/reasoned-heads/list", post(reasoned_heads::list))
-        .route("/reasoned-heads/retire", post(reasoned_heads::retire))
-        .route("/reasoned-heads/refresh", post(reasoned_heads::refresh))
+        .route(
+            "/reasoning-indexes/register",
+            post(reasoning_indexes::register),
+        )
+        .route("/reasoning-indexes/list", post(reasoning_indexes::list))
+        .route("/reasoning-indexes/retire", post(reasoning_indexes::retire))
+        .route(
+            "/reasoning-indexes/refresh",
+            post(reasoning_indexes::refresh),
+        )
         .route("/bm25/create", post(bm25::bm25_create))
         .route("/bm25/sync", post(bm25::bm25_sync))
         // Wholesale .flpack restore: creates a new ledger from a trusted

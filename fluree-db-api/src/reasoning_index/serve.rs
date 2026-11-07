@@ -1,7 +1,7 @@
-//! Serving a reasoning query from a reasoned head.
+//! Serving a reasoning query from a reasoning index.
 //!
 //! A generation is servable to a query when:
-//! - its head is active and the generation belongs to the head's current
+//! - its index is active and the generation belongs to the index's current
 //!   revision;
 //! - its basis is exactly the query's snapshot: the view is the branch's
 //!   state at its commit head, of the same ledger instance. A staged view,
@@ -9,16 +9,16 @@
 //! - the reasoning the query settled to has the generation's settled key,
 //!   which covers the program, the reasoned graph, rule sources, the schema
 //!   bundle and the evaluation time;
-//! - the view is unrestricted. A head is materialized without policy, so a
+//! - the view is unrestricted. An index is materialized without policy, so a
 //!   policy-restricted view always reasons at query time.
 //!
-//! Anything else falls back to query-time reasoning, as do errors reading a
-//! head: serving from a head is an acceleration, never a requirement.
+//! Anything else falls back to query-time reasoning, as do errors reading an
+//! index: serving from an index is an acceleration, never a requirement.
 
 use std::sync::Arc;
 
-use fluree_db_core::reasoned_head::{HeadId, ReasonedManifest, RegistrationState};
-use fluree_db_core::{BranchedContentStore, ContentId, ContentStore, ReasonedHeadTally};
+use fluree_db_core::reasoning_index::{ReasoningIndexId, ReasoningManifest, RegistrationState};
+use fluree_db_core::{BranchedContentStore, ContentId, ContentStore, ReasoningIndexTally};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::ir::{ReasoningConfig, ReasoningFreshness};
 
@@ -26,10 +26,10 @@ use super::{program, LoadedGeneration};
 use crate::view::GraphDb;
 use crate::{ApiError, Fluree, LedgerState, Result};
 
-/// A head view to run a query against, with reasoning off.
-pub(crate) struct ServedHead {
+/// An index view to run a query against, with reasoning off.
+pub(crate) struct ServedGeneration {
     pub view: GraphDb,
-    pub tally: ReasonedHeadTally,
+    pub tally: ReasoningIndexTally,
     /// The generation the view reads, for the other graphs of a dataset.
     pub generation: Arc<LoadedGeneration>,
 }
@@ -37,15 +37,15 @@ pub(crate) struct ServedHead {
 const STRICT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Fluree {
-    /// The head generation that can answer a query with settled
+    /// The index generation that can answer a query with settled
     /// `reasoning` against `db`, if any, as the query's freshness mode
     /// allows. Only a `strict` query fails for want of one.
-    pub(crate) async fn reasoned_head_for(
+    pub(crate) async fn reasoning_index_for(
         &self,
         db: &GraphDb,
         reasoning: &ReasoningConfig,
-    ) -> Result<Option<ServedHead>> {
-        let strict = || ApiError::ReasonedHeadNotReady {
+    ) -> Result<Option<ServedGeneration>> {
+        let strict = || ApiError::ReasoningIndexNotReady {
             ledger_id: db.ledger_id.to_string(),
             t: db.t,
         };
@@ -65,7 +65,7 @@ impl Fluree {
                 None => Ok(self.servable(db, reasoning, true).await),
             },
             ReasoningFreshness::Strict => {
-                let deadline = std::time::Instant::now() + self.reasoned.strict_wait();
+                let deadline = std::time::Instant::now() + self.reasoning_index_state.strict_wait();
                 loop {
                     if let Some(served) = self.servable(db, reasoning, false).await {
                         return Ok(Some(served));
@@ -84,11 +84,11 @@ impl Fluree {
         db: &GraphDb,
         reasoning: &ReasoningConfig,
         as_of: bool,
-    ) -> Option<ServedHead> {
+    ) -> Option<ServedGeneration> {
         match self.try_servable(db, reasoning, as_of).await {
             Ok(served) => served,
             Err(e) => {
-                tracing::debug!(ledger = %db.ledger_id, error = %e, "reasoned head not served");
+                tracing::debug!(ledger = %db.ledger_id, error = %e, "reasoning index not served");
                 None
             }
         }
@@ -101,15 +101,18 @@ impl Fluree {
         db: &GraphDb,
         reasoning: &ReasoningConfig,
         as_of: bool,
-    ) -> Result<Option<ServedHead>> {
+    ) -> Result<Option<ServedGeneration>> {
         let ledger_id = db.ledger_id.as_ref();
-        if self.reasoned.known_to_have_no_heads(ledger_id) {
+        if self
+            .reasoning_index_state
+            .known_to_have_no_indexes(ledger_id)
+        {
             return Ok(None);
         }
-        let doc = match self.nameservice().get_reasoned_heads(ledger_id).await? {
+        let doc = match self.nameservice().get_reasoning_indexes(ledger_id).await? {
             Some(doc) if !doc.is_empty() => doc,
             _ => {
-                self.reasoned.note_no_heads(ledger_id);
+                self.reasoning_index_state.note_no_indexes(ledger_id);
                 return Ok(None);
             }
         };
@@ -133,8 +136,8 @@ impl Fluree {
             return Ok(None);
         }
         let settled = program::settled_key(reasoning, db.graph_id);
-        for (head_id, entry) in &doc.heads {
-            let Some(published) = &entry.published else {
+        for (index_id, entry) in &doc.indexes {
+            let Some(published) = &entry.head else {
                 continue;
             };
             if !matches!(entry.registration.state, RegistrationState::Active)
@@ -155,7 +158,7 @@ impl Fluree {
                     .as_of_generation(
                         &record,
                         &view_commit,
-                        head_id,
+                        index_id,
                         &published.manifest,
                         db.t,
                         &settled,
@@ -167,17 +170,17 @@ impl Fluree {
                 }
             };
             let generation = self
-                .loaded_generation(&record, head_id, &manifest_id)
+                .loaded_generation(&record, index_id, &manifest_id)
                 .await?;
             if generation.manifest.settled != settled
                 || generation.manifest.revision != entry.registration.revision
             {
                 continue;
             }
-            return Ok(Some(ServedHead {
-                view: head_view(db, &generation.state),
-                tally: ReasonedHeadTally {
-                    head_id: head_id.to_string(),
+            return Ok(Some(ServedGeneration {
+                view: generation_view(db, &generation.state),
+                tally: ReasoningIndexTally {
+                    index_id: index_id.to_string(),
                     generation: generation.manifest.generation,
                     basis_t: generation.manifest.basis.t,
                     basis_commit: generation.manifest.basis.commit.to_string(),
@@ -188,21 +191,22 @@ impl Fluree {
         Ok(None)
     }
 
-    /// The newest retained generation of a head whose basis is on the line
+    /// The newest retained generation of an index whose basis is on the line
     /// of the view's commit at or before `t`, computed under `settled`.
     async fn as_of_generation(
         &self,
         record: &NsRecord,
         view_commit: &ContentId,
-        head_id: &HeadId,
+        index_id: &ReasoningIndexId,
         newest: &ContentId,
         t: i64,
         settled: &ContentId,
     ) -> Result<Option<ContentId>> {
-        let store = self.head_store(record, head_id).await?;
-        let generations = fluree_db_indexer::gc::heads::head_generations(store.as_ref(), newest)
-            .await
-            .map_err(|e| ApiError::internal(format!("read head chain: {e}")))?;
+        let store = self.index_store(record, index_id).await?;
+        let generations =
+            fluree_db_indexer::gc::reasoning_indexes::index_generations(store.as_ref(), newest)
+                .await
+                .map_err(|e| ApiError::internal(format!("read index chain: {e}")))?;
         let Some(oldest_t) = generations.iter().map(|g| g.manifest.basis.t).min() else {
             return Ok(None);
         };
@@ -226,35 +230,39 @@ impl Fluree {
     async fn loaded_generation(
         &self,
         record: &NsRecord,
-        head_id: &HeadId,
+        index_id: &ReasoningIndexId,
         manifest_id: &ContentId,
     ) -> Result<Arc<LoadedGeneration>> {
         let ledger_id = record.ledger_id.as_str();
-        if let Some(loaded) = self.reasoned.loaded(ledger_id, head_id, manifest_id) {
+        if let Some(loaded) = self
+            .reasoning_index_state
+            .loaded(ledger_id, index_id, manifest_id)
+        {
             return Ok(loaded);
         }
-        let store = self.head_store(record, head_id).await?;
+        let store = self.index_store(record, index_id).await?;
         let bytes = store
             .get(manifest_id)
             .await
             .map_err(|e| ApiError::internal(format!("read manifest {manifest_id}: {e}")))?;
-        let manifest = ReasonedManifest::decode(&bytes).map_err(ApiError::internal)?;
-        let state = self.load_head_state(store, record, &manifest).await?;
+        let manifest = ReasoningManifest::decode(&bytes).map_err(ApiError::internal)?;
+        let state = self.load_generation_state(store, record, &manifest).await?;
         let loaded = Arc::new(LoadedGeneration {
             manifest_id: manifest_id.clone(),
             manifest,
             state,
         });
-        self.reasoned.keep(ledger_id, head_id, Arc::clone(&loaded));
+        self.reasoning_index_state
+            .keep(ledger_id, index_id, Arc::clone(&loaded));
         Ok(loaded)
     }
 
-    /// A head's store: its own namespace, falling back to the branch's for
+    /// An index's store: its own namespace, falling back to the branch's for
     /// commits.
-    pub(crate) async fn head_store(
+    pub(crate) async fn index_store(
         &self,
         record: &NsRecord,
-        head_id: &HeadId,
+        index_id: &ReasoningIndexId,
     ) -> Result<Arc<dyn ContentStore>> {
         let branch_store = fluree_db_nameservice::branched_content_store_for_record(
             self.backend(),
@@ -262,31 +270,33 @@ impl Fluree {
             record,
         )
         .await?;
-        let head_cs = self
-            .backend()
-            .content_store(&record.storage_namespace().reasoned_head(head_id.as_str()));
+        let index_cs = self.backend().content_store(
+            &record
+                .storage_namespace()
+                .reasoning_index(index_id.as_str()),
+        );
         Ok(Arc::new(BranchedContentStore::with_parents(
-            head_cs,
+            index_cs,
             vec![BranchedContentStore::leaf(branch_store)],
         )))
     }
 
     /// The ledger state a generation's root describes: the branch at the
     /// basis, every graph, merged with the derived facts, and no novelty.
-    async fn load_head_state(
+    async fn load_generation_state(
         &self,
         store: Arc<dyn ContentStore>,
         record: &NsRecord,
-        manifest: &ReasonedManifest,
+        manifest: &ReasoningManifest,
     ) -> Result<LedgerState> {
-        let mut head_record = record.clone();
-        head_record.index_head_id = Some(manifest.root.clone());
-        head_record.index_t = manifest.basis.t;
-        head_record.commit_head_id = Some(manifest.basis.commit.clone());
-        head_record.commit_t = manifest.basis.t;
+        let mut index_record = record.clone();
+        index_record.index_head_id = Some(manifest.root.clone());
+        index_record.index_t = manifest.basis.t;
+        index_record.commit_head_id = Some(manifest.basis.commit.clone());
+        index_record.commit_t = manifest.basis.t;
         let (mut state, root) = LedgerState::load_with_store_decoding_root(
             Arc::clone(&store),
-            head_record,
+            index_record,
             crate::ledger_manager::decode_index_root,
         )
         .await?;
@@ -302,18 +312,18 @@ impl Fluree {
     }
 }
 
-/// `base` with the head's state in place of its own: the same ledger,
-/// configuration and graph, reading the head's index at its basis.
-pub(crate) fn head_view(base: &GraphDb, head: &LedgerState) -> GraphDb {
-    let head = GraphDb::from_ledger_state(head);
+/// `base` with a generation's state in place of its own: the same ledger,
+/// configuration and graph, reading the generation's index at its basis.
+pub(crate) fn generation_view(base: &GraphDb, generation: &LedgerState) -> GraphDb {
+    let generation = GraphDb::from_ledger_state(generation);
     let mut view = base.clone();
-    view.t = head.t;
-    view.commit_id = head.commit_id;
-    view.snapshot = head.snapshot;
-    view.overlay = head.overlay;
-    view.novelty = head.novelty;
-    view.binary_store = head.binary_store;
-    view.dict_novelty = head.dict_novelty;
-    view.runtime_small_dicts = head.runtime_small_dicts;
+    view.t = generation.t;
+    view.commit_id = generation.commit_id;
+    view.snapshot = generation.snapshot;
+    view.overlay = generation.overlay;
+    view.novelty = generation.novelty;
+    view.binary_store = generation.binary_store;
+    view.dict_novelty = generation.dict_novelty;
+    view.runtime_small_dicts = generation.runtime_small_dicts;
     view
 }

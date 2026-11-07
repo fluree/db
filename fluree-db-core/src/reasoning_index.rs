@@ -1,17 +1,20 @@
-//! Reasoned heads: persisted results of a registered reasoning program.
+//! Reasoning indexes: the persisted results of a registered reasoning
+//! program on one branch.
 //!
-//! A head is a complete merged index of one branch for one program reasoning
-//! against one graph: every graph's asserted facts plus the derived ones,
-//! pinned to a basis commit. A reasoned query that matches a head reads only
-//! the head, so every binding stays in the head's dictionary scope.
+//! A reasoning index contains the branch's asserted facts, every graph,
+//! together with the derived facts of one program reasoning against one
+//! graph. Each **generation** is one immutable build at a basis commit, and
+//! the index's **head** points at the generation currently published. A
+//! reasoning query that matches a generation reads only it, so every binding
+//! stays in its dictionary scope.
 //!
 //! This module holds the types shared by the nameservice (which stores one
-//! [`ReasonedHeads`] document per branch), the worker that builds and
+//! [`ReasoningIndexes`] document per branch), the worker that builds and
 //! publishes generations, and the query path that serves them:
 //!
-//! - [`ReasonedHeads`] / [`HeadEntry`] / [`Registration`]: the per-branch
+//! - [`ReasoningIndexes`] / [`ReasoningIndexEntry`] / [`Registration`]: the per-branch
 //!   document, updated by compare-and-swap on `v` under the branch fence.
-//! - [`ReasonedManifest`]: one published generation, content-addressed.
+//! - [`ReasoningManifest`]: one published generation, content-addressed.
 //! - [`admit`]: the publication rules every publisher applies against the
 //!   document it last read.
 
@@ -25,19 +28,19 @@ use std::fmt;
 // Identity
 // ============================================================================
 
-/// A head's id: a ULID assigned when a registration creates the head, never
-/// reused. It names the head's storage folder, so it is never user text.
+/// An index's id: a ULID assigned when a registration creates the index, never
+/// reused. It names the index's storage folder, so it is never user text.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct HeadId(String);
+pub struct ReasoningIndexId(String);
 
-impl HeadId {
+impl ReasoningIndexId {
     pub fn parse(id: &str) -> Result<Self, String> {
         let crockford =
             |c: char| c.is_ascii_digit() || (c.is_ascii_uppercase() && !"ILOU".contains(c));
         if id.len() != 26 || !id.chars().all(crockford) {
             return Err(format!(
-                "Invalid reasoned head id '{id}': expected a 26-character ULID"
+                "Invalid reasoning index id '{id}': expected a 26-character ULID"
             ));
         }
         Ok(Self(id.to_string()))
@@ -48,28 +51,28 @@ impl HeadId {
     }
 }
 
-impl TryFrom<String> for HeadId {
+impl TryFrom<String> for ReasoningIndexId {
     type Error = String;
     fn try_from(id: String) -> Result<Self, Self::Error> {
         Self::parse(&id)
     }
 }
 
-impl From<HeadId> for String {
-    fn from(id: HeadId) -> Self {
+impl From<ReasoningIndexId> for String {
+    fn from(id: ReasoningIndexId) -> Self {
         id.0
     }
 }
 
-impl fmt::Display for HeadId {
+impl fmt::Display for ReasoningIndexId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl fmt::Debug for HeadId {
+impl fmt::Debug for ReasoningIndexId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HeadId({})", self.0)
+        write!(f, "ReasoningIndexId({})", self.0)
     }
 }
 
@@ -141,26 +144,26 @@ pub enum RegistrationState {
     },
 }
 
-/// The inputs a result was computed from, on the head's own branch.
+/// The inputs a result was computed from, on the index's own branch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Basis {
     pub commit: ContentId,
-    /// Locates `commit` on its chain. Not an order: heads can be reset.
+    /// Locates `commit` on its chain. Not an order: indexes can be reset.
     pub t: i64,
     pub epoch: ErasureEpoch,
 }
 
-/// One head's place in the per-branch document.
+/// One index's place in the per-branch document.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HeadEntry {
+pub struct ReasoningIndexEntry {
     pub registration: Registration,
     /// Publication refuses candidates whose epoch is below this.
     #[serde(default)]
     pub floor: ErasureEpoch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published: Option<HeadPointer>,
+    pub head: Option<HeadPointer>,
 }
 
 /// The generation an entry currently publishes.
@@ -175,19 +178,19 @@ pub struct HeadPointer {
     pub settled: ContentId,
 }
 
-/// The per-branch document: every head of the branch, read in one
+/// The per-branch document: every index of the branch, read in one
 /// consistent read.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReasonedHeads {
+pub struct ReasoningIndexes {
     /// Compare-and-swap version. 0 = never written.
     pub v: i64,
     #[serde(default)]
-    pub heads: BTreeMap<HeadId, HeadEntry>,
+    pub indexes: BTreeMap<ReasoningIndexId, ReasoningIndexEntry>,
 }
 
-impl ReasonedHeads {
+impl ReasoningIndexes {
     pub fn is_empty(&self) -> bool {
-        self.heads.is_empty()
+        self.indexes.is_empty()
     }
 }
 
@@ -220,11 +223,11 @@ pub struct GenerationStats {
 }
 
 /// One published generation: content-addressed, kind
-/// [`ContentKind::ReasonedManifest`].
+/// [`ContentKind::ReasoningManifest`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReasonedManifest {
-    pub head_id: HeadId,
+pub struct ReasoningManifest {
+    pub index_id: ReasoningIndexId,
     pub ledger_id: String,
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,7 +243,7 @@ pub struct ReasonedManifest {
     /// own settled reasoning has the same digest.
     pub settled: ContentId,
     pub basis: Basis,
-    /// The merged index root, in the head's namespace.
+    /// The merged index root, in the index's namespace.
     pub root: ContentId,
     /// The derived-only set D, kind [`ContentKind::DerivedFacts`].
     pub derived: ContentId,
@@ -250,7 +253,7 @@ pub struct ReasonedManifest {
 
 const MANIFEST_MAGIC: &[u8; 4] = b"FRM1";
 
-impl ReasonedManifest {
+impl ReasoningManifest {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = MANIFEST_MAGIC.to_vec();
         serde_json::to_writer(&mut out, self).expect("manifest serializes");
@@ -260,12 +263,12 @@ impl ReasonedManifest {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let body = bytes
             .strip_prefix(MANIFEST_MAGIC.as_slice())
-            .ok_or_else(|| "not a reasoned-head manifest (bad magic)".to_string())?;
-        serde_json::from_slice(body).map_err(|e| format!("reasoned-head manifest: {e}"))
+            .ok_or_else(|| "not a reasoning-index manifest (bad magic)".to_string())?;
+        serde_json::from_slice(body).map_err(|e| format!("reasoning-index manifest: {e}"))
     }
 
     pub fn content_id(bytes: &[u8]) -> ContentId {
-        ContentId::new(ContentKind::ReasonedManifest, bytes)
+        ContentId::new(ContentKind::ReasoningManifest, bytes)
     }
 
     pub fn pointer(&self, manifest: ContentId) -> HeadPointer {
@@ -317,7 +320,7 @@ impl DerivedIndex {
 /// What a publisher knows about a candidate's basis relative to the branch.
 pub trait BasisOracle {
     /// Whether `basis` is live: its commit is an ancestor of, or equal to,
-    /// the branch's current head.
+    /// the branch's current index.
     fn is_live(&self, basis: &Basis) -> bool;
     /// Whether `ancestor`'s commit is an ancestor of, or equal to,
     /// `descendant`'s.
@@ -333,7 +336,7 @@ pub fn basis_dominates(oracle: &dyn BasisOracle, b2: &Basis, b1: &Basis) -> bool
 /// A generation ready to publish, before its place in the chain is known.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub head_id: HeadId,
+    pub index_id: ReasoningIndexId,
     pub kind: GenerationKind,
     pub revision: u64,
     pub basis: Basis,
@@ -370,16 +373,16 @@ pub struct Admitted {
 /// Apply the publication rules to `candidate` against `actual`, the document
 /// as last read: eligibility first, then the basis, then progress.
 pub fn admit(
-    actual: &ReasonedHeads,
+    actual: &ReasoningIndexes,
     candidate: &Candidate,
     oracle: &dyn BasisOracle,
 ) -> Result<Admitted, Discard> {
     let entry = actual
-        .heads
-        .get(&candidate.head_id)
-        .ok_or_else(|| Discard::NotEligible("the head is not registered".into()))?;
+        .indexes
+        .get(&candidate.index_id)
+        .ok_or_else(|| Discard::NotEligible("the index is not registered".into()))?;
     if !matches!(entry.registration.state, RegistrationState::Active) {
-        return Err(Discard::NotEligible("the head is retired".into()));
+        return Err(Discard::NotEligible("the index is retired".into()));
     }
     if entry.registration.revision != candidate.revision {
         return Err(Discard::NotEligible(format!(
@@ -399,7 +402,7 @@ pub fn admit(
         ));
     }
 
-    let Some(current) = &entry.published else {
+    let Some(current) = &entry.head else {
         return Ok(Admitted {
             generation: 1,
             prev_manifest: None,
@@ -489,12 +492,15 @@ mod tests {
         }
     }
 
-    fn doc(revision: u64, published: Option<(&str, i64, u64)>) -> (ReasonedHeads, HeadId) {
-        let id = HeadId::parse("01JC0000000000000000000000").unwrap();
-        let mut heads = BTreeMap::new();
-        heads.insert(
+    fn doc(
+        revision: u64,
+        published: Option<(&str, i64, u64)>,
+    ) -> (ReasoningIndexes, ReasoningIndexId) {
+        let id = ReasoningIndexId::parse("01JC0000000000000000000000").unwrap();
+        let mut indexes = BTreeMap::new();
+        indexes.insert(
             id.clone(),
-            HeadEntry {
+            ReasoningIndexEntry {
                 registration: Registration {
                     revision,
                     semantics: key(),
@@ -502,7 +508,7 @@ mod tests {
                     state: RegistrationState::Active,
                 },
                 floor: ErasureEpoch(0),
-                published: published.map(|(tag, t, rev)| HeadPointer {
+                head: published.map(|(tag, t, rev)| HeadPointer {
                     manifest: cid(&format!("manifest-{tag}")),
                     generation: 3,
                     revision: rev,
@@ -511,12 +517,17 @@ mod tests {
                 }),
             },
         );
-        (ReasonedHeads { v: 1, heads }, id)
+        (ReasoningIndexes { v: 1, indexes }, id)
     }
 
-    fn candidate(id: &HeadId, kind: GenerationKind, revision: u64, b: Basis) -> Candidate {
+    fn candidate(
+        id: &ReasoningIndexId,
+        kind: GenerationKind,
+        revision: u64,
+        b: Basis,
+    ) -> Candidate {
         Candidate {
-            head_id: id.clone(),
+            index_id: id.clone(),
             kind,
             revision,
             basis: b,
@@ -602,7 +613,7 @@ mod tests {
     fn the_floor_refuses_stale_epochs() {
         let line = Line::new(&[("c1", 1)], &[], "c1");
         let (mut doc, id) = doc(1, None);
-        doc.heads.get_mut(&id).unwrap().floor = ErasureEpoch(2);
+        doc.indexes.get_mut(&id).unwrap().floor = ErasureEpoch(2);
         let c = candidate(&id, GenerationKind::Rebuild, 1, basis("c1", 1));
         assert!(matches!(
             admit(&doc, &c, &line),
@@ -611,10 +622,10 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_head_admits_nothing() {
+    fn a_retired_index_admits_nothing() {
         let line = Line::new(&[("c1", 1)], &[], "c1");
         let (mut doc, id) = doc(1, None);
-        doc.heads.get_mut(&id).unwrap().registration.state =
+        doc.indexes.get_mut(&id).unwrap().registration.state =
             RegistrationState::Retired { at_ms: 5 };
         let c = candidate(&id, GenerationKind::Rebuild, 1, basis("c1", 1));
         assert!(matches!(
@@ -625,8 +636,8 @@ mod tests {
 
     #[test]
     fn the_manifest_round_trips() {
-        let m = ReasonedManifest {
-            head_id: HeadId::parse("01JC0000000000000000000000").unwrap(),
+        let m = ReasoningManifest {
+            index_id: ReasoningIndexId::parse("01JC0000000000000000000000").unwrap(),
             ledger_id: "mydb:main".into(),
             generation: 2,
             prev_manifest: Some(cid("m1")),
@@ -641,14 +652,17 @@ mod tests {
             stats: GenerationStats::default(),
         };
         let bytes = m.encode();
-        assert_eq!(ReasonedManifest::decode(&bytes).unwrap(), m);
-        assert!(ReasonedManifest::decode(b"nope").is_err());
+        assert_eq!(ReasoningManifest::decode(&bytes).unwrap(), m);
+        assert!(ReasoningManifest::decode(b"nope").is_err());
     }
 
     #[test]
     fn the_document_round_trips() {
         let (doc, _) = doc(1, Some(("c1", 1, 1)));
         let json = serde_json::to_string(&doc).unwrap();
-        assert_eq!(serde_json::from_str::<ReasonedHeads>(&json).unwrap(), doc);
+        assert_eq!(
+            serde_json::from_str::<ReasoningIndexes>(&json).unwrap(),
+            doc
+        );
     }
 }

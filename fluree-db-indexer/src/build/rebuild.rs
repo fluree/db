@@ -439,7 +439,7 @@ where
                 }
             }
 
-            // A reasoned head's derived facts follow the last commit, at its `t`.
+            // A reasoning index's derived facts follow the last commit, at its `t`.
             if let Some(derived) = config.derived_facts.as_deref() {
                 let resolved = shared
                     .resolve_derived_into_chunk(derived, &mut chunk)

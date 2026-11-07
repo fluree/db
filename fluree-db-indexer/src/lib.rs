@@ -309,7 +309,7 @@ pub async fn build_index_for_record_with_tracker(
 /// the root at `record.index_head_id`, incrementally only.
 ///
 /// Unlike [`build_index_for_record`], a window the incremental path cannot
-/// apply is an error rather than a full rebuild: a reasoned head's fold
+/// apply is an error rather than a full rebuild: a reasoning index's fold
 /// carries only the derived facts that changed, which a rebuild from commits
 /// would not see.
 pub async fn fold_index_for_record(

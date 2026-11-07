@@ -2012,26 +2012,27 @@ impl StatusPublisher for DynamoDbNameService {
     }
 }
 
-// ─── Reasoned heads (on the status item) ───────────────────────────────────
+// ─── Reasoning indexes (on the status item) ───────────────────────────────────
 
 impl DynamoDbNameService {
-    fn reasoned_heads_of(
+    fn reasoning_indexes_of(
         item: &Item,
-    ) -> std::result::Result<fluree_db_nameservice::ReasonedHeads, NameServiceError> {
-        match item.get(ATTR_REASONED_HEADS).and_then(|v| v.as_s().ok()) {
+    ) -> std::result::Result<fluree_db_nameservice::ReasoningIndexes, NameServiceError> {
+        match item.get(ATTR_REASONING_INDEXES).and_then(|v| v.as_s().ok()) {
             Some(json) => serde_json::from_str(json)
-                .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}"))),
-            None => Ok(fluree_db_nameservice::ReasonedHeads::default()),
+                .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}"))),
+            None => Ok(fluree_db_nameservice::ReasoningIndexes::default()),
         }
     }
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsLookup for DynamoDbNameService {
-    async fn get_reasoned_heads(
+impl fluree_db_nameservice::ReasoningIndexesLookup for DynamoDbNameService {
+    async fn get_reasoning_indexes(
         &self,
         ledger_id: &str,
-    ) -> std::result::Result<Option<fluree_db_nameservice::ReasonedHeads>, NameServiceError> {
+    ) -> std::result::Result<Option<fluree_db_nameservice::ReasoningIndexes>, NameServiceError>
+    {
         let pk = Self::normalize(ledger_id)?;
         let response = self
             .client
@@ -2049,9 +2050,9 @@ impl fluree_db_nameservice::ReasonedHeadsLookup for DynamoDbNameService {
                 ))
             })?;
         match response.item() {
-            Some(item) => Self::reasoned_heads_of(item).map(Some),
+            Some(item) => Self::reasoning_indexes_of(item).map(Some),
             None if self.meta_exists(&pk).await? => {
-                Ok(Some(fluree_db_nameservice::ReasonedHeads::default()))
+                Ok(Some(fluree_db_nameservice::ReasoningIndexes::default()))
             }
             None => Ok(None),
         }
@@ -2059,22 +2060,23 @@ impl fluree_db_nameservice::ReasonedHeadsLookup for DynamoDbNameService {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsPublisher for DynamoDbNameService {
-    async fn push_reasoned_heads_fenced(
+impl fluree_db_nameservice::ReasoningIndexesPublisher for DynamoDbNameService {
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &fluree_db_nameservice::ReasonedHeads,
-    ) -> std::result::Result<fluree_db_nameservice::ReasonedHeadsCasResult, NameServiceError> {
-        use fluree_db_nameservice::{ReasonedHeadsCasResult, ReasonedHeadsLookup as _};
+        new: &fluree_db_nameservice::ReasoningIndexes,
+    ) -> std::result::Result<fluree_db_nameservice::ReasoningIndexesCasResult, NameServiceError>
+    {
+        use fluree_db_nameservice::{ReasoningIndexesCasResult, ReasoningIndexesLookup as _};
         let pk = Self::normalize(ledger_id)?;
-        let conflict = |actual| Ok(ReasonedHeadsCasResult::Conflict { actual });
+        let conflict = |actual| Ok(ReasoningIndexesCasResult::Conflict { actual });
         if new.v <= expected_v {
-            return conflict(self.get_reasoned_heads(ledger_id).await?);
+            return conflict(self.get_reasoning_indexes(ledger_id).await?);
         }
         let json = serde_json::to_string(new)
-            .map_err(|e| NameServiceError::storage(format!("reasoned-heads document: {e}")))?;
+            .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}")))?;
         let version_clause = if expected_v == 0 {
             "(attribute_not_exists(#rv) OR #rv = :expected_v)"
         } else {
@@ -2088,8 +2090,8 @@ impl fluree_db_nameservice::ReasonedHeadsPublisher for DynamoDbNameService {
             .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()));
         let result = lifecycle::fenced_update_item(request, Some(version_clause), fence)
             .update_expression("SET #rh = :doc, #rv = :new_v, #ua = :now")
-            .expression_attribute_names("#rh", ATTR_REASONED_HEADS)
-            .expression_attribute_names("#rv", ATTR_REASONED_HEADS_V)
+            .expression_attribute_names("#rh", ATTR_REASONING_INDEXES)
+            .expression_attribute_names("#rv", ATTR_REASONING_INDEXES_V)
             .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
             .expression_attribute_values(":expected_v", AttributeValue::N(expected_v.to_string()))
             .expression_attribute_values(":new_v", AttributeValue::N(new.v.to_string()))
@@ -2101,12 +2103,12 @@ impl fluree_db_nameservice::ReasonedHeadsPublisher for DynamoDbNameService {
             .send()
             .await;
         match result {
-            Ok(_) => Ok(ReasonedHeadsCasResult::Updated),
+            Ok(_) => Ok(ReasoningIndexesCasResult::Updated),
             Err(e) if Self::is_conditional_check_failed(&e) => {
                 if self.fence_refuses(&pk, SK_STATUS, fence).await? {
                     return Err(NameServiceError::fenced(ledger_id));
                 }
-                conflict(self.get_reasoned_heads(ledger_id).await?)
+                conflict(self.get_reasoning_indexes(ledger_id).await?)
             }
             Err(e) => Err(NameServiceError::storage(format!(
                 "DynamoDB UpdateItem failed: {e}"

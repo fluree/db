@@ -144,7 +144,7 @@
   - [Explain plans](query/explain.md)
   - [Tracking and fuel limits](query/tracking-and-fuel.md)
   - [Reasoning in queries](query/reasoning.md)
-  - [Persisted reasoning (reasoned heads)](query/reasoned-heads.md)
+  - [Materialized reasoning](query/materialized-reasoning.md)
   - [Datalog rules](query/datalog-rules.md)
 
 - [Transactions](transactions/README.md)

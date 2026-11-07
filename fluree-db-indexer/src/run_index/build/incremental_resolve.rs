@@ -147,7 +147,7 @@ pub struct IncrementalResolveConfig {
     pub pending_commit_cids: Option<Vec<(i64, ContentId)>>,
     /// Global bound on in-flight commit-body fetches on the fast path.
     pub commit_fetch_concurrency: usize,
-    /// A reasoned head's derived facts, in commit-codec form, applied after
+    /// A reasoning index's derived facts, in commit-codec form, applied after
     /// the window's commits at their `t` (see
     /// [`crate::config::IndexerConfig::derived_facts`]).
     pub derived_facts: Option<Arc<Vec<u8>>>,

@@ -1,11 +1,11 @@
-//! Reasoned heads: registered reasoning programs persisted as merged
+//! Reasoning indexes: registered reasoning programs persisted as merged
 //! indexes, served to matching queries at their basis commit.
 
 use crate::support::normalize_rows;
-use fluree_db_api::reasoned::RefreshOutcome;
+use fluree_db_api::reasoning_index::RefreshOutcome;
 use fluree_db_api::{Fluree, FlureeBuilder};
-use fluree_db_core::reasoned_head::GenerationKind;
-use fluree_db_core::ReasonedHeadTally;
+use fluree_db_core::reasoning_index::GenerationKind;
+use fluree_db_core::ReasoningIndexTally;
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -16,12 +16,12 @@ fn ctx() -> JsonValue {
     })
 }
 
-/// A tracked query's rows, sorted, and the head that served it, if any.
+/// A tracked query's rows, sorted, and the index that served it, if any.
 async fn rows(
     fluree: &Fluree,
     ledger_id: &str,
     query: &JsonValue,
-) -> (Vec<JsonValue>, Option<ReasonedHeadTally>) {
+) -> (Vec<JsonValue>, Option<ReasoningIndexTally>) {
     let resp = fluree
         .graph(ledger_id)
         .query()
@@ -32,7 +32,7 @@ async fn rows(
         .unwrap_or_else(|e| panic!("query failed: {e:?}"));
     (
         normalize_rows(&resp.result),
-        resp.reasoning.and_then(|r| r.head).map(|h| *h),
+        resp.reasoning.and_then(|r| r.index).map(|h| *h),
     )
 }
 
@@ -55,13 +55,13 @@ fn published(outcome: RefreshOutcome) -> (u64, GenerationKind) {
 }
 
 #[tokio::test]
-async fn a_head_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
+async fn an_index_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/owl:main";
+    let id = "reasoning-indexes/owl:main";
     let ledger = fluree.create_ledger(id).await.unwrap();
     let ledger = fluree
         .insert(
@@ -79,39 +79,40 @@ async fn a_head_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
         .unwrap()
         .ledger;
 
-    let (expected, head) = rows(&fluree, id, &people_query()).await;
-    assert_eq!(head, None, "nothing is registered yet");
+    let (expected, index) = rows(&fluree, id, &people_query()).await;
+    assert_eq!(index, None, "nothing is registered yet");
     assert_eq!(expected, vec![json!("ex:alice"), json!("ex:bob")]);
 
-    let head_id = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index_id = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
     let again = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
     assert_eq!(
-        head_id, again,
+        index_id, again,
         "registering an active program is idempotent"
     );
 
-    let (generation, kind) = published(fluree.refresh_reasoned_head(id, &head_id).await.unwrap());
+    let (generation, kind) =
+        published(fluree.refresh_reasoning_index(id, &index_id).await.unwrap());
     assert_eq!((generation, kind), (1, GenerationKind::Rebuild));
 
-    let (served, head) = rows(&fluree, id, &people_query()).await;
+    let (served, index) = rows(&fluree, id, &people_query()).await;
     assert_eq!(served, expected);
-    let head = head.expect("the head answers at its basis");
+    let index = index.expect("the index answers at its basis");
     assert_eq!(
-        (head.head_id.as_str(), head.generation),
-        (head_id.as_str(), 1)
+        (index.index_id.as_str(), index.generation),
+        (index_id.as_str(), 1)
     );
 
-    // Without reasoning nothing is derived, and the head is not consulted.
+    // Without reasoning nothing is derived, and the index is not consulted.
     let mut plain = people_query();
     plain.as_object_mut().unwrap().remove("reasoning");
-    let (asserted, head) = rows(&fluree, id, &plain).await;
-    assert_eq!(head, None);
+    let (asserted, index) = rows(&fluree, id, &plain).await;
+    assert_eq!(index, None);
     assert_eq!(asserted, vec![json!("ex:bob")]);
 
     // A new commit: the generation is no longer at the query's snapshot,
@@ -124,18 +125,19 @@ async fn a_head_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
         .await
         .unwrap()
         .ledger;
-    let (fallback, head) = rows(&fluree, id, &people_query()).await;
-    assert_eq!(head, None, "a stale generation is never served");
+    let (fallback, index) = rows(&fluree, id, &people_query()).await;
+    assert_eq!(index, None, "a stale generation is never served");
     assert_eq!(
         fallback,
         vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
     );
 
-    let (generation, kind) = published(fluree.refresh_reasoned_head(id, &head_id).await.unwrap());
+    let (generation, kind) =
+        published(fluree.refresh_reasoning_index(id, &index_id).await.unwrap());
     assert_eq!((generation, kind), (2, GenerationKind::Logical));
-    let (served, head) = rows(&fluree, id, &people_query()).await;
+    let (served, index) = rows(&fluree, id, &people_query()).await;
     assert_eq!(served, fallback);
-    assert_eq!(head.map(|h| h.generation), Some(2));
+    assert_eq!(index.map(|h| h.generation), Some(2));
 
     // Retracting the support removes the derived fact.
     let _ledger = fluree
@@ -150,7 +152,7 @@ async fn a_head_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
         .await
         .unwrap()
         .ledger;
-    let outcome = fluree.refresh_reasoned_head(id, &head_id).await.unwrap();
+    let outcome = fluree.refresh_reasoning_index(id, &index_id).await.unwrap();
     match &outcome {
         RefreshOutcome::Published {
             generation, stats, ..
@@ -160,12 +162,12 @@ async fn a_head_answers_owl2rl_queries_at_its_commit_and_follows_the_branch() {
         }
         other => panic!("expected a published generation, got {other:?}"),
     }
-    let (served, head) = rows(&fluree, id, &people_query()).await;
-    assert_eq!(head.map(|h| h.generation), Some(3));
+    let (served, index) = rows(&fluree, id, &people_query()).await;
+    assert_eq!(index.map(|h| h.generation), Some(3));
     assert_eq!(served, vec![json!("ex:bob"), json!("ex:carol")]);
 
     assert_eq!(
-        fluree.refresh_reasoned_head(id, &head_id).await.unwrap(),
+        fluree.refresh_reasoning_index(id, &index_id).await.unwrap(),
         RefreshOutcome::Current { generation: 3 }
     );
 }
@@ -196,7 +198,7 @@ async fn retract(
 #[tokio::test]
 async fn an_asserted_and_derived_fact_survives_losing_either_support() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/overlap:main";
+    let id = "reasoning-indexes/overlap:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -209,11 +211,11 @@ async fn an_asserted_and_derived_fact_survives_losing_either_support() {
         }),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+    match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
         RefreshOutcome::Published { stats, .. } => {
             assert_eq!(
                 stats.derived_only, 0,
@@ -230,7 +232,7 @@ async fn an_asserted_and_derived_fact_survives_losing_either_support() {
         json!({"@id": "ex:alice", "@type": "ex:Person"}),
     )
     .await;
-    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+    match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
         RefreshOutcome::Published { stats, kind, .. } => {
             assert_eq!(kind, GenerationKind::Logical);
             assert_eq!(stats.derived_only, 1, "{stats:?}");
@@ -258,7 +260,7 @@ async fn an_asserted_and_derived_fact_survives_losing_either_support() {
         json!({"@id": "ex:alice", "@type": "ex:Student"}),
     )
     .await;
-    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+    match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
         RefreshOutcome::Published { stats, .. } => {
             assert_eq!(stats.derived_only, 0, "{stats:?}");
             assert_eq!(
@@ -279,7 +281,7 @@ async fn an_asserted_and_derived_fact_survives_losing_either_support() {
 #[tokio::test]
 async fn a_chain_loses_what_its_retracted_link_supported() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/chain:main";
+    let id = "reasoning-indexes/chain:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -300,11 +302,11 @@ async fn a_chain_loses_what_its_retracted_link_supported() {
         "where": {"@id": "ex:a", "ex:partOf": "?o"},
         "reasoning": "owl2rl"
     });
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let (reached, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
     assert_eq!(reached, vec![json!("ex:b"), json!("ex:c"), json!("ex:d")]);
@@ -318,7 +320,7 @@ async fn a_chain_loses_what_its_retracted_link_supported() {
     let (expected, served) = rows(&fluree, id, &q).await;
     assert!(served.is_none());
     assert_eq!(expected, vec![json!("ex:b")]);
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let (reached, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
     assert_eq!(reached, expected);
@@ -329,7 +331,7 @@ async fn a_chain_loses_what_its_retracted_link_supported() {
 #[tokio::test]
 async fn a_datalog_program_is_served_only_to_queries_with_its_rules() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/datalog:main";
+    let id = "reasoning-indexes/datalog:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -361,8 +363,8 @@ async fn a_datalog_program_is_served_only_to_queries_with_its_rules() {
     let (expected, _) = rows(&fluree, id, &q).await;
     assert_eq!(expected, vec![json!("ex:b"), json!("ex:c")]);
 
-    let head = fluree.register_reasoned_head(id, &program).await.unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let index = fluree.register_reasoning_index(id, &program).await.unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let (served_rows, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
     assert_eq!(served_rows, expected);
@@ -383,7 +385,7 @@ async fn a_datalog_program_is_served_only_to_queries_with_its_rules() {
         .await
         .unwrap()
         .ledger;
-    let (_, kind) = published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (_, kind) = published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     assert_eq!(kind, GenerationKind::Logical);
     let (served_rows, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
@@ -398,7 +400,7 @@ async fn a_datalog_program_is_served_only_to_queries_with_its_rules() {
 #[tokio::test]
 async fn a_rule_into_a_missing_graph_publishes_nothing() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/missing-graph:main";
+    let id = "reasoning-indexes/missing-graph:main";
     let _ledger = ledger_with(
         &fluree,
         id,
@@ -416,25 +418,25 @@ async fn a_rule_into_a_missing_graph_publishes_nothing() {
         }),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "datalog"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog"}))
         .await
         .unwrap();
-    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+    match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
         RefreshOutcome::Failed { reason } => {
             assert!(reason.contains("inferred"), "{reason}");
         }
         other => panic!("expected a failed run, got {other:?}"),
     }
-    let doc = fluree.reasoned_heads(id).await.unwrap();
-    assert!(doc.heads[&head].published.is_none());
+    let doc = fluree.reasoning_indexes(id).await.unwrap();
+    assert!(doc.indexes[&index].head.is_none());
 }
 
-/// SPARQL reasoning queries are served from the same head as JSON-LD ones.
+/// SPARQL reasoning queries are served from the same index as JSON-LD ones.
 #[tokio::test]
-async fn a_sparql_reasoning_query_is_served_from_the_head() {
+async fn a_sparql_reasoning_query_is_served_from_the_index() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/sparql:main";
+    let id = "reasoning-indexes/sparql:main";
     ledger_with(
         &fluree,
         id,
@@ -447,11 +449,11 @@ async fn a_sparql_reasoning_query_is_served_from_the_head() {
         }),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let sparql = "# PRAGMA reasoning: owl2rl\nPREFIX ex: <http://example.org/>\n\
                   SELECT ?p WHERE { ?p a ex:Person }";
     let resp = fluree
@@ -462,19 +464,19 @@ async fn a_sparql_reasoning_query_is_served_from_the_head() {
         .execute_tracked()
         .await
         .unwrap();
-    let head_tally = resp.reasoning.and_then(|r| r.head);
-    assert_eq!(head_tally.map(|h| h.head_id), Some(head.to_string()));
+    let index_tally = resp.reasoning.and_then(|r| r.index);
+    assert_eq!(index_tally.map(|h| h.index_id), Some(index.to_string()));
     let text = resp.result.to_string();
     assert!(text.contains("alice"), "{text}");
 }
 
 /// A base that has its own index: the first generation copies it into the
-/// head's folder and folds the derived facts in; the base keeps answering
+/// index's folder and folds the derived facts in; the base keeps answering
 /// unreasoned queries from its own index.
 #[tokio::test]
-async fn a_head_builds_on_an_indexed_base() {
+async fn an_index_builds_on_an_indexed_base() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/indexed:main";
+    let id = "reasoning-indexes/indexed:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -501,11 +503,11 @@ async fn a_head_builds_on_an_indexed_base() {
         .unwrap()
         .ledger;
     let (expected, _) = rows(&fluree, id, &people_query()).await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    let (_, kind) = published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (_, kind) = published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     assert_eq!(kind, GenerationKind::Rebuild);
     let (served_rows, served) = rows(&fluree, id, &people_query()).await;
     assert!(served.is_some());
@@ -516,11 +518,11 @@ async fn a_head_builds_on_an_indexed_base() {
     );
 }
 
-/// A retired head is never served, and refreshing it publishes nothing.
+/// A retired index is never served, and refreshing it publishes nothing.
 #[tokio::test]
-async fn a_retired_head_is_not_served() {
+async fn a_retired_index_is_not_served() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/retired:main";
+    let id = "reasoning-indexes/retired:main";
     ledger_with(
         &fluree,
         id,
@@ -533,18 +535,18 @@ async fn a_retired_head_is_not_served() {
         }),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     assert!(rows(&fluree, id, &people_query()).await.1.is_some());
-    fluree.retire_reasoned_head(id, &head).await.unwrap();
+    fluree.retire_reasoning_index(id, &index).await.unwrap();
     let (people, served) = rows(&fluree, id, &people_query()).await;
     assert!(served.is_none());
     assert_eq!(people, vec![json!("ex:alice")]);
     assert!(matches!(
-        fluree.refresh_reasoned_head(id, &head).await.unwrap(),
+        fluree.refresh_reasoning_index(id, &index).await.unwrap(),
         RefreshOutcome::Discarded { .. }
     ));
 }
@@ -555,7 +557,7 @@ async fn a_retired_head_is_not_served() {
 #[tokio::test]
 async fn a_derived_fact_retracted_in_the_window_stays_while_derived() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/window-retract:main";
+    let id = "reasoning-indexes/window-retract:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -568,11 +570,11 @@ async fn a_derived_fact_retracted_in_the_window_stays_while_derived() {
         }),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let ledger = fluree
         .insert(
             ledger,
@@ -587,21 +589,21 @@ async fn a_derived_fact_retracted_in_the_window_stays_while_derived() {
         json!({"@id": "ex:alice", "@type": "ex:Person"}),
     )
     .await;
-    let (_, kind) = published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    let (_, kind) = published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     assert_eq!(kind, GenerationKind::Logical);
     let (people, served) = rows(&fluree, id, &people_query()).await;
     assert!(served.is_some());
     assert_eq!(people, vec![json!("ex:alice")]);
 }
 
-/// The branch's own collector keeps the dictionary blobs a head still
-/// reaches: a head starts from a copy of the base index, which shares the
+/// The branch's own collector keeps the dictionary blobs an index still
+/// reaches: an index starts from a copy of the base index, which shares the
 /// base's dictionaries, and the base's later builds retire them.
 #[tokio::test]
-async fn the_branch_collector_keeps_dictionaries_a_head_reaches() {
+async fn the_branch_collector_keeps_dictionaries_an_index_reaches() {
     use fluree_db_indexer::gc::{plan_garbage, release_garbage_plan, CleanGarbageConfig};
     let (writer, reader) = crate::support::instances_sharing_storage();
-    let id = "heads/gc:main";
+    let id = "reasoning-indexes/gc:main";
     let ledger = ledger_with(
         &writer,
         id,
@@ -619,11 +621,11 @@ async fn the_branch_collector_keeps_dictionaries_a_head_reaches() {
         .reindex(id, fluree_db_api::ReindexOptions::default())
         .await
         .unwrap();
-    let head = writer
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = writer
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    published(writer.refresh_reasoning_index(id, &index).await.unwrap());
 
     // The base moves on and rebuilds; its collector retires the old index.
     let ledger = writer
@@ -658,9 +660,9 @@ async fn the_branch_collector_keeps_dictionaries_a_head_reaches() {
     .await
     .unwrap();
 
-    // Bring the head to the new commit, then read it from an instance that
+    // Bring the index to the new commit, then read it from an instance that
     // has nothing cached.
-    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    published(writer.refresh_reasoning_index(id, &index).await.unwrap());
     drop(ledger);
     let q = json!({
         "@context": ctx(),
@@ -698,45 +700,45 @@ async fn student_commit(
 async fn chain_len(
     fluree: &Fluree,
     id: &str,
-    head: &fluree_db_core::reasoned_head::HeadId,
+    index: &fluree_db_core::reasoning_index::ReasoningIndexId,
 ) -> usize {
     let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
     let store = fluree
         .backend()
-        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
-    let doc = fluree.reasoned_heads(id).await.unwrap();
-    let pointer = doc.heads[head].published.clone().unwrap();
-    fluree_db_indexer::gc::heads::head_generations(store.as_ref(), &pointer.manifest)
+        .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+    let doc = fluree.reasoning_indexes(id).await.unwrap();
+    let pointer = doc.indexes[index].head.clone().unwrap();
+    fluree_db_indexer::gc::reasoning_indexes::index_generations(store.as_ref(), &pointer.manifest)
         .await
         .unwrap()
         .len()
 }
 
 /// With no retention window, each publication releases the generations it
-/// superseded, and the head keeps answering.
+/// superseded, and the index keeps answering.
 #[tokio::test]
 async fn superseded_generations_are_released_after_the_guard() {
     let fluree = FlureeBuilder::memory().build_memory();
-    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+    fluree.set_reasoning_index_retention(fluree_db_api::reasoning_index::GenerationRetention {
         min_age_ms: 0,
         max_generations_in_guard: 8,
     });
-    let id = "heads/retention:main";
+    let id = "reasoning-indexes/retention:main";
     let mut ledger = ledger_with(
         &fluree,
         id,
         json!({"@context": ctx(), "@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}}),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
     for name in ["alice", "bob", "carol"] {
         ledger = student_commit(&fluree, ledger, name).await;
-        published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+        published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     }
-    assert_eq!(chain_len(&fluree, id, &head).await, 1);
+    assert_eq!(chain_len(&fluree, id, &index).await, 1);
     let (people, served) = rows(&fluree, id, &people_query()).await;
     assert_eq!(served.map(|h| h.generation), Some(3));
     assert_eq!(
@@ -745,44 +747,44 @@ async fn superseded_generations_are_released_after_the_guard() {
     );
 }
 
-/// Inside the window nothing is released, and once the head holds as many
+/// Inside the window nothing is released, and once the index holds as many
 /// superseded generations as it may, publication waits.
 #[tokio::test]
 async fn publication_waits_rather_than_shorten_the_guard() {
     let fluree = FlureeBuilder::memory().build_memory();
-    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+    fluree.set_reasoning_index_retention(fluree_db_api::reasoning_index::GenerationRetention {
         min_age_ms: 3_600_000,
         max_generations_in_guard: 1,
     });
-    let id = "heads/throttle:main";
+    let id = "reasoning-indexes/throttle:main";
     let mut ledger = ledger_with(
         &fluree,
         id,
         json!({"@context": ctx(), "@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}}),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
     ledger = student_commit(&fluree, ledger, "alice").await;
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     ledger = student_commit(&fluree, ledger, "bob").await;
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
-    assert_eq!(chain_len(&fluree, id, &head).await, 2);
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    assert_eq!(chain_len(&fluree, id, &index).await, 2);
     let _ledger = student_commit(&fluree, ledger, "carol").await;
     assert_eq!(
-        fluree.refresh_reasoned_head(id, &head).await.unwrap(),
+        fluree.refresh_reasoning_index(id, &index).await.unwrap(),
         RefreshOutcome::Throttled { in_guard: 1 }
     );
-    assert_eq!(chain_len(&fluree, id, &head).await, 2);
+    assert_eq!(chain_len(&fluree, id, &index).await, 2);
 }
 
-/// The worker refreshes a head after each commit, with no explicit refresh.
+/// The worker refreshes an index after each commit, with no explicit refresh.
 #[tokio::test]
 async fn the_worker_follows_commits() {
     let fluree = std::sync::Arc::new(FlureeBuilder::memory().build_memory());
-    let id = "heads/worker:main";
+    let id = "reasoning-indexes/worker:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -796,20 +798,20 @@ async fn the_worker_follows_commits() {
     )
     .await;
     let worker = tokio::spawn(
-        fluree_db_api::ReasonedHeadWorker::new(std::sync::Arc::clone(&fluree))
+        fluree_db_api::ReasoningIndexWorker::new(std::sync::Arc::clone(&fluree))
             .with_catchup_interval(std::time::Duration::from_secs(3600))
             .run(),
     );
     fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
     let served_at = |generation: u64| {
         let fluree = std::sync::Arc::clone(&fluree);
         async move {
             for _ in 0..200 {
-                if let (people, Some(head)) = rows(&fluree, id, &people_query()).await {
-                    if head.generation >= generation {
+                if let (people, Some(index)) = rows(&fluree, id, &people_query()).await {
+                    if index.generation >= generation {
                         return people;
                     }
                 }
@@ -860,12 +862,12 @@ async fn school(fluree: &Fluree, id: &str) -> fluree_db_api::LedgerState {
     .await
 }
 
-/// `exact` refuses a capped query-time answer, and a head answers it
-/// completely whatever the budget: budgets bound the reasoner, not a head.
+/// `exact` refuses a capped query-time answer, and an index answers it
+/// completely whatever the budget: budgets bound the reasoner, not an index.
 #[tokio::test]
-async fn exact_refuses_a_capped_answer_and_a_head_gives_the_complete_one() {
+async fn exact_refuses_a_capped_answer_and_an_index_gives_the_complete_one() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/exact:main";
+    let id = "reasoning-indexes/exact:main";
     school(&fluree, id).await;
     let q = with(
         with(people_query(), "reasoningBudget", json!({"maxFacts": 1})),
@@ -875,11 +877,11 @@ async fn exact_refuses_a_capped_answer_and_a_head_gives_the_complete_one() {
     let err = query_err(&fluree, id, &q).await;
     assert!(err.contains("exact"), "{err}");
 
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let (people, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
@@ -888,10 +890,10 @@ async fn exact_refuses_a_capped_answer_and_a_head_gives_the_complete_one() {
 /// `strict` never reasons at query time: it waits for a generation at its
 /// snapshot, and fails when none arrives.
 #[tokio::test]
-async fn strict_waits_for_a_head_and_never_reasons_at_query_time() {
+async fn strict_waits_for_an_index_and_never_reasons_at_query_time() {
     let fluree = FlureeBuilder::memory().build_memory();
-    fluree.set_reasoned_head_strict_wait(std::time::Duration::from_millis(100));
-    let id = "heads/strict:main";
+    fluree.set_reasoning_index_strict_wait(std::time::Duration::from_millis(100));
+    let id = "reasoning-indexes/strict:main";
     let ledger = school(&fluree, id).await;
     let q = with(people_query(), "reasoningFreshness", json!("strict"));
     let err = query_err(&fluree, id, &q).await;
@@ -900,11 +902,11 @@ async fn strict_waits_for_a_head_and_never_reasons_at_query_time() {
         "{err}"
     );
 
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let (people, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
@@ -924,13 +926,13 @@ async fn strict_waits_for_a_head_and_never_reasons_at_query_time() {
 #[tokio::test]
 async fn as_of_reads_the_whole_query_at_the_generation_basis() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/as-of:main";
+    let id = "reasoning-indexes/as-of:main";
     let ledger = school(&fluree, id).await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let _ledger = student_commit(&fluree, ledger, "carol").await;
 
     let as_of = with(people_query(), "reasoningFreshness", json!("asOf"));
@@ -967,8 +969,8 @@ async fn as_of_reads_the_whole_query_at_the_generation_basis() {
 #[tokio::test]
 async fn the_sparql_freshness_pragma_is_honored() {
     let fluree = FlureeBuilder::memory().build_memory();
-    fluree.set_reasoned_head_strict_wait(std::time::Duration::from_millis(50));
-    let id = "heads/sparql-strict:main";
+    fluree.set_reasoning_index_strict_wait(std::time::Duration::from_millis(50));
+    let id = "reasoning-indexes/sparql-strict:main";
     school(&fluree, id).await;
     let sparql = "# PRAGMA reasoning: owl2rl\n# PRAGMA reasoning-freshness: strict\n\
                   PREFIX ex: <http://example.org/>\nSELECT ?p WHERE { ?p a ex:Person }";
@@ -980,11 +982,11 @@ async fn the_sparql_freshness_pragma_is_honored() {
         .execute_tracked()
         .await;
     assert_eq!(refused.err().map(|e| e.status), Some(408));
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    fluree.refresh_reasoned_head(id, &head).await.unwrap();
+    fluree.refresh_reasoning_index(id, &index).await.unwrap();
     let resp = fluree
         .graph(id)
         .query()
@@ -993,16 +995,16 @@ async fn the_sparql_freshness_pragma_is_honored() {
         .execute_tracked()
         .await
         .unwrap();
-    assert!(resp.reasoning.and_then(|r| r.head).is_some());
+    assert!(resp.reasoning.and_then(|r| r.index).is_some());
 }
 
-/// The streaming query path is answered from a head too: under a budget that
+/// The streaming query path is answered from an index too: under a budget that
 /// caps query-time reasoning, the stream still returns the complete answer.
 #[tokio::test]
-async fn a_streaming_query_is_served_from_the_head() {
+async fn a_streaming_query_is_served_from_the_index() {
     use fluree_db_api::{OwnedStreamQuery, QueryExecutionOptions, Tracker};
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/stream:main";
+    let id = "reasoning-indexes/stream:main";
     let students: Vec<JsonValue> = (0..10)
         .map(|i| json!({"@id": format!("ex:s{i}"), "@type": "ex:Student"}))
         .collect();
@@ -1016,11 +1018,11 @@ async fn a_streaming_query_is_served_from_the_head() {
         "the budget caps query-time reasoning"
     );
 
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
 
     let db = fluree.db(id).await.unwrap();
     let plan = fluree
@@ -1049,78 +1051,84 @@ async fn a_streaming_query_is_served_from_the_head() {
 /// A sweep keeps every file a retained generation reaches, and the
 /// manifests and derived-only sets it never lists.
 #[tokio::test]
-async fn a_sweep_keeps_what_the_heads_reach() {
+async fn a_sweep_keeps_what_the_indexes_reach() {
     let (writer, reader) = crate::support::instances_sharing_storage();
-    writer.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+    writer.set_reasoning_index_retention(fluree_db_api::reasoning_index::GenerationRetention {
         min_age_ms: 3_600_000,
         max_generations_in_guard: 8,
     });
-    let id = "heads/sweep:main";
+    let id = "reasoning-indexes/sweep:main";
     let ledger = school(&writer, id).await;
     writer
         .reindex(id, fluree_db_api::ReindexOptions::default())
         .await
         .unwrap();
-    let head = writer
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = writer
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    published(writer.refresh_reasoning_index(id, &index).await.unwrap());
     let ledger = student_commit(&writer, ledger, "carol").await;
-    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    published(writer.refresh_reasoning_index(id, &index).await.unwrap());
 
-    writer.sweep_index_storage("heads/sweep").await.unwrap();
+    writer
+        .sweep_index_storage("reasoning-indexes/sweep")
+        .await
+        .unwrap();
 
     // Both retained generations still read: the current one served, and the
     // older one through its manifest.
-    assert_eq!(chain_len(&reader, id, &head).await, 2);
+    assert_eq!(chain_len(&reader, id, &index).await, 2);
     let (people, served) = rows(&reader, id, &people_query()).await;
     assert_eq!(served.map(|h| h.generation), Some(2));
     assert_eq!(
         people,
         vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
     );
-    // The next generation folds on the swept head.
+    // The next generation folds on the swept index.
     let _ledger = student_commit(&writer, ledger, "dave").await;
-    let (_, kind) = published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    let (_, kind) = published(writer.refresh_reasoning_index(id, &index).await.unwrap());
     assert_eq!(kind, GenerationKind::Logical);
     let (people, served) = rows(&writer, id, &people_query()).await;
     assert_eq!(served.map(|h| h.generation), Some(3));
     assert_eq!(people.len(), 4);
 }
 
-/// Dropping a branch deletes its reasoned heads with it.
+/// Dropping a branch deletes its reasoning indexes with it.
 #[tokio::test]
-async fn a_branch_drop_deletes_its_heads() {
+async fn a_branch_drop_deletes_its_indexes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let main = "heads/branch:main";
+    let main = "reasoning-indexes/branch:main";
     let ledger = school(&fluree, main).await;
     drop(ledger);
     fluree
-        .create_branch("heads/branch", "dev", None, None)
+        .create_branch("reasoning-indexes/branch", "dev", None, None)
         .await
         .unwrap();
-    let dev = "heads/branch:dev";
-    let head = fluree
-        .register_reasoned_head(dev, &json!({"reasoning": "owl2rl"}))
+    let dev = "reasoning-indexes/branch:dev";
+    let index = fluree
+        .register_reasoning_index(dev, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(dev, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(dev, &index).await.unwrap());
     let record = fluree.nameservice().lookup(dev).await.unwrap().unwrap();
     let store = fluree
         .backend()
-        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
-    let manifest = fluree.reasoned_heads(dev).await.unwrap().heads[&head]
-        .published
+        .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+    let manifest = fluree.reasoning_indexes(dev).await.unwrap().indexes[&index]
+        .head
         .clone()
         .unwrap()
         .manifest;
     assert!(store.has(&manifest).await.unwrap());
 
-    fluree.drop_branch("heads/branch", "dev").await.unwrap();
+    fluree
+        .drop_branch("reasoning-indexes/branch", "dev")
+        .await
+        .unwrap();
     assert!(
         !store.has(&manifest).await.unwrap(),
-        "the head's files are deleted"
+        "the index's files are deleted"
     );
     // The main branch is untouched and reasons at query time.
     let (people, served) = rows(&fluree, main, &people_query()).await;
@@ -1128,12 +1136,12 @@ async fn a_branch_drop_deletes_its_heads() {
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
 }
 
-/// A rule that mints a constant gives the head a dictionary blob of its own,
-/// which only the head reaches; a sweep keeps it.
+/// A rule that mints a constant gives the index a dictionary blob of its own,
+/// which only the index reaches; a sweep keeps it.
 #[tokio::test]
-async fn a_sweep_keeps_a_dictionary_only_the_head_reaches() {
+async fn a_sweep_keeps_a_dictionary_only_the_index_reaches() {
     let (writer, reader) = crate::support::instances_sharing_storage();
-    let id = "heads/sweep-dict:main";
+    let id = "reasoning-indexes/sweep-dict:main";
     school(&writer, id).await;
     writer
         .reindex(id, fluree_db_api::ReindexOptions::default())
@@ -1144,14 +1152,14 @@ async fn a_sweep_keeps_a_dictionary_only_the_head_reaches() {
         "where": {"@id": "?x", "@type": "ex:Student"},
         "insert": {"@id": "?x", "ex:tag": "minted-by-the-rule-only"}
     }]);
-    let head = writer
-        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+    let index = writer
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
         .await
         .unwrap();
-    published(writer.refresh_reasoned_head(id, &head).await.unwrap());
+    published(writer.refresh_reasoning_index(id, &index).await.unwrap());
 
     writer
-        .sweep_index_storage("heads/sweep-dict")
+        .sweep_index_storage("reasoning-indexes/sweep-dict")
         .await
         .unwrap();
 
@@ -1176,27 +1184,32 @@ async fn a_sweep_keeps_a_dictionary_only_the_head_reaches() {
 /// A rebase replaces the commits under a published generation: the
 /// generation is obsolete, never served, and the next one is a rebuild.
 #[tokio::test]
-async fn a_rebase_under_a_head_selects_the_rebuild_path() {
+async fn a_rebase_under_an_index_selects_the_rebuild_path() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let main = school(&fluree, "heads/rebase:main").await;
+    let main = school(&fluree, "reasoning-indexes/rebase:main").await;
     fluree
-        .create_branch("heads/rebase", "dev", None, None)
+        .create_branch("reasoning-indexes/rebase", "dev", None, None)
         .await
         .unwrap();
-    let dev_id = "heads/rebase:dev";
+    let dev_id = "reasoning-indexes/rebase:dev";
     let dev = fluree.ledger(dev_id).await.unwrap();
     let _dev = student_commit(&fluree, dev, "dana").await;
-    let head = fluree
-        .register_reasoned_head(dev_id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(dev_id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(dev_id, &head).await.unwrap());
+    published(
+        fluree
+            .refresh_reasoning_index(dev_id, &index)
+            .await
+            .unwrap(),
+    );
     assert!(rows(&fluree, dev_id, &people_query()).await.1.is_some());
 
     let _main = student_commit(&fluree, main, "mo").await;
     fluree
         .rebase_branch(
-            "heads/rebase",
+            "reasoning-indexes/rebase",
             "dev",
             fluree_db_api::ConflictStrategy::default(),
         )
@@ -1216,7 +1229,12 @@ async fn a_rebase_under_a_head_selects_the_rebuild_path() {
     ];
     assert_eq!(people, expected);
 
-    let (generation, kind) = published(fluree.refresh_reasoned_head(dev_id, &head).await.unwrap());
+    let (generation, kind) = published(
+        fluree
+            .refresh_reasoning_index(dev_id, &index)
+            .await
+            .unwrap(),
+    );
     assert_eq!((generation, kind), (2, GenerationKind::Rebuild));
     let (people, served) = rows(&fluree, dev_id, &people_query()).await;
     assert_eq!(served.map(|h| h.generation), Some(2));
@@ -1232,13 +1250,13 @@ GRAPH ex:inferred { ex:seed ex:note "inferred graph" . }
 GRAPH ex:stage { ex:x ex:parent ex:y . ex:y ex:parent ex:z . }
 "#;
 
-/// A rule that derives into a named graph: the head holds the derived facts
+/// A rule that derives into a named graph: the index holds the derived facts
 /// in that graph, and a query of the graph is served with the same answer as
 /// query-time reasoning; the default graph never sees them.
 #[tokio::test]
 async fn derived_facts_land_in_the_rule_s_named_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/named:main";
+    let id = "reasoning-indexes/named:main";
     let ledger = fluree.create_ledger(id).await.unwrap();
     let _ledger = fluree
         .stage_owned(ledger)
@@ -1273,11 +1291,11 @@ async fn derived_facts_land_in_the_rule_s_named_graph() {
         vec![json!(["ex:a", "ex:c"]), json!(["ex:b", "ex:d"])]
     );
 
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let (served_rows, served) = rows(&fluree, id, &in_graph).await;
     assert!(served.is_some());
     assert_eq!(served_rows, expected);
@@ -1291,7 +1309,7 @@ async fn derived_facts_land_in_the_rule_s_named_graph() {
 #[tokio::test]
 async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/over-graph:main";
+    let id = "reasoning-indexes/over-graph:main";
     let ledger = fluree.create_ledger(id).await.unwrap();
     let _ledger = fluree
         .stage_owned(ledger)
@@ -1317,14 +1335,14 @@ async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
     let (expected, _) = rows(&fluree, &stage, &q).await;
     assert_eq!(expected, vec![json!(["ex:x", "ex:z"])]);
 
-    let head = fluree
-        .register_reasoned_head(
+    let index = fluree
+        .register_reasoning_index(
             id,
             &json!({"reasoning": "datalog", "rules": rules, "graph": "http://example.org/stage"}),
         )
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let (served_rows, served) = rows(&fluree, &stage, &q).await;
     assert!(served.is_some(), "a query of the reasoned graph is served");
     assert_eq!(served_rows, expected);
@@ -1336,12 +1354,12 @@ async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
     );
 }
 
-/// owl:sameAs: what query-time reasoning answers through equality, a head
+/// owl:sameAs: what query-time reasoning answers through equality, an index
 /// answers the same.
 #[tokio::test]
 async fn same_as_answers_match_query_time() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/same-as:main";
+    let id = "reasoning-indexes/same-as:main";
     ledger_with(
         &fluree,
         id,
@@ -1366,17 +1384,17 @@ async fn same_as_answers_match_query_time() {
     for q in &queries {
         expected.push(rows(&fluree, id, q).await.0);
     }
-    // The equality itself is derived (symmetry); the head must hold it.
+    // The equality itself is derived (symmetry); the index must hold it.
     assert!(
         expected[0].contains(&json!("ex:carol")),
         "{:?}",
         expected[0]
     );
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     for (q, expected) in queries.iter().zip(&expected) {
         let (got, served) = rows(&fluree, id, q).await;
         assert!(served.is_some());
@@ -1384,42 +1402,42 @@ async fn same_as_answers_match_query_time() {
     }
 }
 
-/// Two heads of one branch publish concurrently; neither entry is lost.
+/// Two indexes of one branch publish concurrently; neither entry is lost.
 #[tokio::test]
-async fn two_heads_of_a_branch_publish_concurrently() {
+async fn two_indexes_of_a_branch_publish_concurrently() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/two:main";
+    let id = "reasoning-indexes/two:main";
     school(&fluree, id).await;
     let owl = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
     let rules = json!([{"@context": ctx(), "where": {"@id": "?x", "@type": "ex:Student"},
                         "insert": {"@id": "?x", "ex:enrolled": true}}]);
     let datalog = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
         .await
         .unwrap();
     let (a, b) = tokio::join!(
-        fluree.refresh_reasoned_head(id, &owl),
-        fluree.refresh_reasoned_head(id, &datalog)
+        fluree.refresh_reasoning_index(id, &owl),
+        fluree.refresh_reasoning_index(id, &datalog)
     );
     published(a.unwrap());
     published(b.unwrap());
-    let doc = fluree.reasoned_heads(id).await.unwrap();
-    assert!(doc.heads[&owl].published.is_some());
-    assert!(doc.heads[&datalog].published.is_some());
+    let doc = fluree.reasoning_indexes(id).await.unwrap();
+    assert!(doc.indexes[&owl].head.is_some());
+    assert!(doc.indexes[&datalog].head.is_some());
     let (people, served) = rows(&fluree, id, &people_query()).await;
-    assert_eq!(served.map(|h| h.head_id), Some(owl.to_string()));
+    assert_eq!(served.map(|h| h.index_id), Some(owl.to_string()));
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
 }
 
 /// A dataset of one ledger's graphs (`from` and `fromNamed` naming the same
-/// ledger) is answered from the head, every graph read from it.
+/// ledger) is answered from the index, every graph read from it.
 #[tokio::test]
-async fn a_within_ledger_dataset_is_served_from_the_head() {
+async fn a_within_ledger_dataset_is_served_from_the_index() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/dataset:main";
+    let id = "reasoning-indexes/dataset:main";
     let ledger = fluree.create_ledger(id).await.unwrap();
     let _ledger = fluree
         .stage_owned(ledger)
@@ -1455,7 +1473,7 @@ async fn a_within_ledger_dataset_is_served_from_the_head() {
                 .unwrap_or_else(|e| panic!("{e:?}"));
             (
                 normalize_rows(&resp.result),
-                resp.reasoning.and_then(|r| r.head).is_some(),
+                resp.reasoning.and_then(|r| r.index).is_some(),
             )
         }
     };
@@ -1466,119 +1484,133 @@ async fn a_within_ledger_dataset_is_served_from_the_head() {
         vec![json!(["ex:a", "ex:c"]), json!(["ex:b", "ex:d"])]
     );
 
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let (got, served) = run(q).await;
     assert!(served, "a dataset of one ledger's graphs is served");
     assert_eq!(got, expected);
 }
 
-/// A branch does not inherit its source's heads: they are derived state of
+/// A branch does not inherit its source's indexes: they are derived state of
 /// the source, and the branch registers its own.
 #[tokio::test]
-async fn a_new_branch_starts_with_no_heads() {
+async fn a_new_branch_starts_with_no_indexes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    school(&fluree, "heads/inherit:main").await;
-    let head = fluree
-        .register_reasoned_head("heads/inherit:main", &json!({"reasoning": "owl2rl"}))
+    school(&fluree, "reasoning-indexes/inherit:main").await;
+    let index = fluree
+        .register_reasoning_index(
+            "reasoning-indexes/inherit:main",
+            &json!({"reasoning": "owl2rl"}),
+        )
         .await
         .unwrap();
     published(
         fluree
-            .refresh_reasoned_head("heads/inherit:main", &head)
+            .refresh_reasoning_index("reasoning-indexes/inherit:main", &index)
             .await
             .unwrap(),
     );
     fluree
-        .create_branch("heads/inherit", "dev", None, None)
+        .create_branch("reasoning-indexes/inherit", "dev", None, None)
         .await
         .unwrap();
-    let doc = fluree.reasoned_heads("heads/inherit:dev").await.unwrap();
-    assert!(doc.heads.is_empty(), "{doc:?}");
-    let (people, served) = rows(&fluree, "heads/inherit:dev", &people_query()).await;
+    let doc = fluree
+        .reasoning_indexes("reasoning-indexes/inherit:dev")
+        .await
+        .unwrap();
+    assert!(doc.indexes.is_empty(), "{doc:?}");
+    let (people, served) = rows(&fluree, "reasoning-indexes/inherit:dev", &people_query()).await;
     assert!(served.is_none());
     assert_eq!(people, vec![json!("ex:alice"), json!("ex:bob")]);
 }
 
-/// A retired head's files are deleted once the retention window has passed
+/// A retired index's files are deleted once the retention window has passed
 /// since it was retired, and then its entry; before that both stay.
 #[tokio::test]
-async fn a_retired_head_is_cleaned_up_after_the_guard() {
+async fn a_retired_index_is_cleaned_up_after_the_guard() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/cleanup:main";
+    let id = "reasoning-indexes/cleanup:main";
     school(&fluree, id).await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
-    let manifest = fluree.reasoned_heads(id).await.unwrap().heads[&head]
-        .published
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    let manifest = fluree.reasoning_indexes(id).await.unwrap().indexes[&index]
+        .head
         .clone()
         .unwrap()
         .manifest;
     let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
     let store = fluree
         .backend()
-        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
-    fluree.retire_reasoned_head(id, &head).await.unwrap();
+        .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+    fluree.retire_reasoning_index(id, &index).await.unwrap();
 
     // Inside the window: kept.
-    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+    fluree.set_reasoning_index_retention(fluree_db_api::reasoning_index::GenerationRetention {
         min_age_ms: 3_600_000,
         max_generations_in_guard: 8,
     });
     assert!(fluree
-        .clean_retired_reasoned_heads(id)
+        .clean_retired_reasoning_indexes(id)
         .await
         .unwrap()
         .is_empty());
     assert!(store.has(&manifest).await.unwrap());
 
     // Past it: files, then the entry.
-    fluree.set_reasoned_head_retention(fluree_db_api::reasoned::HeadRetention {
+    fluree.set_reasoning_index_retention(fluree_db_api::reasoning_index::GenerationRetention {
         min_age_ms: 0,
         max_generations_in_guard: 8,
     });
     assert_eq!(
-        fluree.clean_retired_reasoned_heads(id).await.unwrap(),
-        vec![head.clone()]
+        fluree.clean_retired_reasoning_indexes(id).await.unwrap(),
+        vec![index.clone()]
     );
     assert!(!store.has(&manifest).await.unwrap());
-    assert!(fluree.reasoned_heads(id).await.unwrap().heads.is_empty());
+    assert!(fluree
+        .reasoning_indexes(id)
+        .await
+        .unwrap()
+        .indexes
+        .is_empty());
 }
 
-/// A branch takes at most `MAX_ACTIVE_HEADS` active heads.
+/// A branch takes at most `MAX_ACTIVE_INDEXES` active indexes.
 #[tokio::test]
-async fn a_branch_refuses_more_active_heads_than_its_limit() {
+async fn a_branch_refuses_more_active_indexes_than_its_limit() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/limit:main";
+    let id = "reasoning-indexes/limit:main";
     school(&fluree, id).await;
-    let max = fluree_db_api::reasoned::MAX_ACTIVE_HEADS;
+    let max = fluree_db_api::reasoning_index::MAX_ACTIVE_INDEXES;
     for i in 0..max {
         let rules = json!([{"@context": ctx(), "where": {"@id": "?x", "@type": "ex:Student"},
                             "insert": {"@id": "?x", "ex:mark": i}}]);
         fluree
-            .register_reasoned_head(id, &json!({"reasoning": "datalog", "rules": rules}))
+            .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": rules}))
             .await
             .unwrap();
     }
     let err = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("active reasoned heads"), "{err}");
+    assert!(
+        err.to_string().contains("active reasoning indexes"),
+        "{err}"
+    );
 }
 
-/// A staged view is answered from its own state, never from a head, even
+/// A staged view is answered from its own state, never from an index, even
 /// one published at the `t` its transaction would commit at.
 #[tokio::test]
-async fn a_staged_view_is_never_served_from_a_head() {
+async fn a_staged_view_is_never_served_from_an_index() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/staged:main";
+    let id = "reasoning-indexes/staged:main";
     let ledger = ledger_with(
         &fluree,
         id,
@@ -1592,11 +1624,11 @@ async fn a_staged_view_is_never_served_from_a_head() {
         }),
     )
     .await;
-    let head = fluree
-        .register_reasoned_head(id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
 
     let staged = fluree
         .stage_owned(ledger)
@@ -1612,7 +1644,7 @@ async fn a_staged_view_is_never_served_from_a_head() {
     let expected = vec![json!("ex:alice"), json!("ex:bob"), json!("ex:staged")];
     assert_eq!(preview_rows().await, expected);
 
-    // Another transaction commits at the staged `t`, and its head is built.
+    // Another transaction commits at the staged `t`, and its index is built.
     let ledger = fluree.ledger(id).await.unwrap();
     fluree
         .insert(
@@ -1621,7 +1653,7 @@ async fn a_staged_view_is_never_served_from_a_head() {
         )
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let (_, served) = rows(&fluree, id, &people_query()).await;
     assert!(served.is_some(), "the committed state is served");
     assert_eq!(
@@ -1632,12 +1664,12 @@ async fn a_staged_view_is_never_served_from_a_head() {
 }
 
 /// `rdfs` widens a query rather than materializing, so a query that mixes
-/// it with datalog keeps the rewrite when served from the head of that
+/// it with datalog keeps the rewrite when served from the index of that
 /// program, in a single view and in a dataset.
 #[tokio::test]
-async fn a_head_keeps_the_rdfs_rewrite_of_a_mixed_program() {
+async fn an_index_keeps_the_rdfs_rewrite_of_a_mixed_program() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/rdfs-datalog:main";
+    let id = "reasoning-indexes/rdfs-datalog:main";
     ledger_with(
         &fluree,
         id,
@@ -1676,7 +1708,7 @@ async fn a_head_keeps_the_rdfs_rewrite_of_a_mixed_program() {
                 .unwrap_or_else(|e| panic!("{e:?}"));
             (
                 normalize_rows(&resp.result),
-                resp.reasoning.and_then(|r| r.head).is_some(),
+                resp.reasoning.and_then(|r| r.index).is_some(),
             )
         }
     };
@@ -1689,14 +1721,14 @@ async fn a_head_keeps_the_rdfs_rewrite_of_a_mixed_program() {
         (expected.clone(), false)
     );
 
-    let head = fluree
-        .register_reasoned_head(
+    let index = fluree
+        .register_reasoning_index(
             id,
             &json!({"reasoning": ["rdfs", "datalog"], "rules": rules}),
         )
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(id, &head).await.unwrap());
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
     let (after, served) = rows(&fluree, id, &q).await;
     assert!(served.is_some());
     assert_eq!(after, expected);
@@ -1708,7 +1740,7 @@ async fn a_head_keeps_the_rdfs_rewrite_of_a_mixed_program() {
 #[tokio::test]
 async fn a_program_deriving_hierarchy_edges_under_rdfs_publishes_nothing() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/derived-hierarchy:main";
+    let id = "reasoning-indexes/derived-hierarchy:main";
     ledger_with(
         &fluree,
         id,
@@ -1726,14 +1758,14 @@ async fn a_program_deriving_hierarchy_edges_under_rdfs_publishes_nothing() {
         "where": {"@id": "?c", "ex:narrower": "?d"},
         "insert": {"@id": "?d", "rdfs:subClassOf": {"@id": "?c"}}
     }]);
-    let head = fluree
-        .register_reasoned_head(
+    let index = fluree
+        .register_reasoning_index(
             id,
             &json!({"reasoning": ["rdfs", "datalog"], "rules": rules}),
         )
         .await
         .unwrap();
-    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+    match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
         RefreshOutcome::Failed { reason } => {
             assert!(reason.contains("rdfs:subClassOf"), "{reason}");
         }
@@ -1747,7 +1779,7 @@ async fn a_program_deriving_hierarchy_edges_under_rdfs_publishes_nothing() {
 #[tokio::test]
 async fn a_failed_owl_pass_under_datalog_publishes_nothing() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let id = "heads/owl-failed:main";
+    let id = "reasoning-indexes/owl-failed:main";
     // A property expression nested past the reasoner's limit fails the
     // OWL 2 RL pass outright.
     let mut graph: Vec<JsonValue> = (0..12)
@@ -1767,14 +1799,14 @@ async fn a_failed_owl_pass_under_datalog_publishes_nothing() {
         "where": {"@id": "?x", "ex:parent": "?y"},
         "insert": {"@id": "?y", "ex:child": {"@id": "?x"}}
     }]);
-    let head = fluree
-        .register_reasoned_head(
+    let index = fluree
+        .register_reasoning_index(
             id,
             &json!({"reasoning": ["owl2rl", "datalog"], "rules": rules}),
         )
         .await
         .unwrap();
-    match fluree.refresh_reasoned_head(id, &head).await.unwrap() {
+    match fluree.refresh_reasoning_index(id, &index).await.unwrap() {
         RefreshOutcome::Failed { reason } => {
             assert!(reason.contains("OWL 2 RL"), "{reason}");
         }
@@ -1793,13 +1825,13 @@ async fn a_failed_owl_pass_under_datalog_publishes_nothing() {
 }
 
 /// A schema source in another ledger can change what a program settles to
-/// without the branch moving: queries stop matching the head at once, and
+/// without the branch moving: queries stop matching the index at once, and
 /// a refresh rebuilds it at the same commit.
 #[tokio::test]
 async fn a_refresh_rebuilds_when_an_external_schema_changes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let model_id = "heads/schema-model:main";
-    let data_id = "heads/schema-data:main";
+    let model_id = "reasoning-indexes/schema-model:main";
+    let data_id = "reasoning-indexes/schema-data:main";
     let schema = |turtle: &str| {
         format!(
             "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
@@ -1852,11 +1884,16 @@ async fn a_refresh_rebuilds_when_an_external_schema_changes() {
         })
     };
 
-    let head = fluree
-        .register_reasoned_head(data_id, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(data_id, &json!({"reasoning": "owl2rl"}))
         .await
         .unwrap();
-    published(fluree.refresh_reasoned_head(data_id, &head).await.unwrap());
+    published(
+        fluree
+            .refresh_reasoning_index(data_id, &index)
+            .await
+            .unwrap(),
+    );
     let (employees, served) = rows(&fluree, data_id, &typed("ex:Employee")).await;
     assert_eq!(served.map(|h| h.generation), Some(1));
     assert_eq!(employees, vec![json!("ex:anita")]);
@@ -1870,11 +1907,16 @@ async fn a_refresh_rebuilds_when_an_external_schema_changes() {
     let (people, served) = rows(&fluree, data_id, &typed("ex:Person")).await;
     assert!(
         served.is_none(),
-        "the head was settled under the old schema"
+        "the index was settled under the old schema"
     );
     assert_eq!(people, vec![json!("ex:anita")]);
 
-    let (generation, kind) = published(fluree.refresh_reasoned_head(data_id, &head).await.unwrap());
+    let (generation, kind) = published(
+        fluree
+            .refresh_reasoning_index(data_id, &index)
+            .await
+            .unwrap(),
+    );
     assert_eq!((generation, kind), (2, GenerationKind::Rebuild));
     let (people, served) = rows(&fluree, data_id, &typed("ex:Person")).await;
     assert_eq!(served.map(|h| h.generation), Some(2));

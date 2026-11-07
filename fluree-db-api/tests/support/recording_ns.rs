@@ -102,13 +102,13 @@ impl ConfigLookup for RecordingLookups {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::ReasonedHeadsLookup for RecordingLookups {
-    async fn get_reasoned_heads(
+impl fluree_db_nameservice::ReasoningIndexesLookup for RecordingLookups {
+    async fn get_reasoning_indexes(
         &self,
         id: &str,
-    ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
         self.record(Asked::Record, id);
-        self.inner.get_reasoned_heads(id).await
+        self.inner.get_reasoning_indexes(id).await
     }
 }
 

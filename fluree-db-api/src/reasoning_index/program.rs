@@ -1,4 +1,4 @@
-//! A reasoned head's program: what is registered, and the settled form a
+//! A reasoning index's program: what is registered, and the settled form a
 //! query is matched against.
 //!
 //! A program is registered as the reasoning keys a query would carry
@@ -8,10 +8,10 @@
 //! precedence, rule sources, the schema bundle — and the **settled key** is a
 //! digest of what that produced. A query is served from a generation only when
 //! its settled key equals the generation's, so a change to the ledger's
-//! reasoning configuration can never be answered from a head computed under
+//! reasoning configuration can never be answered from an index computed under
 //! the old one.
 
-use fluree_db_core::reasoned_head::{program_id, ClockPolicy, SemanticKey};
+use fluree_db_core::reasoning_index::{program_id, ClockPolicy, SemanticKey};
 use fluree_db_core::{ContentId, ContentKind, GraphId};
 use fluree_db_query::ir::ReasoningConfig;
 use serde_json::{Map, Value as JsonValue};
@@ -130,7 +130,7 @@ pub(crate) fn settling_query(canonical_program: &JsonValue) -> JsonValue {
 }
 
 /// The digest of settled reasoning, as a query and the worker both reach it,
-/// for the graph `g_id` it reasons against. Budgets are left out: a head
+/// for the graph `g_id` it reasons against. Budgets are left out: an index
 /// holds only complete results, so a budget never changes what it holds.
 pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId) -> ContentId {
     let modes = &reasoning.modes;
@@ -161,23 +161,23 @@ pub(crate) fn settled_key(reasoning: &ReasoningConfig, g_id: GraphId) -> Content
     ContentId::new(ContentKind::LedgerConfig, &canonical_bytes(&settled))
 }
 
-/// Whether settled reasoning runs anything a head could hold.
+/// Whether settled reasoning runs anything an index could hold.
 pub(crate) fn materializes(reasoning: &ReasoningConfig) -> bool {
     let modes = &reasoning.modes;
     modes.owl2rl || modes.owl_datalog || modes.datalog || !modes.rules.is_empty()
 }
 
-/// Whether a query served from a head under this settled reasoning still
+/// Whether a query served from an index under this settled reasoning still
 /// rewrites its patterns. `rdfs` and `owl2ql` widen the query rather than
-/// materialize, so a head cannot hold what they add; OWL 2 RL
+/// materialize, so an index cannot hold what they add; OWL 2 RL
 /// materializes all of it, and the rewrite steps aside when it runs.
 pub(crate) fn serves_rewrites(reasoning: &ReasoningConfig) -> bool {
     let modes = &reasoning.modes;
     !modes.owl2rl && (modes.rdfs || modes.owl2ql)
 }
 
-/// The reasoning a query runs with against a head: the settled reasoning
-/// without what the head materialized.
+/// The reasoning a query runs with against an index: the settled reasoning
+/// without what the index materialized.
 pub(crate) fn served_reasoning(settled: &ReasoningConfig) -> ReasoningConfig {
     if !serves_rewrites(settled) {
         return ReasoningConfig {

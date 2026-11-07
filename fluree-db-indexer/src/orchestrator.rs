@@ -3837,12 +3837,12 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
 
         #[async_trait]
-        impl fluree_db_nameservice::ReasonedHeadsLookup for ListingNs {
-            async fn get_reasoned_heads(
+        impl fluree_db_nameservice::ReasoningIndexesLookup for ListingNs {
+            async fn get_reasoning_indexes(
                 &self,
                 ledger_id: &str,
-            ) -> Result<Option<fluree_db_nameservice::ReasonedHeads>> {
-                self.inner.get_reasoned_heads(ledger_id).await
+            ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+                self.inner.get_reasoning_indexes(ledger_id).await
             }
         }
 

@@ -1809,23 +1809,24 @@ impl crate::Fluree {
     ) -> HashSet<ContentId> {
         let backend = self.backend();
         let own = BranchIndexHead::of(record);
-        // The branch's reasoned heads go with it, so what only they reach is
+        // The branch's reasoning indexes go with it, so what only they reach is
         // released too.
-        let mut refs = match fluree_db_indexer::gc::heads::shared_refs_of_branch_heads(
-            backend,
-            self.nameservice(),
-            std::slice::from_ref(&own),
-        )
-        .await
-        {
-            Ok(refs) => refs,
-            Err(e) => {
-                warnings.push(format!(
-                    "Could not read the branch's reasoned heads; their dictionary blobs are left for a sweep: {e}"
+        let mut refs =
+            match fluree_db_indexer::gc::reasoning_indexes::shared_refs_of_branch_indexes(
+                backend,
+                self.nameservice(),
+                std::slice::from_ref(&own),
+            )
+            .await
+            {
+                Ok(refs) => refs,
+                Err(e) => {
+                    warnings.push(format!(
+                    "Could not read the branch's reasoning indexes; their dictionary blobs are left for a sweep: {e}"
                 ));
-                HashSet::new()
-            }
-        };
+                    HashSet::new()
+                }
+            };
         if record.index_head_id.is_none() {
             return refs;
         }
@@ -1890,7 +1891,7 @@ impl crate::Fluree {
                 return Vec::new();
             }
         };
-        match fluree_db_indexer::gc::heads::shared_refs_of_branch_heads(
+        match fluree_db_indexer::gc::reasoning_indexes::shared_refs_of_branch_indexes(
             backend,
             self.nameservice(),
             &survivors,
@@ -1900,7 +1901,7 @@ impl crate::Fluree {
             Ok(refs) => elsewhere.extend(refs),
             Err(e) => {
                 warnings.push(format!(
-                    "Could not read a sibling branch's reasoned heads; the branch's dictionary blobs are left for a sweep: {e}"
+                    "Could not read a sibling branch's reasoning indexes; the branch's dictionary blobs are left for a sweep: {e}"
                 ));
                 return Vec::new();
             }
@@ -1984,10 +1985,10 @@ impl crate::Fluree {
             format!("fluree:{storage_method}://{branch_prefix}/index/"),
             format!("fluree:{storage_method}://{branch_prefix}/config/"),
             format!("fluree:{storage_method}://{branch_prefix}/blob/"),
-            // Every reasoned head of the branch, files and manifests.
+            // Every reasoning index of the branch, files and manifests.
             format!(
                 "fluree:{storage_method}://{branch_prefix}/{}/",
-                fluree_db_core::address_path::REASONED_SEGMENT
+                fluree_db_core::address_path::REASONING_SEGMENT
             ),
         ];
 
@@ -3167,15 +3168,18 @@ impl crate::Fluree {
         ledger_name: &LedgerName,
     ) -> Result<(
         Vec<MaintenanceGuard>,
-        crate::reasoned::SweepHold<'_>,
+        crate::reasoning_index::SweepHold<'_>,
         Vec<BranchIndexHead>,
         StorageRoot,
         Vec<StorageNamespace>,
     )> {
-        // Reasoned-head builds write outside the indexer, so they are held
+        // Reasoning-index builds write outside the indexer, so they are held
         // off here: one with files written and not yet published would see
         // them reclaimed under it.
-        let heads_hold = self.reasoned.hold_for_sweep(ledger_name.as_str()).await;
+        let indexes_hold = self
+            .reasoning_index_state
+            .hold_for_sweep(ledger_name.as_str())
+            .await;
         let all = self.nameservice().all_records().await?;
         let records: Vec<_> = all
             .iter()
@@ -3216,19 +3220,19 @@ impl crate::Fluree {
                 index_head_id: current.and_then(|r| r.index_head_id),
             });
         }
-        // Each retained generation of each reasoned head takes part as its
+        // Each retained generation of each reasoning index takes part as its
         // own chain, in its head's namespace: its files and the dictionaries
         // it shares are live, and what a lost publish left is reclaimed.
-        let heads = fluree_db_indexer::gc::heads::head_sweep_participants(
+        let indexes = fluree_db_indexer::gc::reasoning_indexes::index_sweep_participants(
             self.backend(),
             self.nameservice(),
             &branches,
         )
         .await
-        .map_err(|e| ApiError::internal(format!("read reasoned heads for the sweep: {e}")))?;
-        branches.extend(heads);
+        .map_err(|e| ApiError::internal(format!("read reasoning indexes for the sweep: {e}")))?;
+        branches.extend(indexes);
 
-        Ok((guards, heads_hold, branches, root, nested))
+        Ok((guards, indexes_hold, branches, root, nested))
     }
 
     /// The storage a sweep enumerates and deletes through.
@@ -3253,7 +3257,7 @@ impl crate::Fluree {
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, _heads_hold, branches, root, nested) =
+        let (_guards, _indexes_hold, branches, root, nested) =
             self.hold_ledger_for_maintenance(&ledger_name).await?;
         Ok(plan_sweep(&storage, &self.backend, &root, &branches, &nested).await?)
     }
@@ -3268,7 +3272,7 @@ impl crate::Fluree {
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, _heads_hold, branches, root, nested) =
+        let (_guards, _indexes_hold, branches, root, nested) =
             self.hold_ledger_for_maintenance(&ledger_name).await?;
 
         let plan = plan_sweep(&storage, &self.backend, &root, &branches, &nested).await?;

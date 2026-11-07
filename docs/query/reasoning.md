@@ -408,8 +408,8 @@ nothing.
 - The materialization cache is invalidated when the underlying data changes
   (new transactions), so the first query after a write will re-materialize.
 - For a program queried often over changing data, register it as a
-  [reasoned head](reasoned-heads.md): its derived facts are persisted and kept
-  current in the background, so matching queries skip materialization.
+  [reasoning index](materialized-reasoning.md): its derived facts are persisted
+  and kept current in the background, so matching queries skip materialization.
 
 ## Reasoning under access policy
 

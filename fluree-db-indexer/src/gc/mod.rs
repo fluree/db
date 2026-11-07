@@ -139,7 +139,7 @@
 //! as a disk limit.
 
 pub(crate) mod collector;
-pub mod heads;
+pub mod reasoning_indexes;
 mod record;
 mod siblings;
 mod sweep;

@@ -60,7 +60,7 @@ pub struct StreamQueryPlan {
     vars: VarRegistry,
     parsed: fluree_db_query::ir::Query,
     executable: ExecutableQuery,
-    /// The reasoned head that answers the query, when one does: execution
+    /// The reasoning index that answers the query, when one does: execution
     /// reads it in place of the ledger state handed to the run.
     served: Option<GraphDb>,
 }
@@ -140,7 +140,7 @@ impl Fluree {
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
         let served = self
-            .serve_from_reasoned_head(db, &mut executable, None)
+            .serve_from_reasoning_index(db, &mut executable, None)
             .await?;
 
         Ok(StreamQueryPlan {

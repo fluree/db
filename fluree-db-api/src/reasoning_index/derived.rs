@@ -9,7 +9,7 @@
 //! content id in the next generation and is not written again.
 
 use fluree_db_core::commit::codec::{read_commit, write_commit};
-use fluree_db_core::reasoned_head::{DerivedIndex, DERIVED_FACTS_MAGIC};
+use fluree_db_core::reasoning_index::{DerivedIndex, DERIVED_FACTS_MAGIC};
 use fluree_db_core::{Commit, ContentId, ContentKind, ContentStore, Flake, IndexType};
 use sha2::{Digest, Sha256};
 

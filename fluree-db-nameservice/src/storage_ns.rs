@@ -1650,33 +1650,43 @@ where
 }
 
 #[async_trait]
-impl<S> crate::ReasonedHeadsLookup for StorageNameService<S>
+impl<S> crate::ReasoningIndexesLookup for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
-        crate::ns_cas::read_reasoned_heads(&self.storage, &key).await
+        crate::ns_cas::read_reasoning_indexes(&self.storage, &key).await
     }
 }
 
 #[async_trait]
-impl<S> crate::ReasonedHeadsPublisher for StorageNameService<S>
+impl<S> crate::ReasoningIndexesPublisher for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn push_reasoned_heads_fenced(
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &crate::ReasonedHeads,
-    ) -> Result<crate::ReasonedHeadsCasResult> {
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
-        crate::ns_cas::push_reasoned_heads(&self.storage, &key, ledger_id, fence, expected_v, new)
-            .await
+        crate::ns_cas::push_reasoning_indexes(
+            &self.storage,
+            &key,
+            ledger_id,
+            fence,
+            expected_v,
+            new,
+        )
+        .await
     }
 }
 

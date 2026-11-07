@@ -67,10 +67,10 @@ pub const CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH: u64 = FLUREE_CODEC_BASE + 19;
 /// Multicodec for edge-annotation reverse arena leaf blobs (EARL1).
 pub const CODEC_FLUREE_ANNOTATION_REVERSE_LEAF: u64 = FLUREE_CODEC_BASE + 20;
 
-/// Multicodec for reasoned-head generation manifests (FRM1).
+/// Multicodec for reasoning-index generation manifests (FRM1).
 pub const CODEC_FLUREE_REASONED_MANIFEST: u64 = FLUREE_CODEC_BASE + 21;
 
-/// Multicodec for a reasoned head's derived-only fact sets (FDS1).
+/// Multicodec for a reasoning index's derived-only fact sets (FDS1).
 pub const CODEC_FLUREE_DERIVED_FACTS: u64 = FLUREE_CODEC_BASE + 22;
 
 // Legacy codec constants (pre-V3 format). Kept for backward-compatible CID
@@ -168,9 +168,9 @@ pub enum ContentKind {
     AnnotationReverseBranch,
     /// Edge-annotation reverse arena leaf blob (EARL1).
     AnnotationReverseLeaf,
-    /// Reasoned-head generation manifest (FRM1).
-    ReasonedManifest,
-    /// A reasoned head's derived-only fact set (FDS1).
+    /// Reasoning-index generation manifest (FRM1).
+    ReasoningManifest,
+    /// A reasoning index's derived-only fact set (FDS1).
     DerivedFacts,
 }
 
@@ -205,7 +205,7 @@ impl ContentKind {
             | ContentKind::AnnotationForwardLeaf
             | ContentKind::AnnotationReverseBranch
             | ContentKind::AnnotationReverseLeaf
-            | ContentKind::ReasonedManifest
+            | ContentKind::ReasoningManifest
             | ContentKind::DerivedFacts => true,
         }
     }
@@ -232,7 +232,7 @@ impl ContentKind {
             ContentKind::AnnotationForwardLeaf => CODEC_FLUREE_ANNOTATION_FORWARD_LEAF,
             ContentKind::AnnotationReverseBranch => CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
             ContentKind::AnnotationReverseLeaf => CODEC_FLUREE_ANNOTATION_REVERSE_LEAF,
-            ContentKind::ReasonedManifest => CODEC_FLUREE_REASONED_MANIFEST,
+            ContentKind::ReasoningManifest => CODEC_FLUREE_REASONED_MANIFEST,
             ContentKind::DerivedFacts => CODEC_FLUREE_DERIVED_FACTS,
         }
     }
@@ -263,7 +263,7 @@ impl ContentKind {
             CODEC_FLUREE_ANNOTATION_FORWARD_LEAF => Some(ContentKind::AnnotationForwardLeaf),
             CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH => Some(ContentKind::AnnotationReverseBranch),
             CODEC_FLUREE_ANNOTATION_REVERSE_LEAF => Some(ContentKind::AnnotationReverseLeaf),
-            CODEC_FLUREE_REASONED_MANIFEST => Some(ContentKind::ReasonedManifest),
+            CODEC_FLUREE_REASONED_MANIFEST => Some(ContentKind::ReasoningManifest),
             CODEC_FLUREE_DERIVED_FACTS => Some(ContentKind::DerivedFacts),
             // Legacy codecs (pre-V3 format) — map to current content kinds so
             // CIDs stored by older builds can still be resolved.
@@ -294,7 +294,7 @@ impl ContentKind {
             ContentKind::AnnotationForwardLeaf => "annotation-forward-leaf",
             ContentKind::AnnotationReverseBranch => "annotation-reverse-branch",
             ContentKind::AnnotationReverseLeaf => "annotation-reverse-leaf",
-            ContentKind::ReasonedManifest => "reasoned-manifest",
+            ContentKind::ReasoningManifest => "reasoning-manifest",
             ContentKind::DerivedFacts => "derived-facts",
         }
     }

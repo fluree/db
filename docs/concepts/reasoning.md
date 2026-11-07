@@ -184,10 +184,11 @@ storage. This means:
 - **Time-travel safe** — querying a historical point in time materializes based
   on that point's data and schema.
 
-A program can also be registered as a **reasoned head**, which persists its
-derived facts in a merged index kept current in the background, so matching
+A program can also be registered for **materialized reasoning**: a
+**reasoning index**, kept current in the background, holds the branch's
+asserted facts together with the program's derived facts, so matching
 queries skip materialization entirely. See
-[Persisted reasoning](../query/reasoned-heads.md).
+[Materialized reasoning](../query/materialized-reasoning.md).
 
 ### owl:sameAs and identity
 

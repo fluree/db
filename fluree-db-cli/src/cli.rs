@@ -1342,16 +1342,16 @@ pub enum Commands {
         remote: Option<String>,
     },
 
-    /// Persisted reasoning: register a reasoning program on a branch, and
-    /// list, refresh or retire its reasoned heads
+    /// Materialized reasoning: register a reasoning program on a branch, and
+    /// list, refresh or retire its reasoning indexes
     ///
-    /// A reasoned head keeps the branch's data merged with a program's
-    /// derived facts, current in the background; reasoning queries that match
-    /// the program are answered from it.
-    #[command(name = "reasoned-heads")]
-    ReasonedHeads {
+    /// A reasoning index contains the branch's asserted facts together with a
+    /// program's derived facts, kept current in the background; reasoning
+    /// queries that match the program are answered from it.
+    #[command(name = "reasoning-indexes")]
+    ReasoningIndexes {
         #[command(subcommand)]
-        action: ReasonedHeadsAction,
+        action: ReasoningIndexesAction,
     },
 
     /// Reclaim index artifacts that no index chain references
@@ -1899,9 +1899,9 @@ pub enum DroppedAction {
     },
 }
 
-/// Reasoned-head subcommands.
+/// Reasoning-index subcommands.
 #[derive(Subcommand)]
-pub enum ReasonedHeadsAction {
+pub enum ReasoningIndexesAction {
     /// Register a reasoning program for persistence
     Register {
         /// Ledger name (defaults to active ledger)
@@ -1922,7 +1922,7 @@ pub enum ReasonedHeadsAction {
         remote: Option<String>,
     },
 
-    /// Show the branch's reasoned heads
+    /// Show the branch's reasoning indexes
     List {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
@@ -1932,24 +1932,24 @@ pub enum ReasonedHeadsAction {
         remote: Option<String>,
     },
 
-    /// Bring the branch's heads up to its current commit now
+    /// Bring the branch's reasoning indexes up to its current commit now
     Refresh {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
 
-        /// Refresh only this head
+        /// Refresh only this index (its id)
         #[arg(long)]
-        head: Option<String>,
+        index: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
     },
 
-    /// Stop a head from being served or refreshed
+    /// Stop an index from being served or refreshed
     Retire {
-        /// The head's id
-        head: String,
+        /// The index's id
+        index: String,
 
         /// Ledger name (defaults to active ledger)
         #[arg(short = 'l', long)]

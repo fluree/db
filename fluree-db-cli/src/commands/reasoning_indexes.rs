@@ -1,11 +1,11 @@
-//! `fluree reasoned-heads`: register a reasoning program for persistence on a
-//! branch, and list, refresh or retire its heads.
+//! `fluree reasoning-indexes`: register a reasoning program for persistence on a
+//! branch, and list, refresh or retire its indexes.
 
-use crate::cli::ReasonedHeadsAction;
+use crate::cli::ReasoningIndexesAction;
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_core::reasoned_head::HeadId;
+use fluree_db_core::reasoning_index::ReasoningIndexId;
 use serde_json::{json, Value as JsonValue};
 
 fn program_of(reasoning: Option<String>, program: Option<String>) -> CliResult<JsonValue> {
@@ -19,8 +19,8 @@ fn program_of(reasoning: Option<String>, program: Option<String>) -> CliResult<J
     }
 }
 
-fn head_id(raw: &str) -> CliResult<HeadId> {
-    HeadId::parse(raw).map_err(CliError::Usage)
+fn index_id(raw: &str) -> CliResult<ReasoningIndexId> {
+    ReasoningIndexId::parse(raw).map_err(CliError::Usage)
 }
 
 fn print(value: &JsonValue) {
@@ -30,29 +30,29 @@ fn print(value: &JsonValue) {
     );
 }
 
-pub async fn run(action: ReasonedHeadsAction, dirs: &FlureeDir) -> CliResult<()> {
+pub async fn run(action: ReasoningIndexesAction, dirs: &FlureeDir) -> CliResult<()> {
     let (ledger, remote) = match &action {
-        ReasonedHeadsAction::Register { ledger, remote, .. }
-        | ReasonedHeadsAction::List { ledger, remote }
-        | ReasonedHeadsAction::Refresh { ledger, remote, .. }
-        | ReasonedHeadsAction::Retire { ledger, remote, .. } => (ledger.clone(), remote.clone()),
+        ReasoningIndexesAction::Register { ledger, remote, .. }
+        | ReasoningIndexesAction::List { ledger, remote }
+        | ReasoningIndexesAction::Refresh { ledger, remote, .. }
+        | ReasoningIndexesAction::Retire { ledger, remote, .. } => (ledger.clone(), remote.clone()),
     };
     let (op, body) = match &action {
-        ReasonedHeadsAction::Register {
+        ReasoningIndexesAction::Register {
             reasoning, program, ..
         } => (
             "register",
             json!({"program": program_of(reasoning.clone(), program.clone())?}),
         ),
-        ReasonedHeadsAction::List { .. } => ("list", json!({})),
-        ReasonedHeadsAction::Refresh { head, .. } => ("refresh", json!({"headId": head})),
-        ReasonedHeadsAction::Retire { head, .. } => ("retire", json!({"headId": head})),
+        ReasoningIndexesAction::List { .. } => ("list", json!({})),
+        ReasoningIndexesAction::Refresh { index, .. } => ("refresh", json!({"indexId": index})),
+        ReasoningIndexesAction::Retire { index, .. } => ("retire", json!({"indexId": index})),
     };
 
     if let Some(remote_name) = remote.as_deref() {
         let alias = context::resolve_ledger(ledger.as_deref(), dirs)?;
         let client = context::build_remote_client(remote_name, dirs).await?;
-        print(&client.reasoned_heads(op, &alias, body).await?);
+        print(&client.reasoning_indexes(op, &alias, body).await?);
         context::persist_refreshed_tokens(&client, remote_name, dirs).await;
         return Ok(());
     }
@@ -63,49 +63,49 @@ pub async fn run(action: ReasonedHeadsAction, dirs: &FlureeDir) -> CliResult<()>
             remote_name,
             ..
         } => {
-            print(&client.reasoned_heads(op, &remote_alias, body).await?);
+            print(&client.reasoning_indexes(op, &remote_alias, body).await?);
             context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
         }
         LedgerMode::Local { fluree, alias } => {
             let out = match action {
-                ReasonedHeadsAction::Register {
+                ReasoningIndexesAction::Register {
                     reasoning, program, ..
                 } => {
-                    let head = fluree
-                        .register_reasoned_head(&alias, &program_of(reasoning, program)?)
+                    let index = fluree
+                        .register_reasoning_index(&alias, &program_of(reasoning, program)?)
                         .await?;
-                    json!({"ledger": alias, "headId": head.to_string()})
+                    json!({"ledger": alias, "indexId": index.to_string()})
                 }
-                ReasonedHeadsAction::List { .. } => {
-                    serde_json::to_value(fluree.reasoned_heads(&alias).await?)
+                ReasoningIndexesAction::List { .. } => {
+                    serde_json::to_value(fluree.reasoning_indexes(&alias).await?)
                         .unwrap_or(JsonValue::Null)
                 }
-                ReasonedHeadsAction::Refresh { head, .. } => {
-                    let results = match head {
+                ReasoningIndexesAction::Refresh { index, .. } => {
+                    let results = match index {
                         Some(raw) => {
-                            let head = head_id(&raw)?;
-                            let outcome = fluree.refresh_reasoned_head(&alias, &head).await?;
-                            vec![(head, outcome)]
+                            let index = index_id(&raw)?;
+                            let outcome = fluree.refresh_reasoning_index(&alias, &index).await?;
+                            vec![(index, outcome)]
                         }
-                        None => fluree.refresh_reasoned_heads(&alias).await?,
+                        None => fluree.refresh_reasoning_indexes(&alias).await?,
                     };
                     json!({
                         "ledger": alias,
                         "results": results
                             .into_iter()
-                            .map(|(head, outcome)| {
+                            .map(|(index, outcome)| {
                                 let mut entry = serde_json::to_value(outcome)
                                     .unwrap_or(JsonValue::Null);
-                                entry["headId"] = json!(head.to_string());
+                                entry["indexId"] = json!(index.to_string());
                                 entry
                             })
                             .collect::<Vec<_>>()
                     })
                 }
-                ReasonedHeadsAction::Retire { head, .. } => {
-                    let head = head_id(&head)?;
-                    fluree.retire_reasoned_head(&alias, &head).await?;
-                    json!({"ledger": alias, "headId": head.to_string()})
+                ReasoningIndexesAction::Retire { index, .. } => {
+                    let index = index_id(&index)?;
+                    fluree.retire_reasoning_index(&alias, &index).await?;
+                    json!({"ledger": alias, "indexId": index.to_string()})
                 }
             };
             print(&out);

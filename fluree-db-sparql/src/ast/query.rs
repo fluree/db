@@ -77,7 +77,7 @@ pub struct Pragmas {
     /// verbatim; validates during lowering.
     pub reasoning_time: Option<String>,
     /// `# PRAGMA reasoning-freshness: exact|strict|asOf|default` — how a
-    /// reasoned head may answer the query (JSON-LD `reasoningFreshness`).
+    /// reasoning index may answer the query (JSON-LD `reasoningFreshness`).
     pub reasoning_freshness: Option<String>,
     /// `# PRAGMA include-system-facts: true` — surface the `f:reifies*`
     /// edge-annotation encoding in variable-predicate scans (JSON-LD

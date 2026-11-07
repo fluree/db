@@ -12,9 +12,9 @@ use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
     GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, NsLookupResult,
-    NsRecord, ReasonedHeads, ReasonedHeadsCasResult, ReasonedHeadsLookup, ReasonedHeadsPublisher,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPublisher, StatusValue,
+    NsRecord, ReasoningIndexes, ReasoningIndexesCasResult, ReasoningIndexesLookup,
+    ReasoningIndexesPublisher, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::{ContentId, InstanceId, LedgerId};
@@ -37,8 +37,8 @@ pub struct MemoryNameService {
     status_values: Arc<RwLock<HashMap<LedgerId, StatusValue>>>,
     /// Config values keyed by canonical address (v2 extension)
     config_values: Arc<RwLock<HashMap<LedgerId, ConfigValue>>>,
-    /// Reasoned-heads documents, taken only after `records` like the others.
-    reasoned_heads: Arc<RwLock<HashMap<LedgerId, ReasonedHeads>>>,
+    /// Reasoning-indexes documents, taken only after `records` like the others.
+    reasoning_indexes: Arc<RwLock<HashMap<LedgerId, ReasoningIndexes>>>,
     /// Name bindings keyed by ledger name; `None` is a deleted binding's
     /// tombstone, which keeps its version from ever repeating.
     bindings: Arc<RwLock<HashMap<String, Versioned<Option<NameBinding>>>>>,
@@ -90,7 +90,7 @@ impl Default for MemoryNameService {
             graph_source_records: Arc::new(RwLock::new(HashMap::new())),
             status_values: Arc::new(RwLock::new(HashMap::new())),
             config_values: Arc::new(RwLock::new(HashMap::new())),
-            reasoned_heads: Arc::new(RwLock::new(HashMap::new())),
+            reasoning_indexes: Arc::new(RwLock::new(HashMap::new())),
             bindings: Arc::new(RwLock::new(HashMap::new())),
             dropped: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -316,7 +316,7 @@ impl BranchRecordStore for MemoryNameService {
         records.remove(&key);
         self.status_values.write().remove(&key);
         self.config_values.write().remove(&key);
-        self.reasoned_heads.write().remove(&key);
+        self.reasoning_indexes.write().remove(&key);
         Ok(FenceOutcome::Applied)
     }
 }
@@ -821,15 +821,15 @@ impl ConfigPublisher for MemoryNameService {
 }
 
 #[async_trait]
-impl ReasonedHeadsLookup for MemoryNameService {
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<ReasonedHeads>> {
+impl ReasoningIndexesLookup for MemoryNameService {
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>> {
         let key = LedgerId::parse(ledger_id)?;
         let records = self.records.read();
         if !records.contains_key(&key) {
             return Ok(None);
         }
         Ok(Some(
-            self.reasoned_heads
+            self.reasoning_indexes
                 .read()
                 .get(&key)
                 .cloned()
@@ -839,24 +839,24 @@ impl ReasonedHeadsLookup for MemoryNameService {
 }
 
 #[async_trait]
-impl ReasonedHeadsPublisher for MemoryNameService {
-    async fn push_reasoned_heads_fenced(
+impl ReasoningIndexesPublisher for MemoryNameService {
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &ReasonedHeads,
-    ) -> Result<ReasonedHeadsCasResult> {
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult> {
         let key = LedgerId::parse(ledger_id)?;
         let records = self.records.read();
-        let mut docs = self.reasoned_heads.write();
+        let mut docs = self.reasoning_indexes.write();
         check_fence(&records, &key, fence)?;
         let current = docs.get(&key).cloned().unwrap_or_default();
-        if let Some(conflict) = crate::reasoned_heads_conflict(&current, expected_v, new) {
+        if let Some(conflict) = crate::reasoning_indexes_conflict(&current, expected_v, new) {
             return Ok(conflict);
         }
         docs.insert(key, new.clone());
-        Ok(ReasonedHeadsCasResult::Updated)
+        Ok(ReasoningIndexesCasResult::Updated)
     }
 }
 

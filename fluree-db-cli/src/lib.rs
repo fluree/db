@@ -765,9 +765,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref()).await
         }
 
-        Commands::ReasonedHeads { action } => {
+        Commands::ReasoningIndexes { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::reasoned_heads::run(action, &fluree_dir).await
+            commands::reasoning_indexes::run(action, &fluree_dir).await
         }
 
         Commands::Sweep {

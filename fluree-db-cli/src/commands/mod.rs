@@ -43,7 +43,7 @@ pub mod ontology;
 pub mod prefix;
 pub mod query;
 pub mod query_stream;
-pub mod reasoned_heads;
+pub mod reasoning_indexes;
 pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;

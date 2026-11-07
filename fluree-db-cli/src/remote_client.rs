@@ -2182,15 +2182,15 @@ impl RemoteLedgerClient {
         self.post_ledger_op(&url, ledger, "sweep").await
     }
 
-    /// A reasoned-head operation: `POST {base_url}/reasoned-heads/{op}` with
+    /// A reasoning-index operation: `POST {base_url}/reasoning-indexes/{op}` with
     /// `{"ledger", ...body}`.
-    pub async fn reasoned_heads(
+    pub async fn reasoning_indexes(
         &self,
         op: &str,
         ledger: &str,
         mut body: serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url_root(&format!("reasoned-heads/{op}"));
+        let url = self.op_url_root(&format!("reasoning-indexes/{op}"));
         body["ledger"] = serde_json::Value::String(ledger.to_string());
         self.send_json_with_timeout(
             reqwest::Method::POST,

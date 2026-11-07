@@ -279,11 +279,14 @@ impl ConfigLookup for CompositeNameService {
 }
 
 #[async_trait]
-impl crate::ReasonedHeadsLookup for CompositeNameService {
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<crate::ReasonedHeads>> {
+impl crate::ReasoningIndexesLookup for CompositeNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
         match self.mount_for(ledger_id) {
-            Some((mount, remote)) => mount.lookup.get_reasoned_heads(remote).await,
-            None => self.local.get_reasoned_heads(ledger_id).await,
+            Some((mount, remote)) => mount.lookup.get_reasoning_indexes(remote).await,
+            None => self.local.get_reasoning_indexes(ledger_id).await,
         }
     }
 }
@@ -493,19 +496,19 @@ impl ConfigPublisher for CompositeNameService {
 }
 
 #[async_trait]
-impl crate::ReasonedHeadsPublisher for CompositeNameService {
-    async fn push_reasoned_heads_fenced(
+impl crate::ReasoningIndexesPublisher for CompositeNameService {
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &crate::ReasonedHeads,
-    ) -> Result<crate::ReasonedHeadsCasResult> {
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
         self.local
-            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
             .await
     }
 }

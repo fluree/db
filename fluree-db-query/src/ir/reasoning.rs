@@ -109,12 +109,12 @@ pub struct ReasoningModes {
     /// datetime.
     pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
 
-    /// How a query may be answered from a persisted reasoned head. Query key
+    /// How a query may be answered from a persisted reasoning index. Query key
     /// `"reasoningFreshness"` / SPARQL `# PRAGMA reasoning-freshness:`.
     pub freshness: ReasoningFreshness,
 }
 
-/// How a reasoning query may be answered when a reasoned head is
+/// How a reasoning query may be answered when a reasoning index is
 /// registered for its program.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ReasoningFreshness {

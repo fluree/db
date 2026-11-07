@@ -1,22 +1,22 @@
-//! Native reasoned-head spike over LUBM: build an OWL 2 RL head from a
+//! Native reasoning-index spike over LUBM: build an OWL 2 RL index from a
 //! file-backed, indexed ledger and compare it with query-time reasoning.
 //!
 //! ```bash
-//! cargo run --release --example reasoned_head_spike -p fluree-db-api --features native -- \
+//! cargo run --release --example reasoning_index_spike -p fluree-db-api --features native -- \
 //!     <lubm-combined.ttl> <queries dir> [expected counts, comma-separated q01..q14]
 //! ```
 //!
 //! Reports, as JSON on stdout:
-//! - per query: query-time and head row counts, whether the two complete result
+//! - per query: query-time and index row counts, whether the two complete result
 //!   multisets are equal, and the expected count when given;
-//! - the head's stats and storage: bytes in the base index, in the head, and in
-//!   the shared dictionaries; how many of the head root's dictionary blobs it
+//! - the index's stats and storage: bytes in the base index, in the index, and in
+//!   the shared dictionaries; how many of the index root's dictionary blobs it
 //!   shares with the base root, and the bytes of the ones it does not;
 //! - the same after one small commit folded in as a logical generation.
 //!
 //! With `SPIKE_TIMINGS=1` it also reports wall-clock figures: the rebuild and
 //! the logical refresh, and per query the first and the median of
-//! `SPIKE_RUNS` (default 5) runs, query-time and from the head. Take timings
+//! `SPIKE_RUNS` (default 5) runs, query-time and from the index. Take timings
 //! on the benchmark hosts only.
 
 use std::collections::HashSet;
@@ -77,7 +77,7 @@ async fn run(fluree: &Fluree, sparql: &str) -> (Vec<String>, bool) {
     let served = resp
         .reasoning
         .as_ref()
-        .and_then(|r| r.head.as_ref())
+        .and_then(|r| r.index.as_ref())
         .is_some();
     (multiset(&resp.result), served)
 }
@@ -127,31 +127,31 @@ async fn dict_refs(store: &dyn ContentStore, root: &ContentId) -> HashSet<Conten
 async fn storage_report(
     fluree: &Fluree,
     dir: &Path,
-    head: &fluree_db_core::reasoned_head::HeadId,
-    head_root: &ContentId,
+    index: &fluree_db_core::reasoning_index::ReasoningIndexId,
+    index_root: &ContentId,
 ) -> JsonValue {
     let record = fluree.nameservice().lookup(LEDGER).await.unwrap().unwrap();
     let base_root = record.index_head_id.clone().expect("base index");
     let store = fluree.backend().content_store(&record.storage_namespace());
-    let head_store = fluree
+    let index_store = fluree
         .backend()
-        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
+        .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
     let base_dicts = dict_refs(store.as_ref(), &base_root).await;
-    let head_dicts = dict_refs(head_store.as_ref(), head_root).await;
-    let shared = head_dicts.intersection(&base_dicts).count();
-    let mut head_only_bytes = 0u64;
-    for id in head_dicts.difference(&base_dicts) {
-        head_only_bytes += store.get(id).await.map(|b| b.len() as u64).unwrap_or(0);
+    let index_dicts = dict_refs(index_store.as_ref(), index_root).await;
+    let shared = index_dicts.intersection(&base_dicts).count();
+    let mut index_only_bytes = 0u64;
+    for id in index_dicts.difference(&base_dicts) {
+        index_only_bytes += store.get(id).await.map(|b| b.len() as u64).unwrap_or(0);
     }
     let branch = find_dir(dir, "main").expect("branch folder");
     json!({
         "base_index_bytes": dir_bytes(&branch.join("index")),
-        "head_bytes": dir_bytes(&branch.join("@reasoned")),
+        "index_bytes": dir_bytes(&branch.join("@reasoning")),
         "shared_dict_bytes": find_dir(dir, "@shared").map(|p| dir_bytes(&p)),
-        "head_root_dict_blobs": head_dicts.len(),
+        "index_root_dict_blobs": index_dicts.len(),
         "shared_with_base_root": shared,
-        "head_only_dict_blobs": head_dicts.len() - shared,
-        "head_only_dict_bytes": head_only_bytes,
+        "index_only_dict_blobs": index_dicts.len() - shared,
+        "index_only_dict_bytes": index_only_bytes,
     })
 }
 
@@ -225,24 +225,24 @@ async fn main() {
         }
     }
 
-    let head = fluree
-        .register_reasoned_head(LEDGER, &json!({"reasoning": "owl2rl"}))
+    let index = fluree
+        .register_reasoning_index(LEDGER, &json!({"reasoning": "owl2rl"}))
         .await
         .expect("register");
     let rebuild_started = std::time::Instant::now();
     let rebuild = fluree
-        .refresh_reasoned_head(LEDGER, &head)
+        .refresh_reasoning_index(LEDGER, &index)
         .await
         .expect("refresh");
     let rebuild_ms = rebuild_started.elapsed().as_secs_f64() * 1000.0;
-    let doc = fluree.reasoned_heads(LEDGER).await.unwrap();
-    let pointer = doc.heads[&head].published.clone().expect("published");
+    let doc = fluree.reasoning_indexes(LEDGER).await.unwrap();
+    let pointer = doc.indexes[&index].head.clone().expect("published");
     let manifest = {
         let record = fluree.nameservice().lookup(LEDGER).await.unwrap().unwrap();
         let store = fluree
             .backend()
-            .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
-        fluree_db_core::reasoned_head::ReasonedManifest::decode(
+            .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+        fluree_db_core::reasoning_index::ReasoningManifest::decode(
             &store.get(&pointer.manifest).await.unwrap(),
         )
         .unwrap()
@@ -257,18 +257,18 @@ async fn main() {
         let mut entry = json!({
             "query": name,
             "query_time_rows": expected_rows.len(),
-            "head_rows": rows.len(),
-            "served_from_head": served,
+            "index_rows": rows.len(),
+            "served_from_index": served,
             "multisets_equal": equal,
             "expected": expected.get(i).copied().flatten(),
         });
         if timings_enabled() {
             entry["query_time"] = query_time_ms[i].clone();
-            entry["head"] = timed(&fluree, sparql).await;
+            entry["index"] = timed(&fluree, sparql).await;
         }
         per_query.push(entry);
     }
-    let storage = storage_report(&fluree, dir.path(), &head, &manifest.root).await;
+    let storage = storage_report(&fluree, dir.path(), &index, &manifest.root).await;
 
     // One small commit, folded in as a logical generation.
     let _ledger = fluree
@@ -281,34 +281,34 @@ async fn main() {
         .await
         .expect("commit")
         .ledger;
-    let head_bytes_before = storage["head_bytes"].as_u64().unwrap_or(0);
+    let index_bytes_before = storage["index_bytes"].as_u64().unwrap_or(0);
     let logical_started = std::time::Instant::now();
     let logical = fluree
-        .refresh_reasoned_head(LEDGER, &head)
+        .refresh_reasoning_index(LEDGER, &index)
         .await
         .expect("refresh");
     let logical_ms = logical_started.elapsed().as_secs_f64() * 1000.0;
-    let doc = fluree.reasoned_heads(LEDGER).await.unwrap();
-    let pointer = doc.heads[&head].published.clone().expect("published");
+    let doc = fluree.reasoning_indexes(LEDGER).await.unwrap();
+    let pointer = doc.indexes[&index].head.clone().expect("published");
     let record = fluree.nameservice().lookup(LEDGER).await.unwrap().unwrap();
-    let head_store = fluree
+    let index_store = fluree
         .backend()
-        .content_store(&record.storage_namespace().reasoned_head(head.as_str()));
-    let manifest2 = fluree_db_core::reasoned_head::ReasonedManifest::decode(
-        &head_store.get(&pointer.manifest).await.unwrap(),
+        .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+    let manifest2 = fluree_db_core::reasoning_index::ReasoningManifest::decode(
+        &index_store.get(&pointer.manifest).await.unwrap(),
     )
     .unwrap();
-    let storage2 = storage_report(&fluree, dir.path(), &head, &manifest2.root).await;
+    let storage2 = storage_report(&fluree, dir.path(), &index, &manifest2.root).await;
     let (q1_rows, q1_served) = run(&fluree, &queries[0].1).await;
 
     let derived_set_bytes = {
-        let index = fluree_db_core::reasoned_head::DerivedIndex::decode(
-            &head_store.get(&manifest2.derived).await.unwrap(),
+        let index = fluree_db_core::reasoning_index::DerivedIndex::decode(
+            &index_store.get(&manifest2.derived).await.unwrap(),
         )
         .unwrap();
         let mut total = 0usize;
         for bucket in &index.buckets {
-            total += head_store.get(bucket).await.map(|b| b.len()).unwrap_or(0);
+            total += index_store.get(bucket).await.map(|b| b.len()).unwrap_or(0);
         }
         total
     };
@@ -320,7 +320,7 @@ async fn main() {
         "logical": {
             "outcome": serde_json::to_value(&logical).unwrap(),
             "storage": storage2,
-            "head_bytes_written": storage2["head_bytes"].as_u64().unwrap_or(0).saturating_sub(head_bytes_before),
+            "index_bytes_written": storage2["index_bytes"].as_u64().unwrap_or(0).saturating_sub(index_bytes_before),
             "derived_set_bytes": derived_set_bytes,
             "q01_rows_after": q1_rows.len(),
             "q01_served": q1_served,

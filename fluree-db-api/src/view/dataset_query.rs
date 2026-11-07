@@ -187,7 +187,7 @@ impl Fluree {
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
         let served = self
-            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
             .await?;
         let dataset = served.as_ref().unwrap_or(dataset);
         let primary = dataset.primary().unwrap_or(primary);
@@ -306,7 +306,7 @@ impl Fluree {
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
         let served = self
-            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
             .await?;
         let dataset = served.as_ref().unwrap_or(dataset);
         let primary = dataset.primary().unwrap_or(primary);
@@ -454,7 +454,7 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let served = self
-            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let dataset = served.as_ref().unwrap_or(dataset);
@@ -568,7 +568,7 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let served = self
-            .serve_dataset_from_reasoned_head(dataset, &mut executable, Some(&tracker))
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let dataset = served.as_ref().unwrap_or(dataset);

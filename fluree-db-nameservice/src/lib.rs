@@ -503,7 +503,7 @@ pub trait NameServiceLookup:
     + RefLookup
     + StatusLookup
     + ConfigLookup
-    + ReasonedHeadsLookup
+    + ReasoningIndexesLookup
     + Debug
     + Send
     + Sync
@@ -1458,57 +1458,57 @@ pub trait ConfigPublisher: ConfigLookup {
 }
 
 // ---------------------------------------------------------------------------
-// Reasoned heads
+// Reasoning indexes
 // ---------------------------------------------------------------------------
 
-pub use fluree_db_core::reasoned_head::ReasonedHeads;
+pub use fluree_db_core::reasoning_index::ReasoningIndexes;
 
-/// Result of a compare-and-swap on a branch's reasoned-heads document.
+/// Result of a compare-and-swap on a branch's reasoning-indexes document.
 ///
 /// A conflict is not an error: `actual` is the document as it stands (`None`
 /// when the branch record does not exist), and the caller rebuilds its
 /// update from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReasonedHeadsCasResult {
+pub enum ReasoningIndexesCasResult {
     Updated,
-    Conflict { actual: Option<ReasonedHeads> },
+    Conflict { actual: Option<ReasoningIndexes> },
 }
 
-/// Read access to each branch's reasoned-heads document.
+/// Read access to each branch's reasoning-indexes document.
 #[async_trait]
-pub trait ReasonedHeadsLookup: Debug + Send + Sync {
+pub trait ReasoningIndexesLookup: Debug + Send + Sync {
     /// The branch's document. `Some` with `v == 0` when the branch exists
-    /// but no head was ever registered; `None` when the branch record does
+    /// but no index was ever registered; `None` when the branch record does
     /// not exist (or is a tombstone).
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<ReasonedHeads>>;
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>>;
 }
 
-/// Compare-and-swap on a branch's reasoned-heads document.
+/// Compare-and-swap on a branch's reasoning-indexes document.
 ///
 /// Backends check only the version and the fence: the update lands when the
 /// stored document's `v` equals `expected_v` and `new.v > expected_v`, and is
 /// refused with [`NameServiceError::Fenced`] unless the record carries
 /// `fence` and is not frozen. Publication rules (eligibility, basis,
 /// progress) run above the nameservice, in
-/// [`fluree_db_core::reasoned_head::admit`].
+/// [`fluree_db_core::reasoning_index::admit`].
 #[async_trait]
-pub trait ReasonedHeadsPublisher: ReasonedHeadsLookup {
-    async fn push_reasoned_heads_fenced(
+pub trait ReasoningIndexesPublisher: ReasoningIndexesLookup {
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &ReasonedHeads,
-    ) -> Result<ReasonedHeadsCasResult>;
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult>;
 }
 
-/// The version check every backend applies to a reasoned-heads push.
-pub(crate) fn reasoned_heads_conflict(
-    current: &ReasonedHeads,
+/// The version check every backend applies to a reasoning-indexes push.
+pub(crate) fn reasoning_indexes_conflict(
+    current: &ReasoningIndexes,
     expected_v: i64,
-    new: &ReasonedHeads,
-) -> Option<ReasonedHeadsCasResult> {
-    (current.v != expected_v || new.v <= current.v).then(|| ReasonedHeadsCasResult::Conflict {
+    new: &ReasoningIndexes,
+) -> Option<ReasoningIndexesCasResult> {
+    (current.v != expected_v || new.v <= current.v).then(|| ReasoningIndexesCasResult::Conflict {
         actual: Some(current.clone()),
     })
 }
@@ -1529,7 +1529,7 @@ pub trait NameServicePublisher:
     + GraphSourcePublisher
     + StatusPublisher
     + ConfigPublisher
-    + ReasonedHeadsPublisher
+    + ReasoningIndexesPublisher
     + LedgerRegistry
     + BranchRecordStore
 {
@@ -1542,7 +1542,7 @@ impl<T> NameServicePublisher for T where
         + GraphSourcePublisher
         + StatusPublisher
         + ConfigPublisher
-        + ReasonedHeadsPublisher
+        + ReasoningIndexesPublisher
         + LedgerRegistry
         + BranchRecordStore
 {
@@ -1677,12 +1677,12 @@ where
 }
 
 #[async_trait]
-impl<T> ReasonedHeadsLookup for Arc<T>
+impl<T> ReasoningIndexesLookup for Arc<T>
 where
-    T: ReasonedHeadsLookup + ?Sized,
+    T: ReasoningIndexesLookup + ?Sized,
 {
-    async fn get_reasoned_heads(&self, ledger_id: &str) -> Result<Option<ReasonedHeads>> {
-        (**self).get_reasoned_heads(ledger_id).await
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>> {
+        (**self).get_reasoning_indexes(ledger_id).await
     }
 }
 
@@ -1870,19 +1870,19 @@ where
 }
 
 #[async_trait]
-impl<T> ReasonedHeadsPublisher for Arc<T>
+impl<T> ReasoningIndexesPublisher for Arc<T>
 where
-    T: ReasonedHeadsPublisher + ?Sized,
+    T: ReasoningIndexesPublisher + ?Sized,
 {
-    async fn push_reasoned_heads_fenced(
+    async fn push_reasoning_indexes_fenced(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         expected_v: i64,
-        new: &ReasonedHeads,
-    ) -> Result<ReasonedHeadsCasResult> {
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult> {
         (**self)
-            .push_reasoned_heads_fenced(ledger_id, fence, expected_v, new)
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
             .await
     }
 }
@@ -2173,8 +2173,8 @@ mod tests {
         }
     }
     #[async_trait]
-    impl ReasonedHeadsLookup for RefOnlyNs {
-        async fn get_reasoned_heads(&self, _: &str) -> Result<Option<ReasonedHeads>> {
+    impl ReasoningIndexesLookup for RefOnlyNs {
+        async fn get_reasoning_indexes(&self, _: &str) -> Result<Option<ReasoningIndexes>> {
             Ok(None)
         }
     }

@@ -91,7 +91,7 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             capped_rules: Vec::new(),
             pending_rules: Vec::new(),
             evaluation_time: None,
-            head: None,
+            index: None,
         }
     }
 }
@@ -543,17 +543,17 @@ pub struct NameServiceState {
     pub dropped: HashMap<String, VersionedJson>,
     /// The fence and frozen flag of each branch created under a binding.
     pub fences: HashMap<RefKey, FenceState>,
-    /// Per-`name:branch` reasoned-heads documents, as JSON. Appended after
+    /// Per-`name:branch` reasoning-indexes documents, as JSON. Appended after
     /// every field above, so a snapshot taken before heads still decodes
     /// through [`NameServiceStateV2`].
-    pub reasoned_heads: HashMap<String, StoredReasonedHeads>,
+    pub reasoning_indexes: HashMap<String, StoredReasoningIndexes>,
 }
 
-/// A branch's reasoned-heads document: its compare-and-swap version and the
+/// A branch's reasoning-indexes document: its compare-and-swap version and the
 /// document as JSON, which postcard cannot carry structurally (it holds
 /// internally tagged enums and open JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredReasonedHeads {
+pub struct StoredReasoningIndexes {
     pub v: i64,
     pub json: String,
 }
@@ -630,7 +630,7 @@ struct NameServiceStateV1 {
     configured_voters: BTreeSet<NodeId>,
 }
 
-/// [`NameServiceState`] as snapshotted before reasoned heads.
+/// [`NameServiceState`] as snapshotted before reasoning indexes.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 struct NameServiceStateV2 {
@@ -673,7 +673,7 @@ impl From<NameServiceStateV2> for NameServiceState {
             bindings: v2.bindings,
             dropped: v2.dropped,
             fences: v2.fences,
-            reasoned_heads: HashMap::new(),
+            reasoning_indexes: HashMap::new(),
         }
     }
 }
@@ -698,7 +698,7 @@ impl From<NameServiceStateV1> for NameServiceState {
             bindings: HashMap::new(),
             dropped: HashMap::new(),
             fences: HashMap::new(),
-            reasoned_heads: HashMap::new(),
+            reasoning_indexes: HashMap::new(),
         }
     }
 }
@@ -922,12 +922,12 @@ pub enum Command {
     /// again under its name can publish from `t` 0. A no-op on a live or
     /// missing record.
     ResetGraphSourceIndex { name: String, branch: String },
-    /// Compare-and-swap a branch's reasoned-heads document on its version.
+    /// Compare-and-swap a branch's reasoning-indexes document on its version.
     /// Always wrapped in [`Command::Fenced`].
-    PushReasonedHeads {
+    PushReasoningIndexes {
         ledger_id: String,
         expected_v: i64,
-        new: StoredReasonedHeads,
+        new: StoredReasoningIndexes,
     },
 }
 
@@ -1545,11 +1545,13 @@ pub enum Response {
     },
     /// [`Command::ResetGraphSourceIndex`] cleared the index pointer.
     GraphSourceIndexReset,
-    /// [`Command::PushReasonedHeads`] wrote the document.
-    ReasonedHeadsUpdated,
-    /// [`Command::PushReasonedHeads`] found another version; `actual` is
+    /// [`Command::PushReasoningIndexes`] wrote the document.
+    ReasoningIndexesUpdated,
+    /// [`Command::PushReasoningIndexes`] found another version; `actual` is
     /// `None` when the branch is not registered.
-    ReasonedHeadsConflict { actual: Option<StoredReasonedHeads> },
+    ReasoningIndexesConflict {
+        actual: Option<StoredReasoningIndexes>,
+    },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1671,7 +1673,7 @@ fn fenced_branch(command: &Command) -> Option<RefKey> {
         Command::CompareAndSetRef(args) => Some(RefKey::new(&args.ledger_id, &args.branch)),
         Command::PushStatus { ledger_id, .. } => of_id(ledger_id),
         Command::PushConfig(args) => of_id(&args.ledger_id),
-        Command::PushReasonedHeads { ledger_id, .. } => of_id(ledger_id),
+        Command::PushReasoningIndexes { ledger_id, .. } => of_id(ledger_id),
         _ => None,
     }
 }
@@ -1735,11 +1737,11 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             } = *args;
             apply_versioned_push(&state.ledgers, &mut state.config, ledger_id, expected, new)
         }
-        Command::PushReasonedHeads {
+        Command::PushReasoningIndexes {
             ledger_id,
             expected_v,
             new,
-        } => apply_push_reasoned_heads(state, ledger_id, expected_v, new),
+        } => apply_push_reasoning_indexes(state, ledger_id, expected_v, new),
         Command::PublishGraphSource {
             name,
             branch,
@@ -1969,7 +1971,7 @@ fn delete_branch(
     state.fences.remove(&key);
     state.status.remove(&full);
     state.config.remove(&full);
-    state.reasoned_heads.remove(&full);
+    state.reasoning_indexes.remove(&full);
     if let Some(ledger) = state.ledgers.get_mut(&key.ledger_name) {
         ledger.branches.retain(|b| b != &key.branch);
         if ledger.branches.is_empty() {
@@ -2710,36 +2712,36 @@ fn apply_versioned_push<T: VersionedValue>(
     T::updated()
 }
 
-/// [`Command::PushReasonedHeads`]: the version check only. An absent
+/// [`Command::PushReasoningIndexes`]: the version check only. An absent
 /// document reads as version 0; the publication rules run in the proposer.
-fn apply_push_reasoned_heads(
+fn apply_push_reasoning_indexes(
     state: &mut NameServiceState,
     ledger_id: String,
     expected_v: i64,
-    new: StoredReasonedHeads,
+    new: StoredReasoningIndexes,
 ) -> Response {
     let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
-        return Response::ReasonedHeadsConflict { actual: None };
+        return Response::ReasoningIndexesConflict { actual: None };
     };
     let registered = state
         .ledgers
         .get(&name)
         .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
     if !registered {
-        return Response::ReasonedHeadsConflict { actual: None };
+        return Response::ReasoningIndexesConflict { actual: None };
     }
-    let current = state.reasoned_heads.get(&ledger_id).cloned();
+    let current = state.reasoning_indexes.get(&ledger_id).cloned();
     let current_v = current.as_ref().map_or(0, |c| c.v);
     if current_v != expected_v || new.v <= current_v {
-        return Response::ReasonedHeadsConflict {
-            actual: Some(current.unwrap_or(StoredReasonedHeads {
+        return Response::ReasoningIndexesConflict {
+            actual: Some(current.unwrap_or(StoredReasoningIndexes {
                 v: 0,
                 json: String::new(),
             })),
         };
     }
-    state.reasoned_heads.insert(ledger_id, new);
-    Response::ReasonedHeadsUpdated
+    state.reasoning_indexes.insert(ledger_id, new);
+    Response::ReasoningIndexesUpdated
 }
 
 fn apply_publish_graph_source(
@@ -4325,7 +4327,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_reasoned_heads_snapshot_restores() {
+    fn pre_reasoning_indexes_snapshot_restores() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
         seed_head(&mut state, "test/db", "main", cid(1), 1);
@@ -4354,19 +4356,19 @@ mod tests {
         // A document pushed into the current layout survives a snapshot.
         let response = apply(
             &mut state,
-            Command::PushReasonedHeads {
+            Command::PushReasoningIndexes {
                 ledger_id: "test/db:main".into(),
                 expected_v: 0,
-                new: StoredReasonedHeads {
+                new: StoredReasoningIndexes {
                     v: 1,
                     json: "{\"v\":1}".into(),
                 },
             },
             7,
         );
-        assert_eq!(response, Response::ReasonedHeadsUpdated);
+        assert_eq!(response, Response::ReasoningIndexesUpdated);
         let restored = NameServiceState::from_snapshot(&state.to_snapshot().unwrap()).unwrap();
-        assert_eq!(restored.reasoned_heads.len(), 1);
+        assert_eq!(restored.reasoning_indexes.len(), 1);
     }
 
     // -------------------------------------------------------------

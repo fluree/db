@@ -1081,7 +1081,7 @@ fn is_cached_kind(kind: &ContentKind) -> bool {
         | ContentKind::AnnotationForwardLeaf
         | ContentKind::AnnotationReverseBranch
         | ContentKind::AnnotationReverseLeaf
-        | ContentKind::ReasonedManifest
+        | ContentKind::ReasoningManifest
         | ContentKind::DerivedFacts => true,
         ContentKind::Commit
         | ContentKind::Txn
