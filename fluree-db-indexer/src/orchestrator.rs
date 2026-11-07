@@ -587,8 +587,10 @@ async fn hold_gc(locks: &GcLocks, ledger_name: &LedgerName) -> GcGuard {
     }
 }
 
-/// A worker build in flight on some branch of a ledger. Dropping it ends it.
-struct BuildTicket {
+/// A build in flight on some branch of a ledger: release windows wait for
+/// it. Dropping it ends it.
+#[must_use = "the build is registered only while the ticket is held"]
+pub struct BuildTicket {
     ledger_name: LedgerName,
     locks: GcLocks,
 }
@@ -1415,6 +1417,15 @@ impl IndexerHandle {
     /// [`TriggerHandle::hold_quiesced`].
     pub async fn hold_quiesced(&self, ledger_id: &LedgerId) -> Option<MaintenanceGuard> {
         self.trigger.hold_quiesced(ledger_id).await
+    }
+
+    /// Register a build that writes index artifacts outside the worker, on a
+    /// branch of `ledger_id`'s ledger: a collector pass's release window
+    /// waits for it as for the worker's own builds, so nothing it will
+    /// reference is released before it publishes. `None` while a window is
+    /// open; the caller retries later.
+    pub fn begin_build(&self, ledger_id: &LedgerId) -> Option<BuildTicket> {
+        try_begin_build(&self.trigger.gc_locks, ledger_id)
     }
 
     /// Hold `ledger_name`'s collector passes off until the guard drops,

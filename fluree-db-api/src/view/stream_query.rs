@@ -72,6 +72,9 @@ pub struct StreamDatasetPlan {
     vars: VarRegistry,
     parsed: fluree_db_query::ir::Query,
     executable: ExecutableQuery,
+    /// The dataset over a reasoning index's generation, when one answers:
+    /// execution reads it in place of the dataset handed to the run.
+    served: Option<DataSetDb>,
 }
 
 impl Fluree {
@@ -426,13 +429,17 @@ impl Fluree {
         )?;
         ensure_streamable(&mut parsed, &vars)?;
 
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
+        let served = self
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, None)
             .await?;
         Ok(StreamDatasetPlan {
             vars,
             parsed,
             executable,
+            served,
         })
     }
 
@@ -444,11 +451,12 @@ impl Fluree {
     pub async fn run_stream_query_dataset(
         &self,
         dataset: DataSetDb,
-        plan: StreamDatasetPlan,
+        mut plan: StreamDatasetPlan,
         tracker: Tracker,
         options: QueryExecutionOptions,
         tx: mpsc::Sender<Bytes>,
     ) {
+        let dataset = plan.served.take().unwrap_or(dataset);
         if let Err(e) = crate::query::helpers::charge_query_floor(&tracker) {
             let _ = tx
                 .send(Bytes::from(ndjson_stream::error_record(

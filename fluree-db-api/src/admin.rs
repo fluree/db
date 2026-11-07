@@ -16,7 +16,7 @@ use fluree_db_core::{format_ledger_id, DEFAULT_BRANCH};
 use fluree_db_core::{InstanceId, LedgerId, LedgerName, StorageNamespace, StorageRoot};
 use fluree_db_indexer::{
     current_sibling_heads, execute_sweep, nested_namespaces, nested_prefixes, plan_garbage,
-    plan_sweep, rebuild_index_from_commits_with_tracker, release_garbage_plan,
+    plan_sweep_with, rebuild_index_from_commits_with_tracker, release_garbage_plan,
     shared_refs_of_branches, siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard,
     SweepPlan, SweepResult,
 };
@@ -1756,7 +1756,12 @@ impl crate::Fluree {
             // from the same chains this does, and with every surviving
             // branch's builds held off: what the survivors reference is only
             // true while none of them can publish. See
-            // `IndexerHandle::open_release_window`.
+            // `IndexerHandle::open_release_window`. Reasoning-index builds,
+            // which write outside the indexer, are held off too.
+            let _reasoning = self
+                .reasoning_index_state
+                .hold_for_reclaim(ledger_id.ledger_name().as_str())
+                .await;
             let _quiet = match &self.indexing_mode {
                 IndexingMode::Background(handle) => {
                     let gc_guard = handle.hold_gc(&ledger_id.ledger_name()).await;
@@ -2967,6 +2972,7 @@ impl crate::Fluree {
                 IndexingMode::Background(handle) => Some(handle.clone()),
                 _ => None,
             };
+            let gc_reasoning = std::sync::Arc::clone(&self.reasoning_index_state);
             tokio::spawn(async move {
                 let gc_config = CleanGarbageConfig {
                     max_old_indexes: Some(gc_max_old_indexes),
@@ -2986,6 +2992,11 @@ impl crate::Fluree {
                     if plan.is_empty() {
                         return Ok(());
                     }
+                    // Reasoning-index builds write outside the indexer: held
+                    // off like its own builds.
+                    let _reasoning = gc_reasoning
+                        .hold_for_reclaim(gc_ledger_id.ledger_name().as_str())
+                        .await;
                     let _window = match (&gc_handle, &gc_guard) {
                         (Some(handle), Some(guard)) => {
                             match handle.open_release_window(guard).await {
@@ -3170,6 +3181,7 @@ impl crate::Fluree {
         Vec<MaintenanceGuard>,
         crate::reasoning_index::SweepHold<'_>,
         Vec<BranchIndexHead>,
+        Vec<fluree_db_indexer::ExtraSweepFiles>,
         StorageRoot,
         Vec<StorageNamespace>,
     )> {
@@ -3178,7 +3190,7 @@ impl crate::Fluree {
         // them reclaimed under it.
         let indexes_hold = self
             .reasoning_index_state
-            .hold_for_sweep(ledger_name.as_str())
+            .hold_for_reclaim(ledger_name.as_str())
             .await;
         let all = self.nameservice().all_records().await?;
         let records: Vec<_> = all
@@ -3221,18 +3233,19 @@ impl crate::Fluree {
             });
         }
         // Each retained generation of each reasoning index takes part as its
-        // own chain, in its head's namespace: its files and the dictionaries
-        // it shares are live, and what a lost publish left is reclaimed.
-        let indexes = fluree_db_indexer::gc::reasoning_indexes::index_sweep_participants(
+        // own chain, in its index's namespace; every registered index's
+        // folders are listed, so what a lost or unfinished publication left
+        // is reclaimed.
+        let indexes = fluree_db_indexer::gc::reasoning_indexes::index_sweep_files(
             self.backend(),
             self.nameservice(),
             &branches,
         )
         .await
         .map_err(|e| ApiError::internal(format!("read reasoning indexes for the sweep: {e}")))?;
-        branches.extend(indexes);
+        branches.extend(indexes.participants);
 
-        Ok((guards, indexes_hold, branches, root, nested))
+        Ok((guards, indexes_hold, branches, indexes.extra, root, nested))
     }
 
     /// The storage a sweep enumerates and deletes through.
@@ -3257,9 +3270,9 @@ impl crate::Fluree {
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, _indexes_hold, branches, root, nested) =
+        let (_guards, _indexes_hold, branches, extra, root, nested) =
             self.hold_ledger_for_maintenance(&ledger_name).await?;
-        Ok(plan_sweep(&storage, &self.backend, &root, &branches, &nested).await?)
+        Ok(plan_sweep_with(&storage, &self.backend, &root, &branches, &extra, &nested).await?)
     }
 
     /// Reclaim index artifacts that no live index chain references.
@@ -3272,10 +3285,11 @@ impl crate::Fluree {
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, _indexes_hold, branches, root, nested) =
+        let (_guards, _indexes_hold, branches, extra, root, nested) =
             self.hold_ledger_for_maintenance(&ledger_name).await?;
 
-        let plan = plan_sweep(&storage, &self.backend, &root, &branches, &nested).await?;
+        let plan =
+            plan_sweep_with(&storage, &self.backend, &root, &branches, &extra, &nested).await?;
         info!(
             ledger_name = %ledger_name,
             orphans = plan.orphans.len(),

@@ -2020,3 +2020,185 @@ async fn a_generation_maintains_the_closure_only_over_inserted_data() {
     );
     check(vec!["ex:alice", "ex:bob", "ex:eve"]).await;
 }
+
+/// Two programs can settle to the same reasoning; `asOf` answers from the
+/// newest eligible generation across all of them, not from the first index.
+#[tokio::test]
+async fn as_of_takes_the_newest_generation_across_indexes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/as-of-newest:main";
+    let ledger = school(&fluree, id).await;
+    let first = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &first).await.unwrap());
+    let ledger = student_commit(&fluree, ledger, "carol").await;
+    // An unused context: a different registration, the same settled program.
+    let second = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl", "@context": ctx()}))
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+    published(fluree.refresh_reasoning_index(id, &second).await.unwrap());
+    let _ledger = student_commit(&fluree, ledger, "dave").await;
+
+    let as_of = with(people_query(), "reasoningFreshness", json!("asOf"));
+    let (people, served) = rows(&fluree, id, &as_of).await;
+    let served = served.expect("an index answers");
+    assert_eq!(
+        (served.index_id.as_str(), served.basis_t),
+        (second.as_str(), 2)
+    );
+    assert_eq!(
+        people,
+        vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")]
+    );
+}
+
+/// Superseded generations expire on a branch that stopped committing: a
+/// refresh that finds the index current still runs retention.
+#[tokio::test]
+async fn an_idle_index_releases_its_expired_generations() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.set_reasoning_index_retention(fluree_db_api::reasoning_index::GenerationRetention {
+        min_age_ms: 40,
+        max_generations_in_guard: 8,
+    });
+    let id = "reasoning-indexes/idle-retention:main";
+    let ledger = school(&fluree, id).await;
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    let _ledger = student_commit(&fluree, ledger, "carol").await;
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    assert_eq!(chain_len(&fluree, id, &index).await, 2, "inside the guard");
+
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(matches!(
+        fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+        RefreshOutcome::Current { .. }
+    ));
+    assert_eq!(chain_len(&fluree, id, &index).await, 1);
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some());
+    assert_eq!(people.len(), 3);
+}
+
+/// A streamed dataset query honors reasoning freshness: `strict` with no
+/// index at the snapshot fails at planning, and one published answers.
+#[tokio::test]
+async fn a_streamed_dataset_honors_strict_freshness() {
+    use fluree_db_api::{DataSetDb, OwnedStreamQuery};
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.set_reasoning_index_strict_wait(std::time::Duration::ZERO);
+    let id = "reasoning-indexes/stream-strict:main";
+    school(&fluree, id).await;
+    let strict =
+        OwnedStreamQuery::JsonLd(with(people_query(), "reasoningFreshness", json!("strict")));
+    let dataset = DataSetDb::new().with_default(fluree.db(id).await.unwrap());
+    let err = fluree
+        .plan_stream_query_dataset(&dataset, &strict)
+        .await
+        .err()
+        .expect("strict, with no index, never reasons at query time");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::ReasoningIndexNotReady { .. }),
+        "{err:?}"
+    );
+
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    let dataset = DataSetDb::new().with_default(fluree.db(id).await.unwrap());
+    let plan = fluree
+        .plan_stream_query_dataset(&dataset, &strict)
+        .await
+        .expect("an index answers");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+    fluree
+        .run_stream_query_dataset(
+            dataset,
+            plan,
+            fluree_db_api::Tracker::disabled(),
+            fluree_db_api::QueryExecutionOptions::default(),
+            tx,
+        )
+        .await;
+    let mut text = String::new();
+    while let Some(chunk) = rx.recv().await {
+        text.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    for person in ["alice", "bob"] {
+        assert!(text.contains(person), "{text}");
+    }
+    assert!(!text.contains("\"error\""), "{text}");
+}
+
+/// A sweep reclaims what no retained generation references in an index's
+/// namespace — manifests and derived-only sets of a lost publication, and
+/// the files of a build that never published — and keeps what one does.
+#[tokio::test]
+async fn a_sweep_reclaims_unpublished_index_files() {
+    use fluree_db_core::{ContentKind, ContentStore};
+    let (fluree, _reader) = crate::support::instances_sharing_storage();
+    let id = "reasoning-indexes/sweep-orphans:main";
+    let ledger = school(&fluree, id).await;
+    let published_index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(
+        fluree
+            .refresh_reasoning_index(id, &published_index)
+            .await
+            .unwrap(),
+    );
+    let _ledger = student_commit(&fluree, ledger, "carol").await;
+    published(
+        fluree
+            .refresh_reasoning_index(id, &published_index)
+            .await
+            .unwrap(),
+    );
+    let never_published = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "rules": []}))
+        .await
+        .unwrap();
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store_of = |index: &fluree_db_core::reasoning_index::ReasoningIndexId| {
+        fluree
+            .backend()
+            .content_store(&record.storage_namespace().reasoning_index(index.as_str()))
+    };
+    let store = store_of(&published_index);
+    let manifest = store
+        .put(ContentKind::ReasoningManifest, b"unpublished manifest")
+        .await
+        .unwrap();
+    let derived = store
+        .put(ContentKind::DerivedFacts, b"unpublished derived set")
+        .await
+        .unwrap();
+    let unborn = store_of(&never_published);
+    let root = unborn
+        .put(ContentKind::IndexRoot, b"unpublished root")
+        .await
+        .unwrap();
+
+    fluree
+        .sweep_index_storage("reasoning-indexes/sweep-orphans")
+        .await
+        .unwrap();
+    assert!(!store.has(&manifest).await.unwrap());
+    assert!(!store.has(&derived).await.unwrap());
+    assert!(!unborn.has(&root).await.unwrap());
+    assert_eq!(chain_len(&fluree, id, &published_index).await, 2);
+    let (people, served) = rows(&fluree, id, &people_query()).await;
+    assert!(served.is_some());
+    assert_eq!(people.len(), 3);
+}

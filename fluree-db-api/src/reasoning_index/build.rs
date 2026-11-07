@@ -398,6 +398,9 @@ impl Fluree {
                 && published.basis == basis
                 && published.settled == settled
             {
+                // Retention runs whether or not anything is published: an
+                // idle branch's superseded generations still expire.
+                self.collect_quietly(ledger_id, &record, index_id).await;
                 return Ok(RefreshOutcome::Current {
                     generation: published.generation,
                 });
@@ -426,6 +429,7 @@ impl Fluree {
             );
             let in_guard = fluree_db_indexer::gc::reasoning_indexes::generations_in_guard(&plan);
             if in_guard >= retention.max_generations_in_guard {
+                self.collect_quietly(ledger_id, &record, index_id).await;
                 return Ok(RefreshOutcome::Throttled { in_guard });
             }
         }
@@ -542,13 +546,44 @@ impl Fluree {
         };
         // From here until publication, files are written that no published
         // generation references yet.
+        // Sweeps and collector passes hold these off, or wait for them, so
+        // nothing those files reference is reclaimed before they are
+        // published.
         let Some(_write) = self
             .reasoning_index_state
             .begin_write(record.ledger_id.name())
         else {
             return Ok(RefreshOutcome::Deferred {
-                reason: "a storage sweep of the ledger is running".into(),
+                reason: "a sweep or collector pass of the ledger is running".into(),
             });
+        };
+        let _build = match &self.indexing_mode {
+            crate::IndexingMode::Background(handle) => {
+                match handle.begin_build(&record.ledger_id) {
+                    Some(ticket) => Some(ticket),
+                    None => {
+                        return Ok(RefreshOutcome::Deferred {
+                            reason: "a collector pass of the ledger is releasing files".into(),
+                        })
+                    }
+                }
+            }
+            crate::IndexingMode::Disabled => None,
+        };
+        // A rebuild copies the branch's index. The one read with the basis
+        // may have been superseded, and released, before the hold above was
+        // taken; the current one serves if it does not go past the basis.
+        let base_index = {
+            let current = self.branch_record(ledger_id).await?;
+            if current.index_head_id == record.index_head_id {
+                (record.index_head_id.clone(), record.index_t)
+            } else if current.index_t <= basis.t {
+                (current.index_head_id, current.index_t)
+            } else {
+                return Ok(RefreshOutcome::Deferred {
+                    reason: "the branch's index moved past the commit computed".into(),
+                });
+            }
         };
         // A logical fold the indexer cannot apply is redone as a rebuild.
         let no_retractions = HashSet::new();
@@ -596,7 +631,9 @@ impl Fluree {
             let mut index_record = record.clone();
             match &previous {
                 None => {
-                    if let Some(base_root) = &record.index_head_id {
+                    index_record.index_head_id = base_index.0.clone();
+                    index_record.index_t = base_index.1;
+                    if let Some(base_root) = &base_index.0 {
                         self.copy_index_to_branch(ledger_id, &index_ns, base_root)
                             .await?;
                     }
@@ -699,12 +736,7 @@ impl Fluree {
         {
             Ok(generation) => {
                 self.reasoning_index_state.forget_index(ledger_id, index_id);
-                if let Err(e) = self
-                    .collect_generations(ledger_id, index_id, index_cs.as_ref())
-                    .await
-                {
-                    tracing::warn!(index = %index_id, error = %e, "reasoning-index collection failed");
-                }
+                self.collect_quietly(ledger_id, &record, index_id).await;
                 Ok(RefreshOutcome::Published {
                     generation,
                     kind,
@@ -728,6 +760,27 @@ impl Fluree {
     /// may hold inside that window before publication waits.
     pub fn set_reasoning_index_retention(&self, retention: super::GenerationRetention) {
         self.reasoning_index_state.set_retention(retention);
+    }
+
+    /// [`Self::collect_generations`], logging rather than failing: a refresh
+    /// stands whether or not retention could run.
+    async fn collect_quietly(
+        &self,
+        ledger_id: &str,
+        record: &NsRecord,
+        index_id: &ReasoningIndexId,
+    ) {
+        let index_cs = self.backend().content_store(
+            &record
+                .storage_namespace()
+                .reasoning_index(index_id.as_str()),
+        );
+        if let Err(e) = self
+            .collect_generations(ledger_id, index_id, index_cs.as_ref())
+            .await
+        {
+            tracing::warn!(index = %index_id, error = %e, "reasoning-index collection failed");
+        }
     }
 
     /// Release an index's superseded generations once the retention window has
@@ -1274,6 +1327,130 @@ mod tests {
             .into_iter()
             .map(|(g_id, f)| (graph_sids.get(&g_id).cloned().flatten(), f))
             .collect()
+    }
+
+    /// A collector pass that releases while an index build has written files
+    /// and not yet published them waits for the build: the dictionary blobs
+    /// the generation shares with a superseded base root stay.
+    #[tokio::test]
+    async fn a_collector_pass_waits_for_an_index_build_to_publish() {
+        use fluree_db_core::ContentKind;
+        use fluree_db_indexer::gc::{plan_garbage, release_garbage_plan, CleanGarbageConfig};
+        let mut fluree = crate::FlureeBuilder::memory().build_memory();
+        let (worker, handle) = crate::BackgroundIndexerWorker::new(
+            fluree.backend().clone(),
+            fluree.nameservice_mode().publisher_arc().unwrap(),
+            fluree_db_indexer::IndexerConfig::small(),
+        );
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(worker.run());
+        fluree.set_indexing_mode(crate::tx::IndexingMode::Background(handle.clone()));
+        local
+            .run_until(async move {
+                let id = "reasoning-indexes/collector-race:main";
+                let ledger_id = fluree_db_core::LedgerId::parse(id).unwrap();
+                let ctx = json!({
+                    "ex": "http://example.org/",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                });
+                let ledger = fluree.create_ledger(id).await.unwrap();
+                let ledger = fluree
+                    .insert(
+                        ledger,
+                        &json!({"@context": ctx, "@graph": [
+                            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                            {"@id": "ex:alice", "@type": "ex:Student"}
+                        ]}),
+                    )
+                    .await
+                    .unwrap()
+                    .ledger;
+                fluree
+                    .reindex(id, crate::ReindexOptions::default())
+                    .await
+                    .unwrap();
+                let index = fluree
+                    .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+                    .await
+                    .unwrap();
+
+                let seam = Arc::new(PauseSeam::default());
+                *fluree.reasoning_index_state.before_publish.lock() = Some(Arc::clone(&seam));
+                let refresh = fluree.refresh_reasoning_index(id, &index);
+                let collect = async {
+                    seam.reached.notified().await;
+                    // The base moves on and is rebuilt; its collector retires the
+                    // root the generation was copied from.
+                    fluree
+                        .insert(
+                            ledger,
+                            &json!({"@context": ctx, "@id": "ex:carol", "@type": "ex:Student"}),
+                        )
+                        .await
+                        .unwrap();
+                    let rebuilt = fluree
+                        .reindex(id, crate::ReindexOptions::default())
+                        .await
+                        .unwrap();
+                    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+                    let store = fluree.backend().content_store(&record.storage_namespace());
+                    let config = CleanGarbageConfig {
+                        max_old_indexes: Some(0),
+                        min_time_garbage_mins: Some(0),
+                        ..Default::default()
+                    };
+                    let plan = plan_garbage(store.as_ref(), &rebuilt.root_id, &config)
+                        .await
+                        .unwrap();
+                    // A collector pass as the indexer runs one.
+                    let gc = handle.hold_gc(&ledger_id.ledger_name()).await;
+                    let pass = async {
+                        let _window = handle.open_release_window(&gc).await.expect("not held");
+                        release_garbage_plan(
+                            plan,
+                            fluree.backend(),
+                            fluree.nameservice(),
+                            &ledger_id,
+                            Some(&[]),
+                        )
+                        .await
+                    };
+                    tokio::pin!(pass);
+                    let early = tokio::time::timeout(Duration::from_millis(300), &mut pass).await;
+                    seam.resume.notify_one();
+                    match early {
+                        Ok(done) => done,
+                        Err(_) => pass.await,
+                    }
+                };
+                let (outcome, released) = tokio::join!(refresh, collect);
+                assert!(matches!(outcome.unwrap(), RefreshOutcome::Published { .. }));
+                released.unwrap();
+
+                let doc = fluree.reasoning_indexes(id).await.unwrap();
+                let head = doc.indexes[&index].head.clone().unwrap();
+                let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+                let store = fluree.index_store(&record, &index).await.unwrap();
+                let manifest =
+                    ReasoningManifest::decode(&store.get(&head.manifest).await.unwrap()).unwrap();
+                let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(
+                    &store.get(&manifest.root).await.unwrap(),
+                )
+                .unwrap();
+                let mut missing = Vec::new();
+                for cid in root.all_cas_ids() {
+                    if matches!(cid.content_kind(), Some(ContentKind::DictBlob { .. }))
+                        && !store.has(&cid).await.unwrap()
+                    {
+                        missing.push(cid);
+                    }
+                }
+                assert!(
+                    missing.is_empty(),
+                    "released while the build ran: {missing:?}"
+                );
+            })
+            .await;
     }
 
     /// A small deterministic generator, so a failing sequence replays.

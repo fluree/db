@@ -241,9 +241,9 @@ impl ReasoningIndexState {
         })
     }
 
-    /// Hold index builds of `ledger_name` off for a sweep, once those already
-    /// writing have published or given up.
-    pub(crate) async fn hold_for_sweep(&self, ledger_name: &str) -> SweepHold<'_> {
+    /// Hold index builds of `ledger_name` off for a sweep or a collector
+    /// pass, once those already writing have published or given up.
+    pub(crate) async fn hold_for_reclaim(&self, ledger_name: &str) -> SweepHold<'_> {
         *self
             .writes
             .lock()

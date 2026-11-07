@@ -136,6 +136,9 @@ impl Fluree {
             return Ok(None);
         }
         let settled = program::settled_key(reasoning, db.graph_id);
+        // Every index's eligible generation, newest basis first: two programs
+        // can settle to the same reasoning, and `asOf` takes the newest.
+        let mut candidates = Vec::new();
         for (index_id, entry) in &doc.indexes {
             let Some(published) = &entry.head else {
                 continue;
@@ -145,30 +148,36 @@ impl Fluree {
             {
                 continue;
             }
-            let manifest_id = if !as_of {
-                if published.basis.commit != view_commit
-                    || published.basis.t != db.t
-                    || published.settled != settled
+            if !as_of {
+                if published.basis.commit == view_commit
+                    && published.basis.t == db.t
+                    && published.settled == settled
                 {
-                    continue;
-                }
-                published.manifest.clone()
-            } else {
-                match self
-                    .as_of_generation(
-                        &record,
-                        &view_commit,
+                    candidates.push((
+                        published.basis.t,
                         index_id,
-                        &published.manifest,
-                        db.t,
-                        &settled,
-                    )
-                    .await?
-                {
-                    Some(id) => id,
-                    None => continue,
+                        entry,
+                        published.manifest.clone(),
+                    ));
                 }
-            };
+                continue;
+            }
+            if let Some((manifest_id, basis_t)) = self
+                .as_of_generation(
+                    &record,
+                    &view_commit,
+                    index_id,
+                    &published.manifest,
+                    db.t,
+                    &settled,
+                )
+                .await?
+            {
+                candidates.push((basis_t, index_id, entry, manifest_id));
+            }
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+        for (_, index_id, entry, manifest_id) in candidates {
             let generation = self
                 .loaded_generation(&record, index_id, &manifest_id)
                 .await?;
@@ -201,7 +210,7 @@ impl Fluree {
         newest: &ContentId,
         t: i64,
         settled: &ContentId,
-    ) -> Result<Option<ContentId>> {
+    ) -> Result<Option<(ContentId, i64)>> {
         let store = self.index_store(record, index_id).await?;
         let generations =
             fluree_db_indexer::gc::reasoning_indexes::index_generations(store.as_ref(), newest)
@@ -224,7 +233,7 @@ impl Fluree {
                     && &g.manifest.settled == settled
                     && line.on_line(&g.manifest.basis)
             })
-            .map(|g| g.manifest_id))
+            .map(|g| (g.manifest_id, g.manifest.basis.t)))
     }
 
     async fn loaded_generation(

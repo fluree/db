@@ -10,6 +10,7 @@
 //! - its derived-only set.
 //!
 //! Two uses:
+//! - [`index_sweep_files`]: what a sweep keeps and lists for them.
 //! - [`shared_refs_of_indexes`]: the dictionary blobs a branch's indexes reach,
 //!   which every pass that releases a shared blob must treat as live.
 //! - [`plan_generation_release`] / [`release_generations`]: the index's own
@@ -171,15 +172,28 @@ pub async fn shared_refs_of_branch_indexes(
     Ok(refs)
 }
 
-/// The reasoning indexes of `branches` as sweep participants: one per
-/// generation still in storage, rooted in its index's namespace, so the sweep
-/// counts every file a retained generation reaches as live.
-pub async fn index_sweep_participants(
+/// What a sweep keeps and lists for the reasoning indexes of `branches`.
+#[derive(Debug, Default)]
+pub struct IndexSweepFiles {
+    /// One participant per generation still in storage, rooted in its
+    /// index's namespace, so every file a retained generation reaches is
+    /// live; and one with no root for an index that has published nothing,
+    /// so the files of a build that never published are listed too.
+    pub participants: Vec<crate::gc::BranchIndexHead>,
+    /// Each index's manifests and derived-only sets, which no root reaches:
+    /// those of retained generations are live, the rest (a lost publication,
+    /// a crash) are reclaimed.
+    pub extra: Vec<crate::gc::ExtraSweepFiles>,
+}
+
+/// The files of every registered reasoning index of `branches`, retired ones
+/// included, for a sweep.
+pub async fn index_sweep_files(
     backend: &StorageBackend,
     nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
     branches: &[crate::gc::BranchIndexHead],
-) -> Result<Vec<crate::gc::BranchIndexHead>> {
-    let mut out = Vec::new();
+) -> Result<IndexSweepFiles> {
+    let mut out = IndexSweepFiles::default();
     for branch in branches {
         let doc = nameservice
             .get_reasoning_indexes(branch.ledger_id.as_str())
@@ -189,18 +203,43 @@ pub async fn index_sweep_participants(
             continue;
         };
         for (index_id, entry) in &doc.indexes {
-            let Some(pointer) = &entry.head else {
-                continue;
-            };
             let namespace = branch.namespace.reasoning_index(index_id.as_str());
             let store = backend.content_store(&namespace);
-            for generation in index_generations(store.as_ref(), &pointer.manifest).await? {
-                out.push(crate::gc::BranchIndexHead {
+            let generations = match &entry.head {
+                Some(pointer) => index_generations(store.as_ref(), &pointer.manifest).await?,
+                None => Vec::new(),
+            };
+            let mut live = Vec::new();
+            for generation in &generations {
+                live.push(generation.manifest_id.clone());
+                live.push(generation.manifest.derived.clone());
+                let bytes = store.get(&generation.manifest.derived).await.map_err(|e| {
+                    IndexerError::StorageRead(format!(
+                        "derived-only set {} of a retained generation: {e}; refusing to sweep",
+                        generation.manifest.derived
+                    ))
+                })?;
+                let derived = fluree_db_core::reasoning_index::DerivedIndex::decode(&bytes)
+                    .map_err(|e| IndexerError::StorageRead(format!("derived-only set: {e}")))?;
+                live.extend(derived.buckets);
+                out.participants.push(crate::gc::BranchIndexHead {
                     ledger_id: branch.ledger_id.clone(),
                     namespace: namespace.clone(),
-                    index_head_id: Some(generation.manifest.root),
+                    index_head_id: Some(generation.manifest.root.clone()),
                 });
             }
+            if generations.is_empty() {
+                out.participants.push(crate::gc::BranchIndexHead {
+                    ledger_id: branch.ledger_id.clone(),
+                    namespace: namespace.clone(),
+                    index_head_id: None,
+                });
+            }
+            out.extra.push(crate::gc::ExtraSweepFiles {
+                namespace,
+                folders: vec!["manifests", "derived"],
+                live,
+            });
         }
     }
     Ok(out)
