@@ -1016,3 +1016,62 @@ async fn an_erased_set_keeps_only_its_branches_current_heads() {
         .collect();
     assert_eq!(kept, vec![1]);
 }
+
+/// A step whose proof exposed the original's signatures, under an
+/// authorization asking it to verify them, is not read in place of the
+/// original: the replacement does not verify.
+#[tokio::test]
+async fn an_exposed_step_authorized_to_verify_does_not_read() {
+    use crate::retention::erasure::SignatureMode;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/exposed").await.unwrap();
+    let id = "t/exposed:main";
+    let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+    let t1 = fluree
+        .graph(id)
+        .transact()
+        .insert(&json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}))
+        .commit_opts(crate::CommitOpts::default().with_signing_key(key))
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    let original = commit_at(&fluree, id, t1).await;
+    let receipt = fluree
+        .erase_occurrences(
+            id,
+            ErasureRequest {
+                signatures: SignatureMode::Expose,
+                ..email("alice", "a@secret")
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    reindex(&fluree, id).await;
+    let report = fluree.run_erasure_pass(id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let runtime = fluree.erasure_runtime().unwrap();
+    let mut authorization = runtime
+        .index
+        .authorization(&receipt.request_id)
+        .await
+        .unwrap()
+        .expect("stored at publication");
+    assert_eq!(authorization.signatures, SignatureMode::Expose);
+    assert!(reads_replacement(&fluree, id, &original).await);
+
+    authorization.signatures = SignatureMode::Verify;
+    runtime
+        .index
+        .overwrite_authorization(&authorization)
+        .await
+        .unwrap();
+    drop(fluree);
+    let restarted = erasing(&dir);
+    let record = restarted.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = restarted.content_store(&record.storage_namespace());
+    assert!(store.get(&original).await.is_err());
+}

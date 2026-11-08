@@ -727,7 +727,14 @@ impl Fluree {
             .ok_or_else(|| StepError::Retry(ApiError::internal("no prover")))?;
         let mut receipts = Vec::new();
         let mut authorized = Vec::new();
-        for earlier in step.prior.iter().flat_map(|p| &p.steps) {
+        let earlier: Vec<_> = step.prior.iter().flat_map(|p| &p.steps).cloned().collect();
+        let mut signatures = runtime
+            .index
+            .step_signatures(&earlier)
+            .await
+            .map_err(StepError::Retry)?;
+        signatures.push(step.signatures.into());
+        for earlier in &earlier {
             receipts.push(
                 runtime
                     .index
@@ -741,15 +748,14 @@ impl Fluree {
         authorized.push(step.slots.clone());
         let verifier = config.verifier.clone();
         let (original, ledger_id) = (step.cid.to_bytes(), step.ledger_id.clone());
-        let signatures = step.signatures.into();
         tokio::task::spawn_blocking(move || {
-            verifier.verify_chain_as(
+            verifier.verify_chain(
                 &receipts,
                 &replacement,
                 &original,
                 &ledger_id,
                 &authorized,
-                signatures,
+                &signatures,
             )
         })
         .await
@@ -1136,6 +1142,7 @@ impl Fluree {
                 control_bytes,
                 manifest,
                 added: job.added.clone(),
+                signatures: job.signatures,
             })
             .await
     }

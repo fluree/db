@@ -82,6 +82,11 @@ pub(crate) struct Authorization {
     /// `manifest`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) added: Vec<OccurrenceRef>,
+    /// How the request's proofs handle the original's signatures, as its
+    /// control commit records it; absent, from an earlier release, is
+    /// `verify`.
+    #[serde(default)]
+    pub(crate) signatures: super::SignatureMode,
 }
 
 impl Authorization {
@@ -113,6 +118,11 @@ impl Authorization {
         }
         if recorded(db::ERASURE_MANIFEST) != Some(manifest_hash(&self.manifest).as_str()) {
             return Err(format!("{control} records another manifest"));
+        }
+        let signatures =
+            recorded(db::ERASURE_SIGNATURES).unwrap_or(super::SignatureMode::Verify.as_str());
+        if signatures != self.signatures.as_str() {
+            return Err(format!("{control} records another signature mode"));
         }
         Ok((control, envelope.t))
     }
@@ -2393,6 +2403,65 @@ mod reach_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An authorization's signature mode is the one its control commit
+    /// records, and one from before the mode was recorded is `verify`.
+    #[test]
+    fn an_authorization_takes_its_signature_mode_from_its_control_commit() {
+        use super::super::SignatureMode::{Expose, Verify};
+        let manifest = vec![OccurrenceRef {
+            commit: "c".into(),
+            slot: 1,
+        }];
+        let control = |mode: Option<&str>| {
+            let mut entries = vec![
+                fluree_db_core::TxnMetaEntry::new(
+                    FLUREE_DB,
+                    db::ERASURE_REQUEST,
+                    TxnMetaValue::String("erasure-1".into()),
+                ),
+                fluree_db_core::TxnMetaEntry::new(
+                    FLUREE_DB,
+                    db::ERASURE_MANIFEST,
+                    TxnMetaValue::String(manifest_hash(&manifest)),
+                ),
+            ];
+            entries.extend(mode.map(|mode| {
+                fluree_db_core::TxnMetaEntry::new(
+                    FLUREE_DB,
+                    db::ERASURE_SIGNATURES,
+                    TxnMetaValue::String(mode.into()),
+                )
+            }));
+            let mut commit = fluree_db_core::Commit::new(2, Vec::new());
+            commit.txn_meta = entries;
+            fluree_db_core::commit::codec::write_commit(&commit, false, None)
+                .unwrap()
+                .bytes
+        };
+        let checked = |bytes: &[u8], signatures| {
+            Authorization {
+                request_id: "erasure-1".into(),
+                ledger_id: "l:main".into(),
+                control: ContentId::new(fluree_db_core::ContentKind::Commit, bytes).to_string(),
+                control_bytes: String::new(),
+                manifest: manifest.clone(),
+                added: Vec::new(),
+                signatures,
+            }
+            .check_control(bytes)
+            .is_ok()
+        };
+        let exposed = control(Some("expose"));
+        assert!(checked(&exposed, Expose));
+        assert!(!checked(&exposed, Verify));
+        let verified = control(Some("verify"));
+        assert!(checked(&verified, Verify));
+        assert!(!checked(&verified, Expose));
+        let earlier = control(None);
+        assert!(checked(&earlier, Verify));
+        assert!(!checked(&earlier, Expose));
+    }
 
     /// A received erasure grows only a job published here: one in a later
     /// release's stage is left as it is.

@@ -201,6 +201,16 @@ pub enum SignatureMode {
     Expose,
 }
 
+impl SignatureMode {
+    /// As the control commit records it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SignatureMode::Verify => "verify",
+            SignatureMode::Expose => "expose",
+        }
+    }
+}
+
 impl From<SignatureMode> for fluree_db_erasure::Signatures {
     fn from(mode: SignatureMode) -> Self {
         match mode {

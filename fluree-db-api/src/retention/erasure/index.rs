@@ -609,6 +609,7 @@ impl ErasureIndex {
             .parse()
             .map_err(|_| ApiError::internal("erasure of an unparsable commit id"))?;
         let authorized: Vec<Vec<u32>> = erased.steps.iter().map(|s| s.slots.clone()).collect();
+        let signatures = self.step_signatures(&erased.steps).await?;
         let verifier = self.verifier.clone();
         let ledger_id = erased.ledger_id.clone();
         let checked = replacement.clone();
@@ -619,6 +620,7 @@ impl ErasureIndex {
                 &original.to_bytes(),
                 &ledger_id,
                 &authorized,
+                &signatures,
             )
         })
         .await
@@ -630,6 +632,25 @@ impl ErasureIndex {
             ))
         })?;
         Ok(replacement.into())
+    }
+
+    /// How each of `steps` was authorized to handle the original's
+    /// signatures, as the request's control commit records it: `verify`
+    /// unless its stored authorization says otherwise.
+    pub(crate) async fn step_signatures(
+        &self,
+        steps: &[ErasureStep],
+    ) -> Result<Vec<fluree_db_erasure::Signatures>> {
+        let mut signatures = Vec::with_capacity(steps.len());
+        for step in steps {
+            let mode = self
+                .authorization(&step.request_id)
+                .await?
+                .map(|a| a.signatures)
+                .unwrap_or_default();
+            signatures.push(mode.into());
+        }
+        Ok(signatures)
     }
 
     /// A replacement's bytes, checked against its CID.
@@ -749,6 +770,20 @@ impl ErasureIndex {
                 ),
             ));
         }
+        let bytes =
+            serde_json::to_vec(authorization).map_err(|e| ApiError::internal(e.to_string()))?;
+        let address = self.authorization_address(&authorization.request_id);
+        self.storage.write_bytes(&address, &bytes).await?;
+        Ok(())
+    }
+
+    /// Store `authorization` over whatever is stored, as a sender that lied
+    /// about it would have.
+    #[cfg(test)]
+    pub(crate) async fn overwrite_authorization(
+        &self,
+        authorization: &super::transfer::Authorization,
+    ) -> Result<()> {
         let bytes =
             serde_json::to_vec(authorization).map_err(|e| ApiError::internal(e.to_string()))?;
         let address = self.authorization_address(&authorization.request_id);

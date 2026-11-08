@@ -1872,6 +1872,12 @@ pub mod db {
     /// occurrences it removes, by commit and slot. It names no value.
     pub const ERASURE_MANIFEST: &str = "erasureManifest";
 
+    /// db:erasureSignatures - how the erasure's proofs handle the original
+    /// commits' signatures: `verify` them inside the proof, or `expose` them
+    /// for the verifier, which reveals a signed body's hash. Absent, from an
+    /// earlier release, is `verify`.
+    pub const ERASURE_SIGNATURES: &str = "erasureSignatures";
+
     /// The local names in this namespace that a user may set in a commit's
     /// txn-meta: `f:message`, `f:author`, and the transaction TTL default
     /// (`f:ttl` or `f:expiresAt`).
@@ -1893,6 +1899,7 @@ pub mod db {
         ERASURE_REQUEST,
         ERASURE_REQUESTER,
         ERASURE_MANIFEST,
+        ERASURE_SIGNATURES,
     ];
 
     /// db:txn - transaction address (optional)

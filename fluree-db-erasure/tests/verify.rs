@@ -11,6 +11,9 @@ use fluree_db_redaction::{commit_cid, redact, redact_with, HostSha, Sha256, Sign
 
 const LEDGER: &str = "acme/people:main";
 
+/// Two steps, each asked to verify the original's signatures.
+const VERIFY: &[Signatures] = &[Signatures::Verify, Signatures::Verify];
+
 fn original() -> Vec<u8> {
     let flakes = (0..12)
         .map(|i| {
@@ -44,13 +47,20 @@ fn a_chain_verifies_back_to_its_original_and_nothing_else() {
     let authorized = vec![vec![2], vec![5, 9]];
     let v = Verifier::accepting_dev_receipts();
     let statements = v
-        .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized)
+        .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized, VERIFY)
         .unwrap();
     assert_eq!(statements[1].redacted_slots, vec![2, 5, 9]);
 
     let check =
         |receipts: &[Vec<u8>], replacement: &[u8], cid: &[u8], ledger, slots: &[Vec<u32>]| {
-            v.verify_chain(receipts, replacement, cid, ledger, slots)
+            v.verify_chain(
+                receipts,
+                replacement,
+                cid,
+                ledger,
+                slots,
+                &VERIFY[..receipts.len()],
+            )
         };
     // Another original, ledger, slots, order, a step missing, another
     // replacement.
@@ -74,11 +84,12 @@ fn a_fake_receipt_never_passes_a_production_verifier() {
     // environment.
     std::env::set_var("RISC0_DEV_MODE", "1");
     let production = Verifier::with_image_ids(vec![TEST_IMAGE_ID]);
-    let outcome = production.verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized);
+    let outcome =
+        production.verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized, VERIFY);
     std::env::remove_var("RISC0_DEV_MODE");
     assert!(outcome.is_err());
     assert!(Verifier::default()
-        .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized)
+        .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized, VERIFY)
         .is_err());
 }
 
@@ -88,26 +99,31 @@ fn a_receipt_of_another_program_is_refused() {
     let authorized = vec![vec![2], vec![5, 9]];
     let elsewhere = Verifier::accepting_dev_receipts_for(vec![[1; 8]]);
     assert!(elsewhere
-        .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized)
+        .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized, VERIFY)
         .is_err());
 }
 
 /// A step asked to verify the original's signatures inside the proof does
-/// not take a proof that exposed them instead.
+/// not take a proof that exposed them instead, wherever it is in the chain.
 #[test]
 fn a_verify_step_refuses_a_proof_that_exposed_the_signatures() {
+    use Signatures::{Expose, Verify};
     let key = fluree_db_credential::SigningKey::from_bytes(&[7u8; 32]);
     let commit = fluree_db_core::commit::codec::read_commit(&original()).unwrap();
     let bytes = write_commit(&commit, true, Some((&key, LEDGER)))
         .unwrap()
         .bytes;
     let cid = commit_cid(&HostSha::sha256(&bytes));
-    let (replacement, exposed) =
-        redact_with::<HostSha, _>(&bytes, &[2], LEDGER, Signatures::Expose, &mut ()).unwrap();
+    let (first, exposed) =
+        redact_with::<HostSha, _>(&bytes, &[2], LEDGER, Expose, &mut ()).unwrap();
     assert!(!exposed.signatures.is_empty());
-    let receipts = vec![fake_receipt(&exposed)];
+    let (second, verified) = redact::<HostSha, _>(&first, &[5], LEDGER, &mut ()).unwrap();
+    let receipts = vec![fake_receipt(&exposed), fake_receipt(&verified)];
     let v = Verifier::accepting_dev_receipts();
-    let chain = |mode| v.verify_chain_as(&receipts, &replacement, &cid, LEDGER, &[vec![2]], mode);
-    assert!(chain(Signatures::Expose).is_ok());
-    assert!(chain(Signatures::Verify).is_err());
+    let chain = |modes: &[Signatures]| {
+        v.verify_chain(&receipts, &second, &cid, LEDGER, &[vec![2], vec![5]], modes)
+    };
+    assert!(chain(&[Expose, Verify]).is_ok());
+    assert!(chain(&[Verify, Verify]).is_err());
+    assert!(chain(&[Expose]).is_err(), "a mode for each step");
 }

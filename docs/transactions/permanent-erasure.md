@@ -52,9 +52,10 @@ Accepting a request does the following, in order:
    assertion takes the retraction that ended it, and a retraction takes the assertion it ended. Both
    carry the value. The removal's own retraction commits contain the value too, so they are erased as
    well.
-2. **An authorization commit.** A control commit records the request ID, the requester and a SHA-256 of
-   the manifest in its txn-meta (`f:erasureRequest`, `f:erasureRequester`, `f:erasureManifest`). It
-   records no value, and anchors the authorization in the ledger's history.
+2. **An authorization commit.** A control commit records the request ID, the requester, a SHA-256 of
+   the manifest and the [signature mode](#signatures) in its txn-meta (`f:erasureRequest`,
+   `f:erasureRequester`, `f:erasureManifest`, `f:erasureSignatures`). It records no value, and anchors
+   the authorization in the ledger's history.
 3. **A job.** It is kept in the branch's retention registration and returned as a receipt:
 
 ```json
@@ -220,9 +221,10 @@ may still hold an erased value. The restored ledger builds its own from the repl
 
 A restore (`fluree create --from`, `POST /import`, `Fluree::restore_ledger`) checks every erasure
 before anything reads the restored history. Each chain's receipts must verify against the pinned guest
-images, bound to the original commit and its slots, and the control commit must record the request and
-the hash of its manifest. Each step's slots must be among the occurrences that manifest names, or the
-retractions joined to it. The commit must be in the archive's history. The restored ledger then reads
+images, bound to the original commit and its slots, and the control commit must record the request,
+the hash of its manifest and its signature mode. Each step's slots must be among the occurrences that
+manifest names, or the retractions joined to it, and a step whose request asked to verify the
+signatures must not have exposed them. The commit must be in the archive's history. The restored ledger then reads
 each erased commit as its replacement and refuses the history the archive's removal journal refuses. No
 prover is needed to restore.
 
@@ -402,6 +404,11 @@ verifies them itself. That makes a signed commit as fast to prove as an unsigned
 privacy. With the body hash, anyone who can rebuild every other byte of the body can test guesses at
 an erased value, which matters when the value has few possible values. The original CID allows the
 same test on an unsigned commit, whichever mode is used.
+
+The mode is recorded on the request's control commit (`f:erasureSignatures`), and every server that
+reads, receives or restores the erasure checks each step against it: a step proved with the
+signatures exposed is refused when its request asked to verify them. A control commit from before the
+mode was recorded asks to verify them.
 
 ## Cost
 

@@ -76,7 +76,10 @@ impl Verifier {
     /// Verify the redactions of one commit, in order, from the original
     /// the ledger's history anchors to the stored `replacement`: each step
     /// reads the previous step's output, removes the slots its authorization
-    /// names, and the last produced `replacement`.
+    /// names, handles the original's signatures as its authorization asked
+    /// (`signatures`, one per step: a step asked to verify them inside the
+    /// proof refuses a proof that exposed them instead), and the last
+    /// produced `replacement`.
     pub fn verify_chain(
         &self,
         receipts: &[Vec<u8>],
@@ -84,66 +87,29 @@ impl Verifier {
         original_cid: &[u8],
         ledger_id: &str,
         authorized: &[Vec<u32>],
+        signatures: &[Signatures],
     ) -> Result<Vec<Statement>, VerifyError> {
-        self.verify_chain_checking(
-            receipts,
-            replacement,
-            original_cid,
-            ledger_id,
-            authorized,
-            None,
-        )
-    }
-
-    /// [`Self::verify_chain`] for a chain whose last step was asked to
-    /// handle the original's signatures as `last` says: one asked to verify
-    /// them inside the proof refuses a proof that exposed them instead.
-    pub fn verify_chain_as(
-        &self,
-        receipts: &[Vec<u8>],
-        replacement: &[u8],
-        original_cid: &[u8],
-        ledger_id: &str,
-        authorized: &[Vec<u32>],
-        last: Signatures,
-    ) -> Result<Vec<Statement>, VerifyError> {
-        self.verify_chain_checking(
-            receipts,
-            replacement,
-            original_cid,
-            ledger_id,
-            authorized,
-            Some(last),
-        )
-    }
-
-    fn verify_chain_checking(
-        &self,
-        receipts: &[Vec<u8>],
-        replacement: &[u8],
-        original_cid: &[u8],
-        ledger_id: &str,
-        authorized: &[Vec<u32>],
-        last: Option<Signatures>,
-    ) -> Result<Vec<Statement>, VerifyError> {
-        if receipts.is_empty() || receipts.len() != authorized.len() {
+        if receipts.is_empty()
+            || receipts.len() != authorized.len()
+            || receipts.len() != signatures.len()
+        {
             return Err(reject(format!(
-                "{} proofs for {} authorized steps",
+                "{} proofs for {} authorized steps in {} signature modes",
                 receipts.len(),
-                authorized.len()
+                authorized.len(),
+                signatures.len()
             )));
         }
         let mut input = original_cid.to_vec();
         let mut redacted: Vec<u32> = Vec::new();
         let mut statements = Vec::with_capacity(receipts.len());
-        for (step, (receipt, slots)) in receipts.iter().zip(authorized).enumerate() {
+        for (step, ((receipt, slots), mode)) in
+            receipts.iter().zip(authorized).zip(signatures).enumerate()
+        {
             let statement = self
                 .step(receipt, &input, original_cid, ledger_id, slots)
                 .map_err(|e| VerifyError::at(step, e))?;
-            if step + 1 == receipts.len()
-                && last == Some(Signatures::Verify)
-                && !statement.signatures.is_empty()
-            {
+            if *mode == Signatures::Verify && !statement.signatures.is_empty() {
                 return Err(VerifyError::at(
                     step,
                     reject("the proof exposes the signatures it was to verify"),

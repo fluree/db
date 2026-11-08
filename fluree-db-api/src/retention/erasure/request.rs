@@ -258,6 +258,7 @@ impl Fluree {
                 &request_id,
                 requester.as_deref(),
                 &manifest,
+                request.signatures,
             )
             .await?;
         let job = ErasureJob {
@@ -556,6 +557,7 @@ impl Fluree {
         request_id: &str,
         requester: Option<&str>,
         manifest: &[OccurrenceRef],
+        signatures: super::SignatureMode,
     ) -> Result<(i64, ContentId)> {
         let mut control = vec![
             TxnMetaEntry::new(
@@ -567,6 +569,11 @@ impl Fluree {
                 FLUREE_DB,
                 db::ERASURE_MANIFEST,
                 TxnMetaValue::String(manifest_hash(manifest)),
+            ),
+            TxnMetaEntry::new(
+                FLUREE_DB,
+                db::ERASURE_SIGNATURES,
+                TxnMetaValue::String(signatures.as_str().to_string()),
             ),
         ];
         if let Some(requester) = requester {
