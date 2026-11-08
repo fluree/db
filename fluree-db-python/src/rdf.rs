@@ -17,6 +17,10 @@ use pyo3::types::{PyList, PyString, PyTuple};
 use crate::convert::{ir_term, is_node, is_triple};
 use crate::error::invalid_request;
 
+/// A parsed document as Python takes it: its quads, and its prefixes as
+/// `(prefix, iri)` pairs.
+type ParsedDocument<'py> = (Bound<'py, PyList>, Vec<(String, String)>);
+
 /// The quads of `text`, read as `format`: `"turtle"`, `"trig"`,
 /// `"ntriples"` or `"nquads"`, in the order the document writes them, and
 /// the prefixes it declares, as `(prefix, iri)` pairs in order. Turtle and
@@ -34,7 +38,7 @@ pub(crate) fn parse_rdf<'py>(
     text: &str,
     format: &str,
     base: Option<&str>,
-) -> PyResult<(Bound<'py, PyList>, Vec<(String, String)>)> {
+) -> PyResult<ParsedDocument<'py>> {
     let format: RdfFormat = format.parse().map_err(rdf_error)?;
     let document = py
         .detach(|| rdf::parse_document(text, format, base))
