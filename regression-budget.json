@@ -168,6 +168,9 @@
       "dataset_build": {
         "tiny": 10.0,
         "small": 5.0
+      },
+      "content_hash": {
+        "small": 5.0
       }
     },
     "fluree-db-server": {

@@ -46,7 +46,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
-            runner: macos-14
+            # The release CLI's runner (dist-workspace.toml): the default
+            # macOS runner is short of memory for an LTO link.
+            runner: macos-26-xlarge
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:

@@ -1,7 +1,11 @@
 [package]
 name = "fluree-db-redaction"
 description = "The v4 commit redaction transform, shared by the zkVM guest that proves it and the verifier"
-version.workspace = true
+# Not the workspace version: the version enters the guest's build, so a
+# workspace bump would change the image id every proof is checked against and
+# break the prover workspaces' `--locked` builds. Change it only with a new
+# image pin in fluree-db-erasure.
+version = "5.0.0-alpha.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

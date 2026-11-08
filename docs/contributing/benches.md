@@ -232,6 +232,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
 | `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
 | `policy` | verified-claim parsing and request authorization binding | `fluree-db-api/benches/policy_authorization.rs` |
+| `content_hash` | content-ID minting and verification, SHA2-256 and SHA2-512, over commit-sized inputs | `fluree-db-api/benches/content_hash.rs` |
 
 **Reserved categories** (not yet in use; add a row here when you ship
 the first bench under that prefix): `core` (foundational ops —
