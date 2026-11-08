@@ -7,7 +7,7 @@ use crate::error::Result;
 use fluree_db_core::{
     Flake, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker, TripleTermValue,
 };
-use fluree_db_policy::{is_schema_flake, PolicyContext};
+use fluree_db_policy::{is_schema_flake, ClassState, PolicyContext};
 use std::sync::Arc;
 
 /// Plan-time-style verdict for a single statically-known scanned predicate under
@@ -57,6 +57,15 @@ impl QueryPolicyEnforcer {
         &self.policy
     }
 
+    /// This enforcer, for a query that reads reasoned facts: class policies
+    /// are selected by the subject's reasoned classes on every property
+    /// ([`PolicyContext::for_reasoned_query`]).
+    pub fn for_reasoned_view(&self) -> Self {
+        Self {
+            policy: Arc::new(self.policy.for_reasoned_query()),
+        }
+    }
+
     /// Check if this is a root policy (bypasses all checks)
     pub fn is_root(&self) -> bool {
         self.policy.wrapper().is_root()
@@ -75,7 +84,7 @@ impl QueryPolicyEnforcer {
         if wrapper.is_root() {
             return PredicateCoverage::Covered;
         }
-        if wrapper.view().covers_predicate(predicate) {
+        if self.policy.view_set().covers_predicate(predicate) {
             PredicateCoverage::Covered
         } else if wrapper.default_allow() {
             PredicateCoverage::UncoveredAllow
@@ -88,7 +97,7 @@ impl QueryPolicyEnforcer {
     /// triple-term check: an uncovered predicate's term rows are hidden only
     /// through the restrictions on the triples they name.
     pub fn view_restricts_anything(&self) -> bool {
-        let view = self.policy.wrapper().view();
+        let view = self.policy.view_set();
         !(view.by_property.is_empty()
             && view.by_class.is_empty()
             && view.by_subject.is_empty()
@@ -133,13 +142,14 @@ impl QueryPolicyEnforcer {
         self.cache_term_subject_classes(snapshot, g_id, overlay, to_t, &flakes)
             .await?;
 
+        let state = ClassState::new(g_id, overlay, to_t);
         let mut result = Vec::with_capacity(flakes.len());
 
         for flake in flakes {
             // A term names its triple even under a schema predicate, so it is
             // checked before the schema exemption.
             if !self
-                .term_visible(g_id, to_t, &flake.o, &executor, tracker)
+                .term_visible(state, &flake.o, &executor, tracker)
                 .await?
             {
                 continue;
@@ -153,7 +163,7 @@ impl QueryPolicyEnforcer {
             // Get subject classes from cache
             let subject_classes = self
                 .policy
-                .get_cached_subject_classes(g_id, to_t, &flake.s)
+                .get_cached_subject_classes(state, &flake.s)
                 .unwrap_or_default();
 
             // Async policy check with f:query support
@@ -204,9 +214,10 @@ impl QueryPolicyEnforcer {
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
         self.cache_term_subject_classes(snapshot, g_id, overlay, to_t, std::slice::from_ref(flake))
             .await?;
+        let state = ClassState::new(g_id, overlay, to_t);
         // Before the schema exemption: a term names its triple under any predicate.
         if !self
-            .term_visible(g_id, to_t, &flake.o, &executor, tracker)
+            .term_visible(state, &flake.o, &executor, tracker)
             .await?
         {
             return Ok(false);
@@ -220,7 +231,7 @@ impl QueryPolicyEnforcer {
         // Get subject classes from cache
         let subject_classes = self
             .policy
-            .get_cached_subject_classes(g_id, to_t, &flake.s)
+            .get_cached_subject_classes(state, &flake.s)
             .unwrap_or_default();
 
         // Async policy check
@@ -242,8 +253,7 @@ impl QueryPolicyEnforcer {
     /// so on through a nested term. Other objects pass.
     async fn term_visible(
         &self,
-        g_id: GraphId,
-        to_t: i64,
+        state: ClassState,
         object: &FlakeValue,
         executor: &QueryPolicyExecutor<'_>,
         tracker: &Tracker,
@@ -252,7 +262,7 @@ impl QueryPolicyEnforcer {
         while let FlakeValue::TripleTerm(term) = object {
             let classes = self
                 .policy
-                .get_cached_subject_classes(g_id, to_t, &term.s)
+                .get_cached_subject_classes(state, &term.s)
                 .unwrap_or_default();
             let allowed = self
                 .policy

@@ -490,10 +490,9 @@ const MANAGER: &str = "http://example.org/Manager";
 ///   asserted salary;
 /// - an asserted member (`ex:bob` the `Manager`) loses his derived ancestors.
 ///
-/// Today the deny covers only the properties class statistics list for the
-/// class's asserted members, so both stay visible.
+/// Class statistics describe asserted members only; a deny expanded through
+/// them once left both visible.
 #[tokio::test]
-#[ignore = "known defect: an f:onClass view deny misses derived members and derived properties"]
 async fn a_class_deny_hides_derived_members_and_derived_properties() {
     let mut observed = Vec::new();
     for storage in STORAGE {
@@ -544,7 +543,6 @@ async fn a_class_deny_hides_derived_members_and_derived_properties() {
 /// same `t`, in either order. Each judges `f:onClass` by the classes its own
 /// query reasons to: `ex:alice` is a `HighEarner` only under the rules.
 #[tokio::test]
-#[ignore = "known defect: a view's class cache answers a reasoning query with a plain query's classes"]
 async fn one_view_judges_classes_by_each_query_s_reasoning() {
     use fluree_db_api::{GovernanceOptions, GraphDb};
     let mut observed = Vec::new();
@@ -597,4 +595,97 @@ async fn one_view_judges_classes_by_each_query_s_reasoning() {
         }
     }
     assert!(observed.is_empty(), "{observed:#?}");
+}
+
+/// A class deny under reasoning reaches an aggregate's fast path, a join and
+/// SPARQL alike: `ex:alice`, a `HighEarner` only by rule, is hidden; `ex:bob`
+/// is not. A graph crawl is `a_derived_class_deny_reaches_a_graph_crawl`.
+#[tokio::test]
+async fn a_derived_class_deny_reaches_every_row_shape() {
+    use fluree_db_api::{GovernanceOptions, GraphDb};
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-deny-shapes-{storage:?}:main");
+        let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
+        let count = query(
+            &ledger_id,
+            json!(["(count ?v)"]),
+            json!({"@id": "?s", "ex:salary": "?v"}),
+            "datalog",
+        );
+        let join = query(
+            &ledger_id,
+            json!(["?s"]),
+            json!([{"@id": "?s", "ex:salary": "?v"}, {"@id": "?s", "ex:parent": "?p"}]),
+            "datalog",
+        );
+        let cases = [
+            ("count", &count, vec![json!([2])], vec![json!([1])]),
+            (
+                "join",
+                &join,
+                vec![json!(["ex:alice"]), json!(["ex:bob"])],
+                vec![json!(["ex:bob"])],
+            ),
+        ];
+        for (shape, q, root, restricted) in cases {
+            assert_eq!(rows(&fluree, q).await, root, "{storage:?}/{shape}: root");
+            assert_eq!(
+                rows(&fluree, &class_restricted(q, HIGH_EARNER)).await,
+                restricted,
+                "{storage:?}/{shape}: restricted"
+            );
+        }
+
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        let opts = GovernanceOptions {
+            policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let view = fluree
+            .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+            .await
+            .expect("policy view");
+        let sparql = "# PRAGMA reasoning: datalog\nPREFIX ex: <http://example.org/>\n\
+                      SELECT ?s ?v WHERE { ?s ex:salary ?v }";
+        let result = fluree.query(&view, sparql).await.expect("sparql");
+        assert_eq!(
+            normalize_rows(&result.to_jsonld(&view.snapshot).expect("to_jsonld")),
+            vec![json!(["ex:bob", 90000])],
+            "{storage:?}/sparql"
+        );
+    }
+}
+
+/// A graph crawl in a reasoning query renders stored facts only, and judges
+/// policy on the state without derived facts, where `ex:alice` is no
+/// `HighEarner`: a deny on the class leaves her crawled salary visible.
+#[tokio::test]
+#[ignore = "known defect: graph crawl formatting ignores reasoning, so a derived class deny misses it"]
+async fn a_derived_class_deny_reaches_a_graph_crawl() {
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-deny-crawl-{storage:?}:main");
+        let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
+        let mut crawl = query(
+            &ledger_id,
+            json!({"ex:alice": ["*"]}),
+            json!(null),
+            "datalog",
+        );
+        crawl.as_object_mut().expect("query").remove("where");
+        let crawled = |q: Value| {
+            let fluree = &fluree;
+            async move {
+                let response = fluree
+                    .query_connection_tracked(&q)
+                    .await
+                    .unwrap_or_else(|e| panic!("crawl failed: {e:?}"));
+                response.result.to_string()
+            }
+        };
+        let root = crawled(crawl.clone()).await;
+        assert!(root.contains("250000"), "{storage:?}: root: {root}");
+        let hidden = crawled(class_restricted(&crawl, HIGH_EARNER)).await;
+        assert!(!hidden.contains("250000"), "{storage:?}: {hidden}");
+    }
 }

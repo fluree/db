@@ -108,21 +108,21 @@ pub async fn populate_class_cache(
         return Ok(());
     }
 
-    // Key on the graph this ref reads, so classes resolved in one graph are never
-    // consulted for a decision about another.
-    let g_id = db.g_id;
+    // Key on the state this ref reads, so classes resolved there are never
+    // consulted for a decision about another graph, time or overlay.
+    let state = crate::evaluate::ClassState::of(db);
     // Only resolve subjects this context has not already cached: the scan
     // operator populates per batch and hydration re-asks per subject fetch, so
     // without this every subject pays the index lookup (a leaflet decode) at
     // least twice.
-    let uncached = policy_ctx.retain_uncached(g_id, db.t, subjects);
+    let uncached = policy_ctx.retain_uncached(state, subjects);
     if uncached.is_empty() {
         return Ok(());
     }
     let class_map = lookup_subject_classes(&uncached, db).await?;
 
     for (subject, classes) in class_map {
-        policy_ctx.cache_subject_classes(g_id, db.t, subject, classes);
+        policy_ctx.cache_subject_classes(state, subject, classes);
     }
 
     Ok(())
