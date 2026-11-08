@@ -75,6 +75,11 @@ const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// retry.
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 
+/// How long a [`Worker`] runs with no queue for its branch before it
+/// returns. It returns between entries, never mid-publish; the
+/// supervisor spawns another once the branch queues again.
+const IDLE_EXIT: Duration = Duration::from_secs(30);
+
 /// Max staging attempts before [`process_entry`] gives up and
 /// proposes a poison. Transient failures and policy denials are retried
 /// after refresh; other staging failures are poisoned immediately.
@@ -1254,7 +1259,8 @@ impl Worker {
             .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))
     }
 
-    /// Drain this branch's queue until aborted by the caller.
+    /// Drain this branch's queue until aborted by the caller, or until
+    /// the branch has had no queue for [`IDLE_EXIT`].
     ///
     /// Each tick peeks the front of [`Self::ref_key`]'s queue and
     /// runs it through [`Self::process_entry`]. The per-branch FIFO
@@ -1274,11 +1280,17 @@ impl Worker {
         // *next* entry), so the second ApplyHead carries our body but
         // pops the next entry — silently dropping that entry's work.
         let mut last_committed: Option<u64> = None;
+        let mut idle_since: Option<tokio::time::Instant> = None;
         loop {
             let Some(entry) = self.snapshot_front().await else {
+                let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= IDLE_EXIT {
+                    return;
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             };
+            idle_since = None;
             if let Some(last) = last_committed {
                 if entry.queue_id <= last {
                     // Local state hasn't yet observed the pop for the
@@ -1434,7 +1446,9 @@ impl WorkerSupervisor {
     ///    [`NameServiceState::queues`] whose rendezvous owner under
     ///    the current voter set is this node.
     /// 2. Spawn a worker for any newly-desired branch; abort the
-    ///    worker for any branch this node no longer owns.
+    ///    worker for any branch this node no longer owns. A worker
+    ///    whose branch drained its queue keeps running until it exits
+    ///    idle ([`ownership`]).
     /// 3. Sleep until either the metrics watch fires (membership /
     ///    leader changed → recompute ownership), the poll interval
     ///    elapses (queues may have new branches), or the cancel
@@ -1448,8 +1462,8 @@ impl WorkerSupervisor {
         let mut metrics_rx = self.raft.metrics();
 
         loop {
-            let desired = self.compute_desired_owners().await;
-            self.reconcile_workers(&mut workers, desired).await;
+            let (desired, kept) = self.compute_ownership(&workers).await;
+            self.reconcile_workers(&mut workers, desired, kept).await;
 
             tokio::select! {
                 // Metrics changed (membership, leader, term, index, …).
@@ -1474,16 +1488,21 @@ impl WorkerSupervisor {
         abort_and_await(workers.drain().map(|(_, h)| h)).await;
     }
 
-    async fn compute_desired_owners(&self) -> HashSet<RefKey> {
+    /// [`ownership`] of the queued branches and of the `running`
+    /// workers' branches.
+    async fn compute_ownership(
+        &self,
+        running: &HashMap<RefKey, JoinHandle<()>>,
+    ) -> (HashSet<RefKey>, HashSet<RefKey>) {
         // Steady-state path: one lock acquisition, no allocation.
-        // `desired_owners` iterates `worker_eligible_voters`
+        // `ownership` iterates `worker_eligible_voters`
         // (a `BTreeSet`) through `owner`'s borrowed-iter input, so
         // passing an empty fallback slice costs nothing — it's never
         // consulted when the eligible set is non-empty.
         {
             let state = self.shared_state.read().await;
             if !state.worker_eligible_voters.is_empty() {
-                return desired_owners(&state, self.id, &[]);
+                return ownership(&state, self.id, &[], running.keys());
             }
         }
         // Boot-window fallback: the lock is released before the
@@ -1495,7 +1514,7 @@ impl WorkerSupervisor {
         // between these two acquisitions can't happen in practice.
         let fallback = self.current_voters();
         let state = self.shared_state.read().await;
-        desired_owners(&state, self.id, &fallback)
+        ownership(&state, self.id, &fallback, running.keys())
     }
 
     fn current_voters(&self) -> Vec<NodeId> {
@@ -1509,9 +1528,10 @@ impl WorkerSupervisor {
     }
 
     /// Spawn workers for newly-desired branches; respawn workers
-    /// whose handle has finished (panic outside `catch_unwind`, or
-    /// any other path that exits `Worker::run` unexpectedly); tear
-    /// down workers for branches no longer owned. Without the
+    /// whose handle has finished (an idle exit as the branch queued
+    /// again, a panic outside `catch_unwind`); tear down workers for
+    /// branches no longer owned, and reap finished ones `kept` for a
+    /// drained branch ([`workers_to_tear_down`]). Without the
     /// respawn step, a single panic in an unguarded path
     /// (`unreachable!()` arm, `propose_poison` await, lock
     /// acquisition) would leave a dead handle in the map and stall
@@ -1528,6 +1548,7 @@ impl WorkerSupervisor {
         &self,
         workers: &mut HashMap<RefKey, JoinHandle<()>>,
         desired: HashSet<RefKey>,
+        kept: HashSet<RefKey>,
     ) {
         // Drain dead handles for still-desired branches first so the
         // spawn pass below treats them as missing entries. Joining
@@ -1536,9 +1557,10 @@ impl WorkerSupervisor {
         // instead of silently respawning.
         for dead in drain_dead_workers(workers, &desired) {
             match dead.await {
-                Ok(()) => warn!(
-                    "worker task exited cleanly — Worker::run is supposed to loop forever; respawning"
-                ),
+                // `Worker::run` returns only once idle.
+                Ok(()) => {
+                    debug!("commit worker exited idle as its branch queued again; respawning");
+                }
                 Err(err) if err.is_panic() => warn!(
                     panic = %panic_message(err.into_panic()),
                     "worker task panicked outside catch_unwind — respawning"
@@ -1548,20 +1570,19 @@ impl WorkerSupervisor {
         }
         for key in &desired {
             if !workers.contains_key(key) {
+                debug!(
+                    ledger_id = %key.ledger_name,
+                    branch = %key.branch,
+                    "commit worker spawned"
+                );
                 let handle = tokio::spawn(self.make_worker(key.clone()).run());
                 workers.insert(key.clone(), handle);
             }
         }
         // Two-step removal: HashMap::extract_if is unstable, so
         // collect the keys we no longer want first, then pull each
-        // handle out by key. The intermediate Vec is bounded by the
-        // number of branches whose ownership just moved off this
-        // node — small under any realistic deployment.
-        let to_drop: Vec<RefKey> = workers
-            .keys()
-            .filter(|key| !desired.contains(*key))
-            .cloned()
-            .collect();
+        // handle out by key.
+        let to_drop = workers_to_tear_down(workers, &desired, &kept);
         let dropped = to_drop.into_iter().filter_map(|key| workers.remove(&key));
         abort_and_await(dropped).await;
     }
@@ -1577,38 +1598,63 @@ impl WorkerSupervisor {
 }
 
 /// Pure computation of the branches this node owns under
-/// rendezvous-hash assignment. Reads `state.worker_eligible_voters`
-/// when populated (the replicated, monitor-curated voter set);
-/// otherwise uses `fallback_voters` (the raft membership view that
-/// only the boot window sees). Empty voter set under either path
-/// yields no owners.
+/// rendezvous-hash assignment: `desired`, those with a queue, and
+/// `kept`, those of `running` workers without one. Reads
+/// `state.worker_eligible_voters` when populated (the replicated,
+/// monitor-curated voter set); otherwise uses `fallback_voters` (the
+/// raft membership view that only the boot window sees). Empty voter
+/// set under either path yields no owners.
+///
+/// Applying the `ApplyHead` that pops a branch's last entry removes its
+/// queue, while the branch's worker still awaits that propose's
+/// response. Its worker is kept, not aborted, and exits on its own
+/// between entries once idle ([`IDLE_EXIT`]): aborted, it would drop the
+/// response and skip installing the commit it just published.
 ///
 /// Pulled out as a free function so the same logic can be exercised
 /// by unit tests without constructing an `Arc<Raft<TypeConfig>>` —
-/// the async wrapper at
-/// [`WorkerSupervisor::compute_desired_owners`] just supplies the
-/// fallback from `raft.metrics()` when needed.
-fn desired_owners(
+/// the async wrapper at [`WorkerSupervisor::compute_ownership`] just
+/// supplies the fallback from `raft.metrics()` when needed.
+fn ownership<'a>(
     state: &crate::raft::state_machine::NameServiceState,
     id: NodeId,
     fallback_voters: &[NodeId],
-) -> HashSet<RefKey> {
-    if !state.worker_eligible_voters.is_empty() {
-        return state
-            .queues
-            .keys()
-            .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(id))
-            .cloned()
-            .collect();
-    }
-    if fallback_voters.is_empty() {
-        return HashSet::new();
-    }
-    state
+    running: impl IntoIterator<Item = &'a RefKey>,
+) -> (HashSet<RefKey>, HashSet<RefKey>) {
+    let owns = |ref_key: &RefKey| {
+        if state.worker_eligible_voters.is_empty() {
+            owner(ref_key, fallback_voters) == Some(id)
+        } else {
+            owner(ref_key, &state.worker_eligible_voters) == Some(id)
+        }
+    };
+    let desired: HashSet<RefKey> = state
         .queues
         .keys()
-        .filter(|ref_key| owner(ref_key, fallback_voters) == Some(id))
+        .filter(|ref_key| owns(ref_key))
         .cloned()
+        .collect();
+    let kept = running
+        .into_iter()
+        .filter(|ref_key| !desired.contains(*ref_key) && owns(ref_key))
+        .cloned()
+        .collect();
+    (desired, kept)
+}
+
+/// The workers to tear down: those for branches this node no longer
+/// owns, and finished ones whose branch has no queue (an idle exit).
+fn workers_to_tear_down(
+    workers: &HashMap<RefKey, JoinHandle<()>>,
+    desired: &HashSet<RefKey>,
+    kept: &HashSet<RefKey>,
+) -> Vec<RefKey> {
+    workers
+        .iter()
+        .filter(|(key, handle)| {
+            !desired.contains(*key) && (!kept.contains(*key) || handle.is_finished())
+        })
+        .map(|(key, _)| key.clone())
         .collect()
 }
 
@@ -2112,17 +2158,95 @@ mod tests {
             .and_then(|queue| queue.front().cloned())
     }
 
-    /// Drive [`desired_owners`] through the same lock acquisition the
-    /// supervisor's async wrapper does. Reads `worker_eligible_voters`
-    /// from the shared state when populated; otherwise uses
-    /// `fallback_voters` (the test stand-in for raft membership).
+    /// Drive [`ownership`]'s desired set through the same lock
+    /// acquisition the supervisor's async wrapper does. Reads
+    /// `worker_eligible_voters` from the shared state when populated;
+    /// otherwise uses `fallback_voters` (the test stand-in for raft
+    /// membership).
     async fn desired_owners_under_lock(
         shared: &SharedState,
         id: NodeId,
         fallback_voters: &[NodeId],
     ) -> HashSet<RefKey> {
         let state = shared.read().await;
-        desired_owners(&state, id, fallback_voters)
+        ownership(&state, id, fallback_voters, []).0
+    }
+
+    /// A branch whose queue drained keeps its running worker while this
+    /// node owns it; one owned elsewhere does not. Neither is desired:
+    /// nothing spawns for a branch without a queue.
+    #[tokio::test]
+    async fn a_drained_branch_keeps_its_running_worker_while_owned_here() {
+        let mut state = NameServiceState::default();
+        install_queue(
+            &mut state,
+            "test/db",
+            "queued",
+            vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
+        );
+        state.worker_eligible_voters = [1, 2].into_iter().collect();
+        let voters = [1u64, 2];
+        let owned_by = |id: NodeId| {
+            (0..)
+                .map(|i| RefKey::new("test/db", format!("drained-{i}")))
+                .find(|key| owner(key, &voters) == Some(id))
+                .unwrap()
+        };
+        let (mine, theirs) = (owned_by(1), owned_by(2));
+        let queued = RefKey::new("test/db", "queued");
+        let running = [mine.clone(), theirs.clone(), queued.clone()];
+
+        let (desired, kept) = ownership(&state, 1, &[], &running);
+        let (expected_desired, expected_kept) = if owner(&queued, &voters) == Some(1) {
+            (HashSet::from([queued]), HashSet::from([mine]))
+        } else {
+            (HashSet::new(), HashSet::from([mine]))
+        };
+        assert_eq!(desired, expected_desired);
+        assert_eq!(kept, expected_kept, "{theirs:?} is owned elsewhere");
+    }
+
+    /// A worker whose branch has no queue returns once it has stayed
+    /// without one for [`IDLE_EXIT`], and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_returns_once_its_branch_stays_without_a_queue() {
+        let (worker, _) = fenced_worker(1, false);
+        let run = tokio::spawn(worker.run());
+        tokio::time::sleep(IDLE_EXIT - POLL_INTERVAL * 2).await;
+        assert!(!run.is_finished(), "returned before IDLE_EXIT");
+        tokio::time::timeout(POLL_INTERVAL * 4, run)
+            .await
+            .expect("returned once idle")
+            .expect("ran to completion");
+    }
+
+    /// Teardown takes a worker whose branch moved elsewhere and reaps a
+    /// finished one kept for a drained branch; a live worker kept for a
+    /// drained branch, and a desired one, keep running.
+    #[tokio::test]
+    async fn teardown_spares_a_live_worker_kept_for_a_drained_branch() {
+        use std::future::pending;
+
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let key = |name: &str| RefKey::new("ledger", name);
+        let mut workers = HashMap::new();
+        workers.insert(key("desired"), tokio::spawn(pending::<()>()));
+        workers.insert(key("drained"), tokio::spawn(pending::<()>()));
+        workers.insert(key("idle-exited"), finished);
+        workers.insert(key("moved"), tokio::spawn(pending::<()>()));
+        let desired = HashSet::from([key("desired")]);
+        let kept = HashSet::from([key("drained"), key("idle-exited")]);
+
+        let mut torn_down = super::workers_to_tear_down(&workers, &desired, &kept);
+        torn_down.sort_by(|a, b| a.branch.cmp(&b.branch));
+        assert_eq!(torn_down, [key("idle-exited"), key("moved")]);
+
+        for (_, handle) in workers.drain() {
+            handle.abort();
+        }
     }
 
     /// A worker only ever takes the front of its own branch — never
