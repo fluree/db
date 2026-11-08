@@ -1960,21 +1960,35 @@ fn source_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Every node journals the shared payload root under its own log. Writes
-/// through every node leave one owned log per node; a node's payloads are
-/// on disk, and only its log directory carries its lock.
+/// Every node journals the shared payload root under its own log. A
+/// follower forwards a write to the leader and stores nothing, so each node
+/// is given a ledger whose commit worker it is, and stores that ledger's
+/// commits. Every node then owns a log, and only its log directory carries
+/// its lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_node_journals_the_shared_root_under_its_own_log() {
+    use fluree_db_consensus::raft::{ownership, state_machine::RefKey};
+
     let cluster = TestCluster::spawn(3).await;
     cluster.bootstrap().await;
-    let ledger = "raft:owners";
-    cluster
-        .create_ledger(cluster.nodes[0].node_id, ledger)
-        .await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let voters: BTreeSet<NodeId> = cluster.nodes.iter().map(|n| n.node_id).collect();
+    assert_eq!(
+        wait_for_eligible_voters(&cluster, leader, &voters, DEFAULT_TIMEOUT).await,
+        voters,
+        "every voter takes commit workers"
+    );
     for node in &cluster.nodes {
-        let subject = format!("via{}", node.node_id);
+        let name = (0..64)
+            .map(|k| format!("owners{k}"))
+            .find(|name| {
+                ownership::owner(&RefKey::new(name.as_str(), "main"), &voters) == Some(node.node_id)
+            })
+            .expect("a ledger whose worker is this node");
+        let ledger = format!("{name}:main");
+        cluster.create_ledger(node.node_id, &ledger).await;
         cluster
-            .insert_subject(node.node_id, ledger, &subject, &subject)
+            .insert_subject(node.node_id, &ledger, "via", "via")
             .await;
     }
     let owners = cluster._shared_data_tmp.path().join(".fluree-wal/owners");
@@ -1982,7 +1996,7 @@ async fn every_node_journals_the_shared_root_under_its_own_log() {
         let lock = owners.join(format!("node-{}", node.node_id)).join("LOCK");
         assert!(
             lock.exists(),
-            "node {} received a write and must own a log at {}",
+            "node {} stored a ledger's commits and must own a log at {}",
             node.node_id,
             lock.display()
         );
