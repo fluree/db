@@ -593,7 +593,7 @@ async fn build_direct_fluree(
     // the leader-scope worker, which `Server::run` gives its own.
     if config.indexing_enabled && catchup_sweeps == CatchupSweeps::Owned {
         fluree.start_maintenance(
-            config.orphan_sweep_interval(),
+            config.housekeeping_options(),
             Some(config.retention_options()),
         );
     }

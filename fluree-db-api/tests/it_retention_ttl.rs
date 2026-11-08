@@ -977,7 +977,7 @@ async fn the_background_worker_expires_on_its_own() {
             .expect("fluree"),
     );
     assert!(fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             ..Default::default()
@@ -1408,7 +1408,7 @@ async fn recreated_ledgers_ttl_is_found(registered: bool) {
             .expect("fluree"),
     );
     assert!(fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             ..Default::default()

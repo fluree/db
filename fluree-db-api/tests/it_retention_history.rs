@@ -599,7 +599,7 @@ async fn incremental_builds_leave_suppressed_history_out() {
             .unwrap(),
     );
     fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             limits: fluree_db_api::retention::RetentionLimits {
@@ -709,7 +709,7 @@ async fn incremental_builds_keep_a_span_that_outlives_the_rule() {
             .unwrap(),
     );
     fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             ..Default::default()
@@ -759,7 +759,7 @@ async fn incremental_builds_keep_a_span_that_outlives_the_rule_in_a_dedicated_gr
             .unwrap(),
     );
     fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             ..Default::default()
@@ -835,7 +835,7 @@ fn indexing_without_background_passes(dir: &std::path::Path) -> std::sync::Arc<F
             .unwrap(),
     );
     fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_secs(3600),
             ..Default::default()
@@ -1088,7 +1088,7 @@ async fn incremental_builds_ahead_of_the_worker_keep_history_written_after_a_rul
             .unwrap(),
     );
     fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_secs(3600),
             ..Default::default()

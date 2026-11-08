@@ -850,7 +850,7 @@ impl FlureeServerBuilder {
                 let event_bus = Arc::clone(&integration.event_bus);
                 let rotation_fluree = Arc::clone(&state_inner.fluree);
                 let housekeeping_fluree = Arc::clone(&state_inner.fluree);
-                let orphan_sweep_interval = state_inner.config.orphan_sweep_interval();
+                let housekeeping_options = state_inner.config.housekeeping_options();
                 let retention_options = state_inner.config.retention_options();
                 // Expiration batches go through the cluster's committer, which
                 // exists once `attach` returns; until then they wait.
@@ -877,7 +877,8 @@ impl FlureeServerBuilder {
                     // lifecycle operations a crashed leader left, and run the
                     // retention worker. Both stop with leadership.
                     handle.set_housekeeping(Arc::new(fluree_db_indexer::Housekeepings(vec![
-                        housekeeping_fluree.lifecycle_housekeeping(orphan_sweep_interval),
+                        housekeeping_fluree
+                            .lifecycle_housekeeping_with(housekeeping_options.clone()),
                         housekeeping_fluree.retention_housekeeping(
                             Some(Arc::clone(&retention_writer)),
                             retention_options.clone(),

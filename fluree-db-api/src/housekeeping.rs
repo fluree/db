@@ -69,9 +69,13 @@ pub struct HousekeepingOptions {
     pub garbage_interval: Duration,
     /// How long a garbage record stands before its blob may be deleted.
     pub garbage_grace: Duration,
-    /// Reconcile each ledger at most this often:
-    /// [`Fluree::reconcile_garbage`].
-    pub reconcile_interval: Duration,
+    /// Reconcile each ledger at most this often in the background:
+    /// [`Fluree::reconcile_garbage`]. `None`, the default, never does: a
+    /// reconciliation lists the ledger's files and reads its references
+    /// whole, whatever `reconcile_budget` allows. Garbage already recorded
+    /// is collected either way, and an erasure's purge reconciles what it
+    /// needs.
+    pub reconcile_interval: Option<Duration>,
     /// How long one garbage pass may spend collecting, and then
     /// reconciling, half of the latter pausing between steps.
     pub reconcile_budget: Duration,
@@ -90,7 +94,7 @@ impl Default for HousekeepingOptions {
             garbage_grace: Duration::from_secs(
                 60 * u64::from(fluree_db_indexer::IndexerConfig::default().gc_min_time_mins),
             ),
-            reconcile_interval: Duration::from_secs(24 * 60 * 60),
+            reconcile_interval: None,
             reconcile_budget: Duration::from_secs(30),
             compact_idle_pool_deltas: true,
         }
@@ -280,7 +284,7 @@ impl LifecycleHousekeeping {
 }
 
 #[cfg(feature = "native")]
-async fn collect_and_reconcile(fluree: &Fluree, options: &HousekeepingOptions) {
+pub(crate) async fn collect_and_reconcile(fluree: &Fluree, options: &HousekeepingOptions) {
     match fluree
         .collect_garbage_within(options.garbage_grace, Some(options.reconcile_budget))
         .await
@@ -289,8 +293,11 @@ async fn collect_and_reconcile(fluree: &Fluree, options: &HousekeepingOptions) {
         Ok(report) => info!(?report, "garbage collected"),
         Err(e) => warn!(error = %e, "garbage collection failed"),
     }
+    let Some(reconcile_interval) = options.reconcile_interval else {
+        return;
+    };
     let pass = match fluree
-        .reconcile_due(options.reconcile_interval, options.reconcile_budget)
+        .reconcile_due(reconcile_interval, options.reconcile_budget)
         .await
     {
         Ok(pass) => pass,
@@ -309,7 +316,7 @@ async fn collect_and_reconcile(fluree: &Fluree, options: &HousekeepingOptions) {
         )
     });
     match behind {
-        Some(age) if age > 2 * options.reconcile_interval => warn!(
+        Some(age) if age > 2 * reconcile_interval => warn!(
             due = pass.due,
             behind_secs = age.as_secs(),
             "garbage reconciliation is behind"
@@ -552,7 +559,13 @@ impl Fluree {
         self: &Arc<Self>,
         orphan_sweep_interval: Option<Duration>,
     ) -> bool {
-        self.start_maintenance(orphan_sweep_interval, None)
+        self.start_maintenance(
+            HousekeepingOptions {
+                orphan_sweep_interval,
+                ..HousekeepingOptions::default()
+            },
+            None,
+        )
     }
 
     /// Install this instance's maintenance on its background indexer, which
@@ -563,13 +576,13 @@ impl Fluree {
     /// no background indexer.
     pub fn start_maintenance(
         self: &Arc<Self>,
-        orphan_sweep_interval: Option<Duration>,
+        housekeeping: HousekeepingOptions,
         retention: Option<crate::retention::RetentionOptions>,
     ) -> bool {
         let crate::tx::IndexingMode::Background(handle) = &self.indexing_mode else {
             return false;
         };
-        let lifecycle = self.lifecycle_housekeeping(orphan_sweep_interval);
+        let lifecycle = self.lifecycle_housekeeping_with(housekeeping);
         match retention {
             Some(options) => {
                 handle.set_housekeeping(Arc::new(fluree_db_indexer::Housekeepings(vec![

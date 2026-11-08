@@ -1162,7 +1162,7 @@ async fn the_worker_resumes_a_restored_ledgers_erasure() {
     // is minutes away.
     let fluree = open();
     assert!(fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             ..Default::default()
@@ -2870,7 +2870,7 @@ async fn the_worker_purges_a_published_erasure() {
     )
     .await;
     assert!(fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(fluree_db_api::retention::RetentionOptions {
             interval: Duration::from_millis(100),
             purge_grace: Duration::ZERO,

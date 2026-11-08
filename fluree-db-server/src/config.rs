@@ -548,6 +548,21 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_ORPHAN_SWEEP_INTERVAL_SECS", default_value_t = 0)]
     pub orphan_sweep_interval_secs: u64,
 
+    /// How often to reconcile each ledger's commit and transaction files in
+    /// the background, recording those no branch references as garbage
+    /// (seconds); `0`, the default, never does
+    ///
+    /// A reconciliation lists the ledger's files and reads its references
+    /// whole, which on a large ledger runs past the garbage pass's time
+    /// budget. Garbage already recorded is collected either way, and an
+    /// erasure's purge reconciles what it needs.
+    #[arg(
+        long,
+        env = "FLUREE_GARBAGE_RECONCILE_INTERVAL_SECS",
+        default_value_t = 0
+    )]
+    pub garbage_reconcile_interval_secs: u64,
+
     /// How often the retention worker runs a pass over TTL-enabled ledgers
     /// (seconds)
     ///
@@ -1023,6 +1038,7 @@ impl Default for ServerConfig {
             gc_hard_max_old_indexes: None,
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             orphan_sweep_interval_secs: 0,
+            garbage_reconcile_interval_secs: 0,
             retention_interval_secs: 15,
             erasure_prover: None,
             disable_erasure: false,
@@ -1164,6 +1180,16 @@ impl ServerConfig {
     pub fn orphan_sweep_interval(&self) -> Option<std::time::Duration> {
         (self.orphan_sweep_interval_secs > 0)
             .then(|| std::time::Duration::from_secs(self.orphan_sweep_interval_secs))
+    }
+
+    /// The background housekeeping these settings ask for.
+    pub fn housekeeping_options(&self) -> fluree_db_api::HousekeepingOptions {
+        fluree_db_api::HousekeepingOptions {
+            orphan_sweep_interval: self.orphan_sweep_interval(),
+            reconcile_interval: (self.garbage_reconcile_interval_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.garbage_reconcile_interval_secs)),
+            ..fluree_db_api::HousekeepingOptions::default()
+        }
     }
 
     /// Create config from CLI args

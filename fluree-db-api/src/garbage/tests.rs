@@ -896,3 +896,29 @@ pub(crate) mod cluster {
         assert!(lease.until().await.is_none());
     }
 }
+
+/// The background garbage pass collects what is recorded, and reconciles
+/// only when asked to: a reconciliation reads the ledger whole.
+#[tokio::test]
+async fn background_reconciliation_is_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("background").await.unwrap();
+    commit_raw(&fluree, "background:main", "background").await;
+    let none = std::time::Duration::ZERO;
+    let reconciled = |fluree: &crate::Fluree| {
+        let fluree = fluree.clone();
+        async move { fluree.reconcile_due(none, none).await.unwrap().oldest_ms }
+    };
+
+    crate::housekeeping::collect_and_reconcile(&fluree, &crate::HousekeepingOptions::default())
+        .await;
+    assert_eq!(reconciled(&fluree).await, None);
+
+    let opted_in = crate::HousekeepingOptions {
+        reconcile_interval: Some(none),
+        ..crate::HousekeepingOptions::default()
+    };
+    crate::housekeeping::collect_and_reconcile(&fluree, &opted_in).await;
+    assert!(reconciled(&fluree).await.is_some());
+}
