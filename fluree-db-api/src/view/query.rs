@@ -1776,6 +1776,23 @@ impl Fluree {
             executable.reasoning.modes.rules.clear();
         }
 
+        // A graph crawl renders stored facts at formatting time and judges
+        // class policies on stored classes, so under reasoning it would miss
+        // derived facts and let a deny on a derived class through. Refused
+        // before the query is served or reasoned.
+        if strip_query_rules
+            && executable.reasoning.modes.has_any_enabled()
+            && executable.query.output.has_hydration()
+        {
+            return Err(ApiError::Query(
+                fluree_db_query::QueryError::UnsupportedFeature(
+                    "a graph crawl in a reasoning query under a view policy; select \
+                     variables instead, or query without reasoning"
+                        .to_string(),
+                ),
+            ));
+        }
+
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
         // into the executable so `compute_derived_facts` extracts
         // datalog rules from the configured graph instead of the

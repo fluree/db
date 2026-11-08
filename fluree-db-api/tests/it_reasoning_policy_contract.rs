@@ -599,7 +599,8 @@ async fn one_view_judges_classes_by_each_query_s_reasoning() {
 
 /// A class deny under reasoning reaches an aggregate's fast path, a join and
 /// SPARQL alike: `ex:alice`, a `HighEarner` only by rule, is hidden; `ex:bob`
-/// is not. A graph crawl is `a_derived_class_deny_reaches_a_graph_crawl`.
+/// is not. A graph crawl is refused instead
+/// (`a_graph_crawl_in_a_reasoning_query_is_refused_under_a_view_policy`).
 #[tokio::test]
 async fn a_derived_class_deny_reaches_every_row_shape() {
     use fluree_db_api::{GovernanceOptions, GraphDb};
@@ -657,35 +658,114 @@ async fn a_derived_class_deny_reaches_every_row_shape() {
     }
 }
 
-/// A graph crawl in a reasoning query renders stored facts only, and judges
-/// policy on the state without derived facts, where `ex:alice` is no
-/// `HighEarner`: a deny on the class leaves her crawled salary visible.
+/// A graph crawl renders stored facts at formatting time and judges class
+/// policies on stored classes, where `ex:alice` is no `HighEarner`: in a
+/// reasoning query a deny on the class would leave her crawled salary
+/// visible. Under any view policy the crawl is refused, in every crawl form
+/// and whether reasoning comes from the query or the ledger's defaults. A
+/// root crawl, and a plain one judged on stored classes, still run.
 #[tokio::test]
-#[ignore = "known defect: graph crawl formatting ignores reasoning, so a derived class deny misses it"]
-async fn a_derived_class_deny_reaches_a_graph_crawl() {
+async fn a_graph_crawl_in_a_reasoning_query_is_refused_under_a_view_policy() {
     for storage in STORAGE {
-        let ledger_id = format!("reasoning-policy/class-deny-crawl-{storage:?}:main");
+        let ledger_id = format!("reasoning-policy/crawl-{storage:?}:main");
         let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
-        let mut crawl = query(
-            &ledger_id,
-            json!({"ex:alice": ["*"]}),
-            json!(null),
-            "datalog",
-        );
-        crawl.as_object_mut().expect("query").remove("where");
-        let crawled = |q: Value| {
+        let crawl = |select: Value, where_: Value, reasoning: &str| {
+            let mut crawl = query(&ledger_id, select, where_, reasoning);
+            if crawl["where"].is_null() {
+                crawl.as_object_mut().expect("query").remove("where");
+            }
+            crawl
+        };
+        let forms = [
+            crawl(json!({"ex:alice": ["*"]}), json!(null), "datalog"),
+            crawl(
+                json!({"?s": ["*"]}),
+                json!({"@id": "?s", "ex:parent": {"@id": "ex:bob"}}),
+                "datalog",
+            ),
+            crawl(
+                json!(["?s", {"?s": ["*", {"ex:parent": ["*"]}]}]),
+                json!({"@id": "?s", "ex:salary": "?v"}),
+                "datalog",
+            ),
+        ];
+        let run = |q: Value| {
             let fluree = &fluree;
             async move {
-                let response = fluree
+                fluree
                     .query_connection_tracked(&q)
                     .await
-                    .unwrap_or_else(|e| panic!("crawl failed: {e:?}"));
-                response.result.to_string()
+                    .map(|r| r.result.to_string())
+                    .map_err(|e| (e.status, e.error))
             }
         };
-        let root = crawled(crawl.clone()).await;
-        assert!(root.contains("250000"), "{storage:?}: root: {root}");
-        let hidden = crawled(class_restricted(&crawl, HIGH_EARNER)).await;
-        assert!(!hidden.contains("250000"), "{storage:?}: {hidden}");
+        for form in &forms {
+            let root = run(form.clone()).await.expect("root crawl");
+            assert!(root.contains("250000"), "{storage:?}: root: {root}");
+            for restricted in [
+                class_restricted(form, HIGH_EARNER),
+                restricted(form, UNRELATED),
+            ] {
+                match run(restricted).await {
+                    Err((400, error)) if error.contains("graph crawl") => {}
+                    other => panic!("{storage:?}: {form}: {other:?}"),
+                }
+            }
+        }
+
+        let plain = crawl(json!({"ex:alice": ["*"]}), json!(null), "none");
+        let plain = run(class_restricted(&plain, HIGH_EARNER))
+            .await
+            .expect("plain crawl");
+        assert!(plain.contains("250000"), "{storage:?}: plain: {plain}");
+    }
+}
+
+/// Ledger reasoning defaults make a crawl that names no reasoning a
+/// reasoning query, so it is refused under a view policy too.
+#[tokio::test]
+async fn a_graph_crawl_under_reasoning_defaults_is_refused_under_a_view_policy() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger_id = "reasoning-policy/crawl-defaults:main";
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    let ledger = fluree
+        .insert(ledger, &family_with_rules())
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig ;
+                               f:reasoningDefaults <urn:cfg:reason> .
+                <urn:cfg:reason> f:reasoningModes f:datalog .
+            }}
+            "
+        ))
+        .execute()
+        .await
+        .expect("reasoning defaults");
+    let mut crawl = json!({
+        "@context": context(),
+        "from": ledger_id,
+        "select": {"ex:alice": ["*"]}
+    });
+    let root = fluree
+        .query_connection_tracked(&crawl)
+        .await
+        .expect("root crawl");
+    assert!(
+        root.result.to_string().contains("250000"),
+        "{:?}",
+        root.result
+    );
+    crawl["opts"] = denying_class(HIGH_EARNER);
+    match fluree.query_connection_tracked(&crawl).await {
+        Err(e) if e.status == 400 && e.error.contains("graph crawl") => {}
+        other => panic!("{:?}", other.map(|r| r.result)),
     }
 }
