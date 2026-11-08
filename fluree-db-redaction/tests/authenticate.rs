@@ -81,6 +81,25 @@ fn the_claim_names_the_commit_and_its_parents_as_fluree_reads_them() {
 }
 
 #[test]
+fn a_commit_that_drops_a_graph_is_authenticated_and_chained() {
+    let mut commit = Commit::new(9, flakes(4)).with_parent(cid(b"p"));
+    commit.graph_drops = vec!["http://example.org/g".into()];
+    let bytes = write_commit(&commit, true, None).unwrap().bytes;
+    assert_eq!(claim_of(&bytes, &SEED).parents, vec![cid(b"p").to_bytes()]);
+
+    let image = [7u32; 8];
+    let first = write_commit(&Commit::new(8, flakes(2)), false, None)
+        .unwrap()
+        .bytes;
+    let start = fluree_db_redaction::chain_link::<HostSha>(&first, None, image).unwrap();
+    let mut second = Commit::new(9, flakes(2)).with_parent(cid(&first));
+    second.graph_drops = vec!["http://example.org/g".into()];
+    let second = write_commit(&second, false, None).unwrap().bytes;
+    let link = fluree_db_redaction::chain_link::<HostSha>(&second, Some(&start), image).unwrap();
+    assert_eq!(link.length, 2);
+}
+
+#[test]
 fn any_operation_is_disclosed_by_its_leaf_salt_and_path() {
     let commit = Commit::new(7, flakes(37)).with_parent(cid(b"p"));
     let bytes = write_commit(&commit, true, None).unwrap().bytes;

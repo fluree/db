@@ -947,7 +947,7 @@ fn envelope_parents(env: &[u8]) -> Result<Vec<Vec<u8>>> {
         return Err(bad("envelope version"));
     }
     let flags = u8_at(env, &mut pos)?;
-    if flags & !0x9f != 0 {
+    if flags & !0xbf != 0 {
         return Err(bad("envelope flags"));
     }
     let len_bytes = |pos: &mut usize| -> Result<Vec<u8>> {

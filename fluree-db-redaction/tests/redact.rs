@@ -85,6 +85,7 @@ fn read_as_original(replacement: &[u8], bytes: &[u8], redacted: &[u32]) {
     );
     assert_eq!(decoded.txn_meta, original.txn_meta);
     assert_eq!(decoded.namespace_delta, original.namespace_delta);
+    assert_eq!(decoded.graph_drops, original.graph_drops);
     assert!(
         decoded.commit_signatures.is_empty(),
         "no signature signs a replacement"
@@ -181,6 +182,14 @@ fn retractions_and_merge_parents_are_preserved() {
         .with_merge_parents(vec![ContentId::new(ContentKind::Commit, b"merged")]);
     let bytes = write_commit(&commit, true, None).unwrap().bytes;
     check(&bytes, &[8]);
+}
+
+#[test]
+fn a_commit_that_drops_a_graph_keeps_its_drops() {
+    let mut commit = Commit::new(9, people(3, 9)).with_parent(parent());
+    commit.graph_drops = vec!["http://example.org/g".into()];
+    let bytes = write_commit(&commit, true, None).unwrap().bytes;
+    check(&bytes, &[1]);
 }
 
 #[test]
