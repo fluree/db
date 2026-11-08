@@ -2077,8 +2077,9 @@ impl fluree_db_nameservice::ReasoningIndexesPublisher for DynamoDbNameService {
         }
         let json = serde_json::to_string(new)
             .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}")))?;
+        // `fenced_update_item` parenthesizes this; DynamoDB refuses `((…))`.
         let version_clause = if expected_v == 0 {
-            "(attribute_not_exists(#rv) OR #rv = :expected_v)"
+            "attribute_not_exists(#rv) OR #rv = :expected_v"
         } else {
             "#rv = :expected_v"
         };
@@ -2111,7 +2112,8 @@ impl fluree_db_nameservice::ReasoningIndexesPublisher for DynamoDbNameService {
                 conflict(self.get_reasoning_indexes(ledger_id).await?)
             }
             Err(e) => Err(NameServiceError::storage(format!(
-                "DynamoDB UpdateItem failed: {e}"
+                "DynamoDB UpdateItem failed: {}",
+                aws_sdk_dynamodb::error::DisplayErrorContext(&e)
             ))),
         }
     }
