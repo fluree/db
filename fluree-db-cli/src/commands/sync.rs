@@ -449,6 +449,16 @@ async fn purge_received(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Purg
     Purge::Pending(format!("not finished in {PURGE_PASSES} passes"))
 }
 
+/// A received index this copy did not take: its history holds a commit
+/// erased here, which the sender's index may hold the original of.
+fn index_not_set_note() {
+    eprintln!(
+        "  {} the received index was not used: this history holds a commit erased \
+         here, so the ledger indexes its replacements itself",
+        "note:".cyan().bold()
+    );
+}
+
 /// `count` erased commits, as a summary's suffix.
 fn erased_note(count: usize) -> String {
     match count {
@@ -964,7 +974,7 @@ async fn pull(
                                             if let Some(ref remote_index_id) =
                                                 remote_ns.index_head_id
                                             {
-                                                fluree
+                                                if !fluree
                                                     .set_index_head(
                                                         &handle,
                                                         remote_index_id,
@@ -975,7 +985,10 @@ async fn pull(
                                                         CliError::Config(format!(
                                                             "pull failed (set index head): {e}"
                                                         ))
-                                                    })?;
+                                                    })?
+                                                {
+                                                    index_not_set_note();
+                                                }
                                             }
                                         }
 
@@ -2049,10 +2062,13 @@ pub async fn run_clone(
     if index_artifacts_stored > 0 {
         if let Some(ref ns) = remote_ns_record {
             if let Some(ref remote_index_id) = ns.index_head_id {
-                fluree
+                if !fluree
                     .set_index_head(&handle, remote_index_id, ns.index_t)
                     .await
-                    .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?;
+                    .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?
+                {
+                    index_not_set_note();
+                }
             }
         }
     }
@@ -2363,10 +2379,13 @@ pub async fn run_clone_origin(
     // Set index head if index artifacts were transferred.
     if index_artifacts_fetched > 0 {
         if let Some(ref remote_index_id) = ns_record.index_head_id {
-            fluree
+            if !fluree
                 .set_index_head(&handle, remote_index_id, ns_record.index_t)
                 .await
-                .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?;
+                .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?
+            {
+                index_not_set_note();
+            }
         }
     }
 
@@ -2664,14 +2683,17 @@ async fn run_pull_via_origins(
 
                             if idx_count > 0 {
                                 if let Some(ref remote_index_id) = remote_ns.index_head_id {
-                                    fluree
+                                    if !fluree
                                         .set_index_head(&handle, remote_index_id, remote_ns.index_t)
                                         .await
                                         .map_err(|e| {
                                             CliError::Config(format!(
                                                 "pull failed (set index head): {e}"
                                             ))
-                                        })?;
+                                        })?
+                                    {
+                                        index_not_set_note();
+                                    }
                                 }
                             }
 

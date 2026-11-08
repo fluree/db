@@ -2357,16 +2357,40 @@ impl Fluree {
     /// Points `IndexHead` at the given CID/t so that the next `ledger()` load
     /// picks up the pulled binary index. `IndexHead` uses `t >= current.t`
     /// monotonic guard (allows equal-t overwrites, unlike `CommitHead`).
+    ///
+    /// Not when this storage holds an erasure of a commit in the ledger's
+    /// history: the sender may have built its index from the original, so
+    /// the ledger builds its own from the replacements. Returns whether the
+    /// index was set.
     pub async fn set_index_head(
         &self,
         handle: &LedgerHandle,
         index_id: &ContentId,
         index_t: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.admit_content_id(index_id)?;
+        // The head the transfer set, which the handle may not hold yet.
+        #[cfg(feature = "native")]
+        if let Some(head) = self
+            .nameservice()
+            .lookup(handle.id())
+            .await?
+            .and_then(|record| record.commit_head_id)
+        {
+            let store = self.branched_content_store(handle.id()).await?;
+            if let Some(erased) = self.erased_in_history(store.as_ref(), &head).await? {
+                tracing::info!(
+                    ledger = %handle.id(),
+                    %erased,
+                    "a received index is not set: its history holds a commit erased here"
+                );
+                return Ok(false);
+            }
+        }
         let basis = handle.snapshot().await.write_basis();
         self.set_ref(handle.id(), basis, RefKind::IndexHead, index_id, index_t)
-            .await
+            .await?;
+        Ok(true)
     }
 
     /// Point `kind` of `ledger_id`'s record at `id`/`t`, by compare-and-swap

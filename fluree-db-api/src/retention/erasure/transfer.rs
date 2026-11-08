@@ -1097,11 +1097,29 @@ impl Fluree {
         store: &dyn ContentStore,
         head: &ContentId,
     ) -> Result<()> {
+        match self.erased_in_history(store, head).await? {
+            Some(cid) => Err(ApiError::http(
+                501,
+                format!(
+                    "commit {cid} of this history is permanently erased; only a pack \
+                     carries erased history"
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// A commit of `head`'s history this storage holds erased, if any.
+    pub(crate) async fn erased_in_history(
+        &self,
+        store: &dyn ContentStore,
+        head: &ContentId,
+    ) -> Result<Option<ContentId>> {
         let Some(runtime) = self.retention.erasure.get() else {
-            return Ok(());
+            return Ok(None);
         };
         if !runtime.index.any_erased().await? {
-            return Ok(());
+            return Ok(None);
         }
         let history = crate::pack::compute_missing_commits(
             store,
@@ -1109,18 +1127,12 @@ impl Fluree {
             &HashSet::new(),
         )
         .await?;
-        for cid in &history {
-            if runtime.index.erased(cid).await?.is_some() {
-                return Err(ApiError::http(
-                    501,
-                    format!(
-                        "commit {cid} of this history is permanently erased; only a pack \
-                         carries erased history"
-                    ),
-                ));
+        for cid in history {
+            if runtime.index.erased(&cid).await?.is_some() {
+                return Ok(Some(cid));
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 

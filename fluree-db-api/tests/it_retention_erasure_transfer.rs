@@ -2152,6 +2152,36 @@ async fn a_push_of_an_original_erased_here_takes_its_replacement() {
     );
 }
 
+/// A received index is not set over a history holding a commit erased
+/// here: the sender may have built it from the original, as this one was
+/// before the erasure.
+#[tokio::test]
+async fn a_received_index_over_history_erased_here_is_not_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/index-erased-here").await;
+    insert_kept(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let before = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let from_originals = before.index_head_id.clone().unwrap();
+    erase_published(&fluree, &id, email("alice", "a@secret")).await;
+    let after = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+
+    let handle = fluree.ledger_cached(&id).await.unwrap();
+    let set = fluree
+        .set_index_head(&handle, &from_originals, after.index_t)
+        .await
+        .unwrap();
+    assert!(!set);
+    let now = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    assert_eq!(now.index_head_id, after.index_head_id);
+}
+
 /// A push carries the ledger's removal journal. Removals the receiver's
 /// journal lacks need the authority removing needs; once the receiver has
 /// them, a push carrying the same journal needs none.
