@@ -96,8 +96,6 @@ A query is answered from an index when all of these hold:
   reads, and the query reads the branch's committed state at that commit. A
   staged (uncommitted) view, or a time-travel view of an earlier commit,
   reasons at query time; time travel to the current `t` is served;
-- the query runs without a restricting policy (an index is computed without
-  policy, so a policy-restricted view always reasons at query time);
 - the index's head was computed under the engine semantics version the
   answering instance runs (see [Upgrades](#upgrades)).
 
@@ -133,6 +131,25 @@ JSON-LD, SPARQL and streaming queries are served from indexes, and so are
 dataset queries whose graphs all belong to the one ledger. A dataset that
 reaches other ledgers reasons at query time.
 
+### Under a view policy
+
+An index is computed without policy, over all of the ledger's data. A caller's
+view policy applies when rows are read, as it does to query-time reasoning:
+each fact is judged by its own subject, predicate and object, a class policy by
+the subject's classes including derived ones, and an `f:query` condition
+against the derived facts the query reads. A restricted caller therefore gets
+the same answer from an index as from query-time reasoning; see
+[Reasoning under access policy](reasoning.md#reasoning-under-access-policy).
+
+A restricted caller is served only by a generation at exactly the commit it
+reads. Under `asOf` it reasons at query time when there is none, rather than
+read an older generation, which would also take its policy's class lookups and
+conditions back to that commit. A dataset is restricted when any of its graphs
+carries a policy. Query-supplied `rules` are stripped from a restricted request
+before an index is chosen, as they are at query time, so only stored and
+configured rules can match. A graph crawl in a reasoning query is refused under
+a policy, served or not.
+
 ## Freshness
 
 `reasoningFreshness` (SPARQL: `# PRAGMA reasoning-freshness: <mode>`) chooses
@@ -143,7 +160,7 @@ what may answer:
 | `default` | An index whose head is at exactly the queried commit; query-time reasoning otherwise. |
 | `exact` | As `default`, but a query-time run that hits a budget, or whose OWL 2 RL pass fails, is an error rather than an incomplete result. |
 | `strict` | Only an index whose head is at exactly the queried commit. Waits briefly for one, then fails (408). Never reasons at query time. |
-| `asOf` | For a query of the branch's current state, the newest retained generation at or before its commit, computed before no graph drop since (a drop takes a graph out as of every earlier `t`, and a generation holds what the graph held). The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none. |
+| `asOf` | For a query of the branch's current state, the newest retained generation at or before its commit, computed before no graph drop since (a drop takes a graph out as of every earlier `t`, and a generation holds what the graph held). The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none, and for a policy-restricted caller when the newest is older than its commit. |
 
 ## Storage and retention
 

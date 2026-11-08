@@ -2759,7 +2759,7 @@ mod tests {
         let db = fluree.db(id).await.unwrap();
         let reasoning = settled_reasoning(&fluree, &db, &program).await;
         let served = fluree
-            .reasoning_index_for(&db, &reasoning)
+            .reasoning_index_for(&db, &reasoning, false)
             .await
             .unwrap()
             .expect("servable");

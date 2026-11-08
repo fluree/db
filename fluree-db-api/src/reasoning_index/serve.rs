@@ -43,28 +43,31 @@ impl Fluree {
     /// The index generation that can answer a query with settled
     /// `reasoning` against `db`, if any, as the query's freshness mode
     /// allows. Only a `strict` query fails for want of one.
+    ///
+    /// A `restricted` request (a view policy on `db` or on any other graph
+    /// it reads) is served only a generation at exactly `db`'s snapshot: an
+    /// older one would also rewind the facts its policy's class lookups and
+    /// conditions read, so its `asOf` falls back to query time instead.
     pub(crate) async fn reasoning_index_for(
         &self,
         db: &GraphDb,
         reasoning: &ReasoningConfig,
+        restricted: bool,
     ) -> Result<Option<ServedGeneration>> {
         let strict = || ApiError::ReasoningIndexNotReady {
             ledger_id: db.ledger_id.to_string(),
             t: db.t,
         };
-        let freshness = reasoning.modes.freshness;
-        if !program::materializes(reasoning) || !db.is_root() {
-            return match freshness {
-                ReasoningFreshness::Strict if program::materializes(reasoning) => Err(strict()),
-                _ => Ok(None),
-            };
+        if !program::materializes(reasoning) {
+            return Ok(None);
         }
-        match freshness {
+        match reasoning.modes.freshness {
             ReasoningFreshness::Default | ReasoningFreshness::Exact => {
                 Ok(self.servable(db, reasoning, false).await)
             }
             ReasoningFreshness::AsOf => match self.servable(db, reasoning, false).await {
                 Some(served) => Ok(Some(served)),
+                None if restricted => Ok(None),
                 None => Ok(self.servable(db, reasoning, true).await),
             },
             ReasoningFreshness::Strict => {

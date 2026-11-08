@@ -423,6 +423,11 @@ Reasoning composes with view policy, but mind the contract when both are on:
 
 **If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden. Under OWL 2 RL and datalog, an `f:onClass` policy applies by the classes the query reasons to: denying a derived class hides every fact of its members, including asserted ones, and every derived fact of an asserted member. A graph crawl (`select {"?s": ["*"]}`, at any depth) renders stored facts only, so a reasoning query that contains one is refused under a non-root policy with a 400; select the values as variables instead. A Cypher node rendered with its properties (Bolt's `RETURN n`) shows what the query saw: its derived labels and properties, judged by the same policy as the rows.
 
+**Policy reads what the query reads.** In a reasoning query, class policies and `f:query` conditions see derived facts, whether they were derived at query time or read from a [reasoning index](materialized-reasoning.md); a query without reasoning is judged on stored facts. Two consequences follow:
+
+- Data a rule or axiom reads is security data. A derived fact can grant access as well as deny it: a rule can place a subject in a class an `f:onClass` policy allows, or satisfy an `f:query` condition, so whoever can write a rule's inputs can open access through it.
+- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off; see [Override control](../ledger-config/override-control.md).
+
 **Query-time rules are admin-only.** Under a non-root view policy, caller-supplied `rules` are stripped before execution — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
 
 ## Related pages

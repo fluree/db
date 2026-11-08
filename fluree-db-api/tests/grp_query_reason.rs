@@ -23,3 +23,6 @@ mod it_query_shortest_path;
 mod it_query_subclass;
 #[path = "it_reasoning_indexes.rs"]
 mod it_reasoning_indexes;
+
+#[path = "it_reasoning_index_policy.rs"]
+mod it_reasoning_index_policy;

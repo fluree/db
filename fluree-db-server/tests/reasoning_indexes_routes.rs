@@ -122,3 +122,98 @@ async fn register_refresh_list_and_retire_an_index() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// A policy-restricted query is answered from an index over HTTP and judged as
+/// it would be at query time: a deny on a class a rule derives hides that
+/// class's member. The rule derives two facts, so the one-fact budget with
+/// `exact` freshness would refuse a query-time answer; the reasoning header
+/// names the index.
+#[tokio::test]
+async fn a_restricted_query_is_served_from_an_index() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(Arc::clone(&state));
+    let ledger = "routes/restricted:main";
+    let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let (status, _) = post(&app, "/v1/fluree/create", json!({"ledger": ledger})).await;
+    assert!(status.is_success(), "{status}");
+    let rule = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where": [{"@id": "?p", "ex:salary": "?s"}, ["filter", "(> ?s 200000)"]],
+        "insert": {"@id": "?p", "@type": "ex:HighEarner"}
+    });
+    let (status, body) = post(
+        &app,
+        "/v1/fluree/insert",
+        json!({
+            "ledger": ledger,
+            "@context": ctx,
+            "@graph": [
+                {"@id": "ex:rule", "f:rule": {"@type": "@json", "@value": rule}},
+                {"@id": "ex:alice", "ex:name": "Alice", "ex:salary": 250_000},
+                {"@id": "ex:bob", "ex:name": "Bob", "ex:salary": 90000},
+                {"@id": "ex:carol", "ex:salary": 300_000}
+            ]
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, body) = post(
+        &app,
+        "/v1/fluree/reasoning-indexes/register",
+        json!({"ledger": ledger, "program": {"reasoning": "datalog"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &app,
+        "/v1/fluree/reasoning-indexes/refresh",
+        json!({"ledger": ledger}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let query = json!({
+        "@context": ctx,
+        "from": ledger,
+        "select": "?n",
+        "where": {"@id": "?s", "ex:name": "?n"},
+        "reasoning": "datalog",
+        "reasoningBudget": {"maxFacts": 1},
+        "reasoningFreshness": "exact",
+        "opts": {
+            "meta": true,
+            "default-allow": true,
+            "policy": [{
+                "@id": "ex:denyHighEarner",
+                "f:required": true,
+                "f:onClass": [{"@id": "http://example.org/HighEarner"}],
+                "f:action": "f:view",
+                "f:allow": false
+            }]
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    let status = resp.status();
+    let reasoning = resp
+        .headers()
+        .get("x-fdb-reasoning")
+        .map(|v| v.to_str().expect("header").to_string());
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body.get("result").unwrap_or(&body);
+    assert_eq!(rows, &json!(["Bob"]), "{body}");
+    let reasoning = reasoning.expect("x-fdb-reasoning");
+    assert!(reasoning.contains("indexId"), "{reasoning}");
+}

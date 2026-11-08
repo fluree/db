@@ -107,6 +107,8 @@ The two approaches can therefore disagree under the same policy. With `ex:ssn rd
 
 Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply. A policy selection that yields no rules under `default-allow: true` is root — nothing is hidden, so there is nothing to launder and query-supplied rules are not stripped.
 
+Class membership and `f:query` conditions read the state the query reads: derived facts in a reasoning query, whether derived at query time or served from a [reasoning index](../query/materialized-reasoning.md#under-a-view-policy), and stored facts in a plain one. A derived fact can therefore grant access as well as deny it, and a deny on a derived class does not reach a caller's plain queries; to make reasoning unavoidable, set the ledger's reasoning defaults with `f:overrideControl` `f:OverrideNone` ([Reasoning under access policy](../query/reasoning.md#reasoning-under-access-policy)).
+
 A graph crawl (`select {"?s": ["*"]}`) reads stored facts at formatting time, after the query's own rows were judged. Under reasoning it would miss derived facts and judge `f:onClass` on stored classes, so a reasoning query containing one is refused under a non-root policy (HTTP 400); select the values as variables instead. A Cypher node rendered over Bolt reads the query's own reasoned state and is judged like its rows.
 
 ### Performance under a policy

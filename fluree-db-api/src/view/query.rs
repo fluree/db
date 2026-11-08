@@ -1614,9 +1614,7 @@ impl Fluree {
                     && v.commit_id == primary.commit_id
                     && v.instance_bits == primary.instance_bits
             });
-        // A restricted member is answered at query time, as a restricted
-        // single view is; a root primary says nothing about the others.
-        if dataset.is_history_mode() || !within_ledger || dataset.any_non_root_policy() {
+        if dataset.is_history_mode() || !within_ledger {
             if executable.reasoning.modes.freshness
                 == fluree_db_query::ir::ReasoningFreshness::Strict
                 && crate::reasoning_index::program::materializes(&executable.reasoning)
@@ -1629,7 +1627,12 @@ impl Fluree {
             return Ok(None);
         }
         let Some(served) = self
-            .reasoning_index_for(primary, &executable.reasoning)
+            .reasoning_index_for(
+                primary,
+                &executable.reasoning,
+                // A root primary says nothing about the other members.
+                dataset.any_non_root_policy(),
+            )
             .await?
         else {
             return Ok(None);
@@ -1654,7 +1657,10 @@ impl Fluree {
         executable: &mut ExecutableQuery,
         tracker: Option<&Tracker>,
     ) -> Result<Option<GraphDb>> {
-        let Some(served) = self.reasoning_index_for(db, &executable.reasoning).await? else {
+        let Some(served) = self
+            .reasoning_index_for(db, &executable.reasoning, !db.is_root())
+            .await?
+        else {
             return Ok(None);
         };
         executable.reasoning =
