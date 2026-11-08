@@ -2516,6 +2516,42 @@ mod tests {
         );
     }
 
+    /// A `@vocab`-typed term's value is an IRI, as a transaction writes it.
+    #[test]
+    fn vocab_typed_term_value_is_an_iri() {
+        let json = json!({
+            "@context": {
+                "@vocab": "http://example.org/",
+                "status": {"@type": "@vocab"}
+            },
+            "select": ["?s"],
+            "where": { "@id": "?s", "status": "Active" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&pattern.o, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/Active"),
+            "{:?}",
+            pattern.o
+        );
+    }
+
+    /// A term defined as `null` names no property, so a pattern on it is
+    /// refused rather than matching nothing.
+    #[test]
+    fn null_term_in_where_is_refused() {
+        let json = json!({
+            "@context": {"@vocab": "http://example.org/", "gone": null},
+            "select": ["?s"],
+            "where": { "@id": "?s", "gone": "?v" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err().to_string();
+        assert!(err.contains("'gone' is defined as null"), "{err}");
+    }
+
     #[test]
     fn test_no_context_full_iris() {
         // Queries can use full IRIs without any context

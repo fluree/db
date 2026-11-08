@@ -2696,6 +2696,72 @@ mod tests {
         assert!(ns_registry.has_prefix("http://example.org/"));
     }
 
+    /// A context's coercion writes what the explicit form beside it does: a
+    /// `@vocab` term an IRI, a `@json` term one JSON literal, a typed term no
+    /// default language, a term's `"@language": null` no language, a `null`
+    /// term nothing, and an `@index` map the values under its keys.
+    #[test]
+    fn context_coercions_write_their_explicit_forms() {
+        let templates = |ctx: Value, body: Value| {
+            let mut doc = json!({"@context": ctx, "@id": "ex:s"});
+            doc.as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
+            parse_doc(&doc, TxnType::Insert)
+                .map(|txn| format!("{:?}", txn.insert_templates))
+                .map_err(|e| e.to_string())
+        };
+        let ex = json!({"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
+        let with = |terms: Value| {
+            let mut ctx = ex.clone();
+            ctx.as_object_mut()
+                .unwrap()
+                .extend(terms.as_object().unwrap().clone());
+            ctx
+        };
+        let cases = [
+            (
+                with(json!({"k": {"@id": "ex:k", "@type": "@vocab"}, "K": "ex:K"})),
+                json!({"k": "K"}),
+                json!({"ex:k": {"@id": "ex:K"}}),
+            ),
+            (
+                with(json!({"d": {"@id": "ex:d", "@type": "@json"}})),
+                json!({"d": [1, {"a": true}]}),
+                json!({"ex:d": {"@value": [1, {"a": true}], "@type": "@json"}}),
+            ),
+            (
+                with(json!({"@language": "en", "n": {"@id": "ex:n", "@type": "xsd:integer"}})),
+                json!({"n": "5"}),
+                json!({"ex:n": {"@value": "5", "@type": "xsd:integer"}}),
+            ),
+            (
+                with(json!({"@language": "en", "t": {"@id": "ex:t", "@language": null}})),
+                json!({"t": "v"}),
+                json!({"ex:t": "v"}),
+            ),
+            (
+                with(json!({"@vocab": "http://example.org/", "gone": null})),
+                json!({"gone": "x", "ex:u": "w"}),
+                json!({"ex:u": "w"}),
+            ),
+            (
+                with(json!({"m": {"@id": "ex:m", "@container": "@index"}})),
+                json!({"m": {"a": {"@id": "ex:o"}, "b": "x"}}),
+                json!({"ex:m": [{"@id": "ex:o"}, "x"]}),
+            ),
+        ];
+        let differing: Vec<String> = cases
+            .into_iter()
+            .filter(|(ctx, coerced, explicit)| {
+                let expected = templates(ex.clone(), explicit.clone());
+                expected.is_err() || templates(ctx.clone(), coerced.clone()) != expected
+            })
+            .map(|(ctx, coerced, _)| format!("{coerced} under {ctx}"))
+            .collect();
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
     /// `rdf:type` as a key writes the type `@type` would, also as a list,
     /// and refuses a literal, which would type the node with a string.
     #[test]

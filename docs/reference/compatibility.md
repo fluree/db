@@ -70,6 +70,8 @@ Fluree supports JSON-LD 1.1:
 - @reverse, @included and @nest
 - @value and @type for literals
 - @language for language tags
+- Term definitions that coerce values with `@type` (`@id`, `@vocab`, `@json` or a datatype) or set `@language` (`null` included), and terms defined as `null`, whose properties are dropped
+- `@container` values `@list`, `@set`, `@language` and `@index`
 - Nested objects
 - Arrays
 - @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
@@ -80,6 +82,8 @@ Deviations from the JSON-LD 1.1 expansion algorithm:
 - Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
 - A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
 - A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
+- A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
+- `@container` values `@id`, `@type` and `@graph` are refused, as is a property-valued `@index`.
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 

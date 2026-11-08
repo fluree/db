@@ -871,11 +871,19 @@ fn parse_property(
         (UnresolvedTerm::iri(&pred_iri), entry, is_reverse)
     };
 
-    // Determine if this property is typed as @id (reference)
+    // A `null` term names no property; matching nothing, or dropping the
+    // pattern, would each answer a different query than the one written.
+    if context_entry.as_ref().is_some_and(|e| e.null_mapping) {
+        return Err(ParseError::InvalidWhere(format!(
+            "'{key}' is defined as null in the @context and names no property"
+        )));
+    }
+
+    // Determine if this property is typed as @id or @vocab (reference)
     let mut is_ref_type = context_entry
         .as_ref()
         .and_then(|e| e.type_.as_ref())
-        .is_some_and(|t| matches!(t, TypeValue::Id));
+        .is_some_and(|t| matches!(t, TypeValue::Id | TypeValue::Vocab));
 
     // rdf:type always expects an IRI object, even if not annotated in @context.
     if matches!(predicate, UnresolvedTerm::Iri(ref iri) if iri.as_ref() == RDF_TYPE) {
