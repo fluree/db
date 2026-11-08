@@ -816,14 +816,20 @@ impl GraphDb {
     }
 
     /// This view reading through `overlay`, which merges facts reasoning
-    /// derived over the view's own, under its policy for reasoning queries:
-    /// class policies select by the subject's reasoned classes.
+    /// derived over the view's own, under [`Self::with_reasoned_policy`].
     pub(crate) fn reasoned(&self, overlay: Arc<dyn OverlayProvider>) -> Self {
         let mut view = self.clone();
         view.overlay = overlay;
-        match &self.policy {
-            Some(policy) => view.with_policy(Arc::new(policy.for_reasoned_query())),
-            None => view,
+        view.with_reasoned_policy()
+    }
+
+    /// This view under its policy for a query that reads derived facts:
+    /// class policies select by the subject's reasoned classes. The policy
+    /// and its enforcer change together; a view without one is unchanged.
+    pub(crate) fn with_reasoned_policy(self) -> Self {
+        match self.policy.clone() {
+            Some(policy) => self.with_policy(Arc::new(policy.for_reasoned_query())),
+            None => self,
         }
     }
 

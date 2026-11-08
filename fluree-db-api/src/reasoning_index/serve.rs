@@ -367,6 +367,8 @@ impl Fluree {
 
 /// `base` with a generation's state in place of its own: the same ledger,
 /// configuration and graph, reading the generation's index at its basis.
+/// That index holds derived facts, so `base`'s policy judges them as it does
+/// in a reasoning query; `base` itself is unchanged.
 pub(crate) fn generation_view(base: &GraphDb, generation: &LedgerState) -> GraphDb {
     let generation = GraphDb::from_ledger_state(generation);
     let mut view = base.clone();
@@ -378,5 +380,124 @@ pub(crate) fn generation_view(base: &GraphDb, generation: &LedgerState) -> Graph
     view.binary_store = generation.binary_store;
     view.dict_novelty = generation.dict_novelty;
     view.runtime_small_dicts = generation.runtime_small_dicts;
-    view
+    view.with_reasoned_policy()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::{IndexType, RangeMatch, RangeTest, Tracker};
+    use serde_json::json;
+
+    /// A restricted view's generation judges by reasoned classes: a rule
+    /// makes `ex:alice` a `HighEarner`, so a deny on that class hides her
+    /// stored salary there. The view's policy and enforcer agree, and the
+    /// base view keeps its ordinary policy.
+    #[tokio::test]
+    async fn a_generation_view_judges_by_reasoned_classes() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "serve/generation-policy:main";
+        let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+        let rule = json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?p", "ex:salary": "?s"}, ["filter", "(> ?s 200000)"]],
+            "insert": {"@id": "?p", "@type": "ex:HighEarner"}
+        });
+        let ledger = fluree.create_ledger(id).await.unwrap();
+        fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@graph": [
+                    {"@id": "ex:rule", "f:rule": {"@type": "@json", "@value": rule}},
+                    {"@id": "ex:alice", "ex:salary": 250_000}
+                ]}),
+            )
+            .await
+            .unwrap();
+        let index = fluree
+            .register_reasoning_index(id, &json!({"reasoning": "datalog"}))
+            .await
+            .unwrap();
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+
+        let ledger = fluree.ledger(id).await.unwrap();
+        let opts = crate::GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "ex:denyHighEarner",
+                "f:required": true,
+                "f:onClass": [{"@id": "http://example.org/HighEarner"}],
+                "f:action": "f:view",
+                "f:allow": false
+            }])),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let base = fluree
+            .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+            .await
+            .unwrap();
+        let query = json!({
+            "@context": ctx,
+            "select": "?v",
+            "where": {"@id": "ex:alice", "ex:salary": "?v"},
+            "reasoning": "datalog"
+        });
+        let (_, parsed) =
+            crate::query::helpers::parse_jsonld_query(&query, &base.snapshot, None, None).unwrap();
+        let executable = fluree
+            .build_executable_for_view(&base, &parsed, None)
+            .await
+            .unwrap();
+        let served = fluree
+            .try_servable(&base, &executable.reasoning, false)
+            .await
+            .unwrap()
+            .expect("a generation at the base's commit");
+        let view = &served.view;
+
+        let policy = view.policy().unwrap();
+        assert!(std::ptr::eq(
+            policy.view_set(),
+            policy.wrapper().reasoned_view()
+        ));
+        assert!(std::ptr::eq(
+            view.policy_enforcer().unwrap().policy(),
+            policy
+        ));
+        let ordinary = base.policy().unwrap();
+        assert!(std::ptr::eq(ordinary.view_set(), ordinary.wrapper().view()));
+
+        let db = view.as_graph_db_ref();
+        let alice = view
+            .snapshot
+            .encode_iri("http://example.org/alice")
+            .unwrap();
+        let salary = view
+            .snapshot
+            .encode_iri("http://example.org/salary")
+            .unwrap();
+        let flakes = db
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject_predicate(alice, salary),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flakes.len(), 1);
+        let visible = view
+            .policy_enforcer()
+            .unwrap()
+            .filter_flakes_for_graph(
+                db.snapshot,
+                db.g_id,
+                db.overlay,
+                db.t,
+                &Tracker::disabled(),
+                flakes,
+            )
+            .await
+            .unwrap();
+        assert!(visible.is_empty(), "{visible:?}");
+    }
 }
