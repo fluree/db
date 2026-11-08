@@ -225,22 +225,11 @@ async fn clean(
     use std::sync::atomic::Ordering;
     let (purged, holders, reported) = {
         let state = state.read().await;
-        let installed = node.installed_through();
-        let cleaned = node.cleaned.load(Ordering::Acquire);
-        let mut purged = None;
-        let mut holders = std::collections::BTreeSet::new();
-        for (activation, index) in &state.erasure_cleanup.purged {
-            if *activation >= installed {
-                continue;
-            }
-            purged = purged.max(Some(*index));
-            if *index > cleaned {
-                if let Some(applied) = state.erasure.activations.get(activation) {
-                    holders.extend(applied.holders.iter().map(RefKey::ledger_id));
-                }
-            }
-        }
-        let holders: Vec<String> = holders.into_iter().collect();
+        let (purged, holders) = cleanable(
+            &state,
+            node.installed_through(),
+            node.cleaned.load(Ordering::Acquire),
+        );
         (
             purged,
             holders,
@@ -272,9 +261,89 @@ async fn clean(
     }
 }
 
+/// The purges a node that installed every activation below `installed`
+/// and cleaned after every purge through `cleaned` can clean now: the
+/// highest purge index its cleanup would cover, and the holders of the
+/// purges past `cleaned` it takes. A report covers every purge up to its
+/// index, so a purge of an activation not installed here holds back each
+/// purge recorded after it too.
+fn cleanable(
+    state: &crate::raft::state_machine::NameServiceState,
+    installed: u64,
+    cleaned: u64,
+) -> (Option<u64>, Vec<String>) {
+    let purges = &state.erasure_cleanup.purged;
+    let waiting = purges
+        .iter()
+        .filter(|(activation, _)| **activation >= installed)
+        .map(|(_, index)| *index)
+        .min();
+    let mut through = None;
+    let mut holders = std::collections::BTreeSet::new();
+    for (activation, index) in purges {
+        if waiting.is_some_and(|waiting| *index >= waiting) {
+            continue;
+        }
+        through = through.max(Some(*index));
+        if *index > cleaned {
+            if let Some(applied) = state.erasure.activations.get(activation) {
+                holders.extend(applied.holders.iter().map(RefKey::ledger_id));
+            }
+        }
+    }
+    (through, holders.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A purge of an activation this node has not installed holds back
+    /// the report of every purge recorded after it: the report would
+    /// cover it, and once installed, the node would never clean it.
+    #[test]
+    fn a_purge_not_installed_here_holds_back_later_ones() {
+        use crate::raft::state_machine::Activation;
+        let mut state = crate::raft::state_machine::NameServiceState::default();
+        for (number, ledger) in [(3, "a"), (5, "b")] {
+            state.erasure.activations.insert(
+                number,
+                Activation {
+                    manifest: String::new(),
+                    holders: vec![RefKey::new(ledger, "main")],
+                    log_index: 0,
+                    applied_at_millis: 0,
+                },
+            );
+        }
+        // Activation 5's purge recorded first, 3's after.
+        state.erasure_cleanup.purged.insert(5, 100);
+        state.erasure_cleanup.purged.insert(3, 200);
+
+        // Installed through 3 (activations below 4): 5 waits, and so
+        // does 3's later purge.
+        assert_eq!(cleanable(&state, 4, 0), (None, Vec::new()));
+        // Installed through 5: both, from the start.
+        assert_eq!(
+            cleanable(&state, 6, 0),
+            (Some(200), vec!["a:main".to_string(), "b:main".to_string()])
+        );
+        // An earlier purge alone, while a later one waits.
+        state.erasure_cleanup.purged.insert(2, 50);
+        state.erasure.activations.insert(
+            2,
+            Activation {
+                manifest: String::new(),
+                holders: vec![RefKey::new("c", "main")],
+                log_index: 0,
+                applied_at_millis: 0,
+            },
+        );
+        assert_eq!(
+            cleanable(&state, 4, 0),
+            (Some(50), vec!["c:main".to_string()])
+        );
+    }
 
     /// A node keeps its storage incarnation across runs on the same
     /// storage, and reports each run as its own.
