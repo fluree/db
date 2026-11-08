@@ -1420,3 +1420,67 @@ async fn a_removal_before_the_first_pass_keeps_earlier_ttls() {
         .await
         .is_empty());
 }
+
+/// A graph's drop ends what it held, its lifetimes with it: the same value
+/// written to the graph again, after the drop or in the drop's own request,
+/// is a new occurrence, which does not expire on the old deadline.
+#[tokio::test]
+async fn a_graph_drop_ends_its_values_lifetimes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-graph-drop").await;
+    let update = |sparql: &'static str| {
+        let fluree = fluree.clone();
+        let id = id.clone();
+        async move {
+            fluree
+                .graph(&id)
+                .transact()
+                .sparql_update(sparql)
+                .commit()
+                .await
+                .expect(sparql);
+        }
+    };
+    let in_graph = |graph: &'static str| {
+        let fluree = fluree.clone();
+        let id = id.clone();
+        async move {
+            let query = json!({
+                "@context": ctx(),
+                "from": id,
+                "select": "?o",
+                "where": {"@graph": graph, "@id": "ex:s", "ex:v": "?o"}
+            });
+            let ledger = fluree.ledger(&id).await.unwrap();
+            fluree
+                .query_connection(&query)
+                .await
+                .unwrap()
+                .to_jsonld(&ledger.snapshot)
+                .unwrap()
+        }
+    };
+    update(
+        "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+         INSERT DATA { GRAPH ex:g1 { ex:s ex:v \"a\" {| f:ttl 60 |} . }
+                       GRAPH ex:g2 { ex:s ex:v \"b\" {| f:ttl 60 |} . } }",
+    )
+    .await;
+    update("DROP GRAPH <http://example.org/g1>").await;
+    update("PREFIX ex: <http://example.org/> INSERT DATA { GRAPH ex:g1 { ex:s ex:v \"a\" } }")
+        .await;
+    update(
+        "PREFIX ex: <http://example.org/>
+         DROP GRAPH ex:g2 ;
+         INSERT DATA { GRAPH ex:g2 { ex:s ex:v \"b\" } }",
+    )
+    .await;
+
+    let report = fluree
+        .run_retention_at(&id, now_ms() + HOUR_MS)
+        .await
+        .expect("pass");
+    assert_eq!((report.pending, report.expired), (0, 0), "{report:?}");
+    assert_eq!(in_graph("ex:g1").await, json!(["a"]));
+    assert_eq!(in_graph("ex:g2").await, json!(["b"]));
+}

@@ -300,6 +300,28 @@ async fn discover_commit(
         .filter(|e| e.predicate_ns == FLUREE_DB)
         .find_map(Lifetime::of_txn_meta);
 
+    // A graph's drop ends what it held, before the commit's own writes:
+    // nothing it held is due to expire, and a value written to it again is
+    // a new occurrence.
+    if !commit.graph_drops.is_empty() {
+        let mut dropped = |g: &Option<Sid>| {
+            let iri = match g {
+                None => Some(fluree_db_core::DEFAULT_GRAPH_IRI.to_string()),
+                Some(g) => ctx.iris.iri(&ctx.state.snapshot, g),
+            };
+            iri.is_some_and(|iri| commit.graph_drops.contains(&iri))
+        };
+        let ended: Vec<FactKey> = schedule
+            .entries()
+            .map(|(k, _)| k.clone())
+            .filter(|k| dropped(&k.g))
+            .collect();
+        for key in &ended {
+            schedule.remove(key);
+        }
+        schedule.retire.retain(|r| !dropped(&r.g));
+    }
+
     // Per-value instructions are honored only in commits the transactor
     // marked: annotations written before TTL support are not instructions.
     let mut instructions: HashMap<FactKey, Instruction> = HashMap::new();
