@@ -51,9 +51,14 @@ See [Edge annotations](../concepts/edge-annotations.md).
 Base-direction language tags (`"text"@en--ltr`) parse and round-trip, but are
 stored as a single `rdf:langString` whose language is the whole `en--ltr`
 string, rather than as `rdf:dirLangString` with a separate direction. Nothing
-is dropped, but `LANG()` returns `en--ltr`, JSON-LD output carries that in
-`@language`, and `langMatches(?l, "en")` will not match it. First-class
-`rdf:dirLangString` is a future extension.
+is dropped, but `LANG()` returns `en--ltr`, and `langMatches(?l, "en")` will
+not match it. JSON-LD reads a value object's `@direction` into that tag
+(`{"@value": "text", "@language": "en", "@direction": "ltr"}` is
+`"text"@en--ltr`, in a transaction, a query or `fluree.parse`) and writes the
+tag back as `@language` and `@direction`. A `@direction` with no language is
+dropped, as JSON-LD's conversion to RDF drops it; a default `@direction` in a
+`@context` is not read. First-class `rdf:dirLangString` is a future
+extension.
 
 **Specification:** https://www.w3.org/TR/rdf12-concepts/
 

@@ -642,10 +642,17 @@ fn term_to_object(
 fn format_literal(value: &LiteralValue, datatype: &Datatype, language: Option<&str>) -> JsonValue {
     // Handle language-tagged strings
     if let Some(lang) = language {
-        return json!({
-            "@value": literal_value_to_json(value),
-            "@language": lang
-        });
+        return match fluree_vocab::rdf::split_base_direction(lang) {
+            (lang, Some(direction)) => json!({
+                "@value": literal_value_to_json(value),
+                "@language": lang,
+                "@direction": direction
+            }),
+            (lang, None) => json!({
+                "@value": literal_value_to_json(value),
+                "@language": lang
+            }),
+        };
     }
 
     // Handle values with inferable types (output as plain JSON values)
@@ -932,6 +939,22 @@ mod tests {
         let name = &result["@graph"][0]["http://xmlns.com/foaf/0.1/name"];
         assert_eq!(name["@value"], "Alicia");
         assert_eq!(name["@language"], "es");
+    }
+
+    /// A directional string's tag (`ar--rtl`) is written as its language
+    /// and its `@direction`: the tag itself is no valid `@language`.
+    #[test]
+    fn directional_string_writes_its_direction() {
+        let mut graph = Graph::new();
+        graph.add_triple(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::lang_string("مرحبا", "ar--rtl"),
+        );
+        let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+        let value = &result["@graph"][0]["http://example.org/p"];
+        assert_eq!(value["@language"], "ar", "{result}");
+        assert_eq!(value["@direction"], "rtl", "{result}");
     }
 
     #[test]

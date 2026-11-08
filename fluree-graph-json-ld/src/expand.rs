@@ -465,6 +465,7 @@ fn parse_value_object(
         .and_then(|l| l.as_str())
         .map(std::string::ToString::to_string)
         .or_else(|| context.language.clone());
+    let direction = base_direction(map)?;
 
     // Build result
     let mut obj = Map::new();
@@ -484,7 +485,11 @@ fn parse_value_object(
             }
             obj.insert("@type".to_string(), json!(t));
         } else if let Some(l) = lang {
-            obj.insert("@language".to_string(), json!(l));
+            let tag = match direction {
+                Some(direction) => format!("{l}--{direction}"),
+                None => l,
+            };
+            obj.insert("@language".to_string(), json!(tag));
         }
     }
 
@@ -500,6 +505,20 @@ fn parse_value_object(
     }
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// A value object's `@direction`, which Fluree joins to its language tag as
+/// RDF 1.2 writes it (`ar` and `rtl` are `ar--rtl`). A string with a
+/// direction but no language is plain, as JSON-LD's RDF conversion makes it.
+fn base_direction(map: &Map<String, JsonValue>) -> Result<Option<&str>> {
+    match map.get("@direction") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(d)) if d == "ltr" || d == "rtl" => Ok(Some(d.as_str())),
+        Some(_) => Err(JsonLdError::InvalidKeywordValue {
+            keyword: "@direction",
+            reason: "a base direction is \"ltr\" or \"rtl\"",
+        }),
+    }
 }
 
 /// Parse @type values and return expanded types with potentially updated
@@ -1734,6 +1753,43 @@ mod tests {
                 "{propagated}"
             );
         }
+    }
+
+    /// A value object's `@direction` joins its language tag (`ar--rtl`), the
+    /// form RDF 1.2 and Fluree hold it in; with no language it is dropped,
+    /// and a direction other than `ltr` or `rtl` is refused.
+    #[test]
+    fn direction_joins_the_language_tag() {
+        let value = |object: JsonValue, context: JsonValue| {
+            let doc =
+                json!({"@context": context, "@id": "http://ex.org/s", "http://ex.org/p": object});
+            crate::expand(&doc).map(|expanded| expanded["http://ex.org/p"][0].clone())
+        };
+        assert_eq!(
+            value(
+                json!({"@value": "v", "@language": "ar", "@direction": "rtl"}),
+                json!({})
+            )
+            .unwrap(),
+            json!({"@value": "v", "@language": "ar--rtl"})
+        );
+        assert_eq!(
+            value(
+                json!({"@value": "v", "@direction": "ltr"}),
+                json!({"@language": "en"})
+            )
+            .unwrap(),
+            json!({"@value": "v", "@language": "en--ltr"})
+        );
+        assert_eq!(
+            value(json!({"@value": "v", "@direction": "rtl"}), json!({})).unwrap(),
+            json!({"@value": "v"})
+        );
+        assert!(value(
+            json!({"@value": "v", "@language": "ar", "@direction": "up"}),
+            json!({})
+        )
+        .is_err());
     }
 
     /// A property's scoped context applies to every node object it holds,
