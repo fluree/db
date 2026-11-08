@@ -3440,3 +3440,243 @@ async fn a_purge_keeps_a_branchs_own_current_value_of_the_same_fact() {
         [json!("a@secret")]
     );
 }
+
+const DROPPED: &str = "http://example.org/graphs/dropped";
+
+async fn sparql_update(fluree: &Fluree, ledger_id: &str, sparql: &str) -> i64 {
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    fluree
+        .stage(&handle)
+        .sparql_update(sparql)
+        .execute()
+        .await
+        .expect("update")
+        .receipt
+        .t
+}
+
+async fn listed_graphs(fluree: &Fluree, ledger_id: &str) -> Vec<String> {
+    let info = fluree.ledger_info(ledger_id).execute().await.expect("info");
+    info["ledger"]["named-graphs"]
+        .as_array()
+        .expect("named-graphs")
+        .iter()
+        .filter_map(|graph| graph["iri"].as_str().map(String::from))
+        .collect()
+}
+
+fn email_in(graph: &str, subject: &str, value: &str) -> ErasureRequest {
+    ErasureRequest {
+        matching: vec![FactSelector {
+            subject: format!("http://example.org/{subject}"),
+            predicate: "http://example.org/email".into(),
+            graph: Some(graph.into()),
+            object: Some(json!(value)),
+        }],
+        ..Default::default()
+    }
+}
+
+/// A graph's drop ends what it held: a value the drop took is erased from
+/// the commit that wrote it, and the removal retracts nothing, so the
+/// graph stays dropped.
+#[tokio::test]
+async fn a_value_its_graphs_drop_ended_is_erased_without_a_retraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-dropped").await;
+    let written = sparql_update(
+        &fluree,
+        &id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{DROPPED}> {{
+               ex:alice ex:email \"alice@secret.example\" .
+               ex:bob ex:email \"bob@kept.example\" }} }}"
+        ),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, written).await;
+    sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    assert!(!listed_graphs(&fluree, &id)
+        .await
+        .contains(&DROPPED.to_string()));
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            email_in(DROPPED, "alice", "alice@secret.example"),
+            Some("did:example:officer".into()),
+        )
+        .await
+        .expect("erase");
+    assert_eq!(receipt.manifest.len(), 1, "{receipt:?}");
+    assert_eq!(receipt.removals[0].removal.retracted_t, None, "{receipt:?}");
+    assert!(
+        !listed_graphs(&fluree, &id)
+            .await
+            .contains(&DROPPED.to_string()),
+        "the removal wrote nothing into the dropped graph"
+    );
+
+    fluree.run_erasure_pass(&id).await.unwrap();
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw));
+    assert!(!contains(&raw, "alice@secret.example"));
+    assert!(contains(&raw, "bob@kept.example"));
+}
+
+/// A value written again after its graph's drop is current: the removal
+/// retracts that one, and erases the occurrence the drop ended too.
+#[tokio::test]
+async fn a_value_written_again_after_its_graphs_drop_is_retracted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-revived").await;
+    let insert = format!(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+    );
+    sparql_update(&fluree, &id, &insert).await;
+    sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    sparql_update(&fluree, &id, &insert).await;
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            email_in(DROPPED, "alice", "alice@secret.example"),
+            Some("did:example:officer".into()),
+        )
+        .await
+        .expect("erase");
+    // Both assertions, and the one retraction of the current value.
+    assert_eq!(receipt.manifest.len(), 3, "{receipt:?}");
+    let retracted_t = receipt.removals[0].removal.retracted_t.expect("retracted");
+    let store = store_of(&fluree, &id).await;
+    let retraction = load_commit_by_id(store.as_ref(), &commit_at(&fluree, &id, retracted_t).await)
+        .await
+        .unwrap();
+    assert_eq!(retraction.flakes.len(), 1, "{:?}", retraction.flakes);
+    let db = fluree.db(&id).await.unwrap();
+    let rows = fluree
+        .query(
+            &db,
+            &format!(
+                "PREFIX ex: <http://example.org/>
+                 SELECT ?o WHERE {{ GRAPH <{DROPPED}> {{ ex:alice ex:email ?o }} }}"
+            ),
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&db.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([]));
+}
+
+/// A copy of a history holding the drop, restored after the erasure with an
+/// index built before the drop, takes the removal as it is restored and
+/// retracts nothing, so its graph stays dropped as well.
+#[tokio::test]
+async fn a_copy_holding_the_drop_retracts_nothing_into_the_dropped_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-dropped-copied").await;
+    sparql_update(
+        &fluree,
+        &id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+        ),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let dropped_t = sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, true, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(
+            &id,
+            email_in(DROPPED, "alice", "alice@secret.example"),
+            None,
+        )
+        .await
+        .expect("erase");
+
+    let copy = fluree
+        .restore_ledger("it/erase-dropped-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let copy_t = fluree
+        .nameservice()
+        .lookup(&copy)
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_t;
+    assert_eq!(copy_t, dropped_t, "nothing retracted in the copy");
+    assert!(!listed_graphs(&fluree, &copy)
+        .await
+        .contains(&DROPPED.to_string()));
+}
+
+/// A named assertion its graph's drop ended takes no retraction with it: a
+/// later retraction ends the value written again after the drop.
+#[tokio::test]
+async fn a_named_occurrence_its_graphs_drop_ended_takes_no_later_retraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-dropped-span").await;
+    let insert = format!(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+    );
+    let written = sparql_update(&fluree, &id, &insert).await;
+    sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    sparql_update(&fluree, &id, &insert).await;
+    sparql_update(
+        &fluree,
+        &id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             DELETE DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+        ),
+    )
+    .await;
+    let asserted = commit_at(&fluree, &id, written).await;
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                occurrences: vec![fluree_db_api::retention::OccurrenceRef {
+                    commit: asserted.to_string(),
+                    slot: 0,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    assert_eq!(
+        receipt.manifest,
+        [fluree_db_api::retention::OccurrenceRef {
+            commit: asserted.to_string(),
+            slot: 0,
+        }],
+        "{receipt:?}"
+    );
+}

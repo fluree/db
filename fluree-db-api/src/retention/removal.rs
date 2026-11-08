@@ -531,10 +531,11 @@ fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Resul
         }
     }
     let events = fact_events(commits);
+    let drops = graph_drops(read);
     if widening.pair_spans {
         let pairs: Vec<Located> = located
             .iter()
-            .filter_map(|loc| span_pair(loc, &events, commits))
+            .filter_map(|loc| span_pair(loc, &events, &drops, commits))
             .collect();
         located.extend(pairs);
     }
@@ -553,7 +554,7 @@ fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Resul
     }
     if widening.bounded {
         for loc in &located {
-            let Some(pair) = span_pair(loc, &events, commits) else {
+            let Some(pair) = span_pair(loc, &events, &drops, commits) else {
                 continue;
             };
             if !located.iter().any(|l| l.occurrence == pair.occurrence) {
@@ -570,17 +571,22 @@ fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Resul
     }
 
     // The span of each occurrence: an assertion runs to the fact's
-    // next retraction; a retraction ends the assertion before it.
+    // next retraction or its graph's next drop; a retraction ends the
+    // assertion before it.
     let mut spans: Vec<(i64, Option<i64>)> = Vec::with_capacity(located.len());
     let mut current: Vec<Flake> = Vec::new();
     for loc in &located {
         let key = FactKey::of(&loc.flake);
         let timeline = events.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         if loc.flake.op {
-            let until = timeline
+            let retracted = timeline
                 .iter()
                 .find(|e| e.t > loc.flake.t && !e.op)
                 .map(|e| e.t);
+            let until = retracted
+                .into_iter()
+                .chain(dropped_after(&drops, &loc.flake.g, loc.flake.t))
+                .min();
             if until.is_none() {
                 current.push(loc.flake.clone());
             }
@@ -601,16 +607,55 @@ fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Resul
     })
 }
 
+/// When each graph was dropped, ascending, keyed as a flake names its graph
+/// (`None` for the default graph).
+fn graph_drops(read: &History) -> HashMap<Option<Sid>, Vec<i64>> {
+    let mut drops: HashMap<Option<Sid>, Vec<i64>> = HashMap::new();
+    for (t, _, commit) in &read.commits {
+        for iri in &commit.graph_drops {
+            let graph = if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+                None
+            } else {
+                let Some(sid) = read.state.snapshot.encode_iri(iri) else {
+                    continue;
+                };
+                Some(sid)
+            };
+            drops.entry(graph).or_default().push(*t);
+        }
+    }
+    for ts in drops.values_mut() {
+        ts.sort_unstable();
+    }
+    drops
+}
+
+/// The first drop of `graph` after `t`, which ends what it held at `t`. A
+/// drop applies before its own commit's writes.
+fn dropped_after(
+    drops: &HashMap<Option<Sid>, Vec<i64>>,
+    graph: &Option<Sid>,
+    t: i64,
+) -> Option<i64> {
+    drops.get(graph)?.iter().copied().find(|d| *d > t)
+}
+
 /// The occurrence bounding `loc`'s span in `commits`: an assertion's
-/// retraction, a retraction's assertion.
+/// retraction, unless its graph's drop ended it first; a retraction's
+/// assertion.
 fn span_pair(
     loc: &Located,
     events: &HashMap<FactKey, Vec<Event>>,
+    drops: &HashMap<Option<Sid>, Vec<i64>>,
     commits: &[(i64, ContentId, fluree_db_core::Commit)],
 ) -> Option<Located> {
     let timeline = events.get(&FactKey::of(&loc.flake))?;
     let pair = if loc.flake.op {
-        timeline.iter().find(|e| e.t > loc.t && !e.op)
+        let dropped = dropped_after(drops, &loc.flake.g, loc.t);
+        timeline
+            .iter()
+            .find(|e| e.t > loc.t && !e.op)
+            .filter(|e| dropped.is_none_or(|d| e.t < d))
     } else {
         timeline.iter().rev().find(|e| e.t < loc.t && e.op)
     }?;
