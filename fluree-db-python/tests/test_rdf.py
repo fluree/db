@@ -10,7 +10,7 @@ import fluree
 from fluree import IRI, BlankNode, InvalidRequestError, LangString, Literal, Quad, Triple
 
 EX = "http://example.org/"
-REIFIES = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies"
+REIFIES = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies")
 XSD = "http://www.w3.org/2001/XMLSchema#"
 PREFIXES = f"PREFIX ex: <{EX}>\nPREFIX xsd: <{XSD}>\n"
 
@@ -367,3 +367,70 @@ def test_a_quad_takes_plain_strings_as_iris():
     for args in [(1, EX + "p", 1), (EX + "s", BlankNode("p"), 1), (EX + "s", EX + "p", 1, 5)]:
         with pytest.raises(TypeError):
             Quad(*args)
+
+
+def test_terms_compare_as_rdf_terms_do():
+    # An IRI, a blank node, a plain string and each tagged string are five
+    # terms, though their text is one.
+    terms = [ex("Paris"), BlankNode(EX + "Paris"), EX + "Paris", LangString(EX + "Paris", "fr"), LangString(EX + "Paris", "en")]
+    assert len(set(terms)) == 5
+    assert ex("x") != EX + "x" and EX + "x" != ex("x")
+    assert ex("x") == IRI(EX + "x") and hash(ex("x")) == hash(IRI(EX + "x"))
+    assert LangString("chat", "FR") == LangString("chat", "fr")
+    assert LangString("chat", "fr") != "chat"
+    assert ex("x") < ex("y") and ex("x").startswith("http:")
+    # Five quads stay five, and value-mode literals stay apart by kind.
+    assert len({Quad(ex("s"), ex("p"), term) for term in terms}) == 5
+    assert len({Quad(ex("s"), ex("p"), value) for value in [1, True, 1.0, Decimal(1)]}) == 4
+    assert len({Quad(ex("s"), ex("p"), {"a": [1]}), Quad(ex("s"), ex("p"), {"a": [1]})}) == 1
+
+
+def test_parsed_terms_keep_their_kinds_in_a_set():
+    doc = f'{PREFIXES}ex:s ex:p ex:o, "{EX}o", "fund", "fund"@en .'
+    assert len(set(fluree.parse(doc, "turtle"))) == 4
+
+
+def test_an_iri_and_a_datatype_are_checked():
+    for text in ["not an iri", "relative/path", "", "http://e/a b", "http://e/<x>"]:
+        with pytest.raises(ValueError):
+            IRI(text)
+    with pytest.raises(ValueError):
+        Literal("x", "notadatatype")
+    with pytest.raises(ValueError):
+        Quad("relative", EX + "p", 1)
+    assert IRI("urn:isbn:0451450523") == IRI("urn:isbn:0451450523")
+
+
+def test_a_direction_is_its_own_field():
+    rtl = LangString("مرحبا", "ar", "rtl")
+    assert (rtl.language, rtl.direction) == ("ar", "rtl")
+    assert LangString("مرحبا", "ar--rtl") == rtl and rtl != LangString("مرحبا", "ar")
+    with pytest.raises(ValueError):
+        LangString("x", "ar", "up")
+    assert pickle.loads(pickle.dumps(rtl)) == rtl
+    (quad,) = fluree.parse(f'{PREFIXES}ex:s ex:p "مرحبا"@ar--rtl .', "turtle")
+    assert quad.object == rtl
+    (quad,) = fluree.parse({"@id": EX + "s", EX + "p": {"@value": "مرحبا", "@language": "ar", "@direction": "rtl"}}, "jsonld")
+    assert quad.object == rtl
+    written = fluree.serialize([quad], "jsonld")
+    assert '"@direction": "rtl"' in written and '"@language": "ar"' in written
+
+
+def test_ntriples_writes_a_term_or_a_quad():
+    assert fluree.ntriples(ex("x")) == f"<{EX}x>"
+    assert fluree.ntriples(BlankNode("b0")) == "_:b0"
+    assert fluree.ntriples("say \"hi\"") == '"say \\"hi\\""'
+    assert fluree.ntriples(LangString("chat", "fr")) == '"chat"@fr'
+    assert fluree.ntriples(1) == f'"1"^^<{XSD}integer>'
+    assert fluree.ntriples(Triple(ex("a"), ex("p"), ex("b"))) == f"<<( <{EX}a> <{EX}p> <{EX}b> )>>"
+    quad = Quad(ex("s"), ex("p"), "v", ex("g"))
+    assert str(quad) == f'<{EX}s> <{EX}p> "v" <{EX}g> .'
+    assert str(quad) == fluree.serialize([quad], "nquads").strip()
+
+
+def test_bytes_parse_as_utf8_text():
+    doc = f'{PREFIXES}ex:s ex:p "é" .'
+    assert fluree.parse(doc.encode(), "turtle") == fluree.parse(doc, "turtle")
+    assert fluree.parse(b"\xef\xbb\xbf" + doc.encode(), "turtle") == fluree.parse(doc, "turtle")
+    with pytest.raises(InvalidRequestError, match="not UTF-8"):
+        fluree.parse(b"\xff\xfe", "turtle")

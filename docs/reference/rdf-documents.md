@@ -131,8 +131,10 @@ object is a triple term into a reification.
 - **An IRI left relative after expansion is an error.** This is usually a
   property with no `@context` entry. JSON-LD processors usually drop such a
   property without telling you; Fluree's reader names it instead.
-- **`@direction` is not read.** Write the base direction in `@language`
-  (`"ar--rtl"`), as the writer does.
+- **`@direction` is read from a value object only.** It joins the language
+  tag (`ar` and `rtl` read as `"…"@ar--rtl`), and the writer gives it back as
+  `@language` and `@direction`. A default `@direction` in a `@context` is not
+  read, and a direction with no language is dropped.
 - **A JSON number can lose its declared datatype in Rust.** A number typed
   anything but `xsd:integer` or `xsd:double`, such as
   `{"@value": 5, "@type": "xsd:long"}`, is written back by `rdf::serialize`

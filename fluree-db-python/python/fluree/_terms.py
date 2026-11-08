@@ -4,9 +4,10 @@ Literals become the Python type their datatype names (``int``, ``float``,
 ``Decimal``, ``datetime``, ...). Anything without a lossless Python type stays
 a :class:`Literal` carrying its lexical form and datatype, so no information
 is dropped. IRIs, blank nodes and language-tagged strings are ``str``
-subclasses: they print and compare like strings but keep what they are. An
-RDF 1.2 triple term is a :class:`Triple`, and a statement in a dataset a
-:class:`Quad`.
+subclasses: they print, slice and pass as their text, but compare as RDF
+terms do, so an IRI equals only the same IRI, never the plain string (a
+literal) with its text. An RDF 1.2 triple term is a :class:`Triple`, and a
+statement in a dataset a :class:`Quad`.
 """
 
 from __future__ import annotations
@@ -25,56 +26,124 @@ EMBEDDING_VECTOR = "https://ns.flur.ee/db#embeddingVector"
 _T = TypeVar("_T")
 
 
+# An absolute IRI: a scheme, then no character an IRI cannot hold.
+_ABSOLUTE_IRI = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:[^\x00-\x20<>\"{}|^`\\]*\Z")
+
+
+def _check_iri(value: str, role: str) -> str:
+    if not _ABSOLUTE_IRI.match(value):
+        raise ValueError(f"{role} is an absolute IRI, not {value!r}")
+    return value
+
+
 class IRI(str):
-    """An IRI. Compares equal to the same IRI as a plain ``str``."""
+    """An absolute IRI. It is equal only to an ``IRI`` with the same text,
+    not to a plain ``str``, which is a string literal. Constructing one
+    checks it: ``IRI("not an iri")`` raises ``ValueError``."""
 
     __slots__ = ()
+
+    def __new__(cls, value: str) -> IRI:
+        if not isinstance(value, str):
+            raise TypeError(f"an IRI is made from a str, not a {type(value).__name__}")
+        return super().__new__(cls, _check_iri(value, "an IRI"))
 
     def __repr__(self) -> str:
         return f"IRI({str.__repr__(self)})"
 
-
-class BlankNode(str):
-    """A blank node, by its label (without the ``_:`` prefix)."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return f"BlankNode({str.__repr__(self)})"
-
-
-class LangString(str):
-    """A language-tagged string: a ``str`` with a ``language`` tag.
-
-    It compares like a string: equal to a plain ``str`` with the same text,
-    and to another ``LangString`` with the same text and the same tag
-    (compared case-insensitively, as BCP 47 tags are)."""
-
-    __slots__ = ("language",)
-    language: str
-
-    def __new__(cls, value: str, language: str) -> LangString:
-        s = super().__new__(cls, value)
-        s.language = language
-        return s
-
-    def __repr__(self) -> str:
-        return f"LangString({str.__repr__(self)}, language={self.language!r})"
-
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, LangString):
-            return str.__eq__(self, other) and self.language.lower() == other.language.lower()
-        return str.__eq__(self, other)
+        if isinstance(other, IRI):
+            return str.__eq__(self, other)
+        return NotImplemented if not isinstance(other, str) else False
 
     def __ne__(self, other: object) -> bool:
         equal = self.__eq__(other)
         return equal if equal is NotImplemented else not equal
 
     def __hash__(self) -> int:
-        return str.__hash__(self)
+        return hash((IRI, str.__str__(self)))
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (LangString, (str(self), self.language))
+        return (trusted_iri, (str.__str__(self),))
+
+
+def trusted_iri(text: str) -> IRI:
+    """An IRI the engine produced, made without checking it: a ledger can
+    hold IRIs written before checks were made, and reading them back must
+    not fail."""
+    return str.__new__(IRI, text)
+
+
+class BlankNode(str):
+    """A blank node, by its label (without the ``_:`` prefix). It is equal
+    only to a ``BlankNode`` with the same label."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return f"BlankNode({str.__repr__(self)})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, BlankNode):
+            return str.__eq__(self, other)
+        return NotImplemented if not isinstance(other, str) else False
+
+    def __ne__(self, other: object) -> bool:
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
+
+    def __hash__(self) -> int:
+        return hash((BlankNode, str.__str__(self)))
+
+
+class LangString(str):
+    """A language-tagged string: a ``str`` with a ``language`` tag and, in
+    RDF 1.2, a base ``direction`` (``"ltr"``, ``"rtl"`` or ``None``).
+
+    It is equal only to a ``LangString`` with the same text, the same tag
+    (compared case-insensitively, as BCP 47 tags are) and the same
+    direction; never to a plain ``str``, a string with no tag. A tag in
+    RDF 1.2's form, ``"ar--rtl"``, is taken apart: ``LangString("x",
+    "ar--rtl")`` is ``LangString("x", "ar", "rtl")``."""
+
+    __slots__ = ("language", "direction")
+    language: str
+    direction: str | None
+
+    def __new__(cls, value: str, language: str, direction: str | None = None) -> LangString:
+        if direction is None:
+            base, _, suffix = language.rpartition("--")
+            if base and suffix in ("ltr", "rtl"):
+                language, direction = base, suffix
+        elif direction not in ("ltr", "rtl"):
+            raise ValueError(f"a base direction is 'ltr' or 'rtl', not {direction!r}")
+        s = super().__new__(cls, value)
+        s.language = language
+        s.direction = direction
+        return s
+
+    def __repr__(self) -> str:
+        direction = "" if self.direction is None else f", direction={self.direction!r}"
+        return f"LangString({str.__repr__(self)}, language={self.language!r}{direction})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, LangString):
+            return (
+                str.__eq__(self, other)
+                and self.language.lower() == other.language.lower()
+                and self.direction == other.direction
+            )
+        return NotImplemented if not isinstance(other, str) else False
+
+    def __ne__(self, other: object) -> bool:
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
+
+    def __hash__(self) -> int:
+        return hash((LangString, str.__str__(self), self.language.lower(), self.direction))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (LangString, (str.__str__(self), self.language, self.direction))
 
 
 class Vector(tuple):  # type: ignore[type-arg]
@@ -113,16 +182,30 @@ def _vector(lexical: str) -> Vector:
 
 @dataclass(frozen=True, slots=True)
 class Literal:
-    """A literal with no lossless Python type, as lexical form and datatype."""
+    """A literal with no lossless Python type, as lexical form and datatype.
+    The datatype is an absolute IRI; constructing one checks it."""
 
     value: str
     datatype: str
+
+    def __post_init__(self) -> None:
+        _check_iri(self.datatype, "a literal's datatype")
 
     def __str__(self) -> str:
         return self.value
 
 
-@dataclass(frozen=True, slots=True)
+def _object_key(value: Any) -> tuple[Any, ...]:
+    """What tells one object position value from another as RDF terms do:
+    ``1``, ``True``, ``1.0`` and ``Decimal(1)`` are four literals, though
+    Python finds them equal. A JSON value (``rdf:JSON``) is keyed by its
+    canonical text, as a ``dict`` or ``list`` cannot be hashed."""
+    if isinstance(value, (dict, list)):
+        return (type(value), json.dumps(value, sort_keys=True, separators=(",", ":")))
+    return (type(value), value)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class Triple:
     """An RDF 1.2 triple term: a triple used as a value, as the object of
     ``rdf:reifies`` or of any other property, or inside another triple term.
@@ -146,8 +229,24 @@ class Triple:
     def __reduce__(self) -> tuple[Any, ...]:
         return (Triple, (self.subject, self.predicate, self.object))
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Triple):
+            return NotImplemented
+        return (self.subject, self.predicate, _object_key(self.object)) == (
+            other.subject,
+            other.predicate,
+            _object_key(other.object),
+        )
 
-@dataclass(frozen=True, slots=True)
+    def __hash__(self) -> int:
+        return hash((self.subject, self.predicate, _object_key(self.object)))
+
+    def __str__(self) -> str:
+        """The triple term in N-Triples: ``<<( s p o )>>``."""
+        return ntriples(self)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class Quad:
     """A statement in a dataset: ``subject predicate object`` in ``graph``,
     or in the default graph when ``graph`` is ``None``. It unpacks as
@@ -174,6 +273,41 @@ class Quad:
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (Quad, (self.subject, self.predicate, self.object, self.graph))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Quad):
+            return NotImplemented
+        return (self.subject, self.predicate, _object_key(self.object), self.graph) == (
+            other.subject,
+            other.predicate,
+            _object_key(other.object),
+            other.graph,
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.subject, self.predicate, _object_key(self.object), self.graph))
+
+    def __str__(self) -> str:
+        """The statement as an N-Quads line, without its newline."""
+        return ntriples(self)
+
+
+def ntriples(value: Any) -> str:
+    """A term, triple or quad in N-Triples syntax: ``<http://e/x>``,
+    ``_:b0``, ``"chat"@fr``, ``"1"^^<http://www.w3.org/2001/XMLSchema#integer>``,
+    ``<<( s p o )>>`` for a :class:`Triple`, and a whole ``s p o g .``
+    N-Quads line for a :class:`Quad`. A plain ``str`` is a string literal.
+
+    The text is what :func:`serialize` writes, so it compares and sorts
+    terms as their RDF syntax does."""
+    from fluree import _fluree
+
+    if isinstance(value, Quad):
+        parts = [value.subject, value.predicate, value.object]
+        if value.graph is not None:
+            parts.append(value.graph)
+        return " ".join(_fluree.term_ntriples(part) for part in parts) + " ."
+    return _fluree.term_ntriples(value)
 
 
 def _unchecked(cls: type[_T], fields: tuple[str, ...]) -> Callable[..., _T]:
@@ -286,7 +420,7 @@ def to_python(cell: tuple[Any, ...] | None) -> Any:
         return None
     kind = cell[0]
     if kind == "iri":
-        return IRI(cell[1])
+        return trusted_iri(cell[1])
     if kind == "bnode":
         return BlankNode(cell[1])
     if kind == "triple":
@@ -300,7 +434,7 @@ def to_python(cell: tuple[Any, ...] | None) -> Any:
             return convert(lexical)
         except ValueError:
             pass
-    return Literal(lexical, datatype)
+    return trusted_literal(lexical, datatype)
 
 
 def to_lexical(cell: tuple[Any, ...]) -> Any:
@@ -317,8 +451,9 @@ def to_lexical(cell: tuple[Any, ...]) -> Any:
         return LangString(lexical, language)
     if datatype == XSD + "string":
         return lexical
-    return Literal(lexical, datatype)
+    return trusted_literal(lexical, datatype)
 
 
 trusted_quad = _unchecked(Quad, ("subject", "predicate", "object", "graph"))
 trusted_triple = _unchecked(Triple, ("subject", "predicate", "object"))
+trusted_literal = _unchecked(Literal, ("value", "datatype"))

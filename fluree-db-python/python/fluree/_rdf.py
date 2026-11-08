@@ -26,7 +26,7 @@ _SUFFIXES: dict[str, RdfFormat] = {
 
 
 def parse(
-    data: str | os.PathLike[str] | dict[str, Any] | list[Any],
+    data: str | bytes | os.PathLike[str] | dict[str, Any] | list[Any],
     format: RdfFormat | None = None,
     *,
     base: str | None = None,
@@ -35,7 +35,8 @@ def parse(
     """The quads of an RDF document: Turtle, TriG, N-Triples, N-Quads or
     JSON-LD.
 
-    ``data`` is the document's text, with its ``format`` given; a path,
+    ``data`` is the document's text (a ``str``, or UTF-8 ``bytes`` such as
+    a request body), with its ``format`` given; a path,
     whose extension (``.ttl``, ``.trig``, ``.nt``, ``.nq``, ``.jsonld``,
     ``.json``) gives the format when ``format`` does not; or a JSON-LD
     document as a dict or list. Turtle, TriG and JSON-LD resolve relative
@@ -55,6 +56,11 @@ def parse(
     (``[]``, a collection, an annotation) gets a fresh label. Malformed input
     raises :class:`InvalidRequestError` naming the line and column.
     """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        try:
+            data = bytes(data).decode("utf-8-sig")
+        except UnicodeDecodeError as e:
+            raise InvalidRequestError(f"the document is not UTF-8: {e}") from None
     if isinstance(data, (dict, list)):
         if format not in (None, "jsonld"):
             raise InvalidRequestError(f"a dict or list is JSON-LD, not {format}")

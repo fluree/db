@@ -201,6 +201,14 @@ impl<'py> Nodes<'py> {
     }
 }
 
+/// `term` in N-Triples syntax: an IRI, blank node, literal (a Python value
+/// included) or `fluree.Triple`.
+#[pyfunction]
+pub(crate) fn term_ntriples(term: &Bound<'_, PyAny>) -> PyResult<String> {
+    let term = Nodes::default().object(term.clone())?;
+    rdf::term_ntriples(&term).map_err(rdf_error)
+}
+
 fn rdf_error(error: RdfError) -> PyErr {
     invalid_request(error.to_string())
 }

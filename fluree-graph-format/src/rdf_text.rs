@@ -86,6 +86,24 @@ pub fn format_nquads(dataset: &Dataset) -> Result<String, InvalidLangTag> {
     Ok(out)
 }
 
+/// Write one term in N-Triples syntax, as [`format_ntriples`] writes it.
+pub fn format_nt_term(term: &Term) -> Result<String, InvalidLangTag> {
+    fn check(term: &Term) -> Result<(), InvalidLangTag> {
+        match term {
+            Term::Literal {
+                language: Some(lang),
+                ..
+            } if !syntax::is_lang_tag(lang) => Err(InvalidLangTag(lang.to_string())),
+            Term::TripleTerm(t) => t.iter().try_for_each(check),
+            _ => Ok(()),
+        }
+    }
+    check(term)?;
+    let mut out = String::new();
+    push_nt_term(&mut out, term);
+    Ok(out)
+}
+
 fn push_nt_graph(out: &mut String, graph: &Graph, name: Option<&Term>) {
     let end_line = |out: &mut String| {
         if let Some(name) = name {

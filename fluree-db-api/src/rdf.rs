@@ -327,6 +327,11 @@ fn check_absolute(dataset: &Dataset) -> Result<(), RdfError> {
     Ok(())
 }
 
+/// One term in N-Triples syntax, as [`serialize`] writes it in N-Triples.
+pub fn term_ntriples(term: &Term) -> Result<String, RdfError> {
+    fluree_graph_format::format_nt_term(term).map_err(|e| RdfError::Unwritable(e.to_string()))
+}
+
 /// `dataset` written as `format`. Turtle and TriG declare `prefixes` and
 /// write IRIs with them, and JSON-LD makes them its `@context`; Turtle and
 /// N-Triples hold the default graph only. A reification of an asserted

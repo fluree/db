@@ -39,7 +39,7 @@ from fluree._records import (
     _validation_report,
 )
 from fluree._results import Result, RowStream
-from fluree._terms import IRI, to_python
+from fluree._terms import IRI, to_python, trusted_iri
 from fluree._sources import (
     Auth,
     AzureServicePrincipal,
@@ -1156,7 +1156,7 @@ class Ledger:
         self._require_unrestricted("graphs")
         system = {"urn:default", f"urn:fluree:{self._id}#txn-meta", self._config_graph}
         named = self.info()["ledger"]["named-graphs"]
-        return [IRI(g["iri"]) for g in named if g["iri"] not in system]
+        return [trusted_iri(g["iri"]) for g in named if g["iri"] not in system]
 
     def drop_graph(self, graph: str) -> Commit:
         """Drop named graph ``graph`` (its full IRI) in one commit, as SPARQL
