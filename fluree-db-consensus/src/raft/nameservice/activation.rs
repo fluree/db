@@ -153,15 +153,27 @@ impl ErasureActivator for RaftNameService {
         let state = self.state.read().await;
         members
             .into_iter()
-            .filter(|member| {
-                !state
-                    .erasure_cleanup
-                    .cleaned
-                    .get(member)
-                    .is_some_and(|cleaned| cleaned.applied >= index)
-            })
+            .filter(|member| !cleaned_by(&state, *member, index))
             .collect()
     }
+}
+
+/// Whether `member` reported cleaning every purge recorded through `index`
+/// from the run it last reported ready from: a member back on an older disk
+/// reports ready again, and its earlier run's cleaning no longer counts.
+fn cleaned_by(
+    state: &crate::raft::state_machine::NameServiceState,
+    member: NodeId,
+    index: u64,
+) -> bool {
+    let current = state.erasure.installed.get(&member).map(|r| r.incarnation);
+    state
+        .erasure_cleanup
+        .cleaned
+        .get(&member)
+        .is_some_and(|cleaned| {
+            cleaned.applied >= index && current.is_none_or(|run| run == cleaned.incarnation)
+        })
 }
 
 impl RaftNameService {
@@ -179,5 +191,47 @@ impl RaftNameService {
             .collect();
         members.extend(self.state.read().await.configured_voters.iter().copied());
         members.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleaned_by;
+    use crate::raft::state_machine::{Cleaned, Incarnation, Installed, NameServiceState};
+
+    /// A member's cleaning counts only from the run it last reported ready
+    /// from: one back on an older disk cleans again.
+    #[test]
+    fn cleaning_counts_from_the_run_that_reported_ready() {
+        let run = |process| Incarnation {
+            process,
+            storage: 1,
+        };
+        let mut state = NameServiceState::default();
+        state.erasure_cleanup.cleaned.insert(
+            2,
+            Cleaned {
+                applied: 10,
+                incarnation: run(1),
+            },
+        );
+        assert!(cleaned_by(&state, 2, 10));
+        state.erasure.installed.insert(
+            2,
+            Installed {
+                through: 3,
+                incarnation: run(1),
+            },
+        );
+        assert!(cleaned_by(&state, 2, 10));
+        assert!(!cleaned_by(&state, 2, 11));
+        state.erasure.installed.insert(
+            2,
+            Installed {
+                through: 3,
+                incarnation: run(2),
+            },
+        );
+        assert!(!cleaned_by(&state, 2, 10));
     }
 }
