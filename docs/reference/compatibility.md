@@ -79,7 +79,7 @@ Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and ev
 
 Deviations from the JSON-LD 1.1 expansion algorithm:
 - Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
-- A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
+- A node with several types applies their scoped contexts in the order written rather than in lexicographic order. `@propagate` is honored on a type's scoped context only.
 - A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 
 **Specification:** https://www.w3.org/TR/json-ld11/
@@ -371,6 +371,18 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 ### Behavior changes
 
 Changes within v1 that a client may need to account for.
+
+#### JSON-LD resolves `@base` by RFC 3986, and a type's scoped context stops at nested nodes (breaking)
+
+A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, as one in Turtle already did; it used to be joined to `@base` as a string. A base ending in `/` resolves as before. Otherwise the result differs:
+
+- Under a base ending in `#`, `alice` resolves beside the document: `http://example.org/alice` under `http://example.org/ns#`. Write `#alice` for `http://example.org/ns#alice`.
+- Under a base ending in a path segment, the segment is replaced: `alice` under `http://example.org/doc` is `http://example.org/alice`.
+- Under a non-hierarchical base such as `urn:ex:`, `alice` is `urn:alice`. Define a prefix for such a namespace instead.
+
+A relative `@base` or `@vocab` resolves against the base already in effect. Data already written stays as it is.
+
+A type's scoped context applies to the typed node's own properties, and no longer to the node objects nested in it: JSON-LD 1.1's default. Mark it `"@propagate": true` to keep it in force for them. A property's scoped context now applies to each node object in an array value, as it did to a single one.
 
 #### `DROP` drops a graph's history (breaking)
 

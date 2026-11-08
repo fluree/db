@@ -140,6 +140,10 @@ pub struct ParsedContext {
     pub version: Option<f64>,
     /// Whether context is protected (@protected)
     pub protected: Option<bool>,
+    /// This context definition's `@propagate`: whether, as a type's scoped
+    /// context, it also applies to the node objects nested in the typed
+    /// node. Not inherited by contexts parsed on top of it.
+    pub propagate: Option<bool>,
     /// Term definitions (string keys map to entries)
     pub terms: HashMap<String, ContextEntry>,
 }
@@ -195,6 +199,9 @@ impl ParsedContext {
         }
         if let Some(protected) = self.protected {
             ctx.insert("@protected".to_string(), JsonValue::Bool(protected));
+        }
+        if let Some(propagate) = self.propagate {
+            ctx.insert("@propagate".to_string(), JsonValue::Bool(propagate));
         }
 
         for (key, entry) in &self.terms {
@@ -307,6 +314,7 @@ fn parse_context_map(
     depth: usize,
 ) -> Result<ParsedContext> {
     let mut result = base.clone();
+    result.propagate = None;
 
     // `@base` first, so a relative `@vocab` beside it resolves against it. A
     // relative `@base` resolves against the base already in effect.
@@ -336,6 +344,9 @@ fn parse_context_map(
                 }
                 "protected" => {
                     result.protected = value.as_bool();
+                }
+                "propagate" => {
+                    result.propagate = value.as_bool();
                 }
                 _ => {} // Ignore unknown @-keywords
             }

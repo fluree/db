@@ -201,11 +201,14 @@ fn is_set_item(map: &Map<String, JsonValue>) -> bool {
             || (map.len() == 2 && (map.contains_key("@index") || map.contains_key("index"))))
 }
 
-/// Parse a value based on its type and context info
+/// Parse a value based on its type and context info. `context` expands the
+/// value; `nodes` is the context a node object in it starts from, without a
+/// type's scoped context that does not propagate.
 fn parse_node_value(
     value: &JsonValue,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    nodes: &ParsedContext,
     path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
@@ -298,15 +301,19 @@ fn parse_node_value(
                     });
                 }
 
-                let expanded = if item.is_object() {
-                    let map = item.as_object().unwrap();
-                    if map.contains_key("@value") || map.contains_key("value") {
-                        parse_node_value(item, entry, context, &item_path, strict)?
-                    } else {
+                let expanded = match item {
+                    JsonValue::Object(map)
+                        if map.contains_key("@value") || map.contains_key("value") =>
+                    {
+                        parse_node_value(item, entry, context, nodes, &item_path, strict)?
+                    }
+                    JsonValue::Object(map) if is_list_item(map) || is_set_item(map) => {
                         vec![expand_node_internal(item, context, &item_path, strict)?]
                     }
-                } else {
-                    parse_node_value(item, entry, context, &item_path, strict)?
+                    JsonValue::Object(map) => vec![expand_nested_node(
+                        item, map, entry, context, nodes, &item_path, strict,
+                    )?],
+                    _ => parse_node_value(item, entry, context, nodes, &item_path, strict)?,
                 };
                 results.extend(expanded);
             }
@@ -338,7 +345,8 @@ fn parse_node_value(
             if is_list_item(map) {
                 let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
                 let list_path = path.key("@list");
-                let expanded = parse_node_value(list_val, entry, context, &list_path, strict)?;
+                let expanded =
+                    parse_node_value(list_val, entry, context, nodes, &list_path, strict)?;
                 let mut obj = Map::new();
                 obj.insert("@list".to_string(), JsonValue::Array(expanded));
                 return Ok(vec![JsonValue::Object(obj)]);
@@ -347,12 +355,12 @@ fn parse_node_value(
             // Check for @set (flatten it)
             if is_set_item(map) {
                 let set_val = map.get("@set").or_else(|| map.get("set")).unwrap();
-                return parse_node_value(set_val, entry, context, &path.key("@set"), strict);
+                return parse_node_value(set_val, entry, context, nodes, &path.key("@set"), strict);
             }
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, path, strict);
+                return parse_value_object(map, entry, context, nodes, path, strict);
             }
 
             // Check for @container: @language
@@ -388,22 +396,36 @@ fn parse_node_value(
                 }
             }
 
-            // Otherwise, expand as nested node
-            let ctx = if let Some(e) = entry {
-                if let Some(ref nested) = e.context {
-                    let mut merged = context.clone();
-                    apply_scoped_context(&mut merged, nested);
-                    Cow::Owned(merged)
-                } else {
-                    Cow::Borrowed(context)
-                }
-            } else {
-                Cow::Borrowed(context)
-            };
-
-            Ok(vec![expand_node_internal(value, &ctx, path, strict)?])
+            Ok(vec![expand_nested_node(
+                value, map, entry, context, nodes, path, strict,
+            )?])
         }
     }
+}
+
+/// A node object a property holds, expanded against `nodes` with the
+/// property's scoped context applied. A lone `{"@id": …}` reference stays in
+/// `context`, as the expansion algorithm keeps it in the typed node's.
+fn expand_nested_node(
+    value: &JsonValue,
+    map: &Map<String, JsonValue>,
+    entry: Option<&ContextEntry>,
+    context: &ParsedContext,
+    nodes: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<JsonValue> {
+    let is_reference = map.len() == 1 && map.keys().all(|k| k == "@id" || *k == context.id_key);
+    let start = if is_reference { context } else { nodes };
+    let ctx = match entry.and_then(|e| e.context.as_deref()) {
+        Some(scoped) => {
+            let mut merged = start.clone();
+            apply_scoped_context(&mut merged, scoped);
+            Cow::Owned(merged)
+        }
+        None => Cow::Borrowed(start),
+    };
+    expand_node_internal(value, &ctx, path, strict)
 }
 
 /// Parse a @value object
@@ -411,6 +433,7 @@ fn parse_value_object(
     map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    nodes: &ParsedContext,
     path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
@@ -469,7 +492,7 @@ fn parse_value_object(
     // reifier of the triple this value completes, and expands as a node does.
     if let Some(annotation) = map.get("@annotation") {
         let expanded =
-            match expand_node_internal(annotation, context, &path.key("@annotation"), strict)? {
+            match expand_node_internal(annotation, nodes, &path.key("@annotation"), strict)? {
                 JsonValue::Array(nodes) => nodes,
                 node => vec![node],
             };
@@ -479,12 +502,14 @@ fn parse_value_object(
     Ok(vec![JsonValue::Object(obj)])
 }
 
-/// Parse @type values and return expanded types with potentially updated context
+/// Parse @type values and return expanded types with potentially updated
+/// context, and whether the types' scoped contexts reach the node objects
+/// nested in the node: only one marked `"@propagate": true` does.
 fn parse_type<'c>(
     node_map: &Map<String, JsonValue>,
     context: &'c ParsedContext,
     strict: bool,
-) -> Result<(Vec<String>, Cow<'c, ParsedContext>)> {
+) -> Result<(Vec<String>, Cow<'c, ParsedContext>, bool)> {
     let type_key = &context.type_key;
     let type_id = context.get(type_key).and_then(|e| e.id.clone());
 
@@ -516,17 +541,19 @@ fn parse_type<'c>(
             _ => vec![],
         };
 
+        let mut propagates = true;
         for orig_t in original_types {
             if let Some(entry) = context.get(orig_t) {
                 if let Some(ref sub_ctx) = entry.context {
                     apply_scoped_context(updated_context.to_mut(), sub_ctx);
+                    propagates &= sub_ctx.propagate == Some(true);
                 }
             }
         }
 
-        Ok((types, updated_context))
+        Ok((types, updated_context, propagates))
     } else {
-        Ok((vec![], Cow::Borrowed(context)))
+        Ok((vec![], Cow::Borrowed(context), true))
     }
 }
 
@@ -687,7 +714,7 @@ fn expand_node_internal(
             };
 
             // Parse @type and get updated context
-            let (types, context_with_types) = parse_type(map, &merged_context, strict)?;
+            let (types, context_with_types, propagates) = parse_type(map, &merged_context, strict)?;
 
             // Build result
             let mut result = Map::new();
@@ -702,6 +729,11 @@ fn expand_node_internal(
             let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
             let keys = NodeKeys {
                 context: &context_with_types,
+                nodes: if propagates {
+                    &context_with_types
+                } else {
+                    &merged_context
+                },
                 type_key: &type_key,
                 type_id: type_id.as_deref(),
                 strict,
@@ -718,6 +750,9 @@ fn expand_node_internal(
 /// What a node object's entries expand against.
 struct NodeKeys<'a> {
     context: &'a ParsedContext,
+    /// The context a node object nested in this node starts from: `context`
+    /// without a type's scoped context that does not propagate.
+    nodes: &'a ParsedContext,
     /// The `@type` key and its alias, handled by [`parse_type`].
     type_key: &'a str,
     type_id: Option<&'a str>,
@@ -760,7 +795,7 @@ fn expand_node_entries(
                     reason: "a nested value cannot carry `@graph`",
                 });
             }
-            let graph_expanded = expand_node_internal(v, context, &key_path, strict)?;
+            let graph_expanded = expand_node_internal(v, keys.nodes, &key_path, strict)?;
             result.insert("@graph".to_string(), graph_expanded);
             continue;
         }
@@ -785,7 +820,7 @@ fn expand_node_entries(
                 JsonValue::Object(_) => {
                     result.insert(
                         "@id".to_string(),
-                        expand_node_internal(v, context, &key_path, strict)?,
+                        expand_node_internal(v, keys.nodes, &key_path, strict)?,
                     );
                 }
                 _ => {}
@@ -828,7 +863,8 @@ fn expand_node_entries(
         }
 
         // Expand value
-        let expanded_values = parse_node_value(v, entry.as_ref(), context, &key_path, strict)?;
+        let expanded_values =
+            parse_node_value(v, entry.as_ref(), context, keys.nodes, &key_path, strict)?;
 
         // A key whose values expand to nothing is dropped — EXCEPT
         // `@list`: `{"@list": []}` is a value, the empty list, which
@@ -889,7 +925,7 @@ fn expand_nest_value(
                 })
             }
         };
-        let (types, _) = parse_type(nested, keys.context, keys.strict)?;
+        let (types, _, _) = parse_type(nested, keys.context, keys.strict)?;
         if !types.is_empty() {
             let slot = result
                 .entry("@type".to_string())
@@ -1658,5 +1694,61 @@ mod tests {
             ParsedContext::parse(None, &json!({"@base": "http://b.org/doc", "@vocab": "ns/"}))
                 .unwrap();
         assert_eq!(vocab.vocab.as_deref(), Some("http://b.org/ns/"));
+    }
+
+    /// A type's scoped context applies to the typed node's own properties,
+    /// not to the node objects nested in it, unless it is marked
+    /// `"@propagate": true`.
+    #[test]
+    fn type_scoped_context_stops_at_nested_nodes() {
+        let doc = |propagate: Option<bool>| {
+            let mut scoped = json!({"name": "http://scoped.org/name"});
+            if let Some(propagate) = propagate {
+                scoped["@propagate"] = json!(propagate);
+            }
+            json!({
+                "@context": {
+                    "@vocab": "http://vocab.org/",
+                    "T": {"@id": "http://vocab.org/T", "@context": scoped}
+                },
+                "@id": "http://ex.org/s",
+                "@type": "T",
+                "name": "own",
+                "child": {"@id": "http://ex.org/c", "name": "nested"},
+                "children": [{"@id": "http://ex.org/d", "name": "in an array"}]
+            })
+        };
+
+        let expanded = crate::expand(&doc(None)).unwrap();
+        assert_eq!(expanded["http://scoped.org/name"][0]["@value"], "own");
+        for property in ["http://vocab.org/child", "http://vocab.org/children"] {
+            let nested = &expanded[property][0];
+            assert!(nested.get("http://vocab.org/name").is_some(), "{expanded}");
+        }
+
+        let propagated = crate::expand(&doc(Some(true))).unwrap();
+        for property in ["http://vocab.org/child", "http://vocab.org/children"] {
+            let nested = &propagated[property][0];
+            assert!(
+                nested.get("http://scoped.org/name").is_some(),
+                "{propagated}"
+            );
+        }
+    }
+
+    /// A property's scoped context applies to every node object it holds,
+    /// one alone or each in an array.
+    #[test]
+    fn property_scoped_context_reaches_each_node_in_an_array() {
+        let ctx = json!({
+            "@vocab": "http://vocab.org/",
+            "p": {"@id": "http://vocab.org/p", "@context": {"name": "http://scoped.org/name"}}
+        });
+        for value in [json!({"name": "a"}), json!([{"name": "a"}, {"name": "b"}])] {
+            let expanded = crate::expand(&json!({"@context": ctx, "p": value})).unwrap();
+            for node in expanded["http://vocab.org/p"].as_array().unwrap() {
+                assert!(node.get("http://scoped.org/name").is_some(), "{expanded}");
+            }
+        }
     }
 }
