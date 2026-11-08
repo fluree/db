@@ -7,7 +7,7 @@ use fluree_db_core::commit::codec::write_commit;
 use fluree_db_core::{Commit, ContentId, ContentKind, Flake, FlakeValue, Sid};
 use fluree_db_erasure::testing::{fake_receipt, TEST_IMAGE_ID};
 use fluree_db_erasure::Verifier;
-use fluree_db_redaction::{commit_cid, redact, HostSha, Sha256};
+use fluree_db_redaction::{commit_cid, redact, redact_with, HostSha, Sha256, Signatures};
 
 const LEDGER: &str = "acme/people:main";
 
@@ -90,4 +90,24 @@ fn a_receipt_of_another_program_is_refused() {
     assert!(elsewhere
         .verify_chain(&receipts, &replacement, &cid, LEDGER, &authorized)
         .is_err());
+}
+
+/// A step asked to verify the original's signatures inside the proof does
+/// not take a proof that exposed them instead.
+#[test]
+fn a_verify_step_refuses_a_proof_that_exposed_the_signatures() {
+    let key = fluree_db_credential::SigningKey::from_bytes(&[7u8; 32]);
+    let commit = fluree_db_core::commit::codec::read_commit(&original()).unwrap();
+    let bytes = write_commit(&commit, true, Some((&key, LEDGER)))
+        .unwrap()
+        .bytes;
+    let cid = commit_cid(&HostSha::sha256(&bytes));
+    let (replacement, exposed) =
+        redact_with::<HostSha, _>(&bytes, &[2], LEDGER, Signatures::Expose, &mut ()).unwrap();
+    assert!(!exposed.signatures.is_empty());
+    let receipts = vec![fake_receipt(&exposed)];
+    let v = Verifier::accepting_dev_receipts();
+    let chain = |mode| v.verify_chain_as(&receipts, &replacement, &cid, LEDGER, &[vec![2]], mode);
+    assert!(chain(Signatures::Expose).is_ok());
+    assert!(chain(Signatures::Verify).is_err());
 }

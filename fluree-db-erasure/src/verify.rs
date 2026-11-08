@@ -1,7 +1,8 @@
 //! Verifying a commit's redaction proofs, with none of its original bytes.
 
 use fluree_db_redaction::{
-    commit_cid, verify_exposed_signatures, HostSha, Sha256, Statement, TRANSFORM_VERSION,
+    commit_cid, verify_exposed_signatures, HostSha, Sha256, Signatures, Statement,
+    TRANSFORM_VERSION,
 };
 use risc0_zkvm::{InnerReceipt, Receipt, VerifierContext};
 
@@ -84,6 +85,47 @@ impl Verifier {
         ledger_id: &str,
         authorized: &[Vec<u32>],
     ) -> Result<Vec<Statement>, VerifyError> {
+        self.verify_chain_checking(
+            receipts,
+            replacement,
+            original_cid,
+            ledger_id,
+            authorized,
+            None,
+        )
+    }
+
+    /// [`Self::verify_chain`] for a chain whose last step was asked to
+    /// handle the original's signatures as `last` says: one asked to verify
+    /// them inside the proof refuses a proof that exposed them instead.
+    pub fn verify_chain_as(
+        &self,
+        receipts: &[Vec<u8>],
+        replacement: &[u8],
+        original_cid: &[u8],
+        ledger_id: &str,
+        authorized: &[Vec<u32>],
+        last: Signatures,
+    ) -> Result<Vec<Statement>, VerifyError> {
+        self.verify_chain_checking(
+            receipts,
+            replacement,
+            original_cid,
+            ledger_id,
+            authorized,
+            Some(last),
+        )
+    }
+
+    fn verify_chain_checking(
+        &self,
+        receipts: &[Vec<u8>],
+        replacement: &[u8],
+        original_cid: &[u8],
+        ledger_id: &str,
+        authorized: &[Vec<u32>],
+        last: Option<Signatures>,
+    ) -> Result<Vec<Statement>, VerifyError> {
         if receipts.is_empty() || receipts.len() != authorized.len() {
             return Err(reject(format!(
                 "{} proofs for {} authorized steps",
@@ -98,6 +140,15 @@ impl Verifier {
             let statement = self
                 .step(receipt, &input, original_cid, ledger_id, slots)
                 .map_err(|e| VerifyError::at(step, e))?;
+            if step + 1 == receipts.len()
+                && last == Some(Signatures::Verify)
+                && !statement.signatures.is_empty()
+            {
+                return Err(VerifyError::at(
+                    step,
+                    reject("the proof exposes the signatures it was to verify"),
+                ));
+            }
             redacted.extend(slots);
             redacted.sort_unstable();
             if statement.redacted_slots != redacted {

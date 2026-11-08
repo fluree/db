@@ -741,8 +741,16 @@ impl Fluree {
         authorized.push(step.slots.clone());
         let verifier = config.verifier.clone();
         let (original, ledger_id) = (step.cid.to_bytes(), step.ledger_id.clone());
+        let signatures = step.signatures.into();
         tokio::task::spawn_blocking(move || {
-            verifier.verify_chain(&receipts, &replacement, &original, &ledger_id, &authorized)
+            verifier.verify_chain_as(
+                &receipts,
+                &replacement,
+                &original,
+                &ledger_id,
+                &authorized,
+                signatures,
+            )
         })
         .await
         .map_err(|e| StepError::Retry(ApiError::internal(e.to_string())))?
