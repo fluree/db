@@ -27,9 +27,12 @@ derived search indexes and scratch files.
   ids (`ex:user-8f3a…`, not `mailto:alice@example.org`). See [Limits](#limits).
 - **Triple terms:** a fact whose object is a triple term spelling an erased fact
   (`ex:claim rdf:reifies <<( ex:alice ex:email "a@secret" )>>`, now or in its history) would keep the
-  value readable. A request is refused with `409` while one exists on a branch it reaches, naming each
-  such fact's commit and slot: name those occurrences in the request too. One written after the request
-  was accepted holds its publication back, with the same explanation in the job's `lastError`. A triple
+  value readable. A request is refused with `409` while one exists on a ledger holding its commits (its
+  branches, and copies restored from an archive), naming each such fact's commit and slot: name those
+  occurrences in the request too. One written after the request was accepted holds its publication
+  back, with the same explanation in the job's `lastError`, and an erasure received from another
+  server, by a restore or a transfer, is refused with `409` while a ledger here holding its commits has
+  one. A triple
   term spelling another fact with the same value, such as another subject's, is left as it is.
 
 ## Requesting an erasure

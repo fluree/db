@@ -780,6 +780,53 @@ async fn an_erasure_is_refused_while_a_triple_term_spells_its_value() {
     assert_eq!(report.published, 1, "{report:?}");
 }
 
+/// A copy restored from an archive holds the request's commits too: a fact
+/// there naming a triple term that spells the value refuses the request,
+/// before anything is removed from either ledger.
+#[tokio::test]
+async fn an_erasure_is_refused_while_a_restored_copy_spells_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-spelled-source").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-spelled-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reify_email(&fluree, &copy).await;
+
+    match fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+    {
+        Err(ApiError::Http {
+            status: 409,
+            message,
+        }) => {
+            assert!(message.contains("it/erase-spelled-copy"), "{message}")
+        }
+        other => panic!("expected 409, got {:?}", other.map(|r| r.request_id)),
+    }
+    for ledger in [&id, &copy] {
+        assert_eq!(
+            objects(&fluree, ledger, "ex:alice", "ex:email").await,
+            vec![json!("a@secret")],
+            "nothing removed from {ledger}"
+        );
+    }
+}
+
 /// A fact naming a triple term that spells the value, written after the
 /// request was accepted, holds its publication back.
 #[tokio::test]

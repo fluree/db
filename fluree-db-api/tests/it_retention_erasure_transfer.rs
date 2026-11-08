@@ -464,6 +464,50 @@ async fn erased_between_archives(
     (dir, fluree, id, t1, shared, before, after)
 }
 
+/// An erasure arriving here is refused while a ledger here holding the
+/// erased commit has a fact naming a triple term that spells the value,
+/// before that ledger is changed.
+#[tokio::test]
+async fn a_received_erasure_is_refused_while_a_holder_spells_its_value() {
+    let (_dir, _source, _, _t1, _shared, before, after) =
+        erased_between_archives("it/receive-spelled-source").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/receive-spelled-held", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    insert_kept(
+        &receiver,
+        &held,
+        json!({
+            "@context": ctx(), "@id": "ex:claim", "ex:note": "seen",
+            "@reifies": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }),
+    )
+    .await;
+    reindex(&receiver, &held).await;
+
+    match receiver
+        .restore_ledger("it/receive-spelled-after", &mut after.as_slice())
+        .await
+    {
+        Err(ApiError::Http {
+            status: 409,
+            message,
+        }) => {
+            assert!(message.contains("it/receive-spelled-held"), "{message}")
+        }
+        other => panic!("expected 409, got {:?}", other.map(|r| r.ledger_id)),
+    }
+    assert_eq!(
+        objects(&receiver, &held, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")],
+        "the holder is left as it was"
+    );
+}
+
 /// A ledger here holding the original of a commit a restore erases, the
 /// value still current in its index, reads as the erasure does once the
 /// restore returns: no current value, its history refused, the commit read

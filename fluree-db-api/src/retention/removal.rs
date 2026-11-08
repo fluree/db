@@ -750,15 +750,17 @@ pub(crate) fn spellings<'a>(
 }
 
 #[cfg(feature = "native")]
-/// Why an erasure leaving `spelled` cannot be made: what must go with it.
+/// Why an erasure leaving `spelled` on `ledger_id` cannot be made: what must
+/// go with it. `snapshot` names its terms, when the ledger can be read.
+#[cfg(feature = "native")]
 pub(crate) fn spelled_refusal(
-    snapshot: &fluree_db_core::LedgerSnapshot,
+    snapshot: Option<&fluree_db_core::LedgerSnapshot>,
     ledger_id: &str,
     spelled: &[Spelling],
 ) -> String {
     let iri = |sid: &Sid| {
         snapshot
-            .decode_sid(sid)
+            .and_then(|snapshot| snapshot.decode_sid(sid))
             .map_or_else(|| format!("{sid:?}"), |iri| format!("<{iri}>"))
     };
     let named: Vec<String> = spelled
@@ -795,40 +797,91 @@ pub(crate) fn spelled_refusal(
 
 #[cfg(feature = "native")]
 impl Fluree {
-    /// Refuse to erase what `request` names on `ledger_id` while a fact
-    /// outside it, now or in its history, names a triple term spelling one
-    /// of its values.
-    pub(crate) async fn refuse_spelled_values(
+    /// The occurrences `request` names on `ledger_id`, widened as
+    /// `widening` says: what a removal there would take out.
+    pub(crate) async fn located_occurrences(
         &self,
         ledger_id: &str,
         request: &RemovalRequest,
         widening: Widening,
-    ) -> Result<()> {
+    ) -> Result<Vec<OccurrenceRef>> {
         for _ in 0..ATTEMPTS {
             let Some(read) = self.read_history(ledger_id, None).await? else {
                 continue;
             };
             let found = locate(&read, request, widening)?;
-            let facts: Vec<Flake> = found.located.iter().map(|l| l.flake.clone()).collect();
-            let named = found
-                .located
-                .iter()
-                .map(|l| (l.occurrence.commit.clone(), l.occurrence.slot))
-                .collect();
-            let commits = read.commits.iter().map(|(t, cid, c)| (*t, cid, c));
-            let spelled = spellings(commits, &facts, &named);
-            if spelled.is_empty() {
-                return Ok(());
-            }
-            return Err(ApiError::http(
-                409,
-                spelled_refusal(&read.state.snapshot, ledger_id, &spelled),
-            ));
+            return Ok(found.located.into_iter().map(|l| l.occurrence).collect());
         }
         Err(ApiError::commit_contention(
             ATTEMPTS,
             ApiError::internal("the head kept moving while the erasure was checked"),
         ))
+    }
+
+    /// Why one of `holders` would keep a value `occurrences` erase readable,
+    /// through a fact, now or in its history, naming a triple term that
+    /// spells it, if one would. An erasure is checked by this when it is
+    /// accepted, received and published, against every ledger holding its
+    /// commits.
+    pub(crate) async fn spelled_in(
+        &self,
+        holders: &[(
+            fluree_db_nameservice::NsRecord,
+            std::sync::Arc<dyn fluree_db_core::ContentStore>,
+        )],
+        occurrences: &[OccurrenceRef],
+    ) -> Result<Option<String>> {
+        let mut facts = Vec::new();
+        let mut named = std::collections::HashSet::new();
+        let mut slots: std::collections::BTreeMap<&str, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for occurrence in occurrences {
+            slots
+                .entry(occurrence.commit.as_str())
+                .or_default()
+                .push(occurrence.slot);
+            named.insert((occurrence.commit.clone(), occurrence.slot));
+        }
+        for (commit, slots) in &slots {
+            let cid: ContentId = commit
+                .parse()
+                .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))?;
+            for (_, store) in holders {
+                if store.has(&cid).await? {
+                    let original = load_commit_by_id(store.as_ref(), &cid).await?;
+                    facts.extend(slots.iter().filter_map(|s| original.at_slot(*s).cloned()));
+                    break;
+                }
+            }
+        }
+        if facts.is_empty() {
+            return Ok(None);
+        }
+        for (holder, store) in holders {
+            let Some(head) = holder.commit_head_id.as_ref() else {
+                continue;
+            };
+            let mut commits = Vec::new();
+            for (t, cid) in collect_first_parent_cids(store.as_ref(), head, 0).await? {
+                let commit = load_commit_by_id(store.as_ref(), &cid).await?;
+                commits.push((t, cid, commit));
+            }
+            let found = spellings(
+                commits.iter().map(|(t, cid, commit)| (*t, cid, commit)),
+                &facts,
+                &named,
+            );
+            if !found.is_empty() {
+                // A dropped holder is not read: its terms go unnamed.
+                let state = self.ledger(holder.ledger_id.as_str()).await.ok();
+                return Ok(Some(spelled_refusal(
+                    state.as_ref().map(|s| &*s.snapshot),
+                    holder.ledger_id.as_str(),
+                    &found,
+                )));
+            }
+        }
+        Ok(None)
     }
 }
 

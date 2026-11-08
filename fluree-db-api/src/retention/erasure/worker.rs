@@ -1053,7 +1053,7 @@ impl Fluree {
         }
         // Checked when the request was accepted, and again for what a holder
         // has written, or become, since.
-        if let Some(message) = self.spelled_in_holders(branch, &holders, job).await? {
+        if let Some(message) = self.spelled_in_holders(&holders, job).await? {
             self.update_job(branch, &job.request_id, |j| {
                 j.last_error = Some(message.clone());
             })
@@ -1466,10 +1466,10 @@ impl Fluree {
     }
 
     /// Why a holder would keep a value `job` erases readable, through a fact
-    /// naming a triple term that spells it, if one would.
+    /// naming a triple term that spells it, if one would: see
+    /// [`Fluree::spelled_in`].
     async fn spelled_in_holders(
         &self,
-        branch: &str,
         holders: &[NsRecord],
         job: &ErasureJob,
     ) -> Result<Option<String>> {
@@ -1483,53 +1483,17 @@ impl Fluree {
         // A dropped holder's commits can spell the value too.
         let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
         stores.extend(self.dropped_holders(&commits).await?);
-        let mut facts = Vec::new();
-        let mut named = std::collections::HashSet::new();
-        for task in &job.commits {
-            let cid = commit_id(&task.commit)?;
-            for (_, store) in &stores {
-                if store.has(&cid).await? {
-                    let original = fluree_db_core::load_commit_by_id(store.as_ref(), &cid).await?;
-                    facts.extend(
-                        task.slots
-                            .iter()
-                            .filter_map(|s| original.at_slot(*s).cloned()),
-                    );
-                    break;
-                }
-            }
-            named.extend(task.slots.iter().map(|s| (task.commit.clone(), *s)));
-        }
-        for (holder, store) in &stores {
-            let Some(head) = holder.commit_head_id.as_ref() else {
-                continue;
-            };
-            let mut commits = Vec::new();
-            for (t, cid) in
-                fluree_db_core::collect_first_parent_cids(store.as_ref(), head, 0).await?
-            {
-                let commit = fluree_db_core::load_commit_by_id(store.as_ref(), &cid).await?;
-                commits.push((t, cid, commit));
-            }
-            let found = crate::retention::removal::spellings(
-                commits.iter().map(|(t, cid, commit)| (*t, cid, commit)),
-                &facts,
-                &named,
-            );
-            if !found.is_empty() {
-                // A dropped holder's names are its copy's, as of the drop.
-                let state = match self.ledger(holder.ledger_id.as_str()).await {
-                    Ok(state) => state,
-                    Err(_) => self.ledger(branch).await?,
-                };
-                return Ok(Some(crate::retention::removal::spelled_refusal(
-                    &state.snapshot,
-                    holder.ledger_id.as_str(),
-                    &found,
-                )));
-            }
-        }
-        Ok(None)
+        let occurrences: Vec<OccurrenceRef> = job
+            .commits
+            .iter()
+            .flat_map(|task| {
+                task.slots.iter().map(|slot| OccurrenceRef {
+                    commit: task.commit.clone(),
+                    slot: *slot,
+                })
+            })
+            .collect();
+        self.spelled_in(&stores, &occurrences).await
     }
 
     /// Whether `holder` holds one of `open`, assertions no retraction in its

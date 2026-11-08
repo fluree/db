@@ -1636,7 +1636,21 @@ impl Fluree {
                 })
             })
             .collect();
-        for listed in self.ledgers_holding(&cids, None).await? {
+        let listed = self.ledgers_holding(&cids, None).await?;
+        // Before any holder is locked or changed: a triple term spelling an
+        // erased value would keep it readable there.
+        let mut holders = Vec::with_capacity(listed.len());
+        for record in &listed {
+            let store = self
+                .content_store_for_record_or_id(Some(record), &record.storage_namespace())
+                .await?;
+            holders.push((record.clone(), store));
+        }
+        holders.extend(self.dropped_holders(&commits).await?);
+        if let Some(why) = self.spelled_in(&holders, &occurrences).await? {
+            return Err(ApiError::http(409, why));
+        }
+        for listed in listed {
             // The cache's lock first, as a commit through the cache takes
             // them.
             let guard = self.lock_ledger(&listed.ledger_id).await?;

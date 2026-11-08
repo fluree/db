@@ -153,22 +153,9 @@ impl Fluree {
             matching: request.matching.clone(),
         };
         // Before anything is removed: a triple term spelling a value would
-        // keep it readable, on any branch.
-        for (i, branch) in branches.iter().enumerate() {
-            let widening = Widening {
-                pair_spans: true,
-                skip_foreign: i > 0,
-                bounded: false,
-            };
-            match self
-                .refuse_spelled_values(branch, &removal_request, widening)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) if i > 0 && (e.is_not_found() || e.status_code() == 404) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        // keep it readable, on any ledger holding its commits.
+        self.refuse_spelled(&ledger_id, &branches, &removal_request)
+            .await?;
         let mut removed = Accepted::default();
         self.remove_on(writer, &branches, &removal_request, true, &mut removed)
             .await?;
@@ -370,6 +357,55 @@ impl Fluree {
 
     /// The branches of ledgers other than `ledger_id`'s, one of whose
     /// branches holds the original of one of `commits` in its own folder.
+    /// Refuse an erasure of what `request` names on `branches` (the first
+    /// the one it is made on) while a ledger holding its commits, a copy
+    /// restored from an archive among them, has a fact naming a triple term
+    /// that spells one of its values: see [`Fluree::spelled_in`].
+    async fn refuse_spelled(
+        &self,
+        ledger_id: &LedgerId,
+        branches: &[String],
+        request: &RemovalRequest,
+    ) -> Result<()> {
+        let mut occurrences: Vec<OccurrenceRef> = Vec::new();
+        for (i, branch) in branches.iter().enumerate() {
+            let widening = Widening {
+                pair_spans: true,
+                skip_foreign: i > 0,
+                bounded: false,
+            };
+            match self.located_occurrences(branch, request, widening).await {
+                Ok(found) => occurrences.extend(found),
+                Err(e) if i > 0 && (e.is_not_found() || e.status_code() == 404) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        occurrences.sort_by(|a, b| (&a.commit, a.slot).cmp(&(&b.commit, b.slot)));
+        occurrences.dedup();
+        let mut commits: Vec<&str> = occurrences.iter().map(|o| o.commit.as_str()).collect();
+        commits.dedup();
+        let mut records = Vec::new();
+        for branch in branches {
+            records.extend(self.nameservice().lookup(branch).await?);
+        }
+        for copy in self.copies_holding(ledger_id, &commits).await? {
+            if !records.iter().any(|r| r.ledger_id == copy.ledger_id) {
+                records.push(copy);
+            }
+        }
+        let mut holders = Vec::with_capacity(records.len());
+        for record in records {
+            let store = self
+                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                .await?;
+            holders.push((record, store));
+        }
+        match self.spelled_in(&holders, &occurrences).await? {
+            Some(why) => Err(ApiError::http(409, why)),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn copies_holding(
         &self,
         ledger_id: &LedgerId,
