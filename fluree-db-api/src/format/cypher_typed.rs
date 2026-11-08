@@ -145,6 +145,15 @@ pub(crate) async fn typed_table(
             }
         }
     }
+    if result.reasoned_under_policy && !wanted.is_empty() {
+        return Err(FormatError::Query(
+            fluree_db_query::QueryError::UnsupportedFeature(
+                "rendering a node or relationship's properties in a reasoning query under a \
+                 view policy; return its properties as values instead"
+                    .to_string(),
+            ),
+        ));
+    }
     hydrator.prefetch(wanted).await?;
 
     let mut rows = Vec::new();

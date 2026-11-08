@@ -214,6 +214,11 @@ pub struct QueryResult {
     /// mixed-dataset paths not routed through that method leave it false → today's
     /// raw rendering is unchanged.
     pub from_graph_source: bool,
+    /// True when a Cypher query ran with reasoning under a non-root view
+    /// policy. Its rows were judged on derived facts; a typed node's
+    /// properties would be read from stored facts at format time and judged
+    /// on stored classes, so the typed formatter refuses to render one.
+    pub reasoned_under_policy: bool,
     /// Non-fatal notes about how the query was read (see
     /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
     /// result.

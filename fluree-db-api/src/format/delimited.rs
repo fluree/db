@@ -776,6 +776,7 @@ mod tests {
             batches: vec![batch],
             binary_graph: None,
             from_graph_source: false,
+            reasoned_under_policy: false,
             advisories: Vec::new(),
         }
     }

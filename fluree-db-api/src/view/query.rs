@@ -753,14 +753,17 @@ impl Fluree {
             "cypher query phases"
         );
 
-        Ok(build_query_result(
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        ))
+        );
+        result.reasoned_under_policy =
+            !db.is_root() && executable.reasoning.modes.has_any_enabled();
+        Ok(result)
     }
 
     /// Execute a query against a GraphDb with explicit R2RML providers.

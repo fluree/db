@@ -534,3 +534,94 @@ async fn cypher_call_procedures_hide_policy_denied_property() {
         "without policy, db.propertyKeys() must list `secret`: {rooted_keys:?}"
     );
 }
+
+/// Under ledger reasoning defaults, a node a visible edge reaches would be
+/// rendered with its stored properties at format time, judged on stored
+/// classes. A rule makes `alice` a `HighEarner` and a deny on that class
+/// hides every fact of hers, which would show anyway, so under a view policy
+/// the typed formatter refuses to render a node. Values still render, and so
+/// does a root caller's node.
+#[tokio::test]
+async fn cypher_typed_node_in_a_reasoning_query_is_refused_under_a_view_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-cypher:reasoned-node";
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    let rule = json!({
+        "@context": {},
+        "where": [{"@id": "?p", "salary": "?s"}, ["filter", "(> ?s 200000)"]],
+        "insert": {"@id": "?p", "@type": "HighEarner"}
+    });
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "highEarnerRule", "f:rule": {"@type": "@json", "@value": rule}},
+                    {"@id": "alice", "@type": "Person", "name": "Alice", "salary": 250_000},
+                    {"@id": "eve", "@type": "Person", "name": "Eve", "knows": {"@id": "alice"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig ;
+                               f:reasoningDefaults <urn:cfg:reason> .
+                <urn:cfg:reason> f:reasoningModes f:datalog .
+            }}
+            "
+        ))
+        .execute()
+        .await
+        .expect("reasoning defaults");
+    let opts = GovernanceOptions {
+        policy: Some(json!([{
+            "@id": "denyHighEarner",
+            "f:required": true,
+            "f:onClass": [{"@id": "HighEarner"}],
+            "f:action": "f:view",
+            "f:allow": false
+        }])),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let restricted = fluree
+        .db_with_policy(ledger_id, &opts)
+        .await
+        .expect("db_with_policy");
+    let root = graphdb_from_ledger(&fluree.ledger(ledger_id).await.unwrap());
+    let typed = |db: fluree_db_api::GraphDb, q: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let result = fluree.query_cypher(&db, q).await.expect("query");
+            result.to_cypher_typed_table(&db).await.map(|(_, rows)| {
+                let mut strings = Vec::new();
+                for cell in rows.iter().flatten() {
+                    typed_cell_strings(cell, &mut strings);
+                }
+                strings
+            })
+        }
+    };
+    let node = "MATCH (e:Person {name: 'Eve'})-[:knows]->(n) RETURN n";
+
+    let rendered = typed(root, node).await.expect("root node");
+    assert!(rendered.iter().any(|s| s == "Alice"), "{rendered:?}");
+    match typed(restricted.clone(), node).await {
+        Err(e)
+            if e.to_string()
+                .contains("reasoning query under a view policy") => {}
+        other => panic!("{other:?}"),
+    }
+    let name = "MATCH (e:Person {name: 'Eve'})-[:knows]->(n) RETURN n.name";
+    let values = typed(restricted, name).await.expect("restricted values");
+    assert!(!values.iter().any(|s| s == "Alice"), "{values:?}");
+}
