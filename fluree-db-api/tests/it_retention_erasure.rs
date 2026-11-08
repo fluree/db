@@ -573,6 +573,132 @@ async fn a_branch_made_while_proving_is_indexed_before_publication() {
         .is_empty());
 }
 
+/// A branch made after acceptance at a point before the removal holds the
+/// value as current. It is retracted as the branch is made, the erasure
+/// takes that retraction too, and the purge leaves no file holding it.
+#[tokio::test]
+async fn a_branch_made_before_the_removal_after_acceptance_is_erased_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-past-branch").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@kept"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    fluree
+        .create_branch(
+            "it/erase-past-branch",
+            "past",
+            None,
+            Some(fluree_db_api::TimeSpec::AtT(t1 + 1)),
+        )
+        .await
+        .expect("branch");
+    let past = "it/erase-past-branch:past";
+    assert!(objects(&fluree, past, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, past).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert!(
+        job.commits
+            .iter()
+            .any(|c| c.branches.iter().any(|b| b == past)),
+        "the branch's retraction joined the job: {job:?}"
+    );
+    assert_eq!(purge_until_purged(&fluree, &id).await.1, 1);
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, past, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, past, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A holder whose head moved back past the removal holds the value as
+/// current again: publication waits, naming it, rather than publish an
+/// erasure its index would go on serving.
+#[tokio::test]
+async fn publication_waits_while_a_holder_holds_the_value_as_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-reset").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let before = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    fluree
+        .branch_admin()
+        .unwrap()
+        .reset_head_fenced(
+            &id,
+            before.write_basis(),
+            fluree_db_nameservice::NsRecordSnapshot::from_record(&before),
+        )
+        .await
+        .unwrap();
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 0, "{report:?}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_ne!(job.stage, ErasureStage::Published);
+    assert!(
+        job.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("still current on it/erase-reset:main")),
+        "{job:?}"
+    );
+}
+
 /// A branch made while a request is accepted is made after it, holding its
 /// removal; made before the removal, the request would miss it.
 #[tokio::test]

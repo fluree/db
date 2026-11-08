@@ -333,6 +333,7 @@ impl Fluree {
         let name = fluree_db_core::LedgerName::parse(ledger_name)?;
         let publisher = self.publisher()?;
         let (from, to) = (source_id.as_ref(), new_id.as_ref());
+        let branch_id = &new_id;
         let new_fence = fluree_db_nameservice::lifecycle::create_branch_with(
             publisher,
             &name,
@@ -353,7 +354,18 @@ impl Fluree {
                 .await
                 .map_err(|e| {
                     NameServiceError::Storage(format!("the source's removal journal: {e}"))
-                })
+                })?;
+                // A past point can be before a removal, holding the value.
+                if is_historical {
+                    self.retract_removed_at_branch_point(branch_id)
+                        .await
+                        .map_err(|e| {
+                            NameServiceError::Storage(format!(
+                                "retracting what the source's journal removed: {e}"
+                            ))
+                        })?;
+                }
+                Ok(())
             },
         )
         .await

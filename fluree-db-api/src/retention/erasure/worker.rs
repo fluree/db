@@ -1016,7 +1016,19 @@ impl Fluree {
             }
             return Ok(Prepared::Waiting);
         }
-        let added = self.unclaimed_span_ends(branch, &holders, job).await?;
+        let (added, current) = self.unclaimed_span_ends(branch, &holders, job).await?;
+        if !current.is_empty() {
+            // Its index would go on serving the value, and the purge find it.
+            let message = format!(
+                "the value is still current on {}; remove it there before this publishes",
+                current.join(", ")
+            );
+            self.update_job(branch, &job.request_id, |j| {
+                j.last_error = Some(message.clone());
+            })
+            .await?;
+            return Ok(Prepared::Waiting);
+        }
         if !added.is_empty() {
             self.update_job(branch, &job.request_id, |j| add_commits(j, &added))
                 .await?;
@@ -1361,13 +1373,17 @@ impl Fluree {
     /// end the span of one of `job`'s assertions but are not in it, as
     /// commits to erase. A copy restored from an older archive since
     /// acceptance makes one, retracting the value still current in it; a
-    /// copy dropped before acceptance can hold its own.
+    /// copy dropped before acceptance can hold its own. Also the holders
+    /// still holding one of the assertions as current: every branch holding
+    /// it retracts it, as the request, a restore or a branch made at a past
+    /// point does, so one that does not is a head moved back since. A
+    /// dropped holder is left to its restore.
     async fn unclaimed_span_ends(
         &self,
         branch: &str,
         holders: &[NsRecord],
         job: &ErasureJob,
-    ) -> Result<Vec<CommitErasure>> {
+    ) -> Result<(Vec<CommitErasure>, Vec<String>)> {
         let named: HashMap<(&str, u32), &CommitErasure> = job
             .commits
             .iter()
@@ -1390,11 +1406,15 @@ impl Fluree {
         let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
         stores.extend(self.dropped_holders(&commits).await?);
         let mut found = super::request::Found::new();
-        for (holder, store) in &stores {
+        let mut current = Vec::new();
+        for (i, (holder, store)) in stores.iter().enumerate() {
             let Some(head) = holder.commit_head_id.as_ref() else {
                 continue;
             };
-            let (ends, _) = span_ends(store.as_ref(), head, from, &named).await?;
+            let (ends, open) = span_ends(store.as_ref(), head, from, &named).await?;
+            if i < holders.len() && self.holds_current(holder, store, &open).await? {
+                current.push(holder.ledger_id.to_string());
+            }
             for end in ends {
                 let entry = found
                     .entry((end.commit.to_string(), end.slot))
@@ -1406,14 +1426,40 @@ impl Fluree {
             }
         }
         if found.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), current));
         }
         let candidates: Vec<String> = stores
             .iter()
             .map(|(r, _)| r.ledger_id.to_string())
             .collect();
-        self.commits_to_erase(&LedgerId::parse(branch)?, &found, &candidates)
-            .await
+        let added = self
+            .commits_to_erase(&LedgerId::parse(branch)?, &found, &candidates)
+            .await?;
+        Ok((added, current))
+    }
+
+    /// Whether `holder` holds one of `open`, assertions no retraction in its
+    /// history ended, as current state at its head: a graph's drop ends one
+    /// without a retraction.
+    async fn holds_current<T>(
+        &self,
+        holder: &NsRecord,
+        store: &std::sync::Arc<dyn fluree_db_core::ContentStore>,
+        open: &[(fluree_db_core::Flake, &T)],
+    ) -> Result<bool> {
+        if open.is_empty() {
+            return Ok(false);
+        }
+        let state = self
+            .load_unlisted_state(store.clone(), holder.clone())
+            .await?;
+        for (flake, _) in open {
+            let stored = crate::retention::removal::stored_terms(&state, flake).await?;
+            if stored.iter().any(|f| f.t == flake.t) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn job(&self, branch: &str, request_id: &str) -> Result<ErasureJob> {

@@ -251,6 +251,64 @@ impl Fluree {
         Ok(retracted_t)
     }
 
+    /// Retract, in `branch`, a branch not yet listed that starts at a past
+    /// point of its source, each journaled occurrence it holds as current
+    /// state, and journal the retraction, as a restore does: a point before
+    /// a removal holds the removed value, which history suppression does not
+    /// cover.
+    pub(crate) async fn retract_removed_at_branch_point(
+        &self,
+        branch: &fluree_db_core::LedgerId,
+    ) -> Result<()> {
+        let ns = self.publisher()?;
+        let Some(registration) = registry::read(ns, self.registry_objects(), branch.as_str())
+            .await?
+            .1
+            .filter(|r| !r.journal.removals.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut branches = self.nameservice().branch_records(branch.name()).await?;
+        branches.retain(|r| r.branch != branch.branch());
+        // Not listed yet, so its root is its ledger's, as its source has it.
+        let root = branches.iter().find_map(|r| r.storage_root.clone());
+        let unlisted = |stored: NsRecord| NsRecord {
+            storage_root: root.clone(),
+            ..stored
+        };
+        let record = unlisted(
+            ns.raw_record(branch.as_str())
+                .await?
+                .ok_or_else(|| ApiError::NotFound(branch.to_string()))?,
+        );
+        branches.push(record.clone());
+        let (_, removals) = self
+            .retract_removed(&record, &registration.journal.removals, &branches)
+            .await?;
+        if removals.is_empty() {
+            return Ok(());
+        }
+        registry::update_fenced(
+            ns,
+            self.registry_objects(),
+            branch.as_str(),
+            record.fence,
+            |current| {
+                let mut next = current?.clone();
+                next.journal.removals.extend(removals.iter().cloned());
+                next.journal.generation += 1;
+                Some(next)
+            },
+        )
+        .await?;
+        let record = unlisted(
+            ns.raw_record(branch.as_str())
+                .await?
+                .ok_or_else(|| ApiError::NotFound(branch.to_string()))?,
+        );
+        self.publish_checkpoint(&record).await
+    }
+
     /// The lineage of a ledger restored from a drop, not yet visible: the
     /// one a restored branch's registration records, or its root branch's
     /// genesis commit.

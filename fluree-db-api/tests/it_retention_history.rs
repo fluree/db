@@ -2644,3 +2644,63 @@ async fn a_removal_before_the_first_pass_keeps_an_earlier_policy() {
     assert_eq!(journal.history_rules.len(), 1, "{status:?}");
     assert!(journal.history_rules[0].until_t.is_some(), "{status:?}");
 }
+
+/// A branch made at a point before a removal holds the removed value as
+/// current, which history suppression does not cover: it is retracted as
+/// the branch is made, and the retraction journaled, as a restore does.
+#[tokio::test]
+async fn a_branch_made_before_a_removal_holds_no_removed_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-past-branch").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let t2 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    let made = fluree
+        .create_branch(
+            "it/removal-past-branch",
+            "past",
+            None,
+            Some(fluree_db_api::TimeSpec::AtT(t2)),
+        )
+        .await
+        .expect("branch");
+    assert_eq!(made.commit_t, t2 + 1, "the retraction");
+    let past = "it/removal-past-branch:past";
+    assert_eq!(
+        read(&fluree, past, json!(past), "ex:alice", "ex:email")
+            .await
+            .unwrap(),
+        Vec::<JsonValue>::new()
+    );
+    assert_eq!(
+        read(&fluree, past, json!(past), "ex:bob", "ex:email")
+            .await
+            .unwrap(),
+        vec![json!("b@old")]
+    );
+    // Its own retraction is journaled: a past read of the branch that
+    // could see the value is refused.
+    assert!(unavailable(
+        read(
+            &fluree,
+            past,
+            json!(format!("{past}@t:{t2}")),
+            "ex:alice",
+            "ex:email"
+        )
+        .await
+    ));
+}
