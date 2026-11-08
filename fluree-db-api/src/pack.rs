@@ -75,8 +75,8 @@ struct Erasures;
 impl Erasures {
     async fn of(
         _: &crate::Fluree,
+        _: &str,
         _: &dyn ContentStore,
-        _: &[ContentId],
         _: &[ContentId],
         _: &[ContentId],
         _: &[String],

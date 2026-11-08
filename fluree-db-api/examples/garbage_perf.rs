@@ -463,7 +463,13 @@ async fn cadence(writers: usize, rate: f64, minutes: u64, interval: Duration) {
                     .await
                     .expect("collect");
                 let reconciled = fluree
-                    .reconcile_due(options.reconcile_interval, options.reconcile_budget)
+                    .reconcile_due(
+                        // Opted in, at the daily interval it measures.
+                        options
+                            .reconcile_interval
+                            .unwrap_or(Duration::from_secs(24 * 60 * 60)),
+                        options.reconcile_budget,
+                    )
                     .await
                     .expect("reconcile");
                 let ended = Instant::now();

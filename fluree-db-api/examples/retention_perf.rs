@@ -96,7 +96,7 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(250);
     fluree.start_maintenance(
-        None,
+        Default::default(),
         Some(RetentionOptions {
             interval: Duration::from_millis(interval_ms),
             ..Default::default()

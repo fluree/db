@@ -701,6 +701,7 @@ fn entries(
         .collect()
 }
 
+#[cfg(feature = "native")]
 /// A fact whose object is a triple term spelling a value an erasure takes
 /// out: it keeps the value readable, in the index and in its own commit.
 pub(crate) struct Spelling {
@@ -710,6 +711,7 @@ pub(crate) struct Spelling {
     pub(crate) fact: Flake,
 }
 
+#[cfg(feature = "native")]
 /// The facts of `commits` whose object is a triple term, at any depth,
 /// spelling one of `facts`, other than the occurrences `named`.
 pub(crate) fn spellings<'a>(
@@ -747,6 +749,7 @@ pub(crate) fn spellings<'a>(
     found
 }
 
+#[cfg(feature = "native")]
 /// Why an erasure leaving `spelled` cannot be made: what must go with it.
 pub(crate) fn spelled_refusal(
     snapshot: &fluree_db_core::LedgerSnapshot,
@@ -790,6 +793,7 @@ pub(crate) fn spelled_refusal(
     )
 }
 
+#[cfg(feature = "native")]
 impl Fluree {
     /// Refuse to erase what `request` names on `ledger_id` while a fact
     /// outside it, now or in its history, names a triple term spelling one
