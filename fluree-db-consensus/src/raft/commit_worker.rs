@@ -201,6 +201,9 @@ pub struct Worker {
     shared_state: SharedState,
     publishing: PublishingChannel,
     staging: StagingContext,
+    /// Signalled by the supervisor when the branch has a queue, so an
+    /// idle worker takes a new entry without waiting out its poll.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl Worker {
@@ -233,6 +236,7 @@ impl Worker {
             shared_state,
             publishing,
             staging,
+            wake: Arc::default(),
         }
     }
 
@@ -1287,7 +1291,10 @@ impl Worker {
                 if since.elapsed() >= IDLE_EXIT {
                     return;
                 }
-                tokio::time::sleep(POLL_INTERVAL).await;
+                tokio::select! {
+                    () = self.wake.notified() => {}
+                    () = tokio::time::sleep(POLL_INTERVAL) => {}
+                }
                 continue;
             };
             idle_since = None;
@@ -1459,11 +1466,13 @@ impl WorkerSupervisor {
     /// supervisor stop only after its children have.
     pub async fn run(self, cancel: CancellationToken) {
         let mut workers: HashMap<RefKey, JoinHandle<()>> = HashMap::new();
+        let mut wakes: HashMap<RefKey, Arc<tokio::sync::Notify>> = HashMap::new();
         let mut metrics_rx = self.raft.metrics();
 
         loop {
             let (desired, kept) = self.compute_ownership(&workers).await;
-            self.reconcile_workers(&mut workers, desired, kept).await;
+            self.reconcile_workers(&mut workers, &mut wakes, desired, kept)
+                .await;
 
             tokio::select! {
                 // Metrics changed (membership, leader, term, index, …).
@@ -1547,6 +1556,7 @@ impl WorkerSupervisor {
     async fn reconcile_workers(
         &self,
         workers: &mut HashMap<RefKey, JoinHandle<()>>,
+        wakes: &mut HashMap<RefKey, Arc<tokio::sync::Notify>>,
         desired: HashSet<RefKey>,
         kept: HashSet<RefKey>,
     ) {
@@ -1575,8 +1585,9 @@ impl WorkerSupervisor {
                     branch = %key.branch,
                     "commit worker spawned"
                 );
-                let handle = tokio::spawn(self.make_worker(key.clone()).run());
-                workers.insert(key.clone(), handle);
+                let worker = self.make_worker(key.clone());
+                wakes.insert(key.clone(), Arc::clone(&worker.wake));
+                workers.insert(key.clone(), tokio::spawn(worker.run()));
             }
         }
         // Two-step removal: HashMap::extract_if is unstable, so
@@ -1585,6 +1596,14 @@ impl WorkerSupervisor {
         let to_drop = workers_to_tear_down(workers, &desired, &kept);
         let dropped = to_drop.into_iter().filter_map(|key| workers.remove(&key));
         abort_and_await(dropped).await;
+        wakes.retain(|key, _| workers.contains_key(key));
+        // A worker kept across a drained queue idles between polls; its
+        // branch queuing again wakes it, as a fresh spawn would start.
+        for key in &desired {
+            if let Some(wake) = wakes.get(key) {
+                wake.notify_one();
+            }
+        }
     }
 
     fn make_worker(&self, ref_key: RefKey) -> Worker {
