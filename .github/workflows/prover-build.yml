@@ -60,6 +60,10 @@ jobs:
         with:
           name: fluree-prover-guest
           path: ${{ runner.temp }}/guest
+      # Xcode 26 ships without the Metal compiler, which risc0-sys's kernels need.
+      - name: Install the Metal toolchain
+        if: runner.os == 'macOS'
+        run: xcodebuild -downloadComponent MetalToolchain
       - name: Build the prover
         working-directory: fluree-prover
         env:
