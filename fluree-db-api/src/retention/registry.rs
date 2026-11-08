@@ -287,28 +287,25 @@ fn named_in(stored: &serde_json::Value, out: &mut std::collections::HashSet<Stri
 }
 
 impl crate::Fluree {
-    /// `ledger_id`'s config record for a reader that cannot read this
-    /// storage's registry objects (a query peer through the storage
-    /// proxy): its retention journal's chunked removals are inlined, so the
-    /// reader refuses the history this ledger refuses.
+    /// What a reader that cannot read this storage's registry objects (a
+    /// query peer through the storage proxy) needs of `ledger_id`'s config:
+    /// its retention activation and journal, the journal's chunked removals
+    /// inlined, so the reader refuses the history this ledger refuses. None
+    /// of the registration's other state, such as erasure requests.
     pub async fn config_for_reader(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let (config, stored) = read_stored(&self.nameservice_mode, ledger_id).await?;
-        let Some(mut stored) = stored else {
-            return Ok(config);
-        };
-        if chunk_refs(stored.pointer("/journal/removalChunks"))?.is_none() {
-            return Ok(config);
-        }
-        let Some(mut config) = config else {
+        let (Some(config), Some(stored)) = (config, stored) else {
             return Ok(None);
         };
         let journal = resolve_journal(&stored, self.registry_objects()).await?;
-        stored["journal"] = serde_json::to_value(&journal)
-            .map_err(|e| ApiError::internal(format!("retention journal: {e}")))?;
-        if let Some(payload) = config.payload.as_mut() {
-            payload.extra.insert(EXTRA_KEY.to_string(), stored);
-        }
-        Ok(Some(config))
+        let reader = serde_json::json!({
+            "activeSinceT": stored.get("activeSinceT").cloned().unwrap_or_default(),
+            "journal": serde_json::to_value(&journal)
+                .map_err(|e| ApiError::internal(format!("retention journal: {e}")))?,
+        });
+        let mut payload = fluree_db_nameservice::ConfigPayload::new();
+        payload.extra.insert(EXTRA_KEY.to_string(), reader);
+        Ok(Some(ConfigValue::new(config.v, Some(payload))))
     }
 
     /// Where this instance keeps registrations' chunks; `None` without

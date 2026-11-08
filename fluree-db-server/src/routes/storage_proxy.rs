@@ -459,23 +459,56 @@ pub async fn get_config_record(
     State(state): State<Arc<AppState>>,
     Path(ledger_id): Path<String>,
     StorageProxyBearer(principal): StorageProxyBearer,
+    headers: HeaderMap,
 ) -> Result<Response, ServerError> {
     if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
-    state
+    let record = state
         .fluree
         .nameservice()
         .lookup(&ledger_id)
         .await
         .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
         .ok_or_else(|| ServerError::not_found("Ledger not found"))?;
+    // The record's version, and the branch's fence, which a ledger created
+    // again under the name does not share.
+    let version = state
+        .fluree
+        .nameservice()
+        .get_config(&ledger_id)
+        .await
+        .map_err(|e| ServerError::internal(format!("Config lookup failed: {e}")))?
+        .map_or(0, |config| config.v);
+    let fence = record
+        .fence
+        .map_or_else(String::new, |fence| fence.to_string());
+    let tag = format!("\"{fence}-{version}\"");
+    let tagged = |mut response: Response| {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&tag) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::ETAG, value);
+        }
+        response
+    };
+    if headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|held| held.to_str().ok())
+        == Some(tag.as_str())
+    {
+        return Ok(tagged(axum::response::IntoResponse::into_response(
+            StatusCode::NOT_MODIFIED,
+        )));
+    }
     let config = state
         .fluree
         .config_for_reader(&ledger_id)
         .await
         .map_err(|e| ServerError::internal(format!("Config lookup failed: {e}")))?;
-    Ok(axum::response::IntoResponse::into_response(Json(config)))
+    Ok(tagged(axum::response::IntoResponse::into_response(Json(
+        config,
+    ))))
 }
 
 /// GET /fluree/storage/ns/{alias}

@@ -151,7 +151,7 @@ The response includes a `serving` array (`"query"`, `"blocks"`) advertising the 
 
 #### `GET /v1/fluree/storage/config/{ledger-id}`
 
-Fetch the ledger's config record (`null` when it has none), with the same authorization as the nameservice record. A peer reads the ledger's [removal journal](../transactions/history-retention.md) from it, so it refuses the history the ledger refuses: the journal's removals arrive inline, readable without the server's storage. A server without this endpoint answers 404, which a peer reads as no journal.
+Fetch what a reader needs of the ledger's config (`null` when the ledger has no retention registration), with the same authorization as the nameservice record: the registration's activation and its [removal journal](../transactions/history-retention.md), the journal's removals inline, readable without the server's storage. A peer reads it before each time-travel query, so it refuses the history the ledger refuses. The response carries an `ETag`; a request whose `If-None-Match` names the current one is answered `304` with no body, as the peer's repeat reads are. A server without this endpoint answers 404, which a peer reads as no journal; a peer treats any other refusal, such as a 403 from a proxy in front of the server, as an error rather than an empty journal, and fails the query.
 
 A ledger with a removal serves its commits only to a token with audit access (`fluree.ledger.audit.all`, or `fluree.ledger.audit.ledgers` naming the ledger; see [History retention](../transactions/history-retention.md)), so a peer serving such a ledger needs one.
 

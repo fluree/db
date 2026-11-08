@@ -4405,6 +4405,58 @@ async fn test_proxy_peer_refuses_removed_history() {
     assert_eq!(json, serde_json::json!([["b@x"]]));
     let (status, json) = query("peerhist:main@t:1", "alice").await;
     assert_eq!(status, StatusCode::GONE, "{json}");
+    // Read again, the journal is revalidated, not sent again, and still
+    // refuses.
+    let (status, json) = query("peerhist:main@t:1", "alice").await;
+    assert_eq!(status, StatusCode::GONE, "{json}");
+
+    // The route answers with the journal alone, tagged; an unchanged one is
+    // not sent again, and a changed one is.
+    let config = |tag: Option<String>| {
+        let mut request = client
+            .get(format!(
+                "{server_url}/v1/fluree/storage/config/peerhist:main"
+            ))
+            .bearer_auth(&token);
+        if let Some(tag) = tag {
+            request = request.header("if-none-match", tag);
+        }
+        request.send()
+    };
+    let first = config(None).await.expect("config");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let tag = first.headers()["etag"].to_str().unwrap().to_string();
+    let body: serde_json::Value = first.json().await.unwrap();
+    let retention = &body["payload"]["retention"];
+    let mut keys: Vec<&str> = retention
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["activeSinceT", "journal"], "{body}");
+    let again = config(Some(tag.clone())).await.expect("config");
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_MODIFIED);
+    let remove = client
+        .post(format!("{server_url}/v1/fluree/remove/peerhist:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"matching": [{
+                "subject": "http://example.org/bob",
+                "predicate": "http://example.org/email"
+            }]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("remove");
+    assert_eq!(remove.status(), reqwest::StatusCode::OK);
+    let changed = config(Some(tag.clone())).await.expect("config");
+    assert_eq!(changed.status(), reqwest::StatusCode::OK);
+    assert_ne!(changed.headers()["etag"].to_str().unwrap(), tag);
+    let (status, json) = query("peerhist:main@t:1", "bob").await;
+    assert_eq!(status, StatusCode::GONE, "{json}");
     server_handle.abort();
 }
 
