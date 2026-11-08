@@ -107,6 +107,11 @@ fn parse(bytes: &[u8]) -> Result<Replacement<'_>, CommitCodecError> {
     }
     let dict = |pos: &mut usize| -> Result<StringDict, CommitCodecError> {
         let count = decode_varint(bytes, pos)? as usize;
+        // Each entry takes at least its tag byte: a count past what is left
+        // is malformed, and must not size an allocation.
+        if count > bytes.len() - *pos {
+            return Err(malformed("dictionary count exceeds the replacement"));
+        }
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             // A removed entry keeps its position; no survivor refers to it.
@@ -219,4 +224,36 @@ pub(crate) fn load_commit_ops_replacement(bytes: &[u8]) -> Result<CommitOps, Com
         r.dicts,
         ops,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::varint::encode_varint;
+    use super::*;
+
+    /// A crafted replacement whose dictionary count runs past its bytes is
+    /// refused, not trusted to size an allocation that aborts the reader.
+    #[test]
+    fn a_dictionary_count_past_the_bytes_is_refused() {
+        let mut bytes = REPLACEMENT_MAGIC.to_vec();
+        bytes.extend(REPLACEMENT_VERSION.to_le_bytes());
+        let cid = ContentId::new(crate::ContentKind::Commit, b"original").to_bytes();
+        bytes.extend((cid.len() as u16).to_le_bytes());
+        bytes.extend(&cid);
+        let mut header = [0u8; HEADER_LEN];
+        CommitHeader {
+            version: VERSION,
+            flags: 0,
+            t: 1,
+            op_count: 0,
+            envelope_len: 0,
+            sig_block_len: 0,
+        }
+        .write_to(&mut header);
+        bytes.extend(header);
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        encode_varint(u64::MAX >> 1, &mut bytes);
+        assert!(read_commit_replacement(&bytes).is_err());
+    }
 }
