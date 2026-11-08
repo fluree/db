@@ -69,20 +69,26 @@ pub struct ClassState {
     overlay: OverlayState,
 }
 
-/// What tells an overlay's content apart: its content version, or, for an
-/// overlay that cannot vouch for one (a historical view), its epoch, which a
-/// reasoning overlay tags with its materialization.
+/// What tells an overlay's content apart: its content version. An overlay
+/// that cannot vouch for one gets an identity of its own each time a state is
+/// taken, shared with nothing: its epoch is unique only within its own
+/// lineage. Such a state answers only for the value it was taken as, so a
+/// caller populates and reads with the same `ClassState`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum OverlayState {
     Version(u64),
-    Epoch(u64),
+    Unshared(u64),
 }
+
+static NEXT_UNSHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl ClassState {
     pub fn new(g_id: GraphId, overlay: &dyn OverlayProvider, t: i64) -> Self {
         let overlay = match overlay.content_version() {
             Some(version) => OverlayState::Version(version),
-            None => OverlayState::Epoch(overlay.epoch()),
+            None => OverlayState::Unshared(
+                NEXT_UNSHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
         };
         Self { g_id, t, overlay }
     }
@@ -1458,8 +1464,9 @@ mod tests {
     }
 
     /// A plain and a reasoning query on one view read one graph at one `t`
-    /// through different overlays; neither answers for the other. An overlay
-    /// with no content version is told apart by its epoch.
+    /// through different overlays; neither answers for the other. A state of
+    /// an overlay with no content version answers only for itself: two such
+    /// overlays can share an epoch.
     #[test]
     fn class_cache_keeps_overlays_apart() {
         let ctx = PolicyContext::new(PolicyWrapper::root(), None);
@@ -1480,11 +1487,12 @@ mod tests {
         );
         assert_eq!(ctx.get_cached_subject_classes(state(None, 1), &alice), None);
 
-        ctx.cache_subject_classes(state(None, 1), alice.clone(), vec![make_sid(100, "Person")]);
+        let unversioned = state(None, 1);
+        ctx.cache_subject_classes(unversioned, alice.clone(), vec![make_sid(100, "Person")]);
         assert!(ctx
-            .get_cached_subject_classes(state(None, 1), &alice)
+            .get_cached_subject_classes(unversioned, &alice)
             .is_some());
-        assert_eq!(ctx.get_cached_subject_classes(state(None, 2), &alice), None);
+        assert_eq!(ctx.get_cached_subject_classes(state(None, 1), &alice), None);
     }
 
     #[test]
