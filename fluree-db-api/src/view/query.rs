@@ -1585,21 +1585,24 @@ impl Fluree {
                 .await?,
         );
 
-        self.refuse_suppressed_view_history(&db, parsed, &executable, None)
+        self.refuse_suppressed_view_history(&db, parsed, &executable, None, &db.snapshot)
             .await?;
 
         Ok(executable)
     }
 
     /// Refuse a read of `db` that needs history its ledger's retention
-    /// suppressed. A read of current state costs a lookup in memory, with no
-    /// I/O or waiting on the ledger; see [`Fluree::view_freshness`].
+    /// suppressed. `parsed` holds ids `encoded_with`'s namespace table
+    /// assigned (a dataset's primary's, for each of its ledgers). A read of
+    /// current state costs a lookup in memory, with no I/O or waiting on
+    /// the ledger; see [`Fluree::view_freshness`].
     pub(crate) async fn refuse_suppressed_view_history(
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::ir::Query,
         executable: &ExecutableQuery,
         history_range: Option<(i64, i64)>,
+        encoded_with: &fluree_db_core::LedgerSnapshot,
     ) -> Result<()> {
         use crate::retention::suppression::Freshness;
         let earlier_point = history_range.is_some() || db.historical;
@@ -1619,7 +1622,7 @@ impl Fluree {
         let reads = if executable.reasoning.modes.has_any_enabled() {
             crate::retention::suppression::Reads::Everything
         } else {
-            crate::retention::suppression::reads_of(parsed, &db.snapshot)
+            crate::retention::suppression::reads_of(parsed, encoded_with)
         };
         let (from_t, to_t) = match history_range {
             Some((from, to)) => (Some(from), to),

@@ -2704,3 +2704,79 @@ async fn a_branch_made_before_a_removal_holds_no_removed_value() {
         .await
     ));
 }
+
+/// A dataset query's ids come from its primary ledger's namespace table:
+/// another ledger of the dataset that numbered the same namespaces
+/// differently still refuses the history it removed.
+#[tokio::test]
+async fn a_dataset_refuses_history_another_of_its_ledgers_removed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let primary = ledger(&fluree, "it/dataset-primary").await;
+    let other = ledger(&fluree, "it/dataset-other").await;
+    // The primary numbers http://beta.test/ before http://alpha.test/; the
+    // other ledger the reverse.
+    insert(
+        &fluree,
+        &primary,
+        json!({"@id": "http://beta.test/x", "http://beta.test/email": "x@other"}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &primary,
+        json!({"@id": "http://alpha.test/carol", "http://alpha.test/email": "c@x"}),
+    )
+    .await;
+    let t1 = insert(
+        &fluree,
+        &other,
+        json!({"@id": "http://alpha.test/alice", "http://alpha.test/email": "a@old"}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &other,
+        json!({"@id": "http://beta.test/y", "http://beta.test/email": "y@other"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(
+            &other,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://alpha.test/alice".into(),
+                    predicate: "http://alpha.test/email".into(),
+                    graph: None,
+                    object: None,
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+
+    let query = json!({
+        // A point holding both namespaces, and the removed value.
+        "from": [primary.clone(), format!("{other}@t:{}", t1 + 1)],
+        "reasoning": "none",
+        "select": "?o",
+        "where": {"@id": "?s", "http://alpha.test/email": "?o"}
+    });
+    let result = fluree.query_connection(&query).await;
+    assert!(
+        matches!(result, Err(ApiError::HistoryUnavailable(_))),
+        "{:?}",
+        result.map(|r| r.row_count())
+    );
+    let sparql = format!(
+        "SELECT ?o FROM <{primary}> FROM <{other}@t:{}> \
+         WHERE {{ ?s <http://alpha.test/email> ?o }}",
+        t1 + 1
+    );
+    let result = fluree.query_connection_sparql(&sparql).await;
+    assert!(
+        matches!(result, Err(ApiError::HistoryUnavailable(_))),
+        "{:?}",
+        result.map(|r| r.row_count())
+    );
+}
