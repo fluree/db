@@ -234,7 +234,9 @@ impl Prover for SubprocessProver {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        create_scratch(&scratch).await.map_err(unavailable)?;
+        create_scratch(&self.config.scratch_dir, &scratch)
+            .await
+            .map_err(unavailable)?;
         let outcome = run(&self.config, &scratch, request).await;
         if let Err(e) = tokio::fs::remove_dir_all(&scratch).await {
             tracing::warn!(dir = %scratch.display(), error = %e, "prover scratch not removed");
@@ -250,19 +252,58 @@ impl Prover for SubprocessProver {
 }
 
 /// A step's scratch directory, which the input commit and the prover's
-/// temporary files pass through: readable by this user alone.
-async fn create_scratch(dir: &Path) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(dir).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
-    }
-    Ok(())
+/// temporary files pass through: readable by this user alone from its
+/// creation, in a root no other user owns or can write to, so none can
+/// read it or put another directory in its place.
+async fn create_scratch(root: &Path, dir: &Path) -> std::io::Result<()> {
+    let (root, dir) = (root.to_path_buf(), dir.to_path_buf());
+    tokio::task::spawn_blocking(move || create_scratch_in(&root, &dir))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
-/// Read `reader` to its end, keeping at most `limit` bytes of it: its
-/// start, or with `tail`, its end. Says whether anything was left out.
+#[cfg(unix)]
+fn create_scratch_in(root: &Path, dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)?;
+    let held = std::fs::symlink_metadata(root)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let user = unsafe { libc::geteuid() };
+    let refuse = |why: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("prover scratch {}: {why}", root.display()),
+        ))
+    };
+    if !held.is_dir() {
+        return refuse("not a directory");
+    }
+    if held.uid() != user && held.uid() != 0 {
+        return refuse("owned by another user");
+    }
+    if held.mode() & 0o022 != 0 {
+        if held.uid() != user {
+            return refuse("writable by other users");
+        }
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // Not recursive: a directory already there under the step's name is
+    // not this step's.
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_scratch_in(root: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    std::fs::create_dir(dir)
+}
+
+/// Read `reader`, keeping at most `limit` bytes of it: its start, read until
+/// it runs past, or with `tail`, its end, read through. Says whether
+/// anything was left out.
 async fn read_capped<R: AsyncRead + Unpin>(
     mut reader: R,
     limit: usize,
@@ -285,7 +326,10 @@ async fn read_capped<R: AsyncRead + Unpin>(
         } else {
             let take = n.min(limit - kept.len());
             kept.extend_from_slice(&buf[..take]);
-            over |= take < n;
+            if take < n {
+                over = true;
+                break;
+            }
         }
     }
     if kept.len() > limit {
@@ -300,15 +344,22 @@ struct Group(Option<u32>);
 
 impl Drop for Group {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0 {
-            // SAFETY: signals the group this step's child leads; ESRCH once
-            // it has ended is harmless.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-            }
+        kill_group(self.0);
+    }
+}
+
+/// Kill the process group the step's child leads.
+fn kill_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: signals the group this step's child leads; ESRCH once it
+        // has ended is harmless.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// The command a step runs: in `scratch`, at low priority, in its own
@@ -373,9 +424,19 @@ async fn run(
     scratch: &Path,
     request: &ProveRequest,
 ) -> Result<ProveResponse, ProverError> {
+    run_limited(config, scratch, request, RESPONSE_LIMIT).await
+}
+
+async fn run_limited(
+    config: &ProverConfig,
+    scratch: &Path,
+    request: &ProveRequest,
+    response_limit: usize,
+) -> Result<ProveResponse, ProverError> {
     let unavailable = |e: std::io::Error| ProverError::Unavailable(e.to_string());
     let mut child = command(config, scratch).spawn().map_err(unavailable)?;
-    let _group = Group(child.id());
+    let pid = child.id();
+    let _group = Group(pid);
     let mut stdin = child.stdin.take().expect("piped");
     let mut stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
@@ -387,13 +448,23 @@ async fn run(
             drop(stdin);
             Ok::<_, std::io::Error>(())
         };
+        // A response past the limit ends the step at once.
+        let read = async {
+            let read = read_capped(&mut stdout, response_limit, false).await;
+            if matches!(read, Ok((_, true))) {
+                kill_group(pid);
+            }
+            read
+        };
         let (written, read, read_err) = tokio::join!(
             write,
-            read_capped(&mut stdout, RESPONSE_LIMIT, false),
+            read,
             read_capped(&mut stderr, DIAGNOSTICS_TAIL, true)
         );
-        written?;
         let out = read?;
+        if !out.1 {
+            written?;
+        }
         let (err, _) = read_err?;
         let status = child.wait().await?;
         Ok::<_, std::io::Error>((status, out, err))
@@ -402,6 +473,11 @@ async fn run(
         .await
         .map_err(|_| ProverError::Unavailable(format!("no result in {:?}", config.timeout)))?
         .map_err(unavailable)?;
+    if too_long {
+        return Err(ProverError::Failed(format!(
+            "its response exceeds {response_limit} bytes"
+        )));
+    }
     if !status.success() {
         let message = String::from_utf8_lossy(&err);
         let last = message
@@ -416,11 +492,6 @@ async fn run(
         } else {
             ProverError::Failed(format!("{status}: {last}"))
         });
-    }
-    if too_long {
-        return Err(ProverError::Failed(format!(
-            "its response exceeds {RESPONSE_LIMIT} bytes"
-        )));
     }
     ProveResponse::decode(&out).map_err(|e| ProverError::Failed(format!("its response: {e}")))
 }
@@ -457,11 +528,64 @@ mod output_tests {
     #[tokio::test]
     async fn the_scratch_is_private() {
         use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         let dir = tempfile::tempdir().unwrap();
-        let scratch = dir.path().join("step-1-1");
-        super::create_scratch(&scratch).await.unwrap();
-        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
+        let root = dir.path().join("scratch");
+        let scratch = root.join("step-1-1");
+        super::create_scratch(&root, &scratch).await.unwrap();
+        assert_eq!((mode(&root), mode(&scratch)), (0o700, 0o700));
+
+        // A root others can write to is made this user's alone.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        super::create_scratch(&root, &root.join("step-1-2"))
+            .await
+            .unwrap();
+        assert_eq!(mode(&root), 0o700);
+
+        // A directory already under the step's name is not the step's.
+        assert!(super::create_scratch(&root, &scratch).await.is_err());
+
+        // Nor is a root that is a link to another directory.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        assert!(super::create_scratch(&linked, &linked.join("step-1-3"))
+            .await
+            .is_err());
+    }
+
+    /// A prover writing past the response limit is stopped there, not left
+    /// running until the step's timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_response_past_its_limit_ends_the_step() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let command = dir.path().join("prover");
+        std::fs::write(&command, "#!/bin/sh\nexec yes\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = super::ProverConfig {
+            command,
+            scratch_dir: dir.path().to_path_buf(),
+            threads: None,
+            niceness: 0,
+            timeout: std::time::Duration::from_secs(120),
+        };
+        let request = super::ProveRequest {
+            input: vec![0; 1 << 20],
+            removed_slots: vec![1],
+            ledger_id: "acme/people:main".into(),
+            signatures: crate::Signatures::Verify,
+        };
+        let started = std::time::Instant::now();
+        let outcome = super::run_limited(&config, dir.path(), &request, 1 << 16).await;
+        assert!(
+            matches!(&outcome, Err(super::ProverError::Failed(why)) if why.contains("exceeds")),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 }
 
