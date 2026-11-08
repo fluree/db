@@ -82,6 +82,8 @@ fluree-db-nameservice = { path = "../fluree-db-nameservice", features = ["confor
 fluree-db-api = { path = "../fluree-db-api", features = ["testing"] }
 fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 tempfile = "3.19"
+# Counts the commit-worker supervisor's spawn events.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
