@@ -25,6 +25,12 @@ derived search indexes and scratch files.
   the stored transaction documents cannot be redacted (see [Limits](#limits)).
 - **What is not erased:** IRIs. They are identifiers, so keep personal data out of them and use opaque
   ids (`ex:user-8f3a…`, not `mailto:alice@example.org`). See [Limits](#limits).
+- **Triple terms:** a fact whose object is a triple term spelling an erased fact
+  (`ex:claim rdf:reifies <<( ex:alice ex:email "a@secret" )>>`, now or in its history) would keep the
+  value readable. A request is refused with `409` while one exists on a branch it reaches, naming each
+  such fact's commit and slot: name those occurrences in the request too. One written after the request
+  was accepted holds its publication back, with the same explanation in the job's `lastError`. A triple
+  term spelling another fact with the same value, such as another subject's, is left as it is.
 
 ## Requesting an erasure
 

@@ -152,6 +152,23 @@ impl Fluree {
             occurrences: request.occurrences.clone(),
             matching: request.matching.clone(),
         };
+        // Before anything is removed: a triple term spelling a value would
+        // keep it readable, on any branch.
+        for (i, branch) in branches.iter().enumerate() {
+            let widening = Widening {
+                pair_spans: true,
+                skip_foreign: i > 0,
+                bounded: false,
+            };
+            match self
+                .refuse_spelled_values(branch, &removal_request, widening)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if i > 0 && (e.is_not_found() || e.status_code() == 404) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let mut removed = Accepted::default();
         self.remove_on(writer, &branches, &removal_request, true, &mut removed)
             .await?;

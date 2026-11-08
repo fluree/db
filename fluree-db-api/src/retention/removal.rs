@@ -701,6 +701,133 @@ fn entries(
         .collect()
 }
 
+/// A fact whose object is a triple term spelling a value an erasure takes
+/// out: it keeps the value readable, in the index and in its own commit.
+pub(crate) struct Spelling {
+    pub(crate) commit: ContentId,
+    pub(crate) slot: u32,
+    pub(crate) t: i64,
+    pub(crate) fact: Flake,
+}
+
+/// The facts of `commits` whose object is a triple term, at any depth,
+/// spelling one of `facts`, other than the occurrences `named`.
+pub(crate) fn spellings<'a>(
+    commits: impl IntoIterator<Item = (i64, &'a ContentId, &'a fluree_db_core::Commit)>,
+    facts: &[Flake],
+    named: &std::collections::HashSet<(String, u32)>,
+) -> Vec<Spelling> {
+    fn spells(value: &FlakeValue, fact: &Flake) -> bool {
+        let FlakeValue::TripleTerm(term) = value else {
+            return false;
+        };
+        let lang = fact.m.as_ref().and_then(|m| m.lang.as_deref());
+        (term.s == fact.s
+            && term.p == fact.p
+            && term.o == fact.o
+            && term.dt == fact.dt
+            && term.lang.as_deref() == lang)
+            || spells(&term.o, fact)
+    }
+    let mut found = Vec::new();
+    for (t, cid, commit) in commits {
+        for (slot, flake) in commit.occurrences() {
+            if facts.iter().any(|fact| spells(&flake.o, fact))
+                && !named.contains(&(cid.to_string(), slot))
+            {
+                found.push(Spelling {
+                    commit: cid.clone(),
+                    slot,
+                    t,
+                    fact: flake.clone(),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Why an erasure leaving `spelled` cannot be made: what must go with it.
+pub(crate) fn spelled_refusal(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    ledger_id: &str,
+    spelled: &[Spelling],
+) -> String {
+    let iri = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .map_or_else(|| format!("{sid:?}"), |iri| format!("<{iri}>"))
+    };
+    let named: Vec<String> = spelled
+        .iter()
+        .take(5)
+        .map(|s| {
+            format!(
+                "{} {} (commit {}, slot {}, t={})",
+                iri(&s.fact.s),
+                iri(&s.fact.p),
+                s.commit,
+                s.slot,
+                s.t
+            )
+        })
+        .collect();
+    let more = spelled.len().saturating_sub(named.len());
+    format!(
+        "on {ledger_id}, {} name a triple term spelling a value this erasure removes, \
+         which would stay readable through them: {}{}. Name those occurrences in the \
+         erasure too",
+        match spelled.len() {
+            1 => "1 fact".to_string(),
+            n => format!("{n} facts"),
+        },
+        named.join("; "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
+impl Fluree {
+    /// Refuse to erase what `request` names on `ledger_id` while a fact
+    /// outside it, now or in its history, names a triple term spelling one
+    /// of its values.
+    pub(crate) async fn refuse_spelled_values(
+        &self,
+        ledger_id: &str,
+        request: &RemovalRequest,
+        widening: Widening,
+    ) -> Result<()> {
+        for _ in 0..ATTEMPTS {
+            let Some(read) = self.read_history(ledger_id, None).await? else {
+                continue;
+            };
+            let found = locate(&read, request, widening)?;
+            let facts: Vec<Flake> = found.located.iter().map(|l| l.flake.clone()).collect();
+            let named = found
+                .located
+                .iter()
+                .map(|l| (l.occurrence.commit.clone(), l.occurrence.slot))
+                .collect();
+            let commits = read.commits.iter().map(|(t, cid, c)| (*t, cid, c));
+            let spelled = spellings(commits, &facts, &named);
+            if spelled.is_empty() {
+                return Ok(());
+            }
+            return Err(ApiError::http(
+                409,
+                spelled_refusal(&read.state.snapshot, ledger_id, &spelled),
+            ));
+        }
+        Err(ApiError::commit_contention(
+            ATTEMPTS,
+            ApiError::internal("the head kept moving while the erasure was checked"),
+        ))
+    }
+}
+
 /// Each fact's assertions and retractions, in commit order.
 fn fact_events(
     commits: &[(i64, ContentId, fluree_db_core::Commit)],

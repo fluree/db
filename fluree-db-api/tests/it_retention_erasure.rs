@@ -699,6 +699,126 @@ async fn publication_waits_while_a_holder_holds_the_value_as_current() {
     );
 }
 
+/// `ex:claim` reifying `ex:alice ex:email "a@secret"`: a triple term that
+/// spells the value, without asserting it.
+async fn reify_email(fluree: &Fluree, ledger_id: &str) -> i64 {
+    insert(
+        fluree,
+        ledger_id,
+        json!({
+            "@context": ctx(),
+            "@id": "ex:claim",
+            "ex:note": "seen",
+            "@reifies": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }),
+    )
+    .await
+}
+
+/// The occurrence at `t` whose object is a triple term.
+async fn triple_term_occurrence(fluree: &Fluree, ledger_id: &str, t: i64) -> OccurrenceRef {
+    let cid = commit_at(fluree, ledger_id, t).await;
+    let commit = load_commit_by_id(store_of(fluree, ledger_id).await.as_ref(), &cid)
+        .await
+        .unwrap();
+    let slot = commit
+        .occurrences()
+        .find(|(_, f)| matches!(f.o, FlakeValue::TripleTerm(_)))
+        .map(|(slot, _)| slot)
+        .expect("a triple term");
+    OccurrenceRef {
+        commit: cid.to_string(),
+        slot,
+    }
+}
+
+/// A fact naming a triple term that spells an erased value would keep it
+/// readable: the erasure is refused, naming the fact, before anything is
+/// removed, until the request names it too.
+#[tokio::test]
+async fn an_erasure_is_refused_while_a_triple_term_spells_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-spelled").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let reified = reify_email(&fluree, &id).await;
+
+    match fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+    {
+        Err(ApiError::Http {
+            status: 409,
+            message,
+        }) => assert!(
+            message.contains("<http://example.org/claim>") && message.contains("triple term"),
+            "{message}"
+        ),
+        other => panic!("expected 409, got {:?}", other.map(|r| r.request_id)),
+    }
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")],
+        "nothing removed"
+    );
+
+    let request = ErasureRequest {
+        occurrences: vec![triple_term_occurrence(&fluree, &id, reified).await],
+        ..email("alice", "a@secret")
+    };
+    fluree
+        .erase_occurrences(&id, request, None)
+        .await
+        .expect("the request names the fact too");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+}
+
+/// A fact naming a triple term that spells the value, written after the
+/// request was accepted, holds its publication back.
+#[tokio::test]
+async fn a_triple_term_written_since_acceptance_holds_publication_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-spelled-later").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reify_email(&fluree, &id).await;
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 0, "{report:?}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert!(
+        job.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("<http://example.org/claim>")),
+        "{job:?}"
+    );
+}
+
 /// A branch made while a request is accepted is made after it, holding its
 /// removal; made before the removal, the request would miss it.
 #[tokio::test]
