@@ -36,6 +36,7 @@ use fluree_graph_turtle::{
 };
 use fluree_vocab::iri::is_absolute_iri;
 
+pub use fluree_graph_format::canon::{Canonical, CanonicalizeOptions, HashAlgorithm};
 pub use fluree_graph_format::PrefixMap;
 pub use fluree_graph_ir::{Dataset, Datatype, Graph, Term};
 
@@ -391,6 +392,23 @@ fn floor_char_boundary(text: &str, position: usize) -> usize {
         at -= 1;
     }
     at
+}
+
+/// `dataset` canonicalized by RDFC-1.0 (<https://www.w3.org/TR/rdf-canon/>):
+/// its blank nodes labeled `c14n0`, `c14n1`, … from its content alone, and
+/// its canonical N-Quads, which every dataset holding the same statements
+/// shares whatever its blank node labels and statement order. A dataset
+/// whose blank nodes take too much work to tell apart is refused (see
+/// [`CanonicalizeOptions::max_deep_calls`]).
+///
+/// It runs only when called: nothing in reading, writing or transacting
+/// canonicalizes.
+pub fn canonicalize(
+    dataset: &Dataset,
+    options: &CanonicalizeOptions,
+) -> Result<Canonical, RdfError> {
+    fluree_graph_format::canon::canonicalize(dataset, options)
+        .map_err(|e| RdfError::Invalid(e.to_string()))
 }
 
 #[cfg(test)]

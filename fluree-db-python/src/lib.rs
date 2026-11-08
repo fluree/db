@@ -51,6 +51,7 @@ fn _fluree(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<transaction::Transaction>()?;
     m.add_class::<query::Canceller>()?;
     m.add_function(wrap_pyfunction!(convert::sparql_form, m)?)?;
+    m.add_function(wrap_pyfunction!(rdf::canonicalize_rdf, m)?)?;
     m.add_function(wrap_pyfunction!(rdf::parse_rdf, m)?)?;
     m.add_function(wrap_pyfunction!(rdf::serialize_rdf, m)?)?;
     m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
