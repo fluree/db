@@ -129,7 +129,17 @@ pub(crate) async fn typed_table(
         .map(|&v| result.vars.name(v).to_string())
         .collect();
 
-    let mut hydrator = NodeHydrator::new(view, compactor, result.binary_graph.as_ref());
+    // A reasoning query's nodes render from the state its rows were read
+    // and judged in. The batched lane reads the index alone, so it is off.
+    let reasoned;
+    let (view, gv) = match &result.reasoned_overlay {
+        Some(overlay) => {
+            reasoned = view.reasoned(Arc::clone(overlay));
+            (&reasoned, None)
+        }
+        None => (view, result.binary_graph.as_ref()),
+    };
+    let mut hydrator = NodeHydrator::new(view, compactor, gv);
 
     // Prefetch pass: the engine has already produced the subject list, so
     // the remaining work is a bulk read, not N point probes. Subjects that
@@ -144,15 +154,6 @@ pub(crate) async fn typed_table(
                 }
             }
         }
-    }
-    if result.reasoned_under_policy && !wanted.is_empty() {
-        return Err(FormatError::Query(
-            fluree_db_query::QueryError::UnsupportedFeature(
-                "rendering a node or relationship's properties in a reasoning query under a \
-                 view policy; return its properties as values instead"
-                    .to_string(),
-            ),
-        ));
     }
     hydrator.prefetch(wanted).await?;
 

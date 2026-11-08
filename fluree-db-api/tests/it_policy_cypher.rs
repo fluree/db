@@ -535,14 +535,12 @@ async fn cypher_call_procedures_hide_policy_denied_property() {
     );
 }
 
-/// Under ledger reasoning defaults, a node a visible edge reaches would be
-/// rendered with its stored properties at format time, judged on stored
-/// classes. A rule makes `alice` a `HighEarner` and a deny on that class
-/// hides every fact of hers, which would show anyway, so under a view policy
-/// the typed formatter refuses to render a node. Values still render, and so
-/// does a root caller's node.
+/// Under ledger reasoning defaults a typed node renders what the query saw:
+/// a rule makes `alice` a `HighEarner`, so a root caller sees that label,
+/// and a deny on the class hides every fact of hers from a restricted one,
+/// though a visible edge from `eve` still reaches her node.
 #[tokio::test]
-async fn cypher_typed_node_in_a_reasoning_query_is_refused_under_a_view_policy() {
+async fn cypher_typed_node_renders_what_a_reasoning_query_saw() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/policy-cypher:reasoned-node";
     let ledger = genesis_ledger(&fluree, ledger_id).await;
@@ -614,14 +612,16 @@ async fn cypher_typed_node_in_a_reasoning_query_is_refused_under_a_view_policy()
     let node = "MATCH (e:Person {name: 'Eve'})-[:knows]->(n) RETURN n";
 
     let rendered = typed(root, node).await.expect("root node");
-    assert!(rendered.iter().any(|s| s == "Alice"), "{rendered:?}");
-    match typed(restricted.clone(), node).await {
-        Err(e)
-            if e.to_string()
-                .contains("reasoning query under a view policy") => {}
-        other => panic!("{other:?}"),
+    for expected in ["alice", "HighEarner", "Person", "Alice", "salary"] {
+        assert!(rendered.iter().any(|s| s == expected), "{rendered:?}");
     }
-    let name = "MATCH (e:Person {name: 'Eve'})-[:knows]->(n) RETURN n.name";
-    let values = typed(restricted, name).await.expect("restricted values");
-    assert!(!values.iter().any(|s| s == "Alice"), "{values:?}");
+    let rendered = typed(restricted.clone(), node)
+        .await
+        .expect("restricted node");
+    assert_eq!(rendered, vec!["alice".to_string()]);
+    let eve = "MATCH (e:Person {name: 'Eve'}) RETURN e";
+    let rendered = typed(restricted, eve).await.expect("restricted eve");
+    for expected in ["eve", "Person", "Eve"] {
+        assert!(rendered.iter().any(|s| s == expected), "{rendered:?}");
+    }
 }

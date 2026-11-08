@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// allowing queries to see both base data and materialized entailments.
 pub struct ReasoningOverlay<'a> {
     /// Base overlay (e.g., novelty)
-    base: &'a dyn OverlayProvider,
+    base: Base<'a>,
     /// Derived facts from OWL2-RL reasoning
     derived: Arc<DerivedFactsOverlay>,
     /// Combined epoch for cache invalidation
@@ -24,10 +24,38 @@ pub struct ReasoningOverlay<'a> {
     content_version: Option<u64>,
 }
 
+/// The overlay derived facts are merged over: borrowed for one execution, or
+/// shared when the combination outlives it.
+enum Base<'a> {
+    Borrowed(&'a dyn OverlayProvider),
+    Shared(Arc<dyn OverlayProvider>),
+}
+
+impl Base<'_> {
+    fn get(&self) -> &dyn OverlayProvider {
+        match self {
+            Base::Borrowed(base) => *base,
+            Base::Shared(base) => &**base,
+        }
+    }
+}
+
+impl ReasoningOverlay<'static> {
+    /// [`ReasoningOverlay::new`] over a shared base, for a reader that holds
+    /// the combination past the query that derived the facts.
+    pub fn shared(base: Arc<dyn OverlayProvider>, derived: Arc<DerivedFactsOverlay>) -> Self {
+        Self::over(Base::Shared(base), derived)
+    }
+}
+
 impl<'a> ReasoningOverlay<'a> {
     /// Create a new reasoning overlay combining base and derived facts.
     pub fn new(base: &'a dyn OverlayProvider, derived: Arc<DerivedFactsOverlay>) -> Self {
-        let content_version = match (base.content_version(), derived.content_version()) {
+        Self::over(Base::Borrowed(base), derived)
+    }
+
+    fn over(base: Base<'a>, derived: Arc<DerivedFactsOverlay>) -> Self {
+        let content_version = match (base.get().content_version(), derived.content_version()) {
             (Some(b), Some(d)) => Some(compose_content_version(&[b, d])),
             _ => None,
         };
@@ -40,6 +68,7 @@ impl<'a> ReasoningOverlay<'a> {
         // caches (overlay translation, cursor batches) would alias them.
         let epoch = 0x8000_0000_0000_0000u64
             | (base
+                .get()
                 .epoch()
                 .wrapping_mul(1_000_003)
                 .wrapping_add(derived.instance_id())
@@ -60,14 +89,14 @@ impl<'a> ReasoningOverlay<'a> {
 
 impl OverlayProvider for ReasoningOverlay<'_> {
     fn as_any(&self) -> &dyn std::any::Any {
-        self.base.as_any()
+        self.base.get().as_any()
     }
 
     /// The base's: a derived fact carries no list position.
     fn list_predicates(
         &self,
     ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
-        self.base.list_predicates()
+        self.base.get().list_predicates()
     }
 
     fn epoch(&self) -> u64 {
@@ -93,6 +122,7 @@ impl OverlayProvider for ReasoningOverlay<'_> {
         let mut derived_flakes: Vec<Flake> = Vec::new();
 
         self.base
+            .get()
             .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, &mut |f| {
                 base_flakes.push(f.clone());
             });

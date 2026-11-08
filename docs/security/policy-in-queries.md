@@ -107,7 +107,7 @@ The two approaches can therefore disagree under the same policy. With `ex:ssn rd
 
 Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply. A policy selection that yields no rules under `default-allow: true` is root — nothing is hidden, so there is nothing to launder and query-supplied rules are not stripped.
 
-A graph crawl (`select {"?s": ["*"]}`) and a Cypher node or relationship rendered with its properties (Bolt's `RETURN n`) read stored facts at formatting time, after the query's own rows were judged. Under reasoning they would miss derived facts and judge `f:onClass` on stored classes, so a reasoning query containing one is refused under a non-root policy (HTTP 400). Select the values as variables, or return a node's properties as values.
+A graph crawl (`select {"?s": ["*"]}`) reads stored facts at formatting time, after the query's own rows were judged. Under reasoning it would miss derived facts and judge `f:onClass` on stored classes, so a reasoning query containing one is refused under a non-root policy (HTTP 400); select the values as variables instead. A Cypher node rendered over Bolt reads the query's own reasoned state and is judged like its rows.
 
 ### Performance under a policy
 

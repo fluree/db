@@ -214,11 +214,11 @@ pub struct QueryResult {
     /// mixed-dataset paths not routed through that method leave it false → today's
     /// raw rendering is unchanged.
     pub from_graph_source: bool,
-    /// True when a Cypher query ran with reasoning under a non-root view
-    /// policy. Its rows were judged on derived facts; a typed node's
-    /// properties would be read from stored facts at format time and judged
-    /// on stored classes, so the typed formatter refuses to render one.
-    pub reasoned_under_policy: bool,
+    /// The overlay a Cypher query read when reasoning derived facts: the
+    /// view's own with the derived facts merged over it. The typed formatter
+    /// renders nodes through it, judged as the query's rows were, so a node
+    /// shows the labels and properties the query saw.
+    pub reasoned_overlay: Option<std::sync::Arc<dyn OverlayProvider>>,
     /// Non-fatal notes about how the query was read (see
     /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
     /// result.

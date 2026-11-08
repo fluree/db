@@ -741,8 +741,13 @@ impl Fluree {
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
-        let batches = self
-            .execute_view_internal(db, &vars, &executable, tracker, options)
+        let noop = crate::NoOpR2rmlProvider::new();
+        let r2rml = crate::R2rmlProviders {
+            provider: &noop,
+            table_provider: &noop,
+        };
+        let (batches, reasoned_overlay) = self
+            .execute_view_read(db, &vars, &executable, tracker, r2rml, options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -761,8 +766,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
-        result.reasoned_under_policy =
-            !db.is_root() && executable.reasoning.modes.has_any_enabled();
+        result.reasoned_overlay = reasoned_overlay;
         Ok(result)
     }
 
@@ -2083,6 +2087,26 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
+        self.execute_view_read(db, vars, executable, tracker, r2rml, options)
+            .await
+            .map(|(batches, _)| batches)
+    }
+
+    /// [`Self::execute_view_internal_with_r2rml`], also returning the overlay
+    /// the query read when reasoning derived facts: the view's own with the
+    /// derived facts merged over it.
+    async fn execute_view_read(
+        &self,
+        db: &GraphDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
+    ) -> Result<(
+        Vec<crate::Batch>,
+        Option<std::sync::Arc<dyn fluree_db_core::OverlayProvider>>,
+    )> {
         let db_ref = db.as_graph_db_ref();
         let union = super::union_default_dataset(db, executable);
         // Single-graph view: no dataset-level history detection — current state.
@@ -2120,9 +2144,16 @@ impl Fluree {
         );
         config.dataset = union.as_ref();
 
-        execute_prepared(db_ref, vars, prepared, config)
+        let read = prepared.derived_overlay.clone().map(|derived| {
+            std::sync::Arc::new(fluree_db_query::ReasoningOverlay::shared(
+                std::sync::Arc::clone(&db.overlay),
+                derived,
+            )) as std::sync::Arc<dyn fluree_db_core::OverlayProvider>
+        });
+        let batches = execute_prepared(db_ref, vars, prepared, config)
             .await
-            .map_err(query_error_to_api_error)
+            .map_err(query_error_to_api_error)?;
+        Ok((batches, read))
     }
 
     /// Execute against a GraphDb with policy awareness (tracked variant).

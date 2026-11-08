@@ -706,7 +706,7 @@ mod tests {
             batches: vec![],
             binary_graph: None,
             from_graph_source: false,
-            reasoned_under_policy: false,
+            reasoned_overlay: None,
             advisories: Vec::new(),
         }
     }
@@ -840,7 +840,7 @@ mod tests {
             batches: vec![batch],
             binary_graph: None,
             from_graph_source: false,
-            reasoned_under_policy: false,
+            reasoned_overlay: None,
             advisories: Vec::new(),
         }
     }
