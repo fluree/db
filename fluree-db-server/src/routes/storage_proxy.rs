@@ -710,15 +710,10 @@ pub async fn get_block(
     if !serving.blocks {
         return Err(ServerError::not_found("Block not found"));
     }
-    if is_audit_kind(kind) {
-        crate::routes::audit::require_audit(
-            &state,
-            &axum::http::HeaderMap::new(),
-            effective_ledger.as_str(),
-            |branch| principal.can_audit(branch),
-        )
-        .await?;
-    }
+    require_audit_of_kind(&state, kind, effective_ledger.as_str(), |branch| {
+        principal.can_audit(branch)
+    })
+    .await?;
     let ledger_ctx = LedgerBlockContext {
         snapshot: &snapshot.snapshot,
         to_t,
@@ -924,15 +919,10 @@ pub async fn get_object_by_cid(
     if !serving.blocks {
         return Err(ServerError::not_found("Object not found"));
     }
-    if is_audit_kind(kind) {
-        crate::routes::audit::require_audit(
-            &state,
-            &axum::http::HeaderMap::new(),
-            effective_ledger.as_str(),
-            |branch| principal.can_audit(branch),
-        )
-        .await?;
-    }
+    require_audit_of_kind(&state, kind, effective_ledger.as_str(), |branch| {
+        principal.can_audit(branch)
+    })
+    .await?;
 
     // 3c'. A permanently erased commit is answered with its erasure, which
     //      can grow, so never revalidated against the CID; its transaction
@@ -1057,6 +1047,34 @@ pub async fn get_object_by_cid(
 /// values, and its dictionaries keep their strings until a purge.
 fn is_audit_kind(kind: ContentKind) -> bool {
     !matches!(kind, ContentKind::LedgerConfig)
+}
+
+/// History: commits, transactions and an index's history sidecars.
+fn is_history_kind(kind: ContentKind) -> bool {
+    matches!(
+        kind,
+        ContentKind::Commit | ContentKind::Txn | ContentKind::HistorySidecar
+    )
+}
+
+/// Refuse raw `kind` content of `ledger` without audit access where its
+/// history is suppressed. History is checked against the journals a cluster
+/// replica has confirmed current; the rest of an index, like a read of
+/// current state, against those it holds, so reading it waits on no leader.
+async fn require_audit_of_kind(
+    state: &AppState,
+    kind: ContentKind,
+    ledger: &str,
+    granted: impl Fn(&fluree_db_api::LedgerId) -> bool,
+) -> Result<(), ServerError> {
+    let headers = axum::http::HeaderMap::new();
+    if is_history_kind(kind) {
+        crate::routes::audit::require_audit(state, &headers, ledger, granted).await
+    } else if is_audit_kind(kind) {
+        crate::routes::audit::require_audit_of_index(state, &headers, ledger, granted).await
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

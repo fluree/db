@@ -4901,3 +4901,113 @@ async fn test_index_objects_of_a_ledger_with_a_removal_need_audit() {
         }
     }
 }
+
+/// An index object other than history is checked against the journal a
+/// cluster replica holds, waiting on no leader: a replica that cannot reach
+/// one still serves an ordinary ledger's index, and still refuses the index
+/// of a ledger with a removal to a storage token. Its commits, history,
+/// wait on the leader as before.
+#[tokio::test]
+async fn test_index_objects_wait_on_no_leader() {
+    struct Partitioned(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
+        async fn sync_reads(&self) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err("no leader".into())
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    let (_tmp, state) = tx_server_state().await;
+    let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+    let token = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+    let mut seeded = Vec::new();
+    for (name, removed) in [("plain-index", false), ("removed-index", true)] {
+        let ledger = format!("{name}:main");
+        state.fluree.create_ledger(name).await.unwrap();
+        state
+            .fluree
+            .graph(&ledger)
+            .transact()
+            .insert(&serde_json::json!({
+                "@id": "http://example.org/alice",
+                "http://example.org/email": "a@old"
+            }))
+            .commit()
+            .await
+            .unwrap();
+        if removed {
+            state
+                .fluree
+                .remove_occurrences(
+                    &ledger,
+                    fluree_db_api::retention::RemovalRequest {
+                        matching: vec![fluree_db_api::retention::FactSelector {
+                            subject: "http://example.org/alice".into(),
+                            predicate: "http://example.org/email".into(),
+                            graph: None,
+                            object: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let namespace = state.fluree.storage_namespace(&ledger).await.unwrap();
+        let payload = format!("{name} index root");
+        storage
+            .content_write_bytes(ContentKind::IndexRoot, &namespace, payload.as_bytes())
+            .await
+            .unwrap();
+        let head = state
+            .fluree
+            .nameservice()
+            .lookup(&ledger)
+            .await
+            .unwrap()
+            .unwrap()
+            .commit_head_id
+            .unwrap();
+        seeded.push((
+            ledger,
+            ContentId::new(ContentKind::IndexRoot, payload.as_bytes()),
+            head,
+        ));
+    }
+    let replicas = Arc::new(Partitioned(std::sync::atomic::AtomicUsize::new(0)));
+    state.fluree.set_retention_replicas(replicas.clone());
+    let status = |id: &ContentId, ledger: &str| {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/fluree/storage/objects/{id}?ledger={ledger}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let app = build_router(state.clone());
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+    let (plain, plain_root, plain_head) = &seeded[0];
+    let (removed, removed_root, _) = &seeded[1];
+    assert_eq!(status(plain_root, plain).await, StatusCode::OK);
+    assert_eq!(status(removed_root, removed).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        replicas.0.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an index read waited on the leader"
+    );
+    assert_eq!(
+        status(plain_head, plain).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

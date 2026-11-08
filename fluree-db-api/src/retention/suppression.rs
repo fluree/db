@@ -325,7 +325,7 @@ impl Fluree {
 
     /// [`Self::suppression_for`], confirming the journal is current first
     /// only when `confirm`.
-    async fn suppression_with(
+    pub(crate) async fn suppression_with(
         &self,
         ledger_id: &str,
         confirm: bool,
