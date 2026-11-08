@@ -1354,8 +1354,9 @@ async fn warn_if_removals_stay(
 ) {
     if req.carries_removals() && !client.supports_push_retention().await {
         eprintln!(
-            "  {} the remote does not take this ledger's removal journal: it goes on \
-             serving the history removed here. Make the removals there too.",
+            "  {} the remote does not take this ledger's removal journal from a push: a \
+             removal made only here is not made there, and it goes on serving that \
+             history. Removals made there, or pulled from there, are unaffected.",
             "warning:".yellow().bold()
         );
     }
