@@ -2591,9 +2591,9 @@ impl NestedLoopJoinOperator {
                         .filter(|w| !w.is_empty());
                     for row in rows {
                         matched_rows += 1;
-                        let o_type_val = entry
-                            .o_type_const
-                            .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                        // The batch's column, not `entry.o_type_const`: a
+                        // replayed leaflet can hold rows of another type.
+                        let o_type_val = batch.o_type.get_or(row, 0);
                         let o_key_val = batch.o_key.get(row);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                             let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
@@ -4110,9 +4110,9 @@ fn batched_subject_probe_binary_uncharged(
                     .filter(|w| !w.is_empty());
 
                 for row in rows {
-                    let o_type_val = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                    // The batch's column, not `entry.o_type_const`: a
+                    // replayed leaflet can hold rows of another type.
+                    let o_type_val = batch.o_type.get_or(row, 0);
                     let o_key_val = batch.o_key.get(row);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                         let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
