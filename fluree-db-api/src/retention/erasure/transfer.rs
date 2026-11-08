@@ -1094,10 +1094,11 @@ impl Fluree {
     /// those commits would go on serving what it erased.
     pub(crate) async fn refuse_erased_history(
         &self,
+        ledger_id: &str,
         store: &dyn ContentStore,
         head: &ContentId,
     ) -> Result<()> {
-        match self.erased_in_history(store, head).await? {
+        match self.erased_in_history(ledger_id, store, head).await? {
             Some(cid) => Err(ApiError::http(
                 501,
                 format!(
@@ -1109,9 +1110,12 @@ impl Fluree {
         }
     }
 
-    /// A commit of `head`'s history this storage holds erased, if any.
+    /// A commit of `head`'s history, `ledger_id`'s, this storage holds
+    /// erased, if any. The walk stops at the head last found clean at the
+    /// same erasure generation, so repeated checks read only new commits.
     pub(crate) async fn erased_in_history(
         &self,
+        ledger_id: &str,
         store: &dyn ContentStore,
         head: &ContentId,
     ) -> Result<Option<ContentId>> {
@@ -1121,17 +1125,26 @@ impl Fluree {
         if !runtime.index.any_erased().await? {
             return Ok(None);
         }
-        let history = crate::pack::compute_missing_commits(
-            store,
-            std::slice::from_ref(head),
-            &HashSet::new(),
-        )
-        .await?;
+        let generation = runtime.index.generation().await?;
+        let clean: HashSet<ContentId> = runtime
+            .clean_heads
+            .lock()
+            .get(ledger_id)
+            .filter(|(_, at)| *at == generation)
+            .map(|(clean, _)| clean.clone())
+            .into_iter()
+            .collect();
+        let history =
+            crate::pack::compute_missing_commits(store, std::slice::from_ref(head), &clean).await?;
         for cid in history {
             if runtime.index.erased(&cid).await?.is_some() {
                 return Ok(Some(cid));
             }
         }
+        runtime
+            .clean_heads
+            .lock()
+            .insert(ledger_id.to_string(), (head.clone(), generation));
         Ok(None)
     }
 }

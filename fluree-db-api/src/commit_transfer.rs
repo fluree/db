@@ -1999,7 +1999,7 @@ impl Fluree {
         // A first page answers for the whole history.
         #[cfg(feature = "native")]
         if request.cursor_id.is_none() && request.cursor.is_none() {
-            self.refuse_erased_history(content_store.as_ref(), &head_commit_id)
+            self.refuse_erased_history(ledger_id, content_store.as_ref(), &head_commit_id)
                 .await?;
         }
 
@@ -2389,7 +2389,10 @@ impl Fluree {
             .and_then(|record| record.commit_head_id)
         {
             let store = self.branched_content_store(handle.id()).await?;
-            if let Some(erased) = self.erased_in_history(store.as_ref(), &head).await? {
+            if let Some(erased) = self
+                .erased_in_history(handle.id(), store.as_ref(), &head)
+                .await?
+            {
                 tracing::info!(
                     ledger = %handle.id(),
                     %erased,

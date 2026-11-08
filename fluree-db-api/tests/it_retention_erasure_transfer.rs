@@ -2230,6 +2230,59 @@ async fn a_received_index_over_history_erased_here_is_not_set() {
     assert_eq!(now.index_head_id, after.index_head_id);
 }
 
+/// A history found clean while another ledger's commit was erased is
+/// checked again once one of its own is: an erasure published since is not
+/// hidden behind the earlier answer.
+#[tokio::test]
+async fn a_history_found_clean_is_checked_again_after_an_erasure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let other = ledger(&fluree, "it/index-erased-other").await;
+    insert_kept(
+        &fluree,
+        &other,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@secret"}),
+    )
+    .await;
+    erase_published(&fluree, &other, email("carol", "c@secret")).await;
+
+    let id = ledger(&fluree, "it/index-erased-later").await;
+    insert_kept(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    // Retracted before the check, so every commit the erasure reaches is in
+    // the history found clean.
+    fluree
+        .graph(&id)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    reindex(&fluree, &id).await;
+    let before = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let from_originals = before.index_head_id.clone().unwrap();
+    let handle = fluree.ledger_cached(&id).await.unwrap();
+    assert!(fluree
+        .set_index_head(&handle, &from_originals, before.index_t)
+        .await
+        .unwrap());
+
+    erase_published(&fluree, &id, email("alice", "a@secret")).await;
+    let after = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let handle = fluree.ledger_cached(&id).await.unwrap();
+    assert!(!fluree
+        .set_index_head(&handle, &from_originals, after.index_t)
+        .await
+        .unwrap());
+}
+
 /// A push carries the ledger's removal journal. Removals the receiver's
 /// journal lacks need the authority removing needs; once the receiver has
 /// them, a push carrying the same journal needs none.
