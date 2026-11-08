@@ -219,8 +219,9 @@ impl Fluree {
             report.timings.check += clock.elapsed();
             // A pass with a budget runs in the background: it pauses as long
             // as each batch took, its claims released, so its deletes take
-            // at most half the device the commits share it with.
-            if let Some(deadline) = deadline {
+            // at most half the device the commits share it with. Not after
+            // the last: the pause would only hold the root's collection.
+            if let Some(deadline) = deadline.filter(|_| due.peek().is_some()) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 tokio::time::sleep(batch.elapsed().min(left)).await;
             }
