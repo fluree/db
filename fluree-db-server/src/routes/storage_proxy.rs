@@ -296,8 +296,8 @@ pub async fn get_vended_credentials(
     if !serving.blocks {
         return Err(ServerError::not_found("Ledger not found"));
     }
-    // The grant reaches the ledger's commits and transactions.
-    crate::routes::audit::require_audit(
+    // The grant reaches every branch's commits and transactions.
+    crate::routes::audit::require_audit_of_every_branch(
         &state,
         &axum::http::HeaderMap::new(),
         effective_ledger.as_str(),

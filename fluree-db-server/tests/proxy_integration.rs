@@ -4547,6 +4547,107 @@ async fn test_pack_streams_commits_and_the_removal_journal() {
     assert_eq!(commits, 2, "the insert and the removal's retraction");
 }
 
+/// A branch with nothing removed still reads its source's commits from the
+/// source's folder: a pack through it that wants its source's head, past
+/// the fork, reaches a value the source removed, and needs audit access.
+#[tokio::test]
+async fn test_pack_through_a_branch_needs_audit_for_its_sources_removals() {
+    use fluree_db_core::pack::PackRequest;
+
+    let (_tmp, state) = tx_server_state().await;
+    state.fluree.create_ledger("packedb").await.unwrap();
+    let insert = |doc: serde_json::Value| {
+        let fluree = state.fluree.clone();
+        async move {
+            fluree
+                .graph("packedb:main")
+                .transact()
+                .insert(&doc)
+                .commit()
+                .await
+                .unwrap();
+        }
+    };
+    insert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/name": "Alice"
+    }))
+    .await;
+    state
+        .fluree
+        .create_branch("packedb", "dev", None, None)
+        .await
+        .unwrap();
+    // Written on main after the fork, so dev's journal never holds it.
+    insert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@old"
+    }))
+    .await;
+    state
+        .fluree
+        .remove_occurrences(
+            "packedb:main",
+            fluree_db_api::retention::RemovalRequest {
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!state
+        .fluree
+        .history_suppressed("packedb:dev")
+        .await
+        .unwrap());
+    let main_head = state
+        .fluree
+        .nameservice()
+        .lookup("packedb:main")
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_head_id
+        .unwrap();
+    let request = serde_json::to_vec(
+        &PackRequest::commits(vec![main_head], vec![]).with_erasures(Vec::new()),
+    )
+    .unwrap();
+    let signing_key = SigningKey::from_bytes(&[8u8; 32]);
+    let post = |token: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/pack/packedb:dev")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(request.clone()))
+            .unwrap()
+    };
+    let storage_only = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(storage_only))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// Wait for `check` to hold, for up to ten seconds.
 async fn eventually<F, Fut>(what: &str, check: F)
 where

@@ -111,6 +111,53 @@ impl Fluree {
             .is_some_and(|s| !s.journal.removals.is_empty()))
     }
 
+    /// Whether a raw read through `ledger_id` reaches history a removal
+    /// journal suppresses: the branch's own, or a source's, since its store
+    /// reads the commits it shares with its sources from their folders.
+    /// With `every_branch`, any branch of the ledger: a grant over the
+    /// ledger's storage reaches every branch's commits.
+    pub async fn raw_history_suppressed(
+        &self,
+        ledger_id: &str,
+        every_branch: bool,
+    ) -> Result<bool> {
+        let id = fluree_db_core::LedgerId::parse(ledger_id)?;
+        if self.history_suppressed(id.as_str()).await? {
+            return Ok(true);
+        }
+        let records = self.nameservice().branch_records(id.name()).await?;
+        let reached: Vec<&str> = if every_branch {
+            records
+                .iter()
+                .filter(|r| !r.retracted)
+                .map(|r| r.ledger_id.as_str())
+                .collect()
+        } else {
+            let mut reached = Vec::new();
+            let mut source = records
+                .iter()
+                .find(|r| r.ledger_id == id)
+                .and_then(|r| r.source_branch.as_deref());
+            while let Some(branch) = source {
+                let Some(record) = records.iter().find(|r| r.branch == branch) else {
+                    break;
+                };
+                if reached.contains(&record.ledger_id.as_str()) {
+                    break;
+                }
+                reached.push(record.ledger_id.as_str());
+                source = record.source_branch.as_deref();
+            }
+            reached
+        };
+        for branch in reached {
+            if branch != id.as_str() && self.history_suppressed(branch).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// What a ledger archive carries of `ledger_id`'s retention (its
     /// activation and removal journal); `None` without a registration.
     pub async fn retention_archive_section(
