@@ -1196,7 +1196,9 @@ async fn head_manifest(
 /// heads on the branch's status item; a fresh process serves them; retention
 /// releases superseded generations; and cleanup deletes a retired index's
 /// files and entry.
-#[tokio::test]
+// Multi-threaded for the reason the collector test above gives: an insert
+// after a build probes the persisted dictionaries synchronously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reasoning_index_lifecycle_on_s3_and_dynamodb() {
     use fluree_db_api::reasoning_index::{GenerationRetention, RefreshOutcome};
 
