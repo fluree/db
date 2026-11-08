@@ -858,6 +858,10 @@ impl ReasoningIndexesPublisher for MemoryNameService {
         docs.insert(key, new.clone());
         Ok(ReasoningIndexesCasResult::Updated)
     }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Refuse a write presenting `fence` unless the record at `key` admits it.

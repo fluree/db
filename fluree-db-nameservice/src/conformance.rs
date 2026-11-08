@@ -94,6 +94,10 @@ impl<S: LifecycleStore> crate::ReasoningIndexesPublisher for PausedBeforeInsert<
             .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
             .await
     }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.inner.max_reasoning_indexes_bytes()
+    }
 }
 
 #[async_trait]

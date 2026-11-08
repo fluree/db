@@ -55,7 +55,13 @@ pub struct DynamoDbConfig {
 pub struct DynamoDbNameService {
     client: Client,
     table_name: String,
+    max_reasoning_indexes_bytes: usize,
 }
+
+/// The largest reasoning-indexes document written, in bytes of its JSON. It
+/// shares the status item, which DynamoDB caps at 400 KB with its attribute
+/// names and the status fields, so it leaves room for those.
+pub const MAX_REASONING_INDEXES_BYTES: usize = 300_000;
 
 /// An item whose id even the persisted grammar refuses is skipped: its
 /// storage path can alias another ledger's (see `LedgerId::from_persisted_parts`).
@@ -102,12 +108,24 @@ impl DynamoDbNameService {
         Ok(Self {
             client,
             table_name: config.table_name,
+            max_reasoning_indexes_bytes: MAX_REASONING_INDEXES_BYTES,
         })
     }
 
     /// Create from a pre-built client (for testing).
     pub fn from_client(client: Client, table_name: String) -> Self {
-        Self { client, table_name }
+        Self {
+            client,
+            table_name,
+            max_reasoning_indexes_bytes: MAX_REASONING_INDEXES_BYTES,
+        }
+    }
+
+    /// Hold reasoning-indexes documents to `bytes` rather than
+    /// [`MAX_REASONING_INDEXES_BYTES`].
+    pub fn with_max_reasoning_indexes_bytes(mut self, bytes: usize) -> Self {
+        self.max_reasoning_indexes_bytes = bytes;
+        self
     }
 }
 
@@ -2077,6 +2095,14 @@ impl fluree_db_nameservice::ReasoningIndexesPublisher for DynamoDbNameService {
         }
         let json = serde_json::to_string(new)
             .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}")))?;
+        if json.len() > self.max_reasoning_indexes_bytes {
+            return Err(NameServiceError::TooLarge(format!(
+                "{ledger_id}'s reasoning-indexes document would take {} bytes, more than the {} \
+                 this nameservice holds",
+                json.len(),
+                self.max_reasoning_indexes_bytes
+            )));
+        }
         // `fenced_update_item` parenthesizes this; DynamoDB refuses `((…))`.
         let version_clause = if expected_v == 0 {
             "attribute_not_exists(#rv) OR #rv = :expected_v"
@@ -2116,6 +2142,10 @@ impl fluree_db_nameservice::ReasoningIndexesPublisher for DynamoDbNameService {
                 aws_sdk_dynamodb::error::DisplayErrorContext(&e)
             ))),
         }
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        Some(self.max_reasoning_indexes_bytes)
     }
 }
 

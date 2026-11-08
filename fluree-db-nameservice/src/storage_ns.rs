@@ -1688,6 +1688,10 @@ where
         )
         .await
     }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[async_trait]

@@ -511,6 +511,10 @@ impl crate::ReasoningIndexesPublisher for CompositeNameService {
             .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
             .await
     }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.local.max_reasoning_indexes_bytes()
+    }
 }
 
 // ---------------------------------------------------------------------------

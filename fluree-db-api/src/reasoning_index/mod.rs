@@ -31,7 +31,7 @@ pub(crate) mod serve;
 mod worker;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use build::{RefreshOutcome, MAX_ACTIVE_INDEXES};
+pub use build::{RefreshOutcome, ENTRY_GROWTH_BYTES, MAX_ACTIVE_INDEXES};
 #[cfg(not(target_arch = "wasm32"))]
 pub use worker::{ReasoningIndexWorker, DEFAULT_CATCHUP_INTERVAL};
 

@@ -1500,6 +1500,11 @@ pub trait ReasoningIndexesPublisher: ReasoningIndexesLookup {
         expected_v: i64,
         new: &ReasoningIndexes,
     ) -> Result<ReasoningIndexesCasResult>;
+
+    /// The largest reasoning-indexes document this store holds, in bytes of
+    /// its JSON; `None` for no limit. A larger push is refused before it
+    /// writes anything.
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize>;
 }
 
 /// The version check every backend applies to a reasoning-indexes push.
@@ -1884,6 +1889,10 @@ where
         (**self)
             .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
             .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        (**self).max_reasoning_indexes_bytes()
     }
 }
 

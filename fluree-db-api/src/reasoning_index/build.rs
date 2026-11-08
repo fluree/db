@@ -52,6 +52,17 @@ const CAS_ATTEMPTS: usize = 16;
 /// branch, refreshed after every commit.
 pub const MAX_ACTIVE_INDEXES: usize = 8;
 
+/// What one entry can grow by after its registration: a head published and
+/// the entry retired. Registration reserves it, so a store's size limit
+/// refuses a registration rather than a later publication or retirement.
+pub const ENTRY_GROWTH_BYTES: usize = 1_024;
+
+/// The bytes `doc` takes once every entry has grown by [`ENTRY_GROWTH_BYTES`].
+fn grown_bytes(doc: &ReasoningIndexes) -> usize {
+    serde_json::to_vec(doc).map_or(usize::MAX, |json| json.len())
+        + doc.indexes.len() * ENTRY_GROWTH_BYTES
+}
+
 /// The materialization budget a worker runs under unless the program sets
 /// one: generous, since a capped result is never published.
 const WORKER_MAX_FACTS: u64 = 100_000_000;
@@ -194,6 +205,7 @@ impl Fluree {
         let id = canonical_id(ledger_id)?;
         let canonical = program::canonical_program(program)?;
         let key = program::registration_key(&canonical);
+        let max_bytes = self.publisher()?.max_reasoning_indexes_bytes();
         self.update_reasoning_indexes(&id, |actual| {
             if let Some((index_id, _)) = actual.indexes.iter().find(|(_, e)| {
                 matches!(e.registration.state, RegistrationState::Active)
@@ -228,6 +240,18 @@ impl Fluree {
                     head: None,
                 },
             );
+            if let Some(max) = max_bytes {
+                let bytes = grown_bytes(&next);
+                if bytes > max {
+                    return Err(ApiError::NameService(
+                        fluree_db_nameservice::NameServiceError::TooLarge(format!(
+                            "{id}'s reasoning indexes would take {bytes} bytes once published, \
+                             more than the {max} this nameservice holds; retire and clean up an \
+                             index, or register a smaller program"
+                        )),
+                    ));
+                }
+            }
             Ok((Some(next), index_id))
         })
         .await
@@ -1468,6 +1492,59 @@ mod tests {
     use serde_json::json;
 
     use super::RefreshOutcome;
+
+    /// A head published and the entry retired, at their largest, fit the
+    /// reserve a registration keeps for them.
+    #[test]
+    fn an_entry_grows_within_its_reserve() {
+        use fluree_db_core::reasoning_index::{
+            Basis, ClockPolicy, ErasureEpoch, HeadPointer, ReasoningIndexEntry, ReasoningIndexId,
+            ReasoningIndexes, Registration, RegistrationState, SemanticKey,
+        };
+        use fluree_db_core::{ContentId, ContentKind};
+        let cid = |kind, s: &str| ContentId::new(kind, s.as_bytes());
+        let registered = ReasoningIndexEntry {
+            registration: Registration {
+                revision: 1,
+                semantics: SemanticKey {
+                    program: cid(ContentKind::LedgerConfig, "program"),
+                    reasoned_graph: None,
+                    clock: ClockPolicy::SnapshotCommitTime,
+                },
+                program: json!({"reasoning": "owl2rl"}),
+                state: RegistrationState::Active,
+            },
+            floor: ErasureEpoch(0),
+            head: None,
+        };
+        let mut grown = registered.clone();
+        grown.registration.revision = u64::MAX;
+        grown.registration.state = RegistrationState::Retired { at_ms: i64::MIN };
+        grown.floor = ErasureEpoch(u64::MAX);
+        grown.head = Some(HeadPointer {
+            manifest: cid(ContentKind::ReasoningManifest, "manifest"),
+            generation: u64::MAX,
+            revision: u64::MAX,
+            basis: Basis {
+                commit: cid(ContentKind::Commit, "commit"),
+                t: i64::MIN,
+                epoch: ErasureEpoch(u64::MAX),
+            },
+            settled: cid(ContentKind::LedgerConfig, "settled"),
+            engine: u32::MAX,
+        });
+        let id = ReasoningIndexId::parse("01JC0000000000000000000000").unwrap();
+        let bytes = |entry: ReasoningIndexEntry, v| {
+            serde_json::to_vec(&ReasoningIndexes {
+                v,
+                indexes: [(id.clone(), entry)].into(),
+            })
+            .unwrap()
+            .len()
+        };
+        let growth = bytes(grown, i64::MAX) - bytes(registered, 1);
+        assert!(growth <= super::ENTRY_GROWTH_BYTES, "{growth} bytes");
+    }
     use crate::reasoning_index::{OtherEngine, PauseSeam};
     use crate::Fluree;
     use fluree_db_core::reasoning_index::{
