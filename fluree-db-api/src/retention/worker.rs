@@ -17,12 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use fluree_db_core::ContentId;
 #[cfg(not(target_arch = "wasm32"))]
 use fluree_db_indexer::{BuildObserver, Housekeeping};
 use fluree_db_nameservice::NsRecord;
 use tokio::sync::Notify;
 
-use super::engine::{probe_activation, PassReport, ScheduleCache};
+use super::engine::{probe_activation, probe_pending, PassReport, ScheduleCache};
 use super::registry;
 use super::writer::{RetentionBatch, RetentionWriter, SubmitOutcome};
 use super::RetentionLimits;
@@ -222,12 +223,13 @@ impl BuildObserver for RetentionBuildObserver {
     async fn before_build(
         &self,
         record: &NsRecord,
+        pending: Option<&[(i64, ContentId)]>,
     ) -> std::result::Result<fluree_db_indexer::BuildDirectives, String> {
         let Some(fluree) = self.fluree.upgrade() else {
             return Ok(Default::default());
         };
         fluree
-            .observe_build_for_retention(record)
+            .observe_build_for_retention(record, pending)
             .await
             .map_err(|e| format!("retention activation check: {e}"))?;
         let history_suppression = fluree
@@ -403,7 +405,11 @@ impl Fluree {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn observe_build_for_retention(&self, record: &NsRecord) -> Result<()> {
+    async fn observe_build_for_retention(
+        &self,
+        record: &NsRecord,
+        pending: Option<&[(i64, ContentId)]>,
+    ) -> Result<()> {
         let id = record.ledger_id.to_string();
         let registered = Some(incarnation(record));
         if self.retention.active.lock().get(&id) == Some(&registered) {
@@ -443,7 +449,11 @@ impl Fluree {
         let store = self
             .content_store_for_record_or_id(Some(record), &record.storage_namespace())
             .await?;
-        match probe_activation(store.as_ref(), &head, from).await? {
+        let found = match pending {
+            Some(pending) => probe_pending(store.as_ref(), pending, from).await?,
+            None => probe_activation(store.as_ref(), &head, from).await?,
+        };
+        match found {
             Some(since) => {
                 registry::activate(ns, self.registry_objects(), &id, since).await?;
                 self.retention.mark_registered(&id, registered);

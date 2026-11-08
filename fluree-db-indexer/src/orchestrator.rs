@@ -976,9 +976,13 @@ type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
 /// before the index covers it is never indexed past unseen.
 #[async_trait::async_trait]
 pub trait BuildObserver: Send + Sync {
+    /// `pending` lists the commits after the record's index, ascending by
+    /// `t`, when the nameservice keeps that list: the commits the build
+    /// fetches.
     async fn before_build(
         &self,
         record: &fluree_db_nameservice::NsRecord,
+        pending: Option<&[(i64, fluree_db_core::ContentId)]>,
     ) -> std::result::Result<BuildDirectives, String>;
 }
 
@@ -2396,7 +2400,10 @@ impl BackgroundIndexerWorker {
 
         let observer = self.build_observer.read().ok().and_then(|o| o.clone());
         if let Some(observer) = observer {
-            match observer.before_build(&record).await {
+            match observer
+                .before_build(&record, job_config.pending_commit_cids.as_deref())
+                .await
+            {
                 Ok(directives) => {
                     job_config.history_suppression = directives.history_suppression;
                 }

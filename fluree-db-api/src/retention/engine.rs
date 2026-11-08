@@ -202,6 +202,33 @@ pub(crate) async fn probe_activation(
     Ok(found)
 }
 
+/// [`probe_activation`] over `pending`, the commits after an index
+/// ascending by `t`: their envelopes are read several at a time, in order,
+/// until one carries retention input.
+pub(crate) async fn probe_pending(
+    store: &dyn ContentStore,
+    pending: &[(i64, ContentId)],
+    after_t: i64,
+) -> Result<Option<i64>> {
+    use futures::{StreamExt, TryStreamExt};
+    const WIDTH: usize = 16;
+    let cids: Vec<ContentId> = pending
+        .iter()
+        .filter(|(t, _)| *t > after_t)
+        .map(|(_, cid)| cid.clone())
+        .collect();
+    let reads = cids
+        .into_iter()
+        .map(|cid| async move { load_commit_envelope_by_id(store, &cid).await });
+    let mut envelopes = futures::stream::iter(reads).buffered(WIDTH);
+    while let Some(envelope) = envelopes.try_next().await? {
+        if carries_retention_input(&envelope.txn_meta) {
+            return Ok(Some(envelope.t));
+        }
+    }
+    Ok(None)
+}
+
 fn commit_ms(commit: &Commit) -> Option<i64> {
     let text = commit.time.as_deref()?;
     chrono::DateTime::parse_from_rfc3339(text)

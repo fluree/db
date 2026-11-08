@@ -1587,7 +1587,7 @@ async fn a_ledger_created_again_under_its_name_is_registered_before_indexing() {
     insert(&fluree, &id, lifetime.clone()).await;
     let observer = fluree.retention_build_observer();
     let first = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
-    observer.before_build(&first).await.unwrap();
+    observer.before_build(&first, None).await.unwrap();
     assert!(fluree.retention_status(&id).await.unwrap().active);
 
     fluree
@@ -1598,6 +1598,11 @@ async fn a_ledger_created_again_under_its_name_is_registered_before_indexing() {
     insert(&fluree, &id, lifetime).await;
     let second = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
     assert_ne!(first.fence, second.fence);
-    observer.before_build(&second).await.unwrap();
+    // Read from the commits the build will fetch, as the indexer lists them.
+    let pending = [(second.commit_t, second.commit_head_id.clone().unwrap())];
+    observer
+        .before_build(&second, Some(&pending))
+        .await
+        .unwrap();
     assert!(fluree.retention_status(&id).await.unwrap().active);
 }
