@@ -409,10 +409,13 @@ impl Fluree {
                 {
                     break;
                 }
+                // Cleared however the step ends, the pass's future dropped
+                // included: a flag left set would stop every later step.
+                let clear = InFlight(&runtime.in_flight);
                 let stepped = self
                     .step_and_record(&branch, &request_id, &commit, config.retry_ms)
                     .await;
-                runtime.in_flight.store(false, Ordering::Release);
+                drop(clear);
                 match stepped {
                     Stepped::Proved => {
                         report.proved += 1;
