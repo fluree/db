@@ -287,6 +287,30 @@ fn named_in(stored: &serde_json::Value, out: &mut std::collections::HashSet<Stri
 }
 
 impl crate::Fluree {
+    /// `ledger_id`'s config record for a reader that cannot read this
+    /// storage's registry objects (a query peer through the storage
+    /// proxy): its retention journal's chunked removals are inlined, so the
+    /// reader refuses the history this ledger refuses.
+    pub async fn config_for_reader(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
+        let (config, stored) = read_stored(&self.nameservice_mode, ledger_id).await?;
+        let Some(mut stored) = stored else {
+            return Ok(config);
+        };
+        if chunk_refs(stored.pointer("/journal/removalChunks"))?.is_none() {
+            return Ok(config);
+        }
+        let Some(mut config) = config else {
+            return Ok(None);
+        };
+        let journal = resolve_journal(&stored, self.registry_objects()).await?;
+        stored["journal"] = serde_json::to_value(&journal)
+            .map_err(|e| ApiError::internal(format!("retention journal: {e}")))?;
+        if let Some(payload) = config.payload.as_mut() {
+            payload.extra.insert(EXTRA_KEY.to_string(), stored);
+        }
+        Ok(Some(config))
+    }
+
     /// Where this instance keeps registrations' chunks; `None` without
     /// managed storage, which keeps them inline.
     pub(crate) fn registry_objects(&self) -> Option<Objects<'_>> {

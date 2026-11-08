@@ -4295,6 +4295,119 @@ async fn test_proxy_peer_forwards_removal_and_erasure() {
     server_handle.abort();
 }
 
+/// A peer reads a ledger's removal journal through the storage proxy: a
+/// time-travel query that could see a removed value is refused there as on
+/// the server, and every other one answers. Without the journal the peer
+/// failed every time-travel query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_refuses_removed_history() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "peerhist:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let insert = client
+        .post(format!("{server_url}/v1/fluree/insert/peerhist:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"@graph": [
+                {"@id": "http://example.org/alice", "http://example.org/email": "a@x"},
+                {"@id": "http://example.org/bob", "http://example.org/email": "b@x"}
+            ]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("insert");
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+    let remove = client
+        .post(format!("{server_url}/v1/fluree/remove/peerhist:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"matching": [{
+                "subject": "http://example.org/alice",
+                "predicate": "http://example.org/email"
+            }]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("remove");
+    assert_eq!(remove.status(), reqwest::StatusCode::OK);
+
+    // A peer reads a journaled ledger's commits, so it holds audit access.
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+    );
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+    let query = |from: &'static str, subject: &'static str| {
+        let app = peer_app.clone();
+        async move {
+            let body = serde_json::json!({
+                "from": from,
+                "select": ["?o"],
+                "where": {
+                    "@id": format!("http://example.org/{subject}"),
+                    "http://example.org/email": "?o"
+                }
+            });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/fluree/query")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+    let (status, json) = query("peerhist:main", "bob").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let (status, json) = query("peerhist:main@t:1", "bob").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, serde_json::json!([["b@x"]]));
+    let (status, json) = query("peerhist:main@t:1", "alice").await;
+    assert_eq!(status, StatusCode::GONE, "{json}");
+    server_handle.abort();
+}
+
 /// A storage-proxy token carrying `claims` besides the issuer's.
 fn token_with_claims(signing_key: &SigningKey, claims: serde_json::Value) -> String {
     let pubkey = signing_key.verifying_key().to_bytes();

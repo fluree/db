@@ -451,6 +451,33 @@ async fn resolve_block_ledger(
 // Handlers
 // ============================================================================
 
+/// GET /fluree/storage/config/{alias}: the ledger's config record, for a
+/// query peer's nameservice. Its retention journal arrives readable without
+/// this server's storage, so the peer refuses the history this ledger
+/// refuses. `null` for a ledger with no config record.
+pub async fn get_config_record(
+    State(state): State<Arc<AppState>>,
+    Path(ledger_id): Path<String>,
+    StorageProxyBearer(principal): StorageProxyBearer,
+) -> Result<Response, ServerError> {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
+        return Err(ServerError::not_found("Ledger not found"));
+    }
+    state
+        .fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await
+        .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
+        .ok_or_else(|| ServerError::not_found("Ledger not found"))?;
+    let config = state
+        .fluree
+        .config_for_reader(&ledger_id)
+        .await
+        .map_err(|e| ServerError::internal(format!("Config lookup failed: {e}")))?;
+    Ok(axum::response::IntoResponse::into_response(Json(config)))
+}
+
 /// GET /fluree/storage/ns/{alias}
 ///
 /// Returns the nameservice record for a ledger.

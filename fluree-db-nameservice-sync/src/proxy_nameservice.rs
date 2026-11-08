@@ -223,13 +223,36 @@ impl fluree_db_nameservice::StatusLookup for ProxyNameService {
 
 #[async_trait]
 impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
+    /// The server's `/storage/config` answer: the ledger's config record,
+    /// its retention journal readable without the server's storage. A
+    /// server from before the route answers `404`, and holds no journal.
     async fn get_config(
         &self,
-        _ledger_id: &str,
+        ledger_id: &str,
     ) -> Result<Option<fluree_db_nameservice::ConfigValue>> {
-        Err(NameServiceError::storage(
-            "get_config not supported in proxy mode".to_string(),
-        ))
+        let url = format!(
+            "{}/storage/config/{}",
+            self.api_base,
+            urlencoding::encode(ledger_id)
+        );
+        let request =
+            TransportRequest::get(url).header("authorization", format!("Bearer {}", self.token));
+        let response =
+            self.transport.execute(request).await.map_err(|e| {
+                NameServiceError::storage(format!("Config proxy request failed: {e}"))
+            })?;
+        match response.status {
+            StatusCode::OK => serde_json::from_slice(&response.body).map_err(|e| {
+                NameServiceError::storage(format!("Failed to parse config response: {e}"))
+            }),
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Ok(None),
+            StatusCode::UNAUTHORIZED => Err(NameServiceError::storage(format!(
+                "Config proxy authentication failed for {ledger_id}: check token validity"
+            ))),
+            status => Err(NameServiceError::storage(format!(
+                "Config proxy unexpected status {status} for {ledger_id}"
+            ))),
+        }
     }
 }
 

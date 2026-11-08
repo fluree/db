@@ -149,6 +149,12 @@ Fetch a nameservice record for a ledger ID. Requires storage proxy authorization
 
 The response includes a `serving` array (`"query"`, `"blocks"`) advertising the tiers this server offers for the ledger, computed from the ledger's `f:servingDefaults` setting group (see [setting groups](../ledger-config/setting-groups.md)). Clients use it to negotiate between query-shipping and peer (local compute) modes. A ledger with `f:serveBlocks false` returns 404 from all raw-content endpoints (`/storage/block`, `/storage/objects`, `/commits`, `/pack`); one with `f:serveQuery false` returns 403 from query endpoints on the origin. The server-wide coarse view is advertised unauthenticated in `/.well-known/fluree.json` under `serving`.
 
+#### `GET /v1/fluree/storage/config/{ledger-id}`
+
+Fetch the ledger's config record (`null` when it has none), with the same authorization as the nameservice record. A peer reads the ledger's [removal journal](../transactions/history-retention.md) from it, so it refuses the history the ledger refuses: the journal's removals arrive inline, readable without the server's storage. A server without this endpoint answers 404, which a peer reads as no journal.
+
+A ledger with a removal serves its commits only to a token with audit access (`fluree.ledger.audit.all`, or `fluree.ledger.audit.ledgers` naming the ledger; see [History retention](../transactions/history-retention.md)), so a peer serving such a ledger needs one.
+
 #### `GET /v1/fluree/storage/objects/{cid}?ledger={ledger-id}`
 
 Fetch a CAS object by **CID** as canonical raw bytes (`application/octet-stream`).

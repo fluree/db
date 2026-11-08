@@ -407,6 +407,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", get(events::events))
         // Storage proxy endpoints (for peer mode)
         .route("/storage/ns/:alias", get(storage_proxy::get_ns_record))
+        .route(
+            "/storage/config/:alias",
+            get(storage_proxy::get_config_record),
+        )
         .route("/storage/block", post(storage_proxy::get_block))
         .route(
             "/storage/objects/:cid",
