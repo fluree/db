@@ -1184,11 +1184,9 @@ async fn a_streaming_query_is_served_from_the_index() {
         .plan_stream_query(&db, &OwnedStreamQuery::JsonLd(capped))
         .await
         .unwrap();
-    let ledger = fluree.ledger(id).await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
     fluree
         .run_stream_query(
-            ledger,
             plan,
             Tracker::disabled(),
             QueryExecutionOptions::default(),
@@ -1201,6 +1199,76 @@ async fn a_streaming_query_is_served_from_the_index() {
     }
     let rows = text.lines().filter(|l| l.contains("\"row\"")).count();
     assert_eq!(rows, 10, "{text}");
+}
+
+/// A stream runs under the policy of the view it was planned on, whether or
+/// not a generation is there to answer it.
+#[tokio::test]
+async fn a_restricted_stream_keeps_its_policy() {
+    use fluree_db_api::{GovernanceOptions, GraphDb, OwnedStreamQuery, QueryExecutionOptions};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/stream-policy:main";
+    let data = json!({"@context": ctx(), "@graph": [
+        {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+        {"@id": "ex:ann", "@type": "ex:Student", "ex:secret": "a"},
+        {"@id": "ex:bob", "@type": "ex:Student", "ex:secret": "b"}
+    ]});
+    ledger_with(&fluree, id, data).await;
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?p", "?v"],
+        "where": [{"@id": "?p", "@type": "ex:Person"}, {"@id": "?p", "ex:secret": "?v"}],
+        "reasoning": "owl2rl"
+    });
+    let hiding_secrets = GovernanceOptions {
+        policy: Some(json!([{
+            "@id": "ex:hideSecrets",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/secret"}],
+            "f:action": "f:view",
+            "f:allow": false
+        }])),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let stream = |view: GraphDb| {
+        let (fluree, query) = (&fluree, query.clone());
+        async move {
+            let plan = fluree
+                .plan_stream_query(&view, &OwnedStreamQuery::JsonLd(query))
+                .await
+                .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+            fluree
+                .run_stream_query(
+                    plan,
+                    fluree_db_api::Tracker::disabled(),
+                    QueryExecutionOptions::default(),
+                    tx,
+                )
+                .await;
+            let mut text = String::new();
+            while let Some(chunk) = rx.recv().await {
+                text.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+            assert!(text.contains("\"end\""), "{text}");
+            text.lines().filter(|l| l.contains("\"row\"")).count()
+        }
+    };
+
+    for indexed in [false, true] {
+        if indexed {
+            let index = fluree
+                .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+                .await
+                .unwrap();
+            published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+        }
+        let root = fluree.db(id).await.unwrap();
+        assert_eq!(stream(root.clone()).await, 2, "indexed: {indexed}");
+        let restricted = fluree.wrap_policy(root, &hiding_secrets).await.unwrap();
+        assert_eq!(stream(restricted).await, 0, "indexed: {indexed}");
+    }
 }
 
 /// A sweep keeps every file a retained generation reaches, and the

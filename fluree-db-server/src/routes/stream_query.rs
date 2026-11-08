@@ -474,9 +474,8 @@ async fn stream_query_inner(
     Ok(response)
 }
 
-/// Keep the plain stream path for unconfigured/root views. A configured
-/// filter must travel with the dataset into the producer, not be discarded
-/// when the single-ledger producer reconstructs its view from LedgerState.
+/// Keep the plain stream path for unconfigured/root views; a configured
+/// filter runs through the dataset path, as on `/query`.
 async fn plan_with_ledger_defaults(
     state: &AppState,
     ledger_state: LedgerState,
@@ -491,7 +490,7 @@ async fn plan_with_ledger_defaults(
         let plan = fluree
             .plan_stream_query_with_options(&graph, input, options)
             .await?;
-        Ok(StreamPlan::Single { ledger_state, plan })
+        Ok(StreamPlan::Single { plan })
     } else {
         let dataset = DataSetDb::single(graph);
         let plan = fluree
@@ -523,10 +522,10 @@ fn finish_stream(
     let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
     let producer_tracker = tracker.clone();
     match stream_plan {
-        StreamPlan::Single { ledger_state, plan } => {
+        StreamPlan::Single { plan } => {
             tokio::spawn(async move {
                 fluree
-                    .run_stream_query(ledger_state, plan, producer_tracker, options, tx)
+                    .run_stream_query(plan, producer_tracker, options, tx)
                     .await;
             });
         }
@@ -551,7 +550,6 @@ fn finish_stream(
 #[allow(clippy::large_enum_variant)]
 enum StreamPlan {
     Single {
-        ledger_state: LedgerState,
         plan: StreamQueryPlan,
     },
     Dataset {

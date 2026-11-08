@@ -10,8 +10,8 @@
 //! Flow: the handler calls [`Fluree::plan_stream_query`] first (parse +
 //! eligibility + plan) so parse errors and unsupported query shapes surface as
 //! a clean `4xx` *before* the `200 OK` stream is committed; it then `spawn`s
-//! [`Fluree::run_stream_query`] with an owned `LedgerState` and the plan, wiring
-//! the receiver into the response body. Heartbeats are injected by the
+//! [`Fluree::run_stream_query`] with the plan, wiring the receiver into the
+//! response body. Heartbeats are injected by the
 //! transport layer (the server), not here.
 
 use bytes::Bytes;
@@ -23,8 +23,8 @@ use crate::format::sparql;
 use crate::query::helpers::build_query_result;
 use crate::view::{GraphDb, QueryInput};
 use crate::{
-    ApiError, DataSetDb, ExecutableQuery, Fluree, LedgerState, QueryExecutionOptions, QueryResult,
-    Result, Tracker, VarRegistry,
+    ApiError, DataSetDb, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result,
+    Tracker, VarRegistry,
 };
 
 use fluree_db_query::execute::{
@@ -60,9 +60,9 @@ pub struct StreamQueryPlan {
     vars: VarRegistry,
     parsed: fluree_db_query::ir::Query,
     executable: ExecutableQuery,
-    /// The reasoning index that answers the query, when one does: execution
-    /// reads it in place of the ledger state handed to the run.
-    served: Option<GraphDb>,
+    /// The view execution reads: the one planned against, or a reasoning
+    /// index's generation answering in its place with that view's policy.
+    view: GraphDb,
 }
 
 /// A parsed, validated, planned streaming query against a dataset (connection /
@@ -142,15 +142,16 @@ impl Fluree {
         let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
-        let served = self
+        let view = self
             .serve_from_reasoning_index(db, &mut executable, None)
-            .await?;
+            .await?
+            .unwrap_or_else(|| db.clone());
 
         Ok(StreamQueryPlan {
             vars,
             parsed,
             executable,
-            served,
+            view,
         })
     }
 
@@ -161,8 +162,8 @@ impl Fluree {
     /// failure). Backpressure is natural: a full channel suspends the producer
     /// at the next `tx.send`, pausing execution.
     ///
-    /// Intended to be `tokio::spawn`ed by the HTTP handler. Owns the
-    /// `LedgerState` (the `GraphDb` borrows it) so it outlives the request.
+    /// Intended to be `tokio::spawn`ed by the HTTP handler. Reads the view the
+    /// plan holds, so it runs under the policy the query was planned with.
     ///
     /// NOT wrapped by the residency retry loop (`query_with_options`): rows
     /// are emitted before execution completes, so a residency miss
@@ -170,7 +171,6 @@ impl Fluree {
     /// (wasm32 browser) must use the buffered query entry instead.
     pub async fn run_stream_query(
         &self,
-        ledger: LedgerState,
         plan: StreamQueryPlan,
         tracker: Tracker,
         options: QueryExecutionOptions,
@@ -190,10 +190,7 @@ impl Fluree {
             return;
         }
 
-        let graph = match plan.served {
-            Some(head) => head,
-            None => GraphDb::from_ledger_state(&ledger),
-        };
+        let graph = plan.view;
 
         // Metadata-only result: carries vars/output/context/binary_graph for the
         // formatter; batches stream separately and are never collected here.

@@ -1377,19 +1377,19 @@ async fn run_local_ndjson_stream(
             detect::QueryFormat::JsonLd => OwnedStreamQuery::JsonLd(serde_json::from_str(content)?),
         };
 
-        // Owned ledger state for the producer; a planning view carrying the
-        // ledger's default context so PREFIX/@context-less queries still resolve
-        // prefixes (parity with the buffered local path's db_with_default_context).
         let ledger_state = match head {
             // The head routing already loaded.
             Some(head) => head.snapshot().await.to_ledger_state(),
             None => fluree.ledger(alias).await?,
         };
+        // A view carrying the ledger's default context so PREFIX/@context-less
+        // queries still resolve prefixes (parity with the buffered local path's
+        // db_with_default_context).
         let planning_view = GraphDb::from_ledger_state(&ledger_state)
             .with_default_context(fluree.get_default_context(alias).await?);
         let plan = fluree.plan_stream_query(&planning_view, &input).await?;
 
-        let producer = fluree.run_stream_query(ledger_state, plan, tracker, exec_opts, tx);
+        let producer = fluree.run_stream_query(plan, tracker, exec_opts, tx);
         let driver = query_stream::drive_channel(rx, &mut consumer);
         let ((), drive_res) = tokio::join!(producer, driver);
         drive_res?;

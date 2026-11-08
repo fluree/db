@@ -50,13 +50,7 @@ async fn collect_records(
 
     let (tx, mut rx) = mpsc::channel(1024);
     fluree
-        .run_stream_query(
-            ledger,
-            plan,
-            stream_tracker(),
-            QueryExecutionOptions::default(),
-            tx,
-        )
+        .run_stream_query(plan, stream_tracker(), QueryExecutionOptions::default(), tx)
         .await;
 
     let mut bytes = Vec::new();
