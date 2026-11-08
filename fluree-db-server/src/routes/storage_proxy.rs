@@ -1050,13 +1050,13 @@ pub async fn get_object_by_cid(
         .map_err(|e| ServerError::internal(e.to_string()))
 }
 
-/// Content that holds what a ledger's history may no longer serve: commit
-/// and transaction blobs, and index history sidecars.
+/// Content that can hold what a ledger's history no longer serves:
+/// everything served but its config. Commits and transactions keep removed
+/// occurrences; an index built before a removal (its root, branch keys,
+/// leaves, history sidecars, spatial arenas and statistics) keeps removed
+/// values, and its dictionaries keep their strings until a purge.
 fn is_audit_kind(kind: ContentKind) -> bool {
-    matches!(
-        kind,
-        ContentKind::Commit | ContentKind::Txn | ContentKind::HistorySidecar
-    )
+    !matches!(kind, ContentKind::LedgerConfig)
 }
 
 #[cfg(test)]
@@ -1069,6 +1069,28 @@ mod tests {
     /// could still 404 there for downstream reasons (unresolvable gs id,
     /// missing bytes) — this asserts the gate itself, so serving a new kind
     /// is always a deliberate edit here plus #1539-style design work.
+    /// On a ledger with a removal, every kind served but its config is audit
+    /// data.
+    #[test]
+    fn every_served_kind_but_config_is_audit_data() {
+        for kind in [
+            ContentKind::Commit,
+            ContentKind::Txn,
+            ContentKind::IndexRoot,
+            ContentKind::IndexBranch,
+            ContentKind::IndexLeaf,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            ContentKind::StatsSketch,
+            ContentKind::SpatialIndex,
+            ContentKind::HistorySidecar,
+        ] {
+            assert!(is_audit_kind(kind), "{kind:?}");
+        }
+        assert!(!is_audit_kind(ContentKind::LedgerConfig));
+    }
+
     #[test]
     fn object_kind_allowlist_pins_served_and_excluded_kinds() {
         for kind in [

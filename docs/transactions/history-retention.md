@@ -120,10 +120,10 @@ It is served again once it syncs. An export as of an earlier point is refused li
 
 ## Audit access
 
-On a ledger whose journal records a removal, raw commit content is audit data. These reads need the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [token claim](../security/authentication.md#scope-claims), and answer `403` without it:
+On a ledger whose journal records a removal, raw content is audit data: its commits, and an index built before the removal and its dictionaries, which still hold the removed values. These reads need the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [token claim](../security/authentication.md#scope-claims), and answer `403` without it:
 
 - commit show (`GET /show/{ledger}`), commit export (`GET /commits/{ledger}`) and pack (`POST /pack/{ledger}`);
-- storage-proxy reads of commit, transaction and history-index blobs, and vended storage credentials;
+- storage-proxy reads of every blob but the ledger's config (commits, transactions, index roots, branches, leaves and sidecars, dictionaries, spatial and statistics artifacts), for a query peer too, and vended storage credentials;
 - the change and conflict details of a merge preview.
 
 Ordinary read, history, export and storage scopes do not imply audit access. On ledgers without a removal, these reads keep their usual permissions; an `f:noHistory` rule alone does not change them.
