@@ -1671,6 +1671,108 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
     }
 }
 
+/// A purge empties a string from the dictionaries only once nothing uses
+/// it: a small named graph, held in the pooled tree, still does, whether
+/// its row is in the pool's base or in a delta run written since.
+#[tokio::test]
+async fn a_purge_keeps_a_string_a_pooled_graph_still_uses() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-pooled").await;
+    let update = |sparql: &'static str| {
+        let fluree = &fluree;
+        let id = &id;
+        async move {
+            let handle = fluree.ledger_cached(id).await.unwrap();
+            fluree
+                .stage(&handle)
+                .sparql_update(sparql)
+                .execute()
+                .await
+                .unwrap();
+        }
+    };
+    update(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {
+           ex:alice ex:email \"base@secret\", \"delta@secret\" .
+           GRAPH ex:g { ex:carol ex:email \"base@secret\" }
+         }",
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    update(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g { ex:dave ex:email \"delta@secret\" } }",
+    )
+    .await;
+    crate::support::build_incrementally_and_publish_index(&fluree, &id).await;
+    let mut request = email("alice", "base@secret");
+    request
+        .matching
+        .extend(email("alice", "delta@secret").matching);
+    fluree
+        .erase_occurrences(&id, request, None)
+        .await
+        .expect("erase");
+    crate::support::build_incrementally_and_publish_index(&fluree, &id).await;
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let store = store_of(&fluree, &id).await;
+    let root = fluree_db_binary_index::IndexRoot::decode(
+        &store
+            .get(record.index_head_id.as_ref().unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let pool = root.pool.as_ref().expect("ex:g is pooled");
+    assert!(
+        pool.deltas.iter().any(|(order, runs)| {
+            *order == fluree_db_binary_index::format::run_record::RunSortOrder::OpstG
+                && !runs.is_empty()
+        }),
+        "ex:dave's row is in a delta run: {pool:?}"
+    );
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!((report.leafwise, report.rebuilt), (1, 0), "{report:?}");
+    assert_eq!(
+        fluree
+            .run_purge_pass(&id, Duration::ZERO)
+            .await
+            .unwrap()
+            .purged,
+        1
+    );
+
+    let db = fluree.db(&id).await.unwrap();
+    let rows = fluree
+        .query(
+            &db,
+            "SELECT ?s ?o WHERE { GRAPH <http://example.org/g> \
+             { ?s <http://example.org/email> ?o } } ORDER BY ?s",
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&db.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            ["http://example.org/carol", "base@secret"],
+            ["http://example.org/dave", "delta@secret"]
+        ])
+    );
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
 /// A second erasure of a commit whose originals a purge already deleted
 /// still reaches the copies that held them: they read it as its
 /// replacement, holding what the second erasure removes.
