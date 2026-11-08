@@ -133,7 +133,10 @@ pub struct SemanticKey {
 ///
 /// A change that leaves what every generation holds, and how it is read, the
 /// same (a faster closure with the same output) does not bump it.
-pub const ENGINE_SEMANTICS: u32 = 1;
+///
+/// 2: a restriction or chain over mutually inverse properties no longer fails
+/// the OWL 2 RL pass.
+pub const ENGINE_SEMANTICS: u32 = 2;
 
 /// The content id a canonical program encoding is known by.
 pub fn program_id(canonical: &[u8]) -> ContentId {
