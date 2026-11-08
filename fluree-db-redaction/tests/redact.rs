@@ -297,3 +297,143 @@ fn exposed_signatures_verify_outside_the_transform_and_bind_their_body() {
     misattributed.ledger_id = "other:main".into();
     assert!(verify_exposed_signatures::<HostSha>(&misattributed).is_err());
 }
+
+/// One value of every kind a commit stores. The match has no wildcard: a
+/// new kind does not compile here until it has a value below, so the
+/// transform, which parses operations on its own, is checked against
+/// Fluree's reader for it too.
+fn every_kind_of_value() -> Vec<(FlakeValue, &'static str)> {
+    use fluree_db_core::coerce::coerce_string_value;
+    let typed = |text: &str, local: &str| {
+        coerce_string_value(text, &format!("http://www.w3.org/2001/XMLSchema#{local}")).unwrap()
+    };
+    let values = vec![
+        (FlakeValue::Ref(Sid::new(13, "person-1")), "id"),
+        (FlakeValue::Boolean(true), "boolean"),
+        (FlakeValue::Long(-42), "long"),
+        (FlakeValue::Double(2.5), "double"),
+        (
+            typed("123456789012345678901234567890", "integer"),
+            "integer",
+        ),
+        (typed("3.14159265358979323846", "decimal"), "decimal"),
+        (typed("2020-01-01T10:00:00Z", "dateTime"), "dateTime"),
+        (typed("2020-01-01", "date"), "date"),
+        (typed("10:00:00", "time"), "time"),
+        (typed("2020", "gYear"), "gYear"),
+        (typed("2020-01", "gYearMonth"), "gYearMonth"),
+        (typed("--01", "gMonth"), "gMonth"),
+        (typed("---01", "gDay"), "gDay"),
+        (typed("--01-01", "gMonthDay"), "gMonthDay"),
+        (typed("P1Y2M", "yearMonthDuration"), "yearMonthDuration"),
+        (typed("P1DT2H", "dayTimeDuration"), "dayTimeDuration"),
+        (typed("P1Y2M3DT4H", "duration"), "duration"),
+        (FlakeValue::String("text".into()), "string"),
+        (FlakeValue::Vector(vec![0.5, -1.5].into()), "vector"),
+        (FlakeValue::Json(r#"{"a":[1,2]}"#.into()), "JSON"),
+        (
+            FlakeValue::GeoPoint(fluree_db_core::GeoPointBits::new(51.5, -0.1).unwrap()),
+            "wktLiteral",
+        ),
+        (
+            FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                s: Sid::new(13, "person-0"),
+                p: Sid::new(14, "email"),
+                o: FlakeValue::String("p0@example.org".into()),
+                dt: Sid::new(2, "string"),
+                lang: None,
+            })),
+            "tripleTerm",
+        ),
+    ];
+    for (value, _) in &values {
+        match value {
+            FlakeValue::Ref(_)
+            | FlakeValue::Boolean(_)
+            | FlakeValue::Long(_)
+            | FlakeValue::Double(_)
+            | FlakeValue::BigInt(_)
+            | FlakeValue::Decimal(_)
+            | FlakeValue::DateTime(_)
+            | FlakeValue::Date(_)
+            | FlakeValue::Time(_)
+            | FlakeValue::GYear(_)
+            | FlakeValue::GYearMonth(_)
+            | FlakeValue::GMonth(_)
+            | FlakeValue::GDay(_)
+            | FlakeValue::GMonthDay(_)
+            | FlakeValue::YearMonthDuration(_)
+            | FlakeValue::DayTimeDuration(_)
+            | FlakeValue::Duration(_)
+            | FlakeValue::String(_)
+            | FlakeValue::Vector(_)
+            | FlakeValue::Json(_)
+            | FlakeValue::GeoPoint(_)
+            | FlakeValue::TripleTerm(_) => {}
+            // Never written to a commit.
+            FlakeValue::Null => unreachable!(),
+        }
+    }
+    values
+}
+
+/// Every kind of value, with a language, a list position and a named
+/// graph, survives the removal of any one slot as Fluree's reader reads the
+/// original.
+#[test]
+fn every_kind_of_operation_survives_redaction_as_written() {
+    let mut flakes: Vec<Flake> = every_kind_of_value()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (value, datatype))| {
+            Flake::new(
+                Sid::new(13, &format!("thing-{i}")),
+                Sid::new(14, "value"),
+                value,
+                Sid::new(2, datatype),
+                9,
+                true,
+                None,
+            )
+        })
+        .collect();
+    flakes.push(Flake::new(
+        Sid::new(13, "thing-lang"),
+        Sid::new(14, "label"),
+        FlakeValue::String("chat".into()),
+        Sid::new(3, "langString"),
+        9,
+        true,
+        Some(fluree_db_core::FlakeMeta::with_lang("fr")),
+    ));
+    flakes.push(Flake::new(
+        Sid::new(13, "thing-list"),
+        Sid::new(14, "items"),
+        FlakeValue::Long(7),
+        Sid::new(2, "long"),
+        9,
+        true,
+        Some(fluree_db_core::FlakeMeta {
+            lang: None,
+            i: Some(3),
+            list: 1,
+        }),
+    ));
+    flakes.push(Flake::new_in_graph(
+        Sid::new(15, "graph"),
+        Sid::new(13, "thing-graph"),
+        Sid::new(14, "value"),
+        FlakeValue::String("in a graph".into()),
+        Sid::new(2, "string"),
+        9,
+        true,
+        None,
+    ));
+    let commit = Commit::new(9, flakes).with_parent(parent());
+    for compress in [false, true] {
+        let bytes = write_commit(&commit, compress, None).unwrap().bytes;
+        for slot in 0..commit.flakes.len() as u32 {
+            check(&bytes, &[slot]);
+        }
+    }
+}
