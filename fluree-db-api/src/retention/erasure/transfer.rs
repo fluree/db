@@ -487,6 +487,7 @@ impl Fluree {
         authority: crate::PushAuthority,
     ) -> Result<HashSet<ContentId>> {
         let positions = erased_positions(request)?;
+        let resent = self.originals_erased_here(request).await?;
         // History rules come from config commits, which the receiver
         // derives itself; only a removal request makes a removal.
         let journal = request
@@ -500,7 +501,7 @@ impl Fluree {
             })
             .filter(|section| !section.journal.is_empty());
         let erasing = !request.erasure_frames.is_empty() || !positions.is_empty();
-        if !erasing && request.base_erasures.is_empty() && journal.is_none() {
+        if !erasing && request.base_erasures.is_empty() && journal.is_none() && resent.is_empty() {
             return Ok(HashSet::new());
         }
         let runtime = match self.retention.erasure.get() {
@@ -643,7 +644,7 @@ impl Fluree {
         }
 
         let mut erased = HashSet::new();
-        for (at, cid) in positions {
+        for (at, cid) in positions.into_iter().chain(resent) {
             let chain = match runtime {
                 Some(runtime) => runtime.index.erased(&cid).await?,
                 None => None,
@@ -662,6 +663,57 @@ impl Fluree {
             erased.insert(cid);
         }
         Ok(erased)
+    }
+
+    /// The commits `request` carries as originals that this storage holds
+    /// erased: the sender has not received their erasure. They are taken as
+    /// their replacements, as commits pushed erased are, so their originals
+    /// reach neither validation nor the ledger's state. Names every commit of
+    /// a list holding one, when the sender named none.
+    async fn originals_erased_here(
+        &self,
+        request: &mut crate::PushCommitsRequest,
+    ) -> Result<Vec<(Position, ContentId)>> {
+        let Some(runtime) = self
+            .retention
+            .erasure
+            .get()
+            .filter(|_| self.retention.replicas.get().is_none())
+        else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for (commits, ids, at) in [
+            (
+                &mut request.commits,
+                &mut request.commit_ids,
+                Position::Line as fn(usize) -> Position,
+            ),
+            (
+                &mut request.merged_commits,
+                &mut request.merged_commit_ids,
+                Position::Merged,
+            ),
+        ] {
+            let named: Vec<ContentId> = match ids.len() == commits.len() {
+                true => ids.clone(),
+                false => commits
+                    .iter()
+                    .map(|c| ContentId::new(fluree_db_core::ContentKind::Commit, &c.0))
+                    .collect(),
+            };
+            let mut any = false;
+            for (i, cid) in named.iter().enumerate() {
+                if !commits[i].0.is_empty() && runtime.index.erased(cid).await?.is_some() {
+                    found.push((at(i), cid.clone()));
+                    any = true;
+                }
+            }
+            if any && ids.is_empty() {
+                *ids = named;
+            }
+        }
+        Ok(found)
     }
 
     /// Ready `request`, a push of `ledger_id`'s history to a receiver whose

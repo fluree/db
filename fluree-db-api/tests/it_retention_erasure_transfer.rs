@@ -2108,6 +2108,50 @@ async fn a_push_to_an_empty_ledger_brings_erased_commits_as_their_erasures() {
     );
 }
 
+/// A push carrying the original of a commit this storage holds erased, from
+/// a sender that never received the erasure, takes the commit as its
+/// replacement: the erased value reaches neither the branch pushed to nor
+/// its reads, and taking it needs no authority to erase.
+#[tokio::test]
+async fn a_push_of_an_original_erased_here_takes_its_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/push-resent").await;
+    insert_kept(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@kept"}),
+    )
+    .await;
+    let (base, _) = head_of(&fluree, &id).await;
+    fluree
+        .create_branch("it/push-resent", "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = "it/push-resent:dev";
+    insert_kept(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    // What a copy of dev taken now, before the erasure, pushes to main.
+    let request = push_request(&fluree, dev, Some(&base)).await;
+    assert_eq!(request.commits.len(), 1);
+    assert!(!is_replacement(&request.commits[0].0));
+    erase_published(&fluree, dev, email("alice", "a@secret")).await;
+
+    let pushed = push(&fluree, &id, request, false).await.unwrap();
+    assert_eq!(pushed.accepted, 1);
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&fluree, &id, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+}
+
 /// A push carries the ledger's removal journal. Removals the receiver's
 /// journal lacks need the authority removing needs; once the receiver has
 /// them, a push carrying the same journal needs none.
