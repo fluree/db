@@ -137,7 +137,7 @@ impl Fluree {
         let ns = self.publisher()?;
         // No branch is made while a request is accepted: one made before is
         // removed from, one made after inherits the removal.
-        let _admission = runtime.admission.lock().await;
+        let _admission = runtime.admission.write().await;
         let mut branches: Vec<String> = ns
             .branch_records(ledger_id.name())
             .await?

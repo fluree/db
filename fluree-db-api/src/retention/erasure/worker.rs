@@ -811,7 +811,7 @@ impl Fluree {
             }
         } else {
             // No branch is made between the check and the publication.
-            let admission = runtime.admission.lock().await;
+            let admission = runtime.admission.write().await;
             match self.prepare_publication(branch, job).await? {
                 Prepared::Waiting => return Ok(()),
                 Prepared::Covered => {}
@@ -880,7 +880,7 @@ impl Fluree {
             let Some(holder_set) = activator.holder_set().await? else {
                 return Ok(false);
             };
-            let admission = runtime.admission.lock().await;
+            let admission = runtime.admission.write().await;
             let (holders, erased) = match self.prepare_publication(branch, job).await? {
                 Prepared::Waiting => return Ok(false),
                 Prepared::Covered => return self.covered_in_cluster(activator, branch, job).await,

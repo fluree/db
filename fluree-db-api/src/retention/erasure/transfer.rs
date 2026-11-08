@@ -431,7 +431,7 @@ impl Fluree {
             };
             // An erasure accepted or published meanwhile would miss what
             // this one changes.
-            let _admission = runtime.admission.lock().await;
+            let _admission = runtime.admission.write().await;
             let history = self
                 .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
                 .await?;
@@ -605,7 +605,7 @@ impl Fluree {
             let runtime = runtime.expect("erasing needs the runtime");
             // An erasure accepted or published meanwhile would miss what
             // this one changes.
-            let _admission = runtime.admission.lock().await;
+            let _admission = runtime.admission.write().await;
             let head = match request.commits.is_empty() {
                 // A push of no commits: what the receiver has.
                 true => record
@@ -1899,7 +1899,7 @@ impl Fluree {
         let Some(runtime) = self.retention.erasure.get() else {
             return Ok(0);
         };
-        let _admission = runtime.admission.lock().await;
+        let _admission = runtime.admission.write().await;
         let mut completed = 0;
         for (id, bytes) in runtime.index.pending().await? {
             let resumed = async {

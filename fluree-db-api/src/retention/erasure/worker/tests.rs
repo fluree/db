@@ -100,7 +100,7 @@ async fn publication_branch_creation_and_restores_wait_for_admission() {
     let mut archive = Vec::new();
     fluree.archive_ledger(id, true, &mut archive).await.unwrap();
     let runtime = fluree.erasure_runtime().unwrap().clone();
-    let held = runtime.admission.lock().await;
+    let held = runtime.admission.write().await;
     let pass = {
         let fluree = fluree.clone();
         tokio::spawn(async move { fluree.run_erasure_pass(id).await })
@@ -140,6 +140,58 @@ async fn publication_branch_creation_and_restores_wait_for_admission() {
     assert_eq!(pass.await.unwrap().unwrap().published, 1);
     branch.await.unwrap().unwrap();
     restore.await.unwrap().unwrap();
+}
+
+/// What only adds branches shares admission: a branch created, or a dropped
+/// ledger restored, while another branch is being created, is not held up
+/// by it; a publication is.
+#[tokio::test]
+async fn branch_creations_and_restores_do_not_wait_for_one_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(erasing(&dir));
+    for name in ["t/shared", "t/shared-dropped"] {
+        fluree.create_ledger(name).await.unwrap();
+        insert(
+            &fluree,
+            &format!("{name}:main"),
+            json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+        )
+        .await;
+    }
+    let dropped = fluree
+        .drop_ledger("t/shared-dropped", crate::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .expect("a soft drop keeps the instance");
+    fluree
+        .erase_occurrences("t/shared:main", email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    reindex(&fluree, "t/shared:main").await;
+
+    let runtime = fluree.erasure_runtime().unwrap().clone();
+    // As a branch creation under way holds it.
+    let creating = runtime.admission.read().await;
+    async fn within<T>(what: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), what)
+            .await
+            .expect("not held up")
+    }
+    within(fluree.create_branch("t/shared", "other", None, None))
+        .await
+        .unwrap();
+    within(fluree.restore_dropped(dropped.as_str()))
+        .await
+        .unwrap();
+    let pass = {
+        let fluree = fluree.clone();
+        tokio::spawn(async move { fluree.run_erasure_pass("t/shared:main").await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pass.is_finished(), "published during a branch creation");
+    drop(creating);
+    pass.await.unwrap().unwrap();
 }
 
 /// A later request's step proved on the original, before the earlier

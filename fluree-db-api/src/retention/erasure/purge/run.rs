@@ -113,7 +113,7 @@ impl Fluree {
         // The holders stay those the pass planned for: a branch made from
         // one would copy an index not yet erased, and a restore would
         // rebuild into folders the release deletes.
-        let _admission = runtime.admission.lock().await;
+        let _admission = runtime.admission.write().await;
         let _purging = runtime.purging.lock().await;
         let name = LedgerId::parse(ledger)?.ledger_name();
         let jobs = self.purge_jobs(&name).await?;

@@ -286,7 +286,7 @@ impl Fluree {
         // An erasure accepted or published meanwhile would miss the branch.
         #[cfg(feature = "native")]
         let _admission = match self.retention.erasure.get() {
-            Some(erasure) => Some(erasure.admission.lock().await),
+            Some(erasure) => Some(erasure.admission.read().await),
             None => None,
         };
 

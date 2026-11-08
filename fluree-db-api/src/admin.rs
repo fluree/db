@@ -1040,7 +1040,7 @@ impl crate::Fluree {
         // An erasure accepted or published meanwhile would miss the ledger.
         #[cfg(feature = "native")]
         let _admission = match self.retention.erasure.get() {
-            Some(erasure) => Some(erasure.admission.lock().await),
+            Some(erasure) => Some(erasure.admission.read().await),
             None => None,
         };
         let records = lifecycle::restore_dropped_with(store, &instance, |entry, records| {

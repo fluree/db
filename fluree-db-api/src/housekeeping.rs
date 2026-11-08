@@ -458,7 +458,7 @@ async fn resume_drop(fluree: &Fluree, name: &str) -> crate::Result<()> {
 async fn resume_restore(fluree: &Fluree, instance: &InstanceId) -> crate::Result<()> {
     #[cfg(feature = "native")]
     let _admission = match fluree.retention.erasure.get() {
-        Some(erasure) => Some(erasure.admission.lock().await),
+        Some(erasure) => Some(erasure.admission.read().await),
         None => None,
     };
     let resumed =

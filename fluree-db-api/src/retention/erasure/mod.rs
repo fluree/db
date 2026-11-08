@@ -91,10 +91,13 @@ pub(crate) struct ErasureRuntime {
     in_flight: AtomicBool,
     /// A background purge pass is running.
     purge_in_flight: AtomicBool,
-    /// Held to accept or publish an erasure, to create a branch, to restore a
-    /// ledger, and by a purge pass: the branches an erasure or a pass reaches
-    /// are the branches as they are then. Taken before `purging`.
-    pub(crate) admission: tokio::sync::Mutex<()>,
+    /// Held exclusively to accept, publish or receive an erasure, by a
+    /// purge pass, and by a restore from an archive, which receives the
+    /// erasures it carries: the branches an erasure or a pass reaches are the
+    /// branches as they are then. Shared by what only adds branches: a
+    /// branch creation, and the restore of a dropped ledger, which do not
+    /// wait for one another. Taken before `purging`.
+    pub(crate) admission: tokio::sync::RwLock<()>,
     /// Held by a purge pass: one at a time. Shared with key rotation, whose
     /// rewrites a purge's deletions must not interleave with.
     pub(crate) purging: Arc<tokio::sync::Mutex<()>>,
@@ -155,7 +158,7 @@ impl ErasureRuntime {
             config,
             in_flight: AtomicBool::new(false),
             purge_in_flight: AtomicBool::new(false),
-            admission: tokio::sync::Mutex::new(()),
+            admission: tokio::sync::RwLock::new(()),
             purging: Default::default(),
             source_heads: tokio::sync::Mutex::new(()),
             rebuilt_on_restore: Default::default(),
