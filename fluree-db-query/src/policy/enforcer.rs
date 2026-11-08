@@ -5,7 +5,8 @@
 use super::QueryPolicyExecutor;
 use crate::error::Result;
 use fluree_db_core::{
-    Flake, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker, TripleTermValue,
+    Flake, FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker,
+    TripleTermValue,
 };
 use fluree_db_policy::{is_schema_flake, ClassState, PolicyContext};
 use std::sync::Arc;
@@ -139,9 +140,9 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
-        let state = ClassState::new(g_id, overlay, to_t);
-        self.cache_subject_classes(state, snapshot, g_id, overlay, to_t, &flakes)
-            .await?;
+        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
+        let state = ClassState::of(db);
+        self.cache_subject_classes(&state, db, &flakes).await?;
 
         let mut result = Vec::with_capacity(flakes.len());
 
@@ -149,7 +150,7 @@ impl QueryPolicyEnforcer {
             // A term names its triple even under a schema predicate, so it is
             // checked before the schema exemption.
             if !self
-                .term_visible(state, &flake.o, &executor, tracker)
+                .term_visible(&state, &flake.o, &executor, tracker)
                 .await?
             {
                 continue;
@@ -163,7 +164,7 @@ impl QueryPolicyEnforcer {
             // Get subject classes from cache
             let subject_classes = self
                 .policy
-                .get_cached_subject_classes(state, &flake.s)
+                .get_cached_subject_classes(&state, &flake.s)
                 .unwrap_or_default();
 
             // Async policy check with f:query support
@@ -212,19 +213,13 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
-        let state = ClassState::new(g_id, overlay, to_t);
-        self.cache_subject_classes(
-            state,
-            snapshot,
-            g_id,
-            overlay,
-            to_t,
-            std::slice::from_ref(flake),
-        )
-        .await?;
+        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
+        let state = ClassState::of(db);
+        self.cache_subject_classes(&state, db, std::slice::from_ref(flake))
+            .await?;
         // Before the schema exemption: a term names its triple under any predicate.
         if !self
-            .term_visible(state, &flake.o, &executor, tracker)
+            .term_visible(&state, &flake.o, &executor, tracker)
             .await?
         {
             return Ok(false);
@@ -238,7 +233,7 @@ impl QueryPolicyEnforcer {
         // Get subject classes from cache
         let subject_classes = self
             .policy
-            .get_cached_subject_classes(state, &flake.s)
+            .get_cached_subject_classes(&state, &flake.s)
             .unwrap_or_default();
 
         // Async policy check
@@ -260,7 +255,7 @@ impl QueryPolicyEnforcer {
     /// so on through a nested term. Other objects pass.
     async fn term_visible(
         &self,
-        state: ClassState,
+        state: &ClassState,
         object: &FlakeValue,
         executor: &QueryPolicyExecutor<'_>,
         tracker: &Tracker,
@@ -291,11 +286,8 @@ impl QueryPolicyEnforcer {
     /// overlay with no content version matches only itself.
     async fn cache_subject_classes(
         &self,
-        state: ClassState,
-        snapshot: &LedgerSnapshot,
-        g_id: GraphId,
-        overlay: &dyn OverlayProvider,
-        to_t: i64,
+        state: &ClassState,
+        db: GraphDbRef<'_>,
         flakes: &[Flake],
     ) -> Result<()> {
         if !self.policy.wrapper().has_class_policies() {
@@ -316,7 +308,6 @@ impl QueryPolicyEnforcer {
         }
         subjects.sort();
         subjects.dedup();
-        let db = fluree_db_core::GraphDbRef::new(snapshot, g_id, overlay, to_t);
         fluree_db_policy::populate_class_cache_in(state, &subjects, db, &self.policy)
             .await
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))

@@ -104,7 +104,7 @@ pub async fn populate_class_cache(
     policy_ctx: &crate::evaluate::PolicyContext,
 ) -> Result<()> {
     populate_class_cache_in(
-        crate::evaluate::ClassState::of(db),
+        &crate::evaluate::ClassState::of(db),
         subjects,
         db,
         policy_ctx,
@@ -116,7 +116,7 @@ pub async fn populate_class_cache(
 /// with: a state of an overlay with no content version answers only for the
 /// value it was taken as.
 pub async fn populate_class_cache_in(
-    state: crate::evaluate::ClassState,
+    state: &crate::evaluate::ClassState,
     subjects: &[Sid],
     db: GraphDbRef<'_>,
     policy_ctx: &crate::evaluate::PolicyContext,
