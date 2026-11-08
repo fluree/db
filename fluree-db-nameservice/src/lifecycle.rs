@@ -1868,6 +1868,85 @@ mod tests {
         assert!(store.get_binding("mydb").await.unwrap().is_none());
     }
 
+    /// A branch's reasoning-indexes document travels in the dropped entry, so
+    /// it counts toward the cap: an entry that fits without it is refused
+    /// with it, before anything is written.
+    #[tokio::test]
+    async fn a_reasoning_document_counts_toward_the_entry_cap() {
+        use crate::{ReasoningIndexesLookup as _, ReasoningIndexesPublisher as _};
+        use std::sync::atomic::Ordering;
+        let store = TestStore::default();
+        let name = LedgerName::parse("mydb").unwrap();
+        let created = create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        let bare = dropped_entry(
+            &name,
+            &binding,
+            false,
+            records_to_copy(&store, &name, &binding).await.unwrap(),
+        );
+        let bare = serde_json::to_vec(&bare).unwrap().len();
+
+        let doc = crate::ReasoningIndexes {
+            v: 1,
+            indexes: [(
+                fluree_db_core::reasoning_index::ReasoningIndexId::parse(
+                    "01JC0000000000000000000000",
+                )
+                .unwrap(),
+                fluree_db_core::reasoning_index::ReasoningIndexEntry {
+                    registration: fluree_db_core::reasoning_index::Registration {
+                        revision: 1,
+                        semantics: fluree_db_core::reasoning_index::SemanticKey {
+                            program: fluree_db_core::ContentId::new(
+                                fluree_db_core::ContentKind::LedgerConfig,
+                                b"program",
+                            ),
+                            reasoned_graph: None,
+                            clock: fluree_db_core::reasoning_index::ClockPolicy::SnapshotCommitTime,
+                        },
+                        program: serde_json::json!({"reasoning": "owl2rl"}),
+                        state: fluree_db_core::reasoning_index::RegistrationState::Active,
+                    },
+                    floor: Default::default(),
+                    head: None,
+                },
+            )]
+            .into(),
+        };
+        store
+            .push_reasoning_indexes_fenced("mydb:main", created.fence, 0, &doc)
+            .await
+            .unwrap();
+
+        store.max_entry.store(bare + 8, Ordering::SeqCst);
+        let err = drop_ledger(&store, &name, false).await.unwrap_err();
+        assert!(matches!(err, NameServiceError::TooLarge(_)), "{err}");
+        assert!(store
+            .get_binding("mydb")
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .is_active());
+        assert!(!store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+        assert_eq!(
+            store.get_reasoning_indexes("mydb:main").await.unwrap(),
+            Some(doc.clone())
+        );
+
+        store.max_entry.store(0, Ordering::SeqCst);
+        let instance = drop_ledger(&store, &name, false)
+            .await
+            .unwrap()
+            .expect("dropped")
+            .instance;
+        let entry = store.get_dropped(&instance).await.unwrap().unwrap().value;
+        assert_eq!(entry.reasoning_indexes.get("main"), Some(&doc));
+    }
+
     /// A name held by a create that stopped reads as absent, so its refusal
     /// says what holds it and how to free it.
     #[tokio::test]
