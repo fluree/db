@@ -464,6 +464,9 @@ pub async fn get_config_record(
     if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
+    // A cluster replica answers, even that the peer's copy still holds, only
+    // once it holds the current journal.
+    state.fluree.confirm_history_current(&ledger_id).await?;
     let record = state
         .fluree
         .nameservice()

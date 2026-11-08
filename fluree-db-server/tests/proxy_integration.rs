@@ -4454,9 +4454,28 @@ async fn test_proxy_peer_refuses_removed_history() {
     assert_eq!(remove.status(), reqwest::StatusCode::OK);
     let changed = config(Some(tag.clone())).await.expect("config");
     assert_eq!(changed.status(), reqwest::StatusCode::OK);
-    assert_ne!(changed.headers()["etag"].to_str().unwrap(), tag);
+    let tag = changed.headers()["etag"].to_str().unwrap().to_string();
     let (status, json) = query("peerhist:main@t:1", "bob").await;
     assert_eq!(status, StatusCode::GONE, "{json}");
+
+    // A cluster replica that cannot confirm it holds the current journal
+    // confirms no copy of it, not even an unchanged one.
+    struct Partitioned;
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
+        async fn sync_reads(&self) -> Result<(), String> {
+            Err("no leader".into())
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    state.fluree.set_retention_replicas(Arc::new(Partitioned));
+    let unconfirmed = config(Some(tag)).await.expect("config");
+    assert_eq!(
+        unconfirmed.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
     server_handle.abort();
 }
 
