@@ -866,9 +866,13 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
         // 2. Build executable with optional reasoning override
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(tracker))
+            .await?;
+        let db = served.as_ref().unwrap_or(db);
 
         // 4. Execute
         let batches = self
@@ -1258,10 +1262,15 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let db = served.as_ref().unwrap_or(db);
 
         let batches = self
             .execute_view_tracked_with_r2rml(db, &vars, &executable, &tracker, r2rml, &options)
