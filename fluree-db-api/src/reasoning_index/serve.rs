@@ -12,8 +12,12 @@
 //!   is served only under the version it runs itself, so while instances of
 //!   two versions run, each reasons at query time over the other's
 //!   generations;
-//! - the view is unrestricted. An index is materialized without policy, so a
-//!   policy-restricted view always reasons at query time.
+//! - for a request under a view policy, on its view or any graph of its
+//!   dataset, the basis is exact even under `asOf`: an older generation would
+//!   also take the policy's class lookups and conditions back to that commit.
+//!   An index is materialized without policy; the caller's policy, for
+//!   reasoning queries, judges what the generation view reads
+//!   ([`generation_view`]).
 //!
 //! Anything else falls back to query-time reasoning, as do errors reading an
 //! index: serving from an index is an acceleration, never a requirement.

@@ -5,13 +5,15 @@
 //! own subject, predicate and object, class policies by the subject's reasoned
 //! classes, and conditions against the derived facts the query reads.
 //!
-//! Each served case checks three things. Its answer is written out by hand.
+//! The semantic cases (`Twins::check`, and the identity, dataset, named-graph
+//! and stream tests) check three things. The answer is written out by hand.
 //! Query-time reasoning gives the same answer on a twin ledger with no index.
 //! And the index answered with no closure computed: the response names the
 //! index (an OWL RL closure would replace that report with its own), and the
 //! served query carries a one-fact reasoning budget and `exact` freshness,
 //! under which the datalog closure here, seven facts, is an error rather than
-//! an answer.
+//! an answer. The isolation, concurrency, program, freshness and fallback
+//! tests check what they are about against hand-written answers.
 
 use crate::support::{genesis_ledger, normalize_rows};
 use fluree_db_api::{
@@ -77,6 +79,14 @@ fn family() -> Value {
     })
 }
 
+/// The same subject in two named graphs: a stored `Secret` in one, with no
+/// class in the other.
+const NAMED_GRAPHS: &str = r#"
+@prefix ex: <http://example.org/> .
+GRAPH <urn:g:hr> { ex:zed a ex:Secret ; ex:name "Zed" . }
+GRAPH <urn:g:public> { ex:zed ex:name "Zed" . }
+"#;
+
 fn published(outcome: fluree_db_api::reasoning_index::RefreshOutcome) {
     assert!(
         matches!(
@@ -87,11 +97,12 @@ fn published(outcome: fluree_db_api::reasoning_index::RefreshOutcome) {
     );
 }
 
-/// A view policy, as inline rules and a default.
+/// A view policy, as inline rules and a default, for a caller identity.
 #[derive(Clone, Debug)]
 struct Policy {
     rules: Value,
     default_allow: bool,
+    identity: Option<String>,
 }
 
 fn deny(target: &str, iri: &str) -> Policy {
@@ -104,6 +115,7 @@ fn deny(target: &str, iri: &str) -> Policy {
             "f:allow": false
         }]),
         default_allow: true,
+        identity: None,
     }
 }
 
@@ -131,6 +143,7 @@ fn deny_classes(classes: &[&str]) -> Policy {
                 .collect(),
         ),
         default_allow: true,
+        identity: None,
     }
 }
 
@@ -148,6 +161,7 @@ fn only_names() -> Policy {
             "f:allow": true
         }]),
         default_allow: false,
+        identity: None,
     }
 }
 
@@ -164,12 +178,14 @@ fn salaries_of_high_earners() -> Policy {
             }}
         }]),
         default_allow: true,
+        identity: None,
     }
 }
 
 impl Policy {
     fn governance(&self) -> GovernanceOptions {
         GovernanceOptions {
+            identity: self.identity.clone(),
             policy: Some(self.rules.clone()),
             default_allow: Some(self.default_allow),
             ..Default::default()
@@ -231,7 +247,13 @@ async fn seeded(fluree: Fluree, name: &str, programs: &[&str]) -> Twins {
     let query_time = format!("reasoning-index-policy/{name}-query-time:main");
     for id in [&served, &query_time] {
         let ledger = genesis_ledger(&fluree, id).await;
-        fluree.insert(ledger, &family()).await.expect("seed");
+        let ledger = fluree.insert(ledger, &family()).await.expect("seed").ledger;
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(NAMED_GRAPHS)
+            .execute()
+            .await
+            .expect("named graphs");
         fluree
             .reindex(id, ReindexOptions::default())
             .await
@@ -295,6 +317,9 @@ impl Twins {
                     "policy": policy.rules,
                     "default-allow": policy.default_allow
                 });
+                if let Some(identity) = &policy.identity {
+                    query["opts"]["identity"] = json!(identity);
+                }
                 self.fluree
                     .query_connection_tracked(&query)
                     .await
@@ -559,89 +584,220 @@ async fn operators_cannot_reach_past_a_reasoned_deny() {
     }
 }
 
+/// One graph under several policies in a dataset: each member keeps its own,
+/// served as at query time, whatever the primary's.
 #[tokio::test]
 async fn a_dataset_member_keeps_its_own_policy_when_served() {
     let twins = twins("dataset", &["datalog"]).await;
-    let state = twins.fluree.ledger(&twins.served).await.expect("ledger");
-    let root = GraphDb::from_ledger_state(&state);
-    let hiding_alice = twins.view(&twins.served, &deny_class("HighEarner")).await;
-    let hiding_salaries = twins.view(&twins.served, &deny_property("salary")).await;
-    let dataset = DataSetDb::new()
-        .with_default(root.clone())
-        .with_named("urn:root", root)
-        .with_named("urn:hiding-alice", hiding_alice)
-        .with_named("urn:hiding-salaries", hiding_salaries);
-    let salaries = |graph: &str| {
-        index_only(&query(
-            json!(["?s", "?v"]),
-            json!([["graph", graph, {"@id": "?s", "ex:salary": "?v"}]]),
-            "datalog",
-        ))
+    for (ledger, served) in [(&twins.query_time, false), (&twins.served, true)] {
+        let state = twins.fluree.ledger(ledger).await.expect("ledger");
+        let root = GraphDb::from_ledger_state(&state);
+        let dataset = DataSetDb::new()
+            .with_default(root.clone())
+            .with_named("urn:root", root)
+            .with_named(
+                "urn:hiding-alice",
+                twins.view(ledger, &deny_class("HighEarner")).await,
+            )
+            .with_named(
+                "urn:hiding-salaries",
+                twins.view(ledger, &deny_property("salary")).await,
+            );
+        for (graph, expected) in [
+            (
+                "urn:root",
+                json!([["ex:alice", 250_000], ["ex:bob", 90000]]),
+            ),
+            ("urn:hiding-alice", json!([["ex:bob", 90000]])),
+            ("urn:hiding-salaries", json!([])),
+        ] {
+            let salaries = query(
+                json!(["?s", "?v"]),
+                json!([["graph", graph, {"@id": "?s", "ex:salary": "?v"}]]),
+                "datalog",
+            );
+            let answer = dataset_answer(&twins, &dataset, &salaries, served).await;
+            assert_eq!(
+                answer,
+                normalize_rows(&expected),
+                "{graph}, served: {served}"
+            );
+        }
+    }
+}
+
+/// Named graphs hold their own classes: `ex:zed` is a stored `Secret` in one
+/// and has no class in the other, so a deny on the class hides its name in
+/// the first only, served and at query time alike.
+#[tokio::test]
+async fn a_named_graph_member_is_judged_by_its_own_classes() {
+    let twins = twins("named-graphs", &["datalog"]).await;
+    let policy = deny_class("Secret");
+    for (ledger, served) in [(&twins.query_time, false), (&twins.served, true)] {
+        let mut dataset =
+            DataSetDb::new().with_default(twins.fluree.db(ledger).await.expect("default graph"));
+        for graph in ["urn:g:hr", "urn:g:public"] {
+            let view = twins
+                .fluree
+                .db(&format!("{ledger}#{graph}"))
+                .await
+                .expect("named graph");
+            let view = twins
+                .fluree
+                .wrap_policy(view, &policy.governance())
+                .await
+                .expect("policy view");
+            dataset = dataset.with_named(graph, view);
+        }
+        for (graph, expected) in [("urn:g:hr", json!([])), ("urn:g:public", json!(["Zed"]))] {
+            let names = query(
+                json!("?n"),
+                json!([["graph", graph, {"@id": "?s", "ex:name": "?n"}]]),
+                "datalog",
+            );
+            let answer = dataset_answer(&twins, &dataset, &names, served).await;
+            assert_eq!(
+                answer,
+                normalize_rows(&expected),
+                "{graph}, served: {served}"
+            );
+        }
+    }
+}
+
+/// `query` against `dataset`, asserting it was served from an index when
+/// `served`, which also makes a query-time answer an error.
+async fn dataset_answer(
+    twins: &Twins,
+    dataset: &DataSetDb,
+    query: &Value,
+    served: bool,
+) -> Vec<Value> {
+    let query = if served {
+        index_only(query)
+    } else {
+        query.clone()
     };
-    for (graph, expected) in [
-        (
-            "urn:root",
-            json!([["ex:alice", 250_000], ["ex:bob", 90000]]),
-        ),
-        ("urn:hiding-alice", json!([["ex:bob", 90000]])),
-        ("urn:hiding-salaries", json!([])),
-    ] {
-        let response = dataset
-            .query(&twins.fluree)
-            .jsonld(&salaries(graph))
-            .execute_tracked()
+    let response = dataset
+        .query(&twins.fluree)
+        .jsonld(&query)
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("served: {served}: {e:?}"));
+    assert_eq!(
+        response.reasoning.and_then(|r| r.index).is_some(),
+        served,
+        "{query}"
+    );
+    normalize_rows(&response.result)
+}
+
+/// A restricted stream is served under its policy, as it is answered at
+/// query time.
+#[tokio::test]
+async fn a_restricted_stream_is_served_under_its_policy() {
+    let twins = twins("stream", &["datalog"]).await;
+    for (ledger, served) in [(&twins.query_time, false), (&twins.served, true)] {
+        let view = twins.view(ledger, &deny_class("HighEarner")).await;
+        let names = query(json!(["?s", "?n"]), names(), "datalog");
+        let names = if served { index_only(&names) } else { names };
+        let plan = twins
+            .fluree
+            .plan_stream_query(&view, &OwnedStreamQuery::JsonLd(names))
             .await
-            .unwrap_or_else(|e| panic!("{graph}: {e:?}"));
+            .expect("plan");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        twins
+            .fluree
+            .run_stream_query(
+                plan,
+                Tracker::disabled(),
+                QueryExecutionOptions::default(),
+                tx,
+            )
+            .await;
+        let mut text = String::new();
+        while let Some(chunk) = rx.recv().await {
+            text.push_str(std::str::from_utf8(&chunk).expect("utf-8"));
+        }
+        let names: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("ndjson"))
+            .filter(|record| record["type"] == "row")
+            .map(|record| record["row"]["n"]["value"].clone())
+            .collect();
+        assert!(text.contains("\"end\""), "served: {served}: {text}");
         assert_eq!(
-            normalize_rows(&response.result),
-            normalize_rows(&expected),
-            "{graph}"
-        );
-        assert!(
-            response.reasoning.and_then(|r| r.index).is_some(),
-            "{graph}"
+            normalize_rows(&Value::Array(names)),
+            normalize_rows(&json!(["Bob", "Carol", "Dave", "Erin"])),
+            "served: {served}: {text}"
         );
     }
 }
 
-#[tokio::test]
-async fn a_restricted_stream_is_served_under_its_policy() {
-    let twins = twins("stream", &["datalog"]).await;
-    let view = twins.view(&twins.served, &deny_class("HighEarner")).await;
-    let plan = twins
-        .fluree
-        .plan_stream_query(
-            &view,
-            &OwnedStreamQuery::JsonLd(index_only(&query(json!(["?s", "?n"]), names(), "datalog"))),
-        )
-        .await
-        .expect("plan");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-    twins
-        .fluree
-        .run_stream_query(
-            plan,
-            Tracker::disabled(),
-            QueryExecutionOptions::default(),
-            tx,
-        )
-        .await;
-    let mut text = String::new();
-    while let Some(chunk) = rx.recv().await {
-        text.push_str(std::str::from_utf8(&chunk).expect("utf-8"));
+/// A salary shows to a caller who is one of its subject's ancestors, a
+/// relation only the rules derive, through a condition on `?$identity`.
+fn salaries_of_descendants(identity: &str) -> Policy {
+    Policy {
+        rules: json!([{
+            "@id": "ex:descendantSalaries",
+            "f:onProperty": [{"@id": ex("salary")}],
+            "f:action": "f:view",
+            "f:query": {"@type": "@json", "@value": {
+                "@context": {"ex": EX},
+                "where": [{"@id": "?$this", "ex:ancestor": "?$identity"}]
+            }}
+        }]),
+        default_allow: true,
+        identity: Some(ex(identity)),
     }
-    let names: Vec<Value> = text
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("ndjson"))
-        .filter(|record| record["type"] == "row")
-        .map(|record| record["row"]["n"]["value"].clone())
-        .collect();
-    assert!(text.contains("\"end\""), "{text}");
-    assert_eq!(
-        normalize_rows(&Value::Array(names)),
-        normalize_rows(&json!(["Bob", "Carol", "Dave", "Erin"])),
-        "{text}"
+}
+
+/// Two identities under one policy that reads `?$identity`: `ex:bob` is
+/// alice's ancestor, and `ex:dave` alice's and bob's. Each sees its own
+/// salaries, matching query time, whichever identity warms an instance's
+/// caches first, and when both read one generation at once.
+#[tokio::test]
+async fn identities_under_one_policy_keep_their_own_answers() {
+    let salaries = query(
+        json!(["?s", "?v"]),
+        json!({"@id": "?s", "ex:salary": "?v"}),
+        "datalog",
     );
+    let (bob, dave) = (
+        salaries_of_descendants("bob"),
+        salaries_of_descendants("dave"),
+    );
+    let bob_sees = json!([["ex:alice", 250_000]]);
+    let dave_sees = json!([["ex:alice", 250_000], ["ex:bob", 90000]]);
+    let expected = |policy: &Policy| {
+        normalize_rows(if policy.identity == bob.identity {
+            &bob_sees
+        } else {
+            &dave_sees
+        })
+    };
+
+    let parity = twins("identities", &["datalog"]).await;
+    parity.check("bob", &salaries, &bob, bob_sees.clone()).await;
+    parity
+        .check("dave", &salaries, &dave, dave_sees.clone())
+        .await;
+
+    let served = index_only(&salaries);
+    for order in [[&bob, &dave], [&dave, &bob]] {
+        let fresh = twins("identities", &["datalog"]).await;
+        for policy in order {
+            let (rows, index) = fresh.answer(&served, policy).await;
+            assert_eq!(rows, expected(policy), "{:?}", policy.identity);
+            assert!(index.is_some());
+        }
+    }
+    let shared = twins("identities", &["datalog"]).await;
+    let (b, d) = tokio::join!(shared.answer(&served, &bob), shared.answer(&served, &dave));
+    assert_eq!(b.0, expected(&bob));
+    assert_eq!(d.0, expected(&dave));
+    assert!(b.1.is_some() && d.1.is_some());
 }
 
 /// The policy context a wrapped view shares between its queries keeps the
@@ -719,6 +875,7 @@ async fn callers_do_not_share_their_answers() {
     let root = Policy {
         rules: json!([]),
         default_allow: true,
+        identity: None,
     };
 
     let (hiding_alice, high_earner_salaries) =
@@ -809,6 +966,7 @@ async fn freshness_serves_a_restricted_caller_only_at_its_basis() {
     let root = Policy {
         rules: json!([]),
         default_allow: true,
+        identity: None,
     };
     let head = twins_head(&twins).await;
     let (_, index) = twins.answer(&freshness("asOf"), &root).await;
