@@ -4096,7 +4096,7 @@ POST /remove/{ledger-id}
 }
 ```
 
-Either list may be empty. `matching[].graph` names a graph (absent for the default graph). `matching[].object` takes a JSON string (an `xsd:string`), number or boolean, `{"@id": ...}` for a reference, or a value object with `@type` (a datatype IRI) or `@language`; it selects every value when absent.
+Either list may be empty. `matching[].graph` names a graph (absent for the default graph). `matching[].object` takes a JSON string (an `xsd:string`), number (under any numeric datatype) or boolean, `{"@id": ...}` for a reference, or a value object with `@type` (an absolute datatype IRI, `@json`, or an `xsd:` or `rdf:` compact IRI; selectors take no `@context`) or `@language`; it selects every value when absent.
 
 **Response:**
 

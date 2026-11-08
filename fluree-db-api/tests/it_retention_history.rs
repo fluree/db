@@ -2817,7 +2817,8 @@ async fn a_dataset_refuses_history_another_of_its_ledgers_removed() {
 
 /// A selector's object names the value as written: a plain string is an
 /// `xsd:string`, not the same text with a language or another datatype, and
-/// a value object takes a datatype or a language.
+/// a value object takes a datatype (an IRI, or a compact `xsd:` one) or a
+/// language.
 #[tokio::test]
 async fn a_selector_matches_the_datatype_and_language_it_names() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2844,13 +2845,19 @@ async fn a_selector_matches_the_datatype_and_language_it_names() {
         }
     };
     assert_eq!(held(&fluree).await, 4);
+    // A selector has no context: a datatype is an IRI.
+    let relative = json!({"@value": "x", "@type": "Token"});
+    match fluree
+        .remove_occurrences(&id, select("alice", Some(relative)))
+        .await
+    {
+        Err(ApiError::Http { status: 400, .. }) => {}
+        other => panic!("expected 400, got {other:?}"),
+    }
     for (object, left) in [
         (json!("x"), 3),
         (json!({"@value": "x", "@language": "FR"}), 2),
-        (
-            json!({"@value": "2020-01-01", "@type": "http://www.w3.org/2001/XMLSchema#date"}),
-            1,
-        ),
+        (json!({"@value": "2020-01-01", "@type": "xsd:date"}), 1),
         (
             json!({"@value": "x", "@type": "http://example.org/Token"}),
             0,

@@ -777,7 +777,8 @@ fn selector_terms(
                 let value = map.get("@value").ok_or_else(shape)?;
                 match (map.get("@type"), map.get("@language")) {
                     (Some(dt), None) => {
-                        let dt = dt.as_str().ok_or_else(shape)?;
+                        let dt = datatype_iri(dt.as_str().ok_or_else(shape)?)?;
+                        let dt = dt.as_str();
                         let coerced = match value {
                             serde_json::Value::String(s) => {
                                 fluree_db_core::coerce::coerce_string_value(s, dt)
@@ -810,6 +811,32 @@ fn selector_terms(
         Some(other) => Some(any(scalar(other)?)),
     };
     Ok((graph, subject, predicate, object))
+}
+
+/// A selector's `@type` as an IRI: an absolute IRI, `@json`, or a compact
+/// `xsd:` or `rdf:` IRI. A selector has no context to expand any other.
+fn datatype_iri(dt: &str) -> Result<String> {
+    if dt == "@json" {
+        return Ok(fluree_vocab::rdf::JSON.to_string());
+    }
+    for (prefix, ns) in [
+        ("xsd:", fluree_vocab::xsd::NS),
+        ("rdf:", fluree_vocab::rdf::NS),
+    ] {
+        if let Some(local) = dt.strip_prefix(prefix) {
+            return Ok(format!("{ns}{local}"));
+        }
+    }
+    match dt.split_once(':') {
+        Some((scheme, _)) if !scheme.is_empty() && !dt.starts_with('@') => Ok(dt.to_string()),
+        _ => Err(ApiError::http(
+            400,
+            format!(
+                "selector object @type {dt:?} is not an absolute IRI, @json, or an xsd: or rdf: \
+                 compact IRI"
+            ),
+        )),
+    }
 }
 
 /// A JSON boolean or number as a value.
