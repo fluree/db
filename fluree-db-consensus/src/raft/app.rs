@@ -1562,6 +1562,50 @@ mod tests {
         assert_eq!(applied, Some(log_id(1, 1)));
     }
 
+    /// A snapshot whose layout predates the membership index (V1/V2)
+    /// carries none; the membership in force when it was taken is applied
+    /// as it loads, on install and on a restart, so every member agrees
+    /// with one that replayed the membership entry instead.
+    #[tokio::test]
+    async fn a_snapshot_from_before_the_membership_index_takes_it_from_its_membership() {
+        let source_storage = Arc::new(MemoryRaftStorage::new());
+        let mut source =
+            StateMachineAdapter::new(Arc::clone(&source_storage), NameServiceObserver::new());
+        source
+            .apply([
+                membership_entry(1, &[1, 2, 3]),
+                create_ledger_entry(2, "test/db"),
+            ])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let v2 = source.shared_state().read().await.to_v2_snapshot();
+        assert_eq!(
+            NameServiceState::from_snapshot(&v2)
+                .unwrap()
+                .membership_index,
+            0,
+            "the layout carries none"
+        );
+
+        let target_storage = Arc::new(MemoryRaftStorage::new());
+        let mut target =
+            StateMachineAdapter::new(Arc::clone(&target_storage), NameServiceObserver::new());
+        target
+            .install_snapshot(&snap.meta, Box::new(std::io::Cursor::new(v2)))
+            .await
+            .unwrap();
+        let installed = target.shared_state().read().await.clone();
+        assert_eq!(installed.membership_index, 1);
+        assert!(installed.ledgers.contains_key("test/db"));
+
+        let restarted = StateMachineAdapter::open(target_storage, NameServiceObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(restarted.shared_state().read().await.membership_index, 1);
+    }
+
     #[tokio::test]
     async fn install_snapshot_drains_waiters_and_stash() {
         use crate::raft::staged_receipt::{StagedReceiptMap, TransactApplied};

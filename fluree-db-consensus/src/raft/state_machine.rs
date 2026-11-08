@@ -1718,6 +1718,32 @@ impl NameServiceState {
         Ok(postcard::to_allocvec(self)?)
     }
 
+    /// This state as a snapshot taken before erasure state was appended
+    /// ([`NameServiceStateV2`]), which deployed clusters may hold.
+    #[cfg(test)]
+    pub(crate) fn to_v2_snapshot(&self) -> Vec<u8> {
+        postcard::to_allocvec(&NameServiceStateV2 {
+            refs: self.refs.clone(),
+            ledgers: self.ledgers.clone(),
+            retracted: self.retracted.clone(),
+            idempotency: self.idempotency.clone(),
+            queues: self.queues.clone(),
+            next_queue_id: self.next_queue_id,
+            recently_cleared: self.recently_cleared.clone(),
+            evicted_idempotency_count: self.evicted_idempotency_count,
+            queue_config: self.queue_config,
+            status: self.status.clone(),
+            config: self.config.clone(),
+            graph_sources: self.graph_sources.clone(),
+            worker_eligible_voters: self.worker_eligible_voters.clone(),
+            configured_voters: self.configured_voters.clone(),
+            bindings: self.bindings.clone(),
+            dropped: self.dropped.clone(),
+            fences: self.fences.clone(),
+        })
+        .expect("a state encodes")
+    }
+
     /// Restore state machine state from snapshot bytes produced by
     /// [`Self::to_snapshot`].
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
