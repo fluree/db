@@ -31,6 +31,7 @@
   - [show](cli/show.md)
   - [index](cli/index.md)
   - [reindex](cli/reindex.md)
+  - [reasoning-indexes](cli/reasoning-indexes.md)
   - [sweep](cli/sweep.md)
   - [encryption](cli/encryption.md)
   - [config](cli/config.md)

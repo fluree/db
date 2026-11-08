@@ -74,6 +74,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`show`](show.md) | Show decoded commit contents (flakes with resolved IRIs) |
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
+| [`reasoning-indexes`](reasoning-indexes.md) | Register reasoning programs and manage their reasoning indexes |
 | [`sweep`](sweep.md) | Reclaim index artifacts no index chain references |
 | [`encryption`](encryption.md) | Held encryption keys and key rotation (status, rotate, resume, pause, cancel, verify, generate-key) |
 | [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
