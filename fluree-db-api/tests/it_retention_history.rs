@@ -2780,3 +2780,52 @@ async fn a_dataset_refuses_history_another_of_its_ledgers_removed() {
         result.map(|r| r.row_count())
     );
 }
+
+/// A selector's object names the value as written: a plain string is an
+/// `xsd:string`, not the same text with a language or another datatype, and
+/// a value object takes a datatype or a language.
+#[tokio::test]
+async fn a_selector_matches_the_datatype_and_language_it_names() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-typed").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": [
+            "x",
+            {"@value": "x", "@language": "fr"},
+            {"@value": "x", "@type": "ex:Token"},
+            {"@value": "2020-01-01", "@type": "http://www.w3.org/2001/XMLSchema#date"}
+        ]}),
+    )
+    .await;
+    let held = |fluree: &Fluree| {
+        let id = id.clone();
+        let fluree = fluree.clone();
+        async move {
+            read(&fluree, &id, json!(id), "ex:alice", "ex:email")
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(held(&fluree).await, 4);
+    for (object, left) in [
+        (json!("x"), 3),
+        (json!({"@value": "x", "@language": "FR"}), 2),
+        (
+            json!({"@value": "2020-01-01", "@type": "http://www.w3.org/2001/XMLSchema#date"}),
+            1,
+        ),
+        (
+            json!({"@value": "x", "@type": "http://example.org/Token"}),
+            0,
+        ),
+    ] {
+        fluree
+            .remove_occurrences(&id, select("alice", Some(object.clone())))
+            .await
+            .unwrap_or_else(|e| panic!("{object}: {e}"));
+        assert_eq!(held(&fluree).await, left, "after removing {object}");
+    }
+}

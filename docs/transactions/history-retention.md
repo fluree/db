@@ -79,7 +79,7 @@ The [geospatial](../indexing-and-search/geospatial.md#s2-spatial-index-complex-g
 | Field | Description |
 |---|---|
 | `matching[].subject`, `matching[].predicate` | Full IRIs of the fact |
-| `matching[].object` | The value: a JSON string, number or boolean, or `{"@id": "..."}` for a reference. Absent selects every value |
+| `matching[].object` | The value: a JSON string (an `xsd:string`, not the same text with a language or another datatype), number or boolean; `{"@id": "..."}` for a reference; or a value object, `{"@value": "...", "@type": "<datatype IRI>"}` or `{"@value": "...", "@language": "<tag>"}`. Absent selects every value |
 | `matching[].graph` | Named graph IRI; absent for the default graph |
 | `occurrences[]` | `{"commit": "<commit id>", "slot": n}`: one operation of one commit |
 

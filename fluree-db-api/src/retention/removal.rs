@@ -45,8 +45,11 @@ pub struct FactSelector {
     /// Named graph IRI; absent for the default graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<String>,
-    /// The object: an IRI as `{"@id": ...}`, or a JSON string, number or
-    /// boolean. Absent selects every object.
+    /// The object: an IRI as `{"@id": ...}`; a JSON string (an
+    /// `xsd:string`), number or boolean; or a value object,
+    /// `{"@value": ..., "@type": "<datatype IRI>"}` or
+    /// `{"@value": "...", "@language": "<tag>"}`. Absent selects every
+    /// object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<serde_json::Value>,
 }
@@ -479,7 +482,7 @@ struct Found {
 /// says.
 fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Result<Found> {
     let commits = &read.commits;
-    let selectors: Vec<(Option<Sid>, Sid, Sid, Option<FlakeValue>)> = request
+    let selectors: Vec<(Option<Sid>, Sid, Sid, Option<ObjectTerm>)> = request
         .matching
         .iter()
         .map(|sel| selector_terms(&read.state.snapshot, sel))
@@ -517,7 +520,7 @@ fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Resul
                 flake.g == *g
                     && flake.s == *s
                     && flake.p == *p
-                    && o.as_ref().is_none_or(|o| flake.o == *o)
+                    && o.as_ref().is_none_or(|o| o.matches(flake))
             }) {
                 located.push(Located {
                     occurrence: OccurrenceRef {
@@ -717,43 +720,113 @@ fn fact_events(
 }
 
 /// The terms a selector names, in the ledger's encoding.
+/// A selector's object: its value, and the datatype and language that
+/// must match too where it names them.
+struct ObjectTerm {
+    value: FlakeValue,
+    datatype: Option<Sid>,
+    /// A language tag, or `Some(None)` for a value with none.
+    language: Option<Option<String>>,
+}
+
+impl ObjectTerm {
+    fn matches(&self, flake: &Flake) -> bool {
+        flake.o == self.value
+            && self.datatype.as_ref().is_none_or(|dt| flake.dt == *dt)
+            && self.language.as_ref().is_none_or(|lang| {
+                let held = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+                match (lang.as_deref(), held) {
+                    (Some(lang), Some(held)) => lang.eq_ignore_ascii_case(held),
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+    }
+}
+
 fn selector_terms(
     snapshot: &fluree_db_core::LedgerSnapshot,
     sel: &FactSelector,
-) -> Result<(Option<Sid>, Sid, Sid, Option<FlakeValue>)> {
+) -> Result<(Option<Sid>, Sid, Sid, Option<ObjectTerm>)> {
     let encode = |iri: &str| {
         snapshot
             .encode_iri(iri)
             .ok_or_else(|| ApiError::http(404, format!("<{iri}> does not occur in the ledger")))
     };
+    let shape = || {
+        ApiError::http(
+            400,
+            "a selector object is a scalar, {\"@id\": ...}, or {\"@value\": ...} with \
+             \"@type\" or \"@language\"",
+        )
+    };
     let graph = sel.graph.as_deref().map(encode).transpose()?;
     let subject = encode(&sel.subject)?;
     let predicate = encode(&sel.predicate)?;
+    let any = |value| ObjectTerm {
+        value,
+        datatype: None,
+        language: None,
+    };
     let object = match &sel.object {
         None => None,
-        Some(serde_json::Value::Object(map)) => match map.get("@id").and_then(|v| v.as_str()) {
-            Some(iri) => Some(FlakeValue::Ref(encode(iri)?)),
-            None => {
-                return Err(ApiError::http(
-                    400,
-                    "a selector object is {\"@id\": ...} or a scalar",
-                ))
+        Some(serde_json::Value::Object(map)) => {
+            if let Some(iri) = map.get("@id").and_then(|v| v.as_str()) {
+                Some(any(FlakeValue::Ref(encode(iri)?)))
+            } else {
+                let value = map.get("@value").ok_or_else(shape)?;
+                match (map.get("@type"), map.get("@language")) {
+                    (Some(dt), None) => {
+                        let dt = dt.as_str().ok_or_else(shape)?;
+                        let coerced = match value {
+                            serde_json::Value::String(s) => {
+                                fluree_db_core::coerce::coerce_string_value(s, dt)
+                            }
+                            other => fluree_db_core::coerce::coerce_value(scalar(other)?, dt),
+                        }
+                        .map_err(|e| ApiError::http(400, format!("selector object: {e}")))?;
+                        Some(ObjectTerm {
+                            value: coerced,
+                            datatype: Some(encode(dt)?),
+                            language: None,
+                        })
+                    }
+                    (None, Some(lang)) => Some(ObjectTerm {
+                        value: FlakeValue::String(value.as_str().ok_or_else(shape)?.to_string()),
+                        datatype: None,
+                        language: Some(Some(lang.as_str().ok_or_else(shape)?.to_string())),
+                    }),
+                    _ => return Err(shape()),
+                }
             }
-        },
-        Some(serde_json::Value::String(s)) => Some(FlakeValue::String(s.clone())),
-        Some(serde_json::Value::Bool(b)) => Some(FlakeValue::Boolean(*b)),
-        Some(serde_json::Value::Number(n)) => match n.as_i64() {
-            Some(i) => Some(FlakeValue::Long(i)),
-            None => Some(FlakeValue::Double(n.as_f64().unwrap_or_default())),
-        },
-        Some(_) => {
-            return Err(ApiError::http(
-                400,
-                "a selector object is {\"@id\": ...} or a scalar",
-            ))
         }
+        // A plain string is an `xsd:string`: not the same text with a
+        // language or another datatype.
+        Some(serde_json::Value::String(s)) => Some(ObjectTerm {
+            value: FlakeValue::String(s.clone()),
+            datatype: Some(encode(fluree_vocab::xsd::STRING)?),
+            language: Some(None),
+        }),
+        Some(other) => Some(any(scalar(other)?)),
     };
     Ok((graph, subject, predicate, object))
+}
+
+/// A JSON boolean or number as a value.
+fn scalar(value: &serde_json::Value) -> Result<FlakeValue> {
+    match value {
+        serde_json::Value::Bool(b) => Ok(FlakeValue::Boolean(*b)),
+        serde_json::Value::Number(n) => Ok(match n.as_i64() {
+            Some(i) => FlakeValue::Long(i),
+            None => FlakeValue::Double(n.as_f64().unwrap_or_default()),
+        }),
+        serde_json::Value::String(s) => Ok(FlakeValue::String(s.clone())),
+        _ => Err(ApiError::http(
+            400,
+            "a selector object is a scalar, {\"@id\": ...}, or {\"@value\": ...} with \
+             \"@type\" or \"@language\"",
+        )),
+    }
 }
 
 /// The stored flakes stating `flake`'s fact at the head, as retractions.
