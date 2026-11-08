@@ -3402,7 +3402,11 @@ impl NestedLoopJoinOperator {
             ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
             _ => None,
         };
-        let (counts, leaflets_loaded) = batched_pair_probe_binary(
+        let PairProbe {
+            counts,
+            leaves_opened,
+            leaflets_loaded,
+        } = batched_pair_probe_binary(
             ctx,
             &store,
             self.batched_predicate
@@ -3452,6 +3456,7 @@ impl NestedLoopJoinOperator {
         tracing::debug!(
             accum_len = entry_pairs.len(),
             pairs = pairs.len(),
+            leaves_opened,
             leaflets_loaded,
             matched_rows,
             "join batched pair flush complete"
@@ -4187,32 +4192,44 @@ fn batched_subject_probe_binary_uncharged(
     Ok(out)
 }
 
+/// What [`batched_pair_probe_binary`] found and read.
+struct PairProbe {
+    /// Live rows holding each requested pair, in `pairs` order.
+    counts: Vec<u32>,
+    leaves_opened: usize,
+    leaflets_loaded: usize,
+}
+
 /// For each `(subject, reference object)` pair of `pairs` (sorted,
 /// deduplicated), the number of live rows of `pred_sid` holding it: base
 /// PSOT rows the overlay does not retract, then novelty-only asserts when
-/// `probe_ops` merges some. Above one only for list positions. Also returns
-/// how many leaflets it loaded.
+/// `probe_ops` merges some. Above one only for list positions.
 ///
-/// Reads none of a subject's other objects: a leaflet loads only when its
-/// key range holds a wanted pair, and each pair's rows are found by binary
-/// search within its subject's run, so a high-degree subject costs a seek,
-/// not its neighbourhood.
+/// Reads none of a subject's other objects: it opens only the leaves a
+/// lookup of each pair selects (as the per-row scan's cursor does), loads a
+/// leaflet only when its key range holds a wanted pair, and finds each
+/// pair's rows by binary search within its subject's run, so a high-degree
+/// subject costs a seek, not its neighbourhood, and distant pairs do not
+/// open the leaves between them.
 fn batched_pair_probe_binary(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
     pairs: &[(u64, u64)],
     mut probe_ops: Option<&mut ProbeOps>,
-) -> Result<(Vec<u32>, usize)> {
+) -> Result<PairProbe> {
     use fluree_db_binary_index::format::run_record_v2::{
         cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
     };
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
-    let mut counts = vec![0u32; pairs.len()];
-    let mut leaflets_loaded = 0;
+    let mut probe = PairProbe {
+        counts: vec![0u32; pairs.len()],
+        leaves_opened: 0,
+        leaflets_loaded: 0,
+    };
     if pairs.is_empty() {
-        return Ok((counts, leaflets_loaded));
+        return Ok(probe);
     }
     if store.is_pooled(ctx.binary_g_id) {
         return Err(QueryError::Internal(
@@ -4221,8 +4238,9 @@ fn batched_pair_probe_binary(
     }
     let merging = probe_ops.is_some();
     let Some(p_id) = p_id_or_none(store, pred_sid, || Ok(merging))? else {
-        return Ok((counts, leaflets_loaded));
+        return Ok(probe);
     };
+    let counts = &mut probe.counts;
     let iri_ref = OType::IRI_REF.as_u16();
     // Pairs share `p_id` and `o_type`, so this orders them as `(s, o)` does.
     let wanted = |&(s_id, o_id): &(u64, u64)| (p_id, s_id, iri_ref, o_id);
@@ -4238,19 +4256,27 @@ fn batched_pair_probe_binary(
             o_type: iri_ref,
             g_id: ctx.binary_g_id,
         };
-        let leaf_range = branch.find_leaves_in_range(
-            &bound(&pairs[0], 0, 0),
-            &bound(pairs.last().unwrap(), LIST_INDEX_NONE, u32::MAX),
-            cmp_v2_for_order(RunSortOrder::Psot),
-        );
+        let cmp = cmp_v2_for_order(RunSortOrder::Psot);
+        // Sorted pairs select ascending leaf ranges.
+        let mut leaves: Vec<usize> = Vec::new();
+        for pair in pairs {
+            let range = branch.find_leaves_in_range(
+                &bound(pair, 0, 0),
+                &bound(pair, LIST_INDEX_NONE, u32::MAX),
+                cmp,
+            );
+            let after = leaves.last().map_or(0, |&l| l + 1);
+            leaves.extend(range.start.max(after)..range.end);
+        }
         let need_replay = ctx.to_t < store.max_t();
         let replay_to = need_replay.then_some(ctx.to_t);
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         let proj = ColumnProjection::all();
 
-        for leaf_idx in leaf_range {
+        for leaf_idx in leaves {
             ctx.check_cancelled()?;
             let leaf = prepare_leaf_for_scan(store, &branch.leaves[leaf_idx], need_replay)?;
+            probe.leaves_opened += 1;
             for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
                 ctx.check_cancelled()?;
                 let needs_history_replay =
@@ -4277,18 +4303,15 @@ fn batched_pair_probe_binary(
                 }
 
                 let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
-                leaflets_loaded += 1;
+                probe.leaflets_loaded += 1;
                 ctx.check_cancelled()?;
                 let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
                 if p_start == p_end {
                     continue;
                 }
-                let object_at = |row: usize| {
-                    let o_type = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
-                    (o_type, batch.o_key.get(row))
-                };
+                // The batch's own column: a replayed leaflet can hold rows of
+                // a type its current `o_type_const` does not name.
+                let object_at = |row: usize| (batch.o_type.get_or(row, 0), batch.o_key.get(row));
                 let mut runs = SubjectRuns::new(&batch, p_start, p_end);
                 let mut i = lo;
                 while i < hi {
@@ -4347,7 +4370,7 @@ fn batched_pair_probe_binary(
     }
 
     charge_probe_rows(ctx, counts.iter().map(|&n| n as usize).sum())?;
-    Ok((counts, leaflets_loaded))
+    Ok(probe)
 }
 
 /// Walk a batch of subjects across several predicates in SPOT order,

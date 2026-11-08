@@ -678,3 +678,105 @@ async fn a_policy_on_the_predicate_declines_the_lane() {
     .await;
     assert_eq!(rows, uni.triangles(), "another predicate denied");
 }
+
+/// A replayed leaflet can hold rows its current constants do not describe: a
+/// reference retracted at t=2 from a predicate whose remaining value is a
+/// string, read back at t=1. One-row leaflets give each row its own type and
+/// predicate constants.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_reference_matches_whatever_the_leaflet_now_holds() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    for leaflet_rows in [None, Some(1), Some(2), Some(4)] {
+        let label = format!("mixed types, leaflet rows {leaflet_rows:?}");
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = "batched-pair/mixed-history:main";
+        ledger_with(
+            &fluree,
+            id,
+            &json!({
+                "@context": {"ex": EX},
+                "@graph": [
+                    {"@id": "ex:s", "ex:p": [{"@id": "ex:o"}, "still present"],
+                     "ex:q": {"@id": "ex:o"}, "ex:r": {"@id": "ex:o"}},
+                    {"@id": "ex:s2", "ex:label": "second subject", "ex:p": "s2 value"}
+                ]
+            }),
+            leaflet_rows,
+        )
+        .await;
+        transact(
+            &fluree,
+            id,
+            json!({"@context": {"ex": EX}, "delete": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}, "ex:r": {"@id": "ex:o"}}}),
+        )
+        .await;
+        reindex(&fluree, id, leaflet_rows).await;
+
+        // `ex:p` keeps a string; `ex:r` keeps nothing, so its restored row
+        // sits among other predicates' rows.
+        for pred in ["p", "r"] {
+            let q = format!(
+                "SELECT ?s ?o WHERE {{ VALUES (?s ?o) {{ (ex:s ex:o) (ex:s2 ex:s) }} ?s ex:{pred} ?o }}"
+            );
+            for (t, want) in [(1, vec![format!("{EX}o|{EX}s")]), (2, vec![])] {
+                let db = fluree.db_at_t(id, t).await.expect("db at t");
+                let label = format!("{label}, ex:{pred}, t={t}");
+                let rows =
+                    differential(&fluree, &db, Query::Sparql(&q), Lane::MustFire, &label).await;
+                assert_eq!(rows, want, "{label}");
+            }
+        }
+    }
+}
+
+/// Distant pairs open only the leaves holding them, not the leaves between.
+#[tokio::test(flavor = "current_thread")]
+async fn distant_pairs_open_only_their_leaves() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    const SUBJECTS: usize = 2_000;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "batched-pair/sparse:main";
+    let graph: Vec<Value> = (0..SUBJECTS)
+        .map(|i| json!({"@id": format!("ex:s{i:04}"), "ex:p": {"@id": format!("ex:o{i:04}")}}))
+        .collect();
+    // Four-row leaflets, sixteen-row leaves: the predicate spans over a
+    // hundred leaves.
+    ledger_with(
+        &fluree,
+        id,
+        &json!({"@context": {"ex": EX}, "@graph": graph}),
+        Some(4),
+    )
+    .await;
+    let db = fluree.db(id).await.expect("db");
+    let last = SUBJECTS - 1;
+    let q = format!(
+        "SELECT ?s ?o WHERE {{ VALUES (?s ?o) {{ (ex:s0000 ex:o0000) (ex:s{last:04} ex:o{last:04}) }} ?s ex:p ?o }}"
+    );
+
+    let (store, guard) = init_test_tracing();
+    let rows = sparql_rows(&fluree, &db, &format!("{PREFIX}{q}")).await;
+    let flushes: Vec<(usize, usize)> = store
+        .find_events("join batched pair flush complete")
+        .iter()
+        .map(|e| {
+            let field = |name: &str| {
+                e.fields
+                    .get(name)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("flush event without {name}: {:?}", e.fields))
+            };
+            (field("leaves_opened"), field("leaflets_loaded"))
+        })
+        .collect();
+    drop(guard);
+    assert_eq!(rows.len(), 2, "both pairs match: {rows:?}");
+    assert_eq!(flushes.len(), 1, "one flush: {flushes:?}");
+    let (leaves, leaflets) = flushes[0];
+    assert!(
+        (1..=4).contains(&leaves) && (1..=4).contains(&leaflets),
+        "two distant pairs opened {leaves} leaves and loaded {leaflets} leaflets"
+    );
+}
