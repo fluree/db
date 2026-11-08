@@ -1,6 +1,7 @@
 """RDF documents to and from quads: fluree.parse(), fluree.serialize(), and
 quads written to a ledger."""
 
+import json
 import pickle
 from decimal import Decimal
 
@@ -453,3 +454,28 @@ def test_a_parse_keeps_the_prefixes_declared():
     assert isinstance(quads, list) and isinstance(quads, fluree.Quads)
     assert quads.prefixes == {"ex": "http://b.example/", "dc": "http://purl.org/dc/terms/"}
     assert fluree.parse(f"<{EX}s> <{EX}p> <{EX}o> .", "ntriples").prefixes == {}
+
+
+def test_serialize_keeps_graph_order_and_gathers_subjects():
+    quads = [
+        Quad(ex("a"), ex("p"), ex("b"), ex("g2")),
+        Quad(ex("z"), ex("p"), ex("y")),
+        Quad(ex("c"), ex("p"), ex("d"), ex("g1")),
+        Quad(ex("a"), ex("q"), ex("e"), ex("g2")),
+        Quad(ex("a"), ex("p"), ex("h"), ex("g2")),
+    ]
+    trig = fluree.serialize(quads, "trig", prefixes={"ex": EX})
+    assert trig.index("GRAPH ex:g2") < trig.index("ex:z ex:p ex:y") < trig.index("GRAPH ex:g1")
+    assert "ex:a ex:p ex:b, ex:h ;\n        ex:q ex:e ." in trig
+    nquads = fluree.serialize(quads, "nquads").splitlines()
+    assert [line.split()[-2] for line in nquads] == [f"<{EX}g2>"] * 3 + ["<http://example.org/y>", f"<{EX}g1>"]
+    assert set(fluree.parse(trig, "trig")) == set(quads)
+
+
+def test_serialize_writes_expanded_json_ld():
+    quads = [Quad(ex("a"), ex("n"), 1), Quad(ex("a"), ex("r"), ex("b"))]
+    expanded = json.loads(fluree.serialize(quads, "jsonld", expanded=True))
+    assert expanded == [{"@id": EX + "a", EX + "n": [{"@value": 1}], EX + "r": [{"@id": EX + "b"}]}]
+    assert set(fluree.parse(expanded)) == set(quads)
+    with pytest.raises(InvalidRequestError, match="expanded"):
+        fluree.serialize(quads, "turtle", expanded=True)

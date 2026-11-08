@@ -415,6 +415,11 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
   string with its text, `"fund"` apart from `"fund"@en`, and `1` apart from
   `True` and `1.0`. `str(quad)` is its N-Quads line, which sorts and diffs
   as text.
+- Quads come in the order the document writes them, and the list `parse`
+  returns has the `prefixes` a Turtle or TriG document declares.
+  `serialize` keeps the quads' order: graphs in the order they first appear,
+  and in Turtle and TriG each subject's statements together. `expanded=True`
+  writes expanded JSON-LD.
 - RDF 1.2 is read whole. A triple term is a `fluree.Triple`, and an
   annotation or a reified triple is the quad `(reifier, rdf:reifies,
   Triple(...))`, the annotated triple being a quad of its own. `serialize`

@@ -46,6 +46,15 @@ The Rust `RdfFormat` also accepts common aliases such as `ttl`, `n-quads` and
   uses. Every parsed document can therefore be written in any format. A JSON-LD
   label that starts with `-`, which no other syntax allows, gets one more `-`:
   `_:-b1` is read as `--b1`.
+- **Order:** statements come in the order the document writes them
+  (`rdf::parse_document` in Rust; `fluree.parse` in Python). A TriG or
+  N-Quads document's graphs interleave as written, an annotation stands where
+  it is written, and a JSON-LD node's statement comes before those of the node
+  nested in it, with a list's cells where the list is.
+- **Prefixes:** the prefixes a Turtle or TriG document declares are kept, in
+  order (`Document::prefixes`; in Python, the `prefixes` of the list
+  `fluree.parse` returns).
+- **Text:** Python also takes UTF-8 `bytes`, such as a request body.
 - **Errors:** a malformed document raises an error naming its line and column.
 - **Memory:** a document is read whole, and parsing holds the text, the parsed
   dataset and, in Python, every `Quad` at once: roughly ten times the
@@ -109,6 +118,15 @@ object is a triple term into a reification.
   Writing a named graph in either is an error; use TriG, N-Quads or JSON-LD.
 - **Prefixes:** Turtle and TriG declare the prefixes you pass and shorten IRIs
   with them. JSON-LD uses them as its `@context` and compacts IRIs with them.
+- **Order:** `rdf::serialize_ordered` (and `fluree.serialize`) writes the
+  graphs in the order given, the default graph among them, and in Turtle and
+  TriG gathers each subject's statements under one subject, with `;` and `,`,
+  subjects in the order they first appear. `rdf::serialize` writes the default
+  graph first and the named graphs by name.
+- **Expanded JSON-LD:** `rdf::serialize_expanded_jsonld` (in Python,
+  `fluree.serialize(quads, "jsonld", expanded=True)`) writes the
+  `json-ld#expanded` profile: an array of node objects with full IRIs, no
+  context, and every value in an array.
 - **Reifications:** when the triple is asserted, the reification is written as
   an annotation where the syntax has one (`~` in Turtle and TriG,
   `@annotation` in JSON-LD). Otherwise it is written as `rdf:reifies` or

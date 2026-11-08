@@ -288,10 +288,25 @@ pub fn format_jsonld_dataset(
     dataset: &Dataset,
     config: &JsonLdFormatConfig,
 ) -> Result<JsonValue, LiteralAsNode> {
+    format_jsonld_dataset_ordered(dataset, &[], config)
+}
+
+/// [`format_jsonld_dataset`], writing the graphs in `graph_order`, each a
+/// graph name or `None` for the default graph, whose nodes stand where it
+/// comes; graphs it leaves out follow, the default graph first.
+pub fn format_jsonld_dataset_ordered(
+    dataset: &Dataset,
+    graph_order: &[Option<Term>],
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
     let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
     let shared = blank_nodes_in_several_graphs(dataset);
-    let mut nodes = graph_nodes(&dataset.default, config, &shared, &mut bnode_renamer)?;
-    for (name, graph) in &dataset.named {
+    let mut nodes = Vec::new();
+    for (name, graph) in crate::rdf_text::graphs_in_order(dataset, graph_order) {
+        let Some(name) = name else {
+            nodes.extend(graph_nodes(graph, config, &shared, &mut bnode_renamer)?);
+            continue;
+        };
         let mut node = Map::new();
         node.insert(
             "@id".to_string(),

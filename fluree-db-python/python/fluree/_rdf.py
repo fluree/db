@@ -111,6 +111,7 @@ def serialize(
     format: RdfFormat,
     *,
     prefixes: dict[str, str] | None = None,
+    expanded: bool = False,
 ) -> str:
     """Write quads as an RDF document: Turtle, TriG, N-Triples, N-Quads or
     JSON-LD.
@@ -122,8 +123,16 @@ def serialize(
     (``{"ex": "http://example.org/"}``) and write IRIs with them, and JSON-LD
     makes them its ``@context``. A quad ``(r, rdf:reifies, Triple(...))`` is
     written as an annotation where the format has one.
+
+    The quads' order is kept: graphs come in the order the quads first name
+    them, the default graph among them, and in Turtle and TriG each subject's
+    statements are written together, with ``;`` and ``,``, subjects in the
+    order they first appear. ``expanded=True`` writes JSON-LD in expanded
+    form (the ``json-ld#expanded`` profile): full IRIs, no context, every
+    value in an array.
     """
-    return native.serialize_rdf([q if type(q) is Quad else _quad(q) for q in quads], format, prefixes)
+    items = [q if type(q) is Quad else _quad(q) for q in quads]
+    return native.serialize_rdf(items, format, prefixes, expanded)
 
 
 def _quad(item: Quad | tuple[Any, ...]) -> Quad:

@@ -202,6 +202,41 @@ impl Graph {
         self.triples.sort();
     }
 
+    /// Bring each subject's triples together, and within a subject each
+    /// predicate's, keeping the order they first appear in: what
+    /// [`Self::sort`] does for a writer that groups a subject's statements,
+    /// without giving up the graph's order.
+    pub fn gather_subjects(&mut self) {
+        // (subject's first appearance, its predicate's, the triple's index)
+        let mut keys: Vec<(usize, usize, usize)> = {
+            let mut subjects: HashMap<&Term, usize> = HashMap::new();
+            let mut pairs: HashMap<(&Term, &Term), usize> = HashMap::new();
+            self.triples
+                .iter()
+                .enumerate()
+                .map(|(index, t)| {
+                    let next = subjects.len();
+                    let subject = *subjects.entry(t.subject()).or_insert(next);
+                    let next = pairs.len();
+                    let pair = *pairs.entry((t.subject(), t.predicate())).or_insert(next);
+                    (subject, pair, index)
+                })
+                .collect()
+        };
+        if keys.windows(2).all(|w| w[0] <= w[1]) {
+            return;
+        }
+        keys.sort_unstable();
+        let mut taken: Vec<Option<Triple>> = std::mem::take(&mut self.triples)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.triples = keys
+            .into_iter()
+            .filter_map(|(_, _, index)| taken[index].take())
+            .collect();
+    }
+
     /// Remove duplicate triples (apply set semantics)
     ///
     /// Preserves the first occurrence of each triple.
@@ -451,5 +486,30 @@ mod tests {
         let subjects = graph.subjects();
 
         assert_eq!(subjects.len(), 2);
+    }
+
+    /// Gathering keeps each subject's triples, and each predicate's, in the
+    /// order they first appear, and moves nothing in a graph already grouped.
+    #[test]
+    fn gather_subjects_keeps_first_appearance() {
+        let iri = |name: &str| Term::iri(format!("http://e/{name}"));
+        let t = |s: &str, p: &str, o: &str| Triple::new(iri(s), iri(p), iri(o));
+        let mut g = Graph::new();
+        for triple in [
+            t("b", "p", "1"),
+            t("a", "q", "2"),
+            t("b", "q", "3"),
+            t("a", "q", "4"),
+            t("b", "p", "5"),
+        ] {
+            g.add(triple);
+        }
+        g.gather_subjects();
+        let order: Vec<_> = g.iter().map(|t| t.object().clone()).collect();
+        assert_eq!(order, ["1", "5", "3", "2", "4"].map(iri));
+
+        let grouped = g.triples().to_vec();
+        g.gather_subjects();
+        assert_eq!(g.triples(), grouped);
     }
 }

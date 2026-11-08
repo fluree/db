@@ -6,7 +6,7 @@
 //! reification travels as the quad `(reifier, rdf:reifies, triple term,
 //! graph)`, as RDF 1.2 defines it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfError, RdfFormat, Statement, Term};
 use fluree_vocab::rdf::REIFIES;
@@ -137,24 +137,40 @@ impl<'py> Terms<'py> {
 }
 
 /// `quads`, each a `fluree.Quad`, written as `format`: `"turtle"`, `"trig"`,
-/// `"ntriples"` or `"nquads"`. Turtle and TriG declare `prefixes` and write
-/// with them. A quad `(r, rdf:reifies, triple term)` is written as an
-/// annotation where the format has one.
+/// `"ntriples"` or `"nquads"`, keeping their order: graphs in the order the
+/// quads first name them, and in Turtle and TriG each subject's statements
+/// together, subjects in the order they first appear. Turtle and TriG
+/// declare `prefixes` and write with them. A quad `(r, rdf:reifies, triple
+/// term)` is written as an annotation where the format has one. `expanded`
+/// writes JSON-LD in expanded form.
 #[pyfunction]
-#[pyo3(signature = (quads, format, prefixes = None))]
+#[pyo3(signature = (quads, format, prefixes = None, expanded = false))]
 pub(crate) fn serialize_rdf<'py>(
     py: Python<'py>,
     quads: &Bound<'py, PyAny>,
     format: &str,
     prefixes: Option<BTreeMap<String, String>>,
+    expanded: bool,
 ) -> PyResult<String> {
     let format: RdfFormat = format.parse().map_err(rdf_error)?;
+    if expanded && format != RdfFormat::JsonLd {
+        return Err(invalid_request(format!(
+            "expanded is a form of JSON-LD, not of {format}"
+        )));
+    }
     let mut nodes = Nodes::default();
     let mut dataset = Dataset::new();
+    let mut graph_order: Vec<Option<Term>> = Vec::new();
+    let mut named: HashSet<Term> = HashSet::new();
     for quad in quads.try_iter()? {
         let quad = quad?;
         let graph = quad.getattr(intern!(py, "graph"))?;
         let graph = (!graph.is_none()).then(|| nodes.term(graph)).transpose()?;
+        match &graph {
+            None if !graph_order.contains(&None) => graph_order.push(None),
+            Some(name) if named.insert(name.clone()) => graph_order.push(Some(name.clone())),
+            _ => {}
+        }
         dataset.add_quad(
             nodes.term(quad.getattr(intern!(py, "subject"))?)?,
             nodes.term(quad.getattr(intern!(py, "predicate"))?)?,
@@ -163,8 +179,14 @@ pub(crate) fn serialize_rdf<'py>(
         );
     }
     let prefixes = PrefixMap::from_map(prefixes.unwrap_or_default());
-    py.detach(|| rdf::serialize(&dataset, format, &prefixes))
-        .map_err(rdf_error)
+    py.detach(|| {
+        if expanded {
+            rdf::serialize_expanded_jsonld(&dataset, &graph_order)
+        } else {
+            rdf::serialize_ordered(dataset, &graph_order, format, &prefixes)
+        }
+    })
+    .map_err(rdf_error)
 }
 
 /// Graph terms for the IRIs and blank nodes of one serialize call, each

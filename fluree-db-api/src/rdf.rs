@@ -26,8 +26,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use fluree_graph_format::{
-    format_jsonld_dataset, format_nquads, format_ntriples, format_trig, format_turtle,
-    BlankNodePolicy, ContextPolicy, JsonLdFormatConfig, TypeHandling,
+    format_jsonld_dataset_ordered, format_nquads, format_nquads_ordered, format_ntriples,
+    format_trig, format_trig_ordered, format_turtle, BlankNodePolicy, ContextPolicy,
+    JsonLdFormatConfig, TypeHandling,
 };
 use fluree_graph_ir::{GraphCollectorSink, OrderedDataset, Reification, StatementPosition, Triple};
 use fluree_graph_turtle::{
@@ -466,12 +467,133 @@ pub fn serialize(
         RdfFormat::TriG => format_trig(dataset, prefixes),
         RdfFormat::NTriples => format_ntriples(&dataset.default),
         RdfFormat::NQuads => format_nquads(dataset),
-        RdfFormat::JsonLd => return write_jsonld(dataset, prefixes),
+        RdfFormat::JsonLd => return write_jsonld(dataset, &[], prefixes),
     };
     written.map_err(|e| RdfError::Unwritable(e.to_string()))
 }
 
-fn write_jsonld(dataset: &Dataset, prefixes: &PrefixMap) -> Result<String, RdfError> {
+/// [`serialize`], keeping the order the dataset was built in: graphs in
+/// `graph_order` (each a name, or `None` for the default graph, which TriG
+/// then writes at top level where it comes), and in Turtle and TriG each
+/// subject's statements together, with `;` and `,`, in the order the
+/// subjects first appear.
+pub fn serialize_ordered(
+    mut dataset: Dataset,
+    graph_order: &[Option<Term>],
+    format: RdfFormat,
+    prefixes: &PrefixMap,
+) -> Result<String, RdfError> {
+    if !format.has_named_graphs() && !dataset.is_default_only() {
+        return Err(RdfError::Unwritable(format!(
+            "{format} has no named graphs; write them as trig or nquads"
+        )));
+    }
+    if matches!(format, RdfFormat::Turtle | RdfFormat::TriG) {
+        dataset.default.gather_subjects();
+        dataset.named.values_mut().for_each(Graph::gather_subjects);
+    }
+    let written = match format {
+        RdfFormat::Turtle => format_turtle(&dataset.default, prefixes),
+        RdfFormat::TriG => format_trig_ordered(&dataset, graph_order, prefixes),
+        RdfFormat::NTriples => format_ntriples(&dataset.default),
+        RdfFormat::NQuads => format_nquads_ordered(&dataset, graph_order),
+        RdfFormat::JsonLd => return write_jsonld(&dataset, graph_order, prefixes),
+    };
+    written.map_err(|e| RdfError::Unwritable(e.to_string()))
+}
+
+/// `dataset` as expanded JSON-LD (the `http://www.w3.org/ns/json-ld#expanded`
+/// profile): a top-level array of node objects, full IRIs, no context, and
+/// every value in an array, a literal as a value object. Graphs come in
+/// `graph_order`, as [`serialize_ordered`] writes them.
+pub fn serialize_expanded_jsonld(
+    dataset: &Dataset,
+    graph_order: &[Option<Term>],
+) -> Result<String, RdfError> {
+    let document = jsonld_document(dataset, graph_order, &PrefixMap::default())?;
+    let nodes = match document {
+        serde_json::Value::Object(mut map) => map
+            .remove("@graph")
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        other => other,
+    };
+    serde_json::to_string_pretty(&expanded(nodes)).map_err(|e| RdfError::Unwritable(e.to_string()))
+}
+
+/// The writer's full-IRI JSON-LD in expanded form: each property's values
+/// in an array, a bare scalar as `{"@value": …}`, and `@type` as an array.
+fn expanded(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    fn values(value: Value) -> Value {
+        let items = match value {
+            Value::Array(items) => items,
+            one => vec![one],
+        };
+        Value::Array(items.into_iter().map(item).collect())
+    }
+    fn item(value: Value) -> Value {
+        match value {
+            Value::Object(map) => node(map),
+            scalar => serde_json::json!({ "@value": scalar }),
+        }
+    }
+    fn node(map: serde_json::Map<String, Value>) -> Value {
+        // A value object keeps its `@type` a string; only an annotation on
+        // it holds nodes.
+        if map.contains_key("@value") {
+            let map = map
+                .into_iter()
+                .map(|(key, value)| match key.as_str() {
+                    "@annotation" => (key, values(value)),
+                    _ => (key, value),
+                })
+                .collect();
+            return Value::Object(map);
+        }
+        let map = map
+            .into_iter()
+            .map(|(key, value)| {
+                let value = match key.as_str() {
+                    "@id" => match value {
+                        Value::Object(term) => node(term),
+                        id => id,
+                    },
+                    "@type" => match value {
+                        Value::Array(types) => Value::Array(types),
+                        one => Value::Array(vec![one]),
+                    },
+                    "@list" => values(value),
+                    "@graph" | "@annotation" => match value {
+                        Value::Array(nodes) => Value::Array(nodes.into_iter().map(item).collect()),
+                        one => Value::Array(vec![item(one)]),
+                    },
+                    _ => values(value),
+                };
+                (key, value)
+            })
+            .collect();
+        Value::Object(map)
+    }
+    match value {
+        Value::Array(nodes) => Value::Array(nodes.into_iter().map(item).collect()),
+        one => Value::Array(vec![item(one)]),
+    }
+}
+
+fn write_jsonld(
+    dataset: &Dataset,
+    graph_order: &[Option<Term>],
+    prefixes: &PrefixMap,
+) -> Result<String, RdfError> {
+    let document = jsonld_document(dataset, graph_order, prefixes)?;
+    serde_json::to_string_pretty(&document).map_err(|e| RdfError::Unwritable(e.to_string()))
+}
+
+fn jsonld_document(
+    dataset: &Dataset,
+    graph_order: &[Option<Term>],
+    prefixes: &PrefixMap,
+) -> Result<serde_json::Value, RdfError> {
     let context = if prefixes.is_empty() {
         ContextPolicy::None
     } else {
@@ -483,9 +605,8 @@ fn write_jsonld(dataset: &Dataset, prefixes: &PrefixMap) -> Result<String, RdfEr
         .with_type_handling(TypeHandling::AsAtType)
         .with_blank_node_policy(BlankNodePolicy::PreserveLabeled)
         .with_compactor(move |iri| compactor.compact(iri).unwrap_or_else(|| iri.to_string()));
-    let document =
-        format_jsonld_dataset(dataset, &config).map_err(|e| RdfError::Unwritable(e.to_string()))?;
-    serde_json::to_string_pretty(&document).map_err(|e| RdfError::Unwritable(e.to_string()))
+    format_jsonld_dataset_ordered(dataset, graph_order, &config)
+        .map_err(|e| RdfError::Unwritable(e.to_string()))
 }
 
 /// A reader error with its line and column rather than a byte offset.
@@ -900,5 +1021,65 @@ mod tests {
                 ("ex".to_string(), "http://b.example/".to_string()),
             ]
         );
+    }
+
+    /// An ordered TriG writes graphs in the order given, the default graph
+    /// where it comes, and a subject's statements together with `;`.
+    #[test]
+    fn serialize_ordered_keeps_graph_and_subject_order() {
+        let mut dataset = Dataset::new();
+        let (g1, g2) = (ex("g1"), ex("g2"));
+        dataset.add_quad(ex("a"), ex("p"), ex("b"), Some(&g2));
+        dataset.add_quad(ex("z"), ex("p"), ex("y"), None);
+        dataset.add_quad(ex("c"), ex("p"), ex("d"), Some(&g1));
+        dataset.add_quad(ex("a"), ex("q"), ex("e"), Some(&g2));
+        dataset.add_quad(ex("f"), ex("p"), ex("g"), Some(&g2));
+        dataset.add_quad(ex("a"), ex("p"), ex("h"), Some(&g2));
+        let prefixes = PrefixMap::from_map(BTreeMap::from([("ex".into(), EX.into())]));
+        let order = [Some(g2), None, Some(g1)];
+        let trig = serialize_ordered(dataset, &order, RdfFormat::TriG, &prefixes).unwrap();
+        let g2_at = trig.find("GRAPH ex:g2").unwrap();
+        let default_at = trig.find("ex:z ex:p ex:y").unwrap();
+        let g1_at = trig.find("GRAPH ex:g1").unwrap();
+        assert!(g2_at < default_at && default_at < g1_at, "{trig}");
+        assert!(
+            trig.contains("ex:a ex:p ex:b, ex:h ;\n        ex:q ex:e ."),
+            "{trig}"
+        );
+    }
+
+    /// Expanded JSON-LD: an array of nodes, every value in an array, each
+    /// literal a value object, and no context.
+    #[test]
+    fn expanded_json_ld_has_every_value_in_an_array() {
+        let doc = format!(
+            "PREFIX ex: <{EX}>\nex:a a ex:T ; ex:n 1 ; ex:s \"x\"@ar--rtl ; ex:r ex:b ; ex:l ( 1 ) ."
+        );
+        let dataset = parse(&doc, RdfFormat::Turtle, None).unwrap();
+        let text = serialize_expanded_jsonld(&dataset, &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let node = &value[0];
+        assert_eq!(
+            node["@type"],
+            serde_json::json!([format!("{EX}T")]),
+            "{text}"
+        );
+        let one = serde_json::json!({"@value": "1", "@type": fluree_vocab::xsd::INTEGER});
+        assert_eq!(node[format!("{EX}n")], serde_json::json!([one]));
+        assert_eq!(
+            node[format!("{EX}s")],
+            serde_json::json!([{"@value": "x", "@language": "ar", "@direction": "rtl"}])
+        );
+        assert_eq!(
+            node[format!("{EX}r")],
+            serde_json::json!([{"@id": format!("{EX}b")}])
+        );
+        assert_eq!(
+            node[format!("{EX}l")],
+            serde_json::json!([{"@list": [one]}])
+        );
+        assert!(!text.contains("@context"));
+        let again = parse(&text, RdfFormat::JsonLd, None).unwrap();
+        assert_eq!(again.len(), dataset.len());
     }
 }
