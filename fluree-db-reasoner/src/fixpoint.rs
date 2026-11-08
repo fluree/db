@@ -133,28 +133,20 @@ async fn run(
         )));
     }
 
-    // If only sameAs (no property rules and no restrictions), generate sameAs flakes and return
-    // This ensures owl:sameAs is queryable even without property rules
+    // Equality alone: no rounds, only the equality rules.
     if ontology.is_empty() && restrictions.is_empty() {
         let frozen_same_as = same_as_tracker.finalize();
-        // Generate explicit sameAs flakes from equivalence classes (eq-sym,
-        // eq-trans), excluding pairs already asserted in the base data — the
-        // database serves those itself.
-        let base_pairs: hashbrown::HashSet<&(Sid, Sid)> = same_as_pairs.iter().collect();
-        let same_as_flakes: Vec<Flake> = generate_same_as_flakes(&frozen_same_as, db.t)
-            .into_iter()
-            .filter(|f| match &f.o {
-                fluree_db_core::value::FlakeValue::Ref(o) => {
-                    !base_pairs.contains(&(f.s.clone(), o.clone()))
-                }
-                _ => true,
-            })
-            .collect();
-        let flake_count = same_as_flakes.len();
+        let mut derived = DerivedSet::new();
+        let capped = apply_equality(db, &frozen_same_as, &mut derived, db.t, opts, &start).await?;
+        let mut diagnostics =
+            ReasoningDiagnostics::completed(0, derived.derived_len(), start.elapsed());
+        if let Some(reason) = capped {
+            diagnostics.mark_capped(reason, 0, derived.derived_len(), start.elapsed());
+        }
         return Ok(Some((
-            same_as_flakes,
+            derived.into_derived_flakes(),
             frozen_same_as,
-            ReasoningDiagnostics::completed(0, flake_count, start.elapsed()),
+            diagnostics,
         )));
     }
 
@@ -432,15 +424,13 @@ async fn run(
         }
     }
 
-    // Finalize sameAs
     let frozen_same_as = same_as_tracker.finalize();
-
-    // Generate explicit sameAs flakes from equivalence classes (eq-sym, eq-trans)
-    // This makes owl:sameAs queryable just like any other predicate.
-    // For each equivalence class, emit: canonical sameAs x, x sameAs canonical for all x
-    let same_as_flakes = generate_same_as_flakes(&frozen_same_as, reasoning_t);
-    for flake in same_as_flakes {
-        derived.try_add(flake);
+    if !diagnostics.capped {
+        if let Some(reason) =
+            apply_equality(db, &frozen_same_as, &mut derived, reasoning_t, opts, &start).await?
+        {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+        }
     }
 
     // Update diagnostics if not already capped
@@ -1153,62 +1143,127 @@ async fn seed_initial_delta(
     Ok(delta)
 }
 
-/// Generate explicit owl:sameAs flakes from the equivalence classes.
+/// The equality rules over the final equality sets: every member gets every
+/// member's facts (eq-rep-s, eq-rep-o), and every ordered pair of members is
+/// `owl:sameAs` (eq-sym, eq-trans).
 ///
-/// For each equivalence class with members [a, b, c, ...], generates:
-/// - a sameAs b, a sameAs c, ... (from canonical to all others)
-/// - b sameAs a, c sameAs a, ... (from all others back to canonical)
+/// The rounds keep facts at a set's representative, so joins meet on one id,
+/// and they read only the predicates rules use. This copies every fact naming
+/// a member, asserted or derived, to every member. Equality between
+/// predicates (eq-rep-p) is not applied.
 ///
-/// This is O(2n) flakes per class instead of O(n²) for full pairwise.
-/// Transitivity allows queries to derive any pair: if a=b and a=c, then b=c.
-///
-/// Note: This also generates reflexive flakes (x sameAs x) for each element,
-/// which matches OWL2-RL semantics.
-fn generate_same_as_flakes(frozen: &FrozenSameAs, t: i64) -> Vec<Flake> {
+/// Returns the budget that stopped it, if one did.
+async fn apply_equality(
+    db: GraphDbRef<'_>,
+    same_as: &FrozenSameAs,
+    derived: &mut DerivedSet,
+    t: i64,
+    opts: &ReasoningOptions,
+    start: &Instant,
+) -> Result<Option<&'static str>> {
     use fluree_db_core::value::FlakeValue;
 
-    let owl_same_as_sid = owl::same_as_sid();
-    let ref_dt = Sid::new(JSON_LD, JSONLD_ID);
-
-    let mut flakes = Vec::new();
-
-    // For each equivalence class
-    for (_root, members) in frozen.members_iter() {
-        if members.len() <= 1 {
-            continue; // Skip singleton classes
+    let mut set_of: hashbrown::HashMap<Sid, &[Sid]> = hashbrown::HashMap::new();
+    for (_, members) in same_as.members_iter() {
+        if members.len() > 1 {
+            for member in members {
+                set_of.insert(member.clone(), members);
+            }
         }
+    }
+    if set_of.is_empty() {
+        return Ok(None);
+    }
+    let owl_same_as = owl::same_as_sid();
+    let ref_dt = Sid::new(JSON_LD, JSONLD_ID);
+    let no_delta = DeltaSet::new();
 
-        let canonical = &members[0]; // Members are sorted, first is canonical
+    // Asserted facts naming a member are registered as base, so a copy that
+    // is itself asserted is not emitted.
+    let mut sources: Vec<Flake> = Vec::new();
+    for member in set_of.keys() {
+        interrupted(opts)?;
+        let by_subject = RangeMatch {
+            s: Some(member.clone()),
+            ..Default::default()
+        };
+        let by_object = RangeMatch {
+            o: Some(FlakeValue::Ref(member.clone())),
+            ..Default::default()
+        };
+        for (index, range) in [(IndexType::Spot, by_subject), (IndexType::Opst, by_object)] {
+            for flake in db.range(index, RangeTest::Eq, range).await? {
+                if flake.op {
+                    derived.register_base(&flake);
+                    sources.push(flake);
+                }
+            }
+        }
+    }
+    let names_a_member = |f: &Flake| {
+        set_of.contains_key(&f.s) || matches!(&f.o, FlakeValue::Ref(o) if set_of.contains_key(o))
+    };
+    sources.extend(
+        derived
+            .derived_flakes()
+            .filter(|f| names_a_member(f))
+            .cloned(),
+    );
 
-        // Generate flakes: canonical sameAs x, x sameAs canonical for each x
-        for member in members {
-            if member != canonical {
-                // canonical sameAs member
-                flakes.push(Flake::new(
-                    canonical.clone(),
-                    owl_same_as_sid.clone(),
-                    FlakeValue::Ref(member.clone()),
-                    ref_dt.clone(),
-                    t,
-                    true,
-                    None,
-                ));
-
-                // member sameAs canonical (symmetry)
-                flakes.push(Flake::new(
-                    member.clone(),
-                    owl_same_as_sid.clone(),
-                    FlakeValue::Ref(canonical.clone()),
+    for (_, members) in same_as.members_iter() {
+        if members.len() < 2 {
+            continue;
+        }
+        for x in members {
+            for y in members.iter().filter(|y| *y != x) {
+                derived.try_add(Flake::new(
+                    x.clone(),
+                    owl_same_as.clone(),
+                    FlakeValue::Ref(y.clone()),
                     ref_dt.clone(),
                     t,
                     true,
                     None,
                 ));
             }
+            if let Some(reason) = budget_exceeded(&opts.budget, start, derived, &no_delta) {
+                return Ok(Some(reason));
+            }
         }
     }
 
-    flakes
+    for flake in sources.iter().filter(|f| f.p != owl_same_as) {
+        let subjects = set_of
+            .get(&flake.s)
+            .copied()
+            .unwrap_or(std::slice::from_ref(&flake.s));
+        let objects: Vec<FlakeValue> = match &flake.o {
+            FlakeValue::Ref(o) => match set_of.get(o) {
+                Some(members) => members.iter().cloned().map(FlakeValue::Ref).collect(),
+                None => vec![flake.o.clone()],
+            },
+            o => vec![o.clone()],
+        };
+        for s in subjects {
+            for o in &objects {
+                if s != &flake.s || o != &flake.o {
+                    derived.try_add(Flake::new(
+                        s.clone(),
+                        flake.p.clone(),
+                        o.clone(),
+                        flake.dt.clone(),
+                        t,
+                        true,
+                        flake.m.clone(),
+                    ));
+                }
+            }
+        }
+        if let Some(reason) = budget_exceeded(&opts.budget, start, derived, &no_delta) {
+            return Ok(Some(reason));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

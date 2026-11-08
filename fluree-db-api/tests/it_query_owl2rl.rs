@@ -126,6 +126,141 @@ async fn owl2rl_same_as_transitivity() {
     );
 }
 
+/// Rows of an owl2rl query, sorted.
+async fn owl2rl_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    select: serde_json::Value,
+    where_: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        },
+        "select": select,
+        "where": where_,
+        "reasoning": "owl2rl"
+    });
+    normalize_rows(
+        &support::query_jsonld(fluree, ledger, &q)
+            .await
+            .unwrap()
+            .to_jsonld(&ledger.snapshot)
+            .unwrap(),
+    )
+}
+
+/// eq-rep-s and eq-rep-o with no other ontology: each member holds every
+/// member's facts, a language-tagged value keeps its tag, and every pair of a
+/// three-member set is `owl:sameAs`.
+#[tokio::test]
+async fn owl2rl_same_as_members_hold_each_other_s_facts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/eq-rep").await;
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "owl:sameAs": {"@id": "ex:b"}},
+            {"@id": "ex:b", "owl:sameAs": {"@id": "ex:c"}},
+            {"@id": "ex:c", "ex:age": 30, "ex:name": {"@value": "Cee", "@language": "en"}},
+            {"@id": "ex:x", "ex:knows": {"@id": "ex:a"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+
+    for member in ["ex:a", "ex:b", "ex:c"] {
+        let others: Vec<_> = ["ex:a", "ex:b", "ex:c"]
+            .into_iter()
+            .filter(|m| *m != member)
+            .map(|m| json!(m))
+            .collect();
+        assert_eq!(
+            owl2rl_rows(
+                &fluree,
+                &ledger,
+                json!("?o"),
+                json!({"@id": member, "owl:sameAs": "?o"})
+            )
+            .await,
+            others,
+            "{member} sameAs"
+        );
+        assert_eq!(
+            owl2rl_rows(
+                &fluree,
+                &ledger,
+                json!("?v"),
+                json!({"@id": member, "ex:age": "?v"})
+            )
+            .await,
+            vec![json!(30)],
+            "{member} age"
+        );
+    }
+    let stated = owl2rl_rows(
+        &fluree,
+        &ledger,
+        json!("?v"),
+        json!({"@id": "ex:c", "ex:name": "?v"}),
+    )
+    .await;
+    assert_eq!(
+        owl2rl_rows(
+            &fluree,
+            &ledger,
+            json!("?v"),
+            json!({"@id": "ex:a", "ex:name": "?v"})
+        )
+        .await,
+        stated,
+        "the copy keeps the language tag"
+    );
+    assert_eq!(
+        owl2rl_rows(
+            &fluree,
+            &ledger,
+            json!("?o"),
+            json!({"@id": "ex:x", "ex:knows": "?o"})
+        )
+        .await,
+        vec![json!("ex:a"), json!("ex:b"), json!("ex:c")],
+        "objects too"
+    );
+}
+
+/// Equality the rules derive (prp-fp) gives its members each other's facts.
+#[tokio::test]
+async fn owl2rl_derived_equality_shares_facts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/eq-rep-derived").await;
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        },
+        "@graph": [
+            {"@id": "ex:mother", "@type": "owl:FunctionalProperty"},
+            {"@id": "ex:brian", "ex:mother": [{"@id": "ex:carol"}, {"@id": "ex:carol2"}]},
+            {"@id": "ex:carol2", "ex:age": 60}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+    assert_eq!(
+        owl2rl_rows(
+            &fluree,
+            &ledger,
+            json!("?v"),
+            json!({"@id": "ex:carol", "ex:age": "?v"})
+        )
+        .await,
+        vec![json!(60)]
+    );
+}
+
 // =============================================================================
 // Property Rules (prp-*)
 // =============================================================================

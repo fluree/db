@@ -221,7 +221,8 @@ conclusions, and so does an OWL 2 RL cap or failure ahead of such a program,
 since the OWL closure is datalog's input (a positive program still runs over
 what OWL produced, or without it). `RuleSchedule::WholeProgram` refuses these
 programs: it runs every rule from the first round. A subquery's solutions are
-a bag, as in queries, and `owl:sameAs` aliases are counted as stated.
+a bag, as in queries. Under OWL 2 RL an `owl:sameAs` alias holds every fact
+of the individual it names, so a count grouped by alias counts them all.
 
 ### Named graphs
 

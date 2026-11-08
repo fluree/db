@@ -193,10 +193,10 @@ queries skip materialization entirely. See
 ### owl:sameAs and identity
 
 When OWL 2 RL is enabled, the engine tracks `owl:sameAs` equivalences using an
-efficient union-find data structure. If two resources are determined to be the
-same (via functional properties, inverse functional properties, or `owl:hasKey`),
-all their facts are merged under a canonical representative. Queries
-transparently resolve through these equivalences.
+efficient union-find data structure. Resources can be asserted the same, or
+determined to be (via functional properties, inverse functional properties, or
+`owl:hasKey`). Each of them then holds all of their facts, so a query naming
+any one of them sees the combined set.
 
 ## What to read next
 

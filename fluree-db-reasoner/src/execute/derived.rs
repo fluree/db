@@ -269,6 +269,14 @@ impl DerivedSet {
         self.flakes.is_empty()
     }
 
+    /// The flakes [`Self::into_derived_flakes`] would return.
+    pub fn derived_flakes(&self) -> impl Iterator<Item = &Flake> {
+        self.flakes
+            .iter()
+            .zip(&self.is_base)
+            .filter_map(|(flake, base)| (!base).then_some(flake))
+    }
+
     /// Consume and return all flakes
     pub fn into_flakes(self) -> Vec<Flake> {
         self.flakes

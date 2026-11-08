@@ -136,7 +136,8 @@ pub struct SemanticKey {
 ///
 /// 2: a restriction or chain over mutually inverse properties no longer fails
 /// the OWL 2 RL pass.
-pub const ENGINE_SEMANTICS: u32 = 2;
+/// 3: every member of an `owl:sameAs` set holds every member's facts.
+pub const ENGINE_SEMANTICS: u32 = 3;
 
 /// The content id a canonical program encoding is known by.
 pub fn program_id(canonical: &[u8]) -> ContentId {

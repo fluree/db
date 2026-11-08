@@ -1510,8 +1510,7 @@ async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
 }
 
 /// owl:sameAs: what query-time reasoning answers through equality, an index
-/// answers the same. Parity only: both lanes share the equality defect that
-/// `same_as_gives_each_member_every_fact` pins.
+/// answers the same. `same_as_gives_each_member_every_fact` checks the answers.
 #[tokio::test]
 async fn same_as_answers_match_query_time() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1559,10 +1558,9 @@ async fn same_as_answers_match_query_time() {
 }
 
 /// eq-rep-s and eq-rep-o give each member of an equality set every member's
-/// facts, at query time and from an index. Today both lanes give them only to
-/// one member, and agree.
+/// facts, at query time and from an index. Both lanes once gave them only to
+/// one member, and agreed.
 #[tokio::test]
-#[ignore = "known defect: owl:sameAs facts are not copied to every member of the equality set"]
 async fn same_as_gives_each_member_every_fact() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = "reasoning-indexes/same-as-members:main";
