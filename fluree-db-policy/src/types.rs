@@ -326,7 +326,7 @@ pub struct PropertyPolicyEntry {
 /// View-set class policies are indexed INTO by_property (pre-expanded via
 /// class→property stats); modify-set class policies are indexed by class in
 /// `by_class`. This is designed for efficient lookup.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PolicySet {
     /// All restrictions in parse order (insertion order preserved)
     pub restrictions: Vec<PolicyRestriction>,
@@ -335,7 +335,7 @@ pub struct PolicySet {
     /// Index: property SID -> property policy entries (includes view-set class policies!)
     /// Each entry includes whether class check is needed for that specific property
     pub by_property: HashMap<Sid, Vec<PropertyPolicyEntry>>,
-    /// Index: class SID -> restriction indices (modify sets only).
+    /// Index: class SID -> restriction indices.
     ///
     /// Modify-side `f:onClass` policies are selected by the subject's
     /// classes at evaluation time instead of being pre-expanded into
@@ -346,7 +346,8 @@ pub struct PolicySet {
     /// let a class allow apply to a non-instance when the staged flake
     /// itself contradicts the stats. View sets keep the stats expansion
     /// (committed data matches stats there, and scan volume makes the
-    /// precomputed property index worthwhile); their `by_class` is empty.
+    /// precomputed property index worthwhile), except for a query that
+    /// reads reasoned facts: see [`Self::selecting_classes_by_subject`].
     pub by_class: HashMap<Sid, Vec<usize>>,
     /// Default-bucket policy indices
     pub defaults: Vec<usize>,
@@ -368,6 +369,37 @@ impl PolicySet {
     /// Create an empty policy set
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This set with its `f:onClass` policies selected by the subject's
+    /// classes, as modify sets select them, rather than by the properties
+    /// class statistics list. `None` when it has none.
+    ///
+    /// For a view that reads reasoned facts. Statistics describe asserted
+    /// data, so they neither know a subject that is a member only by
+    /// derivation, nor a derived property of an asserted member; a class
+    /// policy expanded through them leaves both ungoverned.
+    pub fn selecting_classes_by_subject(&self) -> Option<PolicySet> {
+        let on_class = |idx: usize| self.restrictions[idx].target_mode == TargetMode::OnClass;
+        if !(0..self.restrictions.len()).any(on_class) {
+            return None;
+        }
+        let mut set = self.clone();
+        set.by_property.retain(|_, entries| {
+            entries.retain(|entry| !on_class(entry.idx));
+            !entries.is_empty()
+        });
+        for (idx, restriction) in self.restrictions.iter().enumerate() {
+            if on_class(idx) {
+                for class in &restriction.for_classes {
+                    let bucket = set.by_class.entry(class.clone()).or_default();
+                    if !bucket.contains(&idx) {
+                        bucket.push(idx);
+                    }
+                }
+            }
+        }
+        Some(set)
     }
 
     /// Collect the deduplicated class-bucket restriction indices for a
@@ -526,6 +558,8 @@ impl PolicySet {
 struct PolicyWrapperInner {
     /// View (query) policy set
     view: PolicySet,
+    /// `view` with class policies selected by subject, when it has any
+    reasoned_view: Option<PolicySet>,
     /// Modify (transaction) policy set
     modify: PolicySet,
     /// Root flag - bypasses all policies
@@ -555,6 +589,7 @@ impl PolicyWrapper {
     ) -> Self {
         Self {
             inner: Arc::new(PolicyWrapperInner {
+                reasoned_view: view.selecting_classes_by_subject(),
                 view,
                 modify,
                 root,
@@ -569,6 +604,7 @@ impl PolicyWrapper {
         Self {
             inner: Arc::new(PolicyWrapperInner {
                 view: PolicySet::default(),
+                reasoned_view: None,
                 modify: PolicySet::default(),
                 root: true,
                 default_allow: true,
@@ -590,6 +626,15 @@ impl PolicyWrapper {
     /// Get the view policy set
     pub fn view(&self) -> &PolicySet {
         &self.inner.view
+    }
+
+    /// The view policy set for a query that reads reasoned facts
+    /// ([`PolicySet::selecting_classes_by_subject`]).
+    pub fn reasoned_view(&self) -> &PolicySet {
+        self.inner
+            .reasoned_view
+            .as_ref()
+            .unwrap_or(&self.inner.view)
     }
 
     /// Get the modify policy set

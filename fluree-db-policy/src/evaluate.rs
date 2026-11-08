@@ -14,7 +14,7 @@ use crate::types::{
     TargetMode, WriteFlakeInfo,
 };
 use crate::Result;
-use fluree_db_core::{FlakeValue, GraphId, Sid, Tracker};
+use fluree_db_core::{FlakeValue, GraphDbRef, GraphId, OverlayProvider, Sid, Tracker};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -56,10 +56,45 @@ impl<'a> FlakeEvalParams<'a> {
     }
 }
 
-/// Shared (graph, t, subject) -> classes cache for runtime class-membership
-/// checks. See the `class_cache` field docs for why the graph and `t` are in
-/// the key.
-type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, i64, Sid), Vec<Sid>>>>;
+/// The state a class lookup read: a graph, at `t`, through an overlay.
+///
+/// One context can read several states at one `t`. A plain query and a
+/// reasoning query on the same view read the same graph through different
+/// overlays, and only the reasoning one sees derived memberships, so classes
+/// resolved through one must not answer for the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClassState {
+    g_id: GraphId,
+    t: i64,
+    overlay: OverlayState,
+}
+
+/// What tells an overlay's content apart: its content version, or, for an
+/// overlay that cannot vouch for one (a historical view), its epoch, which a
+/// reasoning overlay tags with its materialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum OverlayState {
+    Version(u64),
+    Epoch(u64),
+}
+
+impl ClassState {
+    pub fn new(g_id: GraphId, overlay: &dyn OverlayProvider, t: i64) -> Self {
+        let overlay = match overlay.content_version() {
+            Some(version) => OverlayState::Version(version),
+            None => OverlayState::Epoch(overlay.epoch()),
+        };
+        Self { g_id, t, overlay }
+    }
+
+    pub fn of(db: GraphDbRef<'_>) -> Self {
+        Self::new(db.g_id, db.overlay, db.t)
+    }
+}
+
+/// Shared (state, subject) -> classes cache for runtime class-membership
+/// checks. See the `class_cache` field docs for what the state holds.
+type ClassCache = Arc<RwLock<std::collections::HashMap<(ClassState, Sid), Vec<Sid>>>>;
 
 /// Policy context for evaluation
 ///
@@ -71,7 +106,10 @@ pub struct PolicyContext {
     pub wrapper: PolicyWrapper,
     /// The grounded identity (always has a value, even if random)
     pub identity: Sid,
-    /// Cache of (graph, t, subject) -> classes for runtime class membership
+    /// Whether this context judges a query that reads reasoned facts, which
+    /// selects [`PolicyWrapper::reasoned_view`].
+    reasoned: bool,
+    /// Cache of (state, subject) -> classes for runtime class membership
     /// checks.
     ///
     /// Keyed on the graph as well as the subject: the same subject IRI can carry
@@ -88,6 +126,10 @@ pub struct PolicyContext {
     /// miss — it answers, and an `f:onClass` decision made from it is
     /// silently wrong.
     ///
+    /// Keyed on the overlay because a view's queries share this context: a
+    /// reasoning query reads derived memberships a plain query at the same
+    /// `t` does not ([`ClassState`]).
+    ///
     /// What the key does not cover: a context must never span two ledgers.
     /// `GraphId` is ledger-local and `Sid` namespaces are per-ledger, so an
     /// entry borrowed from another ledger collides rather than misses.
@@ -103,7 +145,26 @@ impl PolicyContext {
         Self {
             wrapper,
             identity: grounded_identity,
+            reasoned: false,
             class_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// This context, for a query that reads reasoned facts. It shares the
+    /// class cache, which keys entries by the state they read.
+    pub fn for_reasoned_query(&self) -> Self {
+        Self {
+            reasoned: true,
+            ..self.clone()
+        }
+    }
+
+    /// The view policy set this context judges reads by.
+    pub fn view_set(&self) -> &PolicySet {
+        if self.reasoned {
+            self.wrapper.reasoned_view()
+        } else {
+            self.wrapper.view()
         }
     }
 
@@ -140,7 +201,7 @@ impl PolicyContext {
         }
         let tracker = Tracker::disabled();
         self.evaluate_flake(
-            self.wrapper.view(),
+            self.view_set(),
             subject,
             property,
             subject_classes,
@@ -160,13 +221,7 @@ impl PolicyContext {
         if is_schema_flake(property, object) {
             return Ok(true);
         }
-        self.evaluate_flake(
-            self.wrapper.view(),
-            subject,
-            property,
-            subject_classes,
-            tracker,
-        )
+        self.evaluate_flake(self.view_set(), subject, property, subject_classes, tracker)
     }
 
     // Note: The old allow_view_flake_with_evaluator methods have been removed.
@@ -203,7 +258,7 @@ impl PolicyContext {
             return Ok(true);
         }
         let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
-        self.evaluate_flake_async(self.wrapper.view(), flake, executor, tracker)
+        self.evaluate_flake_async(self.view_set(), flake, executor, tracker)
             .await
     }
 
@@ -257,7 +312,7 @@ impl PolicyContext {
             return Ok(PolicyDecision::Allowed { restriction: None });
         }
         let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
-        self.evaluate_flake_async_detailed(self.wrapper.view(), flake, executor, tracker)
+        self.evaluate_flake_async_detailed(self.view_set(), flake, executor, tracker)
             .await
     }
 
@@ -930,28 +985,28 @@ impl PolicyContext {
         Ok((false, evaluated))
     }
 
-    /// Cache subject classes for repeated lookups, within one graph.
-    pub fn cache_subject_classes(&self, g_id: GraphId, t: i64, subject: Sid, classes: Vec<Sid>) {
+    /// Cache subject classes for repeated lookups, within one state.
+    pub fn cache_subject_classes(&self, state: ClassState, subject: Sid, classes: Vec<Sid>) {
         if let Ok(mut cache) = self.class_cache.write() {
-            cache.insert((g_id, t, subject), classes);
+            cache.insert((state, subject), classes);
         }
     }
 
-    /// Whether this context already resolved classes for `subject` in `g_id`.
-    pub fn has_cached_subject_classes(&self, g_id: GraphId, t: i64, subject: &Sid) -> bool {
+    /// Whether this context already resolved classes for `subject` in `state`.
+    pub fn has_cached_subject_classes(&self, state: ClassState, subject: &Sid) -> bool {
         self.class_cache
             .read()
-            .map(|c| c.contains_key(&(g_id, t, subject.clone())))
+            .map(|c| c.contains_key(&(state, subject.clone())))
             .unwrap_or(false)
     }
 
-    /// Filter `subjects` down to those this context has not resolved in `g_id`,
-    /// taking the cache lock once rather than per subject.
-    pub fn retain_uncached(&self, g_id: GraphId, t: i64, subjects: &[Sid]) -> Vec<Sid> {
+    /// Filter `subjects` down to those this context has not resolved in
+    /// `state`, taking the cache lock once rather than per subject.
+    pub fn retain_uncached(&self, state: ClassState, subjects: &[Sid]) -> Vec<Sid> {
         match self.class_cache.read() {
             Ok(cache) => subjects
                 .iter()
-                .filter(|s| !cache.contains_key(&(g_id, t, (*s).clone())))
+                .filter(|s| !cache.contains_key(&(state, (*s).clone())))
                 .cloned()
                 .collect(),
             // Poisoned: resolve everything, same as a miss.
@@ -959,17 +1014,12 @@ impl PolicyContext {
         }
     }
 
-    /// Get cached subject classes for a subject in a specific graph.
-    pub fn get_cached_subject_classes(
-        &self,
-        g_id: GraphId,
-        t: i64,
-        subject: &Sid,
-    ) -> Option<Vec<Sid>> {
+    /// Get cached subject classes for a subject in a specific state.
+    pub fn get_cached_subject_classes(&self, state: ClassState, subject: &Sid) -> Option<Vec<Sid>> {
         self.class_cache
             .read()
             .ok()
-            .and_then(|cache| cache.get(&(g_id, t, subject.clone())).cloned())
+            .and_then(|cache| cache.get(&(state, subject.clone())).cloned())
     }
 }
 
@@ -1373,6 +1423,70 @@ mod tests {
         );
     }
 
+    /// A cache state in graph `g` at `t` 1, with no overlay.
+    fn at(g: GraphId) -> ClassState {
+        ClassState::new(g, &fluree_db_core::NoOverlay, 1)
+    }
+
+    /// An overlay with only an identity, to tell states apart.
+    struct Stamped {
+        version: Option<u64>,
+        epoch: u64,
+    }
+
+    impl OverlayProvider for Stamped {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn epoch(&self) -> u64 {
+            self.epoch
+        }
+        fn content_version(&self) -> Option<u64> {
+            self.version
+        }
+        fn for_each_overlay_flake(
+            &self,
+            _g_id: GraphId,
+            _index: fluree_db_core::IndexType,
+            _first: Option<&fluree_db_core::Flake>,
+            _rhs: Option<&fluree_db_core::Flake>,
+            _leftmost: bool,
+            _to_t: i64,
+            _callback: &mut dyn FnMut(&fluree_db_core::Flake),
+        ) {
+        }
+    }
+
+    /// A plain and a reasoning query on one view read one graph at one `t`
+    /// through different overlays; neither answers for the other. An overlay
+    /// with no content version is told apart by its epoch.
+    #[test]
+    fn class_cache_keeps_overlays_apart() {
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let alice = make_sid(100, "alice");
+        let state = |version, epoch| ClassState::new(3, &Stamped { version, epoch }, 1);
+
+        ctx.cache_subject_classes(
+            state(Some(7), 1),
+            alice.clone(),
+            vec![make_sid(100, "Person")],
+        );
+        assert!(ctx
+            .get_cached_subject_classes(state(Some(7), 2), &alice)
+            .is_some());
+        assert_eq!(
+            ctx.get_cached_subject_classes(state(Some(8), 1), &alice),
+            None
+        );
+        assert_eq!(ctx.get_cached_subject_classes(state(None, 1), &alice), None);
+
+        ctx.cache_subject_classes(state(None, 1), alice.clone(), vec![make_sid(100, "Person")]);
+        assert!(ctx
+            .get_cached_subject_classes(state(None, 1), &alice)
+            .is_some());
+        assert_eq!(ctx.get_cached_subject_classes(state(None, 2), &alice), None);
+    }
+
     #[test]
     fn class_cache_keeps_graphs_apart() {
         // The same subject IRI can be typed differently in two named graphs —
@@ -1385,16 +1499,16 @@ mod tests {
         let employee = make_sid(100, "Employee");
         let patient = make_sid(100, "Patient");
 
-        ctx.cache_subject_classes(3, 1, subject.clone(), vec![employee.clone()]);
-        ctx.cache_subject_classes(4, 1, subject.clone(), vec![patient.clone()]);
+        ctx.cache_subject_classes(at(3), subject.clone(), vec![employee.clone()]);
+        ctx.cache_subject_classes(at(4), subject.clone(), vec![patient.clone()]);
 
         assert_eq!(
-            ctx.get_cached_subject_classes(3, 1, &subject),
+            ctx.get_cached_subject_classes(at(3), &subject),
             Some(vec![employee]),
             "graph 3's classes were clobbered by the graph 4 population"
         );
         assert_eq!(
-            ctx.get_cached_subject_classes(4, 1, &subject),
+            ctx.get_cached_subject_classes(at(4), &subject),
             Some(vec![patient]),
             "graph 4 did not get its own entry"
         );
@@ -1408,9 +1522,9 @@ mod tests {
         let ctx = PolicyContext::new(PolicyWrapper::root(), None);
         let subject = make_sid(100, "alice");
 
-        ctx.cache_subject_classes(3, 1, subject.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(at(3), subject.clone(), vec![make_sid(100, "Employee")]);
 
-        assert_eq!(ctx.get_cached_subject_classes(7, 1, &subject), None);
+        assert_eq!(ctx.get_cached_subject_classes(at(7), &subject), None);
     }
 
     #[test]
@@ -1422,13 +1536,13 @@ mod tests {
         let alice = make_sid(100, "alice");
         let bob = make_sid(100, "bob");
 
-        assert!(!ctx.has_cached_subject_classes(3, 1, &alice));
+        assert!(!ctx.has_cached_subject_classes(at(3), &alice));
 
-        ctx.cache_subject_classes(3, 1, alice.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(at(3), alice.clone(), vec![make_sid(100, "Employee")]);
 
-        assert!(ctx.has_cached_subject_classes(3, 1, &alice));
-        assert!(!ctx.has_cached_subject_classes(4, 1, &alice));
-        assert!(!ctx.has_cached_subject_classes(3, 1, &bob));
+        assert!(ctx.has_cached_subject_classes(at(3), &alice));
+        assert!(!ctx.has_cached_subject_classes(at(4), &alice));
+        assert!(!ctx.has_cached_subject_classes(at(3), &bob));
     }
 
     #[test]
@@ -1441,16 +1555,16 @@ mod tests {
         let bob = make_sid(100, "bob");
         let carol = make_sid(100, "carol");
 
-        ctx.cache_subject_classes(3, 1, alice.clone(), vec![make_sid(100, "Employee")]);
-        ctx.cache_subject_classes(4, 1, bob.clone(), vec![make_sid(100, "Patient")]);
+        ctx.cache_subject_classes(at(3), alice.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(at(4), bob.clone(), vec![make_sid(100, "Patient")]);
 
         let asked = vec![alice.clone(), bob.clone(), carol.clone(), bob.clone()];
         assert_eq!(
-            ctx.retain_uncached(3, 1, &asked),
+            ctx.retain_uncached(at(3), &asked),
             vec![bob.clone(), carol, bob],
             "alice is cached in graph 3 and must be skipped; bob is cached only in graph 4"
         );
-        assert!(ctx.retain_uncached(3, 1, &[alice]).is_empty());
+        assert!(ctx.retain_uncached(at(3), &[alice]).is_empty());
     }
 
     #[test]

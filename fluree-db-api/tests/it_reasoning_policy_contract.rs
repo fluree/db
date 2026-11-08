@@ -461,3 +461,198 @@ async fn negation_aggregation_and_named_graph_heads_follow_the_contract() {
         }
     }
 }
+
+fn denying_class(class: &str) -> Value {
+    json!({
+        "policy": [{
+            "@id": "ex:denyClass",
+            "f:required": true,
+            "f:onClass": [{"@id": class}],
+            "f:action": "f:view",
+            "f:allow": false
+        }],
+        "default-allow": true
+    })
+}
+
+fn class_restricted(query: &Value, class: &str) -> Value {
+    let mut query = query.clone();
+    query["opts"] = denying_class(class);
+    query
+}
+
+const HIGH_EARNER: &str = "http://example.org/HighEarner";
+const MANAGER: &str = "http://example.org/Manager";
+
+/// An `f:onClass` deny hides every fact of the class's members, under the
+/// membership the query reasons to:
+/// - a derived member (`ex:alice` is a `HighEarner` only by rule) loses her
+///   asserted salary;
+/// - an asserted member (`ex:bob` the `Manager`) loses his derived ancestors.
+///
+/// Class statistics describe asserted members only; a deny expanded through
+/// them once left both visible.
+#[tokio::test]
+async fn a_class_deny_hides_derived_members_and_derived_properties() {
+    let mut observed = Vec::new();
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-deny-{storage:?}:main");
+        let mut data = family_with_rules();
+        data["@graph"]
+            .as_array_mut()
+            .expect("graph")
+            .push(json!({"@id": "ex:bob", "@type": "ex:Manager"}));
+        let fluree = seeded_reader(&ledger_id, &data, storage).await;
+        let fact = |s: &str, p: &str| {
+            query(
+                &ledger_id,
+                json!(["?v"]),
+                json!({"@id": s, p: "?v"}),
+                "datalog",
+            )
+        };
+        let cases = [
+            (
+                "alice's derived class",
+                fact("ex:alice", "@type"),
+                HIGH_EARNER,
+            ),
+            ("alice's salary", fact("ex:alice", "ex:salary"), HIGH_EARNER),
+            ("bob's parent", fact("ex:bob", "ex:parent"), MANAGER),
+            (
+                "bob's derived ancestors",
+                fact("ex:bob", "ex:ancestor"),
+                MANAGER,
+            ),
+        ];
+        for (what, q, class) in cases {
+            assert!(
+                !rows(&fluree, &q).await.is_empty(),
+                "{storage:?}: root sees {what}"
+            );
+            let hidden = rows(&fluree, &class_restricted(&q, class)).await;
+            if !hidden.is_empty() {
+                observed.push(format!("{storage:?}: {what} visible: {hidden:?}"));
+            }
+        }
+    }
+    assert!(observed.is_empty(), "{observed:#?}");
+}
+
+/// One policy-wrapped view answers a plain query and a reasoning query at the
+/// same `t`, in either order. Each judges `f:onClass` by the classes its own
+/// query reasons to: `ex:alice` is a `HighEarner` only under the rules.
+#[tokio::test]
+async fn one_view_judges_classes_by_each_query_s_reasoning() {
+    use fluree_db_api::{GovernanceOptions, GraphDb};
+    let mut observed = Vec::new();
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-cache-{storage:?}:main");
+        let mut data = family_with_rules();
+        data["@graph"]
+            .as_array_mut()
+            .expect("graph")
+            .push(json!({"@id": "ex:alice", "@type": "ex:Person"}));
+        let fluree = seeded_reader(&ledger_id, &data, storage).await;
+        let opts = GovernanceOptions {
+            policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let classes = |reasoning: &str| {
+            json!({
+                "@context": context(),
+                "select": ["?c"],
+                "where": {"@id": "ex:alice", "@type": "?c"},
+                "reasoning": reasoning
+            })
+        };
+        let (plain, reasoned) = (classes("none"), classes("datalog"));
+        // A HighEarner's facts, its classes included, are all hidden.
+        let expected_plain = vec![json!(["ex:Person"])];
+        let expected_reasoned: Vec<Value> = Vec::new();
+
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        for order in ["plain first", "reasoning first"] {
+            let view = fluree
+                .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+                .await
+                .expect("policy view");
+            let queries = match order {
+                "plain first" => [(&plain, &expected_plain), (&reasoned, &expected_reasoned)],
+                _ => [(&reasoned, &expected_reasoned), (&plain, &expected_plain)],
+            };
+            for (q, expected) in queries {
+                let result = fluree.query(&view, q).await.expect("query");
+                let got = normalize_rows(&result.to_jsonld(&view.snapshot).expect("to_jsonld"));
+                if &got != expected {
+                    observed.push(format!(
+                        "{storage:?}, {order}: reasoning {} gave {got:?}, expected {expected:?}",
+                        q["reasoning"]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(observed.is_empty(), "{observed:#?}");
+}
+
+/// A class deny under reasoning reaches an aggregate's fast path, a join and
+/// SPARQL alike: `ex:alice`, a `HighEarner` only by rule, is hidden; `ex:bob`
+/// is not. A graph crawl is `a_derived_class_deny_reaches_a_graph_crawl`.
+#[tokio::test]
+async fn a_derived_class_deny_reaches_every_row_shape() {
+    use fluree_db_api::{GovernanceOptions, GraphDb};
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-deny-shapes-{storage:?}:main");
+        let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
+        let count = query(
+            &ledger_id,
+            json!(["(count ?v)"]),
+            json!({"@id": "?s", "ex:salary": "?v"}),
+            "datalog",
+        );
+        let join = query(
+            &ledger_id,
+            json!(["?s"]),
+            json!([{"@id": "?s", "ex:salary": "?v"}, {"@id": "?s", "ex:parent": "?p"}]),
+            "datalog",
+        );
+        let cases = [
+            ("count", &count, vec![json!([2])], vec![json!([1])]),
+            (
+                "join",
+                &join,
+                vec![json!(["ex:alice"]), json!(["ex:bob"])],
+                vec![json!(["ex:bob"])],
+            ),
+        ];
+        for (shape, q, root, restricted) in cases {
+            assert_eq!(rows(&fluree, q).await, root, "{storage:?}/{shape}: root");
+            assert_eq!(
+                rows(&fluree, &class_restricted(q, HIGH_EARNER)).await,
+                restricted,
+                "{storage:?}/{shape}: restricted"
+            );
+        }
+
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        let opts = GovernanceOptions {
+            policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let view = fluree
+            .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+            .await
+            .expect("policy view");
+        let sparql = "# PRAGMA reasoning: datalog\nPREFIX ex: <http://example.org/>\n\
+                      SELECT ?s ?v WHERE { ?s ex:salary ?v }";
+        let result = fluree.query(&view, sparql).await.expect("sparql");
+        assert_eq!(
+            normalize_rows(&result.to_jsonld(&view.snapshot).expect("to_jsonld")),
+            vec![json!(["ex:bob", 90000])],
+            "{storage:?}/sparql"
+        );
+    }
+}

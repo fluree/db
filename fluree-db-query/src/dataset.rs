@@ -370,13 +370,19 @@ impl<'a> DataSet<'a> {
             let matches = graph.ledger_id.as_ref() == ledger_id
                 && g_ids.contains(&graph.g_id)
                 && graph.to_t == to_t;
+            // A graph that reads derived facts judges class policies by
+            // its subjects' reasoned classes.
+            let policy_enforcer = match &graph.policy_enforcer {
+                Some(enforcer) if matches => Some(Arc::new(enforcer.for_reasoned_view())),
+                other => other.clone(),
+            };
             GraphRef {
                 snapshot: graph.snapshot,
                 g_id: graph.g_id,
                 overlay: if matches { overlay } else { graph.overlay },
                 to_t: graph.to_t,
                 ledger_id: Arc::clone(&graph.ledger_id),
-                policy_enforcer: graph.policy_enforcer.clone(),
+                policy_enforcer,
                 kind: graph.kind,
             }
         };

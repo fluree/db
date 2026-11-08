@@ -984,6 +984,13 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx = ctx.with_cancellation(cancellation);
     }
     if let Some(enforcer) = config.policy_enforcer {
+        // Class statistics describe asserted data; with derived facts a
+        // class policy must be selected by the subject's reasoned classes.
+        let enforcer = if reasoning_overlay.is_some() {
+            Arc::new(enforcer.for_reasoned_view())
+        } else {
+            enforcer
+        };
         ctx = ctx.with_policy_enforcer(enforcer);
     }
     ctx.policy_source = config.policy_source;

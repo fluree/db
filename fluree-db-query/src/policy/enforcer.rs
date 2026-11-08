@@ -5,7 +5,7 @@
 use super::QueryPolicyExecutor;
 use crate::error::Result;
 use fluree_db_core::{Flake, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker};
-use fluree_db_policy::{is_schema_flake, PolicyContext};
+use fluree_db_policy::{is_schema_flake, ClassState, PolicyContext};
 use std::sync::Arc;
 
 /// Plan-time-style verdict for a single statically-known scanned predicate under
@@ -55,6 +55,15 @@ impl QueryPolicyEnforcer {
         &self.policy
     }
 
+    /// This enforcer, for a query that reads reasoned facts: class policies
+    /// are selected by the subject's reasoned classes on every property
+    /// ([`PolicyContext::for_reasoned_query`]).
+    pub fn for_reasoned_view(&self) -> Self {
+        Self {
+            policy: Arc::new(self.policy.for_reasoned_query()),
+        }
+    }
+
     /// Check if this is a root policy (bypasses all checks)
     pub fn is_root(&self) -> bool {
         self.policy.wrapper().is_root()
@@ -73,7 +82,7 @@ impl QueryPolicyEnforcer {
         if wrapper.is_root() {
             return PredicateCoverage::Covered;
         }
-        if wrapper.view().covers_predicate(predicate) {
+        if self.policy.view_set().covers_predicate(predicate) {
             PredicateCoverage::Covered
         } else if wrapper.default_allow() {
             PredicateCoverage::UncoveredAllow
@@ -118,6 +127,7 @@ impl QueryPolicyEnforcer {
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
 
+        let state = ClassState::new(g_id, overlay, to_t);
         let mut result = Vec::with_capacity(flakes.len());
 
         for flake in flakes {
@@ -130,7 +140,7 @@ impl QueryPolicyEnforcer {
             // Get subject classes from cache
             let subject_classes = self
                 .policy
-                .get_cached_subject_classes(g_id, to_t, &flake.s)
+                .get_cached_subject_classes(state, &flake.s)
                 .unwrap_or_default();
 
             // Async policy check with f:query support
@@ -184,11 +194,12 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        let state = ClassState::new(g_id, overlay, to_t);
 
         // Get subject classes from cache
         let subject_classes = self
             .policy
-            .get_cached_subject_classes(g_id, to_t, &flake.s)
+            .get_cached_subject_classes(state, &flake.s)
             .unwrap_or_default();
 
         // Async policy check
