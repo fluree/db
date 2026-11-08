@@ -54,7 +54,7 @@ from fluree._sources import (
     Unity,
 )
 from fluree import doc
-from fluree._rdf import RdfFormat, parse, serialize
+from fluree._rdf import Quads, RdfFormat, parse, serialize
 from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector, ntriples
 from fluree.errors import (
     ConflictError,
@@ -106,6 +106,7 @@ __all__ = [
     "PermissionDeniedError",
     "QueryProfile",
     "Quad",
+    "Quads",
     "QueryTimeoutError",
     "RdfFormat",
     "RebaseResult",

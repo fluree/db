@@ -25,15 +25,32 @@ _SUFFIXES: dict[str, RdfFormat] = {
 }
 
 
+class Quads(list):  # type: ignore[type-arg]
+    """The quads :func:`parse` reads, in the order the document writes them:
+    a ``list`` of :class:`Quad`, with the document's ``prefixes``."""
+
+    prefixes: dict[str, str]
+    """The prefixes a Turtle or TriG document declares, ``{"ex":
+    "http://example.org/"}``, in the order declared; a prefix declared again
+    holds its last IRI. Other formats declare none."""
+
+    def __init__(self, quads: Iterable[Quad] = (), prefixes: dict[str, str] | None = None) -> None:
+        super().__init__(quads)
+        self.prefixes = {} if prefixes is None else prefixes
+
+
 def parse(
     data: str | bytes | os.PathLike[str] | dict[str, Any] | list[Any],
     format: RdfFormat | None = None,
     *,
     base: str | None = None,
     literals: _Literal["value", "lexical"] = "value",
-) -> list[Quad]:
+) -> Quads:
     """The quads of an RDF document: Turtle, TriG, N-Triples, N-Quads or
-    JSON-LD.
+    JSON-LD, in the order the document writes them, as a :class:`Quads`
+    list whose ``prefixes`` are the prefixes a Turtle or TriG document
+    declares. A JSON-LD node's statement comes before those of a node
+    nested in it, and a list's cells stand where the list does.
 
     ``data`` is the document's text (a ``str``, or UTF-8 ``bytes`` such as
     a request body), with its ``format`` given; a path,
@@ -85,7 +102,8 @@ def parse(
             return trusted_triple(term[1], term[2], value(term[3]))
         return literal(term)
 
-    return [trusted_quad(s, p, value(o), g) for s, p, o, g in native.parse_rdf(data, format, base)]
+    quads, prefixes = native.parse_rdf(data, format, base)
+    return Quads((trusted_quad(s, p, value(o), g) for s, p, o, g in quads), dict(prefixes))
 
 
 def serialize(

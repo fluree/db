@@ -434,3 +434,22 @@ def test_bytes_parse_as_utf8_text():
     assert fluree.parse(b"\xef\xbb\xbf" + doc.encode(), "turtle") == fluree.parse(doc, "turtle")
     with pytest.raises(InvalidRequestError, match="not UTF-8"):
         fluree.parse(b"\xff\xfe", "turtle")
+
+
+def test_quads_come_in_document_order():
+    trig = f"{PREFIXES}ex:g1 {{ ex:a ex:p ex:b }}\nex:a ex:p ex:c .\nex:g2 {{ ex:d ex:p ex:e }}"
+    assert [(q.subject, q.graph) for q in fluree.parse(trig, "trig")] == [
+        (ex("a"), ex("g1")), (ex("a"), None), (ex("d"), ex("g2"))
+    ]
+    doc = {"@context": {"@vocab": EX}, "@id": EX + "a", "p": {"@id": EX + "b", "q": "x"}, "t": "z"}
+    assert [(q.subject, q.predicate) for q in fluree.parse(doc)] == [
+        (ex("a"), ex("p")), (ex("b"), ex("q")), (ex("a"), ex("t"))
+    ]
+
+
+def test_a_parse_keeps_the_prefixes_declared():
+    doc = f"PREFIX ex: <{EX}>\n@prefix dc: <http://purl.org/dc/terms/> .\nex:s dc:title 'x' .\nPREFIX ex: <http://b.example/>\nex:t dc:title 'y' ."
+    quads = fluree.parse(doc, "turtle")
+    assert isinstance(quads, list) and isinstance(quads, fluree.Quads)
+    assert quads.prefixes == {"ex": "http://b.example/", "dc": "http://purl.org/dc/terms/"}
+    assert fluree.parse(f"<{EX}s> <{EX}p> <{EX}o> .", "ntriples").prefixes == {}

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfError, RdfFormat, Term};
+use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfError, RdfFormat, Statement, Term};
 use fluree_vocab::rdf::REIFIES;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -18,8 +18,9 @@ use crate::convert::{ir_term, is_node, is_triple};
 use crate::error::invalid_request;
 
 /// The quads of `text`, read as `format`: `"turtle"`, `"trig"`,
-/// `"ntriples"` or `"nquads"`. Turtle and TriG resolve relative IRIs
-/// against `base`.
+/// `"ntriples"` or `"nquads"`, in the order the document writes them, and
+/// the prefixes it declares, as `(prefix, iri)` pairs in order. Turtle and
+/// TriG resolve relative IRIs against `base`.
 ///
 /// Each quad is `(subject, predicate, object, graph)`. An IRI or blank node
 /// is a ready `fluree.IRI` or `fluree.BlankNode`, one object for every use of
@@ -33,31 +34,33 @@ pub(crate) fn parse_rdf<'py>(
     text: &str,
     format: &str,
     base: Option<&str>,
-) -> PyResult<Bound<'py, PyList>> {
+) -> PyResult<(Bound<'py, PyList>, Vec<(String, String)>)> {
     let format: RdfFormat = format.parse().map_err(rdf_error)?;
-    let dataset = py
-        .detach(|| rdf::parse(text, format, base))
+    let document = py
+        .detach(|| rdf::parse_document(text, format, base))
         .map_err(rdf_error)?;
     let mut terms = Terms::new(py);
     let reifies = terms.iri(REIFIES)?;
     let quads = PyList::empty(py);
-    for (name, graph) in dataset.graphs() {
-        let name = name.map(|n| terms.term(n)).transpose()?;
-        for t in graph.iter() {
-            let quad = (
-                terms.term(&t.s)?,
-                terms.term(&t.p)?,
-                terms.term(&t.o)?,
-                &name,
-            );
-            quads.append(quad)?;
-        }
-        for r in graph.reifications() {
-            let triple = terms.triple(&r.triple.s, &r.triple.p, &r.triple.o)?;
-            quads.append((terms.term(&r.reifier)?, &reifies, triple, &name))?;
+    for statement in document.statements() {
+        match statement {
+            Statement::Triple(name, t) => {
+                let name = name.map(|n| terms.term(n)).transpose()?;
+                quads.append((
+                    terms.term(&t.s)?,
+                    terms.term(&t.p)?,
+                    terms.term(&t.o)?,
+                    name,
+                ))?;
+            }
+            Statement::Reification(name, r) => {
+                let name = name.map(|n| terms.term(n)).transpose()?;
+                let triple = terms.triple(&r.triple.s, &r.triple.p, &r.triple.o)?;
+                quads.append((terms.term(&r.reifier)?, &reifies, triple, name))?;
+            }
         }
     }
-    Ok(quads)
+    Ok((quads, document.prefixes))
 }
 
 /// Python objects for one dataset's terms. An IRI or blank node label is
