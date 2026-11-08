@@ -396,11 +396,14 @@ mod tests {
     use fluree_db_core::{ContentId, ContentKind};
     use fluree_db_nameservice::{ConfigLookup, ConfigPayload, ConfigValue, RefKind, RefValue};
 
+    /// A response's status, entity tag and body.
+    type Canned = (StatusCode, Option<&'static str>, Vec<u8>);
+
     /// Answers each request with the next of `responses`, recording it.
     #[derive(Debug)]
     struct Scripted {
         requests: std::sync::Mutex<Vec<TransportRequest>>,
-        responses: std::sync::Mutex<Vec<(StatusCode, Option<&'static str>, Vec<u8>)>>,
+        responses: std::sync::Mutex<Vec<Canned>>,
     }
 
     #[async_trait]
@@ -426,9 +429,7 @@ mod tests {
         }
     }
 
-    fn scripted(
-        responses: Vec<(StatusCode, Option<&'static str>, Vec<u8>)>,
-    ) -> (Arc<Scripted>, ProxyNameService) {
+    fn scripted(responses: Vec<Canned>) -> (Arc<Scripted>, ProxyNameService) {
         let transport = Arc::new(Scripted {
             requests: Default::default(),
             responses: std::sync::Mutex::new(responses),

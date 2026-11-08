@@ -387,7 +387,7 @@ fn every_kind_of_operation_survives_redaction_as_written() {
         .enumerate()
         .map(|(i, (value, datatype))| {
             Flake::new(
-                Sid::new(13, &format!("thing-{i}")),
+                Sid::new(13, format!("thing-{i}")),
                 Sid::new(14, "value"),
                 value,
                 Sid::new(2, datatype),
