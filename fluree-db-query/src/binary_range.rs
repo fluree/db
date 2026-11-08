@@ -7,9 +7,11 @@ use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use fluree_db_binary_index::format::run_record_v2::cmp_v2_for_order;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore, ColumnProjection, RunSortOrder,
+    for_each_subject_run, BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore,
+    BranchManifest, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::same_t::supersedes;
@@ -1074,8 +1076,8 @@ fn resolve_sid(s_id: u64, view: &BinaryGraphView) -> std::io::Result<Sid> {
 
 /// Batched lookup for ref-valued predicate objects across many subjects (V3).
 ///
-/// For a fixed predicate, scans PSOT within the `[min_s_id, max_s_id]` range,
-/// filters to the requested subject set, and returns only IRI-ref-typed objects.
+/// For a fixed predicate, reads PSOT where the requested subjects are and
+/// returns only IRI-ref-typed objects.
 /// Used by policy (`rdf:type` lookups) and stats refresh.
 #[allow(clippy::too_many_arguments)]
 fn binary_lookup_subject_predicate_refs_batched_v3(
@@ -1133,32 +1135,18 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     s_ids.sort_unstable();
     s_ids.dedup();
 
-    let min_s_id = s_ids[0];
-    let max_s_id = *s_ids.last().unwrap();
-
-    // PSOT key bounds: restrict to [min_s_id, max_s_id] within this predicate.
-    let min_key = RunRecordV2 {
-        s_id: SubjectId::from_u64(min_s_id),
-        o_key: 0,
+    let key = |s_id: u64, low: bool| RunRecordV2 {
+        s_id: SubjectId::from_u64(s_id),
+        o_key: if low { 0 } else { u64::MAX },
         p_id,
         t: 0,
-        o_i: 0,
-        o_type: 0,
-        g_id,
-    };
-    let max_key = RunRecordV2 {
-        s_id: SubjectId::from_u64(max_s_id),
-        o_key: u64::MAX,
-        p_id,
-        t: 0,
-        o_i: LIST_INDEX_NONE,
-        o_type: u16::MAX,
+        o_i: if low { 0 } else { LIST_INDEX_NONE },
+        o_type: if low { 0 } else { u16::MAX },
         g_id,
     };
 
-    // Get branch manifest.
     let Some(tree) = store.graph_tree(g_id, RunSortOrder::Psot) else {
-        // No PSOT branch — try overlay only.
+        // No index for this graph — overlay-only.
         return batched_refs_overlay_only(
             store,
             dict_novelty,
@@ -1177,22 +1165,10 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         ..Default::default()
     };
 
-    let projection = ColumnProjection::all();
-    let mut cursor = BinaryCursor::new(
-        Arc::clone(store),
-        order,
-        tree.branch,
-        &min_key,
-        &max_key,
-        filter,
-        projection,
-    );
-
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
-    cursor.set_to_t(effective_to_t);
 
-    // Overlay merge — pre-filter to avoid translating irrelevant flakes.
-    // Only translate flakes that match the target predicate and subject set.
+    // Only overlay flakes of the predicate about the asked subjects; each
+    // cursor below merges the ones inside its own key range.
     let subject_sid_set: HashSet<&Sid> = subjects.iter().collect();
     let OverlayTranslateV3Result {
         mut ops,
@@ -1209,47 +1185,75 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         |flake| flake.p == *predicate && subject_sid_set.contains(&flake.s),
         "V3 batched refs",
     );
-
-    if !ops.is_empty() {
+    let ops: Arc<[fluree_db_binary_index::read::types::OverlayOp]> = if ops.is_empty() {
+        Arc::from(Vec::new())
+    } else {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-        cursor.set_overlay_ops(ops.into());
-    }
+        ops.into()
+    };
 
-    // Membership filter for s_id (fast O(1)).
-    let s_id_set: HashSet<u64> = s_ids.into_iter().collect();
     let iri_ref_o_type = OType::IRI_REF.as_u16();
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    let (mut cursors, mut rows_read) = (0usize, 0usize);
 
-    let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+    // Read only where the asked subjects are, not every row between the
+    // smallest and the largest: they can be far apart, and the predicate
+    // (rdf:type) holds rows for every subject in between. One cursor per run
+    // of index leaves that each hold an asked subject, so no leaflet is read
+    // twice; it skips leaflets holding none, and a lone subject binds the
+    // filter so its leaflet is binary-searched rather than scanned.
+    for run in leaf_runs(&s_ids, &tree.branch, order, key) {
+        let (min_key, max_key) = (key(run[0], true), key(run[run.len() - 1], false));
+        let mut filter = filter.clone();
+        if let [only] = run {
+            filter.s_id = Some(*only);
+        }
+        let mut cursor = BinaryCursor::new(
+            Arc::clone(store),
+            order,
+            Arc::clone(&tree.branch),
+            &min_key,
+            &max_key,
+            filter,
+            ColumnProjection::all(),
+        );
+        cursor.set_to_t(effective_to_t);
+        cursor.set_wanted_keys(Arc::from(run));
+        let (start, end) = fluree_db_binary_index::read::types::overlay_window_for_range(
+            &ops, &min_key, &max_key, order,
+        );
+        if start < end {
+            cursor.set_overlay_ops_window(Arc::clone(&ops), start, end);
+        }
+        cursors += 1;
 
-    while let Some(batch) = cursor.next_batch()? {
-        for i in 0..batch.row_count {
-            let s_id = batch.s_id.get(i);
-            if !s_id_set.contains(&s_id) {
-                continue;
-            }
-
-            let o_type = batch.o_type.get_or(i, 0);
-            if o_type != iri_ref_o_type {
-                continue;
-            }
-
-            let o_key = batch.o_key.get(i);
-
-            // Subject Sid: prefer the original input Sid.
-            let subj_sid = match s_id_to_sid.get(&s_id) {
-                Some(s) => s.clone(),
-                None => resolve_sid(s_id, &view)?,
-            };
-
-            // Resolve object (IRI ref) to Sid.
-            let class_sid = resolve_sid(o_key, &view)?;
-
-            out.entry(subj_sid).or_default().push(class_sid);
+        while let Some(batch) = cursor.next_batch()? {
+            rows_read += batch.row_count;
+            for_each_subject_run(&batch, run, |s_id, i, batch| {
+                if batch.o_type.get_or(i, 0) == iri_ref_o_type {
+                    found.push((s_id, batch.o_key.get(i)));
+                }
+            });
         }
     }
+    let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+    for (s_id, o_key) in found {
+        let subj_sid = match s_id_to_sid.get(&s_id) {
+            Some(s) => s.clone(),
+            None => resolve_sid(s_id, &view)?,
+        };
+        out.entry(subj_sid)
+            .or_default()
+            .push(resolve_sid(o_key, &view)?);
+    }
+    tracing::debug!(
+        subjects = s_ids.len(),
+        cursors,
+        rows_read,
+        "batched refs lookup"
+    );
 
-    // Correctness fallback for overlay translation failures: apply raw overlay deltas now.
     if !raw_overlay.is_empty() {
         apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw_overlay, predicate, effective_to_t);
     }
@@ -1261,6 +1265,38 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     }
 
     Ok(out)
+}
+
+/// Split sorted subject ids into runs whose rows lie in consecutive index
+/// leaves: a run ends where a whole leaf holds none of them. `key(s_id, low)`
+/// is the low or high key of `s_id`'s rows.
+fn leaf_runs<'a>(
+    s_ids: &'a [u64],
+    branch: &BranchManifest,
+    order: RunSortOrder,
+    key: impl Fn(u64, bool) -> RunRecordV2,
+) -> Vec<&'a [u64]> {
+    let cmp = cmp_v2_for_order(order);
+    let mut runs = Vec::new();
+    let (mut start, mut leaves_end) = (0, 0);
+    for (i, &s_id) in s_ids.iter().enumerate() {
+        let high = key(s_id, false);
+        // Rows ending inside the run's last leaf need no search.
+        if i > start
+            && leaves_end > 0
+            && cmp(&high, &branch.leaves[leaves_end - 1].last_key) != std::cmp::Ordering::Greater
+        {
+            continue;
+        }
+        let leaves = branch.find_leaves_in_range(&key(s_id, true), &high, cmp);
+        if i > start && leaves.start > leaves_end {
+            runs.push(&s_ids[start..i]);
+            start = i;
+        }
+        leaves_end = leaves.end;
+    }
+    runs.push(&s_ids[start..]);
+    runs
 }
 
 /// Apply raw overlay deltas to the batched refs output map.
