@@ -148,7 +148,7 @@ pub(crate) struct SequentialStager {
 type SequentialFactKey = (Option<Sid>, Sid, Sid, fluree_db_transact::FactTerm);
 
 impl SequentialStager {
-    pub(crate) fn new(ledger: LedgerState) -> Self {
+    pub(crate) fn new(ledger: LedgerState, policy: Option<&crate::PolicyContext>) -> Self {
         let final_t = ledger.t() + 1;
         Self {
             original: ledger.clone(),
@@ -164,7 +164,7 @@ impl SequentialStager {
             txn_meta: Vec::new(),
             last_ns_registry: None,
             union_ns_delta: std::collections::HashMap::new(),
-            governance: RequestGovernance::new(ledger.clone()),
+            governance: RequestGovernance::new(ledger.clone(), policy),
             nested: false,
             current: Some(ledger),
             scope: WriteScope::Subjects(FxHashSet::default()),
@@ -180,7 +180,7 @@ impl SequentialStager {
         Self {
             governance: request.clone(),
             nested: true,
-            ..Self::new(ledger)
+            ..Self::new(ledger, None)
         }
     }
 
@@ -190,7 +190,7 @@ impl SequentialStager {
     pub(crate) fn resume(ledger: LedgerState, governance: RequestGovernance) -> Self {
         Self {
             governance,
-            ..Self::new(ledger)
+            ..Self::new(ledger, None)
         }
     }
 
@@ -222,13 +222,19 @@ impl SequentialStager {
         fluree: &crate::Fluree,
         txn: Txn,
         index_config: Option<&IndexConfig>,
-        policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         advance: bool,
     ) -> Result<usize> {
         self.stage_with(advance, |state, request| async move {
             fluree
-                .stage_txn_governed(state, txn, index_config, policy, tracker, Some(&request))
+                .stage_txn_governed(
+                    state,
+                    txn,
+                    index_config,
+                    request.policy(),
+                    tracker,
+                    Some(&request),
+                )
                 .await
         })
         .await
@@ -564,7 +570,8 @@ impl SequentialStager {
         let mut view = StagedLedger::new(self.original, self.folded, &reverse_graph)?
             .with_graph_drops(self.drops.into_iter().collect());
         if !self.nested {
-            guard_request_view(&mut view, &ns_registry, &graph_delta, None).await?;
+            let policy = self.governance.policy();
+            guard_request_view(&mut view, &ns_registry, &graph_delta, policy).await?;
         }
         Ok(StageResult {
             view,
@@ -730,15 +737,23 @@ pub(crate) struct RequestGovernance {
     config: ConfigRead,
     /// The model-ledger heads the request has read, shared by its clones.
     model_heads: Arc<parking_lot::Mutex<HashMap<LedgerId, crate::cross_ledger::ModelHead>>>,
+    /// The policy every operation, and the request's merged result, is
+    /// checked against.
+    policy: Option<Arc<crate::PolicyContext>>,
 }
 
 impl RequestGovernance {
-    pub(crate) fn new(state: LedgerState) -> Self {
+    pub(crate) fn new(state: LedgerState, policy: Option<&crate::PolicyContext>) -> Self {
         Self {
             state,
             config: ConfigRead::default(),
             model_heads: Arc::default(),
+            policy: policy.cloned().map(Arc::new),
         }
+    }
+
+    pub(crate) fn policy(&self) -> Option<&crate::PolicyContext> {
+        self.policy.as_deref()
     }
 
     /// The resolution context for one of the request's operations: it reads
@@ -3740,7 +3755,7 @@ impl crate::Fluree {
         let request = match enclosing {
             Some(request) => request,
             None => {
-                own = RequestGovernance::new(ledger.clone());
+                own = RequestGovernance::new(ledger.clone(), policy);
                 &own
             }
         };
@@ -3888,7 +3903,7 @@ impl crate::Fluree {
 
         let mut stager = match request {
             Some(request) => SequentialStager::within(ledger, request),
-            None => SequentialStager::new(ledger),
+            None => SequentialStager::new(ledger, policy),
         };
         let op_count = txns.len();
         for (i, txn) in txns.into_iter().enumerate() {
@@ -3897,7 +3912,7 @@ impl crate::Fluree {
             // ORIGINAL base).
             let advance = i + 1 < op_count;
             stager
-                .stage(self, txn, index_config, policy, tracker, advance)
+                .stage(self, txn, index_config, tracker, advance)
                 .await?;
         }
         stager.finish().await

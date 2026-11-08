@@ -907,7 +907,7 @@ impl Fluree {
         // config guard apply; otherwise this statement is the request.
         let mut stager = match request {
             Some(request) => SequentialStager::within(ledger, request),
-            None => SequentialStager::new(ledger),
+            None => SequentialStager::new(ledger, policy),
         };
 
         // ---- 1. Read prefix → initial row table --------------------------
@@ -975,7 +975,6 @@ impl Fluree {
                         clause_skolem,
                         ledger_id,
                         index_config,
-                        policy,
                         tracker,
                         span,
                         after,
@@ -992,7 +991,6 @@ impl Fluree {
                         governance,
                         default_context.as_ref(),
                         index_config,
-                        policy,
                         tracker,
                         span,
                     )
@@ -1025,7 +1023,6 @@ impl Fluree {
                             Some(skolem),
                             ledger_id,
                             index_config,
-                            policy,
                             tracker,
                             span,
                             if pi == last_part {
@@ -1235,7 +1232,6 @@ impl Fluree {
         clause_skolem: String,
         ledger_id: &str,
         index_config: Option<&IndexConfig>,
-        policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
         after: StateAfter,
@@ -1282,7 +1278,6 @@ impl Fluree {
             Some(clause_skolem.clone()),
             ledger_id,
             index_config,
-            policy,
             tracker,
             span,
             after,
@@ -1315,7 +1310,6 @@ impl Fluree {
         governance: Option<&GovernanceOptions>,
         default_context: Option<&serde_json::Value>,
         index_config: Option<&IndexConfig>,
-        policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
     ) -> Result<()> {
@@ -1416,7 +1410,6 @@ impl Fluree {
                     Some(clause_skolem.clone()),
                     ledger_id,
                     index_config,
-                    policy,
                     tracker,
                     span,
                     StateAfter::Read,
@@ -1429,9 +1422,7 @@ impl Fluree {
                     .lower_cypher_ast_to_txn(&ast, ledger_id, &stager.state().snapshot)
                     .await?;
                 txn.opts.skolem_txn_id = Some(clause_skolem.clone());
-                stager
-                    .stage(self, txn, index_config, policy, tracker, true)
-                    .await?;
+                stager.stage(self, txn, index_config, tracker, true).await?;
             }
         }
 
@@ -1549,7 +1540,6 @@ impl Fluree {
                     governance,
                     default_context,
                     index_config,
-                    policy,
                     tracker,
                     span,
                 )
@@ -1566,7 +1556,6 @@ impl Fluree {
                     governance,
                     default_context,
                     index_config,
-                    policy,
                     tracker,
                     span,
                 )
@@ -1599,7 +1588,6 @@ impl Fluree {
         governance: Option<&GovernanceOptions>,
         default_context: Option<&serde_json::Value>,
         index_config: Option<&IndexConfig>,
-        policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
     ) -> Result<()> {
@@ -1623,7 +1611,6 @@ impl Fluree {
                     None,
                     ledger_id,
                     index_config,
-                    policy,
                     tracker,
                     span,
                     StateAfter::Read,
@@ -1660,7 +1647,6 @@ impl Fluree {
                 None,
                 ledger_id,
                 index_config,
-                policy,
                 tracker,
                 span,
                 StateAfter::Read,
@@ -1977,7 +1963,6 @@ impl Fluree {
         skolem: Option<String>,
         ledger_id: &str,
         index_config: Option<&IndexConfig>,
-        policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
         after: StateAfter,
@@ -2019,14 +2004,7 @@ impl Fluree {
         }
         txn.opts.skolem_txn_id = skolem;
         stager
-            .stage(
-                self,
-                txn,
-                index_config,
-                policy,
-                tracker,
-                after == StateAfter::Read,
-            )
+            .stage(self, txn, index_config, tracker, after == StateAfter::Read)
             .await
     }
 }

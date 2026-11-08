@@ -199,7 +199,7 @@ impl Fluree {
         let ledger_id = handle.id().to_string();
         Ok(Transaction {
             fluree: self.clone(),
-            stager: SequentialStager::new(base.clone()),
+            stager: SequentialStager::new(base.clone(), policy.as_ref()),
             base,
             base_head,
             operations: Vec::new(),
@@ -540,7 +540,7 @@ async fn stage_one(
                             &CommitOpts::default(),
                             Some(&context.tracker),
                             &context.index_config,
-                            context.policy.as_ref(),
+                            request.policy(),
                             Some(&request),
                         )
                         .await?;
@@ -602,7 +602,7 @@ async fn stage_cypher(
                             &context.ledger_id,
                             Some(&context.governance),
                             Some(&context.index_config),
-                            context.policy.as_ref(),
+                            request.policy(),
                             Some(&context.tracker),
                             Some(skolem_txn_id.to_string()),
                             Some(&request),
@@ -672,7 +672,7 @@ async fn stage_cypher(
                             resolved.primary,
                             followup,
                             Some(&context.index_config),
-                            context.policy.as_ref(),
+                            request.policy(),
                             Some(&context.tracker),
                             Some(&request),
                         )
@@ -684,7 +684,7 @@ async fn stage_cypher(
                             state,
                             resolved.primary,
                             Some(&context.index_config),
-                            context.policy.as_ref(),
+                            request.policy(),
                             Some(&context.tracker),
                             Some(&request),
                         )
@@ -708,7 +708,7 @@ async fn stage_all(
 ) -> Result<SequentialStager> {
     let mut stager = match governance {
         Some(governance) => SequentialStager::resume(base, governance),
-        None => SequentialStager::new(base),
+        None => SequentialStager::new(base, context.policy.as_ref()),
     };
     for op in operations {
         stage_one(fluree, &mut stager, &op.staged, context).await?;

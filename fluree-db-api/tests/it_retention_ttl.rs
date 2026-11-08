@@ -1032,17 +1032,7 @@ async fn setting_a_lifetime_needs_permission_to_retract_the_value() {
         state.novelty.as_ref(),
         Some(state.novelty.as_ref()),
         state.t(),
-        &fluree_db_api::GovernanceOptions {
-            policy: Some(json!([{
-                "@id": "http://example.org/denyStatus",
-                "f:required": true,
-                "f:onProperty": [{"@id": "http://example.org/status"}],
-                "f:action": "f:modify",
-                "f:allow": false
-            }])),
-            default_allow: Some(true),
-            ..Default::default()
-        },
+        &status_denied(),
         &[0],
     )
     .await
@@ -1064,6 +1054,106 @@ async fn setting_a_lifetime_needs_permission_to_retract_the_value() {
         .await
         .expect("pass");
     assert_eq!(report.expired, 1, "{report:?}");
+}
+
+/// Governance that may not modify `ex:status`.
+fn status_denied() -> fluree_db_api::GovernanceOptions {
+    fluree_db_api::GovernanceOptions {
+        policy: Some(json!([{
+            "@id": "http://example.org/denyStatus",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/status"}],
+            "f:action": "f:modify",
+            "f:allow": false
+        }])),
+        default_allow: Some(true),
+        ..Default::default()
+    }
+}
+
+/// A request of several operations is checked as a whole, after its last
+/// operation: under the same policy as each of them.
+#[tokio::test]
+async fn a_multi_operation_request_needs_permission_for_its_lifetimes() {
+    use fluree_db_api::policy_builder::build_policy_context_from_opts;
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-permission-request").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:victim", "ex:status": "online"}),
+    )
+    .await;
+    let t = fluree.ledger(&id).await.unwrap().t();
+
+    let state = fluree.ledger(&id).await.unwrap();
+    let policy = build_policy_context_from_opts(
+        &state.snapshot,
+        state.novelty.as_ref(),
+        Some(state.novelty.as_ref()),
+        state.t(),
+        &status_denied(),
+        &[0],
+    )
+    .await
+    .expect("policy");
+    let handle = fluree.ledger_cached(&id).await.unwrap();
+    let update = fluree
+        .stage(&handle)
+        .sparql_update(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             INSERT DATA { ex:claim rdf:reifies <<(ex:victim ex:status \"online\")>> ; f:ttl 1 . };
+             INSERT DATA { ex:marker ex:value 1 . }",
+        )
+        .policy(policy)
+        .execute()
+        .await;
+    assert!(update.is_err(), "a two-operation update set the lifetime");
+
+    let mut transaction = fluree
+        .begin_transaction(
+            &id,
+            TransactionOptions {
+                governance: status_denied(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("begin");
+    transaction
+        .stage(TxnOperation::Insert(json!({
+            "@context": ctx(),
+            "@id": "ex:claim",
+            "f:ttl": 1,
+            "@reifies": {"@id": "ex:victim", "ex:status": "online"}
+        })))
+        .await
+        .expect("an operation is not checked for retention on its own");
+    transaction
+        .stage(TxnOperation::Insert(
+            json!({"@context": ctx(), "@id": "ex:marker", "ex:value": 1}),
+        ))
+        .await
+        .expect("stage");
+    let committed = transaction.commit(Default::default()).await;
+    assert!(committed.is_err(), "a transaction set the lifetime");
+
+    assert_eq!(
+        fluree.ledger(&id).await.unwrap().t(),
+        t,
+        "nothing committed"
+    );
+    let report = fluree
+        .run_retention_at(&id, now_ms() + 2_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 0, "{report:?}");
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:victim", "ex:status").await,
+        vec![json!("online")]
+    );
 }
 
 #[tokio::test]
