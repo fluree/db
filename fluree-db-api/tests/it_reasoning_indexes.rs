@@ -780,6 +780,161 @@ async fn publication_waits_rather_than_shorten_the_guard() {
     assert_eq!(chain_len(&fluree, id, &index).await, 2);
 }
 
+/// A restarted process measures the guard from the supersession times the
+/// manifests hold, so it keeps what an earlier process published inside the
+/// window. Lowering the count limit there throttles publication; it releases
+/// nothing.
+#[tokio::test]
+async fn a_restart_keeps_the_guard() {
+    use fluree_db_api::reasoning_index::GenerationRetention;
+    let window = |max_generations_in_guard| GenerationRetention {
+        min_age_ms: 3_600_000,
+        max_generations_in_guard,
+    };
+    let (before, after) = crate::support::instances_sharing_storage();
+    before.set_reasoning_index_retention(window(8));
+    let id = "reasoning-indexes/restart:main";
+    let mut ledger = ledger_with(
+        &before,
+        id,
+        json!({"@context": ctx(), "@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}}),
+    )
+    .await;
+    let index = before
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    for name in ["alice", "bob"] {
+        ledger = student_commit(&before, ledger, name).await;
+        published(before.refresh_reasoning_index(id, &index).await.unwrap());
+    }
+    drop((before, ledger));
+
+    after.set_reasoning_index_retention(window(8));
+    let ledger = student_commit(&after, after.ledger(id).await.unwrap(), "carol").await;
+    published(after.refresh_reasoning_index(id, &index).await.unwrap());
+    assert_eq!(chain_len(&after, id, &index).await, 3);
+
+    after.set_reasoning_index_retention(window(1));
+    let _ledger = student_commit(&after, ledger, "dave").await;
+    assert_eq!(
+        after.refresh_reasoning_index(id, &index).await.unwrap(),
+        RefreshOutcome::Throttled { in_guard: 2 }
+    );
+    assert_eq!(chain_len(&after, id, &index).await, 3);
+}
+
+/// Rows, the serving index, and the evaluation time the query reports.
+async fn rows_at(
+    fluree: &Fluree,
+    ledger_id: &str,
+    query: &JsonValue,
+) -> (Vec<JsonValue>, Option<ReasoningIndexTally>, Option<String>) {
+    let resp = fluree
+        .graph(ledger_id)
+        .query()
+        .jsonld(query)
+        .track_all()
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e:?}"));
+    let reasoning = resp.reasoning.as_ref();
+    (
+        normalize_rows(&resp.result),
+        reasoning.and_then(|r| r.index.clone()).map(|h| *h),
+        reasoning.and_then(|r| r.evaluation_time.clone()),
+    )
+}
+
+/// Clock matching: an index registered at a fixed time serves only queries at
+/// that time, and one evaluated at its basis commit's time serves queries that
+/// name no time or that commit's time. Any other time reasons at query time,
+/// with its own clock.
+#[tokio::test]
+async fn an_index_serves_only_its_own_evaluation_time() {
+    const EARLY: &str = "2026-06-01T00:00:00Z";
+    const LATE: &str = "2027-06-01T00:00:00Z";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/clock:main";
+    let rule = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where": [{"@id": "?x", "ex:due": "?d"}, ["filter", "(< ?d (now))"]],
+        "insert": {"@id": "?x", "@type": "ex:Overdue"}
+    });
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "f": "https://ns.flur.ee/db#",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "@graph": [
+                {"@id": "ex:overdueRule", "f:rule": {"@type": "@json", "@value": rule}},
+                {"@id": "ex:early", "ex:due": {"@value": "2026-01-01T00:00:00Z", "@type": "xsd:dateTime"}},
+                {"@id": "ex:late", "ex:due": {"@value": "2027-01-01T00:00:00Z", "@type": "xsd:dateTime"}}
+            ]
+        }),
+    )
+    .await;
+    let overdue = |time: Option<&str>| {
+        let mut q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?x",
+            "where": {"@id": "?x", "@type": "ex:Overdue"},
+            "reasoning": "datalog"
+        });
+        if let Some(time) = time {
+            q["reasoningTime"] = json!(time);
+        }
+        q
+    };
+    let (_, _, commit_time) = rows_at(&fluree, id, &overdue(None)).await;
+    let commit_time = commit_time.expect("a clock-reading program reports its time");
+
+    let fixed = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog", "reasoningTime": EARLY}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &fixed).await.unwrap());
+    let (got, served, _) = rows_at(&fluree, id, &overdue(Some(EARLY))).await;
+    assert_eq!(served.map(|h| h.index_id), Some(fixed.to_string()));
+    assert_eq!(got, vec![json!("ex:early")]);
+    let (got, served, _) = rows_at(&fluree, id, &overdue(Some(LATE))).await;
+    assert!(served.is_none(), "a fixed-time index serves a later time");
+    assert_eq!(got, vec![json!("ex:early"), json!("ex:late")]);
+    let (_, served, _) = rows_at(&fluree, id, &overdue(None)).await;
+    assert!(
+        served.is_none(),
+        "a fixed-time index serves the commit's time"
+    );
+
+    let at_commit = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "datalog"}))
+        .await
+        .unwrap();
+    published(
+        fluree
+            .refresh_reasoning_index(id, &at_commit)
+            .await
+            .unwrap(),
+    );
+    let (at_commit_rows, served, _) = rows_at(&fluree, id, &overdue(None)).await;
+    assert_eq!(served.map(|h| h.index_id), Some(at_commit.to_string()));
+    // Matching compares the requested time, not the resolved one: naming the
+    // commit's time is another request, answered at query time alike.
+    let (got, served, _) = rows_at(&fluree, id, &overdue(Some(&commit_time))).await;
+    assert!(served.is_none(), "the commit's time, named explicitly");
+    assert_eq!(got, at_commit_rows);
+    let (got, served, _) = rows_at(&fluree, id, &overdue(Some(LATE))).await;
+    assert!(
+        served.is_none(),
+        "an index at the commit's time serves a later time"
+    );
+    assert_eq!(got, vec![json!("ex:early"), json!("ex:late")]);
+}
+
 /// The worker refreshes an index after each commit, with no explicit refresh.
 #[tokio::test]
 async fn the_worker_follows_commits() {
@@ -1355,7 +1510,8 @@ async fn a_program_over_a_named_graph_serves_queries_of_that_graph() {
 }
 
 /// owl:sameAs: what query-time reasoning answers through equality, an index
-/// answers the same.
+/// answers the same. Parity only: both lanes share the equality defect that
+/// `same_as_gives_each_member_every_fact` pins.
 #[tokio::test]
 async fn same_as_answers_match_query_time() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1399,6 +1555,63 @@ async fn same_as_answers_match_query_time() {
         let (got, served) = rows(&fluree, id, q).await;
         assert!(served.is_some());
         assert_eq!(&got, expected, "{q}");
+    }
+}
+
+/// eq-rep-s and eq-rep-o give each member of an equality set every member's
+/// facts, at query time and from an index. Today both lanes give them only to
+/// one member, and agree.
+#[tokio::test]
+#[ignore = "known defect: owl:sameAs facts are not copied to every member of the equality set"]
+async fn same_as_gives_each_member_every_fact() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/same-as-members:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:carol", "owl:sameAs": {"@id": "ex:carol-lynn"}},
+                {"@id": "ex:carol-lynn", "ex:age": 30, "ex:knows": {"@id": "ex:dan"}},
+                {"@id": "ex:dan", "@type": "ex:Person"},
+                {"@id": "ex:knows", "@type": "owl:SymmetricProperty"}
+            ]
+        }),
+    )
+    .await;
+    let query = |select: JsonValue, where_: JsonValue| json!({"@context": ctx(), "select": select, "where": where_, "reasoning": "owl2rl"});
+    let cases = [
+        (
+            query(json!("?age"), json!({"@id": "ex:carol", "ex:age": "?age"})),
+            vec![json!(30)],
+        ),
+        (
+            query(json!("?x"), json!({"@id": "ex:dan", "ex:knows": "?x"})),
+            vec![json!("ex:carol"), json!("ex:carol-lynn")],
+        ),
+        (
+            query(json!(["?s", "?o"]), json!({"@id": "?s", "ex:knows": "?o"})),
+            vec![
+                json!(["ex:carol", "ex:dan"]),
+                json!(["ex:carol-lynn", "ex:dan"]),
+                json!(["ex:dan", "ex:carol"]),
+                json!(["ex:dan", "ex:carol-lynn"]),
+            ],
+        ),
+    ];
+    for (q, expected) in &cases {
+        assert_eq!(&rows(&fluree, id, q).await.0, expected, "query time: {q}");
+    }
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    for (q, expected) in &cases {
+        let (got, served) = rows(&fluree, id, q).await;
+        assert!(served.is_some(), "{q}");
+        assert_eq!(&got, expected, "served: {q}");
     }
 }
 

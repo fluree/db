@@ -684,6 +684,32 @@ mod tests {
         ));
     }
 
+    /// Neither basis dominates: the candidate's commit is later, the published
+    /// one's epoch is. Both are live, so neither kind publishes.
+    #[test]
+    fn incomparable_bases_are_discarded() {
+        let line = Line::new(&[("c1", 1), ("c2", 2)], &[], "c2");
+        let (mut doc, id) = doc(1, Some(("c1", 1, 1)));
+        doc.indexes
+            .get_mut(&id)
+            .unwrap()
+            .head
+            .as_mut()
+            .unwrap()
+            .basis
+            .epoch = ErasureEpoch(1);
+        for kind in [GenerationKind::Logical, GenerationKind::Rebuild] {
+            let c = candidate(&id, kind, 1, basis("c2", 2));
+            assert!(
+                matches!(
+                    admit(&doc, &c, &line),
+                    Err(Discard::NoProgress(ref reason)) if reason.contains("incomparable")
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_older_engine_does_not_replace_a_newer_one() {
         let line = Line::new(&[("c1", 1)], &[], "c1");

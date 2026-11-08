@@ -461,3 +461,140 @@ async fn negation_aggregation_and_named_graph_heads_follow_the_contract() {
         }
     }
 }
+
+fn denying_class(class: &str) -> Value {
+    json!({
+        "policy": [{
+            "@id": "ex:denyClass",
+            "f:required": true,
+            "f:onClass": [{"@id": class}],
+            "f:action": "f:view",
+            "f:allow": false
+        }],
+        "default-allow": true
+    })
+}
+
+fn class_restricted(query: &Value, class: &str) -> Value {
+    let mut query = query.clone();
+    query["opts"] = denying_class(class);
+    query
+}
+
+const HIGH_EARNER: &str = "http://example.org/HighEarner";
+const MANAGER: &str = "http://example.org/Manager";
+
+/// An `f:onClass` deny hides every fact of the class's members, under the
+/// membership the query reasons to:
+/// - a derived member (`ex:alice` is a `HighEarner` only by rule) loses her
+///   asserted salary;
+/// - an asserted member (`ex:bob` the `Manager`) loses his derived ancestors.
+///
+/// Today the deny covers only the properties class statistics list for the
+/// class's asserted members, so both stay visible.
+#[tokio::test]
+#[ignore = "known defect: an f:onClass view deny misses derived members and derived properties"]
+async fn a_class_deny_hides_derived_members_and_derived_properties() {
+    let mut observed = Vec::new();
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-deny-{storage:?}:main");
+        let mut data = family_with_rules();
+        data["@graph"]
+            .as_array_mut()
+            .expect("graph")
+            .push(json!({"@id": "ex:bob", "@type": "ex:Manager"}));
+        let fluree = seeded_reader(&ledger_id, &data, storage).await;
+        let fact = |s: &str, p: &str| {
+            query(
+                &ledger_id,
+                json!(["?v"]),
+                json!({"@id": s, p: "?v"}),
+                "datalog",
+            )
+        };
+        let cases = [
+            (
+                "alice's derived class",
+                fact("ex:alice", "@type"),
+                HIGH_EARNER,
+            ),
+            ("alice's salary", fact("ex:alice", "ex:salary"), HIGH_EARNER),
+            ("bob's parent", fact("ex:bob", "ex:parent"), MANAGER),
+            (
+                "bob's derived ancestors",
+                fact("ex:bob", "ex:ancestor"),
+                MANAGER,
+            ),
+        ];
+        for (what, q, class) in cases {
+            assert!(
+                !rows(&fluree, &q).await.is_empty(),
+                "{storage:?}: root sees {what}"
+            );
+            let hidden = rows(&fluree, &class_restricted(&q, class)).await;
+            if !hidden.is_empty() {
+                observed.push(format!("{storage:?}: {what} visible: {hidden:?}"));
+            }
+        }
+    }
+    assert!(observed.is_empty(), "{observed:#?}");
+}
+
+/// One policy-wrapped view answers a plain query and a reasoning query at the
+/// same `t`, in either order. Each judges `f:onClass` by the classes its own
+/// query reasons to: `ex:alice` is a `HighEarner` only under the rules.
+#[tokio::test]
+#[ignore = "known defect: a view's class cache answers a reasoning query with a plain query's classes"]
+async fn one_view_judges_classes_by_each_query_s_reasoning() {
+    use fluree_db_api::{GovernanceOptions, GraphDb};
+    let mut observed = Vec::new();
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-cache-{storage:?}:main");
+        let mut data = family_with_rules();
+        data["@graph"]
+            .as_array_mut()
+            .expect("graph")
+            .push(json!({"@id": "ex:alice", "@type": "ex:Person"}));
+        let fluree = seeded_reader(&ledger_id, &data, storage).await;
+        let opts = GovernanceOptions {
+            policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let classes = |reasoning: &str| {
+            json!({
+                "@context": context(),
+                "select": ["?c"],
+                "where": {"@id": "ex:alice", "@type": "?c"},
+                "reasoning": reasoning
+            })
+        };
+        let (plain, reasoned) = (classes("none"), classes("datalog"));
+        // A HighEarner's facts, its classes included, are all hidden.
+        let expected_plain = vec![json!(["ex:Person"])];
+        let expected_reasoned: Vec<Value> = Vec::new();
+
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        for order in ["plain first", "reasoning first"] {
+            let view = fluree
+                .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+                .await
+                .expect("policy view");
+            let queries = match order {
+                "plain first" => [(&plain, &expected_plain), (&reasoned, &expected_reasoned)],
+                _ => [(&reasoned, &expected_reasoned), (&plain, &expected_plain)],
+            };
+            for (q, expected) in queries {
+                let result = fluree.query(&view, q).await.expect("query");
+                let got = normalize_rows(&result.to_jsonld(&view.snapshot).expect("to_jsonld"));
+                if &got != expected {
+                    observed.push(format!(
+                        "{storage:?}, {order}: reasoning {} gave {got:?}, expected {expected:?}",
+                        q["reasoning"]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(observed.is_empty(), "{observed:#?}");
+}
