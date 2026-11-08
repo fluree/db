@@ -449,7 +449,12 @@ impl Fluree {
         let store = self
             .content_store_for_record_or_id(Some(record), &record.storage_namespace())
             .await?;
-        let found = match pending {
+        // The list may lag the record; only one covering every commit
+        // since the index stands in for the walk.
+        let covered = pending.filter(|pending| {
+            fluree_db_indexer::pending_covers_range(pending, record.index_t, &head)
+        });
+        let found = match covered {
             Some(pending) => probe_pending(store.as_ref(), pending, from).await?,
             None => probe_activation(store.as_ref(), &head, from).await?,
         };

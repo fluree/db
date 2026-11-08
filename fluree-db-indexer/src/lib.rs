@@ -84,6 +84,7 @@ pub use run_index::build::build_from_commits::{
     build_indexes_from_commits, build_indexes_from_remapped_commits, BuildConfig, BuildResult,
     CommitInput, BUILD_STAGE_LINK_RUNS, BUILD_STAGE_MERGE, BUILD_STAGE_REMAP,
 };
+pub use run_index::build::incremental_resolve::pending_covers_range;
 
 use fluree_db_core::ContentStore;
 use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};

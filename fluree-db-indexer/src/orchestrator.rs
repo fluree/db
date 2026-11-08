@@ -978,7 +978,8 @@ type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
 pub trait BuildObserver: Send + Sync {
     /// `pending` lists the commits after the record's index, ascending by
     /// `t`, when the nameservice keeps that list: the commits the build
-    /// fetches.
+    /// fetches. Like the build, an observer trusts it only once
+    /// [`crate::pending_covers_range`] says it covers the record's range.
     async fn before_build(
         &self,
         record: &fluree_db_nameservice::NsRecord,

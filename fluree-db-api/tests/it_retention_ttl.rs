@@ -1595,14 +1595,25 @@ async fn a_ledger_created_again_under_its_name_is_registered_before_indexing() {
         .await
         .unwrap();
     fluree.create_ledger(name).await.unwrap();
-    insert(&fluree, &id, lifetime).await;
+    insert(&fluree, &id, lifetime.clone()).await;
     let second = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
     assert_ne!(first.fence, second.fence);
-    // Read from the commits the build will fetch, as the indexer lists them.
-    let pending = [(second.commit_t, second.commit_head_id.clone().unwrap())];
-    observer
-        .before_build(&second, Some(&pending))
-        .await
-        .unwrap();
+    // A list of the commits since the index that lags the record is not
+    // taken for them: the chain is walked.
+    observer.before_build(&second, Some(&[])).await.unwrap();
     assert!(fluree.retention_status(&id).await.unwrap().active);
+
+    let third_name = "it/ttl-recreated-pending";
+    let third_id = ledger(&fluree, third_name).await;
+    insert(&fluree, &third_id, lifetime).await;
+    let third = fluree
+        .nameservice()
+        .lookup(&third_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Read from the commits the build will fetch, as the indexer lists them.
+    let pending = [(third.commit_t, third.commit_head_id.clone().unwrap())];
+    observer.before_build(&third, Some(&pending)).await.unwrap();
+    assert!(fluree.retention_status(&third_id).await.unwrap().active);
 }

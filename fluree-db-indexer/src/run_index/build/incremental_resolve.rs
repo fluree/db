@@ -1697,7 +1697,11 @@ async fn fetch_commit_bytes(
 /// is gap-free iff each `t` is exactly one greater than its predecessor and the
 /// first entry is `from_t + 1`. A failure here is never a correctness hazard —
 /// it just declines the fast path.
-fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &ContentId) -> bool {
+pub fn pending_covers_range(
+    pending: &[(i64, ContentId)],
+    from_t: i64,
+    head_id: &ContentId,
+) -> bool {
     let Some((_, tip_cid)) = pending.last() else {
         return false;
     };
