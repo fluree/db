@@ -244,6 +244,17 @@ pub struct PushCommitsRequest {
     pub retention: Option<serde_json::Value>,
 }
 
+impl PushCommitsRequest {
+    /// Whether the push carries removals in its retention section: what a
+    /// receiver that does not take the section loses.
+    pub fn carries_removals(&self) -> bool {
+        self.retention.as_ref().is_some_and(|section| {
+            crate::retention::registry::ArchivedRetention::parse(section)
+                .is_ok_and(|r| !r.journal.removals.is_empty())
+        })
+    }
+}
+
 /// An erased commit a push's receiver already has, as the sender holds its
 /// erasure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2228,6 +2228,7 @@ async fn a_push_carries_the_removal_journal() {
         .ledger_id;
     let request = push_request(&source, &id, Some(&base)).await;
     assert!(request.retention.is_some());
+    assert!(request.carries_removals());
     let refused = push(&receiver, &copy, request.clone(), false)
         .await
         .expect_err("a removal the receiver lacks");

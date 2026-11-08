@@ -1341,7 +1341,24 @@ async fn send_push(
     if erased && !client.supports_push_erasures().await {
         return Err(CliError::Config(ERASURES_UNSUPPORTED.into()));
     }
+    warn_if_removals_stay(client, &req).await;
     send_readied(fluree, client, ids, req, base).await
+}
+
+/// Warn when `req` carries removals the remote does not take (a cluster,
+/// which keeps its own journal, or a release before removals): it goes on
+/// serving the history they remove here.
+async fn warn_if_removals_stay(
+    client: &crate::remote_client::RemoteLedgerClient,
+    req: &fluree_db_api::PushCommitsRequest,
+) {
+    if req.carries_removals() && !client.supports_push_retention().await {
+        eprintln!(
+            "  {} the remote does not take this ledger's removal journal: it goes on \
+             serving the history removed here. Make the removals there too.",
+            "warning:".yellow().bold()
+        );
+    }
 }
 
 /// What `ledger_id`'s history up to `head`, which the remote has, gained
@@ -1362,6 +1379,7 @@ async fn push_without_commits(
         return Err(CliError::Config(ERASURES_UNSUPPORTED.into()));
     }
     if !erased && (req.retention.is_none() || !client.supports_push_retention().await) {
+        warn_if_removals_stay(client, &req).await;
         return Ok(false);
     }
     send_readied(fluree, client, ids, req, Some(head)).await?;
@@ -1670,6 +1688,7 @@ pub async fn run_publish(
     if erased && !client.supports_push_erasures().await {
         return Err(CliError::Config(ERASURES_UNSUPPORTED.into()));
     }
+    warn_if_removals_stay(&client, &req).await;
 
     // Check if remote ledger already exists.
     let remote_exists = client
