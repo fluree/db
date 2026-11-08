@@ -669,19 +669,16 @@ impl Fluree {
     /// erased: the sender has not received their erasure. They are taken as
     /// their replacements, as commits pushed erased are, so their originals
     /// reach neither validation nor the ledger's state. Names every commit of
-    /// a list holding one, when the sender named none.
+    /// a list holding one, when the sender named none. A cluster, which
+    /// takes no erased history, refuses the push.
     async fn originals_erased_here(
         &self,
         request: &mut crate::PushCommitsRequest,
     ) -> Result<Vec<(Position, ContentId)>> {
-        let Some(runtime) = self
-            .retention
-            .erasure
-            .get()
-            .filter(|_| self.retention.replicas.get().is_none())
-        else {
+        let Some(runtime) = self.retention.erasure.get() else {
             return Ok(Vec::new());
         };
+        let clustered = self.retention.replicas.get().is_some();
         let mut found = Vec::new();
         for (commits, ids, at) in [
             (
@@ -705,6 +702,9 @@ impl Fluree {
             let mut any = false;
             for (i, cid) in named.iter().enumerate() {
                 if !commits[i].0.is_empty() && runtime.index.erased(cid).await?.is_some() {
+                    if clustered {
+                        return Err(crate::commit_transfer::cannot_hold_erasures());
+                    }
                     found.push((at(i), cid.clone()));
                     any = true;
                 }

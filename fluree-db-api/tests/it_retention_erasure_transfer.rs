@@ -2152,6 +2152,54 @@ async fn a_push_of_an_original_erased_here_takes_its_replacement() {
     );
 }
 
+/// A cluster takes no erased history: a push carrying the original of a
+/// commit it holds erased is refused rather than taken as its original.
+#[tokio::test]
+async fn a_cluster_refuses_a_push_of_an_original_erased_here() {
+    struct Current;
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for Current {
+        async fn sync_reads(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/push-resent-cluster").await;
+    insert_kept(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@kept"}),
+    )
+    .await;
+    let (base, _) = head_of(&fluree, &id).await;
+    fluree
+        .create_branch("it/push-resent-cluster", "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = "it/push-resent-cluster:dev";
+    insert_kept(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let request = push_request(&fluree, dev, Some(&base)).await;
+    erase_published(&fluree, dev, email("alice", "a@secret")).await;
+    fluree.set_retention_replicas(Arc::new(Current));
+
+    match push(&fluree, &id, request, false).await {
+        Err(ApiError::Http { status: 501, .. }) => {}
+        other => panic!("expected 501, got {:?}", other.map(|r| r.accepted)),
+    }
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
 /// A received index is not set over a history holding a commit erased
 /// here: the sender may have built it from the original, as this one was
 /// before the erasure.
