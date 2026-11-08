@@ -54,7 +54,13 @@ fn match_default(
 
     default_match.and_then(|default| {
         if !iri::any_iri(compact_iri) && !compact_iri.starts_with('@') {
-            let full_iri = format!("{default}{compact_iri}");
+            // A term is `@vocab` joined to the term; a reference resolves
+            // against `@base` (RFC 3986), as Turtle's do.
+            let full_iri = if vocab {
+                format!("{default}{compact_iri}")
+            } else {
+                fluree_vocab::iri::resolve_iri(default, compact_iri)
+            };
             Some((
                 full_iri.clone(),
                 ContextEntry {
@@ -1620,5 +1626,37 @@ mod tests {
             matches!(err, JsonLdError::InvalidGraphValue { .. }),
             "{err}"
         );
+    }
+
+    /// A relative `@id` resolves against `@base` per RFC 3986, as Turtle's
+    /// do; a relative `@base` or `@vocab` resolves against the base in effect.
+    #[test]
+    fn relative_references_resolve_against_base_per_rfc_3986() {
+        let id = |context: JsonValue, reference: &str| {
+            let doc = json!({"@context": context, "@id": reference, "http://example.org/p": 1});
+            crate::expand(&doc).unwrap()["@id"].clone()
+        };
+        let cases = [
+            ("http://b.org/x/y", "../b", "http://b.org/b"),
+            ("http://b.org/doc", "a", "http://b.org/a"),
+            ("http://b.org/dir/", "a", "http://b.org/dir/a"),
+            ("http://b.org/ns#", "#a", "http://b.org/ns#a"),
+            ("http://b.org/doc?q=1", "#f", "http://b.org/doc?q=1#f"),
+        ];
+        for (base, reference, resolved) in cases {
+            assert_eq!(
+                id(json!({"@base": base}), reference),
+                resolved,
+                "{reference} against {base}"
+            );
+        }
+
+        let nested = json!([{"@base": "http://b.org/x/"}, {"@base": "../y/"}]);
+        assert_eq!(id(nested, "a"), "http://b.org/y/a");
+
+        let vocab =
+            ParsedContext::parse(None, &json!({"@base": "http://b.org/doc", "@vocab": "ns/"}))
+                .unwrap();
+        assert_eq!(vocab.vocab.as_deref(), Some("http://b.org/ns/"));
     }
 }

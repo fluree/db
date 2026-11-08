@@ -177,8 +177,16 @@ These expand using @context:
 
 ### Relative IRIs
 
-These are resolved relative to a base IRI:
+A relative reference in an `@id` or reference position resolves against `@base`
+by the rules of RFC 3986, in JSON-LD as in Turtle:
 - `alice` → `http://example.org/ns/alice` (if base is `http://example.org/ns/`)
+- `alice` → `http://example.org/alice` (if base is `http://example.org/doc` — the last segment is replaced)
+- `#alice` → `http://example.org/ns#alice` (if base is `http://example.org/ns#`)
+- `../b` → `http://example.org/b` (if base is `http://example.org/x/y`)
+
+A base ending in `/` gives what joining the strings would. A relative `@base`
+resolves against the base already in effect. A reference starting with `?`
+is a variable in Fluree, not a relative IRI.
 
 ## Strict Compact-IRI Guard
 
