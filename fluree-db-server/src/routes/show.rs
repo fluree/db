@@ -121,9 +121,8 @@ async fn show_local(
             }
         }
         // A commit's flakes are audit data on a ledger that suppresses history.
-        let audit = match bearer.0.as_ref() {
-            Some(p) => p.can_audit(&crate::error::scope_id(&alias)?),
-            None => false,
+        let audit = |branch: &fluree_db_api::LedgerId| {
+            bearer.0.as_ref().is_some_and(|p| p.can_audit(branch))
         };
         crate::routes::audit::require_audit(&state, &headers.raw, &alias, audit).await?;
 

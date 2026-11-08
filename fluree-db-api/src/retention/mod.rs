@@ -111,51 +111,44 @@ impl Fluree {
             .is_some_and(|s| !s.journal.removals.is_empty()))
     }
 
-    /// Whether a raw read through `ledger_id` reaches history a removal
-    /// journal suppresses: the branch's own, or a source's, since its store
-    /// reads the commits it shares with its sources from their folders.
-    /// With `every_branch`, any branch of the ledger: a grant over the
-    /// ledger's storage reaches every branch's commits.
-    pub async fn raw_history_suppressed(
+    /// The branches whose suppressed history a raw read through `ledger_id`
+    /// reaches: its own, and its sources', since its store reads the
+    /// commits it shares with them from their folders. With `every_branch`,
+    /// every branch of the ledger, dropped ones included: a grant over the
+    /// ledger's storage reaches all their folders.
+    pub async fn raw_history_suppressing(
         &self,
         ledger_id: &str,
         every_branch: bool,
-    ) -> Result<bool> {
+    ) -> Result<Vec<fluree_db_core::LedgerId>> {
         let id = fluree_db_core::LedgerId::parse(ledger_id)?;
-        if self.history_suppressed(id.as_str()).await? {
-            return Ok(true);
-        }
-        let records = self.nameservice().branch_records(id.name()).await?;
-        let reached: Vec<&str> = if every_branch {
-            records
-                .iter()
-                .filter(|r| !r.retracted)
-                .map(|r| r.ledger_id.as_str())
+        let reached = if every_branch {
+            self.nameservice()
+                .branch_records(id.name())
+                .await?
+                .into_iter()
+                .map(|record| record.ledger_id)
                 .collect()
         } else {
-            let mut reached = Vec::new();
-            let mut source = records
-                .iter()
-                .find(|r| r.ledger_id == id)
-                .and_then(|r| r.source_branch.as_deref());
-            while let Some(branch) = source {
-                let Some(record) = records.iter().find(|r| r.branch == branch) else {
-                    break;
-                };
-                if reached.contains(&record.ledger_id.as_str()) {
+            let mut reached = vec![id.clone()];
+            let mut record = self.nameservice().lookup(id.as_str()).await?;
+            while let Some(source) = record.and_then(|r| r.source_branch) {
+                let source = id.with_branch(&source)?;
+                if reached.contains(&source) {
                     break;
                 }
-                reached.push(record.ledger_id.as_str());
-                source = record.source_branch.as_deref();
+                record = self.nameservice().lookup(source.as_str()).await?;
+                reached.push(source);
             }
             reached
         };
+        let mut suppressing = Vec::new();
         for branch in reached {
-            if branch != id.as_str() && self.history_suppressed(branch).await? {
-                return Ok(true);
+            if self.history_suppressed(branch.as_str()).await? {
+                suppressing.push(branch);
             }
         }
-        Ok(false)
+        Ok(suppressing)
     }
 
     /// What a ledger archive carries of `ledger_id`'s retention (its

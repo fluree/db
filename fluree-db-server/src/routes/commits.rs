@@ -85,12 +85,9 @@ async fn commits_ledger_local(
     }
     // Commit and transaction blobs are audit data on a ledger that
     // suppresses history.
-    crate::routes::audit::require_audit(
-        &state,
-        &axum::http::HeaderMap::new(),
-        &ledger,
-        principal.can_audit(&crate::error::scope_id(&ledger)?),
-    )
+    crate::routes::audit::require_audit(&state, &axum::http::HeaderMap::new(), &ledger, |branch| {
+        principal.can_audit(branch)
+    })
     .await?;
 
     let fluree = &state.fluree;

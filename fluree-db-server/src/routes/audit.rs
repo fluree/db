@@ -12,17 +12,18 @@ use fluree_db_api::{ApiError, LedgerId};
 use crate::error::{Result, ServerError};
 use crate::state::AppState;
 
-/// Refuse raw commit content read through `ledger` unless no history it
-/// reaches is suppressed (its own, or a source branch's, whose commits its
-/// store reads too) or `granted` (the route's own principal) says the caller
-/// may audit it. A bearer token the route's extractor ignored (data auth
-/// off) still counts when it carries the audit permission. A cluster
-/// replica short of the erasures it applied serves raw content to no one.
+/// Refuse raw commit content read through `ledger` unless the caller may
+/// audit each branch whose suppressed history it reaches (its own, or a
+/// source branch's, whose commits its store reads too). `granted` says
+/// whether the route's own principal may audit a branch. A bearer token the
+/// route's extractor ignored (data auth off) still counts when it carries the
+/// audit permission. A cluster replica short of the erasures it applied
+/// serves raw content to no one.
 pub(crate) async fn require_audit(
     state: &AppState,
     headers: &HeaderMap,
     ledger: &str,
-    granted: bool,
+    granted: impl Fn(&LedgerId) -> bool,
 ) -> Result<()> {
     require_audit_reaching(state, headers, ledger, granted, false).await
 }
@@ -34,7 +35,7 @@ pub(crate) async fn require_audit_of_every_branch(
     state: &AppState,
     headers: &HeaderMap,
     ledger: &str,
-    granted: bool,
+    granted: impl Fn(&LedgerId) -> bool,
 ) -> Result<()> {
     require_audit_reaching(state, headers, ledger, granted, true).await
 }
@@ -43,32 +44,47 @@ async fn require_audit_reaching(
     state: &AppState,
     headers: &HeaderMap,
     ledger: &str,
-    granted: bool,
+    granted: impl Fn(&LedgerId) -> bool,
     every_branch: bool,
 ) -> Result<()> {
-    if granted {
-        return Ok(state.fluree.confirm_history_current(ledger).await?);
-    }
-    if !state
+    // Reading each branch's journal first confirms, on a cluster replica,
+    // that it holds the current one and the erasures it names.
+    let suppressing = state
         .fluree
-        .raw_history_suppressed(ledger, every_branch)
-        .await?
-    {
-        return Ok(());
-    }
-    let ledger_id = LedgerId::parse(ledger).map_err(|e| ServerError::bad_request(e.to_string()))?;
-    if let Some(token) = crate::extract::extract_bearer_token(headers) {
-        if let Ok(principal) = crate::extract::verify_data_principal(&token, state).await {
-            if principal.can_audit(&ledger_id) {
-                return Ok(());
-            }
+        .raw_history_suppressing(ledger, every_branch)
+        .await?;
+    let mut bearer = None;
+    for branch in suppressing {
+        if granted(&branch) {
+            continue;
         }
+        if bearer.is_none() {
+            bearer = Some(match crate::extract::extract_bearer_token(headers) {
+                Some(token) => crate::extract::verify_data_principal(&token, state)
+                    .await
+                    .ok(),
+                None => None,
+            });
+        }
+        if bearer
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_some_and(|principal| principal.can_audit(&branch))
+        {
+            continue;
+        }
+        let through = if branch.as_str() == ledger {
+            String::new()
+        } else {
+            format!(" (read through {ledger})")
+        };
+        return Err(ServerError::Api(ApiError::http(
+            403,
+            format!(
+                "{branch} suppresses history{through}: raw commits and transactions need \
+                 the fluree.ledger.audit permission"
+            ),
+        )));
     }
-    Err(ServerError::Api(ApiError::http(
-        403,
-        format!(
-            "{ledger} suppresses history: raw commits and transactions need the \
-             fluree.ledger.audit permission"
-        ),
-    )))
+    Ok(())
 }

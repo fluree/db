@@ -4637,12 +4637,28 @@ async fn test_pack_through_a_branch_needs_audit_for_its_sources_removals() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let auditor = token_with_claims(
+    // Audit of the branch read through does not cover its source's removals.
+    let dev_auditor = token_with_claims(
         &signing_key,
-        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+        serde_json::json!({
+            "fluree.storage.all": true,
+            "fluree.ledger.audit.ledgers": ["packedb:dev"]
+        }),
     );
     let resp = build_router(state.clone())
-        .oneshot(post(auditor))
+        .oneshot(post(dev_auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let main_auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({
+            "fluree.storage.all": true,
+            "fluree.ledger.audit.ledgers": ["packedb:main"]
+        }),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(main_auditor))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

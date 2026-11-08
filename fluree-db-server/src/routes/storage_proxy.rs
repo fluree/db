@@ -301,7 +301,7 @@ pub async fn get_vended_credentials(
         &state,
         &axum::http::HeaderMap::new(),
         effective_ledger.as_str(),
-        principal.can_audit(&effective_ledger),
+        |branch| principal.can_audit(branch),
     )
     .await?;
 
@@ -679,7 +679,7 @@ pub async fn get_block(
             &state,
             &axum::http::HeaderMap::new(),
             effective_ledger.as_str(),
-            principal.can_audit(&effective_ledger),
+            |branch| principal.can_audit(branch),
         )
         .await?;
     }
@@ -893,7 +893,7 @@ pub async fn get_object_by_cid(
             &state,
             &axum::http::HeaderMap::new(),
             effective_ledger.as_str(),
-            principal.can_audit(&effective_ledger),
+            |branch| principal.can_audit(branch),
         )
         .await?;
     }

@@ -2518,7 +2518,8 @@ pub async fn merge_preview(
                     .transpose()?,
             };
             for branch in std::iter::once(source).chain(target) {
-                let audit = bearer.0.as_ref().is_some_and(|p| p.can_audit(&branch));
+                let audit =
+                    |b: &fluree_db_api::LedgerId| bearer.0.as_ref().is_some_and(|p| p.can_audit(b));
                 crate::routes::audit::require_audit(&state, &headers.raw, branch.as_str(), audit)
                     .await?;
             }
