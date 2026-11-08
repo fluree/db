@@ -12,7 +12,7 @@
 // the runtime state they drive is unused.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -31,8 +31,10 @@ use crate::{Fluree, Result};
 /// The retention state one `Fluree` instance keeps in memory.
 #[derive(Default)]
 pub(crate) struct RetentionRuntime {
-    /// Branches known to be registered.
-    active: parking_lot::Mutex<HashSet<String>>,
+    /// Branches known to be registered, with the incarnation the
+    /// registration was read for where it is known: one created again under
+    /// the name has its own registration, or none.
+    active: parking_lot::Mutex<HashMap<String, Option<Incarnation>>>,
     /// Unregistered branches, with the incarnation whose chain was probed
     /// and the commit `t` it was probed through.
     probed: parking_lot::Mutex<HashMap<String, (Incarnation, i64)>>,
@@ -86,9 +88,19 @@ fn incarnation(record: &NsRecord) -> Incarnation {
 
 impl RetentionRuntime {
     pub(crate) fn mark_active(&self, ledger_id: &str) {
-        self.active.lock().insert(ledger_id.to_string());
+        self.mark_registered(ledger_id, None);
+    }
+
+    fn mark_registered(&self, ledger_id: &str, incarnation: Option<Incarnation>) {
+        self.active
+            .lock()
+            .insert(ledger_id.to_string(), incarnation);
         self.probed.lock().remove(ledger_id);
         self.nudge.notify_one();
+    }
+
+    fn active_ledgers(&self) -> Vec<String> {
+        self.active.lock().keys().cloned().collect()
     }
 
     pub(crate) fn running(&self) -> bool {
@@ -308,7 +320,7 @@ impl Fluree {
     /// One pass over every active branch. Returns whether there is more
     /// work right away (a batch committed or was recomputed).
     async fn retention_sweep(&self, worker: &Worker) -> bool {
-        let ledgers: Vec<String> = self.retention.active.lock().iter().cloned().collect();
+        let ledgers: Vec<String> = self.retention.active_ledgers();
         let mut busy = false;
         for ledger_id in ledgers {
             match self
@@ -337,7 +349,7 @@ impl Fluree {
         }
         #[cfg(feature = "native")]
         {
-            let ledgers: Vec<String> = self.retention.active.lock().iter().cloned().collect();
+            let ledgers: Vec<String> = self.retention.active_ledgers();
             self.erasure_sweep(&worker.fluree, &ledgers, worker.options.purge_grace)
                 .await;
         }
@@ -393,7 +405,8 @@ impl Fluree {
     #[cfg(not(target_arch = "wasm32"))]
     async fn observe_build_for_retention(&self, record: &NsRecord) -> Result<()> {
         let id = record.ledger_id.to_string();
-        if self.retention.active.lock().contains(&id) {
+        let registered = Some(incarnation(record));
+        if self.retention.active.lock().get(&id) == Some(&registered) {
             return Ok(());
         }
         let ns = self.publisher()?;
@@ -402,7 +415,7 @@ impl Fluree {
             .1
             .is_some()
         {
-            self.retention.mark_active(&id);
+            self.retention.mark_registered(&id, registered);
             return Ok(());
         }
         let Some(head) = record.commit_head_id.clone() else {
@@ -423,7 +436,7 @@ impl Fluree {
                 .1
             {
                 registry::activate(ns, self.registry_objects(), &id, r.active_since_t).await?;
-                self.retention.mark_active(&id);
+                self.retention.mark_registered(&id, registered);
                 return Ok(());
             }
         }
@@ -433,7 +446,7 @@ impl Fluree {
         match probe_activation(store.as_ref(), &head, from).await? {
             Some(since) => {
                 registry::activate(ns, self.registry_objects(), &id, since).await?;
-                self.retention.mark_active(&id);
+                self.retention.mark_registered(&id, registered);
             }
             None => {
                 self.retention

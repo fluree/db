@@ -1574,3 +1574,30 @@ async fn a_graph_drop_ends_its_values_lifetimes() {
     assert_eq!(in_graph("ex:g1").await, json!(["a"]));
     assert_eq!(in_graph("ex:g2").await, json!(["b"]));
 }
+
+/// A ledger created again under a dropped one's name is registered for its
+/// own lifetimes, before an index build covers them.
+#[tokio::test]
+async fn a_ledger_created_again_under_its_name_is_registered_before_indexing() {
+    let fluree = std::sync::Arc::new(FlureeBuilder::memory().build_memory());
+    let name = "it/ttl-recreated";
+    let id = ledger(&fluree, name).await;
+    let lifetime =
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "private", "@ttl": 1}});
+    insert(&fluree, &id, lifetime.clone()).await;
+    let observer = fluree.retention_build_observer();
+    let first = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    observer.before_build(&first).await.unwrap();
+    assert!(fluree.retention_status(&id).await.unwrap().active);
+
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    fluree.create_ledger(name).await.unwrap();
+    insert(&fluree, &id, lifetime).await;
+    let second = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    assert_ne!(first.fence, second.fence);
+    observer.before_build(&second).await.unwrap();
+    assert!(fluree.retention_status(&id).await.unwrap().active);
+}
