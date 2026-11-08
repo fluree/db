@@ -44,6 +44,7 @@ pub mod query;
 pub mod reasoning;
 pub mod term_components;
 pub mod triple;
+pub mod walk;
 
 pub use adapters::{
     GeoSearchCenter, GeoSearchPattern, IndexSearchPattern, IndexSearchTarget, R2rmlPattern,

@@ -1555,6 +1555,24 @@ async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_
         json!({"@context": ctx(), "@id": "ex:c", "ex:count": 2}),
     )
     .await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:d", "@type": "ex:Doc", "ex:text": "rust language"}),
+    )
+    .await;
+    let created = fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "replica-search",
+            &id,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:text": "?text"}],
+                "select": {"?x": ["@id", "ex:text"]}
+            }),
+        ))
+        .await
+        .expect("create index");
     fluree.set_retention_replicas(std::sync::Arc::new(Partitioned));
     assert!(fluree
         .retention_status(&id)
@@ -1581,6 +1599,22 @@ async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_
             .unwrap(),
         vec![json!(2)]
     );
+    // So is a search of current state.
+    let search = json!({
+        "@context": ctx(),
+        "from": id,
+        "select": ["?doc"],
+        "where": [{
+            "f:graphSource": created.graph_source_id,
+            "f:searchText": "rust",
+            "f:searchLimit": 10,
+            "f:searchResult": {"f:resultId": "?doc"}
+        }]
+    });
+    fluree
+        .query_connection(&search)
+        .await
+        .expect("current search");
     let held = fluree.db(&id).await.unwrap();
     upsert(
         &fluree,
@@ -2827,5 +2861,43 @@ async fn a_selector_matches_the_datatype_and_language_it_names() {
             .await
             .unwrap_or_else(|e| panic!("{object}: {e}"));
         assert_eq!(held(&fluree).await, left, "after removing {object}");
+    }
+}
+
+/// An `EXISTS` in a solution modifier reads history as a WHERE pattern does.
+#[tokio::test]
+async fn a_solution_modifier_cannot_read_removed_history() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-modifiers").await;
+    let t = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .unwrap();
+    let exists = r#"EXISTS { ex:alice ex:email "a@old" }"#;
+    let prefix =
+        format!("PREFIX ex: <http://example.org/> SELECT (COUNT(*) AS ?n) FROM <{id}@t:{t}>");
+    for query in [
+        format!("{prefix} WHERE {{ VALUES ?x {{ 1 }} }} HAVING ({exists})"),
+        format!(
+            "PREFIX ex: <http://example.org/> SELECT ?x FROM <{id}@t:{t}> \
+             WHERE {{ VALUES ?x {{ 1 2 }} }} ORDER BY ({exists})"
+        ),
+        format!(
+            "{prefix} WHERE {{ {{ SELECT (COUNT(*) AS ?m) WHERE {{ VALUES ?x {{ 1 }} }} \
+             HAVING ({exists}) }} }}"
+        ),
+    ] {
+        let result = fluree.query_connection_sparql(&query).await;
+        assert!(
+            matches!(result, Err(ApiError::HistoryUnavailable(_))),
+            "{query}: {:?}",
+            result.map(|_| "answered")
+        );
     }
 }

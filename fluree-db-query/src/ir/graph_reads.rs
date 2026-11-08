@@ -1,10 +1,8 @@
 //! The graphs a query reads beyond the one it runs against.
 
-use super::expression::Expression;
-use super::grouping::Grouping;
 use super::pattern::{GraphName, Pattern};
 use super::query::Query;
-use crate::var_registry::VarId;
+use super::walk::for_each_pattern;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -28,82 +26,17 @@ impl GraphReads {
             any: query.union_default_graph == Some(true) || query.reasoning.has_reasoning(),
             ..Self::default()
         };
-        reads.patterns(&query.patterns);
-        reads.solution_modifiers(query.grouping.as_ref(), &query.order_binds);
-        if let Some(post_values) = &query.post_values {
-            for (_, expr) in &post_values.then {
-                reads.expression(expr);
-            }
-        }
+        for_each_pattern(query, &mut |pattern| match pattern {
+            Pattern::Graph { name, .. } => match name {
+                GraphName::Iri(iri) => {
+                    reads.named.insert(Arc::clone(iri));
+                }
+                GraphName::Var(_) => reads.any = true,
+            },
+            Pattern::Service(_) => reads.any = true,
+            _ => {}
+        });
         reads
-    }
-
-    fn patterns(&mut self, patterns: &[Pattern]) {
-        for pattern in patterns {
-            match pattern {
-                Pattern::Graph { name, patterns } => {
-                    match name {
-                        GraphName::Iri(iri) => {
-                            self.named.insert(Arc::clone(iri));
-                        }
-                        GraphName::Var(_) => self.any = true,
-                    }
-                    self.patterns(patterns);
-                }
-                Pattern::Service(_) => self.any = true,
-                Pattern::Optional(inner)
-                | Pattern::Minus(inner)
-                | Pattern::Exists(inner)
-                | Pattern::NotExists(inner)
-                | Pattern::DefaultGraphSource { patterns: inner }
-                | Pattern::EdgeAnnotation { body: inner, .. } => self.patterns(inner),
-                Pattern::Union(branches) => {
-                    for branch in branches {
-                        self.patterns(branch);
-                    }
-                }
-                Pattern::Subquery(sub) => {
-                    self.patterns(&sub.patterns);
-                    self.solution_modifiers(sub.grouping.as_ref(), &sub.order_binds);
-                }
-                Pattern::Filter(expr)
-                | Pattern::Bind { expr, .. }
-                | Pattern::Unwind { list: expr, .. } => self.expression(expr),
-                Pattern::Triple(_)
-                | Pattern::ListView(_)
-                | Pattern::Values { .. }
-                | Pattern::PropertyPath(_)
-                | Pattern::TermComponents(_)
-                | Pattern::ShortestPath(_)
-                | Pattern::IndexSearch(_)
-                | Pattern::VectorSearch(_)
-                | Pattern::R2rml(_)
-                | Pattern::GeoSearch(_)
-                | Pattern::S2Search(_) => {}
-            }
-        }
-    }
-
-    fn solution_modifiers(
-        &mut self,
-        grouping: Option<&Grouping>,
-        order_binds: &[(VarId, Expression)],
-    ) {
-        if let Some(
-            Grouping::Implicit { having, binds, .. } | Grouping::Explicit { having, binds, .. },
-        ) = grouping
-        {
-            for expr in having.iter().chain(binds.iter().map(|(_, expr)| expr)) {
-                self.expression(expr);
-            }
-        }
-        for (_, expr) in order_binds {
-            self.expression(expr);
-        }
-    }
-
-    fn expression(&mut self, expr: &Expression) {
-        expr.for_each_embedded_patterns(&mut |patterns| self.patterns(patterns));
     }
 }
 

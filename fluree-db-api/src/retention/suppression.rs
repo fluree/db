@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use fluree_db_core::{ContentId, LedgerSnapshot};
 use fluree_db_nameservice::NsRecord;
+use fluree_db_query::ir::walk::for_each_pattern;
 use fluree_db_query::ir::{Pattern, Query, Ref};
 
 use super::journal::{Journal, Removal};
@@ -33,13 +34,18 @@ pub(crate) enum Reads {
     Facts(Vec<(Option<String>, String)>),
 }
 
-/// What `query` reads, in IRIs.
+/// What `query` reads, in IRIs: every pattern it evaluates, those in its
+/// solution modifiers included.
 pub(crate) fn reads_of(query: &Query, snapshot: &LedgerSnapshot) -> Reads {
     if query.output.has_hydration() {
         return Reads::Everything;
     }
     let mut facts = Vec::new();
-    if collect(&query.patterns, snapshot, &mut facts) {
+    let mut bounded = true;
+    for_each_pattern(query, &mut |pattern| {
+        bounded &= read_by(pattern, snapshot, &mut facts);
+    });
+    if bounded {
         Reads::Facts(facts)
     } else {
         Reads::Everything
@@ -54,113 +60,91 @@ fn iri(r: &Ref, snapshot: &LedgerSnapshot) -> Option<String> {
     }
 }
 
-/// Collect the facts `patterns` read; `false` when they can read anything.
-fn collect(
-    patterns: &[Pattern],
+/// Collect the facts `pattern` itself reads, not those of the patterns
+/// nested in it; `false` when it can read anything.
+fn read_by(
+    pattern: &Pattern,
     snapshot: &LedgerSnapshot,
     out: &mut Vec<(Option<String>, String)>,
 ) -> bool {
-    for pattern in patterns {
-        let bounded = match pattern {
-            Pattern::Triple(tp) => match iri(&tp.p, snapshot) {
-                Some(p) => {
-                    out.push((iri(&tp.s, snapshot), p));
-                    true
-                }
-                None => false,
-            },
-            Pattern::EdgeAnnotation { edge, body, .. } => match iri(&edge.p, snapshot) {
-                Some(p) => {
-                    out.push((iri(&edge.s, snapshot), p));
-                    out.push((None, fluree_vocab::rdf::REIFIES.to_string()));
-                    collect(body, snapshot, out)
-                }
-                None => false,
-            },
-            // Its values may be a list's members, read through the list's
-            // cells.
-            Pattern::ListView(lv) => match iri(&lv.triple.p, snapshot) {
-                Some(p) => {
-                    out.push((iri(&lv.triple.s, snapshot), p));
-                    out.push((None, fluree_vocab::rdf::FIRST.to_string()));
-                    out.push((None, fluree_vocab::rdf::REST.to_string()));
-                    true
-                }
-                None => false,
-            },
-            // A path's steps past the first, and an inverse step, read
-            // subjects other than the constant one: its predicates count for
-            // every subject.
-            Pattern::PropertyPath(path) => {
-                if path.wildcard || !path.sequence_steps.is_empty() {
-                    false
-                } else {
-                    path.predicates
-                        .iter()
-                        .all(|p| match snapshot.decode_sid(p) {
-                            Some(p) => {
-                                out.push((None, p));
-                                true
-                            }
-                            None => false,
-                        })
-                }
+    match pattern {
+        Pattern::Triple(tp) => match iri(&tp.p, snapshot) {
+            Some(p) => {
+                out.push((iri(&tp.s, snapshot), p));
+                true
             }
-            Pattern::Optional(ps)
-            | Pattern::Minus(ps)
-            | Pattern::Exists(ps)
-            | Pattern::NotExists(ps)
-            | Pattern::DefaultGraphSource { patterns: ps }
-            | Pattern::Graph { patterns: ps, .. } => collect(ps, snapshot, out),
-            Pattern::Union(branches) => branches.iter().all(|b| collect(b, snapshot, out)),
-            Pattern::Subquery(sub) => collect(&sub.patterns, snapshot, out),
-            Pattern::Filter(expr)
-            | Pattern::Bind { expr, .. }
-            | Pattern::Unwind { list: expr, .. } => {
-                let mut ok = true;
-                expr.for_each_embedded_patterns(&mut |ps| ok &= collect(ps, snapshot, out));
-                ok
+            None => false,
+        },
+        Pattern::EdgeAnnotation { edge, .. } => match iri(&edge.p, snapshot) {
+            Some(p) => {
+                out.push((iri(&edge.s, snapshot), p));
+                out.push((None, fluree_vocab::rdf::REIFIES.to_string()));
+                true
             }
-            Pattern::Values { .. }
-            | Pattern::TermComponents(_)
-            | Pattern::IndexSearch(_)
-            | Pattern::VectorSearch(_)
-            | Pattern::R2rml(_) => true,
-            Pattern::ShortestPath(_)
-            | Pattern::GeoSearch(_)
-            | Pattern::S2Search(_)
-            | Pattern::Service(_) => false,
-        };
-        if !bounded {
-            return false;
+            None => false,
+        },
+        // Its values may be a list's members, read through the list's cells.
+        Pattern::ListView(lv) => match iri(&lv.triple.p, snapshot) {
+            Some(p) => {
+                out.push((iri(&lv.triple.s, snapshot), p));
+                out.push((None, fluree_vocab::rdf::FIRST.to_string()));
+                out.push((None, fluree_vocab::rdf::REST.to_string()));
+                true
+            }
+            None => false,
+        },
+        // A path's steps past the first, and an inverse step, read subjects
+        // other than the constant one: its predicates count for every
+        // subject.
+        Pattern::PropertyPath(path) => {
+            if path.wildcard || !path.sequence_steps.is_empty() {
+                false
+            } else {
+                path.predicates
+                    .iter()
+                    .all(|p| match snapshot.decode_sid(p) {
+                        Some(p) => {
+                            out.push((None, p));
+                            true
+                        }
+                        None => false,
+                    })
+            }
         }
+        Pattern::Optional(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::DefaultGraphSource { .. }
+        | Pattern::Graph { .. }
+        | Pattern::Union(_)
+        | Pattern::Subquery(_)
+        | Pattern::Filter(_)
+        | Pattern::Bind { .. }
+        | Pattern::Unwind { .. }
+        | Pattern::Values { .. }
+        | Pattern::TermComponents(_)
+        | Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::R2rml(_) => true,
+        Pattern::ShortestPath(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_)
+        | Pattern::Service(_) => false,
     }
-    true
 }
 
-/// The search graph sources (full-text, vector) `patterns` read.
-pub(crate) fn search_sources(patterns: &[Pattern], out: &mut Vec<String>) {
-    for pattern in patterns {
-        match pattern {
-            Pattern::IndexSearch(p) => out.push(p.graph_source_id.clone()),
-            Pattern::VectorSearch(p) => out.push(p.graph_source_id.clone()),
-            Pattern::EdgeAnnotation { body: ps, .. }
-            | Pattern::Optional(ps)
-            | Pattern::Minus(ps)
-            | Pattern::Exists(ps)
-            | Pattern::NotExists(ps)
-            | Pattern::DefaultGraphSource { patterns: ps }
-            | Pattern::Graph { patterns: ps, .. } => search_sources(ps, out),
-            Pattern::Union(branches) => branches.iter().for_each(|b| search_sources(b, out)),
-            Pattern::Subquery(sub) => search_sources(&sub.patterns, out),
-            Pattern::Filter(expr)
-            | Pattern::Bind { expr, .. }
-            | Pattern::Unwind { list: expr, .. } => {
-                expr.for_each_embedded_patterns(&mut |ps| search_sources(ps, out));
-            }
-            _ => {}
-        }
-    }
+/// The search graph sources `query` consults.
+pub(crate) fn search_sources(query: &Query) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_pattern(query, &mut |pattern| match pattern {
+        Pattern::IndexSearch(p) => out.push(p.graph_source_id.clone()),
+        Pattern::VectorSearch(p) => out.push(p.graph_source_id.clone()),
+        _ => {}
+    });
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// A historical read of one ledger.
@@ -522,14 +506,7 @@ impl Fluree {
         query: &Query,
         historical: bool,
     ) -> Result<()> {
-        let mut sources = Vec::new();
-        search_sources(&query.patterns, &mut sources);
-        if sources.is_empty() {
-            return Ok(());
-        }
-        sources.sort();
-        sources.dedup();
-        for id in sources {
+        for id in search_sources(query) {
             let Some(record) = self.nameservice().lookup_graph_source(&id).await? else {
                 continue;
             };
@@ -539,7 +516,10 @@ impl Fluree {
                     continue;
                 };
                 let ledger_id = ledger_id.to_string();
-                let Some(suppression) = self.suppression_for(&ledger_id).await? else {
+                // A current search is a current-state read: like one of a
+                // ledger, it is checked against the journal this replica
+                // holds, without waiting on the cluster.
+                let Some(suppression) = self.suppression_with(&ledger_id, historical).await? else {
                     continue;
                 };
                 let journal = &suppression.journal;
