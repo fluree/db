@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use fluree_db_redaction::protocol::{ProveRequest, ProveResponse};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// Why a step was not proved.
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +123,14 @@ pub fn check_prover(prover: &Path) -> Result<(), String> {
 /// How long `--image-id`, which prints a constant, may take.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Most a step's response may hold: a receipt, and a replacement, which
+/// stores its operations uncompressed, several times its original's size.
+const RESPONSE_LIMIT: usize = 1 << 30;
+
+/// The end of a step's diagnostics that is kept: its last line names a
+/// failure.
+const DIAGNOSTICS_TAIL: usize = 64 * 1024;
+
 fn check_within(prover: &Path, timeout: Duration) -> Result<(), String> {
     let mut command = std::process::Command::new(prover);
     command
@@ -226,9 +234,7 @@ impl Prover for SubprocessProver {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        tokio::fs::create_dir_all(&scratch)
-            .await
-            .map_err(unavailable)?;
+        create_scratch(&scratch).await.map_err(unavailable)?;
         let outcome = run(&self.config, &scratch, request).await;
         if let Err(e) = tokio::fs::remove_dir_all(&scratch).await {
             tracing::warn!(dir = %scratch.display(), error = %e, "prover scratch not removed");
@@ -241,6 +247,52 @@ impl Prover for SubprocessProver {
             name.strip_prefix("step-")?.split_once('-')?.0.parse().ok()
         })
     }
+}
+
+/// A step's scratch directory, which the input commit and the prover's
+/// temporary files pass through: readable by this user alone.
+async fn create_scratch(dir: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+/// Read `reader` to its end, keeping at most `limit` bytes of it: its
+/// start, or with `tail`, its end. Says whether anything was left out.
+async fn read_capped<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    tail: bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut over = false;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if tail {
+            kept.extend_from_slice(&buf[..n]);
+            if kept.len() > 2 * limit {
+                kept.drain(..kept.len() - limit);
+                over = true;
+            }
+        } else {
+            let take = n.min(limit - kept.len());
+            kept.extend_from_slice(&buf[..take]);
+            over |= take < n;
+        }
+    }
+    if kept.len() > limit {
+        kept.drain(..kept.len() - limit);
+        over = true;
+    }
+    Ok((kept, over))
 }
 
 /// Kills a step's process group when the step ends, however it ends.
@@ -335,20 +387,18 @@ async fn run(
             drop(stdin);
             Ok::<_, std::io::Error>(())
         };
-        let mut out = Vec::new();
-        let mut err = Vec::new();
         let (written, read, read_err) = tokio::join!(
             write,
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err)
+            read_capped(&mut stdout, RESPONSE_LIMIT, false),
+            read_capped(&mut stderr, DIAGNOSTICS_TAIL, true)
         );
         written?;
-        read?;
-        read_err?;
+        let out = read?;
+        let (err, _) = read_err?;
         let status = child.wait().await?;
         Ok::<_, std::io::Error>((status, out, err))
     };
-    let (status, out, err) = tokio::time::timeout(config.timeout, exchange)
+    let (status, (out, too_long), err) = tokio::time::timeout(config.timeout, exchange)
         .await
         .map_err(|_| ProverError::Unavailable(format!("no result in {:?}", config.timeout)))?
         .map_err(unavailable)?;
@@ -367,7 +417,52 @@ async fn run(
             ProverError::Failed(format!("{status}: {last}"))
         });
     }
+    if too_long {
+        return Err(ProverError::Failed(format!(
+            "its response exceeds {RESPONSE_LIMIT} bytes"
+        )));
+    }
     ProveResponse::decode(&out).map_err(|e| ProverError::Failed(format!("its response: {e}")))
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::read_capped;
+
+    /// A prover's output is kept to its limit, its start or its end, and
+    /// read through to the end either way, so the prover never blocks.
+    #[tokio::test]
+    async fn output_is_kept_to_its_limit() {
+        let bytes: Vec<u8> = (0..200u8).collect();
+        assert_eq!(
+            read_capped(&bytes[..], 500, false).await.unwrap(),
+            (bytes.clone(), false)
+        );
+        assert_eq!(
+            read_capped(&bytes[..], 50, false).await.unwrap(),
+            (bytes[..50].to_vec(), true)
+        );
+        assert_eq!(
+            read_capped(&bytes[..], 50, true).await.unwrap(),
+            (bytes[150..].to_vec(), true)
+        );
+        let long = vec![7u8; 1 << 20];
+        let (kept, over) = read_capped(&long[..], 1000, true).await.unwrap();
+        assert!(over && kept.len() == 1000);
+    }
+
+    /// A step's scratch, which holds the commit it proves, is this user's
+    /// alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_scratch_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("step-1-1");
+        super::create_scratch(&scratch).await.unwrap();
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 }
 
 #[cfg(all(test, unix))]
