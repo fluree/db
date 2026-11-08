@@ -769,3 +769,79 @@ async fn a_graph_crawl_under_reasoning_defaults_is_refused_under_a_view_policy()
         other => panic!("{:?}", other.map(|r| r.result)),
     }
 }
+
+/// A dataset can hold one ledger under several policies. A restricted
+/// member keeps its deny on a derived class whatever its primary is, and
+/// whether or not the ledger has an index to serve the reasoning from.
+#[tokio::test]
+async fn a_restricted_member_of_an_indexed_dataset_keeps_its_class_deny() {
+    use fluree_db_api::{DataSetDb, FlureeBuilder, GovernanceOptions, GraphDb};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "reasoning-policy/dataset-member:main";
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    fluree
+        .insert(ledger, &family_with_rules())
+        .await
+        .expect("seed");
+    let index = fluree
+        .register_reasoning_index(ledger_id, &json!({"reasoning": "datalog"}))
+        .await
+        .expect("register");
+    fluree
+        .refresh_reasoning_index(ledger_id, &index)
+        .await
+        .expect("refresh");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let root = GraphDb::from_ledger_state(&ledger);
+    let run = |dataset: DataSetDb, query: Value| {
+        let (fluree, snapshot) = (&fluree, &ledger.snapshot);
+        async move {
+            let result = fluree.query_dataset(&dataset, &query).await.expect("query");
+            normalize_rows(&result.to_jsonld(snapshot).expect("format"))
+        }
+    };
+    // Capped query-time reasoning derives no `HighEarner`: alice answers
+    // only from the index, so the index serves this ledger.
+    let earners = json!({
+        "@context": context(),
+        "select": "?s",
+        "where": {"@id": "?s", "@type": "ex:HighEarner"},
+        "reasoning": "datalog",
+        "reasoningBudget": {"maxFacts": 1}
+    });
+    assert_eq!(
+        run(DataSetDb::single(root.clone()), earners).await,
+        normalize_rows(&json!(["ex:alice"]))
+    );
+
+    let opts = GovernanceOptions {
+        policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let restricted = fluree
+        .wrap_policy(root.clone(), &opts)
+        .await
+        .expect("policy");
+    let dataset = DataSetDb::new()
+        .with_default(root.clone())
+        .with_named("urn:root", root)
+        .with_named("urn:restricted", restricted);
+    let salaries = |graph: &str| {
+        json!({
+            "@context": context(),
+            "select": ["?s", "?v"],
+            "where": [["graph", graph, {"@id": "?s", "ex:salary": "?v"}]],
+            "reasoning": "datalog"
+        })
+    };
+    assert_eq!(
+        run(dataset.clone(), salaries("urn:root")).await,
+        normalize_rows(&json!([["ex:alice", 250_000], ["ex:bob", 90000]]))
+    );
+    assert_eq!(
+        run(dataset, salaries("urn:restricted")).await,
+        normalize_rows(&json!([["ex:bob", 90000]]))
+    );
+}
