@@ -138,6 +138,7 @@ async fn run(
         let frozen_same_as = same_as_tracker.finalize();
         let mut derived = DerivedSet::new();
         let capped = apply_equality(db, &frozen_same_as, &mut derived, db.t, opts, &start).await?;
+        interrupted(opts)?;
         let mut diagnostics =
             ReasoningDiagnostics::completed(0, derived.derived_len(), start.elapsed());
         if let Some(reason) = capped {
@@ -433,6 +434,8 @@ async fn run(
         }
     }
 
+    // A run cancelled after its last sampled check is not complete.
+    interrupted(opts)?;
     // Update diagnostics if not already capped
     if !diagnostics.capped {
         diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
@@ -1177,6 +1180,7 @@ async fn apply_equality(
     let owl_same_as = owl::same_as_sid();
     let ref_dt = Sid::new(JSON_LD, JSONLD_ID);
     let no_delta = DeltaSet::new();
+    let mut ticks = 0u32;
 
     // Asserted facts naming a member are registered as base, so a copy that
     // is itself asserted is not emitted.
@@ -1200,6 +1204,7 @@ async fn apply_equality(
             }
         }
     }
+    interrupted(opts)?;
     let names_a_member = |f: &Flake| {
         set_of.contains_key(&f.s) || matches!(&f.o, FlakeValue::Ref(o) if set_of.contains_key(o))
     };
@@ -1225,9 +1230,9 @@ async fn apply_equality(
                     true,
                     None,
                 ));
-            }
-            if let Some(reason) = budget_exceeded(&opts.budget, start, derived, &no_delta) {
-                return Ok(Some(reason));
+                if let Some(reason) = equality_limit(opts, start, derived, &no_delta, &mut ticks)? {
+                    return Ok(Some(reason));
+                }
             }
         }
     }
@@ -1256,14 +1261,34 @@ async fn apply_equality(
                         true,
                         flake.m.clone(),
                     ));
+                    if let Some(reason) =
+                        equality_limit(opts, start, derived, &no_delta, &mut ticks)?
+                    {
+                        return Ok(Some(reason));
+                    }
                 }
             }
         }
-        if let Some(reason) = budget_exceeded(&opts.budget, start, derived, &no_delta) {
-            return Ok(Some(reason));
-        }
     }
+    interrupted(opts)?;
     Ok(None)
+}
+
+/// [`apply_equality`]'s check after each fact it adds: one pair of large
+/// sets multiplies a fact many times over, so a check per source fact can
+/// overshoot a budget by the product. Cancellation is sampled with the clock.
+fn equality_limit(
+    opts: &ReasoningOptions,
+    start: &Instant,
+    derived: &DerivedSet,
+    no_delta: &DeltaSet,
+    ticks: &mut u32,
+) -> Result<Option<&'static str>> {
+    let reason = budget_exceeded_sampled(&opts.budget, start, derived, no_delta, ticks);
+    if ticks.is_multiple_of(CLOCK_SAMPLE_INTERVAL) {
+        interrupted(opts)?;
+    }
+    Ok(reason)
 }
 
 #[cfg(test)]
