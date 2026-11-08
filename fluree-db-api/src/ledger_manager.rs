@@ -1868,7 +1868,11 @@ impl LedgerManager {
             }
 
             // Slow path: need to coordinate loading
-            let rx = {
+            enum Wait {
+                Load(oneshot::Receiver<std::result::Result<LedgerHandle, Arc<ApiError>>>),
+                Reload(oneshot::Receiver<std::result::Result<(), Arc<ApiError>>>),
+            }
+            let wait = {
                 let mut entries = self.entries.write().await;
 
                 match entries.get_mut(&canonical_alias) {
@@ -1876,15 +1880,19 @@ impl LedgerManager {
                         // Another task loaded while we waited for write lock
                         return Ok(handle.clone());
                     }
-                    Some(LoadState::Reloading { handle, .. }) => {
-                        // Handle is valid even during reload
-                        return Ok(handle.clone());
+                    Some(LoadState::Reloading { waiters, .. }) => {
+                        // The handle this pass found was behind its target,
+                        // and a reload is bringing it up: wait for that
+                        // rather than serve the state it replaces.
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        Wait::Reload(rx)
                     }
                     Some(LoadState::Loading { waiters, .. }) => {
                         // Someone else is loading - add ourselves as waiter
                         let (tx, rx) = oneshot::channel();
                         waiters.push(tx);
-                        rx
+                        Wait::Load(rx)
                     }
                     Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
                         return Err(ApiError::http(error.status_code(), error.to_string()));
@@ -1907,15 +1915,31 @@ impl LedgerManager {
             };
             // Manager lock released here
 
-            // Phase instrumentation (debug!): a waiter parked here with
-            // no matching leader publish is the orphaned-Loading signature.
-            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
-            match rx.await {
-                Ok(published) => return published.map_err(shared_load_error),
-                Err(_) if self.is_shutdown() => {
-                    return Err(ApiError::internal("load cancelled"));
+            match wait {
+                Wait::Load(rx) => {
+                    // Phase instrumentation (debug!): a waiter parked here with
+                    // no matching leader publish is the orphaned-Loading signature.
+                    tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
+                    match rx.await {
+                        Ok(published) => return published.map_err(shared_load_error),
+                        Err(_) if self.is_shutdown() => {
+                            return Err(ApiError::internal("load cancelled"));
+                        }
+                        Err(_) => {
+                            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.rejoin");
+                        }
+                    }
                 }
-                Err(_) => tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.rejoin"),
+                // Reloaded, the handle is checked against the target again.
+                Wait::Reload(rx) => match rx.await {
+                    Ok(reloaded) => reloaded.map_err(shared_load_error)?,
+                    Err(_) if self.is_shutdown() => {
+                        return Err(ApiError::internal("reload cancelled"));
+                    }
+                    Err(_) => {
+                        tracing::debug!(alias = %canonical_alias, "ledger.reload.waiter.rejoin");
+                    }
+                },
             }
         };
 
@@ -4193,9 +4217,12 @@ mod tests {
 
     /// As above, where the stale handle's entry became a reload (the cache
     /// listener catching it up) while the reader checked it: evicting by name
-    /// failed the reload's waiters with `reload cancelled`.
+    /// failed the reload's waiters with `reload cancelled`. The reader joins
+    /// the reload and reads what it brought up, not the state it replaced.
     #[tokio::test]
     async fn a_stale_eviction_leaves_a_reload_to_its_waiters() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
         let alias = id("x:main");
         let mgr = manager_holding("x:main").await;
         let stale = make_test_handle("x:main");
@@ -4217,11 +4244,19 @@ mod tests {
         until(|| async move { reload_waiters(m, a, generation).await == Some(1) }).await;
 
         drop(commit);
+        until(|| async move { reload_waiters(m, a, generation).await == Some(2) }).await;
+        assert!(
+            !checking.is_finished(),
+            "the reader took the state being replaced"
+        );
+        *stale.inner.state.write().await =
+            LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        publish_reload(&mgr, &alias, generation).await;
         let checked = checking
             .await
             .unwrap()
-            .expect("a reader during a reload gets the handle being reloaded");
-        publish_reload(&mgr, &alias, generation).await;
+            .expect("a reader behind its target gets the reloaded handle");
+        assert_eq!(checked.t().await, 1);
 
         reloading
             .await
