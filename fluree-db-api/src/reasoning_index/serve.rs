@@ -211,6 +211,7 @@ impl Fluree {
     /// of the view's commit at or before `db`'s `t`, computed under `settled`,
     /// and before no drop `db` records: a generation holds what a graph held
     /// at its basis, which a later drop takes out as of every `t`.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn as_of_generation(
         &self,
         record: &NsRecord,
@@ -248,6 +249,21 @@ impl Fluree {
                         .is_empty()
             })
             .map(|g| (g.manifest_id, g.manifest.basis.t)))
+    }
+
+    /// Walking an index's generations needs the native indexer: a wasm build
+    /// serves `asOf` only from a generation at exactly the queried commit.
+    #[cfg(target_arch = "wasm32")]
+    async fn as_of_generation(
+        &self,
+        _record: &NsRecord,
+        _view_commit: &ContentId,
+        _index_id: &ReasoningIndexId,
+        _newest: &ContentId,
+        _settled: &ContentId,
+        _db: &GraphDb,
+    ) -> Result<Option<(ContentId, i64)>> {
+        Ok(None)
     }
 
     async fn loaded_generation(

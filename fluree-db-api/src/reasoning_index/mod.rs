@@ -16,13 +16,23 @@
 //! - [`build`]: registration, and building and publishing generations.
 //! - [`serve`]: matching a query to a servable generation.
 
+// Building and maintaining indexes needs the native indexer: a wasm build
+// only serves generations built elsewhere. The state the build side keeps is
+// unread there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
+#[cfg(not(target_arch = "wasm32"))]
 mod build;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod derived;
 pub(crate) mod program;
 pub(crate) mod serve;
+#[cfg(not(target_arch = "wasm32"))]
 mod worker;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use build::{RefreshOutcome, MAX_ACTIVE_INDEXES};
+#[cfg(not(target_arch = "wasm32"))]
 pub use worker::{ReasoningIndexWorker, DEFAULT_CATCHUP_INTERVAL};
 
 use std::collections::{HashMap, HashSet};
