@@ -104,11 +104,12 @@ pub(crate) struct ErasureRuntime {
     /// Branches a restore rebuilt over an erased commit, whose replaced
     /// indexes are released once the ledger is visible.
     pub(crate) rebuilt_on_restore: parking_lot::Mutex<std::collections::HashSet<String>>,
-    /// Per ledger, the last head whose history held no erased commit, and
-    /// the erasure generation it was checked at: a later check walks only
-    /// what is new since.
-    pub(crate) clean_heads:
-        parking_lot::Mutex<std::collections::HashMap<String, (fluree_db_core::ContentId, String)>>,
+    /// Per ledger, which erased commits its history holds, as last found:
+    /// see [`transfer::Reached`].
+    pub(crate) reached: parking_lot::Mutex<std::collections::HashMap<String, transfer::Reached>>,
+    /// Commits a reachability walk has read, for tests.
+    #[cfg(test)]
+    pub(crate) reach_reads: std::sync::atomic::AtomicUsize,
     /// Per branch: held by a commit from its check until it publishes, and
     /// exclusively by a reconciliation with received erasures.
     fences:
@@ -158,7 +159,9 @@ impl ErasureRuntime {
             purging: Default::default(),
             source_heads: tokio::sync::Mutex::new(()),
             rebuilt_on_restore: Default::default(),
-            clean_heads: Default::default(),
+            reached: Default::default(),
+            #[cfg(test)]
+            reach_reads: Default::default(),
             fences: Default::default(),
             fact_keys: Default::default(),
             activator: Default::default(),

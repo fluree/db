@@ -134,6 +134,10 @@ pub(crate) struct ErasureIndex {
     /// The digests of erased commits' transaction documents.
     txns: parking_lot::RwLock<HashSet<String>>,
     entries: parking_lot::RwLock<HashMap<String, Arc<Entry>>>,
+    /// Advanced by every change to `entries`.
+    version: AtomicU64,
+    /// [`Self::generation`] at a version.
+    generation: parking_lot::Mutex<Option<(u64, String)>>,
     /// Reads of commits and transaction documents under way, by the epoch
     /// they started in, so [`Self::drain`] can wait out those begun before
     /// it.
@@ -237,6 +241,8 @@ impl ErasureIndex {
             any: AtomicBool::new(false),
             txns: parking_lot::RwLock::new(HashSet::new()),
             entries: parking_lot::RwLock::new(HashMap::new()),
+            version: AtomicU64::new(0),
+            generation: parking_lot::Mutex::new(None),
             reads: parking_lot::Mutex::new(BTreeMap::new()),
             epoch: AtomicU64::new(0),
             read_done: tokio::sync::Notify::new(),
@@ -281,9 +287,15 @@ impl ErasureIndex {
     }
 
     /// The published erasures, as a hash: every chain, and where its
-    /// originals are read without a file.
+    /// originals are read without a file. Computed once per change.
     pub(crate) async fn generation(&self) -> Result<String> {
         self.load().await?;
+        let version = self.version();
+        if let Some((at, generation)) = &*self.generation.lock() {
+            if *at == version {
+                return Ok(generation.clone());
+            }
+        }
         let mut chains: Vec<String> = self
             .entries
             .read()
@@ -295,7 +307,39 @@ impl ErasureIndex {
             })
             .collect();
         chains.sort();
-        Ok(sha256_hex(chains.join("\n").as_bytes()))
+        let generation = sha256_hex(chains.join("\n").as_bytes());
+        *self.generation.lock() = Some((version, generation.clone()));
+        Ok(generation)
+    }
+
+    /// Advanced by every change to the published erasures this process
+    /// holds: equal versions, the same erasures.
+    pub(crate) fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// The erased commits whose own file is in one of `namespaces`, or
+    /// which one of them reads as its replacement without a file: the only
+    /// erased commits a history read from those folders can hold.
+    pub(crate) async fn held_in(&self, namespaces: &[StorageNamespace]) -> Result<Vec<ContentId>> {
+        self.load().await?;
+        let commits: Vec<ContentId> = self
+            .entries
+            .read()
+            .values()
+            .filter_map(|e| e.erased.commit.parse().ok())
+            .collect();
+        let mut held = Vec::new();
+        for commit in commits {
+            for namespace in namespaces {
+                if self.holds_original(namespace, &commit).await? {
+                    held.push(commit);
+                    break;
+                }
+            }
+        }
+        held.sort_by_key(ContentId::address_digest);
+        Ok(held)
     }
 
     /// Whether the last listing of the map objects still stands.
@@ -369,6 +413,7 @@ impl ErasureIndex {
                         verified: tokio::sync::OnceCell::new(),
                     }),
                 );
+                self.version.fetch_add(1, Ordering::AcqRel);
             }
         }
         self.any.store(!entries.is_empty(), Ordering::Release);

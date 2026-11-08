@@ -494,9 +494,9 @@ async fn stream_pack_inner(
 
     let mut erasures = Erasures::of(
         fluree,
+        ledger_id,
         content_store.as_ref(),
         &request.want,
-        &request.have,
         &missing_commits,
         &request.held_erasures,
     )

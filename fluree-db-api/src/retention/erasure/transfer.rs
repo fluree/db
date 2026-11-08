@@ -164,9 +164,9 @@ impl Sender {
     /// `have` is empty) and holding the chains `held` (digests).
     pub(crate) async fn of(
         fluree: &Fluree,
+        ledger_id: &str,
         store: &dyn ContentStore,
         want: &[ContentId],
-        have: &[ContentId],
         missing: &[ContentId],
         held: &[String],
     ) -> Result<Self> {
@@ -178,20 +178,19 @@ impl Sender {
         if want.is_empty() || !index.any_erased().await? {
             return Ok(sender);
         }
-        let history = match have.is_empty() {
-            true => missing.to_vec(),
-            false => crate::pack::compute_missing_commits(store, want, &HashSet::new()).await?,
-        };
         let missing: HashSet<&ContentId> = missing.iter().collect();
-        for cid in &history {
-            let Some(erased) = index.erased(cid).await? else {
-                continue;
-            };
-            sender.history_erased = true;
-            if missing.contains(cid) {
-                sender.erased.insert(cid.clone(), erased);
-            } else if !held.contains(&erased.digest()) {
-                sender.held.push(erased);
+        let mut seen = HashSet::new();
+        for head in want {
+            for (cid, erased) in fluree.erased_reached(ledger_id, store, head).await? {
+                if !seen.insert(cid.clone()) {
+                    continue;
+                }
+                sender.history_erased = true;
+                if missing.contains(&cid) {
+                    sender.erased.insert(cid, erased);
+                } else if !held.contains(&erased.digest()) {
+                    sender.held.push(erased);
+                }
             }
         }
         Ok(sender)
@@ -1111,42 +1110,155 @@ impl Fluree {
     }
 
     /// A commit of `head`'s history, `ledger_id`'s, this storage holds
-    /// erased, if any. The walk stops at the head last found clean at the
-    /// same erasure generation, so repeated checks read only new commits.
+    /// erased, if any.
     pub(crate) async fn erased_in_history(
         &self,
         ledger_id: &str,
         store: &dyn ContentStore,
         head: &ContentId,
     ) -> Result<Option<ContentId>> {
-        let Some(runtime) = self.retention.erasure.get() else {
-            return Ok(None);
-        };
-        if !runtime.index.any_erased().await? {
-            return Ok(None);
-        }
-        let generation = runtime.index.generation().await?;
-        let clean: HashSet<ContentId> = runtime
-            .clean_heads
-            .lock()
-            .get(ledger_id)
-            .filter(|(_, at)| *at == generation)
-            .map(|(clean, _)| clean.clone())
+        Ok(self
+            .erased_reached(ledger_id, store, head)
+            .await?
             .into_iter()
-            .collect();
-        let history =
-            crate::pack::compute_missing_commits(store, std::slice::from_ref(head), &clean).await?;
-        for cid in history {
-            if runtime.index.erased(&cid).await?.is_some() {
-                return Ok(Some(cid));
+            .next()
+            .map(|(cid, _)| cid))
+    }
+
+    /// The commits of `head`'s history, `ledger_id`'s, read through `store`,
+    /// that this storage holds erased, oldest first.
+    ///
+    /// Only an erased commit whose file is in one of the ledger's folders
+    /// (or which one of them reads as its replacement) can be in its
+    /// history: when none is, nothing is walked, whatever other ledgers
+    /// erased. Otherwise the walk stops at the head last walked, as long as
+    /// the erased commits the folders hold are the same.
+    pub(crate) async fn erased_reached(
+        &self,
+        ledger_id: &str,
+        store: &dyn ContentStore,
+        head: &ContentId,
+    ) -> Result<Vec<(ContentId, ErasedCommit)>> {
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(Vec::new());
+        };
+        let index = &runtime.index;
+        if !index.any_erased().await? {
+            return Ok(Vec::new());
+        }
+        // Read before what it versions.
+        let version = index.version();
+        let folders = self.ledger_folders(ledger_id).await?;
+        let prior = runtime.reached.lock().get(ledger_id).cloned();
+        let held = match &prior {
+            Some(prior) if prior.version == version && prior.folders == folders => {
+                prior.held.clone()
+            }
+            _ => index.held_in(&folders).await?,
+        };
+        let reached = if held.is_empty() {
+            Vec::new()
+        } else {
+            let prior = prior.filter(|prior| prior.held == held);
+            let stop = prior.as_ref().map(|prior| &prior.head);
+            let (walked, met) = walk_down_to(store, head, stop).await?;
+            #[cfg(test)]
+            runtime
+                .reach_reads
+                .fetch_add(walked.len(), std::sync::atomic::Ordering::Relaxed);
+            let mut reached: Vec<ContentId> = match (met, prior) {
+                (true, Some(prior)) => prior.reached,
+                _ => Vec::new(),
+            };
+            for cid in walked.into_iter().rev() {
+                if held.contains(&cid) && !reached.contains(&cid) {
+                    reached.push(cid);
+                }
+            }
+            reached
+        };
+        runtime.reached.lock().insert(
+            ledger_id.to_string(),
+            Reached {
+                version,
+                folders,
+                held,
+                head: head.clone(),
+                reached: reached.clone(),
+            },
+        );
+        let mut erased = Vec::with_capacity(reached.len());
+        for cid in reached {
+            if let Some(chain) = index.erased(&cid).await? {
+                erased.push((cid, chain));
             }
         }
-        runtime
-            .clean_heads
-            .lock()
-            .insert(ledger_id.to_string(), (head.clone(), generation));
-        Ok(None)
+        Ok(erased)
     }
+
+    /// The folders `ledger_id`'s store reads commits from: its own, then
+    /// each source branch's.
+    async fn ledger_folders(&self, ledger_id: &str) -> Result<Vec<StorageNamespace>> {
+        let mut folders = Vec::new();
+        let mut next = self.nameservice().lookup(ledger_id).await?;
+        while let Some(record) = next {
+            let namespace = record.storage_namespace();
+            if folders.contains(&namespace) {
+                break;
+            }
+            folders.push(namespace);
+            next = match &record.source_branch {
+                Some(source) => {
+                    let source = fluree_db_core::LedgerId::from_parts(&record.name, source)?;
+                    self.nameservice().lookup(source.as_str()).await?
+                }
+                None => None,
+            };
+        }
+        Ok(folders)
+    }
+}
+
+/// Which erased commits a ledger's history holds, as last found.
+#[derive(Clone, Debug)]
+pub(crate) struct Reached {
+    /// The erasure index's version it was found at.
+    version: u64,
+    /// The ledger's folders: another ledger under the name has its own.
+    folders: Vec<StorageNamespace>,
+    /// The erased commits the ledger's folders hold, the only ones its
+    /// history can.
+    held: Vec<ContentId>,
+    /// The head whose history was walked.
+    head: ContentId,
+    /// Those of `held` its history holds, oldest first.
+    reached: Vec<ContentId>,
+}
+
+/// The commits of `head`'s history, newest first, down to `stop` (not
+/// included, nor what is under it), and whether the walk met `stop`.
+async fn walk_down_to(
+    store: &dyn ContentStore,
+    head: &ContentId,
+    stop: Option<&ContentId>,
+) -> Result<(Vec<ContentId>, bool)> {
+    let mut walked = Vec::new();
+    let mut seen = HashSet::new();
+    let mut met = false;
+    let mut frontier = vec![head.clone()];
+    while let Some(cid) = frontier.pop() {
+        if Some(&cid) == stop {
+            met = true;
+            continue;
+        }
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
+        let envelope = fluree_db_core::load_commit_envelope_by_id(store, &cid).await?;
+        walked.push(cid);
+        frontier.extend(envelope.parents);
+    }
+    Ok((walked, met))
 }
 
 /// What a stream brought of erasures. Its artifacts are stored as they
@@ -2274,6 +2386,9 @@ pub(crate) mod hooks {
 
 #[cfg(test)]
 mod activation_tests;
+
+#[cfg(test)]
+mod reach_tests;
 
 #[cfg(test)]
 mod tests {
