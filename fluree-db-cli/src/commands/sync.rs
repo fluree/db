@@ -772,13 +772,12 @@ fn push_failure(e: crate::remote_client::RemoteLedgerError, carries_merges: bool
              advertises support for such pushes. A node serving the request may still run an \
              earlier release."
         )),
-        // A release refuses a commit flag it predates. A graph drop (0x20)
-        // is the one a push carries.
+        // A release refuses an envelope feature it does not understand.
+        // The unknown bit need not be the graph-drop flag.
         RemoteLedgerError::ValidationError(msg) if msg.contains("unknown envelope flags") => {
             CliError::Config(format!(
-                "push failed: the remote cannot read these commits ({msg}). A commit that drops \
-                 a graph needs a remote on a release that supports graph drops; upgrade the \
-                 remote, then push again."
+                "push failed: the remote cannot read these commits ({msg}). These commits use \
+                 a format feature the remote does not support; upgrade the remote, then push again."
             ))
         }
         e => CliError::Config(format!("push failed: {e}")),
@@ -2140,20 +2139,23 @@ mod tests {
     use fluree_db_api::{Base64Bytes, ExportCommitsResponse};
     use fluree_db_core::{Commit, ContentId, ContentKind};
 
-    /// A remote on a release that predates graph drops refuses the commit
-    /// flag; the push names that as the cause. Other refusals pass through.
+    /// An unknown flag identifies a format mismatch, without assuming which
+    /// feature set it. Other refusals pass through.
     #[test]
     fn a_push_refused_for_an_unknown_commit_flag_names_the_remote_release() {
         use crate::remote_client::RemoteLedgerError;
-        let refused = RemoteLedgerError::ValidationError(
-            "invalid commit[0]: invalid commit: unknown envelope flags: 0x20".to_string(),
-        );
-        let message = push_failure(refused, false).to_string();
-        assert!(
-            message.contains("unknown envelope flags: 0x20"),
-            "{message}"
-        );
-        assert!(message.contains("upgrade the remote"), "{message}");
+        for flag in ["0x20", "0x40", "0x80"] {
+            let detail = format!("unknown envelope flags: {flag}");
+            let refused = RemoteLedgerError::ValidationError(format!(
+                "invalid commit[0]: invalid commit: {detail}"
+            ));
+            let message = push_failure(refused, false).to_string();
+            assert!(message.contains(&detail), "{message}");
+            assert!(message.contains("upgrade the remote"), "{message}");
+            if flag != "0x20" {
+                assert!(!message.contains("graph drops"), "{message}");
+            }
+        }
 
         let other = RemoteLedgerError::ValidationError("retraction of absent fact".to_string());
         let message = push_failure(other, false).to_string();
