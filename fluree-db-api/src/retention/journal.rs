@@ -131,6 +131,10 @@ pub struct Removal {
 }
 
 impl Removal {
+    fn key(&self) -> (&str, u32) {
+        (&self.commit, self.slot)
+    }
+
     pub fn covers(&self, t: i64) -> bool {
         self.from_t <= t && self.until_t.is_none_or(|until| t < until)
     }
@@ -164,29 +168,68 @@ impl Journal {
     /// the generation then moves past both.
     pub(crate) fn merge(&mut self, other: &Journal) -> Result<bool, SubjectConflict> {
         let mut changed = false;
+        // Borrow only incoming keys, then locate their first occurrences in
+        // one pass. Stop as soon as all are found; an empty incoming journal
+        // never scans ours. Appends below join the same index.
+        let mut positions: std::collections::HashMap<
+            &str,
+            std::collections::HashMap<u32, Option<usize>>,
+        > = std::collections::HashMap::new();
+        let mut missing = 0;
         for removal in &other.removals {
-            let held = self
-                .removals
-                .iter_mut()
-                .find(|r| r.commit == removal.commit && r.slot == removal.slot);
-            match held {
+            let (commit, slot) = removal.key();
+            if positions
+                .entry(commit)
+                .or_default()
+                .insert(slot, None)
+                .is_none()
+            {
+                missing += 1;
+            }
+        }
+        if missing > 0 {
+            for (i, removal) in self.removals.iter().enumerate() {
+                let (commit, slot) = removal.key();
+                if let Some(position @ None) = positions
+                    .get_mut(commit)
+                    .and_then(|slots| slots.get_mut(&slot))
+                {
+                    *position = Some(i);
+                    missing -= 1;
+                    if missing == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        for removal in &other.removals {
+            let (commit, slot) = removal.key();
+            let position = positions
+                .get_mut(commit)
+                .and_then(|slots| slots.get_mut(&slot))
+                .expect("indexed above");
+            match position {
                 None => {
+                    *position = Some(self.removals.len());
                     self.removals.push(removal.clone());
                     changed = true;
                 }
-                Some(held) => match (&held.subject, &removal.subject) {
-                    (None, Some(subject)) => {
-                        held.subject = Some(subject.clone());
-                        changed = true;
+                Some(i) => {
+                    let held = &mut self.removals[*i];
+                    match (&held.subject, &removal.subject) {
+                        (None, Some(subject)) => {
+                            held.subject = Some(subject.clone());
+                            changed = true;
+                        }
+                        (Some(a), Some(b)) if a != b => {
+                            return Err(SubjectConflict {
+                                commit: removal.commit.clone(),
+                                slot: removal.slot,
+                            })
+                        }
+                        _ => {}
                     }
-                    (Some(a), Some(b)) if a != b => {
-                        return Err(SubjectConflict {
-                            commit: removal.commit.clone(),
-                            slot: removal.slot,
-                        })
-                    }
-                    _ => {}
-                },
+                }
             }
         }
         for rule in &other.history_rules {
@@ -221,14 +264,14 @@ impl Journal {
         let held: std::collections::HashMap<(&str, u32), bool> = base
             .removals
             .iter()
-            .map(|r| ((r.commit.as_str(), r.slot), r.subject.is_some()))
+            .map(|r| (r.key(), r.subject.is_some()))
             .collect();
         Journal {
             generation: self.generation,
             removals: self
                 .removals
                 .iter()
-                .filter(|r| match held.get(&(r.commit.as_str(), r.slot)) {
+                .filter(|r| match held.get(&r.key()) {
                     None => true,
                     Some(known) => !known && r.subject.is_some(),
                 })
@@ -442,6 +485,50 @@ mod tests {
         assert!(a.starts_with("v1:") && a.len() == 3 + 64);
         assert_eq!(a, subject_fingerprint("http://example.org/carol"));
         assert_ne!(a, subject_fingerprint("http://example.org/erin"));
+    }
+
+    #[test]
+    fn merging_repeated_incoming_occurrences_preserves_order_and_subject_checks() {
+        let removal = |commit: &str, slot, subject: Option<&str>| Removal {
+            request_id: "first".into(),
+            commit: commit.into(),
+            slot,
+            predicate: "ex:p".into(),
+            from_t: 1,
+            until_t: Some(2),
+            scope_t: 1,
+            subject: subject.map(str::to_string),
+        };
+        let batch = Journal {
+            generation: 7,
+            removals: vec![
+                removal("a", 1, None),
+                removal("b", 1, None),
+                removal("a", 2, None),
+                Removal {
+                    request_id: "later".into(),
+                    ..removal("a", 1, Some("subject"))
+                },
+            ],
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        assert!(journal.merge(&batch).unwrap());
+        assert_eq!(journal.generation, 8);
+        assert_eq!(
+            journal.removals,
+            [
+                removal("a", 1, Some("subject")),
+                removal("b", 1, None),
+                removal("a", 2, None),
+            ]
+        );
+        assert!(!journal.merge(&batch).unwrap());
+        let conflicting = Journal {
+            removals: vec![removal("c", 1, Some("one")), removal("c", 1, Some("two"))],
+            ..Default::default()
+        };
+        assert!(journal.merge(&conflicting).is_err());
     }
 
     #[test]

@@ -4074,4 +4074,33 @@ async fn a_named_occurrence_its_graphs_drop_ended_takes_no_later_retraction() {
         }],
         "{receipt:?}"
     );
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let registration = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .unwrap();
+    let job = registration
+        .erasures
+        .iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(
+        job.commits.len(),
+        1,
+        "the later span must remain intact: {job:?}"
+    );
+
+    // Replaying the replacement must not resurrect the later assertion by
+    // erasing its retraction as though it ended the first assertion.
+    reindex(&fluree, &id).await;
+    let db = fluree.db(&id).await.unwrap();
+    let rows = fluree.query(&db, &format!(
+        "PREFIX ex: <http://example.org/> SELECT ?o WHERE {{ GRAPH <{DROPPED}> {{ ex:alice ex:email ?o }} }}"
+    )).await.unwrap().to_jsonld(&db.snapshot).unwrap();
+    assert_eq!(rows, json!([]));
 }

@@ -169,6 +169,92 @@ async fn source(name: &str) -> (tempfile::TempDir, Fluree, String, ContentId, i6
     (dir, fluree, id, erased, t1)
 }
 
+/// Incoming, checked authorizations govern proof verification before the
+/// receiver has stored them, including the cheaper signed-commit mode.
+#[tokio::test]
+async fn a_signed_erasure_restores_on_fresh_storage_in_either_signature_mode() {
+    use fluree_db_api::retention::erasure::SignatureMode;
+    for mode in [SignatureMode::Verify, SignatureMode::Expose] {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+        let id = ledger(&fluree, "it/transfer-signed").await;
+        let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let t = fluree
+            .graph(&id)
+            .transact()
+            .insert(&json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:email": "a@secret"},
+                {"@id": "ex:bob", "ex:email": "b@kept"}
+            ]}))
+            .commit_opts(fluree_db_api::CommitOpts::default().with_signing_key(key))
+            .commit()
+            .await
+            .unwrap()
+            .receipt
+            .t;
+        let original = commit_at(&fluree, &id, t).await;
+        erase_published(
+            &fluree,
+            &id,
+            ErasureRequest {
+                signatures: mode,
+                ..email("alice", "a@secret")
+            },
+        )
+        .await;
+        let bytes = archive(&fluree, &id).await;
+        let altered = rewritten(&bytes, |frame| {
+            Some(match frame {
+                PackFrame::Authorization(mut authorization) => {
+                    authorization["signatures"] = json!(match mode {
+                        SignatureMode::Verify => SignatureMode::Expose,
+                        SignatureMode::Expose => SignatureMode::Verify,
+                    });
+                    PackFrame::Authorization(authorization)
+                }
+                other => other,
+            })
+        });
+        let rejected_dir = tempfile::tempdir().unwrap();
+        let rejected = receiving(&rejected_dir);
+        let error = rejected
+            .restore_ledger("it/transfer-altered-mode", &mut altered.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status_code(), 400, "{error}");
+        assert!(
+            error.to_string().contains("another signature mode"),
+            "{error}"
+        );
+
+        let fresh = tempfile::tempdir().unwrap();
+        let receiver = receiving(&fresh);
+        let copy = receiver
+            .restore_ledger("it/transfer-signed-copy", &mut bytes.as_slice())
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"))
+            .ledger_id;
+        drop(receiver);
+        // Ordinary reads after restart use the now-persisted authorization.
+        let receiver = receiving(&fresh);
+        assert!(is_replacement(
+            &store_of(&receiver, &copy)
+                .await
+                .get(&original)
+                .await
+                .unwrap()
+        ));
+        reindex(&receiver, &copy).await;
+        assert!(objects(&receiver, &copy, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        assert_eq!(
+            objects(&receiver, &copy, "ex:bob", "ex:email").await,
+            [json!("b@kept")]
+        );
+    }
+}
+
 /// Another storage, with no prover, restores an archive of erased history:
 /// the erased commits read as their replacements, neither the value nor its
 /// history is served, no original or transaction document holding the

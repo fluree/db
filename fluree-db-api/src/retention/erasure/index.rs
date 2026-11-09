@@ -608,6 +608,18 @@ impl ErasureIndex {
     /// `erased`'s latest replacement, once its stored receipts verify it
     /// against the pinned guest images, bound to the original and its slots.
     pub(crate) async fn verify(&self, erased: &ErasedCommit) -> Result<Arc<[u8]>> {
+        let signatures = self.step_signatures(&erased.steps).await?;
+        self.verify_with_signatures(erased, signatures).await
+    }
+
+    /// Verify with the modes from checked authorizations. A receiver uses
+    /// the incoming authorizations before they are stored; ordinary reads
+    /// use the stored ones through [`Self::verify`].
+    pub(crate) async fn verify_with_signatures(
+        &self,
+        erased: &ErasedCommit,
+        signatures: Vec<fluree_db_erasure::Signatures>,
+    ) -> Result<Arc<[u8]>> {
         let last = erased.steps.last().ok_or_else(|| {
             ApiError::internal(format!("erasure of {} has no steps", erased.commit))
         })?;
@@ -625,7 +637,6 @@ impl ErasureIndex {
             .parse()
             .map_err(|_| ApiError::internal("erasure of an unparsable commit id"))?;
         let authorized: Vec<Vec<u32>> = erased.steps.iter().map(|s| s.slots.clone()).collect();
-        let signatures = self.step_signatures(&erased.steps).await?;
         let verifier = self.verifier.clone();
         let ledger_id = erased.ledger_id.clone();
         let checked = replacement.clone();

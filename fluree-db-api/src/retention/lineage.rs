@@ -517,6 +517,11 @@ pub(crate) async fn span_ends<'a, T>(
             if flake.op {
                 if let Some(by) = name {
                     open.insert(FactKey::of(flake), (flake.clone(), *by));
+                } else if !open.is_empty() {
+                    // A graph drop can end the named occurrence without a
+                    // retraction. A later assertion starts its own span,
+                    // whose retraction must not be joined to the old one.
+                    open.remove(&FactKey::of(flake));
                 }
             } else if let Some((asserted, by)) = open.remove(&FactKey::of(flake)) {
                 if name.is_none() {

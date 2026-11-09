@@ -11,7 +11,11 @@
 //! not erasure.
 
 use std::collections::HashMap;
+#[cfg(feature = "native")]
+use std::collections::{BTreeMap, HashSet};
 
+#[cfg(feature = "native")]
+use fluree_db_core::TripleTermValue;
 use fluree_db_core::{
     collect_first_parent_cids, load_commit_by_id, ContentId, Flake, FlakeValue, LedgerId, Sid,
 };
@@ -712,38 +716,35 @@ pub(crate) struct Spelling {
 }
 
 #[cfg(feature = "native")]
-/// The facts of `commits` whose object is a triple term, at any depth,
+/// The facts of `commit` whose object is a triple term, at any depth,
 /// spelling one of `facts`, other than the occurrences `named`.
-pub(crate) fn spellings<'a>(
-    commits: impl IntoIterator<Item = (i64, &'a ContentId, &'a fluree_db_core::Commit)>,
-    facts: &[Flake],
-    named: &std::collections::HashSet<(String, u32)>,
+fn spellings(
+    t: i64,
+    cid: &ContentId,
+    commit: &fluree_db_core::Commit,
+    facts: &HashSet<TripleTermValue>,
+    named: &BTreeMap<&str, HashSet<u32>>,
 ) -> Vec<Spelling> {
-    fn spells(value: &FlakeValue, fact: &Flake) -> bool {
-        let FlakeValue::TripleTerm(term) = value else {
-            return false;
-        };
-        let lang = fact.m.as_ref().and_then(|m| m.lang.as_deref());
-        (term.s == fact.s
-            && term.p == fact.p
-            && term.o == fact.o
-            && term.dt == fact.dt
-            && term.lang.as_deref() == lang)
-            || spells(&term.o, fact)
-    }
-    let mut found = Vec::new();
-    for (t, cid, commit) in commits {
-        for (slot, flake) in commit.occurrences() {
-            if facts.iter().any(|fact| spells(&flake.o, fact))
-                && !named.contains(&(cid.to_string(), slot))
-            {
-                found.push(Spelling {
-                    commit: cid.clone(),
-                    slot,
-                    t,
-                    fact: flake.clone(),
-                });
+    fn spells(mut value: &FlakeValue, facts: &HashSet<TripleTermValue>) -> bool {
+        while let FlakeValue::TripleTerm(term) = value {
+            if facts.contains(term.as_ref()) {
+                return true;
             }
+            value = &term.o;
+        }
+        false
+    }
+    let id = cid.to_string();
+    let named = named.get(id.as_str());
+    let mut found = Vec::new();
+    for (slot, flake) in commit.occurrences() {
+        if !named.is_some_and(|slots| slots.contains(&slot)) && spells(&flake.o, facts) {
+            found.push(Spelling {
+                commit: cid.clone(),
+                slot,
+                t,
+                fact: flake.clone(),
+            });
         }
     }
     found
@@ -831,16 +832,13 @@ impl Fluree {
         )],
         occurrences: &[OccurrenceRef],
     ) -> Result<Option<String>> {
-        let mut facts = Vec::new();
-        let mut named = std::collections::HashSet::new();
-        let mut slots: std::collections::BTreeMap<&str, Vec<u32>> =
-            std::collections::BTreeMap::new();
+        let mut facts = HashSet::new();
+        let mut slots: BTreeMap<&str, HashSet<u32>> = BTreeMap::new();
         for occurrence in occurrences {
             slots
                 .entry(occurrence.commit.as_str())
                 .or_default()
-                .push(occurrence.slot);
-            named.insert((occurrence.commit.clone(), occurrence.slot));
+                .insert(occurrence.slot);
         }
         for (commit, slots) in &slots {
             let cid: ContentId = commit
@@ -849,7 +847,18 @@ impl Fluree {
             for (_, store) in holders {
                 if store.has(&cid).await? {
                     let original = load_commit_by_id(store.as_ref(), &cid).await?;
-                    facts.extend(slots.iter().filter_map(|s| original.at_slot(*s).cloned()));
+                    // TripleTermValue is the graph-independent identity
+                    // used by the terms themselves, including datatype and
+                    // language. Repeated occurrences need only one key.
+                    facts.extend(slots.iter().filter_map(|s| original.at_slot(*s)).map(|f| {
+                        TripleTermValue {
+                            s: f.s.clone(),
+                            p: f.p.clone(),
+                            o: f.o.clone(),
+                            dt: f.dt.clone(),
+                            lang: f.m.as_ref().and_then(|m| m.lang.clone()),
+                        }
+                    }));
                     break;
                 }
             }
@@ -861,16 +870,11 @@ impl Fluree {
             let Some(head) = holder.commit_head_id.as_ref() else {
                 continue;
             };
-            let mut commits = Vec::new();
+            let mut found = Vec::new();
             for (t, cid) in collect_first_parent_cids(store.as_ref(), head, 0).await? {
                 let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                commits.push((t, cid, commit));
+                found.extend(spellings(t, &cid, &commit, &facts, &slots));
             }
-            let found = spellings(
-                commits.iter().map(|(t, cid, commit)| (*t, cid, commit)),
-                &facts,
-                &named,
-            );
             if !found.is_empty() {
                 // A dropped holder is not read: its terms go unnamed.
                 let state = self.ledger(holder.ledger_id.as_str()).await.ok();
@@ -1094,4 +1098,71 @@ fn request_id(ledger_id: &str, scope_t: i64, located: &[Located]) -> String {
         hasher.update(loc.occurrence.slot.to_le_bytes());
     }
     format!("removal-{}", hex::encode(&hasher.finalize()[..12]))
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spellings_match_nested_terms_by_identity_and_keep_original_slots() {
+        let selected = TripleTermValue {
+            s: Sid::new(100, "alice"),
+            p: Sid::new(100, "name"),
+            o: FlakeValue::String("secret".into()),
+            dt: Sid::new(fluree_vocab::namespaces::RDF, "langString"),
+            lang: Some("en".into()),
+        };
+        let term = |value: TripleTermValue| FlakeValue::TripleTerm(Box::new(value));
+        let values = vec![
+            FlakeValue::String("secret".into()),
+            term(selected.clone()),
+            term(TripleTermValue {
+                o: term(selected.clone()),
+                ..selected.clone()
+            }),
+            term(TripleTermValue {
+                s: Sid::new(100, "bob"),
+                ..selected.clone()
+            }),
+            term(TripleTermValue {
+                dt: Sid::xsd_string(),
+                ..selected.clone()
+            }),
+            term(TripleTermValue {
+                lang: Some("fr".into()),
+                ..selected.clone()
+            }),
+            term(selected.clone()),
+        ];
+        let mut commit = fluree_db_core::Commit::new(
+            9,
+            values
+                .into_iter()
+                .map(|o| {
+                    Flake::new_in_graph(
+                        Sid::new(100, "another-graph"),
+                        Sid::new(100, "claim"),
+                        Sid::new(fluree_vocab::namespaces::RDF, "reifies"),
+                        o,
+                        Sid::xsd_string(),
+                        9,
+                        true,
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        commit.redaction = Some(fluree_db_core::commit::Redaction {
+            slots: vec![2, 4, 6, 8, 10, 12, 14],
+            op_count: 15,
+            signers: Vec::new(),
+        });
+        let cid = ContentId::new(fluree_db_core::ContentKind::Commit, b"spelling-test");
+        let id = cid.to_string();
+        let named = BTreeMap::from([(id.as_str(), HashSet::from([14]))]);
+        let found = spellings(9, &cid, &commit, &HashSet::from([selected]), &named);
+        assert_eq!(found.iter().map(|s| s.slot).collect::<Vec<_>>(), [4, 6]);
+        assert!(found.iter().all(|s| s.t == 9 && s.commit == cid));
+    }
 }

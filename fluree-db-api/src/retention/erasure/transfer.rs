@@ -1449,6 +1449,7 @@ impl Fluree {
                     chain.commit
                 ))
             })?;
+            let mut signatures = Vec::with_capacity(chain.steps.len());
             for step in &chain.steps {
                 let authorization =
                     received
@@ -1471,10 +1472,11 @@ impl Fluree {
                         chain.commit, step.slots, step.request_id
                     )));
                 }
+                signatures.push(authorization.signatures.into());
             }
             let erased = chain.erased(Vec::new());
             let replacement = index
-                .verify(&erased)
+                .verify_with_signatures(&erased, signatures)
                 .await
                 .map_err(|e| bad(e.to_string()))?;
             let envelope = read_commit_envelope(&replacement)
