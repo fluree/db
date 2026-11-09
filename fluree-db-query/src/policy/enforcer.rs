@@ -8,7 +8,7 @@ use fluree_db_core::{
     Flake, FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker,
     TripleTermValue,
 };
-use fluree_db_policy::{is_schema_flake, ClassState, PolicyContext};
+use fluree_db_policy::{is_schema_flake, is_schema_predicate, ClassState, PolicyContext};
 use std::sync::Arc;
 
 /// Plan-time-style verdict for a single statically-known scanned predicate under
@@ -19,8 +19,9 @@ use std::sync::Arc;
 /// (see [`PolicySet::covers_predicate`](fluree_db_policy::PolicySet::covers_predicate)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredicateCoverage {
-    /// A view restriction may apply to flakes with this predicate; the per-flake
-    /// filtered scan fallback is required.
+    /// A view restriction may apply to flakes with this predicate, or a deny
+    /// default meets a schema predicate (whose schema flakes stay visible); the
+    /// per-flake filtered scan fallback is required.
     Covered,
     /// No restriction can apply and the effective default is allow — every flake
     /// with this predicate is visible, so a fast path may run unfiltered.
@@ -89,6 +90,10 @@ impl QueryPolicyEnforcer {
             PredicateCoverage::Covered
         } else if wrapper.default_allow() {
             PredicateCoverage::UncoveredAllow
+        } else if is_schema_predicate(predicate) {
+            // Schema flakes stay visible under a deny default; filter rather
+            // than fold to empty.
+            PredicateCoverage::Covered
         } else {
             PredicateCoverage::UncoveredDeny
         }
@@ -482,5 +487,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, vec![name("bob")]);
+    }
+
+    /// `rdf:type` (a schema predicate) is uncovered under an allow default
+    /// unless a rule can reach it; under a deny default it is never folded to
+    /// empty.
+    #[test]
+    fn rdf_type_coverage_follows_rules_and_default() {
+        let rdf_type = Sid::new(fluree_vocab::namespaces::RDF, "type");
+        let restriction = |mode: TargetMode, target: Sid| PolicyRestriction {
+            id: "r".into(),
+            target_mode: mode,
+            targets: [target.clone()].into_iter().collect(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: PolicyValue::Deny,
+            required: false,
+            message: None,
+            class_policy: mode == TargetMode::OnClass,
+            for_classes: if mode == TargetMode::OnClass {
+                [target].into_iter().collect()
+            } else {
+                HashSet::new()
+            },
+            class_check_needed: mode == TargetMode::OnClass,
+        };
+        let classify = |rules: Vec<PolicyRestriction>, default_allow: bool, p: &Sid| {
+            let view = build_policy_set(rules, None, PolicyAction::View, None);
+            let wrapper = PolicyWrapper::new(
+                view,
+                PolicySet::default(),
+                false,
+                default_allow,
+                HashMap::new(),
+            );
+            QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(wrapper, None)))
+                .classify_view_predicate(p)
+        };
+        let on_ssn = || vec![restriction(TargetMode::OnProperty, ex("ssn"))];
+
+        assert_eq!(
+            classify(on_ssn(), true, &rdf_type),
+            PredicateCoverage::UncoveredAllow
+        );
+        assert_eq!(
+            classify(on_ssn(), false, &rdf_type),
+            PredicateCoverage::Covered
+        );
+        assert_eq!(
+            classify(on_ssn(), false, &ex("name")),
+            PredicateCoverage::UncoveredDeny
+        );
+        assert_eq!(
+            classify(
+                vec![restriction(TargetMode::OnProperty, rdf_type.clone())],
+                true,
+                &rdf_type
+            ),
+            PredicateCoverage::Covered
+        );
+        assert_eq!(
+            classify(
+                vec![restriction(TargetMode::OnClass, ex("Admin"))],
+                true,
+                &rdf_type
+            ),
+            PredicateCoverage::Covered
+        );
     }
 }

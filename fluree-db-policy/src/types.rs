@@ -541,12 +541,14 @@ impl PolicySet {
     /// `defaults`. It never derives coverage from the raw
     /// `restrictions`/`for_classes`, so a `false` verdict is a faithful
     /// optimization of the per-flake evaluator and can never disagree with it
-    /// (even when class policies were expanded under absent stats). Schema
-    /// predicates always report `true` so the per-flake `is_schema_flake` bypass
-    /// keeps firing rather than being constant-folded away.
+    /// (even when class policies were expanded under absent stats).
+    ///
+    /// Schema flakes are visible whatever the restrictions say, which this does
+    /// not consider: a caller folding an uncovered predicate to empty under a
+    /// deny default must keep schema predicates on the per-flake path
+    /// ([`is_schema_predicate`](crate::is_schema_predicate)).
     pub fn covers_predicate(&self, p: &Sid) -> bool {
-        crate::schema::is_schema_predicate(p)
-            || self.by_property.contains_key(p)
+        self.by_property.contains_key(p)
             || !self.by_class.is_empty()
             || !self.by_subject.is_empty()
             || !self.defaults.is_empty()
@@ -773,13 +775,12 @@ mod tests {
     fn test_covers_predicate() {
         use fluree_vocab::namespaces::{RDF, RDFS};
 
-        // Empty set: a regular predicate is provably uncovered...
+        // Empty set: nothing can apply, schema predicates included (their
+        // exemption is the deny-default caller's concern).
         let empty = PolicySet::new();
         assert!(!empty.covers_predicate(&make_sid(100, "name")));
-        // ...but schema predicates always report covered so the per-flake
-        // is_schema_flake bypass keeps firing.
-        assert!(empty.covers_predicate(&make_sid(RDFS, "subClassOf")));
-        assert!(empty.covers_predicate(&make_sid(RDF, "type")));
+        assert!(!empty.covers_predicate(&make_sid(RDFS, "subClassOf")));
+        assert!(!empty.covers_predicate(&make_sid(RDF, "type")));
 
         // A by_property entry (this is also where f:onClass policies are
         // pre-expanded) covers exactly its predicate, nothing else.
