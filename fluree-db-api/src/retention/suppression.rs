@@ -316,6 +316,7 @@ impl Fluree {
     /// The branch's suppression, or `None` when its journal is empty. On a
     /// cluster replica, read once the replica has confirmed it holds the
     /// current journal.
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub(crate) async fn suppression_for(
         &self,
         ledger_id: &str,

@@ -497,7 +497,7 @@ async fn a_received_erasure_is_refused_while_a_holder_spells_its_value() {
             status: 409,
             message,
         }) => {
-            assert!(message.contains("it/receive-spelled-held"), "{message}")
+            assert!(message.contains("it/receive-spelled-held"), "{message}");
         }
         other => panic!("expected 409, got {:?}", other.map(|r| r.ledger_id)),
     }

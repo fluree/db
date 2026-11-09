@@ -814,7 +814,7 @@ async fn an_erasure_is_refused_while_a_restored_copy_spells_its_value() {
             status: 409,
             message,
         }) => {
-            assert!(message.contains("it/erase-spelled-copy"), "{message}")
+            assert!(message.contains("it/erase-spelled-copy"), "{message}");
         }
         other => panic!("expected 409, got {:?}", other.map(|r| r.request_id)),
     }
