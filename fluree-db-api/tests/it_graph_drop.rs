@@ -711,6 +711,149 @@ async fn a_transferred_write_brings_a_dropped_graph_back() {
 }
 
 const N: &str = "http://example.org/graphs/n";
+const A: &str = "http://example.org/graphs/a";
+
+fn drop_records(
+    registry: &fluree_db_core::GraphRegistry,
+) -> std::collections::BTreeMap<String, fluree_db_core::graph_registry::GraphDrop> {
+    registry
+        .graph_drops()
+        .map(|(g_id, drop)| {
+            let iri = if g_id == fluree_db_core::DEFAULT_GRAPH_ID {
+                fluree_db_core::graph_registry::DEFAULT_GRAPH_IRI
+            } else {
+                registry.iri_for_graph_id(g_id).unwrap()
+            };
+            (iri.to_string(), drop)
+        })
+        .collect()
+}
+
+fn encode_commit(commit: &fluree_db_core::Commit) -> fluree_db_api::Base64Bytes {
+    fluree_db_api::Base64Bytes(
+        fluree_db_core::commit::codec::write_commit(commit, false, None)
+            .unwrap()
+            .bytes,
+    )
+}
+
+async fn transfer(
+    fluree: &Fluree,
+    id: &str,
+    push: bool,
+    commits: Vec<fluree_db_api::Base64Bytes>,
+    blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes>,
+) -> fluree_db_api::Result<()> {
+    if push {
+        fluree
+            .push_commits(
+                id,
+                fluree_db_api::PushCommitsRequest {
+                    commits,
+                    blobs,
+                    missing_blobs: Vec::new(),
+                    merged_commits: Vec::new(),
+                },
+                &fluree_db_api::GovernanceOptions::default(),
+                &fluree.default_index_config(),
+            )
+            .await
+            .map(|_| ())
+    } else {
+        fluree
+            .import_commits_incremental(id, commits, Vec::new(), blobs)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Drop records must name user graphs known at that commit. Invalid targets
+/// must not turn an otherwise empty commit into an accepted change.
+#[tokio::test]
+async fn transfers_reject_unknown_and_system_graph_drops() {
+    use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/graph-drop/invalid-targets:main";
+    let t = seed(&fluree, id).await;
+    let base = fluree.ledger(id).await.unwrap().head_commit_id.unwrap();
+    for target in [
+        N.to_string(),
+        config_graph_iri(id),
+        config_graph_iri("another:main"),
+        txn_meta_graph_iri(id),
+    ] {
+        for mixed in [false, true] {
+            let mut commit =
+                fluree_db_core::Commit::new(t + 1, Vec::new()).with_parent(base.clone());
+            commit.graph_drops = vec![target.clone()];
+            if mixed {
+                commit.graph_drops.push(G.to_string());
+                commit.graph_drops.sort();
+            }
+            let bytes = encode_commit(&commit);
+            for push in [true, false] {
+                let result =
+                    transfer(&fluree, id, push, vec![bytes.clone()], Default::default()).await;
+                let error =
+                    result.expect_err(&format!("push={push}, target={target}, mixed={mixed}"));
+                assert_eq!(error.status_code(), 422, "{error}");
+                assert!(error.to_string().contains(&target), "{error}");
+                let state = fluree.ledger(id).await.unwrap();
+                assert_eq!(state.head_commit_id.as_ref(), Some(&base));
+                assert_eq!(state.t(), t);
+                assert!(drop_records(&state.snapshot.graph_registry).is_empty());
+            }
+        }
+    }
+}
+
+/// Registering a graph later in a batch cannot authorize an earlier drop.
+/// Batch and one-commit-at-a-time delivery reject the same first commit.
+#[tokio::test]
+async fn transfers_reject_a_drop_before_its_graph_is_registered() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/graph-drop/future-target";
+    let source = "it/graph-drop/future-target:main";
+    let t = seed(&fluree, source).await;
+    let base = fluree.ledger(source).await.unwrap().head_commit_id.unwrap();
+    let receiver = format!("{name}:receiver");
+    fluree
+        .create_branch(name, "receiver", None, None)
+        .await
+        .unwrap();
+    update(&fluree, source, &format!("DROP GRAPH <{G}>"))
+        .await
+        .unwrap();
+    update(
+        &fluree,
+        source,
+        &format!("INSERT DATA {{ GRAPH <{N}> {{ <urn:s> <urn:p> \"later\" }} }}"),
+    )
+    .await
+    .unwrap();
+    let mut page = commits_above(&fluree, source, &base).await;
+    assert_eq!(page.commits.len(), 2);
+    let mut first = fluree_db_core::commit::codec::read_commit(&page.commits[0].0).unwrap();
+    first.graph_drops = vec![N.to_string()];
+    page.commits[0] = encode_commit(&first);
+    let mut second = fluree_db_core::commit::codec::read_commit(&page.commits[1].0).unwrap();
+    second.parents[0] =
+        fluree_db_core::ContentId::new(fluree_db_core::ContentKind::Commit, &page.commits[0].0);
+    page.commits[1] = encode_commit(&second);
+    for push in [true, false] {
+        for count in [2, 1] {
+            let commits = page.commits[..count].to_vec();
+            let result = transfer(&fluree, &receiver, push, commits, page.blobs.clone()).await;
+            let error = result.expect_err(&format!("push={push}, count={count}"));
+            assert_eq!(error.status_code(), 422, "{error}");
+            assert!(error.to_string().contains(N), "{error}");
+            let state = fluree.ledger(&receiver).await.unwrap();
+            assert_eq!(state.head_commit_id.as_ref(), Some(&base));
+            assert_eq!(state.t(), t);
+            assert!(drop_records(&state.snapshot.graph_registry).is_empty());
+        }
+    }
+}
 
 /// What a reader of `ledger_id` gets from each graph as of each `t` in `ts`:
 /// its sorted objects, or why the read was refused.
@@ -723,6 +866,7 @@ async fn reads_as_of(fluree: &Fluree, ledger_id: &str, ts: &[i64]) -> Vec<String
             in_graph(G),
             in_graph(H),
             in_graph(N),
+            in_graph(A),
             GRAPHS.to_string(),
         ] {
             let read = match objects(fluree, &db, &query).await {
@@ -823,6 +967,11 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
                     "PREFIX ex: <http://example.org/> \
                      DROP GRAPH <{N}> ; INSERT DATA {{ GRAPH <{N}> {{ ex:n ex:v \"new\" }} }}"
                 ),
+                format!(
+                    "{} ; DROP GRAPH <{A}> ; {}",
+                    ins(A, "ex:a ex:v \"before\" ."),
+                    ins(A, "ex:a ex:v \"after\" ."),
+                ),
                 "DROP DEFAULT".to_string(),
             ] {
                 ts.push(update(&fluree, main, &sparql).await.expect(&sparql));
@@ -839,6 +988,7 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
             assert!(at_head(DEFAULT_GRAPH).ends_with("-> "));
             assert!(at_head(&in_graph(G)).ends_with("-> \"a\" \"c\""));
             assert!(at_head(&in_graph(N)).ends_with("-> \"new\""));
+            assert!(at_head(&in_graph(A)).ends_with("-> \"after\""));
             assert!(written.iter().any(|read| {
                 read.starts_with(&format!("t={seeded} {} -> ", in_graph(G)))
                     && read.contains(&format!("graph <{G}> was dropped at t={}", ts[1]))
@@ -846,6 +996,17 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
 
             let page = commits_above(&fluree, main, &base).await;
             assert_eq!(page.commits.len(), ts.len() - 1);
+            let expected_drops = drop_records(&fluree.ledger(main).await.unwrap().snapshot.graph_registry);
+            let mut caught_up = fluree.ledger(&format!("{name}:pushed")).await.unwrap();
+            for bytes in &page.commits {
+                let mut commit = fluree_db_core::commit::codec::read_commit(&bytes.0).unwrap();
+                commit.id = Some(fluree_db_core::ContentId::new(
+                    fluree_db_core::ContentKind::Commit, &bytes.0,
+                ));
+                caught_up.apply_single_commit(commit, main).unwrap();
+                fluree_db_transact::hide_dropped_graphs(&mut caught_up);
+            }
+            assert_eq!(drop_records(&caught_up.snapshot.graph_registry), expected_drops, "peer catch-up");
             let pushed = fluree
                 .push_commits(
                     &format!("{name}:pushed"),
@@ -890,12 +1051,14 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
                     written,
                     "{branch}"
                 );
+                assert_eq!(drop_records(&fluree.ledger(&receiver).await.unwrap().snapshot.graph_registry), expected_drops, "{branch}");
                 fluree.disconnect_ledger(&receiver).await;
                 assert_eq!(
                     reads_as_of(&fluree, &receiver, &ts).await,
                     written,
                     "{branch}, reloaded"
                 );
+                assert_eq!(drop_records(&fluree.ledger(&receiver).await.unwrap().snapshot.graph_registry), expected_drops, "{branch}, reloaded");
             }
 
             // An index the receiver builds over the commits leaves out what
@@ -914,6 +1077,7 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
                 now(&written),
                 "indexed"
             );
+            assert_eq!(drop_records(&fluree.ledger(&pushed).await.unwrap().snapshot.graph_registry), expected_drops, "indexed");
         })
         .await;
 }

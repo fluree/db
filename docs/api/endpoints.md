@@ -419,6 +419,7 @@ JSON object:
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
 - A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
 - A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
