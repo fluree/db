@@ -119,6 +119,8 @@ struct Entry {
     erased: ErasedCommit,
     /// The replacement, once its proofs have verified in this process.
     verified: tokio::sync::OnceCell<Arc<[u8]>>,
+    /// The index's version when it last changed.
+    changed: u64,
 }
 
 /// The erased commits of one storage, by the original's address digest.
@@ -138,6 +140,9 @@ pub(crate) struct ErasureIndex {
     version: AtomicU64,
     /// [`Self::generation`] at a version.
     generation: parking_lot::Mutex<Option<(u64, String)>>,
+    /// Folders probed by [`Self::held_in`], for tests.
+    #[cfg(test)]
+    pub(crate) probes: std::sync::atomic::AtomicUsize,
     /// Reads of commits and transaction documents under way, by the epoch
     /// they started in, so [`Self::drain`] can wait out those begun before
     /// it.
@@ -243,6 +248,8 @@ impl ErasureIndex {
             entries: parking_lot::RwLock::new(HashMap::new()),
             version: AtomicU64::new(0),
             generation: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            probes: Default::default(),
             reads: parking_lot::Mutex::new(BTreeMap::new()),
             epoch: AtomicU64::new(0),
             read_done: tokio::sync::Notify::new(),
@@ -318,20 +325,29 @@ impl ErasureIndex {
         self.version.load(Ordering::Acquire)
     }
 
-    /// The erased commits whose own file is in one of `namespaces`, or
-    /// which one of them reads as its replacement without a file: the only
-    /// erased commits a history read from those folders can hold.
-    pub(crate) async fn held_in(&self, namespaces: &[StorageNamespace]) -> Result<Vec<ContentId>> {
+    /// Of the erasures changed since version `after`, the erased commits
+    /// whose own file is in one of `namespaces`, or which one of them reads
+    /// as its replacement without a file: the only erased commits a history
+    /// read from those folders can hold. Only those are probed, so a reader
+    /// that keeps what it found reads each erasure's folders once.
+    pub(crate) async fn held_in(
+        &self,
+        namespaces: &[StorageNamespace],
+        after: u64,
+    ) -> Result<Vec<ContentId>> {
         self.load().await?;
         let commits: Vec<ContentId> = self
             .entries
             .read()
             .values()
+            .filter(|e| e.changed > after)
             .filter_map(|e| e.erased.commit.parse().ok())
             .collect();
         let mut held = Vec::new();
         for commit in commits {
             for namespace in namespaces {
+                #[cfg(test)]
+                self.probes.fetch_add(1, Ordering::Relaxed);
                 if self.holds_original(namespace, &commit).await? {
                     held.push(commit);
                     break;
@@ -411,9 +427,9 @@ impl ErasureIndex {
                     Arc::new(Entry {
                         erased: next,
                         verified: tokio::sync::OnceCell::new(),
+                        changed: self.version.fetch_add(1, Ordering::AcqRel) + 1,
                     }),
                 );
-                self.version.fetch_add(1, Ordering::AcqRel);
             }
         }
         self.any.store(!entries.is_empty(), Ordering::Release);

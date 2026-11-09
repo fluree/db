@@ -1160,11 +1160,23 @@ impl Fluree {
         let version = index.version();
         let folders = self.ledger_folders(ledger_id).await?;
         let prior = runtime.reached.lock().get(ledger_id).cloned();
+        // Only the erasures changed since: another ledger's erasure costs a
+        // probe of its own commits, once.
         let held = match &prior {
-            Some(prior) if prior.version == version && prior.folders == folders => {
+            Some(prior) if prior.folders == folders && prior.version == version => {
                 prior.held.clone()
             }
-            _ => index.held_in(&folders).await?,
+            Some(prior) if prior.folders == folders => {
+                let mut held = prior.held.clone();
+                for commit in index.held_in(&folders, prior.version).await? {
+                    if !held.contains(&commit) {
+                        held.push(commit);
+                    }
+                }
+                held.sort_by_key(ContentId::address_digest);
+                held
+            }
+            _ => index.held_in(&folders, 0).await?,
         };
         let reached = if held.is_empty() {
             Vec::new()
