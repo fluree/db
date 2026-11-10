@@ -135,6 +135,11 @@ impl SpatialHook {
     pub fn entries(&self) -> &[SpatialEntry] {
         &self.entries
     }
+
+    /// Keep only the collected entries `keep` accepts.
+    pub fn retain(&mut self, keep: impl FnMut(&SpatialEntry) -> bool) {
+        self.entries.retain(keep);
+    }
 }
 
 impl Default for SpatialHook {

@@ -3235,6 +3235,7 @@ dependencies = [
  "fluree-db-r2rml",
  "fluree-db-server",
  "fluree-db-transact",
+ "fluree-graph-ir",
  "fluree-graph-turtle",
  "fluree-vocab",
  "futures",
@@ -3456,8 +3457,13 @@ dependencies = [
  "fluree-doc-pptx",
  "fluree-doc-transcript",
  "fluree-doc-xlsx",
+ "fluree-graph-format",
+ "fluree-graph-ir",
+ "fluree-graph-json-ld",
+ "fluree-graph-turtle",
  "hayro-syntax",
  "hex",
+ "httpdate",
  "image",
  "reqwest 0.13.5",
  "rust-stemmers",
@@ -3753,21 +3759,27 @@ dependencies = [
 name = "fluree-db-python"
 version = "4.2.5"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "fluree-db-api",
  "fluree-db-core",
+ "fluree-db-doc",
  "fluree-db-nameservice",
  "fluree-db-query",
  "fluree-db-sparql",
+ "fluree-graph-ir",
  "fluree-vocab",
+ "mimalloc",
  "pyo3",
  "pythonize",
  "serde",
  "serde_json",
  "stacker",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -4298,6 +4310,7 @@ version = "4.2.5"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "http 1.4.0",
  "http-body-util",
  "openraft",
  "postcard",

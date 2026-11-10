@@ -19,10 +19,17 @@
 //! the crate is empty (see Cargo.toml).
 #![cfg(feature = "extension")]
 
+// The extension's Rust allocations go to mimalloc; Python's own stay with
+// Python's allocator. See the `mimalloc` feature.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod branch;
 mod connection;
 mod convert;
 mod cypher;
+mod doc;
 mod error;
 mod graph_source;
 mod logging;
@@ -44,6 +51,9 @@ fn _fluree(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<query::Canceller>()?;
     m.add_function(wrap_pyfunction!(convert::sparql_form, m)?)?;
     m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
+    m.add_function(wrap_pyfunction!(doc::read_document, m)?)?;
+    m.add_function(wrap_pyfunction!(doc::reading_turtle, m)?)?;
+    m.add_function(wrap_pyfunction!(doc::reading_context, m)?)?;
     logging::install();
     Ok(())
 }

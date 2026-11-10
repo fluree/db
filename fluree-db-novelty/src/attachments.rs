@@ -93,6 +93,20 @@ impl AttachmentNovelty {
         Self::default()
     }
 
+    /// Forget every attachment of an edge in one of `graphs` (`None` = the
+    /// default graph): a drop took the edges. The sticky
+    /// [`Self::has_annotations`] stays.
+    pub fn forget_graphs(&mut self, graphs: &[Option<fluree_db_core::Sid>]) {
+        if graphs.is_empty() || !self.has_annotations {
+            return;
+        }
+        self.forward.retain(|edge, _| !graphs.contains(&edge.g));
+        self.reverse.retain(|_, rows| {
+            rows.retain(|row| !graphs.contains(&row.edge.g));
+            !rows.is_empty()
+        });
+    }
+
     /// True iff at least one `f:reifies*` flake has been observed.
     ///
     /// Cascade fast-path: when both `Novelty::attachments.has_annotations()`

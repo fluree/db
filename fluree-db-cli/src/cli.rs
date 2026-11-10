@@ -304,20 +304,8 @@ pub enum Commands {
         #[arg(long)]
         from: Option<PathBuf>,
 
-        /// CSV/Cypher import: how properties on a relationship (edge) are
-        /// stored. `annotated` (default) keeps them as RDF 1.2 / LPG
-        /// `@annotation` (queryable from Cypher and SPARQL); `plain` drops
-        /// them for pure RDF; `nary` (an intermediate node) is not
-        /// implemented yet.
-        #[arg(long, value_enum, default_value_t = EdgeProperties::Annotated)]
-        edge_properties: EdgeProperties,
-
-        /// CSV/Cypher import: base IRI namespace for minted ids, predicates,
-        /// and classes (e.g. `--base-iri http://ldbc.example/`). CSV defaults
-        /// to `http://example.org/`; Cypher defaults to bare names
-        /// (namespace 0), which zero-config Cypher queries read directly.
-        #[arg(long)]
-        base_iri: Option<String>,
+        #[command(flatten)]
+        import: ImportArgs,
 
         /// Import memory history from a git-tracked .fluree-memory/ directory.
         /// Each git commit becomes a Fluree transaction, enabling time-travel
@@ -329,42 +317,6 @@ pub enum Commands {
         /// Exclude user-scoped memories (.local/user.ttl) from --memory import
         #[arg(long)]
         no_user: bool,
-
-        /// Chunk size in MB for splitting large Turtle files (0 = derive from memory budget).
-        /// Only used when --from points to a .ttl file.
-        #[arg(long, default_value_t = 0)]
-        chunk_size_mb: usize,
-
-        /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
-        /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
-        #[arg(long, default_value_t = 0)]
-        memory_budget_mb: usize,
-
-        /// Number of parallel parse threads for bulk import.
-        /// 0 = auto (most logical cores, capped to fit the memory budget).
-        /// Explicit values are honored as-is (not capped), floored at 1.
-        #[arg(long, default_value_t = 0)]
-        parallelism: usize,
-
-        /// Namespace that salts the blank-node ids this import mints.
-        /// Defaults to the ledger id, so importing one source tree into two
-        /// ledgers gives them disjoint blank nodes. Pass the same value to
-        /// both to make them mint IDENTICAL ids instead — for a
-        /// rebuild-and-diff, a sharded load of one logical dataset, or a
-        /// staging/production pair you want to compare node-for-node.
-        /// Any string; two imports match iff they agree on it.
-        #[arg(long)]
-        skolem_namespace: Option<String>,
-
-        /// Records per leaflet in index files. Default: 25000.
-        /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
-        #[arg(long, default_value_t = 25_000)]
-        leaflet_rows: usize,
-
-        /// Leaflets per leaf file. Default: 10.
-        /// Larger values produce fewer leaf files (shallower tree, bigger reads).
-        #[arg(long, default_value_t = 10)]
-        leaflets_per_leaf: usize,
 
         /// Create the ledger on a remote server (by remote name, e.g., "origin").
         /// Empty, or with `--from`: a `.flpack` archive is restored on the
@@ -1240,6 +1192,24 @@ pub enum Commands {
         action: AuthAction,
     },
 
+    /// Sign this machine in to a fluree.ai account
+    ///
+    /// Opens the account's approval page in a browser and waits while you
+    /// approve the code it shows. The sign-in is kept once per machine (not
+    /// per project) and refreshes itself; `fluree auth status` shows it.
+    Login {
+        /// Account service to sign in to
+        #[arg(long, value_name = "URL", default_value = crate::account::DEFAULT_ACCOUNT_URL)]
+        url: String,
+
+        /// Print the approval link instead of opening a browser (e.g. over SSH)
+        #[arg(long)]
+        no_browser: bool,
+    },
+
+    /// Sign this machine out of its fluree.ai account
+    Logout,
+
     /// Manage upstream tracking configuration
     Upstream {
         #[command(subcommand)]
@@ -1677,6 +1647,84 @@ pub enum Bm25Action {
     },
 }
 
+/// Bulk-import options shared by `create --from` and `graph import`.
+#[derive(Args, Debug, Clone)]
+pub struct ImportArgs {
+    /// CSV/Cypher import: how properties on a relationship (edge) are
+    /// stored. `annotated` (default) keeps them as RDF 1.2 / LPG
+    /// `@annotation` (queryable from Cypher and SPARQL); `plain` drops
+    /// them for pure RDF; `nary` (an intermediate node) is not
+    /// implemented yet.
+    #[arg(long, value_enum, default_value_t = EdgeProperties::Annotated)]
+    pub edge_properties: EdgeProperties,
+
+    /// CSV/Cypher import: base IRI namespace for minted ids, predicates,
+    /// and classes (e.g. `--base-iri http://ldbc.example/`). CSV defaults
+    /// to `http://example.org/`; Cypher defaults to bare names
+    /// (namespace 0), which zero-config Cypher queries read directly.
+    #[arg(long)]
+    pub base_iri: Option<String>,
+
+    /// Chunk size in MB for splitting large Turtle files (0 = derive from memory budget).
+    /// Only used when --from points to a .ttl file.
+    #[arg(long, default_value_t = 0)]
+    pub chunk_size_mb: usize,
+
+    /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
+    /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
+    #[arg(long, default_value_t = 0)]
+    pub memory_budget_mb: usize,
+
+    /// Number of parallel parse threads for bulk import.
+    /// 0 = auto (most logical cores, capped to fit the memory budget).
+    /// Explicit values are honored as-is (not capped), floored at 1.
+    #[arg(long, default_value_t = 0)]
+    pub parallelism: usize,
+
+    /// Namespace that salts the blank-node ids this import mints.
+    /// Defaults to the ledger id (with `graph import`, the ledger id and
+    /// the graph IRI), so importing one source tree twice gives disjoint
+    /// blank nodes. Pass the same value to both imports to make them mint
+    /// IDENTICAL ids instead — for a rebuild-and-diff, a sharded load of
+    /// one logical dataset, or a staging/production pair you want to
+    /// compare node-for-node. Any string; two imports match iff they agree
+    /// on it.
+    #[arg(long)]
+    pub skolem_namespace: Option<String>,
+
+    /// Records per leaflet in index files. Default: 25000.
+    /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
+    #[arg(long, default_value_t = 25_000)]
+    pub leaflet_rows: usize,
+
+    /// Leaflets per leaf file. Default: 10.
+    /// Larger values produce fewer leaf files (shallower tree, bigger reads).
+    #[arg(long, default_value_t = 10)]
+    pub leaflets_per_leaf: usize,
+}
+
+impl ImportArgs {
+    /// The import's options, falling back to the global `--memory-budget-mb`
+    /// and `--parallelism` where these leave them at 0.
+    pub fn opts(
+        self,
+        global_memory_budget_mb: usize,
+        global_parallelism: usize,
+    ) -> crate::commands::create::ImportOpts {
+        let or_global = |own: usize, global: usize| if own > 0 { own } else { global };
+        crate::commands::create::ImportOpts {
+            memory_budget_mb: or_global(self.memory_budget_mb, global_memory_budget_mb),
+            parallelism: or_global(self.parallelism, global_parallelism),
+            chunk_size_mb: self.chunk_size_mb,
+            skolem_namespace: self.skolem_namespace,
+            leaflet_rows: self.leaflet_rows,
+            leaflets_per_leaf: self.leaflets_per_leaf,
+            edge_policy: self.edge_properties.into(),
+            base_iri: self.base_iri,
+        }
+    }
+}
+
 /// Named-graph subcommands.
 #[derive(Subcommand)]
 pub enum GraphAction {
@@ -1714,13 +1762,60 @@ pub enum GraphAction {
         include_system: bool,
     },
 
+    /// Bulk-import data into a new named graph of an existing ledger
+    ///
+    /// Runs the `fluree create --from` pipeline, continuing the ledger's
+    /// commits: every statement in the source lands in <IRI>, which must be
+    /// new to the ledger. IRIs and strings the ledger already holds keep
+    /// their identity, so the graph joins with the rest of the ledger. The
+    /// ledger's index is extended rather than rebuilt.
+    ///
+    /// The source holds default-graph data: Turtle, N-Triples, JSON-LD,
+    /// JSONL/NDJSON (optionally .gz/.zst), or CSV / Cypher, as a file or a
+    /// directory. TriG and N-Quads are refused, since they name graphs of
+    /// their own.
+    ///
+    /// A ledger with commits after its index is indexed first. Writes to
+    /// the ledger wait until the import finishes. With a local server
+    /// running, the import runs on the server (a single file); pass
+    /// --direct only when no server holds the storage.
+    ///
+    /// Examples:
+    ///   fluree graph import http://example.org/graph/products --from products/
+    ///   fluree graph import urn:example:payroll --from payroll.ttl.gz --ledger mydb
+    ///   fluree graph import urn:example:payroll --from payroll.ttl --ledger mydb --remote origin
+    #[command(verbatim_doc_comment)]
+    Import {
+        /// Full IRI of the new named graph.
+        iri: String,
+
+        /// File or directory to import.
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
+        /// Defaults to the active ledger.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
+        /// Import on a remote server (by remote name, e.g. "origin"). The
+        /// server must offer source uploads into a graph; `--from` must be
+        /// a single file.
+        #[arg(long)]
+        remote: Option<String>,
+
+        #[command(flatten)]
+        import: ImportArgs,
+    },
+
     /// Drop a named graph from a single branch of a ledger
     ///
-    /// Issues a transactional retract: every triple currently asserted
-    /// in the target graph is retracted in one new commit. History is
-    /// preserved — queries `as-of` an earlier `t` still see the graph
-    /// populated. The graph IRI remains registered so it can be
-    /// re-populated by a later insert.
+    /// SPARQL `DROP GRAPH`: one new commit, after which the graph and its
+    /// history are no longer queryable — a query `as-of` an earlier `t`
+    /// naming it is refused. The commits that wrote it keep its facts, so
+    /// a branch from before the drop still has them. Writing to the IRI
+    /// again starts the graph afresh. Use `CLEAR GRAPH` (SPARQL) to
+    /// retract the facts and keep their history instead.
     ///
     /// Refuses the default graph and the system `txn-meta` / `config`
     /// graphs.
@@ -3395,7 +3490,7 @@ pub enum RemoteAction {
 
 #[derive(Subcommand)]
 pub enum AuthAction {
-    /// Show authentication status for a remote
+    /// Show this machine's fluree.ai sign-in and a remote's authentication status
     Status {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]
@@ -3429,8 +3524,20 @@ pub enum AuthAction {
     /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "account")]
         remote: Option<String>,
+
+        /// The machine's fluree.ai sign-in (`fluree login`) instead of a
+        /// remote: an access token with time left, refreshed first if it
+        /// is about to expire. Needs no project.
+        #[arg(long)]
+        account: bool,
+
+        /// With `--account`: refresh the token even if it has time left,
+        /// e.g. after the account's configuration changed and the service
+        /// answers `config_stale`.
+        #[arg(long, requires = "account")]
+        refresh: bool,
     },
 }
 
@@ -4395,6 +4502,24 @@ pub enum DocAction {
     #[command(verbatim_doc_comment)]
     Parse(DocParseArgs),
 
+    /// Read one document with an extraction model and print the reading,
+    /// without writing to a ledger
+    ///
+    /// Parses the file as `fluree doc parse` does, sends its text and
+    /// structure with the ontology and catalog to the HTTP reader that
+    /// serves `--model` (`[doc.reader]`), and prints what it read: mentions
+    /// linked to catalog records, entities, and claims, each anchored to the
+    /// text's offsets. Needs no project; where there is one (or a global
+    /// config), its `[doc]` settings and caches are used. What the read was
+    /// billed goes to stderr.
+    ///
+    /// Examples:
+    ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
+    ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
+    ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    #[command(verbatim_doc_comment)]
+    Read(DocReadArgs),
+
     /// Search a ledger's chunks by meaning (vector) or by words (full-text)
     ///
     /// Examples:
@@ -4457,6 +4582,19 @@ pub struct DocIngestArgs {
     /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
     #[arg(long, value_name = "LEDGER|FILE")]
     pub ontology: Option<String>,
+
+    /// The extraction model: one a `[doc.reader]` serves (its `models`),
+    /// which reads each document whole against `--ontology` and `--catalog`,
+    /// or a language model name for `[doc.llm]`. Default: `doc.model`, else
+    /// `[doc.llm] model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// `catalog` (the ontology and catalog), or `off` (nothing, overriding
+    /// `doc.reader.cache`). Config: `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
+    pub cache: Option<String>,
 
     /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
     /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
@@ -4549,6 +4687,71 @@ pub struct DocParseArgs {
     /// Neither read nor write the parse and reading caches
     #[arg(long)]
     pub no_cache: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DocReadArgs {
+    /// The document to read
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Ontology to read against: a `.ttl` / `.nt` / `.jsonld` / `.json`
+    /// file, or a ledger in the project
+    #[arg(long, value_name = "FILE|LEDGER")]
+    pub ontology: String,
+
+    /// Known entities, a catalog, to link mentions to: a file, a ledger,
+    /// or a graph source mapped over a table, optionally scoped to one
+    /// class with `#Class`. Repeatable
+    #[arg(long, visible_alias = "catalog", value_name = "FILE|LEDGER[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// The extraction model, one a `[doc.reader]` serves. Default: `doc.model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// `catalog`, or `off` (nothing, overriding `doc.reader.cache`). Config:
+    /// `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
+    pub cache: Option<String>,
+
+    /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the
+    /// structure graph and the reading, each in a named graph
+    #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
+    pub format: DocReadFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// IRI prefix the file name is appended to, forming the document IRI,
+    /// as `doc ingest` does
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// The document IRI in full, in place of `--base-iri` and the file name
+    #[arg(long, value_name = "IRI", conflicts_with = "base_iri")]
+    pub doc_iri: Option<String>,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Most crops the document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocReadFormat {
+    Jsonld,
+    Turtle,
+    Trig,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

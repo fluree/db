@@ -593,7 +593,7 @@ async fn reifies_flakes_in(fluree: &Fluree, id: &str, graph: &str) -> Vec<fluree
     let g_id = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(graph)
+        .assigned_graph_id(graph)
         .expect("named graph registered");
     fluree_db_core::range_with_overlay(
         &ledger.snapshot,

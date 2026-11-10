@@ -30,7 +30,7 @@ async fn held_terms(ledger: &LedgerState, graph: Option<&str>) -> Vec<(FlakeValu
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph"),
     };
     let s = ledger

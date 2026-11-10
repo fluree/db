@@ -2575,6 +2575,8 @@ mod tests {
             sketch_ref: None,
             attachment_events: None,
             prev_index,
+            graph_floors: HashMap::new(),
+            graph_drops: Vec::new(),
         }
     }
 
