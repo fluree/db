@@ -62,8 +62,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-/// [`Worker`] poll interval when the previous tick found nothing on
-/// its branch queue.
+/// [`Worker`] poll interval while its local state has yet to apply the
+/// pop of the entry it just published.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// [`WorkerSupervisor`] scan interval for branches in
@@ -1291,9 +1291,11 @@ impl Worker {
                 if since.elapsed() >= IDLE_EXIT {
                     return;
                 }
+                // The supervisor wakes this worker whenever its branch
+                // has a queue; the sleep only bounds the idle exit.
                 tokio::select! {
                     () = self.wake.notified() => {}
-                    () = tokio::time::sleep(POLL_INTERVAL) => {}
+                    () = tokio::time::sleep_until(since + IDLE_EXIT) => {}
                 }
                 continue;
             };
@@ -1597,7 +1599,7 @@ impl WorkerSupervisor {
         let dropped = to_drop.into_iter().filter_map(|key| workers.remove(&key));
         abort_and_await(dropped).await;
         wakes.retain(|key, _| workers.contains_key(key));
-        // A worker kept across a drained queue idles between polls; its
+        // A worker kept across a drained queue idles until woken; its
         // branch queuing again wakes it, as a fresh spawn would start.
         for key in &desired {
             if let Some(wake) = wakes.get(key) {
@@ -2065,6 +2067,14 @@ mod tests {
     /// A worker over `test/db:main` whose replicated fence is `live`,
     /// `frozen` or not, publishing through a [`FencedPublisher`].
     fn fenced_worker(live: u64, frozen: bool) -> (Worker, Arc<FencedPublisher>) {
+        let (worker, publisher, _) = fenced_worker_and_state(live, frozen);
+        (worker, publisher)
+    }
+
+    fn fenced_worker_and_state(
+        live: u64,
+        frozen: bool,
+    ) -> (Worker, Arc<FencedPublisher>, Arc<RwLock<NameServiceState>>) {
         let key = RefKey::new("test/db", "main");
         let mut state = NameServiceState::default();
         state.fences.insert(
@@ -2080,9 +2090,10 @@ mod tests {
             live: (!frozen).then(|| fluree_db_nameservice::Fence::from_u64(live)),
             ..Default::default()
         });
+        let state = Arc::new(RwLock::new(state));
         let worker = Worker::new(
             key,
-            SharedState::view_of(Arc::new(RwLock::new(state))),
+            SharedState::view_of(Arc::clone(&state)),
             PublishingChannel {
                 commits: Arc::clone(&publisher) as _,
                 poison: Arc::new(NoPoison),
@@ -2093,7 +2104,7 @@ mod tests {
                 index_config: fluree_db_api::server_defaults::default_index_config(),
             },
         );
-        (worker, publisher)
+        (worker, publisher, state)
     }
 
     /// A commit staged on a state cached from another activation of the
@@ -2237,6 +2248,26 @@ mod tests {
             .await
             .expect("returned once idle")
             .expect("ran to completion");
+    }
+
+    /// An idle worker waits on its wake and reads no replicated state
+    /// meanwhile: nothing of its is queued on that state's lock, which every
+    /// apply takes for writing.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_worker_reads_no_state_until_woken() {
+        let (worker, _, state) = fenced_worker_and_state(1, false);
+        let run = tokio::spawn(worker.run());
+        tokio::time::sleep(POLL_INTERVAL / 2).await;
+
+        let applying = state.write().await;
+        tokio::time::sleep(IDLE_EXIT / 2).await;
+        // Releasing the lock hands it to a read already queued.
+        drop(applying);
+        assert!(
+            state.try_write().is_ok(),
+            "an idle worker read the state between wakes"
+        );
+        run.abort();
     }
 
     /// Teardown takes a worker whose branch moved elsewhere and reaps a
