@@ -249,12 +249,27 @@ async fn setup_extraction(
             .map(|r| (id, r))
     });
     if let Some((id, endpoint)) = reader {
+        // A reader's facts come with its reading, each claim annotating its
+        // fact: there are no edges apart from relations to keep or drop.
+        if mode != RelationMode::Direct {
+            return Err(CliError::Usage(format!(
+                "--relations {}: a reader's facts always come with its reading; \
+                 --include claims|mentions|none says what comes with them",
+                if mode == RelationMode::Off {
+                    "off"
+                } else {
+                    "reified"
+                }
+            )));
+        }
+        let include = doc_reader::include(args.include.as_deref())?;
         let reader = doc_reader::setup(
             id,
             endpoint,
             args.ontology.as_deref(),
             &args.entities,
             args.cache.as_deref(),
+            include,
             cache,
             Some(dirs),
         )
@@ -276,6 +291,11 @@ async fn setup_extraction(
     if args.cache.is_some() {
         return Err(CliError::Usage(
             "--cache is for a model a [doc.reader] serves (see its `models`)".into(),
+        ));
+    }
+    if args.include.is_some() {
+        return Err(CliError::Usage(
+            "--include is for a model a [doc.reader] serves (see its `models`)".into(),
         ));
     }
     // `--model` named the ontology until it named the extraction model, so
@@ -537,20 +557,20 @@ async fn run_extraction(
     .map_err(|e| CliError::Input(format!("extraction task failed: {e}")))?
 }
 
-/// A reader's account of a document in the shape the language-model path
-/// reports and commits: its nodes, and counts in the same columns.
-fn read_extracted(mut read: fluree_db_doc::reader::Read, relations: RelationMode) -> Extracted {
-    read.relations = fluree_db_doc::reader::reading::apply_relations(&mut read.nodes, relations);
+/// A reader's account of a document, counted in the columns the
+/// language-model path reports. Its nodes are not the document commit's:
+/// each call's transaction is committed as it is, in the reading graph.
+fn read_extracted(read: fluree_db_doc::reader::Read) -> Extracted {
     let stats = fluree_db_doc::extract::ExtractionStats {
-        llm_mentions: read.mentions,
-        entities_known: read.linked.len(),
-        entities_new: read.entities,
-        relations_valid: read.relations,
+        llm_mentions: read.mentions().count(),
+        entities_known: read.linked().len(),
+        entities_new: read.new_entities().len(),
+        relations_valid: read.claims().count(),
         ..Default::default()
     };
     Extracted {
         graph: ExtractionGraph {
-            nodes: std::mem::take(&mut read.nodes),
+            nodes: Vec::new(),
             direct: Vec::new(),
             stats,
         },
@@ -592,6 +612,25 @@ async fn asserted_edges(
             Some((cell(0)?, cell(1)?, cell(2)?))
         })
         .collect())
+}
+
+/// Clear a document's reading graph before its new reading is committed.
+/// A graph with nothing in it (the document was never read by a reader, or
+/// read to nothing) has nothing to clear.
+async fn clear_reading_graph(fluree: &Fluree, alias: &str, graph_iri: &str) -> CliResult<()> {
+    match fluree
+        .graph(alias)
+        .transact()
+        .clear_graph(graph_iri)
+        .commit()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(fluree_db_api::ApiError::Transact(
+            fluree_db_transact::TransactError::EmptyTransaction,
+        )) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn drop_unsupported_edges(
@@ -772,10 +811,8 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         let (doc, extracted) = match &extraction {
             Some(Extraction {
                 reader: Some(reader),
-                policy,
                 ..
             }) => {
-                let reader_relations = policy.relations;
                 let reader = reader.clone();
                 let out_dir = args.out_dir.clone();
                 if args.dry_run {
@@ -815,7 +852,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     .await
                     .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
                     match read {
-                        Ok(read) => (doc, Some(read_extracted(read, reader_relations))),
+                        Ok(read) => (doc, Some(read_extracted(read))),
                         Err(e) => {
                             println!("  {} {label}  reading: {e}", "✗".red());
                             totals.failed += 1;
@@ -879,6 +916,11 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                         (Some(_), Some(x)) => graph::reader_predicates(&x.graph.nodes),
                         _ => Vec::new(),
                     },
+                    reading_graph: extracted
+                        .as_ref()
+                        .and_then(|x| x.read.as_ref())
+                        .filter(|r| r.calls() > 0)
+                        .map(|_| doc_reader::reading_graph(&doc.doc_iri)),
                 }
             });
         let document = graph::document_node(
@@ -895,9 +937,30 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         }
         let tx = graph::transaction(&doc.parsed.doco, document, chunks, extra)?;
 
+        // A reader's calls, each a transaction for the reading graph.
+        let reading_graph = doc_reader::reading_graph(&doc.doc_iri);
+        let readings: Vec<Value> = extracted
+            .as_ref()
+            .and_then(|x| x.read.as_ref())
+            .map(|r| {
+                r.readings
+                    .iter()
+                    .map(|r| r.in_graph(&reading_graph))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if let Some(out) = &args.out_dir {
             let target = out.join(format!("{}.jsonld", relative.replace('/', "__")));
             std::fs::write(&target, serde_json::to_vec_pretty(&tx)?)?;
+            for (i, reading) in readings.iter().enumerate() {
+                let target = out.join(format!(
+                    "{}.reading-{}.jsonld",
+                    relative.replace('/', "__"),
+                    i + 1
+                ));
+                std::fs::write(&target, serde_json::to_vec_pretty(reading)?)?;
+            }
         }
 
         let mut commit_note = String::new();
@@ -912,6 +975,18 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     .commit()
                     .await?;
                 drop_unsupported_edges(f, &alias, &edges).await?;
+            }
+            // An earlier reader's reading goes whole, whatever reads the
+            // document now: its graph holds nothing but readings. Cleared,
+            // not dropped, so it stays queryable at its commits.
+            if previous.is_some() {
+                clear_reading_graph(f, &alias, &reading_graph).await?;
+            }
+            // One commit per call, its run that commit's metadata; the
+            // document node, which stamps the document as read, last, so a
+            // reading that fails to commit is read again next run.
+            for reading in &readings {
+                f.graph(&alias).transact().insert(reading).commit().await?;
             }
             let result = g.transact().insert(&tx).commit().await?;
             commit_note = format!("  t={}", result.receipt.t);
@@ -977,17 +1052,18 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     if !usage.is_empty() {
                         note.push_str(&format!(", {usage}"));
                     }
-                    if read.cached == read.calls {
+                    if read.calls() > 0 && read.cached() == read.calls() {
                         note.push_str(", reading from cache");
-                    } else if read.cached > 0 {
+                    } else if read.cached() > 0 {
                         note.push_str(&format!(
                             ", {} of {} call(s) from cache",
-                            read.cached, read.calls
+                            read.cached(),
+                            read.calls()
                         ));
                     }
                     totals.reader_usage.add(&read.usage);
-                    totals.reader_calls += read.calls;
-                    totals.reader_cached += read.cached;
+                    totals.reader_calls += read.calls();
+                    totals.reader_cached += read.cached();
                     totals
                         .ontology_notes
                         .extend(read.ontology_notes.iter().cloned());
@@ -1014,6 +1090,11 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 "    {} extraction incomplete, will be retried next run: {why}",
                 "!".yellow()
             );
+        }
+        if let Some(read) = extracted.as_ref().and_then(|x| x.read.as_ref()) {
+            for line in read.run_lines() {
+                println!("    {} {line}", "·".dimmed());
+            }
         }
         if let Some(why) = &doc.parsed.escalation_skipped {
             println!(
@@ -1509,12 +1590,14 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     let cache = dirs
         .filter(|_| !args.no_cache)
         .map(|d| DocCache::new(cache_root(d)));
+    let include = doc_reader::include(Some(&args.include))?;
     let setup = doc_reader::setup(
         &model,
         endpoint,
         Some(&args.ontology),
         &args.entities,
         args.cache.as_deref(),
+        include,
         cache.clone(),
         dirs,
     )
@@ -1559,7 +1642,6 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     };
 
     let (p, iri) = (path.clone(), doc_iri.clone());
-    let format = args.format;
     let result = tokio::task::spawn_blocking(move || -> CliResult<_> {
         let (meta, parsed) =
             fluree_db_doc::parse_file(&p, &file_name, &iri, cache.as_ref(), vlm.as_ref())?;
@@ -1581,19 +1663,11 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         if doc.parsed.text.trim().is_empty() {
             eprintln!("{} no text to read: nothing was sent", "!".yellow());
         }
-        let read = doc_reader::read_document(&setup, &doc, None)?;
-        let structure = match format {
-            DocReadFormat::Trig => Some(
-                fluree_db_doc::reader::request::parse_jsonld(&doc.parsed.doco)
-                    .map_err(|e| CliError::Input(format!("structure graph: {e}")))?,
-            ),
-            _ => None,
-        };
-        Ok((read, structure))
+        doc_reader::read_document(&setup, &doc, None)
     })
     .await
     .map_err(|e| CliError::Input(format!("reading task failed: {e}")));
-    let (read, structure) = match result.and_then(|r| r) {
+    let read = match result.and_then(|r| r) {
         Ok(r) => r,
         Err(e) => {
             // Nothing was read: take back the file opened for it.
@@ -1604,35 +1678,36 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         }
     };
 
-    let mut out = match (format, &structure) {
-        (DocReadFormat::Jsonld, _) => serde_json::to_string_pretty(&json!({
-            "@context": vocab::context(),
-            "@graph": read.nodes,
-        }))?,
-        (DocReadFormat::Turtle, _) => fluree_db_doc::reader::reading::turtle(&read.nodes)?,
-        (DocReadFormat::Trig, Some(structure)) => {
-            fluree_db_doc::reader::reading::trig(&doc_iri, structure, &read.nodes)?
-        }
-        (DocReadFormat::Trig, None) => unreachable!("the structure graph is kept for trig"),
+    // The reading as the reader wrote it: one transaction per call, which
+    // `fluree insert` takes as it is.
+    let mut out = match args.format {
+        DocReadFormat::Jsonld => match read.readings.as_slice() {
+            [one] => serde_json::to_string_pretty(&one.transaction)?,
+            many => serde_json::to_string_pretty(&Value::Array(
+                many.iter().map(|r| r.transaction.clone()).collect(),
+            ))?,
+        },
+        DocReadFormat::Turtle => fluree_db_doc::reader::reading::turtle(&read.readings)?,
+        DocReadFormat::Trig => fluree_db_doc::reader::reading::trig(&read.readings)?,
     };
     if !out.ends_with('\n') {
         out.push('\n');
     }
 
     let usage = read.usage.note();
-    // Nodes as received, beside what the reading's terms say they are: a
-    // reader in terms of its own still shows what it sent.
+    let new_entities = read.new_entities().len();
     eprintln!(
-        "{} {} node(s): {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
+        "{} {} fact(s), {} claim(s), {} mention(s), {} new entit{}, {} catalog record(s) linked; {} call(s){}{}",
         "✓".green(),
-        read.nodes.len(),
-        read.mentions,
-        read.entities,
-        if read.entities == 1 { "y" } else { "ies" },
-        read.relations,
-        read.calls,
-        if read.cached > 0 {
-            format!(" ({} from cache)", read.cached)
+        read.facts(),
+        read.claims().count(),
+        read.mentions().count(),
+        new_entities,
+        if new_entities == 1 { "y" } else { "ies" },
+        read.linked().len(),
+        read.calls(),
+        if read.cached() > 0 {
+            format!(" ({} from cache)", read.cached())
         } else {
             String::new()
         },
@@ -1642,6 +1717,16 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
             format!(", {usage}")
         }
     );
+    for line in read.run_lines() {
+        eprintln!("  {} {line}", "·".dimmed());
+    }
+    if read.calls() > 1 && args.format != DocReadFormat::Turtle {
+        eprintln!(
+            "  {} read in {} calls: each is a transaction of its own (a run of its own), offsets in the whole document's text",
+            "·".dimmed(),
+            read.calls()
+        );
+    }
     for note in &read.ontology_notes {
         eprintln!("  {} ontology {note}", "·".dimmed());
     }

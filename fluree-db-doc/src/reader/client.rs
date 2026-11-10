@@ -3,14 +3,24 @@
 //! Blocking, like [`crate::LlmClient`] and for the same reason: readings run
 //! inside a `spawn_blocking` task, and ureq carries no runtime to drop there.
 //!
+//! **Controls.** What a call asks for travels in headers, never in the body
+//! as well (a reader refuses a request that sends both): the answer's shape
+//! (`X-Fluree-Output: fluree-transaction`, a Fluree DB transaction), what
+//! comes with the facts (`X-Fluree-Include`), and, for a long text, the
+//! windows it is read in (`X-Fluree-Window`). See [`Controls`].
+//!
 //! **Resends.** A read is resent only when the answer is a 503 that carries
 //! `Retry-After`: the endpoint saying it had no capacity (a model still
 //! starting, a full queue) and when to come back. Nothing else is resent —
-//! not a timeout, not a dropped connection, not a 503 without the header —
-//! because any of those may follow a read that ran, and a read is billed.
-//! Attempts and total waiting are capped, and every wait is reported through
-//! the caller's `on_wait`, so a model starting from cold shows as waiting
-//! rather than as a hang.
+//! not a timeout, not a dropped connection, not a 503 without the header,
+//! not a 504 (the gateway stopped waiting, and the read may still have
+//! run) — because any of those may follow a read that ran, and a read is
+//! billed. Attempts and total waiting are capped, and every wait is reported
+//! through the caller's `on_wait`, so a model starting from cold shows as
+//! waiting rather than as a hang.
+//!
+//! Every answer, an error's included, carries the endpoint's ID for the call
+//! (`X-Fluree-Request-ID`), which an error's message quotes.
 
 use crate::config::ReaderEndpoint;
 use crate::{DocError, Result};
@@ -114,15 +124,107 @@ impl Usage {
     }
 }
 
+/// What a call asks for besides the reading of its body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Controls {
+    pub include: Include,
+    /// Character ranges of the request's text, each read as one window
+    /// (`X-Fluree-Window`); empty reads the text as one.
+    pub windows: Vec<(usize, usize)>,
+}
+
+impl Controls {
+    /// The headers a call sends for these controls.
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![
+            ("X-Fluree-Output", "fluree-transaction".to_string()),
+            ("X-Fluree-Include", self.include.header().to_string()),
+        ];
+        if !self.windows.is_empty() {
+            let windows: Vec<String> = self
+                .windows
+                .iter()
+                .map(|(b, e)| format!("{b}-{e}"))
+                .collect();
+            out.push(("X-Fluree-Window", windows.join(",")));
+        }
+        out
+    }
+}
+
+/// What comes back with the facts, which always do: the claims behind them,
+/// the mentions (each occurrence in the text, and the record it links to),
+/// both, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Include {
+    pub claims: bool,
+    pub mentions: bool,
+}
+
+impl Default for Include {
+    /// Claims and mentions: a reading anchored to the text.
+    fn default() -> Self {
+        Self {
+            claims: true,
+            mentions: true,
+        }
+    }
+}
+
+impl Include {
+    /// `claims`, `mentions`, `claims,mentions` (either order) or `none`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let invalid = || {
+            DocError::Config(format!(
+                "include {value:?}: expected claims, mentions, claims,mentions or none"
+            ))
+        };
+        let parts: Vec<String> = value
+            .split(',')
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut include = Self {
+            claims: false,
+            mentions: false,
+        };
+        for part in &parts {
+            match part.as_str() {
+                "claims" => include.claims = true,
+                "mentions" => include.mentions = true,
+                "none" if parts.len() == 1 => {}
+                _ => return Err(invalid()),
+            }
+        }
+        if parts.is_empty() {
+            return Err(invalid());
+        }
+        Ok(include)
+    }
+
+    /// The `X-Fluree-Include` value.
+    pub fn header(&self) -> &'static str {
+        match (self.claims, self.mentions) {
+            (true, true) => "claims,mentions",
+            (true, false) => "claims",
+            (false, true) => "mentions",
+            (false, false) => "none",
+        }
+    }
+}
+
 /// One answered read.
 #[derive(Debug, Clone)]
 pub struct Answer {
-    /// The reading, as JSON-LD.
+    /// The reading: a Fluree DB transaction, as JSON-LD.
     pub body: String,
     pub usage: Usage,
-    /// The model and release that served, as the endpoint names them.
-    pub model: Option<String>,
+    /// The release that served (`X-Fluree-Release`), the run's IRI
+    /// (`X-Fluree-Run`) and the endpoint's ID for the call
+    /// (`X-Fluree-Request-ID`), as the answer names them.
     pub release: Option<String>,
+    pub run: Option<String>,
+    pub request_id: Option<String>,
     /// What the endpoint set aside or adapted in the ontology, as it reports
     /// it (`X-Fluree-Ontology-Not-Shown`, `-Adapted`).
     pub ontology_notes: Vec<String>,
@@ -172,13 +274,14 @@ impl ReaderClient {
         &self.url
     }
 
-    /// Read one request dataset (TriG) with `model`. `on_wait` hears about
-    /// each wait for capacity before it starts.
+    /// Read one request dataset (TriG) with `model`, asking for `controls`.
+    /// `on_wait` hears about each wait for capacity before it starts.
     pub fn read(
         &self,
         body: &str,
         model: &str,
         cache: Option<&str>,
+        controls: &Controls,
         on_wait: &dyn Fn(&str),
     ) -> Result<Answer> {
         let mut waited = Duration::ZERO;
@@ -192,6 +295,9 @@ impl ReaderClient {
                 .header("X-Fluree-Model", model);
             if let Some(c) = cache {
                 req = req.header("X-Fluree-Cache", c);
+            }
+            for (name, value) in controls.headers() {
+                req = req.header(name, value.as_str());
             }
             req = match &self.credential {
                 Some(Credential::Bearer(t)) => req.header("Authorization", &format!("Bearer {t}")),
@@ -207,40 +313,48 @@ impl ReaderClient {
             let headers = response.headers().clone();
             let text = response
                 .body_mut()
-                // An answer echoes the structure graph beside the reading;
-                // ureq's 10 MiB default is too tight for a large document.
+                // A long document's mentions alone can pass ureq's 10 MiB
+                // default.
                 .with_config()
                 .limit(64 * 1024 * 1024)
                 .read_to_string()
                 .map_err(|e| DocError::Model(format!("{}: reading the answer: {e}", self.url)))?;
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            let request_id = header("x-fluree-request-id");
             if (200..300).contains(&status) {
-                let header = |name: &str| {
-                    headers
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                };
                 let ontology_notes = [
                     ("x-fluree-ontology-not-shown", "not shown to the model"),
                     ("x-fluree-ontology-adapted", "adapted"),
                 ]
                 .into_iter()
-                .filter_map(|(h, what)| {
-                    header(h)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| format!("{what}: {v}"))
-                })
+                .filter_map(|(h, what)| header(h).map(|v| format!("{what}: {v}")))
                 .collect();
                 return Ok(Answer {
                     body: text,
                     usage: Usage::from_headers(&headers),
-                    model: header("x-fluree-model"),
                     release: header("x-fluree-release"),
+                    run: header("x-fluree-run"),
+                    request_id,
                     ontology_notes,
                     resends: attempt - 1,
                 });
             }
-            let message = error_message(&text);
+            let mut message = error_message(&text);
+            if status == 504 {
+                message.push_str(
+                    "; the reader may still have read it, and billed it, so it is not resent",
+                );
+            }
+            if let Some(id) = &request_id {
+                message.push_str(&format!(" (request {id})"));
+            }
             let retry_after = (status == 503)
                 .then(|| headers.get("retry-after"))
                 .flatten()
@@ -411,15 +525,24 @@ mod tests {
                 "X-Fluree-Serialized-Tokens: 1000, 32",
                 "X-Fluree-Cache-Read-Tokens: 0,900",
                 "X-Fluree-Fuel-Consumed: 3.4",
-                "X-Fluree-Model: m",
+                "X-Fluree-Release: example-reader-1.0",
+                "X-Fluree-Run: urn:fluree:run:01EXAMPLE",
+                "X-Fluree-Request-ID: req-1",
                 "X-Fluree-Ontology-Not-Shown: rdfs:domain=2",
             ],
             "[]",
         )]);
         let client = ReaderClient::new(&endpoint(&url));
+        let controls = Controls {
+            include: Include::parse("mentions, claims").unwrap(),
+            windows: vec![(0, 1200), (1100, 2400)],
+        };
         let answer = client
-            .read("<urn:g> {}", "m", Some("catalog"), &|_| {})
+            .read("<urn:g> {}", "m", Some("catalog"), &controls, &|_| {})
             .unwrap();
+        assert_eq!(answer.release.as_deref(), Some("example-reader-1.0"));
+        assert_eq!(answer.run.as_deref(), Some("urn:fluree:run:01EXAMPLE"));
+        assert_eq!(answer.request_id.as_deref(), Some("req-1"));
         assert_eq!(answer.usage.input_tokens, 1032);
         assert_eq!(answer.usage.windows, 2);
         assert_eq!(answer.usage.cache_read_tokens, 900);
@@ -433,7 +556,47 @@ mod tests {
         assert!(head.contains("x-fluree-model: m"));
         assert!(head.contains("x-fluree-cache: catalog"));
         assert!(head.contains("content-type: application/trig"));
+        assert!(head.contains("accept: application/ld+json"));
+        assert!(head.contains("x-fluree-output: fluree-transaction"));
+        assert!(head.contains("x-fluree-include: claims,mentions"));
+        assert!(head.contains("x-fluree-window: 0-1200,1100-2400"));
         assert!(!head.contains("authorization"));
+    }
+
+    #[test]
+    fn include_reads_each_part_or_none() {
+        let header = |v: &str| Include::parse(v).map(|i| i.header());
+        assert_eq!(header("claims").unwrap(), "claims");
+        assert_eq!(header("MENTIONS").unwrap(), "mentions");
+        assert_eq!(header("mentions,claims").unwrap(), "claims,mentions");
+        assert_eq!(header("none").unwrap(), "none");
+        for bad in ["", "none,claims", "facts"] {
+            assert!(header(bad).is_err(), "{bad:?}");
+        }
+        // No windows, no window header.
+        let headers = Controls::default().headers();
+        assert!(headers.iter().all(|(h, _)| *h != "X-Fluree-Window"));
+    }
+
+    /// A 504 may follow a read that ran: not resent, and the message says
+    /// so with the endpoint's ID for the call.
+    #[test]
+    fn a_504_is_not_resent_and_names_the_request() {
+        let (url, seen) = stub(vec![http(
+            "504 Gateway Timeout",
+            &["X-Fluree-Request-ID: req-504"],
+            r#"{"error":"no answer within the job timeout"}"#,
+        )]);
+        let err = ReaderClient::new(&endpoint(&url))
+            .read("x", "m", None, &Controls::default(), &|_| {
+                panic!("no wait expected")
+            })
+            .unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let text = err.to_string();
+        assert!(text.contains("504"), "{text}");
+        assert!(text.contains("not resent"), "{text}");
+        assert!(text.contains("(request req-504)"), "{text}");
     }
 
     #[test]
@@ -448,7 +611,7 @@ mod tests {
         ]);
         let waits = Mutex::new(Vec::new());
         let answer = ReaderClient::new(&endpoint(&url))
-            .read("x", "m", None, &|w| {
+            .read("x", "m", None, &Controls::default(), &|w| {
                 waits.lock().unwrap().push(w.to_string());
             })
             .unwrap();
@@ -477,7 +640,9 @@ mod tests {
         ] {
             let (url, seen) = stub(vec![response]);
             let err = ReaderClient::new(&endpoint(&url))
-                .read("x", "m", None, &|_| panic!("no wait expected"))
+                .read("x", "m", None, &Controls::default(), &|_| {
+                    panic!("no wait expected")
+                })
                 .unwrap_err();
             assert_eq!(seen.lock().unwrap().len(), 1, "{err}");
         }
@@ -488,7 +653,7 @@ mod tests {
         let busy = || http("503 Service Unavailable", &["Retry-After: 1"], "busy");
         let (url, seen) = stub(vec![busy(), busy(), busy(), busy()]);
         let err = ReaderClient::new(&endpoint(&url))
-            .read("x", "m", None, &|_| {})
+            .read("x", "m", None, &Controls::default(), &|_| {})
             .unwrap_err();
         assert_eq!(seen.lock().unwrap().len(), ATTEMPTS as usize);
         assert!(err.to_string().contains("503"), "{err}");
@@ -544,7 +709,8 @@ mod tests {
     #[test]
     fn an_error_status_is_kept_typed() {
         let (url, _) = stub(vec![http("401 Unauthorized", &[], r#"{"error":"no"}"#)]);
-        match ReaderClient::new(&endpoint(&url)).read("x", "m", None, &|_| {}) {
+        match ReaderClient::new(&endpoint(&url)).read("x", "m", None, &Controls::default(), &|_| {})
+        {
             Err(DocError::Endpoint { status: 401, .. }) => {}
             other => panic!("{other:?}"),
         }
@@ -556,7 +722,7 @@ mod tests {
         let mut ep = endpoint(&url);
         ep.auth_header = None;
         ReaderClient::new(&ep)
-            .read("x", "m", None, &|_| {})
+            .read("x", "m", None, &Controls::default(), &|_| {})
             .unwrap();
         assert!(seen.lock().unwrap()[0]
             .to_ascii_lowercase()

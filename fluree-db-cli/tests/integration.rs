@@ -6977,7 +6977,7 @@ type StubLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
 /// A stub HTTP reader: records each request (head and body) and answers the
 /// n-th with `answers[n]` (the last one again past the end), billing 1,032
-/// tokens a call.
+/// tokens a call and naming it `req-<n + 1>`.
 fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7019,7 +7019,8 @@ fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
             let payload = answers[n.min(answers.len() - 1)].to_string();
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nX-Fluree-Serialized-Tokens: 1032\r\nX-Fluree-Ontology-Not-Shown: rdfs:domain=1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nX-Fluree-Output: fluree-transaction\r\nX-Fluree-Serialized-Tokens: 1032\r\nX-Fluree-Ontology-Not-Shown: rdfs:domain=1\r\nX-Fluree-Release: example-reader-1.0\r\nX-Fluree-Request-ID: req-{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                n + 1,
                 payload.len(),
                 payload
             );
@@ -7029,44 +7030,105 @@ fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
     (format!("http://{addr}/extract"), seen)
 }
 
-/// A reading of `memo.md` in a vocabulary of the reader's own: the echoed
-/// document graph, a mention of Acme, and (with `claim`) a local entity
-/// for Jane Doe and the reified claim that she works for Acme.
+/// A reading of `memo.md` in the reader's layout: a Fluree DB transaction
+/// whose commit metadata names the run, with a mention of Acme and (with
+/// `claim`) the fact that Jane Doe, an entity the run minted, works for it,
+/// the claim behind that fact annotating it. Each `score` is its own run.
 fn stub_reading(score: f64, claim: bool) -> serde_json::Value {
-    const R: &str = "http://example.org/r#";
-    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-    const NIF: &str = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#";
     let doc = "urn:fluree:doc:memo.md";
-    let mut reading = vec![serde_json::json!({
-        "@id": format!("{doc}/reading#o31-35"),
-        // In the reader's own terms, as a NIF string with offsets.
-        format!("{RDF}type"): [
-            { "@id": format!("{R}Occurrence") },
-            { "@id": format!("{NIF}RFC5147String") }
-        ],
-        format!("{NIF}beginIndex"): [{ "@value": 31 }],
-        format!("{NIF}endIndex"): [{ "@value": 35 }],
-        format!("{R}refersTo"): [{ "@id": "https://example.org/org/acme" }],
-        format!("{R}score"): [{ "@value": score }]
+    let run = format!("urn:fluree:run:01TEST{}", (score * 100.0) as u32);
+    let jane = "urn:fluree:entity:memo00-jane";
+    let mut mentions = vec![serde_json::json!({
+        "id": "run:o31-35",
+        "type": ["Occurrence", "nif:RFC5147String"],
+        "anchorOf": "Acme",
+        "beginIndex": 31,
+        "endIndex": 35,
+        "occurrenceClass": "schema:Organization",
+        "entity": "https://example.org/org/acme",
+        "linkConfidence": score,
+        "referenceContext": doc
     })];
+    let mut graph = Vec::new();
     if claim {
-        reading.push(serde_json::json!({
-            "@id": format!("{doc}/entity/1"),
-            format!("{RDF}type"): [{ "@id": format!("{R}LocalEntity") }],
-            "https://schema.org/worksFor": [{ "@id": "https://example.org/org/acme" }]
+        mentions.push(serde_json::json!({
+            "id": "run:o15-23",
+            "type": ["Occurrence", "nif:RFC5147String"],
+            "anchorOf": "Jane Doe",
+            "beginIndex": 15,
+            "endIndex": 23,
+            "occurrenceClass": "schema:Person",
+            "localEntity": jane,
+            "score": 0.99,
+            "referenceContext": doc
         }));
-        reading.push(serde_json::json!({
-            "@id": format!("{doc}/reading#r-0"),
-            format!("{RDF}type"): [{ "@id": format!("{RDF}Statement") }],
-            format!("{RDF}subject"): [{ "@id": format!("{doc}/entity/1") }],
-            format!("{RDF}predicate"): [{ "@id": "https://schema.org/worksFor" }],
-            format!("{RDF}object"): [{ "@id": "https://example.org/org/acme" }]
+        mentions.push(serde_json::json!({ "id": jane, "type": "LocalEntity" }));
+        graph.push(serde_json::json!({
+            "id": jane,
+            "type": "schema:Person",
+            "label": "Jane Doe",
+            "schema:worksFor": {
+                "@id": "https://example.org/org/acme",
+                "@annotation": {
+                    "@id": "run:r-0",
+                    "type": "Claim",
+                    "assertionStatus": "xt:affirmed",
+                    "accepted": true,
+                    "score": score,
+                    "subjectOccurrence": "run:o15-23",
+                    "objectOccurrence": "run:o31-35",
+                    "wasGeneratedBy": run
+                }
+            }
         }));
     }
-    serde_json::json!([
-        { "@id": doc, "@graph": [{ "@id": doc, format!("{NIF}isString"): [{ "@value": "echo" }] }] },
-        { "@id": format!("{doc}/reading"), "@graph": reading }
-    ])
+    graph.insert(
+        0,
+        serde_json::json!({ "id": "xt:mentions", "@graph": mentions }),
+    );
+    serde_json::json!({
+        "@context": {
+            "id": "@id",
+            "type": "@type",
+            "nif": "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "schema": "https://schema.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#",
+            "xt": "https://ns.flur.ee/extract#",
+            "prov": "http://www.w3.org/ns/prov#",
+            "run": { "@id": format!("{run}-"), "@prefix": true },
+            "label": "rdfs:label",
+            "anchorOf": "nif:anchorOf",
+            "beginIndex": "nif:beginIndex",
+            "endIndex": "nif:endIndex",
+            "occurrenceClass": { "@id": "xt:occurrenceClass", "@type": "@id" },
+            "assertionStatus": { "@id": "xt:assertionStatus", "@type": "@id" },
+            "accepted": "xt:accepted",
+            "entity": { "@id": "xt:entity", "@type": "@id" },
+            "localEntity": { "@id": "xt:localEntity", "@type": "@id" },
+            "linkConfidence": { "@id": "xt:linkConfidence", "@type": "xsd:double" },
+            "score": { "@id": "xt:score", "@type": "xsd:double" },
+            "subjectOccurrence": { "@id": "xt:subjectOccurrence", "@type": "@id" },
+            "objectOccurrence": { "@id": "xt:objectOccurrence", "@type": "@id" },
+            "referenceContext": { "@id": "nif:referenceContext", "@type": "@id" },
+            "responseLayout": { "@id": "xt:responseLayout", "@type": "@id" },
+            "textSha256": "xt:textSha256",
+            "used": { "@id": "prov:used", "@type": "@id" },
+            "wasAssociatedWith": { "@id": "prov:wasAssociatedWith", "@type": "@id" },
+            "wasGeneratedBy": { "@id": "prov:wasGeneratedBy", "@type": "@id" },
+            "Claim": "xt:Claim",
+            "LocalEntity": "xt:LocalEntity",
+            "Occurrence": "xt:Occurrence"
+        },
+        "txn-meta": {
+            "used": { "@id": doc },
+            "wasAssociatedWith": { "@id": "https://ns.flur.ee/model/example-reader-1.0" },
+            "responseLayout": { "@id": "https://ns.flur.ee/extract/response/2" },
+            "xt:run": { "@id": run },
+            "textSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "@graph": graph
+    })
 }
 
 fn sparql_rows(tmp: &TempDir, ledger: &str, query: &str) -> usize {
@@ -7124,9 +7186,12 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
             "catalog    ont/entities.ttl: 1 record(s)",
         ))
         .stdout(predicate::str::contains(
-            "1 mention(s) of 0 entities (0 new)",
+            "2 mention(s) of 2 entities (1 new)",
         ))
         .stdout(predicate::str::contains("1 relation(s), 1,032 tokens"))
+        .stdout(predicate::str::contains(
+            "run urn:fluree:run:01TEST90, release example-reader-1.0, request req-1",
+        ))
         .stdout(predicate::str::contains("reading: 1 call(s), 1,032 tokens"))
         .stdout(predicate::str::contains(
             "ontology not shown to the model: rdfs:domain=1",
@@ -7138,6 +7203,15 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
         assert!(head.contains("x-fluree-model: stub-reader"), "{head}");
         assert!(head.contains("x-api-key: k-123"), "{head}");
         assert!(head.contains("content-type: application/trig"), "{head}");
+        // The controls are headers, and only headers.
+        assert!(
+            head.contains("x-fluree-output: fluree-transaction"),
+            "{head}"
+        );
+        assert!(head.contains("x-fluree-include: claims,mentions"), "{head}");
+        assert!(!head.contains("x-fluree-window"), "{head}");
+        assert!(!body.contains("extract#request"), "{body}");
+        assert!(!body.contains("extract#Request"), "{body}");
         for role in ["document", "ontology", "instances"] {
             assert!(
                 body.contains(&format!("<https://ns.flur.ee/extract#{role}> {{")),
@@ -7150,54 +7224,71 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
             "{body}"
         );
     }
-    let refers = "SELECT ?o WHERE { ?m <http://example.org/r#refersTo> ?o }";
-    let asserted = "SELECT ?r WHERE { ?r a <https://ns.flur.ee/doc#Relation> ; <https://ns.flur.ee/doc#asserted> true }";
-    let edge =
-        "SELECT ?s WHERE { ?s <https://schema.org/worksFor> <https://example.org/org/acme> }";
-    let scores = "SELECT ?v WHERE { ?m <http://example.org/r#score> ?v }";
-    assert_eq!(sparql_rows(&tmp, "memos", refers), 1);
-    // The mention sits in the paragraph that holds its span.
+    // The transaction went in as it is, in the document's reading graph:
+    // the fact, the claim annotating it, and the mentions beside them.
+    let g = "<urn:fluree:doc:memo.md/reading>";
+    let fact = format!(
+        "SELECT ?s WHERE {{ GRAPH {g} {{ ?s <https://schema.org/worksFor> <https://example.org/org/acme> }} }}"
+    );
+    let claim = format!(
+        "SELECT ?c WHERE {{ GRAPH {g} {{ ?c a <https://ns.flur.ee/extract#Claim> ; <https://ns.flur.ee/extract#score> ?v }} }}"
+    );
+    let annotation = format!(
+        "SELECT ?c WHERE {{ GRAPH {g} {{ ?c <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s <https://schema.org/worksFor> ?o )>> }} }}"
+    );
+    let link = format!(
+        "SELECT ?v WHERE {{ GRAPH {g} {{ ?m <https://ns.flur.ee/extract#entity> <https://example.org/org/acme> ; <https://ns.flur.ee/extract#linkConfidence> ?v }} }}"
+    );
+    let runs = "SELECT ?run FROM NAMED <memos:main#txn-meta> WHERE { GRAPH <memos:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }";
+    let stamped =
+        "SELECT ?g WHERE { <urn:fluree:doc:memo.md> <https://ns.flur.ee/doc#readingGraph> ?g }";
+    assert_eq!(sparql_rows(&tmp, "memos", &fact), 1);
+    // Not in the default graph, where the document's structure is.
     assert_eq!(
         sparql_rows(
             &tmp,
             "memos",
-            "SELECT ?e WHERE { ?m a <http://example.org/r#Occurrence> ; <https://ns.flur.ee/doc#sourceElement> ?e . ?e a <http://purl.org/spar/doco/Paragraph> }"
+            "SELECT ?s WHERE { ?s <https://schema.org/worksFor> ?o }"
         ),
-        1
+        0
     );
-    assert_eq!(sparql_rows(&tmp, "memos", asserted), 1);
-    assert_eq!(sparql_rows(&tmp, "memos", edge), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", &claim), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", &annotation), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", &link), 1);
+    // The run is the commit's metadata, and a fact joins to its document
+    // through its claim's run (the query the docs give).
+    assert_eq!(sparql_rows(&tmp, "memos", runs), 1);
+    let traced = "PREFIX xt: <https://ns.flur.ee/extract#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?s ?p ?o ?score ?document
+FROM NAMED <urn:fluree:doc:memo.md/reading> FROM NAMED <memos:main#txn-meta>
+WHERE {
+  GRAPH <urn:fluree:doc:memo.md/reading> {
+    ?claim rdf:reifies <<( ?s ?p ?o )>> ; xt:score ?score ; prov:wasGeneratedBy ?run .
+  }
+  GRAPH <memos:main#txn-meta> { ?commit xt:run ?run ; prov:used ?document . }
+}";
+    assert_eq!(sparql_rows(&tmp, "memos", traced), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", stamped), 1);
 
     // The same request again is answered from the cache: nothing is sent.
     ingest(&["--force"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("reading from cache"));
+        .stdout(predicate::str::contains("reading from cache"))
+        .stdout(predicate::str::contains("from cache"));
     assert_eq!(seen.lock().unwrap().len(), 1);
 
-    // Someone annotates a node the reader minted.
-    let note = "SELECT ?c WHERE { <urn:fluree:doc:memo.md/reading#o31-35> <http://www.w3.org/2000/01/rdf-schema#comment> ?c }";
-    fluree_cmd(&tmp)
-        .args([
-            "insert",
-            "--ledger",
-            "memos",
-            "-e",
-            "<urn:fluree:doc:memo.md/reading#o31-35> <http://www.w3.org/2000/01/rdf-schema#comment> \"checked by hand\" .",
-        ])
-        .assert()
-        .success();
-    assert_eq!(sparql_rows(&tmp, "memos", note), 1);
-
-    // A fresh read replaces the reading whole: the old score, the claim and
-    // the edge it asserted are gone. The annotation, in a predicate the
-    // reader never wrote, stays.
+    // A fresh read replaces the reading whole: the fact, its claim and the
+    // old link are gone, the new link is there, and the commit metadata
+    // keeps every run.
     ingest(&["--force", "--no-cache"]).assert().success();
     assert_eq!(seen.lock().unwrap().len(), 2);
-    assert_eq!(sparql_rows(&tmp, "memos", scores), 1);
-    assert_eq!(sparql_rows(&tmp, "memos", note), 1);
-    assert_eq!(sparql_rows(&tmp, "memos", asserted), 0);
-    assert_eq!(sparql_rows(&tmp, "memos", edge), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &fact), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &claim), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &link), 1);
+    assert!(sparql_rows(&tmp, "memos", runs) >= 2);
 
     // An unchanged document is not read again.
     ingest(&[])
@@ -7272,7 +7363,8 @@ fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
 }
 
 /// `doc read` needs no project: the reader comes from the environment, the
-/// reading goes to stdout and what it was billed to stderr.
+/// reading goes to stdout as the reader wrote it, and what it was billed,
+/// with each call's run, release and request ID, to stderr.
 #[test]
 fn doc_read_prints_one_files_reading_without_a_project() {
     let tmp = TempDir::new().unwrap();
@@ -7304,45 +7396,67 @@ fn doc_read_prints_one_files_reading_without_a_project() {
     );
     assert!(
         stderr.contains(
-            "3 node(s): 1 mention(s), 0 entities, 1 relation(s); 1 call(s), 1,032 tokens"
+            "3 fact(s), 1 claim(s), 2 mention(s), 1 new entity, 1 catalog record(s) linked; 1 call(s), 1,032 tokens"
         ),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("run urn:fluree:run:01TEST90, release example-reader-1.0, request req-1"),
+        "{stderr}"
+    );
+    // The transaction as the reader wrote it: its commit metadata, the
+    // fact with its claim, the mentions graph.
     let reading: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let nodes = reading["@graph"].as_array().unwrap();
-    // The stub answers in its own terms: a mention is a NIF string.
-    assert!(nodes
+    assert_eq!(
+        reading["txn-meta"]["responseLayout"]["@id"],
+        "https://ns.flur.ee/extract/response/2"
+    );
+    let graph = reading["@graph"].as_array().unwrap();
+    assert!(graph.iter().any(|n| n["id"] == "xt:mentions"));
+    assert!(graph
         .iter()
-        .any(|n| n["@type"].as_array().is_some_and(|t| t.iter().any(
-            |t| t == "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#RFC5147String"
-        ))));
-    assert!(nodes
-        .iter()
-        .all(|n| n["https://ns.flur.ee/doc#sourceDocument"][0]["@id"] == "urn:fluree:doc:memo.md"));
-    assert_eq!(seen.lock().unwrap().len(), 1);
+        .any(|n| n["schema:worksFor"]["@annotation"]["@id"] == "run:r-0"));
+    assert_eq!(
+        seen.lock().unwrap()[0]
+            .0
+            .matches("x-fluree-include: claims,mentions")
+            .count(),
+        1
+    );
 
     // The same request again is answered from the cache.
     read(&["--format", "turtle"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "@prefix doc: <https://ns.flur.ee/doc#>",
+            "@prefix xt: <https://ns.flur.ee/extract#>",
         ))
+        .stdout(predicate::str::contains("txn-meta").not())
         .stderr(predicate::str::contains("(1 from cache)"));
     assert_eq!(seen.lock().unwrap().len(), 1);
 
     read(&["--format", "trig", "--no-cache"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "<urn:fluree:doc:memo.md/reading> {",
-        ))
-        .stdout(predicate::str::contains("<urn:fluree:doc:memo.md> {"))
+        .stdout(predicate::str::contains("GRAPH <#txn-meta> {"))
+        .stdout(predicate::str::contains("fluree:commit:this"))
+        .stdout(predicate::str::contains("GRAPH xt:mentions {"))
         // The stub writes offsets as native JSON numbers: still numbers.
         .stdout(predicate::str::contains("beginIndex 31"))
         .stdout(predicate::str::contains("beginIndex \"31\"").not());
     // `--no-cache` read afresh.
     assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // What comes with the facts is the caller's to say.
+    read(&["--include", "none", "--no-cache"])
+        .assert()
+        .success();
+    assert!(seen.lock().unwrap()[2].0.contains("x-fluree-include: none"));
+    read(&["--include", "facts"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--include \"facts\""));
+    assert_eq!(seen.lock().unwrap().len(), 3);
 
     // An output path that can't be written fails before anything is sent,
     // by name.
@@ -7350,7 +7464,7 @@ fn doc_read_prints_one_files_reading_without_a_project() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no/such/dir/out.jsonld"));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().len(), 3);
 
     // A document with no text is not sent.
     std::fs::write(tmp.path().join("docs/empty.md"), "").unwrap();
@@ -7371,6 +7485,38 @@ fn doc_read_prints_one_files_reading_without_a_project() {
         .success()
         .stderr(predicate::str::contains("no text to read"))
         .stderr(predicate::str::contains("0 call(s)"));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+/// A reader still answering in the earlier layout (the document graph
+/// echoed, no commit metadata) is refused by name, and nothing is kept.
+#[test]
+fn doc_read_refuses_an_answer_in_the_earlier_layout() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let doc = "urn:fluree:doc:memo.md";
+    let earlier = serde_json::json!([
+        { "@id": doc, "@graph": [{ "@id": doc, "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#isString": [{ "@value": "echo" }] }] },
+        { "@id": format!("{doc}/reading"), "@graph": [] }
+    ]);
+    let (url, seen) = spawn_stub_reader(vec![earlier]);
+    std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", tmp.path().join("home"))
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader"]);
+        cmd
+    };
+    read()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("response layout 2"))
+        .stderr(predicate::str::contains("(request req-1)"));
+    // Not cached: the next read asks again.
+    read().assert().failure();
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
@@ -7490,20 +7636,17 @@ fn doc_reader_configured_with_config_set_reads() {
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
-/// `--relations` holds for a reader as for the language model: `off` keeps
-/// no relation and no edge, `reified` keeps the relation but not its edge.
+/// A reader's facts come with its reading: `--relations off|reified` is
+/// refused for one, and `--include` says what comes with the facts.
 #[test]
-fn doc_ingest_reader_honours_relations_off_and_reified() {
-    let edge =
-        "SELECT ?s WHERE { ?s <https://schema.org/worksFor> <https://example.org/org/acme> }";
-    let relation = "SELECT ?r WHERE { ?r a <https://ns.flur.ee/doc#Relation> }";
-    for (mode, edges, relations) in [("off", 0, 0), ("reified", 0, 1), ("direct", 1, 1)] {
-        let tmp = TempDir::new().unwrap();
-        fluree_cmd(&tmp).arg("init").assert().success();
-        write_extraction_fixtures(&tmp);
-        let (url, _seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
-        fluree_cmd(&tmp)
-            .env("FLUREE_DOC_READER_URL", &url)
+fn doc_ingest_reader_takes_include_not_relations() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let ingest = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_READER_URL", &url)
             .env("FLUREE_DOC_READER_MODELS", "stub-reader")
             .args([
                 "doc",
@@ -7514,21 +7657,35 @@ fn doc_ingest_reader_honours_relations_off_and_reified() {
                 "--no-embed",
                 "--ontology",
                 "ont/model.ttl",
+                "--model",
+                "stub-reader",
             ])
-            .args(["--model", "stub-reader", "--relations", mode])
+            .args(extra);
+        cmd
+    };
+    for mode in ["off", "reified"] {
+        ingest(&["--relations", mode])
             .assert()
-            .success();
-        assert_eq!(
-            sparql_rows(&tmp, "memos", edge),
-            edges,
-            "edges with --relations {mode}"
-        );
-        assert_eq!(
-            sparql_rows(&tmp, "memos", relation),
-            relations,
-            "relations with --relations {mode}"
-        );
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "--relations {mode}: a reader's facts always come with its reading"
+            )));
     }
+    assert_eq!(seen.lock().unwrap().len(), 0);
+    ingest(&["--include", "claims"]).assert().success();
+    assert!(seen.lock().unwrap()[0]
+        .0
+        .lines()
+        .any(|l| l.trim() == "x-fluree-include: claims"));
+    // `--include` is a reader's.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--include", "claims"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--include is for a model a [doc.reader] serves",
+        ));
 }
 
 #[test]

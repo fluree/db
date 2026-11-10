@@ -18,7 +18,10 @@
 //! `<api base>/grounding`.
 
 use crate::error::{fluree_error, invalid_request, raise_status};
-use fluree_db_doc::reader::{request, Credential, ReaderClient, Session, CACHE_MODES};
+use fluree_db_doc::reader::{
+    read_answer, reading, request, Claim, Credential, Frame, Include, Mention, ReaderClient,
+    Session, CACHE_MODES,
+};
 use fluree_db_doc::{DocCache, DocError, PreparedDocument};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -80,7 +83,8 @@ impl ReadError {
 #[pyfunction]
 #[pyo3(signature = (
     path, *, ontology, catalog, model, url=None, api_key=None, auth_header=None,
-    cache=None, doc_iri=None, base_iri="urn:fluree:doc:".to_string(), cache_dir=None,
+    cache=None, include="claims,mentions".to_string(), doc_iri=None,
+    base_iri="urn:fluree:doc:".to_string(), cache_dir=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_document(
@@ -93,10 +97,15 @@ pub(crate) fn read_document(
     api_key: Option<String>,
     auth_header: Option<String>,
     cache: Option<String>,
+    include: String,
     doc_iri: Option<String>,
     base_iri: String,
     cache_dir: Option<PathBuf>,
 ) -> PyResult<Bound<'_, PyDict>> {
+    let include = Include::parse(&include).map_err(|e| match e {
+        DocError::Config(m) => invalid_request(m),
+        e => fluree_error(e.to_string()),
+    })?;
     if let Some(c) = &cache {
         if !CACHE_MODES.contains(&c.trim().to_ascii_lowercase().as_str()) {
             return Err(invalid_request(format!(
@@ -126,7 +135,8 @@ pub(crate) fn read_document(
             records,
             doc_cache.clone(),
         )
-        .map_err(ReadError::from_doc)?;
+        .map_err(ReadError::from_doc)?
+        .with_include(include);
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -151,14 +161,40 @@ pub(crate) fn read_document(
     });
     let (read, url, notes) = read.map_err(ReadError::into_py)?;
     let out = PyDict::new(py);
+    let json =
+        |v: &serde_json::Value| serde_json::to_string(v).map_err(|e| fluree_error(e.to_string()));
+    let transactions: Vec<serde_json::Value> = read
+        .readings
+        .iter()
+        .map(|r| r.transaction.clone())
+        .collect();
     out.set_item(
-        "nodes",
-        serde_json::to_string(&read.nodes).map_err(|e| fluree_error(e.to_string()))?,
+        "transactions",
+        json(&serde_json::Value::Array(transactions))?,
     )?;
-    out.set_item("mentions", read.mentions)?;
-    out.set_item("entities", read.entities)?;
-    out.set_item("relations", read.relations)?;
-    out.set_item("linked", read.linked.into_iter().collect::<Vec<_>>())?;
+    let mentions: Vec<serde_json::Value> = read.mentions().map(mention_row).collect();
+    out.set_item("mentions", json(&serde_json::Value::Array(mentions))?)?;
+    let claims: Vec<serde_json::Value> = read.claims().map(claim_row).collect();
+    out.set_item("claims", json(&serde_json::Value::Array(claims))?)?;
+    let runs: Vec<serde_json::Value> = read
+        .readings
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "run": r.run,
+                "release": r.release,
+                "request_id": r.request_id,
+                "cached": r.cached,
+            })
+        })
+        .collect();
+    out.set_item("runs", json(&serde_json::Value::Array(runs))?)?;
+    out.set_item("facts", read.facts())?;
+    out.set_item(
+        "new_entities",
+        read.new_entities().into_iter().collect::<Vec<_>>(),
+    )?;
+    out.set_item("linked", read.linked().into_iter().collect::<Vec<_>>())?;
     let usage = PyDict::new(py);
     usage.set_item("input_tokens", read.usage.input_tokens)?;
     usage.set_item("windows", read.usage.windows)?;
@@ -167,27 +203,77 @@ pub(crate) fn read_document(
     usage.set_item("fuel", read.usage.fuel)?;
     usage.set_item("note", read.usage.note())?;
     out.set_item("usage", usage)?;
-    out.set_item("calls", read.calls)?;
-    out.set_item("cached", read.cached)?;
-    out.set_item("release", read.release)?;
-    out.set_item("ontology_notes", read.ontology_notes)?;
+    out.set_item("calls", read.calls())?;
+    out.set_item("cached", read.cached())?;
+    out.set_item("release", read.release())?;
+    out.set_item("ontology_notes", read.ontology_notes.clone())?;
     out.set_item("notes", notes)?;
     out.set_item("url", url)?;
     Ok(out)
 }
 
-/// A reading's nodes (JSON) as Turtle, with the pipeline's prefixes.
-#[pyfunction]
-pub(crate) fn reading_turtle(nodes: &str) -> PyResult<String> {
-    let nodes: Vec<serde_json::Value> =
-        serde_json::from_str(nodes).map_err(|e| invalid_request(e.to_string()))?;
-    fluree_db_doc::reader::reading::turtle(&nodes).map_err(|e| fluree_error(e.to_string()))
+/// A mention as a row: its id, words, offsets, class, the record or new
+/// entity it names, its confidence, and the structure element it sits in.
+fn mention_row(m: &Mention) -> serde_json::Value {
+    serde_json::json!({
+        "id": m.id,
+        "text": m.text,
+        "begin": m.begin,
+        "end": m.end,
+        "class": m.class,
+        "entity": m.entity,
+        "new_entity": m.new_entity,
+        "confidence": m.confidence,
+        "element": m.element,
+    })
 }
 
-/// The pipeline's `@context`, for a reading written as JSON-LD.
+/// A claim as a row; its object an IRI, or a literal's lexical form.
+fn claim_row(c: &Claim) -> serde_json::Value {
+    let object = c.object.as_ref().map(|o| match o.as_iri() {
+        Some(iri) => iri.to_string(),
+        None => o
+            .as_literal()
+            .map(|(v, _, _)| v.lexical())
+            .unwrap_or_default(),
+    });
+    serde_json::json!({
+        "id": c.id,
+        "subject": c.subject,
+        "predicate": c.predicate,
+        "object": object,
+        "status": c.status,
+        "accepted": c.accepted,
+        "score": c.score,
+        "asserted": c.asserted,
+    })
+}
+
+/// Readings (their transactions, as JSON) as TriG or Turtle.
 #[pyfunction]
-pub(crate) fn reading_context() -> String {
-    fluree_db_doc::vocab::context().to_string()
+pub(crate) fn reading_text(transactions: &str, format: &str) -> PyResult<String> {
+    let transactions: Vec<serde_json::Value> =
+        serde_json::from_str(transactions).map_err(|e| invalid_request(e.to_string()))?;
+    let readings = transactions
+        .iter()
+        .map(|t| {
+            // The offsets are the document's already.
+            read_answer(
+                &t.to_string(),
+                &Frame {
+                    doc_iri: "",
+                    offset: 0,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| fluree_error(e.to_string()))?;
+    match format {
+        "trig" => reading::trig(&readings),
+        "turtle" => reading::turtle(&readings),
+        other => return Err(invalid_request(format!("format {other:?}: trig or turtle"))),
+    }
+    .map_err(|e| fluree_error(e.to_string()))
 }
 
 fn load_rdf(path: &Path) -> Result<fluree_graph_ir::Graph, String> {

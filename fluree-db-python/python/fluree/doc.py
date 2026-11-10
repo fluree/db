@@ -3,9 +3,10 @@
 :func:`read` parses a file (PDF, Word, PowerPoint, HTML, Markdown, text,
 spreadsheets, transcripts, email) the way ``fluree doc parse`` does, sends
 its text and structure with your ontology and catalog to a reader, and
-returns what it read: mentions linked to your catalog's records, entities,
-and claims, each anchored to character offsets in the parser's text (what
-``fluree doc parse --format text`` prints)::
+returns its reading: a Fluree DB transaction holding the run (the document
+read, the release that read it), the facts in your ontology's terms, the
+claims behind them and the mentions, each anchored to character offsets in
+the parser's text (what ``fluree doc parse --format text`` prints)::
 
     import fluree
 
@@ -16,6 +17,9 @@ and claims, each anchored to character offsets in the parser's text (what
 
     with fluree.connect("./data") as conn:
         conn.create("invoices").insert(reading.to_jsonld())
+
+``include=`` says what comes with the facts, which always come: ``"claims"``,
+``"mentions"``, both (the default) or ``"none"``.
 
 The read is the ``fluree`` CLI's own, so a document is cut into calls, sent,
 resent when the reader has no capacity yet, and kept the same way. Waits for
@@ -37,11 +41,12 @@ pages and images are read with the parser's deterministic tier only, and
 
 With no ``url``, a Fluree.ai sign-in reads through the account.
 
-**Rows and terms.** :meth:`Reading.mentions` and :meth:`Reading.claims`
-read NIF offsets (``nif:beginIndex``, ``nif:anchorOf``, ``nif:entity``) and
-the pipeline's ``doc:`` terms. A reader that writes terms of its own keeps
-them in :attr:`Reading.nodes` and :meth:`Reading.to_jsonld` as it wrote
-them.
+**Rows and terms.** The reading is kept as the reader wrote it, in the
+extraction vocabulary (``xt:``, ``https://ns.flur.ee/extract#``):
+:attr:`Reading.transactions` holds one transaction per call (a document
+longer than one call's limit takes several, each its own run, its offsets
+moved into the whole document's text). :meth:`Reading.mentions` and
+:meth:`Reading.claims` are rows read out of it.
 """
 
 from __future__ import annotations
@@ -58,13 +63,8 @@ from fluree import _fluree
 
 __all__ = ["Reading", "Usage", "read"]
 
-_DOC = "https://ns.flur.ee/doc#"
-_NIF = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#"
-_RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-
-# A node of one of these types, with offsets, is a mention.
-_MENTION_TYPES = (_DOC + "Mention", _NIF + "RFC5147String", _NIF + "String")
 _RDF_FILE = (".ttl", ".nt", ".jsonld", ".json")
+_INCLUDE = ("claims", "mentions")
 
 
 @dataclass(frozen=True)
@@ -82,73 +82,77 @@ class Usage:
 
 @dataclass(frozen=True)
 class Reading:
-    """One document's reading, in the shape ``fluree doc ingest`` commits."""
+    """One document's reading, as the reader wrote it."""
 
-    nodes: list[dict[str, Any]]
-    """The reading as expanded JSON-LD nodes."""
-    mention_count: int
-    entity_count: int
-    relation_count: int
+    transactions: list[dict[str, Any]]
+    """One Fluree DB transaction (JSON-LD) per call: the run in its
+    ``txn-meta``, the facts and the claims annotating them in its
+    ``@graph``, the mentions in a named graph of their own."""
+    fact_count: int
+    """Statements in the facts, the claims aside."""
+    new_entities: list[str]
+    """Entities the runs minted for things the catalog doesn't hold."""
     linked: list[str]
-    """Catalog records the reading links to."""
+    """Catalog records the mentions link to."""
     usage: Usage
     calls: int
     """Calls the document took; :attr:`cached` of them were answered from the cache."""
     cached: int
     release: str | None
+    runs: list[dict[str, Any]] = field(default_factory=list)
+    """One per call: ``run`` (the run's IRI), ``release``, ``request_id``
+    (the endpoint's ID for the call) and ``cached``."""
     ontology_notes: list[str] = field(default_factory=list)
     """What the reader set aside or adapted in the ontology."""
     notes: list[str] = field(default_factory=list)
     """What the parse left out: pages it couldn't read (no vision escalation
     from Python), an email's attachments, and the like."""
+    _mentions: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    _claims: list[dict[str, Any]] = field(default_factory=list, repr=False)
+
+    @property
+    def mention_count(self) -> int:
+        return len(self._mentions)
+
+    @property
+    def claim_count(self) -> int:
+        return len(self._claims)
 
     def to_jsonld(self) -> dict[str, Any]:
-        """The reading as a JSON-LD document, ready for ``Ledger.insert``."""
-        return {"@context": json.loads(_fluree.reading_context()), "@graph": self.nodes}
+        """The reading as a transaction, ready for ``Ledger.insert``: the
+        run becomes the commit's metadata. A document read in several calls
+        has a transaction per call; insert each of :attr:`transactions`."""
+        if len(self.transactions) != 1:
+            raise ValueError(
+                f"read in {len(self.transactions)} calls: insert each of .transactions, one per run"
+            )
+        return self.transactions[0]
+
+    def to_trig(self) -> str:
+        """The reading as TriG: the run in ``<#txn-meta>``, each claim behind
+        a fact reifying it."""
+        return _fluree.reading_text(json.dumps(self.transactions), "trig")
 
     def to_turtle(self) -> str:
-        """The reading as Turtle."""
-        return _fluree.reading_turtle(json.dumps(self.nodes))
+        """The reading's statements as Turtle, without the run."""
+        return _fluree.reading_text(json.dumps(self.transactions), "turtle")
 
     def mentions(self) -> list[dict[str, Any]]:
-        """One row per mention, a NIF occurrence of the text: ``id``,
+        """One row per mention (``xt:Occurrence``), in text order: ``id``,
         ``text`` (``nif:anchorOf``), ``begin`` and ``end`` (offsets in the
-        parser's text), ``entity`` (``nif:entity``, the record or entity it
-        names, when the reading links it) and ``element`` (the structure
-        element it sits in, ``doc:sourceElement``)."""
-        rows = []
-        for node in self.nodes:
-            types = node.get("@type", [])
-            if not any(t in types for t in _MENTION_TYPES):
-                continue
-            if node.get(_NIF + "beginIndex") is None:
-                continue
-            rows.append({
-                "id": node.get("@id"),
-                "text": _value(node, _NIF + "anchorOf"),
-                "begin": _int(_value(node, _NIF + "beginIndex")),
-                "end": _int(_value(node, _NIF + "endIndex")),
-                "entity": _value(node, _NIF + "entity"),
-                "element": _value(node, _DOC + "sourceElement"),
-            })
-        return rows
+        parser's text), ``class`` (``xt:occurrenceClass``), ``entity`` (the
+        catalog record it links to, ``xt:entity``, or the entity the run
+        minted, ``xt:localEntity``, and then ``new_entity``), ``confidence``
+        (``xt:linkConfidence`` for a link, else ``xt:score``) and
+        ``element`` (the structure element it sits in)."""
+        return [dict(m) for m in self._mentions]
 
     def claims(self) -> list[dict[str, Any]]:
-        """One row per claim, a reified statement (``doc:Relation``):
-        ``id``, ``subject``, ``predicate``, ``object``, and ``asserted``
-        (the reading also states the triple)."""
-        rows = []
-        for node in self.nodes:
-            if _DOC + "Relation" not in node.get("@type", []):
-                continue
-            rows.append({
-                "id": node.get("@id"),
-                "subject": _value(node, _RDF + "subject"),
-                "predicate": _value(node, _RDF + "predicate"),
-                "object": _value(node, _RDF + "object"),
-                "asserted": bool(_value(node, _DOC + "asserted")),
-            })
-        return rows
+        """One row per claim (``xt:Claim``): ``id``, ``subject``,
+        ``predicate``, ``object`` (an IRI, or a literal's text), ``status``
+        (``xt:assertionStatus``), ``accepted``, ``score``, and ``asserted``
+        (the claim annotates its fact, which is in the facts)."""
+        return [dict(c) for c in self._claims]
 
 
 def read(
@@ -159,6 +163,7 @@ def read(
     catalog: str | os.PathLike[str] | Sequence[str | os.PathLike[str] | tuple[str | os.PathLike[str], str]] | None = None,
     model: str,
     cache: str | None = None,
+    include: str | Sequence[str] = _INCLUDE,
     url: str | None = None,
     api_key: str | None = None,
     auth_header: str | None = None,
@@ -176,8 +181,11 @@ def read(
     pair to take only that class's records; a bare 2-tuple is read as such
     a pair unless its second item is itself an RDF file. ``cache``
     (``"ontology"``, ``"catalog"`` or ``"off"``) lets the reader keep that
-    much for the next request sharing it. With ``cache_dir``, parses and
-    answers are kept there, so reading the same request again costs nothing.
+    much for the next request sharing it. ``include`` says what comes with
+    the facts: ``"claims"``, ``"mentions"``, both (the default, as
+    ``("claims", "mentions")`` or ``"claims,mentions"``), or ``"none"``.
+    With ``cache_dir``, parses and answers are kept there, so reading the
+    same request again costs nothing.
 
     Raises :class:`fluree.errors.InvalidRequestError` for arguments that
     can't make a read (a bad ``cache``, ``auth_header`` without
@@ -206,6 +214,7 @@ def read(
         api_key=api_key,
         auth_header=auth_header,
         cache=cache,
+        include=include if isinstance(include, str) else ",".join(include) or "none",
         doc_iri=doc_iri,
         base_iri=base_iri,
         cache_dir=os.fspath(cache_dir) if cache_dir is not None else None,
@@ -226,10 +235,9 @@ def read(
 def _reading(raw: Mapping[str, Any]) -> Reading:
     u = raw["usage"]
     return Reading(
-        nodes=json.loads(raw["nodes"]),
-        mention_count=raw["mentions"],
-        entity_count=raw["entities"],
-        relation_count=raw["relations"],
+        transactions=json.loads(raw["transactions"]),
+        fact_count=raw["facts"],
+        new_entities=list(raw["new_entities"]),
         linked=list(raw["linked"]),
         usage=Usage(
             input_tokens=u["input_tokens"],
@@ -242,8 +250,11 @@ def _reading(raw: Mapping[str, Any]) -> Reading:
         calls=raw["calls"],
         cached=raw["cached"],
         release=raw["release"],
+        runs=json.loads(raw["runs"]),
         ontology_notes=list(raw["ontology_notes"]),
         notes=list(raw.get("notes", [])),
+        _mentions=json.loads(raw["mentions"]),
+        _claims=json.loads(raw["claims"]),
     )
 
 
@@ -258,19 +269,3 @@ def _as_list(value: Any) -> list[Any]:
             return [value]
         return list(value)
     return list(value)
-
-
-def _value(node: Mapping[str, Any], key: str) -> Any:
-    values = node.get(key)
-    if not values:
-        return None
-    first = values[0]
-    if isinstance(first, Mapping):
-        return first.get("@id", first.get("@value"))
-    return first
-
-
-def _int(value: Any) -> int | None:
-    return None if value is None else int(value)
-
-

@@ -58,8 +58,9 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--ontology <LEDGER\|FILE>` | Ontology extraction reads against: a ledger, or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Needs a language model (`[doc.llm]` or `doc.remote`) or a reader (`--model`). |
 | `--model <ID>` | The extraction model. An id a [`[doc.reader]`](#an-http-reader) lists in `models` reads each document whole with that reader; any other id names the language model `[doc.llm]` runs. Default: `doc.model`, else `[doc.llm] model`. |
 | `--cache <ontology\|catalog\|off>` | For a reader: what it may keep for the next request that shares it, the ontology alone or the ontology and catalog; `off` keeps nothing, overriding `doc.reader.cache`. Config: `doc.reader.cache`. |
+| `--include <PARTS>` | For a reader: what its reading holds besides the facts, which it always holds. `claims` (the claim behind each fact), `mentions` (each occurrence in the text and the record it links to), `claims,mentions` (default) or `none`. |
 | `--entities <LEDGER\|FILE[#CLASS]>` (alias `--catalog`) | Known entities (a catalog): a ledger, a graph source mapped over a table (`fluree iceberg\|sql\|delta map`), or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Found by `skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName` and `schema:alternateName`. Repeatable; `#Class` scopes to one type. A mention keeps the entity's IRI. Needs no model. |
-| `--relations <direct\|reified\|off>` | `direct` (default): reified nodes plus an edge per admitted predicate; `reified`: nodes only; `off`: entities alone. |
+| `--relations <direct\|reified\|off>` | For the language model: `direct` (default): reified nodes plus an edge per admitted predicate; `reified`: nodes only; `off`: entities alone. A reader's facts always come with its reading, so with a reader only `direct` is accepted; `--include` says what comes with them. |
 | `--guidance <FILE>` | Project priorities placed in the extraction prompt. Config: `doc.extraction.guidance`. |
 | `--system-prompt <FILE>` | Replaces the extraction system prompt; keep the `{model}` and `{guidance}` slots. Config: `doc.extraction.system_prompt`. |
 | `--user-prompt <FILE>` | Replaces the extraction user prompt; keep the `{existing}` and `{document}` slots. Config: `doc.extraction.user_prompt`. |
@@ -68,18 +69,18 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--lang <CODE>` | Language for stemming in the entity scan (default `en`). |
 | `--no-extract` | Skip extraction even when `--ontology` or `--entities` is given. |
 | `--dry-run` | Parse, chunk and embed, then report what would be written. Nothing is written. With a reader, nothing is read either: each document reports the calls it would take (and how many the reading cache would answer), and `--out-dir` still writes their requests. |
-| `--out-dir <DIR>` | Also write each document's transaction as JSON-LD into this directory. |
+| `--out-dir <DIR>` | Also write each document's transaction as JSON-LD into this directory, and, with a reader, each call's reading as `<relative-path>.reading-<n>.jsonld`, as committed. |
 
 ### What a run does
 
 For each document, in path order:
 
-1. **Skip if unchanged.** The ledger's document node records the file's SHA-256, the parser revision, the embedding model and the extraction fingerprint (ontology, entity sources, model, guidance, relation mode). When all match, the document is reported as `unchanged` and skipped. `--force` overrides this.
+1. **Skip if unchanged.** The ledger's document node records the file's SHA-256, the parser revision, the embedding model and the extraction fingerprint (ontology, entity sources, model, guidance, relation mode; for a reader, what `--include` asks for). When all match, the document is reported as `unchanged` and skipped. `--force` overrides this.
 2. **Parse**, served from the parse cache when the same bytes were parsed with the same settings before. PDF structure is inferred from glyph geometry; the other formats declare their structure. Pages the deterministic pass cannot read (scans, pixel-only regions, tables whose structure it doubts) are sent to the configured vision model as crops, and the readings are spliced back in under the engine's arbitration rules.
 3. **Chunk** along the structure graph. A chunk closes once it reaches `--min-chars`, or at a heading once it is at least half full. Table cells carry their row and column headers.
 4. **Embed** each chunk's text, prefixed with its section path, against `[doc.embedding]`.
 5. **Extract**, when `--entities` or `--ontology` is given. Each chunk is scanned for every label of every known entity (longest whole-word match, case-folded, plus Snowball stems), and each match becomes a mention under the entity's IRI. With `--ontology`, the language model is then asked about the chunk with the ontology as its system prompt and the entities found as known names. Its entities are resolved to known IRIs where a label matches and minted otherwise; an entity whose excerpt is not in the chunk is dropped; a new entity typed outside the ontology is kept flagged `doc:offModel` (or dropped with `--drop-off-model`); each relation's predicate is judged against the ontology as `valid`, `repaired` (an unambiguous label, local name or class-to-property fix) or `rejected`, and written reified with that verdict, a relation whose object names no entity carrying it as a literal. In `direct` mode an admitted relation with an entity object is also written as an edge. Answers are cached per chunk and asked for several chunks at once; a chunk whose call fails keeps its gazetteer mentions, and the document is not stamped as extracted so the next run retries it.
-6. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks, the document node and the extraction as one commit. The earlier extraction remains queryable at its commit. Entity nodes are shared across documents and not retracted; an edge the earlier extraction asserted is dropped only when no remaining relation supports it. What is retracted is what the pipeline wrote: its own predicates on the nodes it stamped, and, on the nodes a reader minted under the document's IRI, the predicates that reader wrote, which the document node lists as `doc:readerPredicate`. A predicate anyone else adds to those nodes, a reviewer's note on a relation say, survives the re-ingest.
+6. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks, the document node and the extraction as one commit. The earlier extraction remains queryable at its commit. Entity nodes are shared across documents and not retracted; an edge the earlier extraction asserted is dropped only when no remaining relation supports it. What is retracted is what the pipeline wrote: its own predicates on the nodes it stamped, and, on the nodes a reader minted under the document's IRI, the predicates that reader wrote, which the document node lists as `doc:readerPredicate`. A predicate anyone else adds to those nodes, a reviewer's note on a relation say, survives the re-ingest. A reader's reading is not part of that commit: it is the document's reading graph, `<doc>/reading`, cleared whole (not dropped, so it stays queryable at its commits) and then filled with the new reading, one commit per call ([What is kept](#an-http-reader)).
 
 After the documents, the ledger's binary index is brought up to the new head, so later invocations read it rather than replaying the commits just written (a CLI process never runs the background indexer that a server would). Then the full-text index `<ledger>-text` is created or synced. Embeddings need no index step — they are committed with the chunks and scored at search time.
 
@@ -200,9 +201,9 @@ The output is the engine's own JSON-LD, insertable as it is: `fluree insert docs
 
 ## fluree doc read
 
-Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading: mentions linked to catalog records, entities, and claims, each anchored to offsets in the parser's text, in the same shape `ingest` would commit. No ledger is written or needed. The reader is the `[doc.reader]` of the project when there is one, and of the global config otherwise (a project's config is read alone, not merged with the global one); `FLUREE_DOC_READER_*` overrides any of its fields one by one, so setting only `FLUREE_DOC_READER_URL` still sends the configured key and models. Files as ontology and catalog need no project, a ledger does.
+Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading as the reader wrote it: a Fluree DB transaction holding the run, the facts in the ontology's terms, the claims behind them and the mentions, each mention anchored to offsets in the parser's text. It is what `ingest` commits for the file (there, in the document's reading graph), and `fluree insert -f` takes it as it is. No ledger is written or needed. The reader is the `[doc.reader]` of the project when there is one, and of the global config otherwise (a project's config is read alone, not merged with the global one); `FLUREE_DOC_READER_*` overrides any of its fields one by one, so setting only `FLUREE_DOC_READER_URL` still sends the configured key and models. Files as ontology and catalog need no project, a ledger does.
 
-The offsets index the text the parser made of the file, which is what `fluree doc parse --format text` prints (and the `nif:isString` of the document in `--format trig`), not the file's own bytes: a Markdown file's markup, or a PDF's layout, is not counted.
+The offsets index the text the parser made of the file, which is what `fluree doc parse --format text` prints, not the file's own bytes: a Markdown file's markup, or a PDF's layout, is not counted. The reading doesn't repeat the text; its run's `xt:textSha256` names the text it read.
 
 ### Usage
 
@@ -218,13 +219,14 @@ fluree doc read <FILE> --ontology <FILE|LEDGER> [OPTIONS]
 | `--entities <FILE\|LEDGER[#CLASS]>` (alias `--catalog`) | Known entities to link mentions to: a file, a ledger, or a graph source mapped over a table. Repeatable; `#Class` scopes to one type. |
 | `--model <ID>` | The extraction model, one a `[doc.reader]` lists in `models`. Default: `doc.model`. |
 | `--cache <ontology\|catalog\|off>` | What the reader may keep for the next request that shares it; `off` keeps nothing, overriding `doc.reader.cache`. Config: `doc.reader.cache`. |
-| `--format <FORMAT>` | `jsonld` (default): the reading. `turtle`: the reading as Turtle. `trig`: the structure graph in `<doc>` and the reading in `<doc>/reading`. |
+| `--include <PARTS>` | What the reading holds besides the facts: `claims`, `mentions`, `claims,mentions` (default) or `none`. |
+| `--format <FORMAT>` | `jsonld` (default): the reading as the reader wrote it, a Fluree DB transaction in JSON-LD. `trig`: the same transaction as TriG, the run in `<#txn-meta>` and each claim behind a fact reifying it (`~ claim`). `turtle`: its statements without the run, since Turtle has no graphs. |
 | `-o, --output <FILE>` | Write to this file instead of stdout. It is opened before the read, so a path that can't be written fails before anything is sent. |
 | `--base-iri <IRI>`, `--doc-iri <IRI>` | The document IRI, as for `parse`. |
 | `--no-escalate`, `--max-crops <N>` | Vision-model escalation during the parse, as for `parse`. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 
-The reading goes to stdout. Stderr says what was read with which model (and the vision model, when one reads what the parser can't), then the nodes received and the counts among them, the calls made (and how many the cache answered), what the reader billed, and what it set aside or adapted in the ontology. A file with no text is not sent: the reading is empty and no call is made.
+The reading goes to stdout. Stderr says what was read with which model (and the vision model, when one reads what the parser can't), then the facts, claims, mentions, new entities and linked catalog records, the calls made (and how many the cache answered), what the reader billed, a line per call with its run, the release that read it and the reader's ID for the call (`X-Fluree-Request-ID`, the one to quote when reporting a problem), and what the reader set aside or adapted in the ontology. A file with no text is not sent: the reading is empty and no call is made. A document read in several calls prints a transaction per call (a JSON array of them, or one after another in TriG), each its own run.
 
 ### Examples
 
@@ -232,6 +234,7 @@ The reading goes to stdout. Stderr says what was read with which model (and the 
 fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small > invoice.jsonld
 fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
 fluree doc read call.vtt --ontology onto.ttl --format trig -o call.trig
+fluree doc read memo.md --ontology onto.ttl --include none -o memo.jsonld && fluree insert memos -f memo.jsonld
 ```
 
 ## Configuration
@@ -282,15 +285,40 @@ models = ["reader-small", "reader-large"]
 # model = "reader-small"                 # what --model defaults to
 ```
 
-Then `fluree doc ingest ./docs -l docs --ontology onto.ttl --catalog people --model reader-small` reads each document with it. Each request is one RDF dataset (TriG) whose named graphs give the inputs their roles, under `https://ns.flur.ee/extract#`: `document` (the document node with its full text as `nif:isString`, and the parsed structure's elements with their offsets), `ontology` (the `--ontology` source as it is), `instances` (the catalog: each `--catalog` record's types, labels and short description), and, when the text needs it, `request` (the windows it is read in). The model id goes in `X-Fluree-Model` and `--cache` in `X-Fluree-Cache`; the answer is asked for as JSON-LD.
+Then `fluree doc ingest ./docs -l docs --ontology onto.ttl --catalog people --model reader-small` reads each document with it. Each request is one RDF dataset (TriG) whose named graphs give the inputs their roles, under `https://ns.flur.ee/extract#`: `document` (the document node with its full text as `nif:isString`, and the parsed structure's elements with their offsets), `ontology` (the `--ontology` source as it is), and `instances` (the catalog: each `--catalog` record's types, labels and short description). What the request asks for travels in headers, and only there (a reader refuses a request that sends a control both as a header and in the body):
 
-- **Long documents.** A request carries at most 48,000 characters, so a longer document is read in several, cut between elements, never inside one (between words, for a text with no elements). A request whose text would not fit one window beside the ontology and catalog is read in up to 16 windows, cut between leaf elements.
+| Header | Value |
+|--------|-------|
+| `X-Fluree-Model` | The model id. |
+| `X-Fluree-Cache` | `--cache`, when set. |
+| `X-Fluree-Output` | `fluree-transaction`: the answer is a Fluree DB transaction. |
+| `X-Fluree-Include` | `--include`: `claims,mentions` unless it says otherwise. |
+| `X-Fluree-Window` | For a text read in windows, their character ranges (`0-1200,1100-2400`). |
+
+The answer is asked for as JSON-LD (`Accept: application/ld+json`).
+
+- **The answer.** A Fluree DB transaction in the extraction vocabulary (`xt:`, `https://ns.flur.ee/extract#`), response layout 2 (`https://ns.flur.ee/extract/response/2`): the run in the commit metadata (`txn-meta`: `xt:run`, the document it read as `prov:used` and that text's SHA-256 as `xt:textSha256`, the release as `prov:wasAssociatedWith`), the facts as the default graph's nodes (the triples of the accepted, affirmed claims, each new entity's type and label), each claim behind a fact as an annotation of it (`@annotation`; TriG `rdf:reifies`) and any other claim as an `rdf:Statement`, and with `--include mentions` the mentions in the graph `xt:mentions` (each `xt:Occurrence` with its offsets, class, the record it links to as `xt:entity` with `xt:linkConfidence`, or the new entity as `xt:localEntity`). The document is not echoed. An answer in another layout (one that echoes the document graph, as readers did before this layout) is refused by name, and not cached.
+- **Long documents.** A request carries at most 48,000 characters, so a longer document is read in several, cut between elements, never inside one (between words, for a text with no elements). Each is a run of its own; a later call's offsets are moved from its part of the text into the whole document's, and its `xt:textSha256` is that of its part. A request whose text would not fit one window beside the ontology and catalog is read in up to 16 windows (`X-Fluree-Window`), cut between leaf elements.
 - **Request size.** A request body is at most 2,000,000 bytes, and the ontology and the whole catalog travel in every one. A document whose requests would be larger is cut into smaller parts; when the ontology and catalog alone leave too little room, nothing is sent and the document fails with both sizes, so the catalog can be scoped (`FILE#Class`, `ledger#Class`) or split.
-- **What is kept.** The reader's answer is a dataset: the document graph it was sent, echoed, and the reading in graphs of its own. The echo is dropped. The reading goes into the document's commit with its offsets moved back into the document's text, every node stamped `doc:sourceDocument`, and each reified `rdf:Statement` typed `doc:Relation` (and `doc:asserted` when the reading also states its triple with an IRI object).
-- **A reader's own terms.** Beyond that, the reading is stored in the terms the reader wrote it in: nothing renames a reader's classes and properties to `doc:` ones unless a vocabulary table for that model maps them, and none ships yet. What is read regardless of vocabulary: a mention is any node typed `doc:Mention`, or any NIF string (`nif:RFC5147String`, `nif:String`, `nif:Phrase`, `nif:Word`) with `nif:beginIndex`; those are what the counts report and what gets `doc:sourceElement`. A link to a catalog record is a `nif:entity`; a reader that links through a property of its own is stored with that link, but the run's entity counts and `nif:entity` queries won't see it.
+- **What is kept.** Each call's transaction is committed as it is, one commit per call, so its run is that commit's metadata. Everything it holds (the facts, the claims annotating them, the mentions) goes into one named graph, the document's reading graph `<doc>/reading`, which the document node names as `doc:readingGraph`; the document's structure and chunks stay in the default graph. Nothing is renamed: the facts are in the ontology's terms and the rest in `xt:`. A re-read clears the reading graph and commits the new reading in it, so it replaces the earlier one exactly, and every run stays in the commit history. Query a reading with `GRAPH <doc/reading> { … }`, and join a fact to its run through its claim:
+
+  ```sparql
+  PREFIX xt:   <https://ns.flur.ee/extract#>
+  PREFIX prov: <http://www.w3.org/ns/prov#>
+  PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+  SELECT ?s ?p ?o ?score ?document
+  FROM NAMED <urn:fluree:doc:memo.md/reading> FROM NAMED <docs:main#txn-meta>
+  WHERE {
+    GRAPH <urn:fluree:doc:memo.md/reading> {
+      ?claim rdf:reifies <<( ?s ?p ?o )>> ; xt:score ?score ; prov:wasGeneratedBy ?run .
+    }
+    GRAPH <docs:main#txn-meta> { ?commit xt:run ?run ; prov:used ?document . }
+  }
+  ```
 - **What is billed.** Each document line reports the tokens the reader billed (`X-Fluree-Serialized-Tokens`), prompt-cache reads and writes, and fuel when the endpoint meters it; the run's last lines total them, and say what the reader set aside or adapted in the ontology.
-- **Resends.** A request is resent only when the reader answers 503 with `Retry-After` (no capacity yet, such as a model still starting), after the wait it names (in seconds or as an HTTP date), up to four attempts and five minutes of waiting, each wait shown as it starts. Nothing else is resent, because any other failure may follow a read that ran and was billed.
-- **Caching.** Answers are kept in the reading cache by endpoint, model, `--cache` and request body, so a rerun that sends the same request (`--force` with nothing changed) is not read again; `--no-cache` reads afresh.
+- **Resends.** A request is resent only when the reader answers 503 with `Retry-After` (no capacity yet, such as a model still starting), after the wait it names (in seconds or as an HTTP date), up to four attempts and five minutes of waiting, each wait shown as it starts. Nothing else is resent, because any other failure may follow a read that ran and was billed: a 504 (the reader's gateway stopped waiting) says so in its message. Every error quotes the reader's ID for the call (`X-Fluree-Request-ID`) when it sent one.
+- **Runs.** Each document line is followed by a line per call: its run's IRI, the release that read it (`X-Fluree-Release`) and the reader's ID for the call, or that the reading cache answered.
+- **Caching.** Answers are kept in the reading cache by endpoint, model, `--cache`, the control headers and request body, so a rerun that sends the same request (`--force` with nothing changed) is not read again; `--no-cache` reads afresh.
 
 Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE}` and `FLUREE_DOC_MODEL` override the file.
 
