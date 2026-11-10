@@ -209,7 +209,7 @@ async fn a_remote_refusal_of_a_reference_carries_the_hint() {
     );
     assert!(
         run.stderr
-            .contains("this remote may not support stored catalog connections or mappings"),
+            .contains("if this remote does not store catalog connections or mappings"),
         "{}",
         run.stderr
     );
@@ -267,7 +267,7 @@ async fn a_db_server_refuses_a_reference_and_registers_nothing() {
         assert!(run.stderr.contains(reason), "{refs:?}: {}", run.stderr);
         assert!(
             run.stderr
-                .contains("may not support stored catalog connections"),
+                .contains("if this remote does not store catalog connections"),
             "{refs:?}: {}",
             run.stderr
         );
@@ -305,7 +305,7 @@ async fn a_local_map_refuses_a_reference() {
     .await;
     assert!(!run.ok);
     assert!(
-        run.stderr.contains("a local map has no such store"),
+        run.stderr.contains("they need --remote <NAME>"),
         "{}",
         run.stderr
     );

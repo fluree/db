@@ -2449,7 +2449,7 @@ The CLI sends the connection **structured**: `catalog` and `io` objects exactly 
 { "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "stored_mapping_id": "<mapping-id>", "table": "sales.orders" }
 ```
 
-A stored mapping implies its connection, and `table` defaults to its first table. With `stored_catalog_id` and an inline `r2rml`, `table` is required. As with an inline connection, a mapping is required: the CLI refuses `stored_catalog_id` without `r2rml` or `stored_mapping_id`. The CLI does not ask whether a server supports references. A server that does not, such as the Fluree server, refuses the request and registers nothing: a body without `r2rml` lacks the mapping it requires, and one with `r2rml` carries a field it does not know. A `400`, `404` or `422` to a by-reference request is shown with the server's message and a hint that the remote may not support stored connections or mappings.
+A stored mapping implies its connection, and `table` defaults to its first table. With `stored_catalog_id` and an inline `r2rml`, `table` is required. As with an inline connection, a mapping is required: the CLI refuses `stored_catalog_id` without `r2rml` or `stored_mapping_id`. The CLI does not ask whether a server supports references. A server that does not, such as the Fluree server, refuses the request and registers nothing: a body without `r2rml` lacks the mapping it requires, and one with `r2rml` carries a field it does not know. A `400`, `404` or `422` to a by-reference request is shown with the server's message and a hint that covers both causes: a remote without stored connections or mappings, or an id that names nothing it has. Ids are trimmed before they are sent.
 
 **Example — REST catalog with R2RML:**
 

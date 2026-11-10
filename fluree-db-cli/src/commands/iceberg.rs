@@ -15,6 +15,19 @@ pub async fn run_iceberg_map(
     dirs: &FlureeDir,
     direct: bool,
 ) -> CliResult<()> {
+    // Only a named remote can store catalog connections or mappings: a local
+    // map has no such store, and neither does a local server a map would be
+    // routed to, so refuse references before trying either.
+    if args.remote.is_none() && StoredRefs::from_args(&args)?.is_some() {
+        return Err(CliError::Usage(
+            "--stored-catalog and --stored-mapping name a catalog connection or mapping that a \
+             remote stores, so they need --remote <NAME>; a local map, or one routed through a \
+             local server, has no such store. Give the connection options and --r2rml <FILE> \
+             to map here"
+                .into(),
+        ));
+    }
+
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
         let result = run_iceberg_map_remote(&client, &args).await.map_err(|e| {
@@ -36,14 +49,6 @@ pub async fn run_iceberg_map(
     }
 
     // Local execution
-    if StoredRefs::from_args(&args)?.is_some() {
-        return Err(CliError::Usage(
-            "--stored-catalog and --stored-mapping name a catalog connection or mapping that a \
-             remote stores, and a local map has no such store. Map on the remote with \
-             --remote <NAME>, or give the connection options and --r2rml <FILE> here"
-                .into(),
-        ));
-    }
     run_iceberg_map_local(args, dirs).await
 }
 
@@ -260,15 +265,12 @@ async fn run_iceberg_map_remote(
     client: &crate::remote_client::RemoteLedgerClient,
     args: &IcebergMapArgs,
 ) -> CliResult<()> {
-    let refs = StoredRefs::from_args(args)?;
-    let body = match &refs {
-        Some(refs) => refs.body(args)?,
-        None => inline_body(args)?,
-    };
+    let by_reference = args.stored_catalog.is_some() || args.stored_mapping.is_some();
+    let body = args_to_json(args)?;
     let result = client
         .iceberg_map(&body)
         .await
-        .map_err(|e| map_refusal(e, refs.is_some()))?;
+        .map_err(|e| map_refusal(e, by_reference))?;
 
     // Print response
     let gs_id = result
@@ -521,11 +523,13 @@ pub(crate) enum StoredRefs {
     },
 }
 
-/// Every key a by-reference `iceberg/map` body may carry. A key outside it is
-/// refused before any request, naming its option, rather than dropped or
-/// sent; the remote refuses unknown keys beside a reference anyway. `r2rml` /
-/// `r2rml_type` only ever travel with `stored_catalog_id`, since
-/// [`StoredRefs::Mapping`] holds no mapping text.
+/// Every key a by-reference `iceberg/map` body may carry, the set the remote
+/// accepts beside a reference. [`StoredRefs::body`] builds only these keys;
+/// what keeps a connection out is clap's conflicts (checked by a sweep test)
+/// and the [`StoredRefs`] variants, which hold none. `r2rml` / `r2rml_type`
+/// only ever travel with `stored_catalog_id`, since [`StoredRefs::Mapping`]
+/// holds no mapping text.
+#[cfg(test)]
 pub(crate) const BY_REFERENCE_KEYS: &[&str] = &[
     "name",
     "table",
@@ -577,15 +581,11 @@ impl StoredRefs {
     pub(crate) fn body(&self, args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
         use serde_json::Value;
         let some = |v: &Option<String>| v.clone().map(Value::from);
-        let mut fields: Vec<(&str, &str, Option<Value>)> = vec![
-            ("name", "<NAME>", Some(args.name.clone().into())),
-            ("branch", "--branch", some(&args.branch)),
-            ("model", "--model", some(&args.model)),
-            (
-                "default_allow",
-                "--default-allow",
-                args.default_allow.map(Value::from),
-            ),
+        let mut fields: Vec<(&str, Option<Value>)> = vec![
+            ("name", Some(args.name.clone().into())),
+            ("branch", some(&args.branch)),
+            ("model", some(&args.model)),
+            ("default_allow", args.default_allow.map(Value::from)),
         ];
         match self {
             Self::Catalog {
@@ -594,44 +594,30 @@ impl StoredRefs {
                 table,
             } => {
                 let (text, media_type) = read_mapping(mapping, args.r2rml_type.as_deref())?;
-                fields.push(("table", "--table", Some(table.clone().into())));
-                fields.push((
-                    "stored_catalog_id",
-                    "--stored-catalog",
-                    Some(catalog.clone().into()),
-                ));
-                fields.push(("r2rml", "--r2rml", Some(text.into())));
-                fields.push(("r2rml_type", "--r2rml-type", media_type.map(Value::from)));
+                fields.push(("table", Some(table.clone().into())));
+                fields.push(("stored_catalog_id", Some(catalog.clone().into())));
+                fields.push(("r2rml", Some(text.into())));
+                fields.push(("r2rml_type", media_type.map(Value::from)));
             }
             Self::Mapping { mapping, catalog } => {
                 // Optional: the mapping's first table unless one is named.
-                fields.push(("table", "--table", some(&args.table)));
-                fields.push((
-                    "stored_mapping_id",
-                    "--stored-mapping",
-                    Some(mapping.clone().into()),
-                ));
-                fields.push(("stored_catalog_id", "--stored-catalog", some(catalog)));
+                fields.push(("table", some(&args.table)));
+                fields.push(("stored_mapping_id", Some(mapping.clone().into())));
+                fields.push(("stored_catalog_id", some(catalog)));
             }
         }
 
-        let mut body = serde_json::Map::new();
-        for (key, option, value) in fields {
-            let Some(value) = value else { continue };
-            if !BY_REFERENCE_KEYS.contains(&key) {
-                return Err(CliError::Usage(format!(
-                    "{option} cannot be given with --stored-catalog or --stored-mapping"
-                )));
-            }
-            body.insert(key.to_string(), value);
-        }
+        let body: serde_json::Map<String, Value> = fields
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| (key.to_string(), v)))
+            .collect();
         Ok(Value::Object(body))
     }
 }
 
 /// What a by-reference request appends to the remote's refusal of it.
-pub(crate) const STORED_REFS_HINT: &str =
-    "this remote may not support stored catalog connections or mappings";
+pub(crate) const STORED_REFS_HINT: &str = "if this remote does not store catalog connections \
+     or mappings, it refuses references to them; otherwise check that the id names one it has";
 
 /// A failed map request as a CLI error. A by-reference request the remote
 /// refused as malformed or naming nothing it has (400, 404, 422) keeps the
@@ -1622,6 +1608,14 @@ mod tests {
                 assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{e}");
             }
         }
+    }
+
+    /// A pasted id with surrounding spaces is sent trimmed, so the remote
+    /// looks up the id the user meant rather than answering 404.
+    #[test]
+    fn a_stored_id_is_sent_trimmed() {
+        let body = args_to_json(&parse(&["--stored-mapping", "  map-1 \t"])).unwrap();
+        assert_eq!(body["stored_mapping_id"], "map-1", "{body}");
     }
 
     /// The options a reference leaves the caller. Every other `iceberg map`

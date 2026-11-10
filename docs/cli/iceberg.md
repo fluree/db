@@ -162,9 +162,9 @@ The request carries the ids (`stored_catalog_id`, `stored_mapping_id`) and the s
 - `--r2rml` or `--r2rml-type` is given beside `--stored-mapping`;
 - `--stored-catalog` is given with `--r2rml` but no `--table` (a stored connection is mapped one named table at a time);
 - an id is empty;
-- the map would run locally (no `--remote`, and no local server to route through): a local map has no stored connections or mappings.
+- no `--remote` is given: only a named remote stores connections or mappings, and neither a local map nor one routed through a running local server has any.
 
-Both references together must name the mapping's own connection; the remote checks. A server that does not store connections or mappings, a Fluree server among them, refuses the request. The CLI then shows the server's message and adds `hint: this remote may not support stored catalog connections or mappings`.
+Both references together must name the mapping's own connection; the remote checks. A server that does not store connections or mappings, a Fluree server among them, refuses the request. The CLI then shows the server's message and adds a hint: if the remote does not store catalog connections or mappings, it refuses references to them; otherwise the id may name nothing it has.
 
 ### Examples
 

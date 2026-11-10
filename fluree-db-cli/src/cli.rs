@@ -4128,7 +4128,7 @@ fn stored_id(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         Err("a stored id cannot be empty".to_string())
     } else {
-        Ok(value.to_string())
+        Ok(value.trim().to_string())
     }
 }
 
