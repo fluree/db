@@ -326,6 +326,16 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
             })
         }));
         if matches!(load, SnapshotLoad::LiveInstall) {
+            // A snapshot can replace a removal journal without moving its
+            // commit head. Invalidate readers through the same channel as
+            // ordinary replicated config changes, including SSE followers.
+            for (name, ledger) in &state.ledgers {
+                for branch in &ledger.branches {
+                    if let Some(ledger_id) = event_ledger_id(name, branch) {
+                        out.push(Effect::Event(NameServiceEvent::LedgerRefresh { ledger_id }));
+                    }
+                }
+            }
             // Only a live install can strand in-flight work. At boot
             // there is none to strand.
             out.push(Effect::InvalidateInFlight);
@@ -563,6 +573,12 @@ fn event_for(
     state: &NameServiceState,
 ) -> Option<NameServiceEvent> {
     match (cmd, response) {
+        (Command::PushConfig(args), Response::ConfigUpdated) => {
+            Some(NameServiceEvent::LedgerConfigPublished {
+                ledger_id: parsed_event_ledger_id(&args.ledger_id)?,
+                config_version: args.new.v,
+            })
+        }
         (
             Command::ApplyHead(args),
             Response::HeadApplied {
@@ -815,6 +831,29 @@ mod tests {
             drain_releases(&mut poisoned),
             vec![("test/db:main".to_string(), cid(3))]
         );
+    }
+
+    #[test]
+    fn a_config_change_is_announced_without_a_head_change() {
+        let command = Command::PushConfig(Box::new(crate::raft::state_machine::ConfigUpdate {
+            ledger_id: "test/db:main".into(),
+            expected: None,
+            new: crate::raft::state_machine::StoredConfig {
+                v: 9,
+                payload: None,
+            },
+        }));
+        assert!(matches!(
+            event_for(
+                &command,
+                &Response::ConfigUpdated,
+                &NameServiceState::default()
+            ),
+            Some(NameServiceEvent::LedgerConfigPublished {
+                config_version: 9,
+                ..
+            })
+        ));
     }
 
     /// An index rewritten at the same `t`, as a purge rewrites one, is

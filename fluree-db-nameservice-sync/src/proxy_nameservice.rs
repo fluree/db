@@ -75,6 +75,8 @@ struct NsRecordResponse {
     /// when an older server omits the field.
     #[serde(default)]
     storage_root: Option<fluree_db_core::StorageRoot>,
+    #[serde(default)]
+    config_version: Option<i64>,
 }
 
 impl NsRecordResponse {
@@ -111,6 +113,7 @@ impl NsRecordResponse {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: self.config_version,
         })
     }
 }
@@ -533,6 +536,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         };
 
         // A branchless lookup still yields a canonical id (#1540): a
@@ -561,6 +565,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         }
         .into_ns_record("books:main")
         .unwrap()
@@ -615,6 +620,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         }
         .into_ns_record("books:main")
         .unwrap();
@@ -642,6 +648,7 @@ mod tests {
             source_branch: Some("main".to_string()),
             branches: 3,
             storage_root: None,
+            config_version: None,
         };
 
         let record = response.into_ns_record("books:feature").unwrap();
@@ -684,6 +691,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         };
 
         let record = response.into_ns_record("books:main").unwrap();
@@ -707,6 +715,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         };
 
         let record = response.into_ns_record("books").unwrap();

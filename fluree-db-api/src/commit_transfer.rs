@@ -1971,7 +1971,7 @@ impl Fluree {
             .min(EXPORT_MAX_LIMIT);
 
         let ledger_id = handle.id();
-        self.confirm_history_current(ledger_id).await?;
+        self.ensure_read_ready(ledger_id).await?;
 
         // Read current head.
         let head_ref = self

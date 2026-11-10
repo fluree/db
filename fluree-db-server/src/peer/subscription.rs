@@ -223,6 +223,7 @@ impl HeadSink for PeerEventSink {
                 self.preload_configured_ledgers().await;
             }
             RemoteEvent::LedgerUpdated(record) => {
+                self.fluree.observe_nameservice_record(&record);
                 let changed = self
                     .peer_state
                     .update_ledger(

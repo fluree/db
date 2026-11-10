@@ -859,6 +859,7 @@ impl ConfigPublisher for MemoryNameService {
         if let Some(record) = records.get_mut(&key) {
             record.default_context = new_default_context;
             record.config_id = new_config_id;
+            record.config_version = Some(new.v);
         }
 
         Ok(ConfigCasResult::Updated)

@@ -1,10 +1,9 @@
-//! Read barriers for the removal journal.
+//! Write-side catch-up and acknowledgements for retention.
 //!
-//! A replica serving a retention-enabled ledger's history first confirms it
-//! has applied everything the cluster had committed (a Raft read index): the
-//! leader confirms its leadership with a quorum and reports its commit
-//! position, and the replica waits to apply through it. A journal change on
-//! the leader waits for every member to report it has applied the change.
+//! Erasure acceptance and proving confirm what the cluster has committed
+//! through a Raft read index. Ordinary reads use local replication state
+//! and only wait for locally applied erasures to be installed. A journal
+//! change waits for members to report that they have applied it.
 
 use super::{ForwardingConfig, RaftNameService, POSTCARD_MIME};
 use crate::raft::NodeId;
@@ -188,6 +187,10 @@ pub struct RaftReplicaSync(pub Arc<RaftNameService>);
 
 #[async_trait]
 impl fluree_db_api::retention::replicas::ReplicaSync for RaftReplicaSync {
+    fn config_events_complete(&self) -> bool {
+        true
+    }
+
     async fn sync_reads(&self) -> Result<(), String> {
         self.0.sync_reads().await
     }
@@ -203,6 +206,6 @@ impl fluree_db_api::retention::replicas::ReplicaSync for RaftReplicaSync {
     }
 }
 
-/// How long a history read waits for this node to install an erasure
+/// How long an affected read waits for this node to install an erasure
 /// activation it has applied before refusing the read.
 const INSTALL_WAIT: Duration = Duration::from_secs(5);

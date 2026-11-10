@@ -1526,16 +1526,15 @@ async fn a_policy_enabled_and_disabled_between_passes_still_covers_its_interval(
     );
 }
 
-/// A cluster replica that cannot confirm its journal is current refuses a
-/// ledger's history even when it holds no retention registration for it: it
-/// may not have applied the first one yet.
+/// A partitioned replica serves the journal it has learned, for both
+/// historical and current reads. Reads make no leader round trip.
 #[tokio::test]
-async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_enabled() {
+async fn a_partitioned_replica_serves_its_local_history() {
     struct Partitioned;
     #[async_trait::async_trait]
     impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
         async fn sync_reads(&self) -> Result<(), String> {
-            Err("no leader".into())
+            panic!("reads must not wait on a leader")
         }
         async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
             Vec::new()
@@ -1580,7 +1579,7 @@ async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_
         .unwrap()
         .registration
         .is_none());
-    assert!(matches!(
+    assert_eq!(
         read(
             &fluree,
             &id,
@@ -1588,9 +1587,10 @@ async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_
             "ex:c",
             "ex:count"
         )
-        .await,
-        Err(ApiError::ReplicaNotCurrent(_))
-    ));
+        .await
+        .unwrap(),
+        vec![json!(1)]
+    );
     // Current state is still served, and so is a view held past a commit:
     // it is checked against the journal this replica holds.
     assert_eq!(

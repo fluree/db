@@ -58,6 +58,7 @@ impl Chain {
             txn: self.txn.clone(),
             steps: self.steps.clone(),
             replaced_at,
+            locations_known: false,
         }
     }
 }
@@ -935,7 +936,7 @@ impl Fluree {
             id.content_kind(),
             Some(fluree_db_core::ContentKind::Txn | fluree_db_core::ContentKind::Commit)
         ) {
-            self.confirm_history_current(ledger_id).await?;
+            self.ensure_read_ready(ledger_id).await?;
         }
         let Some(runtime) = self.retention.erasure.get() else {
             return Ok(None);
@@ -1627,11 +1628,10 @@ impl Fluree {
         let cids: Vec<ContentId> = newly.iter().map(|n| n.cid.clone()).collect();
         let commits: Vec<String> = cids.iter().map(ToString::to_string).collect();
         let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
+        let dropped = self.dropped_holders(&commits).await?;
         let mut prepared = Prepared {
-            dropped: self
-                .dropped_holders(&commits)
-                .await?
-                .into_iter()
+            dropped: dropped
+                .iter()
                 .map(|(r, _)| r.ledger_id.to_string())
                 .collect(),
             ..Default::default()
@@ -1660,10 +1660,12 @@ impl Fluree {
                 .await?;
             holders.push((record.clone(), store));
         }
-        holders.extend(self.dropped_holders(&commits).await?);
+        holders.extend(dropped);
         if let Some(why) = self.spelled_in(&holders, &occurrences).await? {
             return Err(ApiError::http(409, why));
         }
+        #[cfg(test)]
+        hooks::before_locks().await;
         for listed in listed {
             // The cache's lock first, as a commit through the cache takes
             // them.
@@ -1672,6 +1674,18 @@ impl Fluree {
             let Some(record) = self.nameservice().lookup(&listed.ledger_id).await? else {
                 continue;
             };
+            // Ordinary commits do not take the admission lock. The spelling
+            // scan must describe the head we hold, including for branches
+            // whose own history has no occurrence to reconcile.
+            if record.commit_head_id != listed.commit_head_id || record.fence != listed.fence {
+                return Err(ApiError::http(
+                    409,
+                    format!(
+                        "{} changed while checking erasure holders; retry",
+                        record.ledger_id
+                    ),
+                ));
+            }
             let held = guard
                 .as_ref()
                 .map(crate::ledger_manager::LedgerWriteGuard::clone_state);
@@ -1679,6 +1693,7 @@ impl Fluree {
                 .received_removal(record.ledger_id.as_str(), occurrences.clone(), held)
                 .await?
             else {
+                prepared.checked.push(record);
                 continue;
             };
             prepared.holders.push(Holder {
@@ -1765,6 +1780,12 @@ impl Fluree {
                 .collect(),
         );
         let mut reconciled = Vec::new();
+        let checked_records: Vec<_> = prepared
+            .holders
+            .iter()
+            .map(|h| h.record.clone())
+            .chain(prepared.checked)
+            .collect();
         for holder in prepared.holders {
             let Holder {
                 record,
@@ -1852,7 +1873,28 @@ impl Fluree {
             reconciled.push(record.ledger_id.to_string());
         }
         self.rebuild_sources(&prepared.sources).await?;
-        let published = activation
+        // Rebuilding sources uses the reconciled cached states, so their
+        // cache locks were released above. Reacquire in the same order and
+        // ensure no commit invalidated the spelling check in that interval.
+        let mut locked = Vec::with_capacity(checked_records.len());
+        for record in &checked_records {
+            let guard = self.lock_ledger(&record.ledger_id).await?;
+            let fence = runtime.fence(record.ledger_id.as_str()).write_owned().await;
+            let current = self.nameservice().lookup(&record.ledger_id).await?;
+            if current.as_ref().is_none_or(|r| {
+                r.commit_head_id != record.commit_head_id || r.fence != record.fence
+            }) {
+                return Err(ApiError::http(
+                    409,
+                    format!(
+                        "{} changed before erasure publication; retry",
+                        record.ledger_id
+                    ),
+                ));
+            }
+            locked.push((guard, fence));
+        }
+        let mut published: Vec<_> = activation
             .chains
             .iter()
             .map(|chain| {
@@ -1864,7 +1906,9 @@ impl Fluree {
                 chain.erased(at)
             })
             .collect();
+        self.locate_erasures(&mut published, restoring).await?;
         index.publish(published).await?;
+        drop(locked);
         // Their cached states read through the substituting store until
         // now; they read the published erasures from here on.
         for ledger_id in &reconciled {
@@ -2106,6 +2150,9 @@ struct Newly<'a> {
 struct Prepared {
     /// Live branches whose history holds one.
     holders: Vec<Holder>,
+    /// Scanned branches without an occurrence to reconcile. Their heads
+    /// are also checked under locks immediately before publication.
+    checked: Vec<fluree_db_nameservice::NsRecord>,
     /// Branches of soft-dropped ledgers, left to the purge.
     dropped: Vec<String>,
     /// The properties (IRIs) of the occurrences erased there; one empty
@@ -2406,6 +2453,19 @@ pub(crate) mod hooks {
         Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     > = parking_lot::Mutex::new(None);
 
+    #[allow(clippy::type_complexity)]
+    pub(crate) static BEFORE_LOCKS: parking_lot::Mutex<
+        Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    > = parking_lot::Mutex::new(None);
+
+    pub(crate) async fn before_locks() {
+        let notifies = BEFORE_LOCKS.lock().take();
+        if let Some((listed, proceed)) = notifies {
+            listed.notify_one();
+            proceed.notified().await;
+        }
+    }
+
     pub(crate) fn stop(at: Stop) -> crate::Result<()> {
         match *STOP.lock() == Some(at) {
             true => Err(crate::ApiError::internal(format!("stopped {at:?}"))),
@@ -2541,6 +2601,7 @@ mod tests {
             txn: None,
             steps: steps.iter().map(|s| step(s)).collect(),
             replaced_at: vec!["sender's folder".into()],
+            locations_known: false,
         })
     }
 

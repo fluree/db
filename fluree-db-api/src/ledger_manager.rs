@@ -3283,6 +3283,7 @@ mod tests {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: None,
         }
     }
 

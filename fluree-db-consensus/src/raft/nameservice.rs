@@ -348,6 +348,12 @@ fn record_from_state(
         })
         .ok()?;
     let mut record = NsRecord::new(id);
+    record.config_version = Some(
+        state
+            .config
+            .get(record.ledger_id.as_str())
+            .map_or(0, |c| c.v),
+    );
     let ref_key = RefKey::new(ledger_name, branch);
     if let Some(entry) = state.refs.get(&ref_key) {
         record.commit_head_id = Some(entry.head.clone());

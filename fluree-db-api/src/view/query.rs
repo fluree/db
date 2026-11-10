@@ -1605,6 +1605,7 @@ impl Fluree {
         encoded_with: &fluree_db_core::LedgerSnapshot,
     ) -> Result<()> {
         use crate::retention::suppression::Freshness;
+        self.ensure_read_ready(&db.ledger_id).await?;
         let earlier_point = history_range.is_some() || db.historical;
         let freshness = self.view_freshness(db).await?;
         self.refuse_stale_search_sources(parsed, earlier_point)
@@ -1634,7 +1635,6 @@ impl Fluree {
                 to_t,
                 from_t,
                 reads,
-                confirm_journal: earlier_point,
             },
         )
         .await

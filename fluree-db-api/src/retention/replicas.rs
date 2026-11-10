@@ -1,16 +1,9 @@
-//! Replicas and the removal journal.
+//! Replica coordination for retention.
 //!
-//! A cluster replica answers a historical read from its own copy of the
-//! journal, which can lag the leader's. Before serving a ledger's history it
-//! confirms it has applied every change the cluster had committed when the
-//! read arrived, and refuses the read when it
-//! cannot (it is partitioned, or no leader is known): an unconfirmed replica
-//! is out of serving for that history until it catches up. A journal change
-//! waits for every replica to apply it and reports the ones that did not.
-//!
-//! The confirmation covers every ledger, enabled or not: a replica that has
-//! not applied a ledger's first retention registration cannot tell it is
-//! enabled.
+//! Reads use the journal this node has learned through replication. They
+//! never wait for a leader, but cannot serve a locally applied erasure until
+//! it is installed. Write-side proving still catches up with the leader.
+//! A journal change waits for replicas and reports those that did not apply it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +16,13 @@ pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// A cluster's view of how current each replica is.
 #[async_trait::async_trait]
 pub trait ReplicaSync: Send + Sync {
+    /// Every applied config update and snapshot invalidation is published
+    /// on this Fluree instance's nameservice event bus before acknowledgement.
+    /// Custom backends default to revalidating journals on reads.
+    fn config_events_complete(&self) -> bool {
+        false
+    }
+
     /// Wait until this node has applied every change committed before the
     /// call.
     async fn sync_reads(&self) -> std::result::Result<(), String>;
@@ -41,43 +41,45 @@ pub trait ReplicaSync: Send + Sync {
 }
 
 impl Fluree {
-    /// Keep this node's journal reads current with the cluster's.
+    /// Register the cluster's local installation and write coordination.
     pub fn set_retention_replicas(&self, sync: Arc<dyn ReplicaSync>) {
         // Other members write the journals too.
-        self.retention.watch.clear_sole_writer();
+        self.retention
+            .watch
+            .set_replicated(sync.config_events_complete());
         let _ = self.retention.replicas.set(sync);
     }
 
-    /// On a cluster replica, wait until the local copy of `ledger_id`'s
-    /// journal is current. Whether there was anything to confirm.
-    pub(crate) async fn confirm_journal_current(&self, ledger_id: &str) -> Result<bool> {
-        self.confirm_current(ledger_id, "retry, or read as of the current head")
-            .await
+    /// Observe a record delivered by a peer's replication stream, including
+    /// its reconnect snapshot. Config revisions invalidate journal caches
+    /// independently of commit and index heads.
+    pub fn observe_nameservice_record(&self, record: &fluree_db_nameservice::NsRecord) {
+        self.retention.watch.remote_record(record);
     }
 
-    /// On a cluster replica, refuse to hand out `ledger_id`'s raw history
-    /// (a transfer, a commit's content) until its journal is current and it
-    /// has installed the erasures reaching the ledger: before, it could
-    /// hand out what they erase.
-    pub async fn confirm_history_current(&self, ledger_id: &str) -> Result<()> {
-        self.confirm_current(ledger_id, "retry").await.map(|_| ())
+    /// Refuse reads while a locally applied erasure reaching this ledger
+    /// has not been installed. This makes no leader round trip.
+    pub async fn ensure_read_ready(&self, ledger_id: &str) -> Result<()> {
+        if let Some(replicas) = self.retention.replicas.get() {
+            replicas
+                .erasures_installed(ledger_id)
+                .await
+                .map_err(|e| ApiError::ReplicaNotCurrent(format!("{e}; retry")))?;
+        }
+        Ok(())
     }
 
-    async fn confirm_current(&self, ledger_id: &str, advice: &str) -> Result<bool> {
-        let Some(replicas) = self.retention.replicas.get() else {
-            return Ok(false);
-        };
-        replicas.sync_reads().await.map_err(|e| {
-            ApiError::ReplicaNotCurrent(format!(
-                "this replica cannot confirm it holds {ledger_id}'s current removal journal \
-                 ({e}); {advice}"
-            ))
-        })?;
-        replicas
-            .erasures_installed(ledger_id)
-            .await
-            .map_err(|e| ApiError::ReplicaNotCurrent(format!("{e}; {advice}")))?;
-        Ok(true)
+    /// Catch up before making a write-side decision about erasure proofs.
+    #[cfg(feature = "native")]
+    pub(crate) async fn confirm_replica_current(&self, ledger_id: &str) -> Result<()> {
+        if let Some(replicas) = self.retention.replicas.get() {
+            replicas.sync_reads().await.map_err(|e| {
+                ApiError::ReplicaNotCurrent(format!(
+                    "this replica cannot confirm it holds {ledger_id}'s current removal journal ({e}); retry"
+                ))
+            })?;
+        }
+        self.ensure_read_ready(ledger_id).await
     }
 
     /// After a journal change: the replicas that have not applied it.
@@ -86,5 +88,52 @@ impl Fluree {
             Some(replicas) => replicas.await_replicas(timeout).await,
             None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn raw_reads_keep_local_installation_gate() {
+        struct AppliedButNotInstalled(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ReplicaSync for AppliedButNotInstalled {
+            async fn sync_reads(&self) -> std::result::Result<(), String> {
+                panic!("no leader barrier wanted")
+            }
+            async fn await_replicas(&self, _: Duration) -> Vec<String> {
+                vec![]
+            }
+            async fn erasures_installed(&self, _: &str) -> std::result::Result<(), String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err("applied erasure is not installed".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = crate::FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        fluree.create_ledger("review/local-install").await.unwrap();
+        let replicas = Arc::new(AppliedButNotInstalled(std::sync::atomic::AtomicUsize::new(
+            0,
+        )));
+        fluree.set_retention_replicas(replicas.clone());
+        let result = fluree
+            .raw_history_suppressing("review/local-install:main", false)
+            .await;
+        assert!(
+            result.is_err(),
+            "locally applied erasures must block serving until installed"
+        );
+        let query = serde_json::json!({
+            "from": "review/local-install:main", "select": "?o",
+            "where": {"@id": "http://example.org/a", "http://example.org/email": "?o"}
+        });
+        assert!(matches!(
+            fluree.query_connection(&query).await,
+            Err(ApiError::ReplicaNotCurrent(_))
+        ));
     }
 }

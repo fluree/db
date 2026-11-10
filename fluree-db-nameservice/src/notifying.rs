@@ -464,7 +464,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// ConfigPublisher — pure delegation (no events)
+// ConfigPublisher — notify after a successful CAS
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -479,9 +479,18 @@ where
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        self.inner
+        let result = self
+            .inner
             .push_config_fenced(ledger_id, fence, expected, new)
-            .await
+            .await?;
+        if matches!(result, ConfigCasResult::Updated) {
+            self.event_bus
+                .notify(NameServiceEvent::LedgerConfigPublished {
+                    ledger_id: fluree_db_core::LedgerId::parse(ledger_id)?,
+                    config_version: new.v,
+                });
+        }
+        Ok(result)
     }
 }
 
@@ -671,6 +680,45 @@ mod tests {
     use super::*;
     use crate::{lifecycle, memory::MemoryNameService, SubscriptionScope};
     use fluree_db_core::{InstanceId, LedgerName};
+
+    #[tokio::test]
+    async fn successful_config_updates_publish_the_atomic_record_revision() {
+        let bus = Arc::new(LedgerEventBus::new(8));
+        let ns = NotifyingNameService::new(MemoryNameService::new(), bus.clone());
+        let id = LedgerId::parse("config:main").unwrap();
+        let record = lifecycle::create_ledger(&ns, &id).await.unwrap();
+        let mut sub = bus.subscribe(SubscriptionScope::all());
+        let prior = ns.get_config(id.as_str()).await.unwrap().unwrap();
+        let next = ConfigValue::new(prior.v + 1, Some(crate::ConfigPayload::new()));
+        assert_eq!(
+            ns.push_config_fenced(id.as_str(), record.fence, Some(&prior), &next)
+                .await
+                .unwrap(),
+            ConfigCasResult::Updated
+        );
+        assert_eq!(
+            ns.lookup(id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .config_version,
+            Some(next.v)
+        );
+        assert_eq!(
+            drain(&mut sub),
+            vec![NameServiceEvent::LedgerConfigPublished {
+                ledger_id: id.clone(),
+                config_version: next.v
+            }]
+        );
+        assert!(matches!(
+            ns.push_config_fenced(id.as_str(), record.fence, Some(&prior), &next)
+                .await
+                .unwrap(),
+            ConfigCasResult::Conflict { .. }
+        ));
+        assert!(drain(&mut sub).is_empty());
+    }
 
     fn drain(sub: &mut Subscription) -> Vec<NameServiceEvent> {
         std::iter::from_fn(|| sub.receiver.try_recv().ok()).collect()

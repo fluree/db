@@ -458,3 +458,44 @@ async fn a_purge_owed_to_a_dropped_holder_outlives_a_failed_restore() {
         holding(here.path(), "a@secret")
     );
 }
+
+#[tokio::test]
+async fn quote_committed_between_spelling_check_and_holder_lock() {
+    let _serial = SERIAL.lock().await;
+    let source = tempfile::tempdir().unwrap();
+    let (before, after, _, _) = archives(&source).await;
+    let here = tempfile::tempdir().unwrap();
+    let (receiver, held) = holder(&here, &before).await;
+    let receiver = Arc::new(receiver);
+    let checked = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    *super::hooks::BEFORE_LOCKS.lock() = Some((checked.clone(), proceed.clone()));
+    let receiving = {
+        let receiver = receiver.clone();
+        tokio::spawn(async move {
+            receiver
+                .restore_ledger("t/review-racing-restore", &mut after.as_slice())
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), checked.notified())
+        .await
+        .unwrap();
+    *super::hooks::BEFORE_LOCKS.lock() = None;
+    receiver
+        .graph(&held)
+        .transact()
+        .insert(&json!({
+            "@context":ctx(),"@id":"ex:claim","ex:note":"seen",
+            "@reifies":{"@id":"ex:alice","ex:email":"a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    proceed.notify_one();
+    let result = receiving.await.unwrap();
+    assert!(
+        result.is_err(),
+        "a newly committed quote must be rechecked under the holder lock"
+    );
+}

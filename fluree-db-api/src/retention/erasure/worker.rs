@@ -524,7 +524,7 @@ impl Fluree {
     /// over the erasures installed here, once they are the cluster's. The
     /// member, `node`, is recorded as proving it, for a leader asking again.
     pub(super) async fn prove_handed(&self, step: &ProofStep, node: u64) -> StepOutcome {
-        if let Err(e) = self.confirm_history_current(&step.branch).await {
+        if let Err(e) = self.confirm_replica_current(&step.branch).await {
             return StepOutcome::Retry(e.to_string());
         }
         AssertUnwindSafe(self.prove_here(step, node))
@@ -822,8 +822,23 @@ impl Fluree {
                 Prepared::Waiting => return Ok(()),
                 Prepared::Covered => {}
                 Prepared::Ready { holders, erased } => {
+                    let mut locked = Vec::with_capacity(holders.len());
+                    for holder in &holders {
+                        let guard = self.lock_ledger(&holder.ledger_id).await?;
+                        let fence = runtime.fence(holder.ledger_id.as_str()).write_owned().await;
+                        let current = self.nameservice().lookup(&holder.ledger_id).await?;
+                        if current.as_ref().is_none_or(|r| {
+                            r.commit_head_id != holder.commit_head_id || r.fence != holder.fence
+                        }) {
+                            // Retry preparation on the next pass; a concurrent
+                            // commit may have introduced a quoted value.
+                            return Ok(());
+                        }
+                        locked.push((guard, fence));
+                    }
                     self.store_authorization(branch, job).await?;
                     runtime.index.publish(erased).await?;
+                    drop(locked);
                     for holder in &holders {
                         self.announce_refresh(&holder.ledger_id).await;
                     }
@@ -1075,6 +1090,7 @@ impl Fluree {
                         txn: None,
                         steps: Vec::new(),
                         replaced_at: Vec::new(),
+                        locations_known: false,
                     });
                     if next.txn.is_none() {
                         let bytes = self
@@ -1109,6 +1125,7 @@ impl Fluree {
             .await?;
             return Ok(Prepared::Waiting);
         }
+        self.locate_erasures(&mut erased, None).await?;
         Ok(match erased.is_empty() {
             true => Prepared::Covered,
             false => Prepared::Ready { holders, erased },

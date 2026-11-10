@@ -219,6 +219,7 @@ impl HeadSink for PeerHeadSink {
                 }
             }
             RemoteEvent::LedgerUpdated(record) => {
+                self.fluree.observe_nameservice_record(&record);
                 let change = HeadChange {
                     ledger_id: record.ledger_id.to_string(),
                     commit_t: record.commit_t,

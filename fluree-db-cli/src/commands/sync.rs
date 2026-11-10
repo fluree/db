@@ -48,6 +48,22 @@ impl PackSink for Reception<'_> {
     }
 }
 
+/// Discover changes to already-held history, independently of commit heads.
+/// An object walk cannot establish that no ancestor was erased remotely.
+async fn origin_history_changes(
+    fetcher: &MultiOriginFetcher,
+    ledger_id: &str,
+    head: &fluree_db_core::ContentId,
+    held: Vec<String>,
+) -> CliResult<reqwest::Response> {
+    let request = PackRequest::commits(vec![head.clone()], vec![head.clone()]).with_erasures(held);
+    fetcher.fetch_pack_response(ledger_id, &request).await
+        .map_err(|e| CliError::Config(format!("pull failed (history changes): {e}")))?
+        .ok_or_else(|| CliError::Config(
+            "the origin cannot synchronize erasures and journal changes for commits already held; configure a pack-capable origin before pulling".into()
+        ))
+}
+
 /// Where an origin walk reads objects: an origin's object requests.
 #[async_trait::async_trait]
 trait ObjectSource: Sync {
@@ -78,7 +94,10 @@ async fn walk_origin(
     fluree: &fluree_db_api::Fluree,
     source: &dyn ObjectSource,
     (ledger_id, local_id): (&str, &str),
-    head: &fluree_db_core::ContentId,
+    (head, stop): (
+        &fluree_db_core::ContentId,
+        Option<&fluree_db_core::ContentId>,
+    ),
     (storage, namespace): (
         &Arc<dyn fluree_db_core::storage::Storage>,
         &fluree_db_core::StorageNamespace,
@@ -95,7 +114,7 @@ async fn walk_origin(
     let mut visited_commits = std::collections::HashSet::new();
 
     while let Some(cid) = frontier.pop() {
-        if !visited_commits.insert(cid.clone()) {
+        if stop == Some(&cid) || !visited_commits.insert(cid.clone()) {
             continue;
         }
         // A read of an erased commit returns its replacement here whether
@@ -2372,7 +2391,7 @@ pub async fn run_clone_origin(
             &fluree,
             &fetcher,
             (ledger_id.as_str(), local_id.as_str()),
-            &head_cid,
+            (&head_cid, None),
             (&storage, &namespace),
             no_txns,
             &mut reception,
@@ -2574,23 +2593,15 @@ async fn run_pull_via_origins(
             .held_erasure_digests()
             .await
             .map_err(|e| CliError::Config(e.to_string()))?;
-        let request =
-            PackRequest::commits(vec![remote_head_cid.clone()], vec![remote_head_cid.clone()])
-                .with_erasures(held);
-        let response = match held_here {
-            true => fetcher
-                .fetch_pack_response(ledger_id, &request)
-                .await
-                .map_err(|e| CliError::Config(format!("pull failed (journal since): {e}")))?,
-            false => None,
-        };
-        if let Some(response) = response {
-            let mut reception = OriginReception::new(&fluree, erasure_authority);
-            ingest_pack_stream_into(response, &storage, &namespace, Some(&mut reception))
-                .await
-                .map_err(|e| CliError::Config(format!("pull failed (journal since): {e}")))?;
-            reception.accept(ledger_id, &remote_head_cid).await?;
+        if !held_here {
+            return Err(CliError::Config("the origin's head is not in the local history; reconcile the diverged histories before pulling".into()));
         }
+        let response = origin_history_changes(&fetcher, ledger_id, &remote_head_cid, held).await?;
+        let mut reception = OriginReception::new(&fluree, erasure_authority);
+        ingest_pack_stream_into(response, &storage, &namespace, Some(&mut reception))
+            .await
+            .map_err(|e| CliError::Config(format!("pull failed (history changes): {e}")))?;
+        reception.accept(ledger_id, &remote_head_cid).await?;
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
         return Ok(fluree);
     }
@@ -2765,111 +2776,26 @@ async fn run_pull_via_origins(
         }
     }
 
-    // Walk chain from remote head toward local head.
-    struct FetchedCommit {
-        id: fluree_db_core::ContentId,
-        bytes: Vec<u8>,
-        txn: Option<fluree_db_core::ContentId>,
-    }
-    let mut fetched: Vec<FetchedCommit> = Vec::new();
-    let mut frontier = vec![remote_head_cid.clone()];
-    let mut visited_pull = std::collections::HashSet::new();
+    // A CID walk can discover replacements of missing commits, but cannot
+    // discover changes to an ancestor it already holds. Before using it,
+    // require an erasure-aware discovery round over the remote history.
+    let response = origin_history_changes(&fetcher, ledger_id, &remote_head_cid, held).await?;
+    ingest_pack_stream_into(response, &storage, &namespace, Some(&mut reception))
+        .await
+        .map_err(|e| CliError::Config(format!("pull failed (history changes): {e}")))?;
+    // Acceptance waits until the walk has supplied any missing history.
 
-    while let Some(cid) = frontier.pop() {
-        if !visited_pull.insert(cid.clone()) {
-            continue;
-        }
-        // Primary stop: hit local head CID — its ancestry is complete.
-        if local_ref.id.as_ref() == Some(&cid) {
-            continue;
-        }
-
-        // If commit already exists locally (e.g., from an interrupted pull),
-        // read local bytes to continue chain traversal but skip re-fetching.
-        // An erased commit reads here whether or not this ledger holds it.
-        let held = content_store.has(&cid).await.unwrap_or(false)
-            && fluree
-                .ledger_holds_commit(ledger_id, &cid)
-                .await
-                .map_err(|e| CliError::Config(format!("pull failed (read local commit): {e}")))?;
-        if held {
-            let local_bytes = content_store
-                .get(&cid)
-                .await
-                .map_err(|e| CliError::Config(format!("pull failed (read local commit): {e}")))?;
-            let envelope = read_commit_envelope(&local_bytes)
-                .map_err(|e| CliError::Config(format!("pull failed (read envelope): {e}")))?;
-            if envelope.t <= local_ref.t {
-                continue;
-            }
-            for parent_id in envelope.parent_ids() {
-                frontier.push(parent_id.clone());
-            }
-            continue;
-        }
-
-        let commit_bytes = fetcher
-            .fetch(&cid, ledger_id)
-            .await
-            .map_err(|e| CliError::Config(format!("pull failed (fetch commit): {e}")))?;
-
-        if !commit_blob_matches(&cid, &commit_bytes) {
-            return Err(CliError::Config(format!(
-                "pull failed: commit {cid} does not match its bytes"
-            )));
-        }
-
-        let envelope = read_commit_envelope(&commit_bytes)
-            .map_err(|e| CliError::Config(format!("pull failed (read envelope): {e}")))?;
-
-        // Secondary stop: t-based early exit (reached or passed local history).
-        if envelope.t <= local_ref.t {
-            continue;
-        }
-
-        for parent_id in envelope.parent_ids() {
-            frontier.push(parent_id.clone());
-        }
-        fetched.push(FetchedCommit {
-            id: cid.clone(),
-            bytes: commit_bytes,
-            txn: envelope.txn,
-        });
-    }
-
-    if fetched.is_empty() {
-        println!("{} '{}' is already up to date", "✓".green(), ledger_id);
-        return Ok(fluree);
-    }
-
-    // Reverse to oldest→newest, store blobs.
-    fetched.reverse();
-    for fc in &fetched {
-        storage
-            .content_write_bytes_with_hash(
-                ContentKind::Commit,
-                &namespace,
-                &fc.id.address_digest(),
-                &fc.bytes,
-            )
-            .await
-            .map_err(|e| CliError::Config(format!("pull failed (store commit): {e}")))?;
-
-        if let Some(txn_cid) = &fc.txn {
-            if !content_store.has(txn_cid).await.unwrap_or(false) {
-                let txn_bytes = fetcher
-                    .fetch(txn_cid, ledger_id)
-                    .await
-                    .map_err(|e| CliError::Config(format!("pull failed (fetch txn blob): {e}")))?;
-                content_store
-                    .put_with_id(txn_cid, &txn_bytes)
-                    .await
-                    .map_err(|e| CliError::Config(format!("pull failed (store txn blob): {e}")))?;
-            }
-        }
-    }
-
-    let count = fetched.len();
+    let count = walk_origin(
+        &fluree,
+        &fetcher,
+        (ledger_id, ledger_id),
+        (&remote_head_cid, local_ref.id.as_ref()),
+        (&storage, &namespace),
+        false,
+        &mut reception,
+    )
+    .await?;
+    reception.accept(ledger_id, &remote_head_cid).await?;
 
     // Set new commit head.
     let handle = fluree
@@ -3127,7 +3053,7 @@ mod tests {
             copy,
             source,
             (source.ledger_id, local_id),
-            head,
+            (head, None),
             (storage, &namespace),
             false,
             &mut reception,

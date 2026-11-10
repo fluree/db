@@ -30,6 +30,7 @@
 mod activation;
 pub(crate) mod index;
 mod members;
+mod ownership;
 pub(crate) mod purge;
 mod request;
 pub(crate) mod transfer;

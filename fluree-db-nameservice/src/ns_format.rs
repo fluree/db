@@ -215,6 +215,7 @@ impl NsFileV2 {
             fence: self.fence,
             frozen: self.status == STATUS_FROZEN,
             erasure_generation: 0,
+            config_version: self.config_v,
         };
         // READ-TIME merge rule: the index file wins at equal or higher t.
         if let Some(index_data) = index_file.filter(|f| f.fence == record.fence) {

@@ -1,6 +1,6 @@
 //! What this instance knows of each branch, without reading the
 //! nameservice: which incarnation holds the name, its commit head, and
-//! (where this instance makes every write) whether it has a removal journal;
+//! its configuration revision and whether it has a removal journal;
 //! and which incarnations this instance has dropped.
 //!
 //! Kept current by the nameservice event bus, which carries this instance's
@@ -26,6 +26,7 @@ pub(crate) enum Seen {
         instance: u128,
         head_t: i64,
         journal: Option<bool>,
+        config_version: Option<i64>,
     },
     /// The branch was dropped.
     Dropped,
@@ -48,6 +49,7 @@ struct Branch {
     /// Sequence of the last event or write that changed it.
     touched: u64,
     seen: Option<Seen>,
+    replicated: bool,
 }
 
 #[derive(Default)]
@@ -64,9 +66,9 @@ pub(crate) struct BranchWatch {
     /// The event bus carries every nameservice write this instance makes
     /// or applies; without it nothing is kept.
     tracking: AtomicBool,
-    /// This instance makes every nameservice write (file or memory
-    /// storage), so a journal it last read or wrote is the journal.
-    sole_writer: AtomicBool,
+    /// Every config change is observed locally, through exclusive storage
+    /// ownership or the replicated apply path.
+    coherent: AtomicBool,
 }
 
 impl BranchWatch {
@@ -79,16 +81,54 @@ impl BranchWatch {
     }
 
     pub(crate) fn set_sole_writer(&self) {
-        self.sole_writer.store(true, Ordering::Release);
+        self.coherent.store(true, Ordering::Release);
     }
 
-    pub(crate) fn clear_sole_writer(&self) {
-        self.sole_writer.store(false, Ordering::Release);
+    /// A replicated nameservice emits every applied config change locally.
+    pub(crate) fn set_replicated(&self, complete: bool) {
+        self.coherent.store(complete, Ordering::Release);
+    }
+
+    /// A peer's stream and reconnect snapshots carry configuration
+    /// revisions even when the commit head stays unchanged.
+    pub(crate) fn remote_record(&self, record: &NsRecord) {
+        let mut state = self.state.write().expect("watch lock never poisoned");
+        state.seq += 1;
+        let seq = state.seq;
+        let branch = state
+            .branches
+            .entry(record.ledger_id.to_string())
+            .or_default();
+        let mut next = Seen::live(record);
+        if let (
+            Some(Seen::Live {
+                fence: a,
+                instance: b,
+                config_version: c,
+                journal: prior,
+                ..
+            }),
+            Seen::Live {
+                fence: d,
+                instance: e,
+                config_version: f,
+                journal,
+                ..
+            },
+        ) = (branch.seen, &mut next)
+        {
+            if (a, b, c) == (*d, *e, *f) {
+                *journal = prior;
+            }
+        }
+        branch.seen = Some(next);
+        branch.touched = seq;
+        branch.replicated = true;
     }
 
     /// What is known of `ledger_id` (as canonically spelled) and of the
-    /// branch record `fence` belongs to, in one look; a journal is reported
-    /// only where this instance makes every write.
+    /// branch record `fence` belongs to, in one look; cached journal state
+    /// is reported only when every change is observed locally.
     pub(crate) fn check(&self, ledger_id: &str, fence: Option<Fence>) -> Check {
         let state = self.state.read().expect("watch lock never poisoned");
         if fence.is_some_and(|fence| state.dropped.contains(&fence)) {
@@ -97,7 +137,10 @@ impl BranchWatch {
         if !self.tracking.load(Ordering::Acquire) {
             return Check::Unknown;
         }
-        let Some(seen) = state.branches.get(ledger_id).and_then(|b| b.seen) else {
+        let Some(branch) = state.branches.get(ledger_id) else {
+            return Check::Unknown;
+        };
+        let Some(seen) = branch.seen else {
             return Check::Unknown;
         };
         Check::Known(match seen {
@@ -106,11 +149,17 @@ impl BranchWatch {
                 instance,
                 head_t,
                 journal,
+                config_version,
             } => Seen::Live {
                 fence,
                 instance,
                 head_t,
-                journal: journal.filter(|_| self.sole_writer.load(Ordering::Acquire)),
+                journal: journal.filter(|_| {
+                    self.coherent.load(Ordering::Acquire)
+                        || (branch.replicated && config_version.is_some())
+                }),
+                config_version: config_version
+                    .filter(|_| self.coherent.load(Ordering::Acquire) || branch.replicated),
             },
             other => other,
         })
@@ -165,15 +214,55 @@ impl BranchWatch {
     /// it no longer holds.
     pub(crate) fn journal_changing(&self, ledger_id: &str) {
         self.touch(ledger_id, |seen| {
-            if let Some(Seen::Live { journal, .. }) = seen {
+            if let Some(Seen::Live {
+                journal,
+                config_version,
+                ..
+            }) = seen
+            {
                 *journal = None;
+                *config_version = None;
             }
         });
+    }
+
+    pub(crate) fn forget(&self, ledger_id: &str) {
+        self.touch(ledger_id, |seen| *seen = None);
+    }
+
+    pub(crate) fn forget_all(&self) {
+        let mut state = self.state.write().expect("watch lock never poisoned");
+        state.seq += 1;
+        let seq = state.seq;
+        for branch in state.branches.values_mut() {
+            branch.seen = None;
+            branch.touched = seq;
+        }
     }
 
     /// Apply a nameservice event.
     pub(crate) fn observe(&self, event: &NameServiceEvent) {
         match event {
+            NameServiceEvent::LedgerConfigPublished {
+                ledger_id,
+                config_version,
+            } => {
+                self.touch(ledger_id.as_str(), |seen| {
+                    if let Some(Seen::Live {
+                        journal,
+                        config_version: version,
+                        ..
+                    }) = seen
+                    {
+                        *journal = None;
+                        *version =
+                            Some(version.map_or(*config_version, |v| v.max(*config_version)));
+                    }
+                });
+            }
+            NameServiceEvent::LedgerRefresh { ledger_id } => {
+                self.forget(ledger_id.as_str());
+            }
             NameServiceEvent::LedgerCommitPublished {
                 ledger_id,
                 commit_t,
@@ -216,7 +305,8 @@ impl Seen {
                 .and_then(fluree_db_core::StorageRoot::instance_bits)
                 .unwrap_or(0),
             head_t: record.commit_t,
-            journal: None,
+            journal: (record.config_version == Some(0)).then_some(false),
+            config_version: record.config_version,
         }
     }
 }
@@ -246,6 +336,7 @@ mod tests {
     fn record(t: i64) -> NsRecord {
         NsRecord {
             commit_t: t,
+            config_version: None,
             ..NsRecord::new(id())
         }
     }
@@ -270,6 +361,7 @@ mod tests {
             instance: 0,
             head_t,
             journal,
+            config_version: None,
         };
         assert_eq!(get(&watch), Some(live(5, None)));
         watch.learn_journal("w:main", false, watch.token());
@@ -297,6 +389,49 @@ mod tests {
         let token = watch.token();
         watch.journal_changing("w:main");
         watch.learn_journal("w:main", false, token);
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live { journal: None, .. })
+        ));
+    }
+
+    #[test]
+    fn a_peer_learns_config_changes_at_the_same_head_and_on_reconnect() {
+        let watch = tracking();
+        let mut r = record(3);
+        r.config_version = Some(0);
+        watch.remote_record(&r);
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live {
+                journal: Some(false),
+                ..
+            })
+        ));
+        let token = watch.token();
+        r.config_version = Some(1);
+        watch.remote_record(&r);
+        watch.learn_journal("w:main", false, token);
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live {
+                journal: None,
+                config_version: Some(1),
+                ..
+            })
+        ));
+        watch.learn_journal("w:main", true, watch.token());
+        watch.remote_record(&r); // unchanged reconnect snapshot
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live {
+                journal: Some(true),
+                ..
+            })
+        ));
+        r.config_version = None; // legacy records are unknown, never zero
+        watch.remote_record(&r);
+        watch.learn_journal("w:main", false, watch.token());
         assert!(matches!(
             get(&watch),
             Some(Seen::Live { journal: None, .. })

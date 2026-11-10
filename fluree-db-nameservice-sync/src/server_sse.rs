@@ -93,6 +93,8 @@ struct LedgerSseRecord {
     branches: u32,
     #[serde(default)]
     storage_root: Option<fluree_db_core::StorageRoot>,
+    #[serde(default)]
+    config_version: Option<i64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -203,6 +205,7 @@ fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRe
         fence: None,
         frozen: false,
         erasure_generation: 0,
+        config_version: record.config_version,
     }
 }
 
@@ -229,6 +232,19 @@ fn gs_sse_to_graph_source_record(
 mod tests {
     use super::*;
     use fluree_sse::SseEvent;
+
+    #[test]
+    fn a_record_carries_a_config_revision_or_an_explicit_unknown() {
+        for revision in [None, Some(0), Some(9)] {
+            let mut value = serde_json::json!({"ledger_id":"test:main", "commit_t":1, "index_t":0, "retracted":false});
+            if let Some(v) = revision {
+                value["config_version"] = v.into();
+            }
+            let parsed: LedgerSseRecord = serde_json::from_value(value).unwrap();
+            let record = ledger_sse_to_ns_record(LedgerId::parse("test:main").unwrap(), parsed);
+            assert_eq!(record.config_version, revision);
+        }
+    }
 
     #[test]
     fn test_parse_ledger_ns_record_event() {

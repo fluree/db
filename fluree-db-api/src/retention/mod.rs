@@ -104,15 +104,9 @@ impl Fluree {
     /// history no longer serves, so reading them is audit access.
     /// `f:noHistory` alone does not count: it hides nothing.
     pub async fn history_suppressed(&self, ledger_id: &str) -> Result<bool> {
-        self.history_suppressed_with(ledger_id, true).await
-    }
-
-    /// [`Self::history_suppressed`], confirming with the cluster first that
-    /// this replica holds the current journal only when `confirm`.
-    async fn history_suppressed_with(&self, ledger_id: &str, confirm: bool) -> Result<bool> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
         Ok(self
-            .suppression_with(&ledger_id, confirm)
+            .suppression_for(&ledger_id)
             .await?
             .is_some_and(|s| !s.journal.removals.is_empty()))
     }
@@ -121,15 +115,12 @@ impl Fluree {
     /// reaches: its own, and its sources', since its store reads the
     /// commits it shares with them from their folders. With `every_branch`,
     /// every branch of the ledger, dropped ones included: a grant over the
-    /// ledger's storage reaches all their folders. On a cluster replica,
-    /// each journal is confirmed current with the cluster first when
-    /// `confirm`, as a read of history needs; otherwise it is the one this
-    /// replica holds, as a read of current state takes.
+    /// ledger's storage reaches all their folders. Each branch uses this
+    /// node's journal and must have installed its locally applied erasures.
     pub async fn raw_history_suppressing(
         &self,
         ledger_id: &str,
         every_branch: bool,
-        confirm: bool,
     ) -> Result<Vec<fluree_db_core::LedgerId>> {
         let id = fluree_db_core::LedgerId::parse(ledger_id)?;
         let reached = if every_branch {
@@ -154,10 +145,7 @@ impl Fluree {
         };
         let mut suppressing = Vec::new();
         for branch in reached {
-            if self
-                .history_suppressed_with(branch.as_str(), confirm)
-                .await?
-            {
+            if self.history_suppressed(branch.as_str()).await? {
                 suppressing.push(branch);
             }
         }

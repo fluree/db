@@ -299,7 +299,7 @@ pub async fn stream_pack(
     // The journal travels with the commits, so the copy serves no history
     // its source no longer serves.
     let journal = match async {
-        fluree.confirm_history_current(handle.id()).await?;
+        fluree.ensure_read_ready(handle.id()).await?;
         fluree.retention_archive_section(handle.id()).await
     }
     .await

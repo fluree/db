@@ -4458,13 +4458,13 @@ async fn test_proxy_peer_refuses_removed_history() {
     let (status, json) = query("peerhist:main@t:1", "bob").await;
     assert_eq!(status, StatusCode::GONE, "{json}");
 
-    // A cluster replica that cannot confirm it holds the current journal
-    // confirms no copy of it, not even an unchanged one.
+    // A partitioned replica still revalidates the journal it holds, with
+    // no leader round trip.
     struct Partitioned;
     #[async_trait::async_trait]
     impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
         async fn sync_reads(&self) -> Result<(), String> {
-            Err("no leader".into())
+            panic!("config reads must not contact the leader")
         }
         async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
             Vec::new()
@@ -4472,10 +4472,7 @@ async fn test_proxy_peer_refuses_removed_history() {
     }
     state.fluree.set_retention_replicas(Arc::new(Partitioned));
     let unconfirmed = config(Some(tag)).await.expect("config");
-    assert_eq!(
-        unconfirmed.status(),
-        reqwest::StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(unconfirmed.status(), reqwest::StatusCode::NOT_MODIFIED);
     server_handle.abort();
 }
 
@@ -4905,10 +4902,10 @@ async fn test_index_objects_of_a_ledger_with_a_removal_need_audit() {
 /// An index object other than history is checked against the journal a
 /// cluster replica holds, waiting on no leader: a replica that cannot reach
 /// one still serves an ordinary ledger's index, and still refuses the index
-/// of a ledger with a removal to a storage token. Its commits, history,
-/// wait on the leader as before.
+/// of a ledger with a removal to a storage token. Raw commits use the
+/// same local checks.
 #[tokio::test]
-async fn test_index_objects_wait_on_no_leader() {
+async fn test_raw_objects_wait_on_no_leader() {
     struct Partitioned(std::sync::atomic::AtomicUsize);
     #[async_trait::async_trait]
     impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
@@ -5006,8 +5003,6 @@ async fn test_index_objects_wait_on_no_leader() {
         0,
         "an index read waited on the leader"
     );
-    assert_eq!(
-        status(plain_head, plain).await,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(status(plain_head, plain).await, StatusCode::OK);
+    assert_eq!(replicas.0.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

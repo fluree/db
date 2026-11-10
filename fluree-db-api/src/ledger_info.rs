@@ -3571,6 +3571,7 @@ mod tests {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: None,
         };
 
         let json = ns_record_to_jsonld(&record);
@@ -3606,6 +3607,7 @@ mod tests {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: None,
         };
 
         let json = ns_record_to_jsonld(&record);

@@ -362,6 +362,7 @@ async fn a_publication_whose_job_update_was_lost_completes() {
                     proof: proved.proof.clone(),
                 }],
                 replaced_at: Vec::new(),
+                locations_known: false,
             }
         })
         .collect();

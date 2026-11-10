@@ -248,6 +248,7 @@ impl<'a> ExportBuilder<'a> {
     /// Returns export statistics (triples written, rows skipped).
     pub async fn write_to<W: Write>(self, writer: &mut W) -> Result<ExportStats> {
         self.validate()?;
+        self.fluree.ensure_read_ready(&self.ledger_id).await?;
 
         let ledger = self.fluree.ledger(&self.ledger_id).await?;
 
@@ -290,7 +291,6 @@ impl<'a> ExportBuilder<'a> {
                         to_t,
                         from_t: None,
                         reads: crate::retention::suppression::Reads::Everything,
-                        confirm_journal: true,
                     },
                 )
                 .await?;

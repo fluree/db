@@ -195,6 +195,8 @@ pub struct NsRecordResponse {
     pub retracted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<i64>,
     /// Parent branch this branch was forked from. `None` for the
     /// initial branch. Peers need it to build the branched content
     /// store that walks parent ancestry for commits inherited from
@@ -464,9 +466,9 @@ pub async fn get_config_record(
     if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
         return Err(ServerError::not_found("Ledger not found"));
     }
-    // A cluster replica answers, even that the peer's copy still holds, only
-    // once it holds the current journal.
-    state.fluree.confirm_history_current(&ledger_id).await?;
+    // Use the locally replicated journal, once locally applied erasures
+    // are installed. Revalidation makes no leader round trip.
+    state.fluree.ensure_read_ready(&ledger_id).await?;
     let record = state
         .fluree
         .nameservice()
@@ -569,6 +571,7 @@ pub async fn get_ns_record(
             .as_ref()
             .map(std::string::ToString::to_string),
         commit_t: ns_record.commit_t,
+        config_version: ns_record.config_version,
         index_head_id: ns_record
             .index_head_id
             .as_ref()
@@ -1049,18 +1052,7 @@ fn is_audit_kind(kind: ContentKind) -> bool {
     !matches!(kind, ContentKind::LedgerConfig)
 }
 
-/// History: commits, transactions and an index's history sidecars.
-fn is_history_kind(kind: ContentKind) -> bool {
-    matches!(
-        kind,
-        ContentKind::Commit | ContentKind::Txn | ContentKind::HistorySidecar
-    )
-}
-
-/// Refuse raw `kind` content of `ledger` without audit access where its
-/// history is suppressed. History is checked against the journals a cluster
-/// replica has confirmed current; the rest of an index, like a read of
-/// current state, against those it holds, so reading it waits on no leader.
+/// Check raw content against this node's journal and local installation gate.
 async fn require_audit_of_kind(
     state: &AppState,
     kind: ContentKind,
@@ -1068,10 +1060,8 @@ async fn require_audit_of_kind(
     granted: impl Fn(&fluree_db_api::LedgerId) -> bool,
 ) -> Result<(), ServerError> {
     let headers = axum::http::HeaderMap::new();
-    if is_history_kind(kind) {
+    if is_audit_kind(kind) {
         crate::routes::audit::require_audit(state, &headers, ledger, granted).await
-    } else if is_audit_kind(kind) {
-        crate::routes::audit::require_audit_of_index(state, &headers, ledger, granted).await
     } else {
         Ok(())
     }

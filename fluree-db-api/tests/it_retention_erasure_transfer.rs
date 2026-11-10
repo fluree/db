@@ -2932,3 +2932,78 @@ async fn a_proxy_reads_an_erased_commit_from_its_erasure_answer() {
     let refused = proxy.read_bytes(&address(&later)).await;
     assert!(refused.is_err(), "{refused:?}");
 }
+
+/// Learning only a journal must invalidate an earlier empty-journal result,
+/// even when neither side's commit head moves.
+#[tokio::test]
+async fn journal_only_transfers_invalidate_empty_journal_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = receiving(&dir);
+    let id = ledger(&source, "it/journal-only").await;
+    let t1 = insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    source
+        .graph(&id)
+        .transact()
+        .update(&json!({"@context": ctx(), "delete": {"@id": "ex:alice", "ex:email": "a@old"}}))
+        .commit()
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let (head, head_t) = head_of(&source, &id).await;
+    source
+        .remove_occurrences(
+            &id,
+            RemovalRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: Some(json!("a@old")),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_of(&source, &id).await.0, head);
+    for as_pack in [false, true] {
+        let here = tempfile::tempdir().unwrap();
+        let receiver = receiving(&here);
+        let copy = receiver
+            .restore_ledger("it/journal-only-copy", &mut archive.as_slice())
+            .await
+            .unwrap()
+            .ledger_id;
+        // The restore also sees lineage checkpoints on its own storage only.
+        assert!(!receiver.history_suppressed(&copy).await.unwrap());
+        let query = json!({"@context": ctx(), "from": format!("{copy}@t:{t1}"), "select": "?o", "where": {"@id": "ex:alice", "ex:email": "?o"}});
+        receiver.query_connection(&query).await.unwrap();
+        if as_pack {
+            let request =
+                fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![head.clone()])
+                    .with_erasures(Vec::new());
+            let pack = packed(&source, &id, &request).await;
+            take_pack(&receiver, &copy, &pack, (&head, head_t), true)
+                .await
+                .unwrap();
+        } else {
+            let request = push_of_no_commits(&source, &id, &head).await;
+            assert!(request.commits.is_empty());
+            push(&receiver, &copy, request, true).await.unwrap();
+        }
+        assert!(receiver.history_suppressed(&copy).await.unwrap());
+        assert!(matches!(
+            receiver.query_connection(&query).await,
+            Err(ApiError::HistoryUnavailable(_))
+        ));
+    }
+}

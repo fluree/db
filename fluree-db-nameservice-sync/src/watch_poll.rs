@@ -69,6 +69,7 @@ impl crate::watch::RemoteWatch for PollRemoteWatch {
                                     || prev.commit_head_id != record.commit_head_id
                                     || prev.index_head_id != record.index_head_id
                                     || prev.storage_root != record.storage_root
+                                    || prev.config_version != record.config_version
                                 {
                                     yield RemoteEvent::LedgerUpdated(record.clone());
                                 }
@@ -220,6 +221,7 @@ mod tests {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: None,
         }
     }
 

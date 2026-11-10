@@ -231,6 +231,11 @@ pub struct NsRecord {
     /// [`WriteBasis`]. Always 0 outside a cluster.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub erasure_generation: u64,
+
+    /// Version of the runtime configuration, including the removal journal.
+    /// `Some(0)` is an unborn config; `None` is an older or unknown projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<i64>,
 }
 
 pub(crate) fn is_zero(v: &u32) -> bool {
@@ -262,6 +267,7 @@ impl NsRecord {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: Some(0),
         }
     }
 
@@ -959,6 +965,11 @@ pub enum NameServiceEvent {
         ledger_id: LedgerId,
         commit_id: ContentId,
         commit_t: i64,
+    },
+    /// Runtime configuration changed, even if the commit head did not.
+    LedgerConfigPublished {
+        ledger_id: LedgerId,
+        config_version: i64,
     },
     /// A ledger index head was advanced.
     LedgerIndexPublished {

@@ -67,11 +67,15 @@ pub struct ErasedCommit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub txn: Option<String>,
     pub steps: Vec<ErasureStep>,
-    /// Addresses of its original that hold no file but whose folders read
-    /// it, as its replacement: those a purge deleted, and those written
-    /// since publication, which are refused (a restored copy's).
+    /// Addresses whose folders read the original as its replacement, with
+    /// or without an original file: known holders, purged originals, and
+    /// later copies whose writes were refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replaced_at: Vec<String>,
+    /// `replaced_at` also records every namespace holding an original at
+    /// publication. Older maps without this bit require discovery probes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locations_known: bool,
 }
 
 impl ErasedCommit {
@@ -119,8 +123,6 @@ struct Entry {
     erased: ErasedCommit,
     /// The replacement, once its proofs have verified in this process.
     verified: tokio::sync::OnceCell<Arc<[u8]>>,
-    /// The index's version when it last changed.
-    changed: u64,
 }
 
 /// The erased commits of one storage, by the original's address digest.
@@ -136,6 +138,10 @@ pub(crate) struct ErasureIndex {
     /// The digests of erased commits' transaction documents.
     txns: parking_lot::RwLock<HashSet<String>>,
     entries: parking_lot::RwLock<HashMap<String, Arc<Entry>>>,
+    /// Original address prefixes to commit digests. Updated with `entries`.
+    owners: parking_lot::RwLock<HashMap<String, HashMap<String, u64>>>,
+    /// Legacy maps whose physical owners were not recorded at publication.
+    unknown_owners: parking_lot::RwLock<HashMap<String, u64>>,
     /// Advanced by every change to `entries`.
     version: AtomicU64,
     /// [`Self::generation`] at a version.
@@ -218,7 +224,11 @@ fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedC
         }
     }
     let longer = incoming.steps.len() > current.steps.len();
-    if !longer && replaced_at.len() == current.replaced_at.len() {
+    let locations_known = current.locations_known || incoming.locations_known;
+    if !longer
+        && replaced_at.len() == current.replaced_at.len()
+        && locations_known == current.locations_known
+    {
         return None;
     }
     let txn = incoming.txn.clone().or_else(|| current.txn.clone());
@@ -226,6 +236,7 @@ fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedC
     Some(ErasedCommit {
         txn,
         replaced_at,
+        locations_known,
         ..base
     })
 }
@@ -246,6 +257,8 @@ impl ErasureIndex {
             any: AtomicBool::new(false),
             txns: parking_lot::RwLock::new(HashSet::new()),
             entries: parking_lot::RwLock::new(HashMap::new()),
+            owners: Default::default(),
+            unknown_owners: Default::default(),
             version: AtomicU64::new(0),
             generation: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -336,14 +349,37 @@ impl ErasureIndex {
         after: u64,
     ) -> Result<Vec<ContentId>> {
         self.load().await?;
-        let commits: Vec<ContentId> = self
-            .entries
-            .read()
-            .values()
-            .filter(|e| e.changed > after)
-            .filter_map(|e| e.erased.commit.parse().ok())
-            .collect();
-        let mut held = Vec::new();
+        let (mut held, commits) = {
+            let entries = self.entries.read();
+            let owners = self.owners.read();
+            let mut held = HashSet::new();
+            for namespace in namespaces {
+                let prefix = format!(
+                    "fluree:{}://{}/commit",
+                    self.storage.storage_method(),
+                    namespace
+                );
+                if let Some(owned) = owners.get(&prefix) {
+                    for (digest, changed) in owned {
+                        if *changed > after {
+                            if let Some(entry) = entries.get(digest) {
+                                if let Ok(cid) = entry.erased.commit.parse::<ContentId>() {
+                                    held.insert(cid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let unknown: Vec<ContentId> = self
+                .unknown_owners
+                .read()
+                .iter()
+                .filter(|(_, changed)| **changed > after)
+                .filter_map(|(key, _)| entries.get(key)?.erased.commit.parse().ok())
+                .collect();
+            (held.into_iter().collect::<Vec<_>>(), unknown)
+        };
         for commit in commits {
             for namespace in namespaces {
                 #[cfg(test)]
@@ -355,6 +391,7 @@ impl ErasureIndex {
             }
         }
         held.sort_by_key(ContentId::address_digest);
+        held.dedup();
         Ok(held)
     }
 
@@ -422,12 +459,29 @@ impl ErasureIndex {
                 if let Some(txn) = &next.txn {
                     self.txns.write().insert(txn.clone());
                 }
+                let changed = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+                {
+                    let mut owners = self.owners.write();
+                    for address in &next.replaced_at {
+                        if let Some((prefix, _)) = address.rsplit_once('/') {
+                            owners
+                                .entry(prefix.to_string())
+                                .or_default()
+                                .insert(key.clone(), changed);
+                        }
+                    }
+                    let mut unknown = self.unknown_owners.write();
+                    if next.locations_known {
+                        unknown.remove(&key);
+                    } else {
+                        unknown.insert(key.clone(), changed);
+                    }
+                }
                 entries.insert(
                     key,
                     Arc::new(Entry {
                         erased: next,
                         verified: tokio::sync::OnceCell::new(),
-                        changed: self.version.fetch_add(1, Ordering::AcqRel) + 1,
                     }),
                 );
             }
@@ -1241,7 +1295,48 @@ mod tests {
             txn: None,
             steps: vec![step(&format!("r{n}"))],
             replaced_at: Vec::new(),
+            locations_known: false,
         }
+    }
+
+    #[tokio::test]
+    async fn ownership_survives_reload_and_registers_later_copies() {
+        let storage: Arc<dyn Storage> = Arc::new(fluree_db_core::MemoryStorage::new());
+        let index = ErasureIndex::new(storage.clone(), Arc::new(Verifier::default()));
+        let owner = fluree_db_core::StorageRoot::legacy(
+            &fluree_db_core::LedgerName::parse("owner").unwrap(),
+        )
+        .namespace("main");
+        let other = fluree_db_core::StorageRoot::legacy(
+            &fluree_db_core::LedgerName::parse("other").unwrap(),
+        )
+        .namespace("main");
+        let mut chain = erased(1);
+        let cid: ContentId = chain.commit.parse().unwrap();
+        chain.replaced_at = vec![index.commit_address(&owner, &cid)];
+        chain.locations_known = true;
+        index.publish(vec![chain]).await.unwrap();
+        let reopened = ErasureIndex::new(storage, Arc::new(Verifier::default()));
+        assert_eq!(
+            reopened
+                .held_in(std::slice::from_ref(&owner), 0)
+                .await
+                .unwrap(),
+            vec![cid.clone()]
+        );
+        assert!(reopened
+            .held_in(std::slice::from_ref(&other), 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(reopened.probes.load(Ordering::Relaxed), 0);
+        let before = reopened.version();
+        reopened
+            .record_replaced_at(&[reopened.commit_address(&other, &cid)])
+            .await
+            .unwrap();
+        assert_eq!(reopened.held_in(&[other], before).await.unwrap(), vec![cid]);
+        assert_eq!(reopened.probes.load(Ordering::Relaxed), 0);
     }
 
     /// An installation waits out reads of commits begun before it, which
@@ -1396,6 +1491,7 @@ mod tests {
             txn: None,
             steps,
             replaced_at: Vec::new(),
+            locations_known: false,
         };
         let mut held = HashMap::new();
         merge(&mut held, erased(vec![step("a")]));
@@ -1418,6 +1514,7 @@ mod tests {
             txn: None,
             steps: steps.iter().map(|s| step(s)).collect(),
             replaced_at: at.iter().map(ToString::to_string).collect(),
+            locations_known: false,
         };
         let mut held = HashMap::new();
         merge(&mut held, erased(&["a"], &[]));

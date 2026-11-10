@@ -366,6 +366,8 @@ impl PeerSyncTask {
             }
         }
 
+        self.fluree.observe_nameservice_record(record);
+
         // 4. Update in-memory watermarks (AFTER persisting to NS)
         let changed = self
             .peer_state

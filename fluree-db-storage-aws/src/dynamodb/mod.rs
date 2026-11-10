@@ -346,6 +346,10 @@ impl DynamoDbNameService {
             fence,
             frozen,
             erasure_generation: 0,
+            config_version: config
+                .and_then(|c| c.get(ATTR_CONFIG_V))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse().ok()),
         })
     }
 

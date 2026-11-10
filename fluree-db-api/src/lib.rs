@@ -5457,6 +5457,7 @@ impl Fluree {
     /// cached state reloads on next use, after the erasure maps are listed
     /// again, and decoded leaves are read again.
     pub async fn refresh_ledger(&self, ledger_id: &str) {
+        self.retention.watch.forget(ledger_id);
         self.expire_erasures();
         self.disconnect_ledger(ledger_id).await;
         self.clear_decoded();
@@ -5481,6 +5482,7 @@ impl Fluree {
     /// [`Self::refresh_ledger`] for every ledger cached here: a follower
     /// that may have missed a refresh.
     pub async fn refresh_ledgers(&self) {
+        self.retention.watch.forget_all();
         self.expire_erasures();
         if let Some(mgr) = &self.ledger_manager {
             for ledger_id in mgr.cached_aliases().await {

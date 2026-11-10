@@ -1788,8 +1788,23 @@ impl StorageRead for FileStorage {
 
         // Get the directory to list from and the file prefix to match
         let full_path = self.resolve_relative_path(path_prefix)?;
-        let (list_dir, file_prefix) = if full_path.is_dir() {
+        let is_dir = match tokio::fs::metadata(&full_path).await {
+            Ok(metadata) => metadata.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(crate::error::Error::io(format!(
+                    "Failed to inspect {}: {}",
+                    full_path.display(),
+                    e
+                )));
+            }
+        };
+        let (list_dir, file_prefix) = if is_dir {
             (full_path, String::new())
+        } else if path_prefix.ends_with('/') {
+            // A directory that is not there holds nothing: listing its
+            // parent for a partial name would walk every sibling.
+            return Ok(Vec::new());
         } else {
             // The prefix might be a partial filename, so list the parent
             let parent = full_path.parent().unwrap_or(&self.base_path);
@@ -1799,11 +1814,6 @@ impl StorageRead for FileStorage {
                 .unwrap_or_default();
             (parent.to_path_buf(), file_part)
         };
-
-        // Check if directory exists
-        if !list_dir.exists() {
-            return Ok(Vec::new());
-        }
 
         // Walk directory recursively
         let mut results = Vec::new();
@@ -2937,6 +2947,59 @@ mod tests {
             storage.list_prefix("d/e/re").await.unwrap(),
             vec!["fluree:file://d/e/real.json".to_string()]
         );
+    }
+
+    /// A ledger without garbage records has no `@garbage/` beside its
+    /// commits and indexes; listing it reads none of them. The sibling is
+    /// made unreadable, so a walk of it fails (unless run as root).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_prefix_of_a_missing_directory_reads_no_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://l/commit/a.fcv2", b"v")
+            .await
+            .unwrap();
+        let sibling = dir.path().join("l/commit");
+        let set_mode = |mode| {
+            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o000);
+        let listed = storage.list_prefix("fluree:file://l/@garbage/").await;
+        set_mode(0o755);
+        assert_eq!(listed.unwrap(), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_prefix_preserves_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://blocked/map/entry.json", b"present")
+            .await
+            .unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::metadata(parent.join("map")).is_err();
+        let listed = storage.list_prefix("fluree:file://blocked/map/").await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A privileged test process can bypass mode bits.
+        if denied {
+            assert!(
+                listed.is_err(),
+                "permission denied must not mean an empty prefix"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_prefix_preserves_metadata_errors_even_for_root() {
+        let (dir, storage) = storage();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        assert!(storage.list_prefix("fluree:file://loop/").await.is_err());
     }
 
     #[tokio::test]

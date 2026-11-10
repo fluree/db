@@ -222,8 +222,13 @@ struct NsRefreshData {
 /// Compute the SSE event ID for a ledger record
 fn ledger_event_id(resource_id: &str, record: &NsRecord) -> String {
     format!(
-        "ledger:{}:{}:{}",
-        resource_id, record.commit_t, record.index_t
+        "ledger:{}:{}:{}:{}",
+        resource_id,
+        record.commit_t,
+        record.index_t,
+        record
+            .config_version
+            .map_or_else(|| "unknown".into(), |v| v.to_string())
     )
 }
 
@@ -288,6 +293,7 @@ fn ledger_to_sse_event(record: &NsRecord) -> Event {
             "source_branch": record.source_branch,
             "branches": record.branches,
             "storage_root": record.storage_root,
+            "config_version": record.config_version,
             "instance": record.instance(),
         }),
         emitted_at: now_iso8601(),
@@ -446,6 +452,7 @@ fn event_resource_id(event: &NameServiceEvent) -> &LedgerId {
     match event {
         NameServiceEvent::LedgerCommitPublished { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerIndexPublished { ledger_id, .. } => ledger_id,
+        NameServiceEvent::LedgerConfigPublished { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerRetracted { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerCreated { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerRefresh { ledger_id } => ledger_id,
@@ -463,6 +470,7 @@ fn event_resource_id(event: &NameServiceEvent) -> &LedgerId {
 fn event_kind(event: &NameServiceEvent) -> &'static str {
     match event {
         NameServiceEvent::LedgerCommitPublished { .. }
+        | NameServiceEvent::LedgerConfigPublished { .. }
         | NameServiceEvent::LedgerIndexPublished { .. }
         | NameServiceEvent::LedgerRetracted { .. }
         | NameServiceEvent::LedgerCreated { .. }
@@ -489,6 +497,7 @@ where
         // A created branch goes out as its record. One announced before its
         // record can be looked up is skipped: it is announced again.
         NameServiceEvent::LedgerCommitPublished { .. }
+        | NameServiceEvent::LedgerConfigPublished { .. }
         | NameServiceEvent::LedgerIndexPublished { .. }
         | NameServiceEvent::LedgerCreated { .. } => {
             let record = ns.lookup(&resource_id).await.ok()??;
@@ -770,9 +779,13 @@ mod tests {
             fence: None,
             frozen: false,
             erasure_generation: 0,
+            config_version: None,
         };
         let id = ledger_event_id("test:main", &record);
-        assert_eq!(id, "ledger:test:main:42:40");
+        assert_eq!(id, "ledger:test:main:42:40:unknown");
+        let mut revised = record;
+        revised.config_version = Some(1);
+        assert_ne!(id, ledger_event_id("test:main", &revised));
     }
 
     #[test]

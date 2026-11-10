@@ -8,8 +8,8 @@
 //! history. `f:noHistory` refuses nothing: its property is read from what
 //! the index and novelty still hold. The check runs once per request, while
 //! the executable is built, and reads only the journal: a ledger without one
-//! pays one nameservice read on a historical query and nothing on a current
-//! one.
+//! reuses its known-empty result until a configuration event invalidates it.
+//! Backends without a complete local change stream still revalidate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -154,10 +154,6 @@ pub(crate) struct HistoricalRead {
     /// The start of a history range; `None` for a point-in-time read.
     pub(crate) from_t: Option<i64>,
     pub(crate) reads: Reads,
-    /// Whether a cluster replica first confirms its journal is current: a
-    /// read as of an earlier point does, while a view merely behind a head
-    /// this replica has applied is checked against the journal it holds.
-    pub(crate) confirm_journal: bool,
 }
 
 /// A journal with the removals that apply to its branch looked up by what
@@ -166,6 +162,8 @@ pub(crate) struct Suppression {
     pub(crate) journal: Journal,
     /// The journal's identity as its record names it.
     identity: String,
+    revision: Option<(Option<fluree_db_nameservice::Fence>, u128, i64, i64)>,
+    processed_until: i64,
     /// The removals whose commit the branch holds, by predicate, as indexes
     /// into the journal's removals. One whose commit the branch does not
     /// hold (merged from another copy of the lineage) is left out.
@@ -197,6 +195,8 @@ impl Suppression {
         Suppression {
             journal,
             identity,
+            revision: None,
+            processed_until: 0,
             removed,
         }
     }
@@ -297,6 +297,7 @@ impl Fluree {
                 instance,
                 head_t,
                 journal,
+                ..
             } => {
                 let other_fence = db.fence.is_some() && fence.is_some() && db.fence != fence;
                 let other_instance =
@@ -313,34 +314,50 @@ impl Fluree {
         }
     }
 
-    /// The branch's suppression, or `None` when its journal is empty. On a
-    /// cluster replica, read once the replica has confirmed it holds the
-    /// current journal.
-    #[cfg(any(test, not(target_arch = "wasm32")))]
+    /// The branch's suppression, using this node's replicated journal.
     pub(crate) async fn suppression_for(
         &self,
         ledger_id: &str,
     ) -> Result<Option<Arc<Suppression>>> {
-        self.suppression_with(ledger_id, true).await
-    }
-
-    /// [`Self::suppression_for`], confirming the journal is current first
-    /// only when `confirm`.
-    pub(crate) async fn suppression_with(
-        &self,
-        ledger_id: &str,
-        confirm: bool,
-    ) -> Result<Option<Arc<Suppression>>> {
+        self.ensure_read_ready(ledger_id).await?;
         let ns = &self.nameservice_mode;
-        // On a cluster replica, first confirm the local copy is current,
-        // whether or not this replica has seen the ledger registered yet: one
-        // that has not applied its first registration does not know it is
-        // enabled. Outside a cluster this is a no-op.
-        if confirm {
-            self.confirm_journal_current(ledger_id).await?;
+        let watch = &self.retention.watch;
+        if matches!(watch.check(ledger_id, None), Check::Unknown) {
+            let token = watch.token();
+            let record = self.nameservice().lookup(ledger_id).await?;
+            watch.learn(ledger_id, record.as_ref(), token);
         }
-        let token = self.retention.watch.token();
-        let (_, stored) = registry::read_stored(ns, ledger_id).await?;
+        let token = watch.token();
+        let revision = match watch.check(ledger_id, None) {
+            Check::Known(Seen::Live {
+                journal: Some(false),
+                ..
+            }) => return Ok(None),
+            Check::Known(Seen::Live {
+                fence,
+                instance,
+                head_t,
+                config_version: Some(v),
+                ..
+            }) => Some((fence, instance, head_t, v)),
+            _ => None,
+        };
+        let cache = &self.retention.suppressions;
+        if let Some(revision) = revision {
+            if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
+                if cached.revision == Some(revision) {
+                    return Ok(Some(Arc::clone(cached)));
+                }
+            }
+        }
+        let (config, stored) = registry::read_stored(ns, ledger_id).await?;
+        if let Some((_, _, _, expected)) = revision {
+            if config.as_ref().map_or(0, |c| c.v) < expected {
+                return Err(ApiError::ReplicaNotCurrent(format!(
+                    "{ledger_id}'s journal is older than configuration revision {expected}, which this node has already learned; retry"
+                )));
+            }
+        }
         let stored = stored.filter(|s| !registry::journal_empty(s));
         self.retention
             .watch
@@ -349,15 +366,21 @@ impl Fluree {
             return Ok(None);
         };
         let identity = registry::journal_identity(&stored);
-        let cache = &self.retention.suppressions;
-        if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
-            if cached.identity == identity {
-                return Ok(Some(Arc::clone(cached)));
+        if revision.is_none() {
+            if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
+                if cached.identity == identity
+                    && cached.processed_until == registry::shell(&stored)?.watermark_t + 1
+                {
+                    return Ok(Some(Arc::clone(cached)));
+                }
             }
         }
         let journal = registry::resolve_journal(&stored, self.registry_objects()).await?;
         let applies = self.removals_applying(ledger_id, &journal).await;
-        let suppression = Arc::new(Suppression::new(journal, identity, &applies));
+        let mut suppression = Suppression::new(journal, identity, &applies);
+        suppression.revision = revision.filter(|r| config.as_ref().is_some_and(|c| c.v == r.3));
+        suppression.processed_until = registry::shell(&stored)?.watermark_t + 1;
+        let suppression = Arc::new(suppression);
         cache
             .by_ledger
             .lock()
@@ -468,18 +491,10 @@ impl Fluree {
         &self,
         ledger_id: &str,
     ) -> Result<Vec<fluree_db_indexer::SuppressedHistory>> {
-        // Read before the journal, which reflects the config through at
-        // least the watermark it is persisted with.
-        let Some(stored) = registry::read_stored(&self.nameservice_mode, ledger_id)
-            .await?
-            .1
-        else {
-            return Ok(Vec::new());
-        };
-        let processed_until = registry::shell(&stored)?.watermark_t + 1;
         let Some(suppression) = self.suppression_for(ledger_id).await? else {
             return Ok(Vec::new());
         };
+        let processed_until = suppression.processed_until;
         Ok(suppression
             .journal
             .history_rules
@@ -520,7 +535,7 @@ impl Fluree {
                 // A current search is a current-state read: like one of a
                 // ledger, it is checked against the journal this replica
                 // holds, without waiting on the cluster.
-                let Some(suppression) = self.suppression_with(&ledger_id, historical).await? else {
+                let Some(suppression) = self.suppression_for(&ledger_id).await? else {
                     continue;
                 };
                 let journal = &suppression.journal;
@@ -560,10 +575,7 @@ impl Fluree {
         ledger_id: &str,
         read: HistoricalRead,
     ) -> Result<()> {
-        let Some(suppression) = self
-            .suppression_with(ledger_id, read.confirm_journal)
-            .await?
-        else {
+        let Some(suppression) = self.suppression_for(ledger_id).await? else {
             return Ok(());
         };
         let head_t = match self.nameservice().lookup(ledger_id).await? {
@@ -593,6 +605,34 @@ mod tests {
     use super::*;
 
     use super::super::journal::{subject_fingerprint, Removal};
+
+    #[tokio::test]
+    async fn a_peer_never_caches_an_empty_journal_older_than_its_record() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        fluree.create_ledger("revision").await.unwrap();
+        let mut record = fluree
+            .nameservice()
+            .lookup("revision:main")
+            .await
+            .unwrap()
+            .unwrap();
+        record.config_version = Some(9);
+        fluree.observe_nameservice_record(&record);
+        for _ in 0..2 {
+            assert!(matches!(
+                fluree.history_suppressed("revision:main").await,
+                Err(ApiError::ReplicaNotCurrent(_))
+            ));
+        }
+        // An explicitly empty response carries its actual revision too.
+        let reader = fluree
+            .config_for_reader("revision:main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.v, 0);
+        assert!(reader.payload.is_none());
+    }
 
     fn removal(subject: Option<&str>, commit: &str) -> Removal {
         Removal {

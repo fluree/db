@@ -294,8 +294,14 @@ impl crate::Fluree {
     /// of the registration's other state, such as erasure requests.
     pub async fn config_for_reader(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let (config, stored) = read_stored(&self.nameservice_mode, ledger_id).await?;
-        let (Some(config), Some(stored)) = (config, stored) else {
+        let Some(config) = config else {
             return Ok(None);
+        };
+        let Some(stored) = stored else {
+            // Even an empty journal carries the revision read with it. A
+            // peer may have learned a newer revision from another replica
+            // and must not cache an older empty answer indefinitely.
+            return Ok(Some(ConfigValue::new(config.v, None)));
         };
         let journal = resolve_journal(&stored, self.registry_objects()).await?;
         let reader = serde_json::json!({

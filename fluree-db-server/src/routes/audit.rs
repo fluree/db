@@ -25,19 +25,7 @@ pub(crate) async fn require_audit(
     ledger: &str,
     granted: impl Fn(&LedgerId) -> bool,
 ) -> Result<()> {
-    require_audit_reaching(state, headers, ledger, granted, false, true).await
-}
-
-/// [`require_audit`] for an index's content other than its history: checked
-/// against the journals this replica holds, as reads of current state are,
-/// without confirming them with the cluster first.
-pub(crate) async fn require_audit_of_index(
-    state: &AppState,
-    headers: &HeaderMap,
-    ledger: &str,
-    granted: impl Fn(&LedgerId) -> bool,
-) -> Result<()> {
-    require_audit_reaching(state, headers, ledger, granted, false, false).await
+    require_audit_reaching(state, headers, ledger, granted, false).await
 }
 
 /// [`require_audit`] for a grant over `ledger`'s whole storage, which
@@ -49,7 +37,7 @@ pub(crate) async fn require_audit_of_every_branch(
     ledger: &str,
     granted: impl Fn(&LedgerId) -> bool,
 ) -> Result<()> {
-    require_audit_reaching(state, headers, ledger, granted, true, true).await
+    require_audit_reaching(state, headers, ledger, granted, true).await
 }
 
 async fn require_audit_reaching(
@@ -58,14 +46,10 @@ async fn require_audit_reaching(
     ledger: &str,
     granted: impl Fn(&LedgerId) -> bool,
     every_branch: bool,
-    confirm: bool,
 ) -> Result<()> {
-    // With `confirm`, reading each branch's journal first confirms, on a
-    // cluster replica, that it holds the current one and the erasures it
-    // names.
     let suppressing = state
         .fluree
-        .raw_history_suppressing(ledger, every_branch, confirm)
+        .raw_history_suppressing(ledger, every_branch)
         .await?;
     let mut bearer = None;
     for branch in suppressing {

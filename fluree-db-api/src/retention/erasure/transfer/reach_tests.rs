@@ -96,16 +96,15 @@ async fn only_a_history_that_can_hold_an_erasure_is_walked() {
     let runtime = fluree.erasure_runtime().unwrap();
     let reads = || runtime.reach_reads.load(Ordering::Relaxed);
     let probes = || runtime.index.probes.load(Ordering::Relaxed);
-    let erasures = || async { runtime.index.digests().await.unwrap().len() };
 
     // A ledger whose folders hold no erased commit is not walked, and
-    // probes its folder for each erased commit once.
-    let erased_now = erasures().await;
+    // probes no unrelated commit.
+
     assert!(reached(&fluree, other).await.is_empty());
     assert_eq!(reads(), 0);
-    assert_eq!(probes(), erased_now);
+    assert_eq!(probes(), 0);
     assert!(reached(&fluree, other).await.is_empty());
-    assert_eq!(probes(), erased_now);
+    assert_eq!(probes(), 0);
 
     // One that does is walked once, then only for what is new.
     assert!(!reached(&fluree, erased).await.is_empty());
@@ -118,17 +117,15 @@ async fn only_a_history_that_can_hold_an_erasure_is_walked() {
     assert_eq!(reads(), walked + 1);
 
     // Another ledger's erasure walks neither again, and the first probes
-    // only for the commits it erased.
+    // none of its commits.
     let third = "t/reach-third:main";
     fluree.create_ledger("t/reach-third").await.unwrap();
     insert(&fluree, third, "dave", "d@secret").await;
-    let before_third = erasures().await;
     erase_published(&fluree, third, "dave", "d@secret").await;
-    let new = erasures().await - before_third;
     let before = reads();
     let probed = probes();
     assert!(reached(&fluree, other).await.is_empty());
-    assert_eq!(probes() - probed, new);
+    assert_eq!(probes() - probed, 0);
     assert_eq!(reached(&fluree, erased).await, first);
     assert_eq!(reads(), before);
     assert!(!reached(&fluree, third).await.is_empty());
