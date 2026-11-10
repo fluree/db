@@ -2682,7 +2682,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpawnCounter {
 /// worker still awaits that propose's response, and tearing the worker
 /// down then would drop the response and skip installing the commit.
 /// Writes spaced past the supervisor's poll each drain the queue, and
-/// one worker stages them all.
+/// one worker stages them all. Kept, it idles until the supervisor wakes
+/// it: left asleep, a write would wait out the worker's idle exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_branch_keeps_its_worker_across_drained_queues() {
     count_worker_spawns();
@@ -2692,9 +2693,12 @@ async fn a_branch_keeps_its_worker_across_drained_queues() {
         .await
         .expect("create ledger");
     for round in 0..4 {
-        node.committer
-            .transact(bulk_request_round("drained/db:main", 1, round))
+        let write = node
+            .committer
+            .transact(bulk_request_round("drained/db:main", 1, round));
+        tokio::time::timeout(Duration::from_secs(10), write)
             .await
+            .expect("a kept worker is woken for its branch's next write")
             .expect("transact through consensus");
         tokio::time::sleep(Duration::from_millis(600)).await;
     }

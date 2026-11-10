@@ -1827,7 +1827,10 @@ impl LedgerManager {
         // A pass returns, or ends with this caller leading a load. It repeats
         // when the load this caller joined ended without a result — its
         // leader was cancelled or its entry evicted. This caller's request is
-        // still live, so it joins or leads the next load.
+        // still live, so it joins or leads the next load. It also repeats
+        // when another caller's load published a handle: that load sampled
+        // its head when it began, so the handle is checked against the
+        // target like any cached one.
         let generation = loop {
             // Fast path: already loaded
             {
@@ -1876,10 +1879,8 @@ impl LedgerManager {
                 let mut entries = self.entries.write().await;
 
                 match entries.get_mut(&canonical_alias) {
-                    Some(LoadState::Ready(handle)) => {
-                        // Another task loaded while we waited for write lock
-                        return Ok(handle.clone());
-                    }
+                    // Another task loaded while we waited for the write lock.
+                    Some(LoadState::Ready(_)) => continue,
                     Some(LoadState::Reloading { waiters, .. }) => {
                         // The handle this pass found was behind its target,
                         // and a reload is bringing it up: wait for that
@@ -1921,7 +1922,12 @@ impl LedgerManager {
                     // no matching leader publish is the orphaned-Loading signature.
                     tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
                     match rx.await {
-                        Ok(published) => return published.map_err(shared_load_error),
+                        Ok(published) => {
+                            let handle = published.map_err(shared_load_error)?;
+                            if Self::holds(&handle, target).await {
+                                return Ok(handle);
+                            }
+                        }
                         Err(_) if self.is_shutdown() => {
                             return Err(ApiError::internal("load cancelled"));
                         }
@@ -4194,7 +4200,7 @@ mod tests {
         until(|| async move { j.is_finished() || load_waiters(m, a, generation).await == Some(2) })
             .await;
 
-        let fresh = make_test_handle("x:main");
+        let fresh = ready_handle("x:main");
         publish_load(&mgr, &alias, generation, &fresh).await;
 
         let joined = joined
@@ -4303,6 +4309,93 @@ mod tests {
             .unwrap()
             .expect("the reader gets the handle the catch-up brought up");
         assert!(same(&read, &cached), "the reader loaded the ledger again");
+        assert_eq!(read.t().await, 1);
+    }
+
+    /// A reader that joins a load is held to its target like any other. The
+    /// load sampled its head when it began, so a commit applied since, before
+    /// the reader arrived, is one its handle lacks. The reader waits for what
+    /// brings that handle up, here a reload, rather than take it as published.
+    #[tokio::test]
+    async fn a_load_waiter_is_held_to_its_target() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let generation = begin_load(&mgr, &alias).await;
+        mgr.note_head_advance(&alias, 1);
+        let joined = spawn_get(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(1) }).await;
+
+        let loaded = make_test_handle("x:main");
+        let applying = loaded.inner.state.write().await;
+        publish_load(&mgr, &alias, generation, &loaded).await;
+        let reload = begin_reload(&mgr, &alias, &loaded).await;
+        drop(applying);
+        let j = &joined;
+        until(|| async move { j.is_finished() || reload_waiters(m, a, reload).await == Some(1) })
+            .await;
+        assert!(
+            !joined.is_finished(),
+            "the reader took a handle behind its target"
+        );
+
+        *loaded.inner.state.write().await =
+            LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        publish_reload(&mgr, &alias, reload).await;
+        let read = joined
+            .await
+            .unwrap()
+            .expect("a reader that joined a load gets the handle brought up");
+        assert!(same(&read, &loaded), "the reader loaded the ledger again");
+        assert_eq!(read.t().await, 1);
+    }
+
+    /// The same for a reader that goes to load and finds another caller's
+    /// load already published: the handle is checked, here while the commit
+    /// it lacks is being applied to it, before the reader takes it.
+    #[tokio::test]
+    async fn a_reader_finding_a_load_published_is_held_to_its_target() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let stale = make_test_handle("x:main");
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(stale.clone()));
+        mgr.note_head_advance(&alias, 1);
+
+        let commit = stale.inner.state.write().await;
+        let holders = Arc::strong_count(&stale.inner);
+        let reading = spawn_get(&mgr, &alias);
+        let held = &stale.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+
+        let loaded = make_test_handle("x:main");
+        let mut applying = loaded.inner.state.write().await;
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(loaded.clone()));
+        let holders = Arc::strong_count(&loaded.inner);
+        drop(commit);
+        let held = &loaded.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+        assert!(
+            !reading.is_finished(),
+            "the reader took a handle behind its target"
+        );
+
+        *applying = LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        drop(applying);
+        let read = reading
+            .await
+            .unwrap()
+            .expect("the reader gets the published handle once it is brought up");
+        assert!(same(&read, &loaded), "the reader loaded the ledger again");
         assert_eq!(read.t().await, 1);
     }
 
