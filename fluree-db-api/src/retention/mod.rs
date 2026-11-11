@@ -109,6 +109,7 @@ impl RetentionStatus {
     pub fn without_audit_data(mut self) -> Self {
         if let Some(registration) = &mut self.registration {
             registration.journal.removals.clear();
+            #[cfg(feature = "native")]
             for job in &mut registration.erasures {
                 job.requester = None;
                 job.authorized_commit = None;
