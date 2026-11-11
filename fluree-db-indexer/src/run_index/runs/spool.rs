@@ -985,8 +985,8 @@ impl Iterator for SortedCommitReaderV2 {
 /// Subject and string remaps are monotone, so remapped records stay in the
 /// commit's order. A triple term's handle is not monotone in its ordinal (a
 /// term interned by an earlier chunk, or held by the ledger, has the lower
-/// handle), so the records that differ only in their term are re-sorted as a
-/// group before they are handed out.
+/// handle), so in a chunk with a term table the records that differ only in
+/// their term are re-sorted as a group before they are handed out.
 pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     reader: SortedCommitReaderV2,
     subject_remap: S,
@@ -995,10 +995,18 @@ pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     scope: GraphScope,
     term_ctx: Option<Arc<TermRemapCtx>>,
     current: Option<RunRecordV2>,
+    /// Only for a chunk with a term table: a chunk without one holds no
+    /// triple-term records, and its records take the plain path.
+    regroup: Option<Box<TermRegroup>>,
+}
+
+#[derive(Default)]
+struct TermRegroup {
     /// The rest of a re-sorted group, in order.
     pending: std::collections::VecDeque<RunRecordV2>,
     /// The remapped record that ended a group.
     lookahead: Option<RunRecordV2>,
+    group: Vec<RunRecordV2>,
 }
 
 impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
@@ -1011,6 +1019,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
         scope: GraphScope,
         term_ctx: Option<Arc<TermRemapCtx>>,
     ) -> io::Result<Self> {
+        let regroup = term_ctx.as_ref().map(|_| Box::default());
         let mut reader = Self {
             reader: SortedCommitReaderV2::open(path, record_count)?,
             subject_remap,
@@ -1019,22 +1028,41 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
             scope,
             term_ctx,
             current: None,
-            pending: std::collections::VecDeque::new(),
-            lookahead: None,
+            regroup,
         };
         reader.advance_to_next()?;
         Ok(reader)
     }
 
+    #[inline]
     fn advance_to_next(&mut self) -> io::Result<()> {
+        if self.regroup.is_some() {
+            return self.advance_regrouped();
+        }
+        self.current = self.next_remapped()?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn advance_regrouped(&mut self) -> io::Result<()> {
+        let mut regroup = self.regroup.take().expect("a chunk with a term table");
+        let result = self.next_regrouped(&mut regroup);
+        self.regroup = Some(regroup);
+        result
+    }
+
+    fn next_regrouped(&mut self, rg: &mut TermRegroup) -> io::Result<()> {
         use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
         use fluree_db_core::o_type::{DecodeKind, OType};
 
-        if let Some(record) = self.pending.pop_front() {
+        if let Some(record) = rg.pending.pop_front() {
             self.current = Some(record);
             return Ok(());
         }
-        self.current = self.next_remapped()?;
+        self.current = match rg.lookahead.take() {
+            Some(record) => Some(record),
+            None => self.next_remapped()?,
+        };
         let Some(first) = self.current else {
             return Ok(());
         };
@@ -1044,30 +1072,30 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
         let same_group = |r: &RunRecordV2| {
             (r.g_id, r.s_id, r.p_id, r.o_type) == (first.g_id, first.s_id, first.p_id, first.o_type)
         };
-        let mut group = vec![first];
-        while let Some(record) = self.next_remapped()? {
-            if same_group(&record) {
-                group.push(record);
-            } else {
-                self.lookahead = Some(record);
-                break;
+        rg.group.clear();
+        rg.group.push(first);
+        loop {
+            match self.next_remapped()? {
+                Some(record) if same_group(&record) => rg.group.push(record),
+                other => {
+                    rg.lookahead = other;
+                    break;
+                }
             }
         }
-        if group.len() > 1 {
+        if rg.group.len() > 1 {
             // Stable, so a term's ops keep the commit's order. Within the
             // group every merge order compares as this one does.
-            group.sort_by(cmp_v2_g_spot);
-            self.pending = group.into();
-            self.current = self.pending.pop_front();
+            rg.group.sort_by(cmp_v2_g_spot);
+            rg.pending.extend(rg.group.drain(..));
+            self.current = rg.pending.pop_front();
         }
         Ok(())
     }
 
     /// The next record the scope accepts, remapped.
+    #[inline]
     fn next_remapped(&mut self) -> io::Result<Option<RunRecordV2>> {
-        if let Some(record) = self.lookahead.take() {
-            return Ok(Some(record));
-        }
         while let Some(mut record) = self.reader.next_record()? {
             if !self.scope.accepts(record.g_id) {
                 continue;
@@ -1097,6 +1125,7 @@ impl<S: SubjectRemap, R: StringRemap> crate::run_index::runs::streaming_reader::
         self.current.as_ref()
     }
 
+    #[inline]
     fn advance(&mut self) -> io::Result<()> {
         self.advance_to_next()
     }
