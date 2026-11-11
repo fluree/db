@@ -387,6 +387,7 @@ pub async fn resolve_incremental_commits_v6(
     let (walked_commits, t_walk_chain_ms) = {
         let t0 = Instant::now();
         let commits = walk_commit_chain_since(cs.as_ref(), &config).await?;
+        refuse_base_off_the_line(&commits, &subject_tree)?;
         (commits, t0.elapsed().as_millis() as u64)
     };
 
@@ -1712,6 +1713,36 @@ pub fn pending_covers_range(
     (from_t + 1..)
         .zip(pending.iter())
         .all(|(expected, (t, _))| *t == expected)
+}
+
+/// Refuse to extend a base index that does not hold the commit the walk
+/// starts after: the head's line at the base's `t`. An index of a line a
+/// rebase replaced does not, and extending it would mix the two lines. The
+/// build falls back to a full rebuild, which reads the head's line alone.
+fn refuse_base_off_the_line(
+    walked: &[WalkedCommit],
+    subject_tree: &DictTreeReader,
+) -> Result<(), IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    let Some(oldest) = walked.first() else {
+        return Ok(());
+    };
+    let envelope = read_commit_envelope(&oldest.bytes).map_err(|e| {
+        IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", oldest.cid))
+    })?;
+    let Some(base) = envelope.parents.first() else {
+        return Ok(());
+    };
+    let sid = fluree_db_core::commit_subject::commit_sid(base);
+    let key = subject_reverse_key(sid.namespace_code, sid.name.as_bytes());
+    match subject_tree.reverse_lookup(&key) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(IncrementalResolveError::CommitChain(format!(
+            "the base index does not hold commit {base}, which the head's line has at \
+             its t: it indexes another line"
+        ))),
+        Err(e) => Err(IncrementalResolveError::Io(e)),
+    }
 }
 
 async fn walk_commit_chain_since(
