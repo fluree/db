@@ -373,6 +373,63 @@ async fn notify_large_gap_falls_back_to_reload() {
     );
 }
 
+/// A reader whose cached handle is behind the head this node applied (a
+/// Raft member applying a replicated commit reports it with
+/// `note_head_advance`, and nothing else has told the cache) reads the same
+/// handle brought up by `commits` commits, rather than a fresh load of the
+/// ledger. Past the incremental limit the handle is reloaded in place.
+async fn a_reader_behind_the_head_brings_its_handle_up(ledger_id: &str, commits: usize) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alias = fluree_db_api::LedgerId::parse(ledger_id).unwrap();
+    let manager = peer_manager(&fluree);
+
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+    let mut ledger = insert_data(&fluree, ledger0, "item0").await;
+    let cached = manager.get_or_load(&alias).await.expect("load");
+    let cached_t = cached.t().await;
+
+    for i in 1..=commits {
+        ledger = insert_data(&fluree, ledger, &format!("item{i}")).await;
+    }
+    let head = ledger.t();
+    assert_eq!(head, cached_t + commits as i64);
+    assert_eq!(cached.t().await, cached_t, "nothing told the cache yet");
+    manager.note_head_advance(&alias, head);
+
+    let read = manager.get_or_load(&alias).await.expect("read");
+    assert_eq!(read.t().await, head, "the read sees the applied head");
+    assert_eq!(
+        cached.t().await,
+        head,
+        "the cached handle was replaced rather than brought up"
+    );
+    assert_eq!(
+        manager
+            .notify(NsNotify {
+                ledger_id: alias,
+                record: None,
+            })
+            .await
+            .expect("notify"),
+        NotifyResult::Current
+    );
+}
+
+#[tokio::test]
+async fn a_reader_one_commit_behind_the_head_applies_it() {
+    a_reader_behind_the_head_brings_its_handle_up("it/read-catch-up-one:main", 1).await;
+}
+
+#[tokio::test]
+async fn a_reader_a_few_commits_behind_the_head_applies_them() {
+    a_reader_behind_the_head_brings_its_handle_up("it/read-catch-up-few:main", 5).await;
+}
+
+#[tokio::test]
+async fn a_reader_far_behind_the_head_reloads_its_handle_in_place() {
+    a_reader_behind_the_head_brings_its_handle_up("it/read-catch-up-far:main", 7).await;
+}
+
 #[tokio::test]
 async fn notify_index_only_trims_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
