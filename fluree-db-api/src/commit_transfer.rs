@@ -950,12 +950,18 @@ struct PushCommitDecoded {
 
 /// The CID of a pushed commit: the one the sender names, checked against the
 /// bytes, or else the SHA2-256 of the bytes, all a sender that names none
-/// can have minted.
+/// can have minted. A replacement is refused either way: one is taken only
+/// as a commit this instance holds erased, which callers check first.
 fn pushed_commit_id(
     named: Option<&ContentId>,
     bytes: &[u8],
     what: &str,
 ) -> std::result::Result<ContentId, PushError> {
+    if fluree_db_core::commit::codec::replacement::is_replacement(bytes) {
+        return Err(PushError::Invalid(format!(
+            "{what}: an erased commit's replacement, which no proof here covers"
+        )));
+    }
     match named {
         Some(id) if fluree_db_core::commit::codec::commit_blob_matches(id, bytes) => Ok(id.clone()),
         Some(id) => Err(PushError::Invalid(format!(

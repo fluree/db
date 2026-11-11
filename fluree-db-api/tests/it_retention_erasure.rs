@@ -4104,3 +4104,73 @@ async fn a_named_occurrence_its_graphs_drop_ended_takes_no_later_retraction() {
     )).await.unwrap().to_jsonld(&db.snapshot).unwrap();
     assert_eq!(rows, json!([]));
 }
+
+/// A replacement exists only where a verified proof made it. A push that
+/// names no CIDs would otherwise take one's CID from its bytes and store a
+/// redacted commit no proof covers, which reads as another commit.
+#[tokio::test]
+async fn a_push_naming_no_cids_refuses_a_replacement() {
+    use fluree_db_api::{
+        Base64Bytes, ExportCommitsRequest, GovernanceOptions, IndexConfig, PushCommitsRequest,
+    };
+    use fluree_db_redaction::{redact_with, HostSha, Signatures};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let src = ledger(&fluree, "it/push-fcr1-src").await;
+    insert(
+        &fluree,
+        &src,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &src,
+        json!({"@context": ctx(), "@id": "ex:alice",
+               "ex:email": "a@secret", "ex:phone": "555"}),
+    )
+    .await;
+    let handle = fluree.ledger_cached(&src).await.unwrap();
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut commits = export.commits;
+    commits.reverse();
+    let (first, second) = (commits[0].clone(), commits[1].clone());
+    let (redacted, _) =
+        redact_with::<HostSha, _>(&second.0, &[0], &src, Signatures::Verify, &mut ()).unwrap();
+    assert!(is_replacement(&redacted));
+
+    let tgt = ledger(&fluree, "it/push-fcr1-tgt").await;
+    let push = |commit: Base64Bytes| PushCommitsRequest {
+        commits: vec![commit],
+        blobs: export.blobs.clone(),
+        ..Default::default()
+    };
+    let config = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let opts = GovernanceOptions::default();
+    let accepted = fluree
+        .push_commits(&tgt, push(first), &opts, &config)
+        .await
+        .unwrap();
+    assert_eq!(accepted.accepted, 1);
+    let refused = fluree
+        .push_commits(&tgt, push(Base64Bytes(redacted)), &opts, &config)
+        .await;
+    assert!(
+        matches!(&refused, Err(e) if e.status_code() == 422),
+        "{:?}",
+        refused.map(|r| r.accepted)
+    );
+    assert_eq!(fluree.ledger(&tgt).await.unwrap().t(), 1);
+}
