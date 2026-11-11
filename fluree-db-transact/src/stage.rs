@@ -1272,8 +1272,9 @@ fn resolve_named_graph(
 /// The refusal a policed (non-root) identity gets for an operation that
 /// drops a graph: the drop takes facts and history the identity's policy may
 /// not let it see, let alone modify. It leads with the standard modify
-/// refusal, which clients match on.
-fn drop_needs_unrestricted_identity(verb: &str) -> TransactError {
+/// refusal, which clients match on. `verb` names what drops: `DROP`, `MOVE`,
+/// or a pushed commit.
+pub fn drop_needs_unrestricted_identity(verb: &str) -> TransactError {
     TransactError::PolicyViolation(fluree_db_policy::PolicyError::modify_denied(format!(
         "Policy enforcement prevents modification. {verb} drops a graph with its history, \
          which only an identity without a restricting policy may do; CLEAR retracts what a \
@@ -3608,9 +3609,12 @@ async fn generate_upsert_deletions(
 /// Presence with `mode = Reject` means violations cause the transaction to
 /// fail; `mode = Warn` means violations are returned for the caller to log.
 #[cfg(feature = "shacl")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShaclGraphPolicy {
     pub mode: fluree_db_core::ledger_config::ValidationMode,
+    /// The graph's `f:additionalDataSource` graphs, read with it when its
+    /// nodes are checked.
+    pub additional_data_g_ids: Vec<GraphId>,
 }
 
 /// Outcome of a staged SHACL validation, split by mode so the caller can
@@ -3668,8 +3672,13 @@ pub async fn validate_view_with_shacl(
     // a nested shape) rather than raised, so severity and the graph's mode
     // apply to it as they do to a result (below).
     let constraint_failures = std::sync::Arc::new(fluree_db_shacl::ConstraintFailures::default());
+    let additional_data_g_ids = per_graph_policy
+        .iter()
+        .map(|(g_id, policy)| (*g_id, policy.additional_data_g_ids.clone()))
+        .collect();
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
         .with_membership_graphs(membership_g_ids.to_vec())
+        .with_additional_data_graphs(additional_data_g_ids)
         .with_constraint_failures(std::sync::Arc::clone(&constraint_failures));
     let enabled_graphs: HashSet<GraphId> = per_graph_policy.keys().copied().collect();
     let report = validate_staged_nodes(

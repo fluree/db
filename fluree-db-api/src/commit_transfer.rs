@@ -530,6 +530,8 @@ impl Fluree {
 
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
+        validate_graph_drop_targets(&base_state.snapshot.graph_registry, &decoded)
+            .map_err(PushError::into_api_error)?;
 
         // 2.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
@@ -571,6 +573,20 @@ impl Fluree {
             .entry(txn_meta_g.clone())
             .or_insert(TXN_META_GRAPH_ID);
 
+        // A push that drops graphs validates each commit after the drops
+        // before it, so the state it validates against registers every graph
+        // the commits write now, under the ids routing gave them: a drop or a
+        // write of a graph an earlier commit registered then finds it.
+        let pushes_drops = decoded.iter().any(|c| !c.commit.graph_drops.is_empty());
+        if pushes_drops {
+            Arc::make_mut(&mut base_state.snapshot)
+                .apply_envelope_deltas(
+                    &HashMap::new(),
+                    decoded.iter().flat_map(|c| c.commit.graph_delta.values()),
+                )
+                .map_err(|e| PushError::Internal(e.to_string()).into_api_error())?;
+        }
+
         // The namespaces these commits introduce, which reach the snapshot only
         // in `apply_pushed_commits_to_state` — after validation. Kept as a plain
         // map so a rejected commit's violation can name the terms it brought in,
@@ -599,9 +615,35 @@ impl Fluree {
                     .map_err(|e| PushError::Invalid(e.to_string()).into_api_error())?;
             }
 
-            // 4.0.2 Datatype limit, ahead of the costlier validation below. A
+            // 4.0.2 Policy, built from the state before this commit, as a
+            // local write's is. Only an unrestricted identity may drop, and a
+            // commit that drops the graph holding the policy would otherwise
+            // find no policy restricting it.
+            let policy_ctx =
+                build_policy_ctx_for_push(self, &base_state, &evolving_novelty, current_t, opts)
+                    .await?;
+            if !c.commit.graph_drops.is_empty()
+                && policy_ctx.as_ref().is_some_and(|p| !p.wrapper().is_root())
+            {
+                return Err(push_error_for_stage(
+                    fluree_db_transact::drop_needs_unrestricted_identity(&format!(
+                        "Pushed commit t={}",
+                        c.commit.t
+                    )),
+                )
+                .into_api_error());
+            }
+
+            // 4.0.3 The commit's drops, ahead of everything else it does, and
+            // the dropped graphs it writes again: what follows checks its
+            // flakes against the state they land on.
+            if pushes_drops {
+                validate_after_graph_lifecycle(&mut base_state, &mut evolving_novelty, &c.commit);
+            }
+
+            // 4.0.4 Datatype limit, ahead of the costlier validation below. A
             // sender that does not enforce it can push commits the index could
-            // never hold. The datatypes are those that reach novelty at 4.5:
+            // never hold. The datatypes are those that reach novelty at 4.4:
             // the blob's flakes other than forged commit records, and the
             // typed txn-meta values. The other generated metadata flakes have
             // reserved datatypes.
@@ -627,7 +669,7 @@ impl Fluree {
             .map_err(ApiError::Transact)?;
             pushed_datatypes.extend(adding);
 
-            // 4.0.3 Vectors the index can store: checked against the ledger
+            // 4.0.5 Vectors the index can store: checked against the ledger
             // and the earlier commits of this push, as a local write is.
             vector_dims::check_vectors(
                 &base_state,
@@ -655,12 +697,8 @@ impl Fluree {
                 .await
                 .map_err(PushError::into_api_error)?;
 
-            // 4.2 Policy enforcement: build policy context from opts against current state.
-            let policy_ctx =
-                build_policy_ctx_for_push(self, &base_state, &evolving_novelty, current_t, opts)
-                    .await?;
-
-            // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
+            // 4.2 Stage flakes (policy/backpressure) under the policy from
+            // 4.0.2. No WHERE/cancellation; flakes are prebuilt.
             let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
@@ -687,7 +725,7 @@ impl Fluree {
                 }
             };
 
-            // 4.4 SHACL (optional feature).
+            // 4.3 SHACL (optional feature).
             //
             // Route through the shared post-stage helper so commit replay
             // honors the ledger's current `f:shaclEnabled` / `f:validationMode`
@@ -751,7 +789,7 @@ impl Fluree {
                 let _ = &staged_view;
             }
 
-            // 4.5 Advance evolving novelty with this commit's flakes + derived metadata flakes.
+            // 4.4 Advance evolving novelty with this commit's flakes + derived metadata flakes.
             //
             // These commits come from a peer, so the blob's flakes are screened
             // before they reach novelty: a flake claiming commit provenance
@@ -1169,10 +1207,11 @@ fn txn_meta_sid_after(
     ))
 }
 
-/// Refuse a transferred commit that drops graphs: commit transfer validates
-/// each commit against the state the earlier ones leave, which does not yet
-/// apply a drop.
-fn refuse_graph_drops(
+/// Refuse a commit a merge brought in that drops graphs. A merge never
+/// brings one in (`merge::refuse_merging_graph_drops`), and the receiver
+/// stores such commits without replaying them, so it would never apply the
+/// drop either.
+fn refuse_merged_graph_drops(
     commit: &fluree_db_core::Commit,
     which: &str,
 ) -> std::result::Result<(), PushError> {
@@ -1180,9 +1219,45 @@ fn refuse_graph_drops(
         return Ok(());
     }
     Err(PushError::Invalid(format!(
-        "{which} (t={}) drops graphs, which pushing and pulling commits does not support yet",
+        "{which} (t={}) drops graphs, which a merge cannot bring in",
         commit.t
     )))
+}
+
+/// Validate drop targets against the registry at each commit, before batch
+/// routing registers graphs from later commits. The batch keeps its stable
+/// graph ids; this tracks only when an IRI is introduced. A graph created
+/// and dropped within one transaction is carried in that commit's delta.
+/// Shared by push and incremental pull, ahead of any storage writes.
+fn validate_graph_drop_targets(
+    registry: &fluree_db_core::GraphRegistry,
+    decoded: &[PushCommitDecoded],
+) -> std::result::Result<(), PushError> {
+    use fluree_db_core::graph_registry::{drop_may_take, DEFAULT_GRAPH_IRI};
+
+    if !decoded.iter().any(|c| !c.commit.graph_drops.is_empty()) {
+        return Ok(());
+    }
+    let mut introduced = HashSet::new();
+    for (idx, c) in decoded.iter().enumerate() {
+        introduced.extend(c.commit.graph_delta.values().map(String::as_str));
+        for iri in &c.commit.graph_drops {
+            if iri == DEFAULT_GRAPH_IRI {
+                continue;
+            }
+            let reason = match registry.assigned_graph_id(iri) {
+                Some(g_id) if !drop_may_take(g_id) => "is a system graph",
+                Some(_) => continue,
+                None if introduced.contains(iri.as_str()) => continue,
+                None => "is not registered at this commit",
+            };
+            return Err(PushError::Invalid(format!(
+                "invalid commit[{idx}] (t={}): cannot drop graph <{iri}>, which {reason}",
+                c.commit.t
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn decode_and_validate_commit_chain(
@@ -1200,7 +1275,6 @@ fn decode_and_validate_commit_chain(
         let bytes = b64.0.clone();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
-        refuse_graph_drops(&commit, &format!("commit[{idx}]"))?;
 
         let named = ids.map(|ids| &ids[idx]);
         let is_erased = named.is_some_and(|id| erased.contains(id));
@@ -1208,12 +1282,14 @@ fn decode_and_validate_commit_chain(
         // Reject empty commits (no flakes) - keep semantics clear. A merge
         // commit is exempt: it records the merge even when the strategy
         // resolved every flake away, and dropping it would let the same
-        // branch be merged again. So is a commit recording only transaction
-        // metadata (an erasure's authorization), and an erased commit, all
-        // of whose operations an erasure may have removed.
+        // branch be merged again. So is a commit that drops graphs (the drop
+        // is its change, and it retracts nothing), a commit recording only
+        // transaction metadata (an erasure's authorization), and an erased
+        // commit, all of whose operations an erasure may have removed.
         if commit.flakes.is_empty()
             && commit.txn_meta.is_empty()
             && commit.parents.len() < 2
+            && commit.graph_drops.is_empty()
             && !is_erased
         {
             return Err(PushError::Invalid(format!(
@@ -1298,7 +1374,7 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
-            refuse_graph_drops(&commit, &format!("merged_commits[{idx}]"))?;
+            refuse_merged_graph_drops(&commit, &format!("merged_commits[{idx}]"))?;
             let named = ids.map(|ids| &ids[idx]);
             let is_erased = named.is_some_and(|id| erased.contains(id));
             let id = match named {
@@ -1732,14 +1808,6 @@ fn apply_pushed_commits_to_state(
         std::sync::Arc::make_mut(&mut base.snapshot)
             .apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)
             .map_err(|e| PushError::Internal(format!("apply_envelope_deltas failed: {e}")))?;
-        // A graph the ledger dropped exists again from the commit that writes
-        // it, as replay finds.
-        for c in decoded {
-            base.revive_graphs(
-                c.commit.graph_delta.values().map(String::as_str),
-                c.commit.t,
-            );
-        }
     }
 
     // Build reverse_graph now that namespace_codes and graph_registry are
@@ -1754,8 +1822,8 @@ fn apply_pushed_commits_to_state(
         .entry(txn_meta_g.clone())
         .or_insert(TXN_META_GRAPH_ID);
 
-    // Apply all flakes to novelty (we already validated them; re-apply for state).
-    let mut novelty = (*base.novelty).clone();
+    // Apply all flakes to novelty (we already validated them; re-apply for
+    // state), each commit's after its drops and before the next commit's.
     // Detach the range provider first: it pins `dict_novelty`, so mutating
     // with it attached deep-clones the dictionary and leaves the provider —
     // the copy every read through `base.snapshot` resolves against — without
@@ -1767,14 +1835,15 @@ fn apply_pushed_commits_to_state(
     // them, and the datatype limit counts them.
     let mut runtime_small_dicts = base.runtime_small_dicts.clone();
 
-    let store_opt: Option<&BinaryIndexStore> = base
-        .binary_store
+    let binary_store = base.binary_store.clone();
+    let store_opt: Option<&BinaryIndexStore> = binary_store
         .as_ref()
         .and_then(|te| te.0.as_ref().downcast_ref::<BinaryIndexStore>());
 
     // The dictionary keeps covering novelty only if it did before the push.
-    let covered = dict_novelty.covers(novelty.t);
-    for (t, flakes) in accepted_all_flakes {
+    let covered = dict_novelty.covers(base.novelty.t);
+    debug_assert_eq!(decoded.len(), accepted_all_flakes.len());
+    for (c, (t, flakes)) in decoded.iter().zip(accepted_all_flakes) {
         // Populate dict novelty similarly to transact commit path.
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             Arc::make_mut(&mut dict_novelty),
@@ -1785,8 +1854,8 @@ fn apply_pushed_commits_to_state(
             PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
         })?;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
-        // Apply to novelty.
-        let links = novelty
+        base.apply_commit_graph_lifecycle(&c.commit);
+        let links = Arc::make_mut(&mut base.novelty)
             .apply_commit(flakes.clone(), *t, &reverse_graph)
             .map_err(|e| {
                 PushError::Internal(format!("novelty apply_commit failed at t={t}: {e}"))
@@ -1802,13 +1871,16 @@ fn apply_pushed_commits_to_state(
     }
 
     if covered {
-        Arc::make_mut(&mut dict_novelty).mark_covered_through(novelty.t);
+        Arc::make_mut(&mut dict_novelty).mark_covered_through(base.novelty.t);
     }
-    base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
     base.runtime_small_dicts = runtime_small_dicts;
     if let Some(store) = provider_store {
         fluree_db_transact::attach_binary_provider(&mut base, store);
+    }
+    // The index still holds what the drops took.
+    if decoded.iter().any(|c| !c.commit.graph_drops.is_empty()) {
+        fluree_db_transact::hide_dropped_graphs(&mut base);
     }
     base.head_commit_id = stored_commits.last().map(|c| c.commit_id.clone());
     if let Some(ref mut r) = base.ns_record {
@@ -1818,6 +1890,23 @@ fn apply_pushed_commits_to_state(
         }
     }
     Ok(base)
+}
+
+/// [`LedgerState::apply_commit_graph_lifecycle`] on the state a push validates `commit` against:
+/// `base` for the registry, statistics and index, and `evolving`, the novelty
+/// the push's earlier commits leave. `base` keeps its own novelty, which the
+/// accepted commits apply to afterward, through the same lifecycle again.
+fn validate_after_graph_lifecycle(
+    base: &mut LedgerState,
+    evolving: &mut Novelty,
+    commit: &fluree_db_core::Commit,
+) {
+    let pre_push = std::mem::replace(&mut base.novelty, Arc::new(std::mem::take(evolving)));
+    base.apply_commit_graph_lifecycle(commit);
+    *evolving = Arc::unwrap_or_clone(std::mem::replace(&mut base.novelty, pre_push));
+    if !commit.graph_drops.is_empty() {
+        fluree_db_transact::hide_dropped_graphs(base);
+    }
 }
 
 trait LedgerStateCloneExt {
@@ -3053,6 +3142,8 @@ impl Fluree {
 
         // 4) Ancestry preflight: verify first commit's parent matches local head.
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
+            .map_err(PushError::into_api_error)?;
+        validate_graph_drop_targets(&base_state.snapshot.graph_registry, &decoded)
             .map_err(PushError::into_api_error)?;
         let txn_meta_g =
             txn_meta_sid_after(&base_state, &decoded).map_err(PushError::into_api_error)?;

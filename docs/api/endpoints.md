@@ -426,7 +426,9 @@ JSON object:
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit, records transaction metadata (an erasure's authorization), or is erased. A merge records the merge even when its conflict strategy resolved every flake away; an erasure may remove every operation of a commit.
+- A commit with no flakes is rejected unless it is a merge commit, drops graphs, records transaction metadata (an erasure's authorization), or is erased. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops; an erasure may remove every operation of a commit.
+- A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
@@ -462,7 +464,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
-- `403 Forbidden`: the push carries erasures, or removals the server's journal lacks, without the authority to make them
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy; or the push carries erasures, or removals the server's journal lacks, without the authority to make them
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t; or the server asks for the erasures of commits it already has (see `base_erasures`)
 - `501 Not Implemented`: the push carries erased commits, which this server cannot store (memory or S3 storage, a cluster)
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
@@ -484,7 +486,7 @@ The fields of `POST /push/*ledger`, plus:
 
 - `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
 
-The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit, and none may drop graphs, which a merge cannot bring in. A push that carries any other commit is refused with `422`.
 
 A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
 
@@ -1866,7 +1868,7 @@ POST /validate/{ledger...}
 }
 ```
 
-- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `graph` — IRI of the named data graph to validate (default: the default graph). It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graphs the ledger config lists for it, whichever shapes are used.
 - `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
 - `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
 - `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
@@ -1909,6 +1911,7 @@ POST /validate/{ledger...}
 - `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
 - `401 Unauthorized` — authentication required and missing
 - `404 Not Found` — ledger or named graph not found (or not authorized)
+- `500 Internal Server Error` — the ledger config could not be read (`err:storage/ReadFailure`); validation does not run without it
 
 **Examples:**
 
