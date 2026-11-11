@@ -542,3 +542,86 @@ async fn a_fast_forward_merge_lands_through_consensus() {
 
     node.shutdown().await;
 }
+
+static WORKER_SPAWNS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Count the supervisor's `commit worker spawned` events per ledger, for
+/// every test in this binary from the first call on.
+fn count_worker_spawns() {
+    static COUNTING: std::sync::Once = std::sync::Once::new();
+    COUNTING.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+        let commit_worker = tracing_subscriber::filter::filter_fn(|meta| {
+            meta.target() == "fluree_db_consensus::raft::commit_worker"
+        });
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(SpawnCounter.with_filter(commit_worker)),
+        )
+        .expect("the only global subscriber");
+    });
+}
+
+fn worker_spawns(ledger: &str) -> usize {
+    WORKER_SPAWNS
+        .lock()
+        .unwrap()
+        .get(ledger)
+        .copied()
+        .unwrap_or(0)
+}
+
+struct SpawnCounter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpawnCounter {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        #[derive(Default)]
+        struct Spawn {
+            spawned: bool,
+            ledger: Option<String>,
+        }
+        impl tracing::field::Visit for Spawn {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "message" => self.spawned = format!("{value:?}") == "commit worker spawned",
+                    "ledger_id" => self.ledger = Some(format!("{value:?}")),
+                    _ => {}
+                }
+            }
+        }
+        let mut spawn = Spawn::default();
+        event.record(&mut spawn);
+        if let (true, Some(ledger)) = (spawn.spawned, spawn.ledger) {
+            *WORKER_SPAWNS.lock().unwrap().entry(ledger).or_default() += 1;
+        }
+    }
+}
+
+/// A branch whose queue each write drains keeps its worker: applying the
+/// `ApplyHead` that pops the last entry removes the queue while the
+/// worker still awaits that propose's response, and tearing the worker
+/// down then would drop the response and skip installing the commit.
+/// Writes spaced past the supervisor's poll each drain the queue, and
+/// one worker stages them all. Kept, it idles until the supervisor wakes
+/// it: left asleep, a write would wait out the worker's idle exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_keeps_its_worker_across_drained_queues() {
+    count_worker_spawns();
+    let (_integration, fluree, node, _dirs) = stand_up(62, |config| config).await;
+    fluree
+        .create_ledger("drained/db")
+        .await
+        .expect("create ledger");
+    for round in 0..4 {
+        let write = node
+            .committer
+            .transact(bulk_request_round("drained/db:main", 1, round));
+        tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("a kept worker is woken for its branch's next write")
+            .expect("transact through consensus");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    assert_eq!(worker_spawns("drained/db"), 1);
+}
