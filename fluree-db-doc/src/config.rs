@@ -150,7 +150,9 @@ impl ModelEndpoint {
 /// (`<api base>/grounding`).
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ReaderEndpoint {
-    /// The URL a request is POSTed to.
+    /// The URL a request is POSTed to. May be left out with `account`,
+    /// whose API supplies it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
     /// The credential. A value starting with `$` names an environment
     /// variable holding it.
@@ -456,6 +458,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_account_reader_needs_no_url() {
+        // `[doc.reader] account = true` as the docs show it, with no `url`.
+        let cfg: DocConfig = serde_json::from_value(serde_json::json!({
+            "reader": { "account": true, "models": ["reader-small"] }
+        }))
+        .unwrap();
+        let reader = cfg.reader.unwrap();
+        assert!(reader.account && reader.url.is_empty());
+        assert!(!serde_json::to_value(&reader).unwrap()["url"].is_string());
     }
 
     #[test]
