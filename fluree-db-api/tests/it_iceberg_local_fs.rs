@@ -3823,3 +3823,281 @@ async fn a_parent_probe_plans_its_file_counts_from_the_kept_list() {
     let limited = ask(String::new(), " LIMIT 2").await;
     assert!(twins(&limited), "SPARQL LIMIT 2: {limited:?}");
 }
+
+/// `silver.cells` references `silver.people_window` by its `id` twice, through
+/// two columns of its own: `ex:self` by `id` (cell k is person k) and
+/// `ex:near` by `i32` (cells 1 to 7 hold 2, 9, -3, 9, 10, 100, 10; no person
+/// is -3, and cell 8's is null).
+const CELL_TWO_REFS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/cell/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:self ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:near ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "i32" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] .
+"#;
+
+/// Insert `triples` (subject, predicate, object IRIs) into a new memory
+/// ledger `alias`: the native answer a graph source's query is checked against.
+async fn native_oracle(fluree: &fluree_db_api::Fluree, alias: &str, triples: &[[String; 3]]) {
+    let ledger = fluree.create_ledger(alias).await.expect("oracle ledger");
+    let graph: Vec<serde_json::Value> = triples
+        .iter()
+        .map(|[s, p, o]| serde_json::json!({"@id": s, p.as_str(): {"@id": o}}))
+        .collect();
+    fluree
+        .insert(ledger, &serde_json::json!({"@graph": graph}))
+        .await
+        .expect("oracle insert");
+}
+
+/// `pattern`'s answers over `from` on both surfaces: `vars` (in order) of the
+/// SPARQL `SELECT … WHERE { values triples } LIMIT`, and of its JSON-LD twin.
+/// `values` binds `?{var}` to IRIs; `triples` share the subject `?{subject}`.
+#[allow(clippy::too_many_arguments)]
+async fn sparql_and_jsonld_rows(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    values: Option<(&str, &[String])>,
+    subject: &str,
+    triples: &[(&str, &str)],
+    limit: Option<usize>,
+    vars: &[&str],
+) -> [Vec<Vec<String>>; 2] {
+    let select: Vec<String> = vars.iter().map(|v| format!("?{v}")).collect();
+    let values_clause = values.map_or(String::new(), |(var, iris)| {
+        let iris: Vec<String> = iris.iter().map(|iri| format!("<{iri}>")).collect();
+        format!("VALUES ?{var} {{ {} }} ", iris.join(" "))
+    });
+    let pattern: Vec<String> = triples.iter().map(|(p, o)| format!("<{p}> ?{o}")).collect();
+    let sparql = format!(
+        "SELECT {} FROM <{from}> WHERE {{ {values_clause}?{subject} {} }}{}",
+        select.join(" "),
+        pattern.join(" ; "),
+        limit.map_or(String::new(), |k| format!(" LIMIT {k}"))
+    );
+    let sparql_result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("SPARQL over {from}: {e}"));
+
+    let mut where_clause = Vec::new();
+    if let Some((var, iris)) = values {
+        let ids: Vec<serde_json::Value> = iris
+            .iter()
+            .map(|iri| serde_json::json!({"@id": iri}))
+            .collect();
+        where_clause.push(serde_json::json!(["values", [format!("?{var}"), ids]]));
+    }
+    let mut node = serde_json::Map::new();
+    node.insert("@id".into(), serde_json::json!(format!("?{subject}")));
+    for (p, o) in triples {
+        node.insert((*p).to_string(), serde_json::json!(format!("?{o}")));
+    }
+    where_clause.push(serde_json::Value::Object(node));
+    let mut jsonld = serde_json::json!({
+        "from": from,
+        "select": select,
+        "where": where_clause,
+    });
+    if let Some(k) = limit {
+        jsonld["limit"] = serde_json::json!(k);
+    }
+    let jsonld_result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("JSON-LD over {from}: {e}"));
+    [
+        answer_rows(&sparql_result, vars),
+        answer_rows(&jsonld_result, vars),
+    ]
+}
+
+/// Two referencing object maps of one map read one parent by the same parent
+/// column through different columns of their own. A parent read by key serves
+/// both: a star holding both answers every cell whose two references resolve,
+/// on both surfaces, as the same triples in a ledger do.
+#[tokio::test]
+async fn two_references_to_one_parent_by_different_columns_both_resolve() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("cell-refs", &root, CELL_TWO_REFS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cell = |id: u32| format!("http://example.org/cell/{id}");
+    let (self_p, near_p) = ("http://example.org/self", "http://example.org/near");
+    // cell id -> `i32`, for the cells whose `ex:near` resolves.
+    let near = [(1, 2), (2, 9), (4, 9), (5, 10), (6, 100), (7, 10)];
+    let mut triples: Vec<[String; 3]> = (1..=8)
+        .map(|id| [cell(id), self_p.to_string(), person(id)])
+        .collect();
+    triples.extend(
+        near.iter()
+            .map(|&(id, to)| [cell(id), near_p.to_string(), person(to)]),
+    );
+    native_oracle(&fluree, "cell-refs-oracle:main", &triples).await;
+    let mut star: Vec<Vec<String>> = near
+        .iter()
+        .map(|&(id, to)| vec![cell(id), person(id), person(to)])
+        .collect();
+    star.sort();
+
+    let star_pattern = [(self_p, "s"), (near_p, "n")];
+    let mut wrong = Vec::new();
+    for from in ["cell-refs:main", "cell-refs-oracle:main"] {
+        for limit in [None, Some(3)] {
+            let answers = sparql_and_jsonld_rows(
+                &fluree,
+                from,
+                None,
+                "c",
+                &star_pattern,
+                limit,
+                &["c", "s", "n"],
+            )
+            .await;
+            for (surface, rows) in ["SPARQL", "JSON-LD"].iter().zip(answers) {
+                let ok = match limit {
+                    None => rows == star,
+                    Some(k) => rows.len() == k && rows.iter().all(|r| star.contains(r)),
+                };
+                if !ok {
+                    wrong.push(format!("{from} {surface} LIMIT {limit:?}: {rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}
+
+/// `silver.cells` (by `i32`) and `silver.literals` (by `id`) both reference
+/// `silver.people_window` by its `id` through `ex:ref`, with one subject
+/// template, so a row id names a subject of both maps.
+const TWO_MAPS_ONE_PARENT_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:ref ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "i32" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Literal>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.literals" ] ;
+        rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:ref ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] .
+"#;
+
+/// Two maps reference one parent by the same parent column, each through a
+/// column of its own table, and the scan's input arrives in more than one
+/// window: under a `LIMIT` the input is pulled 1024 rows at a time, and here
+/// the first 1024 `VALUES` subjects name no row. The parent's keys resolved in
+/// one window are kept for the next, for both maps, so the second window
+/// answers every row of both tables, on both surfaces, as a ledger does.
+#[tokio::test]
+async fn two_maps_to_one_parent_resolve_their_own_keys_across_input_windows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("two-maps", &root, TWO_MAPS_ONE_PARENT_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let row = |id: u32| format!("http://example.org/row/{id}");
+    let ref_p = "http://example.org/ref";
+    // `cells`: row id -> `i32`, where it resolves; `literals`: row k -> person k.
+    let cells = [(1, 2), (2, 9), (4, 9), (5, 10), (6, 100), (7, 10)];
+    let literals = (1..=5).map(|id| (id, id));
+    let pairs: Vec<(u32, u32)> = cells.into_iter().chain(literals).collect();
+    let triples: Vec<[String; 3]> = pairs
+        .iter()
+        .map(|&(id, to)| [row(id), ref_p.to_string(), person(to)])
+        .collect();
+    native_oracle(&fluree, "two-maps-oracle:main", &triples).await;
+    let mut want: Vec<Vec<String>> = pairs
+        .iter()
+        .map(|&(id, to)| vec![row(id), person(to)])
+        .collect();
+    want.sort();
+
+    // 1024 subjects no table holds, then rows 1 to 8.
+    let subjects: Vec<String> = (100_001..=101_024).chain(1..=8).map(row).collect();
+    let mut wrong = Vec::new();
+    for from in ["two-maps:main", "two-maps-oracle:main"] {
+        for limit in [Some(100), None] {
+            let answers = sparql_and_jsonld_rows(
+                &fluree,
+                from,
+                Some(("r", &subjects)),
+                "r",
+                &[(ref_p, "p")],
+                limit,
+                &["r", "p"],
+            )
+            .await;
+            for (surface, rows) in ["SPARQL", "JSON-LD"].iter().zip(answers) {
+                if rows != want {
+                    wrong.push(format!("{from} {surface} LIMIT {limit:?}: {rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}

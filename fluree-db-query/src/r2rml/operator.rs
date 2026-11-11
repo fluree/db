@@ -107,6 +107,13 @@ impl ParentIndex {
 /// every parent row whose key it keeps, so each key read is complete (its
 /// keep-min is exact), and a probed key nothing came back for is absent from
 /// the parent (a dangling FK, never probed again).
+///
+/// Like a [`CompleteParentLookup`], it is a fact about the parent alone,
+/// keyed like it by [`LookupCacheKey`]: it holds no referencing columns, so
+/// every RefObjectMap and TriplesMap resolving through one parent shares it.
+/// Which keys a window needs is the caller's to say, from the join columns of
+/// every RefObjectMap that will read the window's rows through it
+/// ([`ParentJoins`]).
 #[derive(Debug)]
 struct PartialParentIndex {
     /// The resolved keys present in the parent.
@@ -120,7 +127,8 @@ struct PartialParentIndex {
     source: ParentSource,
 }
 
-/// What reading one RefObjectMap's parent takes.
+/// What reading a parent by its join columns takes: everything a
+/// [`LookupCacheKey`] fixes, and nothing about the map that references it.
 #[derive(Debug, Clone)]
 struct ParentSource {
     parent_tm_iri: String,
@@ -129,16 +137,10 @@ struct ParentSource {
     projection: Vec<String>,
     /// The parent's join columns, in the canonical order the lookup is keyed in.
     parent_cols: Vec<String>,
-    /// The referencing table's join columns, aligned with `parent_cols`.
-    child_cols: Vec<String>,
 }
 
 impl ParentSource {
-    fn new(
-        parent_tm: &TriplesMap,
-        parent_cols: Vec<String>,
-        child_cols: Vec<String>,
-    ) -> Option<Self> {
+    fn new(parent_tm: &TriplesMap, parent_cols: Vec<String>) -> Option<Self> {
         let parent_table = parent_tm.table_name()?.to_string();
         // Columns needed from the parent: join columns + subject template
         // columns (+ rr:column if the subject uses one).
@@ -154,7 +156,6 @@ impl ParentSource {
             parent_table,
             projection,
             parent_cols,
-            child_cols,
         })
     }
 }
@@ -170,21 +171,31 @@ impl PartialParentIndex {
         }
     }
 
-    /// The join keys of `window`'s rows not resolved yet, or `None` once there
-    /// are more than `cap`.
-    fn missing_keys(&self, window: &[ColumnBatch], cap: usize) -> Option<HashSet<Vec<String>>> {
+    /// The join keys `window`'s rows hold that are not resolved yet, read
+    /// through each of `child_joins` (the referencing table's join columns of
+    /// every RefObjectMap that reads the window through this parent, each
+    /// aligned with the parent's join columns), or `None` once there are more
+    /// than `cap`.
+    fn missing_keys(
+        &self,
+        window: &[ColumnBatch],
+        child_joins: &[Vec<String>],
+        cap: usize,
+    ) -> Option<HashSet<Vec<String>>> {
         let mut missing: HashSet<Vec<String>> = HashSet::new();
-        let mut key = Vec::with_capacity(self.source.child_cols.len());
-        for batch in window {
-            for row in 0..batch.num_rows {
-                // A null join column joins nothing.
-                if fill_join_key_from_batch(&self.source.child_cols, batch, row, &mut key)
-                    && !self.resolved.contains(key.as_slice())
-                    && !missing.contains(key.as_slice())
-                {
-                    missing.insert(key.clone());
-                    if missing.len() > cap {
-                        return None;
+        let mut key = Vec::with_capacity(self.source.parent_cols.len());
+        for child_cols in child_joins {
+            for batch in window {
+                for row in 0..batch.num_rows {
+                    // A null join column joins nothing.
+                    if fill_join_key_from_batch(child_cols, batch, row, &mut key)
+                        && !self.resolved.contains(key.as_slice())
+                        && !missing.contains(key.as_slice())
+                    {
+                        missing.insert(key.clone());
+                        if missing.len() > cap {
+                            return None;
+                        }
                     }
                 }
             }
@@ -553,25 +564,40 @@ enum JoinPlan {
     },
 }
 
+/// For each parent a TriplesMap's RefObjectMaps resolve through, the distinct
+/// join columns of the map's table those RefObjectMaps read it by, each
+/// aligned with the parent's join columns. Two RefObjectMaps of one map can
+/// share a parent and its join columns through different columns of their own
+/// (a ship-to and a bill-to address), so a key is resolved for all of them.
+type ParentJoins = HashMap<LookupCacheKey, Vec<Vec<String>>>;
+
+/// Record that a RefObjectMap reads `key`'s parent through `child_cols`.
+fn add_parent_join(joins: &mut ParentJoins, key: LookupCacheKey, child_cols: Vec<String>) {
+    let cols = joins.entry(key).or_default();
+    if !cols.contains(&child_cols) {
+        cols.push(child_cols);
+    }
+}
+
 /// One TriplesMap's streaming scan state: the live batch stream from the table
-/// scan, the parent lookups for its RefObjectMap joins, and the precomputed join
+/// scan, the parents its RefObjectMap joins read, and the precomputed join
 /// plan against the buffered child. Batches are pulled in bounded windows and
 /// dropped after materializing, so the whole table is never resident.
 struct TmStream {
     tm_iri: String,
     stream: ColumnBatchStream,
     exhausted: bool,
-    /// Parent (dimension) lookups for this TriplesMap's RefObjectMap POMs, keyed
-    /// by `(parent TriplesMap IRI, join_cols)` ([`LookupCacheKey`]). `Arc`-shared
-    /// so a lookup memoized on the operator's `parent_lookup_cache` (PR-4) is
-    /// reused across child batches without a re-scan or a clone.
-    parent_lookups: HashMap<LookupCacheKey, ParentIndex>,
+    /// The parents this TriplesMap's RefObjectMap POMs resolve through
+    /// ([`ScanProgress::parents`]), with the columns of this map's table each
+    /// is read by: a probe-built parent resolves, per window of this map's
+    /// rows, the keys every one of them holds.
+    parent_joins: ParentJoins,
     /// Rows pulled past a window's size, read first by the next window (a
     /// window is cut to its size while a parent is resolved by probes, so the
     /// keys it probes are its own).
     pending: Option<ColumnBatch>,
     /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
-    /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
+    /// skipped (trusted browse crawl only). Keyed identically to `parent_joins`;
     /// a given `LookupCacheKey` populates exactly one of the two maps.
     ref_shortcuts: HashMap<LookupCacheKey, RefShortcut>,
     join: JoinPlan,
@@ -584,6 +610,13 @@ struct TmStream {
 struct ScanProgress {
     child_batch: Batch,
     child_schema: Vec<VarId>,
+    /// Parent (dimension) lookups for the RefObjectMap POMs of every
+    /// TriplesMap in `tms`, keyed by `(parent TriplesMap IRI, join_cols)`
+    /// ([`LookupCacheKey`]): one per key, whichever maps and columns reference
+    /// it. A complete lookup is `Arc`-shared so one memoized on the operator's
+    /// `parent_lookup_cache` (PR-4) is reused across child batches without a
+    /// re-scan or a clone.
+    parents: HashMap<LookupCacheKey, ParentIndex>,
     tms: Vec<TmStream>,
     tm_idx: usize,
     window_rows: usize,
@@ -770,7 +803,7 @@ pub struct R2rmlScanOperator {
     /// PR-4: cross-child-batch parent-lookup memoization. A correlated join
     /// (OPTIONAL / ref) re-enters `build_progress` per child batch; without this
     /// the (dimension) parent tables are re-scanned every batch (q008: 123+
-    /// parent scans, DNF → 8 scans with the memo). Keyed like `parent_lookups`:
+    /// parent scans, DNF → 8 scans with the memo). Keyed like `ScanProgress::parents`:
     /// `(parent TriplesMap IRI, join_cols)` — the TM IRI, NOT the parent table
     /// name. Two parent TMs over one table can render different subject IRIs
     /// from the same join key (different subject templates), so a table-name
@@ -784,7 +817,10 @@ pub struct R2rmlScanOperator {
     /// operator-scoped cache — that's PR-4b.)
     parent_lookup_cache: HashMap<LookupCacheKey, Arc<CompleteParentLookup>>,
     /// Parent indexes resolved by probes, kept from one child window's scan to
-    /// the next so a resolved key is not probed again.
+    /// the next so a resolved key is not probed again. Keyed like the
+    /// complete lookups: an index holds only what the parent holds for the
+    /// keys resolved, so the next scan serves it to every map that reads that
+    /// parent, by whatever columns.
     partial_parents: HashMap<LookupCacheKey, Box<PartialParentIndex>>,
     /// Per `(table, projection)`: what pushing child keys into its scan has
     /// taught this operator (see [`KeyPushSeen`]).
@@ -1441,6 +1477,8 @@ impl R2rmlScanOperator {
         let child_subjects = self.child_subject_iris(&child_schema, &child_batch, ctx);
 
         let mut tms: Vec<TmStream> = Vec::with_capacity(triples_maps.len());
+        // One index per parent key, shared by every map below that references it.
+        let mut parents: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
 
         for triples_map in &triples_maps {
@@ -1646,7 +1684,7 @@ impl R2rmlScanOperator {
             // predicate filter. Parent (dimension) tables are small and consumed
             // whole into the lookup, so they are not streamed.
             let parent_memo = self.parent_memo;
-            let mut parent_lookups: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
+            let mut parent_joins = ParentJoins::new();
             let mut ref_shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
             // Trusted browse crawl (`trust_fk_refs`) over the injected TRUE-wildcard
             // scan (`?s ?p ?o`): render RefObjectMap objects by templating the
@@ -1716,12 +1754,17 @@ impl R2rmlScanOperator {
                     let lookup_key: LookupCacheKey =
                         (rom.parent_triples_map.clone(), parent_join_cols.clone());
 
-                    // A given key populates exactly one of the two maps; skip if
-                    // either already holds it (else the 2nd POM sharing a parent
-                    // re-introduces the parent scan we removed).
-                    if parent_lookups.contains_key(&lookup_key)
-                        || ref_shortcuts.contains_key(&lookup_key)
-                    {
+                    // A shortcut renders from the row's own columns, whichever
+                    // RefObjectMap reads it.
+                    if ref_shortcuts.contains_key(&lookup_key) {
+                        continue;
+                    }
+                    // A parent already opened (by an earlier POM of this map, or
+                    // another map of this scan) is shared, not re-read; this POM
+                    // adds its own join columns, so a parent resolved by probes
+                    // resolves the keys this POM's rows hold too (#2239).
+                    if parents.contains_key(&lookup_key) {
+                        add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                         continue;
                     }
 
@@ -1734,8 +1777,11 @@ impl R2rmlScanOperator {
                     // cached scan-lookup is never mixed with a shortcut key.
                     if parent_memo {
                         if let Some(cached) = self.parent_lookup_cache.get(&lookup_key) {
-                            parent_lookups
-                                .insert(lookup_key, ParentIndex::Complete(Arc::clone(cached)));
+                            parents.insert(
+                                lookup_key.clone(),
+                                ParentIndex::Complete(Arc::clone(cached)),
+                            );
+                            add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                             continue;
                         }
                     }
@@ -1765,7 +1811,8 @@ impl R2rmlScanOperator {
                         if let Some(cached) = hit {
                             self.parent_lookup_cache
                                 .insert(lookup_key.clone(), Arc::clone(&cached));
-                            parent_lookups.insert(lookup_key, ParentIndex::Complete(cached));
+                            parents.insert(lookup_key.clone(), ParentIndex::Complete(cached));
+                            add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                             continue;
                         }
                     }
@@ -1795,9 +1842,7 @@ impl R2rmlScanOperator {
                         }
                     }
 
-                    let Some(source) =
-                        ParentSource::new(parent_tm, parent_join_cols, child_join_cols)
-                    else {
+                    let Some(source) = ParentSource::new(parent_tm, parent_join_cols) else {
                         tracing::warn!(
                             parent = %rom.parent_triples_map,
                             "Parent TriplesMap has no logical table, skipping"
@@ -1807,7 +1852,9 @@ impl R2rmlScanOperator {
                     // #2239: with key pushdown on, the parent is read by the keys
                     // each window of this scan needs (see `resolve_parent_keys`),
                     // not whole up front: a `LIMIT` or a key-filtered scan needs
-                    // a handful of its rows.
+                    // a handful of its rows. The keys an earlier child window
+                    // resolved are kept: the index holds nothing of the map or
+                    // the columns that read it, so it serves every one.
                     let index = if self.key_pushdown {
                         ParentIndex::Partial(
                             self.partial_parents
@@ -1826,7 +1873,8 @@ impl R2rmlScanOperator {
                             .await?,
                         )
                     };
-                    parent_lookups.insert(lookup_key, index);
+                    parents.insert(lookup_key.clone(), index);
+                    add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                 }
             }
 
@@ -1836,7 +1884,7 @@ impl R2rmlScanOperator {
                 tm_iri: triples_map.iri.clone(),
                 stream,
                 exhausted: false,
-                parent_lookups,
+                parent_joins,
                 pending: None,
                 ref_shortcuts,
                 join,
@@ -1860,6 +1908,7 @@ impl R2rmlScanOperator {
         Ok(Some(ScanProgress {
             child_batch,
             child_schema,
+            parents,
             tms,
             tm_idx: 0,
             window_rows,
@@ -1918,15 +1967,18 @@ impl R2rmlScanOperator {
     }
 
     /// Resolve every join key `window`'s rows hold in each partial parent
-    /// index (#2239), before the window materializes against them. The keys
-    /// not yet resolved are probed when there are few enough to push and a
-    /// keyed read is worth it ([`PartialParentIndex::worth_probing`]);
-    /// otherwise the parent is read whole once and the index becomes complete,
-    /// so a scan never reads a parent whole more than once.
+    /// index (#2239), before the window materializes against them: through
+    /// each parent `joins` names (the window's map's), by each of the columns
+    /// it names. The keys not yet resolved are probed when there are few
+    /// enough to push and a keyed read is worth it
+    /// ([`PartialParentIndex::worth_probing`]); otherwise the parent is read
+    /// whole once and the index becomes complete, so a scan never reads a
+    /// parent whole more than once.
     async fn resolve_parent_keys(
         &mut self,
         ctx: &ExecutionContext<'_>,
         parents: &mut HashMap<LookupCacheKey, ParentIndex>,
+        joins: &ParentJoins,
         window: &[ColumnBatch],
     ) -> Result<()> {
         let mapping = self
@@ -1937,7 +1989,10 @@ impl R2rmlScanOperator {
         let provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        for (lookup_key, index) in parents.iter_mut() {
+        for (lookup_key, child_joins) in joins {
+            let Some(index) = parents.get_mut(lookup_key) else {
+                continue;
+            };
             let ParentIndex::Partial(partial) = index else {
                 continue;
             };
@@ -1948,7 +2003,8 @@ impl R2rmlScanOperator {
                 ))
             })?;
             let mut probe = None;
-            if let Some(keys) = partial.missing_keys(window, super::in_pushdown_max()) {
+            if let Some(keys) = partial.missing_keys(window, child_joins, super::in_pushdown_max())
+            {
                 if keys.is_empty() {
                     continue;
                 }
@@ -1997,13 +2053,11 @@ impl R2rmlScanOperator {
     }
 
     /// Keep a finished scan's probe-built parent indexes for the next child
-    /// window's scan.
+    /// window's scan: one per key, whichever maps read it.
     fn retire_progress(&mut self, progress: ScanProgress) {
-        for tm in progress.tms {
-            for (key, index) in tm.parent_lookups {
-                if let ParentIndex::Partial(partial) = index {
-                    self.partial_parents.insert(key, partial);
-                }
+        for (key, index) in progress.parents {
+            if let ParentIndex::Partial(partial) = index {
+                self.partial_parents.insert(key, partial);
             }
         }
     }
@@ -2069,9 +2123,9 @@ impl R2rmlScanOperator {
             // rows, so cut the window to its size: under a `LIMIT 5` it is five
             // rows, not the whole Parquet batch the first pull returned.
             let probing = progress.tms[i]
-                .parent_lookups
-                .values()
-                .any(|index| matches!(index, ParentIndex::Partial(_)));
+                .parent_joins
+                .keys()
+                .any(|key| matches!(progress.parents.get(key), Some(ParentIndex::Partial(_))));
             if probing && rows > progress.window_rows {
                 if let Some(last) = window.pop() {
                     let keep = last.num_rows - (rows - progress.window_rows);
@@ -2084,8 +2138,13 @@ impl R2rmlScanOperator {
                 }
             }
             if probing && !window.is_empty() {
-                self.resolve_parent_keys(ctx, &mut progress.tms[i].parent_lookups, &window)
-                    .await?;
+                self.resolve_parent_keys(
+                    ctx,
+                    &mut progress.parents,
+                    &progress.tms[i].parent_joins,
+                    &window,
+                )
+                .await?;
             }
 
             if window.is_empty() {
@@ -2106,7 +2165,7 @@ impl R2rmlScanOperator {
             } = self.materialize_window(
                 triples_map,
                 &window,
-                &progress.tms[i].parent_lookups,
+                &progress.parents,
                 &progress.tms[i].ref_shortcuts,
                 ctx,
             )?;
@@ -4863,6 +4922,10 @@ mod tests {
         #[derive(Debug)]
         struct Tables {
             cust_ids: Vec<i64>,
+            /// A second reference from `orders` to `customers`, `BILL_ID`.
+            bill_ids: Option<Vec<i64>>,
+            /// `suppliers` (SID, SUPP_CUST) rows' references to `customers`.
+            supp_cust: Vec<i64>,
             customers: Vec<i64>,
             /// Each `customers` data file's `ID` bounds (min, max), when the
             /// provider reports scan file counts: a file is read when a key
@@ -4874,6 +4937,8 @@ mod tests {
             fn new(cust_ids: Vec<i64>, customers: Vec<i64>) -> Self {
                 Self {
                     cust_ids,
+                    bill_ids: None,
+                    supp_cust: Vec::new(),
                     customers,
                     files: None,
                     scans: Mutex::new(Vec::new()),
@@ -4881,6 +4946,14 @@ mod tests {
             }
             fn with_files(mut self, files: Vec<(i64, i64)>) -> Self {
                 self.files = Some(files);
+                self
+            }
+            fn with_bill_ids(mut self, bill_ids: Vec<i64>) -> Self {
+                self.bill_ids = Some(bill_ids);
+                self
+            }
+            fn with_suppliers(mut self, supp_cust: Vec<i64>) -> Self {
+                self.supp_cust = supp_cust;
                 self
             }
         }
@@ -4957,9 +5030,19 @@ mod tests {
                     .push((table_name.to_string(), filters.to_vec()));
                 let batch = if table_name == "orders" {
                     let n = self.cust_ids.len() as i64;
-                    i64_batch(vec![
+                    let mut columns = vec![
                         ("OID", (1..=n).collect()),
                         ("CUST_ID", self.cust_ids.clone()),
+                    ];
+                    if let Some(bill_ids) = &self.bill_ids {
+                        columns.push(("BILL_ID", bill_ids.clone()));
+                    }
+                    i64_batch(columns)
+                } else if table_name == "suppliers" {
+                    let n = self.supp_cust.len() as i64;
+                    i64_batch(vec![
+                        ("SID", (1..=n).collect()),
+                        ("SUPP_CUST", self.supp_cust.clone()),
                     ])
                 } else {
                     let mut ids = Vec::new();
@@ -5228,6 +5311,274 @@ mod tests {
             let scans = customer_scans(&tables);
             assert_eq!(scans.len(), 1, "{scans:?}");
             assert!(scans[0].1.is_empty(), "read whole: {scans:?}");
+        }
+
+        fn customer_ref(column: &str) -> ObjectMap {
+            ObjectMap::RefObjectMap(RefObjectMap::new("#Customer", column, "ID"))
+        }
+
+        fn customers_map() -> TriplesMap {
+            TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://ex/customer/{VID}")
+        }
+
+        /// `orders` references `customers` twice by the same parent column,
+        /// through two columns of its own: `ex:shipTo` by `CUST_ID`, `ex:billTo`
+        /// by `BILL_ID`.
+        fn ship_bill_mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/shipTo"),
+                    object_map: customer_ref("CUST_ID"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/billTo"),
+                    object_map: customer_ref("BILL_ID"),
+                });
+            Arc::new(CompiledR2rmlMapping::new(vec![orders, customers_map()]))
+        }
+
+        /// `orders` (by `CUST_ID`) and `suppliers` (by `SUPP_CUST`) both
+        /// reference `customers` by `ex:address`.
+        fn two_maps_mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/address"),
+                    object_map: customer_ref("CUST_ID"),
+                });
+            let suppliers = TriplesMap::new("#Supplier", "suppliers")
+                .with_subject_template("http://ex/supplier/{SID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/address"),
+                    object_map: customer_ref("SUPP_CUST"),
+                });
+            Arc::new(CompiledR2rmlMapping::new(vec![
+                orders,
+                suppliers,
+                customers_map(),
+            ]))
+        }
+
+        /// Run `pattern` over `mapping` and `tables`: every output row's
+        /// bindings in schema order, in output order. With `child_rows`, the
+        /// scan's input is that many rows binding an unrelated variable, each
+        /// its own child window (so its own scan, and the parents' indexes are
+        /// carried from one to the next); without, a single seed row.
+        fn run_pattern(
+            tables: &Tables,
+            mapping: Arc<CompiledR2rmlMapping>,
+            pattern: R2rmlPattern,
+            child_rows: Option<usize>,
+            budget: Option<usize>,
+            key_pushdown: bool,
+        ) -> Vec<Vec<String>> {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            ctx.r2rml_table_provider = Some(tables);
+            let child: BoxedOperator = match child_rows {
+                None => Box::new(EmptyOperator::new()),
+                Some(n) => {
+                    let schema: Arc<[VarId]> = Arc::from(vec![VarId(9)].into_boxed_slice());
+                    let rows = (1..=n)
+                        .map(|w| Binding::iri(format!("http://ex/window/{w}")))
+                        .collect();
+                    let batch = Batch::new(Arc::clone(&schema), vec![rows]).unwrap();
+                    Box::new(crate::seed::BatchReplayOperator::new(schema, vec![batch]))
+                }
+            };
+            let mut op = R2rmlScanOperator::new(child, pattern);
+            futures::executor::block_on(op.child.open(&ctx)).unwrap();
+            op.mapping = Some(mapping);
+            op.key_pushdown = key_pushdown;
+            op.state = OperatorState::Open;
+            if let Some(budget) = budget {
+                op.set_row_budget(budget);
+            }
+            if child_rows.is_some() {
+                op.child_window = FlushSchedule::fixed(1);
+            }
+            let schema = op.schema().to_vec();
+            let mut rows = Vec::new();
+            while let Some(batch) = futures::executor::block_on(op.next_batch(&ctx)).unwrap() {
+                for row in 0..batch.len() {
+                    rows.push(
+                        schema
+                            .iter()
+                            .map(|&v| match &batch.column(v).unwrap()[row] {
+                                Binding::Iri(iri) => iri.to_string(),
+                                other => format!("{other:?}"),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            if let Some(budget) = budget {
+                rows.truncate(budget);
+            }
+            rows
+        }
+
+        /// Each customer in its own data file, so a keyed read always skips
+        /// files and probes are made while they read less than the whole.
+        fn one_file_per_customer(tables: Tables) -> Tables {
+            let files = tables.customers.iter().map(|&id| (id, id)).collect();
+            tables.with_files(files)
+        }
+
+        /// Two RefObjectMaps of one map read one parent by the same parent
+        /// column through different columns of their own. The probe-built
+        /// index is shared, so it must resolve the keys of both: under a star
+        /// and a variable predicate, which hold both, the answers are a whole
+        /// read's under every `LIMIT`, with and without file counts.
+        #[test]
+        fn two_references_to_one_parent_resolve_both_columns_keys() {
+            // Ship-to and bill-to keys differ; 90 and 91 dangle, and
+            // customers 8 to 12 are referenced by neither (their files are
+            // the ones a keyed read skips).
+            let cust_ids = vec![1, 2, 3, 90, 4];
+            let bill_ids = vec![5, 6, 7, 1, 91];
+            let tables = |files: bool| {
+                let tables = Tables::new(cust_ids.clone(), (1..=12).collect())
+                    .with_bill_ids(bill_ids.clone());
+                if files {
+                    one_file_per_customer(tables)
+                } else {
+                    tables
+                }
+            };
+            let star = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/shipTo")
+                    .with_star_bindings(vec![("http://ex/billTo".to_string(), VarId(2))])
+            };
+            let wildcard = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))).with_predicate_var(VarId(2))
+            };
+            for (label, pattern, answers) in [
+                ("star", star as fn() -> R2rmlPattern, 3),
+                ("variable predicate", wildcard, 8),
+            ] {
+                for files in [false, true] {
+                    for budget in [None, Some(1), Some(2), Some(5)] {
+                        let whole = run_pattern(
+                            &tables(files),
+                            ship_bill_mapping(),
+                            pattern(),
+                            None,
+                            budget,
+                            false,
+                        );
+                        let probed = run_pattern(
+                            &tables(files),
+                            ship_bill_mapping(),
+                            pattern(),
+                            None,
+                            budget,
+                            true,
+                        );
+                        assert_eq!(probed, whole, "{label}, files {files}, LIMIT {budget:?}");
+                        if budget.is_none() {
+                            assert_eq!(whole.len(), answers, "{label}: {whole:?}");
+                        }
+                    }
+                }
+            }
+            // One keyed read of the parent serves both columns' keys.
+            let tables = tables(true);
+            run_pattern(&tables, ship_bill_mapping(), star(), None, None, true);
+            let keys: Vec<Vec<String>> = customer_scans(&tables)
+                .iter()
+                .map(|(_, f)| filtered_keys(f))
+                .collect();
+            let want: Vec<String> = ["1", "2", "3", "4", "5", "6", "7", "90", "91"]
+                .map(String::from)
+                .to_vec();
+            assert_eq!(keys, [want], "one probe for both columns");
+        }
+
+        /// Two maps reference one parent by the same parent column, each
+        /// through a column of its own table, over several child windows: the
+        /// probe-built index carried from one window's scan to the next serves
+        /// both maps, by each map's own columns. With file counts each window
+        /// probes only what is new; without, the shared index allows one probe
+        /// and then reads the parent whole once, for both maps.
+        #[test]
+        fn two_maps_to_one_parent_resolve_their_own_keys_across_child_windows() {
+            let tables = |files: bool| {
+                let tables =
+                    Tables::new(vec![1, 2, 3], (1..=7).collect()).with_suppliers(vec![4, 5, 90]);
+                if files {
+                    one_file_per_customer(tables)
+                } else {
+                    tables
+                }
+            };
+            let pattern = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/address")
+            };
+            let sorted = |mut rows: Vec<Vec<String>>| {
+                rows.sort();
+                rows
+            };
+            let whole = sorted(run_pattern(
+                &tables(false),
+                two_maps_mapping(),
+                pattern(),
+                Some(3),
+                None,
+                false,
+            ));
+            assert_eq!(whole.len(), 3 * 5, "three windows of 3 + 2: {whole:?}");
+            for files in [false, true] {
+                for budget in [None, Some(2), Some(4), Some(9)] {
+                    let probed = run_pattern(
+                        &tables(files),
+                        two_maps_mapping(),
+                        pattern(),
+                        Some(3),
+                        budget,
+                        true,
+                    );
+                    // The maps' scan order is the mapping's, which a `LIMIT`
+                    // answer follows: compare as sets, all of them without it.
+                    let label = format!("files {files}, LIMIT {budget:?}: {probed:?}");
+                    match budget {
+                        None => assert_eq!(sorted(probed), whole, "{label}"),
+                        Some(k) => {
+                            assert_eq!(probed.len(), k, "{label}");
+                            assert!(probed.iter().all(|r| whole.contains(r)), "{label}");
+                        }
+                    }
+                }
+            }
+            let probes = |files: bool| {
+                let tables = tables(files);
+                run_pattern(&tables, two_maps_mapping(), pattern(), Some(3), None, true);
+                let mut keys: Vec<Vec<String>> = customer_scans(&tables)
+                    .iter()
+                    .map(|(_, f)| filtered_keys(f))
+                    .collect();
+                keys.sort();
+                keys
+            };
+            let strings =
+                |keys: &[&str]| keys.iter().copied().map(String::from).collect::<Vec<_>>();
+            assert_eq!(
+                probes(true),
+                [strings(&["1", "2", "3"]), strings(&["4", "5", "90"])],
+                "each map's keys are probed once, in the first window"
+            );
+            let without_counts = probes(false);
+            assert!(
+                without_counts == [vec![], strings(&["1", "2", "3"])]
+                    || without_counts == [vec![], strings(&["4", "5", "90"])],
+                "one probe (the first map's keys), then one whole read serving both maps: \
+                 {without_counts:?}"
+            );
         }
     }
 
