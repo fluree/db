@@ -226,6 +226,20 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             }
         }
 
+        // Without the iceberg feature no graph source is served here. A mapped
+        // one the target names is refused with what the build lacks, rather
+        // than reported as a ledger that is not there.
+        #[cfg(not(feature = "iceberg"))]
+        if result
+            .as_ref()
+            .is_err_and(super::error::ApiError::is_not_found)
+        {
+            self.graph
+                .fluree
+                .refuse_unreadable_graph_source(address.id())
+                .await?;
+        }
+
         self.wrap_request_policy(result?).await
     }
 

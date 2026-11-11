@@ -101,7 +101,7 @@ pub async fn resolve_schema_bundle(
         return Ok(None);
     };
 
-    let starting_g_id = resolve_local_graph_source(snapshot, schema_source)?;
+    let starting_g_id = resolve_local_graph_source(snapshot, schema_source, to_t)?;
 
     let follow_imports = reasoning.follow_owl_imports.unwrap_or(false);
 
@@ -115,6 +115,7 @@ pub async fn resolve_schema_bundle(
         follow_imports,
     };
     if let Some(cached) = global_schema_bundle_cache().get(&cache_key) {
+        refuse_dropped_sources(snapshot, to_t, &cached.sources)?;
         return Ok(Some(cached));
     }
 
@@ -126,7 +127,7 @@ pub async fn resolve_schema_bundle(
         let mut queue: VecDeque<GraphId> = VecDeque::from([starting_g_id]);
         while let Some(g_id) = queue.pop_front() {
             for import_iri in scan_owl_imports_in_graph(snapshot, overlay, to_t, g_id).await? {
-                let resolved = resolve_import_iri(snapshot, reasoning, &import_iri)?;
+                let resolved = resolve_import_iri(snapshot, reasoning, &import_iri, to_t)?;
                 if seen.insert(resolved) {
                     sources.push(resolved);
                     queue.push_back(resolved);
@@ -136,6 +137,8 @@ pub async fn resolve_schema_bundle(
         }
     }
 
+    refuse_dropped_sources(snapshot, to_t, &sources)?;
+
     let bundle = Arc::new(ResolvedSchemaBundle {
         ledger_id: Arc::from(snapshot.ledger_id.as_str()),
         to_t,
@@ -144,6 +147,30 @@ pub async fn resolve_schema_bundle(
     global_schema_bundle_cache().insert(cache_key, bundle.clone());
 
     Ok(Some(bundle))
+}
+
+/// Refuse a bundle reading a named graph that a commit after `to_t` dropped,
+/// as a `GRAPH` naming it as of `to_t` is refused: what it held then is gone,
+/// and reasoning without it would answer something else. Checked on cache
+/// hits too, since a bundle cached as of `to_t` before the drop still lists
+/// the graph and its flakes. (The default graph is never a cached source:
+/// [`fluree_db_query::schema_bundle::build_schema_bundle_flakes`] leaves it
+/// to the query's own reads.)
+fn refuse_dropped_sources(snapshot: &LedgerSnapshot, to_t: i64, sources: &[GraphId]) -> Result<()> {
+    let registry = &snapshot.graph_registry;
+    for &g_id in sources.iter().filter(|g_id| **g_id != DEFAULT_GRAPH_ID) {
+        if let Some(floor) = registry.drop_after(g_id, to_t) {
+            let iri = registry.iri_for_graph_id(g_id).unwrap_or_default();
+            return Err(dropped_schema_source(iri, floor, to_t));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal of a schema source graph `iri` a drop at `floor`, after
+/// `to_t`, took.
+fn dropped_schema_source(iri: &str, floor: i64, to_t: i64) -> ApiError {
+    crate::policy_builder::dropped_source("schema source", iri, floor, to_t)
 }
 
 /// Resolve a `GraphSourceRef` to a local `GraphId` in the current ledger.
@@ -164,6 +191,7 @@ pub async fn resolve_schema_bundle(
 fn resolve_local_graph_source(
     snapshot: &LedgerSnapshot,
     source: &GraphSourceRef,
+    to_t: i64,
 ) -> Result<GraphId> {
     if let Some(ledger) = source.ledger.as_deref() {
         if ledger != snapshot.ledger_id {
@@ -214,7 +242,8 @@ fn resolve_local_graph_source(
         Some(sel) if sel == config_iris::TXN_META_GRAPH => TXN_META_GRAPH_ID,
         Some(sel) => snapshot
             .graph_registry
-            .graph_id_for_iri(sel)
+            .existing_graph_id(sel, to_t)
+            .map_err(|floor| dropped_schema_source(sel, floor, to_t))?
             .ok_or_else(|| {
                 ApiError::OntologyImport(format!(
                     "f:schemaSource / f:graphRef points to graph '{sel}' \
@@ -262,8 +291,13 @@ fn resolve_import_iri(
     snapshot: &LedgerSnapshot,
     reasoning: &ReasoningDefaults,
     import_iri: &str,
+    to_t: i64,
 ) -> Result<GraphId> {
-    if let Some(g_id) = snapshot.graph_registry.graph_id_for_iri(import_iri) {
+    if let Some(g_id) = snapshot
+        .graph_registry
+        .existing_graph_id(import_iri, to_t)
+        .map_err(|floor| dropped_schema_source(import_iri, floor, to_t))?
+    {
         reject_if_system_graph(g_id)?;
         return Ok(g_id);
     }
@@ -273,7 +307,7 @@ fn resolve_import_iri(
         .iter()
         .find(|b| b.ontology_iri == import_iri)
     {
-        return resolve_local_graph_source(snapshot, &binding.graph_ref);
+        return resolve_local_graph_source(snapshot, &binding.graph_ref, to_t);
     }
 
     Err(ApiError::OntologyImport(format!(

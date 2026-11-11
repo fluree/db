@@ -421,7 +421,7 @@ impl Transaction {
             let mut attempt = 0;
             loop {
                 tracing::Span::current().record("attempts", attempt + 1);
-                let guard = handle.lock_for_write().await;
+                let mut guard = handle.lock_for_write().await;
                 let unchanged = guard.state().t() == base_t
                     && guard.state().head_commit_id.as_ref() == base_head.as_ref();
                 if read && !unchanged {
@@ -444,7 +444,7 @@ impl Transaction {
                         }
                         None => {
                             handle.note_write_path(WritePath::Restaged);
-                            let state = guard.clone_state();
+                            let state = guard.clone_state_for_staging();
                             // The policy the ledger has now: a commit since the
                             // transaction began may have changed it.
                             context.policy =

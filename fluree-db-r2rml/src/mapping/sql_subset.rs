@@ -24,11 +24,12 @@
 //! `rr:column` are. Keywords are case-insensitive. A namespaced table
 //! (`ns.table`) is joined with `.` and resolves like `rr:tableName`.
 //!
-//! The select list does not shape the rows: the triples map's own term maps
-//! choose the columns a scan reads. It is kept so the source can refuse a
-//! column the table does not have. This parser checks only the grammar; the
-//! columns, and whether each literal compares exactly with its column's type,
-//! are checked by the source against the table's schema.
+//! The select list is the logical table's columns, as in R2RML: a source
+//! refuses a map whose term maps (or a referencing map's join) read a column
+//! the list leaves out, and a column the table does not have. `SELECT *`
+//! selects every column. This parser checks only the grammar; the columns,
+//! and whether each literal compares exactly with its column's type, are
+//! checked by the source against the mapping and the table's schema.
 
 use std::fmt;
 
@@ -39,7 +40,7 @@ use super::LogicalTable;
 pub struct RestrictedSelect {
     /// The table, normalized like an `rr:tableName` (`ns.table`).
     pub table: String,
-    /// The select list, or `None` for `SELECT *`. Advisory: see the module docs.
+    /// The select list, or `None` for `SELECT *`: see the module docs.
     pub columns: Option<Vec<String>>,
     /// The `WHERE` conjunction; empty when there is no `WHERE`.
     pub conditions: Vec<RowCondition>,

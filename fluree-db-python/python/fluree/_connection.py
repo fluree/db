@@ -1161,11 +1161,31 @@ class Ledger:
         return [IRI(g["iri"]) for g in named if g["iri"] not in system]
 
     def drop_graph(self, graph: str) -> Commit:
-        """Retract everything in named graph ``graph`` (its full IRI) in one
-        commit. History keeps it, and the graph can be written to again. The
-        default graph and Fluree's own graphs cannot be dropped."""
+        """Drop named graph ``graph`` (its full IRI) in one commit, as SPARQL
+        ``DROP GRAPH`` does: the graph and its history are no longer queryable
+        — a query as of an earlier ``t`` naming it raises — though the commits
+        that wrote it keep its facts, so a branch from before the drop has
+        them. Writing to the IRI again starts the graph afresh. The default
+        graph and Fluree's own graphs cannot be dropped; SPARQL ``CLEAR
+        GRAPH`` empties a graph and keeps its history."""
         self._require_unrestricted("drop_graph")
         return Commit(**self._connection._native.drop_graph(self._id, graph))
+
+    def import_graph(self, graph: str, source: str | os.PathLike[str]) -> Commit:
+        """Bulk-load ``source`` into ``graph``, a named graph (its full IRI)
+        the ledger does not have yet, as :meth:`Connection.create` loads a new
+        ledger. Returns the import's last commit, with every fact it added as
+        ``asserts``.
+
+        ``source`` is a file or a directory of Turtle, N-Triples, or JSON-LD
+        files; TriG and N-Quads name graphs of their own and are refused.
+        IRIs and strings the ledger already holds keep their identity, so the
+        graph joins with the rest of the ledger. Commits the ledger has not
+        indexed yet are indexed first, and writes to the ledger wait while the
+        import runs. Raises :class:`InvalidRequestError` when the ledger
+        already has ``graph``."""
+        self._require_unrestricted("import_graph")
+        return Commit(**self._connection._native.import_graph(self._id, graph, Path(source)))
 
     def set_full_text(
         self, properties: Iterable[str], *, language: str = "en", reindex: bool = True
