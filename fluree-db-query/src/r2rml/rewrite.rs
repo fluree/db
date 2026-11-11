@@ -1174,12 +1174,16 @@ fn bound_besides_subject(p: &R2rmlPattern) -> impl Iterator<Item = VarId> + '_ {
 }
 
 /// The subject var of a regular-predicate R2RML pattern that can join a
-/// Whether every map that can answer a same-subject star over `predicates`
-/// (one providing all of them: a map missing one yields no star row) mints
-/// each of its subjects from one row, so a scan reading the star's members
-/// from one row sees all of a subject's objects. `false` without a mapping, or
-/// while a map's table keys are unknown (recorded in `keys` for the caller to
-/// fetch).
+/// Whether every subject a same-subject star over `predicates` can match is
+/// minted from one row, so a scan reading the star's members from one row
+/// sees all of a subject's objects. A map providing all of them (a map
+/// missing one yields no star row) must mint each of its subjects from one
+/// row, and no two such maps may mint one subject from rows of their own: a
+/// subject both mint has a row in each, and the graph pairs one row's objects
+/// with the other's. Two covering maps pass when their subjects are provably
+/// disjoint, or when they read the same row and mint every member alike (one
+/// set of triples, held once). `false` without a mapping, or while a map's
+/// table keys are unknown (recorded in `keys` for the caller to fetch).
 fn one_row_per_subject<'p>(
     mapping: Option<&CompiledR2rmlMapping>,
     keys: &TableKeyEvidence,
@@ -1189,20 +1193,32 @@ fn one_row_per_subject<'p>(
         return false;
     };
     let predicates: Vec<&str> = predicates.collect();
+    let covering: Vec<&TriplesMap> = mapping
+        .triples_maps
+        .values()
+        .filter(|tm| {
+            predicates.iter().all(|p| {
+                tm.predicate_object_maps
+                    .iter()
+                    .any(|pom| pom.predicate_map.as_constant() == Some(*p))
+            })
+        })
+        .collect();
+    // Every covering map is asked, not just up to the first `false`, so one
+    // round of fetching learns every table the answer depends on.
     let mut answer = true;
-    for tm in mapping.triples_maps.values() {
-        let covers = predicates.iter().all(|p| {
-            tm.predicate_object_maps
-                .iter()
-                .any(|pom| pom.predicate_map.as_constant() == Some(*p))
-        });
-        // Every covering map is asked, not just up to the first `false`, so
-        // one round of fetching learns every table the answer depends on.
-        if covers && !keys.subject_unique(tm) {
+    for tm in &covering {
+        if !keys.subject_unique(tm) {
             answer = false;
         }
     }
     answer
+        && covering.iter().enumerate().all(|(i, a)| {
+            covering[i + 1..].iter().all(|b| {
+                a.subjects_provably_disjoint(b)
+                    || (a.same_source_row(b) && predicates.iter().all(|p| a.mints_alike(b, p)))
+            })
+        })
 }
 
 /// Rewrite `patterns` for the R2RML graph source `graph_source_id`
@@ -2341,6 +2357,72 @@ mod tests {
             base.class_prune_hint, None,
             "overlapping subject templates ⇒ pruning unsound ⇒ hint refused"
         );
+    }
+
+    // Two keyed maps that each cover a star over one subject template: each
+    // mints a subject from one row of its own table, but a subject both mint
+    // has a row in each, whose objects the graph pairs. The members stay
+    // separate scans unless the maps' subjects are provably apart or the maps
+    // read the same row and mint every member alike.
+    #[test]
+    fn star_two_covering_maps_fuse_only_when_apart_or_alike() {
+        const COUNTRY: &str = "http://example.org/country";
+        let covering = |iri: &str, table: &str, template: &str| {
+            TriplesMap::new(iri, table)
+                .with_subject_template(template)
+                .with_predicate_object(pom(PRED, "name"))
+                .with_predicate_object(pom(COUNTRY, "country"))
+        };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let scans = |maps: Vec<TriplesMap>| -> usize {
+            let mapping = CompiledR2rmlMapping::new(maps);
+            rewrite_patterns_for_r2rml(
+                &[star(PRED, 1), star(COUNTRY, 2)],
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::R2rml(_)))
+            .count()
+        };
+        let us = covering("#Us", "us", "http://example.org/person/{id}");
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Eu", "eu", "http://example.org/person/{id}")
+            ]),
+            2,
+            "a subject in both tables has a row in each: no fusion"
+        );
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Eu", "eu", "http://example.org/client/{id}")
+            ]),
+            1,
+            "subjects provably apart: each subject is one row's"
+        );
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Us2", "us", "http://example.org/person/{id}")
+            ]),
+            1,
+            "one row, every member minted alike: one set of triples"
+        );
+        assert_eq!(scans(vec![us]), 1, "one covering map still fuses");
     }
 
     // F10: members split across maps sharing the subject template. No single

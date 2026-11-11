@@ -47,6 +47,9 @@
   amount twice (one triple, two rows) above every amount in the second, so a
   scan-side top-k that counted rows rather than triples would stop before
   the second file.
+- `sets.customers_us`, `sets.customers_eu`: two tables, each keyed by `id`,
+  minting customers with one template; customer 7 has a row in each, so a
+  same-subject star over the two pairs each name with each city.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -478,6 +481,30 @@ order_lines.append(order_lines_batch([(1, 42, 100), (2, 42, 100)]))
 order_lines.append(order_lines_batch([(3, 43, 50), (4, 44, 40)]))
 order_lines = catalog.load_table("sets.order_lines")
 print("sets.order_lines table_location:", order_lines.location())
+
+# ---------------------------------------------------------------------------
+# sets.customers_us + sets.customers_eu: one subject, a row in each table.
+# ---------------------------------------------------------------------------
+# Each table holds one row per `id` (a key of each), and both mint
+# customer/{id}: customer 7 is in both, with a different name and city in
+# each, so its star pairs every name with every city across the two rows.
+regional_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("city", pa.string()),
+])
+for table_name, rows in [
+    ("sets.customers_us", [(7, "Ada", "Miami"), (8, "Bo", "Austin")]),
+    ("sets.customers_eu", [(7, "Ada L.", "Lyon"), (9, "Cy", "Paris")]),
+]:
+    regional = catalog.create_table(table_name, schema=regional_schema)
+    regional.append(pa.table({
+        "id": pa.array([r[0] for r in rows], pa.int64()),
+        "name": pa.array([r[1] for r in rows]),
+        "city": pa.array([r[2] for r in rows]),
+    }, schema=regional_schema))
+    regional = catalog.load_table(table_name)
+    print(table_name, "table_location:", regional.location())
 
 # ---------------------------------------------------------------------------
 # silver.customers_history + silver.orders: a filtered logical table and a

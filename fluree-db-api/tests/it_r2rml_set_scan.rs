@@ -18,6 +18,8 @@
 //!   exact duplicate row, 104's customer dangles, 105's is NULL.
 //! - `order_lines`: in two files, the first holding order 42's amount twice,
 //!   above every amount in the second.
+//! - `customers_us`, `customers_eu`: each keyed by `id`, minting one
+//!   template; customer 7 has a row in each.
 //!
 //! Three mappings over them:
 //! - `sets-hist`: the history table and the orders, no key declared;
@@ -115,6 +117,12 @@ const AMOUNTS: [(i64, &str); 8] = [
 /// one file and the rest in another.
 const LINES: [(i64, i64, i64); 4] = [(1, 42, 100), (2, 42, 100), (3, 43, 50), (4, 44, 40)];
 
+/// `sets.customers_us` and `sets.customers_eu`: `(id, name, city)`.
+const REGIONAL: [(&str, [(i64, &str, &str); 2]); 2] = [
+    ("us", [(7, "Ada", "Miami"), (8, "Bo", "Austin")]),
+    ("eu", [(7, "Ada L.", "Lyon"), (9, "Cy", "Paris")]),
+];
+
 const HISTORY_MAP: &str = r#"
     <http://example.org/mapping#History>
         a rr:TriplesMap ;
@@ -178,6 +186,31 @@ const LINE_MAP: &str = r#"
             rr:predicate ex:amount ;
             rr:objectMap [ rr:column "amount" ; rr:datatype xsd:integer ]
         ] .
+"#;
+
+/// The two regional tables, each keyed by `id`, minting one customer
+/// template: each map mints a subject from one row, but customer 7 is minted
+/// by a row of each.
+const REGIONAL_MAPS: &str = r#"
+    <http://example.org/mapping#Us>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.customers_us" ; f:key ( "id" ) ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/customer/{id}" ;
+            rr:class ex:Customer
+        ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+
+    <http://example.org/mapping#Eu>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.customers_eu" ; f:key ( "id" ) ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/customer/{id}" ;
+            rr:class ex:Customer
+        ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
 "#;
 
 const CURRENT_MAP: &str = r#"
@@ -266,6 +299,12 @@ const AMOUNTS_SRC: Source = Source {
     native: "sets-amount-native:main",
     maps: &[AMOUNT_MAP],
 };
+/// The two regional tables, each keyed.
+const REGIONS: Source = Source {
+    alias: "sets-regions",
+    native: "sets-regions-native:main",
+    maps: &[REGIONAL_MAPS],
+};
 /// The order lines per order, no key declared.
 const LINES_PER_ORDER: Source = Source {
     alias: "sets-order-lines",
@@ -344,6 +383,15 @@ impl Source {
         if has(AMOUNT_MAP) {
             for (oid, amount) in AMOUNTS {
                 add(order(oid), "amount", format!("decimal:{amount}"));
+            }
+        }
+        if has(REGIONAL_MAPS) {
+            for (_, rows) in REGIONAL {
+                for (id, name, city) in rows {
+                    add(customer(id), "@type", iri(ex("Customer")));
+                    add(customer(id), "name", name.to_string());
+                    add(customer(id), "city", city.to_string());
+                }
             }
         }
         if has(ORDER_LINE_MAP) {
@@ -980,6 +1028,58 @@ fn amount_cases() -> Vec<Case> {
     ]
 }
 
+/// Stars over a subject two keyed maps mint, from a row of each: each map's
+/// rows are one per subject, but the subject's objects come from both, and
+/// the graph pairs every name with every city across them.
+fn regional_cases() -> Vec<Case> {
+    let name = ex("name");
+    let city = ex("city");
+    vec![
+        case(
+            "a star over a subject two keyed maps mint",
+            "SELECT ?s ?n ?c FROM <{from}> WHERE { ?s ex:name ?n ; ex:city ?c }",
+            select(
+                &["s", "n", "c"],
+                json!({ "@id": "?s", name.clone(): "?n", city.clone(): "?c" }),
+            ),
+            &["s", "n", "c"],
+        )
+        // Customer 7: two names by two cities; 8 and 9 one each.
+        .rows(6),
+        case(
+            "a star's constant over a subject two keyed maps mint",
+            "SELECT ?s ?n FROM <{from}> WHERE { ?s ex:name ?n ; ex:city \"Miami\" }",
+            select(
+                &["s", "n"],
+                json!({ "@id": "?s", name.clone(): "?n", city.clone(): "Miami" }),
+            ),
+            &["s", "n"],
+        )
+        .rows(2),
+        count(
+            "COUNT a star over a subject two keyed maps mint",
+            "?s ex:name ?n ; ex:city ?c",
+            "c",
+            json!({ "@id": "?s", name.clone(): "?n", city.clone(): "?c" }),
+        ),
+        case(
+            "a typed star over a subject two keyed maps mint",
+            "SELECT ?s ?n ?c FROM <{from}> WHERE { ?s a ex:Customer ; ex:name ?n ; ex:city ?c }",
+            select(
+                &["s", "n", "c"],
+                json!({
+                    "@id": "?s",
+                    "@type": ex("Customer"),
+                    name.clone(): "?n",
+                    city.clone(): "?c"
+                }),
+            ),
+            &["s", "n", "c"],
+        )
+        .rows(6),
+    ]
+}
+
 /// `ORDER BY DESC(?a) LIMIT k [OFFSET n]` over the order lines' amounts. The
 /// first file holds the two largest amounts; the scan-side top-k reads it
 /// first, and its bound tells it whether the second file can hold any of the
@@ -1133,6 +1233,49 @@ async fn keyed_maps_keep_their_fast_paths() {
     seed(&fluree, &[&KEYED, &IDENT]).await;
     let mut failures = check(&fluree, &keyed_cases(), &KEYED).await;
     failures.extend(check(&fluree, &identifier_cases(), &IDENT).await);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A same-subject star fuses its members into one scan only where each
+/// subject's objects are one row's. Two keyed maps minting one template each
+/// hold one row per subject, but a subject in both has a row in each: the
+/// star answers the cross product across them, as the native ledger does,
+/// on every lane, in a COUNT, and in a crawl folding a constant.
+#[tokio::test]
+async fn a_star_over_a_subject_two_maps_mint_pairs_their_rows() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree, &[&REGIONS]).await;
+    let mut failures = check(&fluree, &regional_cases(), &REGIONS).await;
+    for where_clause in [
+        json!({ "@id": "?s", "ex:city": "Miami" }),
+        json!({ "@id": "?s", "@type": "ex:Customer", "ex:city": "Miami" }),
+    ] {
+        let mut answers = Vec::new();
+        for from in [REGIONS.from(), REGIONS.native.to_string()] {
+            let query = json!({
+                "@context": { "ex": EX },
+                "from": from,
+                "select": { "?s": ["*"] },
+                "where": where_clause.clone(),
+                "orderBy": "?s",
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("crawl on {from}: {e}"));
+            answers.push(normalize_docs(&result));
+        }
+        if answers[0] != answers[1] || answers[1].is_empty() {
+            failures.push(format!(
+                "crawl {where_clause}: graph source {:#?}\nnative {:#?}",
+                answers[0], answers[1]
+            ));
+        }
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
