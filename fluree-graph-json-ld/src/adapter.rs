@@ -619,10 +619,13 @@ fn process_literal<S: GraphSink>(
     obj: &serde_json::Map<String, Value>,
     sink: &mut S,
 ) -> Result<ProcessedValue> {
-    // The datatype: `@type` when given; otherwise what JSON-LD's RDF
-    // conversion gives a native value: `xsd:boolean` for a boolean,
-    // `xsd:integer` for an integral number, `xsd:double` for any other
-    // number, and `xsd:string` for a string. (A native number used to be
+    // The datatype: `@type` when given; otherwise, for a native value,
+    // `xsd:boolean` for a boolean, `xsd:integer` for a number that fits an
+    // i64, `xsd:double` for any other number, and `xsd:string` for a
+    // string. So `1.0`, `1e3` and an integer past `i64::MAX` are doubles,
+    // as the value stored for them is, and as a bare number in a list is;
+    // JSON-LD's own RDF conversion would call the first two integers.
+    // (A native number used to be
     // labelled `xsd:string` here while keeping its numeric value, which a
     // sink that writes the datatype out, like the graph collector, then
     // printed as a string: `"0"` for `{"@value": 0}`.)
