@@ -3007,6 +3007,39 @@ mod tests {
         assert!(dtc.datatype().name.as_ref().contains("integer"));
     }
 
+    /// A value object under a term typed `@id` or `@vocab` inserts the
+    /// literal it would under an untyped term, not an IRI.
+    #[test]
+    fn value_object_under_id_or_vocab_term_inserts_a_literal() {
+        let templates = |unit: Value, value: Value| {
+            let doc = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#",
+                    "unit": unit
+                },
+                "@id": "ex:price",
+                "unit": value
+            });
+            parse_doc(&doc, TxnType::Insert)
+                .map(|txn| format!("{:?}", txn.insert_templates))
+                .map_err(|e| e.to_string())
+        };
+        for value in [
+            json!({"@value": "TWD"}),
+            json!({"@value": "TWD", "@language": "en"}),
+            json!({"@value": "TWD", "@type": "xsd:string"}),
+            json!({"@value": 5}),
+        ] {
+            let untyped = templates(json!("ex:unit"), value.clone()).unwrap();
+            for coercion in ["@id", "@vocab"] {
+                let coerced =
+                    templates(json!({"@id": "ex:unit", "@type": coercion}), value.clone());
+                assert_eq!(coerced.as_ref(), Ok(&untyped), "{value} under {coercion}");
+            }
+        }
+    }
+
     #[test]
     fn test_parse_value_object_builtin_xsd_curie_without_context() {
         let mut vars = VarRegistry::new();

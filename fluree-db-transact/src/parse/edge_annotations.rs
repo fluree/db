@@ -139,18 +139,18 @@ pub(crate) fn reject_context_coercion_on_annotated_literal(
 ) -> Result<()> {
     let entry = context.get(predicate);
 
-    // Datatype coercion: any predicate-level `@type` (including `@id`,
-    // `@vocab`, `@json`) without an explicit `@type` on the value
-    // object means the expander applies the coercion, while the
-    // synthesized `f:reifiesObject` would carry no such datatype.
+    // Datatype coercion: a predicate-level datatype or `@json` without an
+    // explicit `@type` on the value object means the expander applies the
+    // coercion, while the synthesized `f:reifiesObject` would carry no such
+    // datatype. `@id` and `@vocab` coerce only strings, never a value
+    // object, so they leave both sides a plain literal.
     if let Some(e) = entry {
         if let Some(type_) = e.type_.as_ref() {
             if !map.contains_key("@type") {
                 let coerced = match type_ {
                     TypeValue::Iri(t) => t.clone(),
-                    TypeValue::Id => "@id".to_string(),
-                    TypeValue::Vocab => "@vocab".to_string(),
                     TypeValue::Json => "@json".to_string(),
+                    TypeValue::Id | TypeValue::Vocab => return Ok(()),
                 };
                 return Err(TransactError::Parse(format!(
                     "annotated literal on '{predicate}' relies on @context term coercion \
@@ -2682,11 +2682,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_term_coerced_id_typing_on_value_form_annotation() {
-        // `@type: "@id"` term coercion would make the base edge a Ref,
-        // not a literal. Annotated value-object form without explicit
-        // @type=@id would generate a literal f:reifiesObject while the
-        // base flake is a Ref. Reject.
+    fn accepts_value_form_annotation_under_id_typed_term() {
+        // `@type: "@id"` term coercion applies to strings only, so the
+        // value object stays a literal on the base edge, matching the
+        // literal f:reifiesObject the lowering writes.
         let doc = json!({
             "@context": {
                 "ex": "http://example.org/",
@@ -2698,11 +2697,11 @@ mod tests {
                 "@annotation": { "ex:source": "x" }
             }
         });
-        let err = lower(doc).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("@context term coercion (@type='@id')"),
-            "got: {err}"
+        let result = lower(doc).expect("a value object under an @id term is a literal");
+        let sibling = &included(&result)[0];
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "ex:bob"})
         );
     }
 

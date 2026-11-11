@@ -419,11 +419,13 @@ fn parse_value_object(
         None => None,
     };
 
-    // Get type from entry if not explicit
+    // Get type from entry if not explicit. A term's `@id` or `@vocab`
+    // coercion never applies here: JSON-LD 1.1 coerces only a string value
+    // to an IRI (Value Expansion), and a value object is a literal. Only an
+    // explicit `"@type": "@id"` on the object makes it a reference.
     let type_iri = explicit_type.or_else(|| {
         entry.as_ref().and_then(|e| match &e.type_ {
             Some(TypeValue::Iri(t)) => Some(t.clone()),
-            Some(TypeValue::Id) => Some("@id".to_string()),
             _ => None,
         })
     });
@@ -1158,6 +1160,71 @@ mod tests {
         let obj = result.as_object().unwrap();
 
         assert_eq!(obj["bar"][0]["@value"], false);
+    }
+
+    /// A term's `@id` or `@vocab` coercion turns a string into an IRI, but a
+    /// value object stays a literal, with only its own `@type` or
+    /// `@language` (JSON-LD 1.1 API, Expansion Algorithm step 4.3 and Value
+    /// Expansion). An explicit `"@type": "@id"` still makes a reference.
+    #[test]
+    fn value_object_under_id_or_vocab_term_stays_a_literal() {
+        let xsd_string = "http://www.w3.org/2001/XMLSchema#string";
+        for coercion in ["@id", "@vocab"] {
+            let doc = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#",
+                    "unit": {"@id": "ex:unit", "@type": coercion}
+                },
+                "@id": "ex:price",
+                "unit": [
+                    {"@value": "TWD"},
+                    {"@value": "TWD", "@language": "en"},
+                    {"@value": "TWD", "@type": "xsd:string"},
+                    {"@value": 5},
+                    {"@value": "ex:TWD", "@type": "@id"}
+                ]
+            });
+            let expanded = crate::expand(&doc).unwrap();
+            assert_eq!(
+                expanded["http://example.org/unit"],
+                json!([
+                    {"@value": "TWD"},
+                    {"@value": "TWD", "@language": "en"},
+                    {"@value": "TWD", "@type": xsd_string},
+                    {"@value": 5},
+                    {"@id": "http://example.org/TWD"}
+                ]),
+                "{coercion}: {expanded}"
+            );
+
+            // A single value object, not in an array, the shape an
+            // extraction service's answer writes.
+            let single = json!({
+                "@context": {"ex": "http://example.org/", "unit": {"@id": "ex:unit", "@type": coercion}},
+                "@id": "ex:price",
+                "unit": {"@value": "TWD"}
+            });
+            let expanded = crate::expand(&single).unwrap();
+            assert_eq!(
+                expanded["http://example.org/unit"],
+                json!([{"@value": "TWD"}]),
+                "{coercion}: {expanded}"
+            );
+        }
+
+        // The string beside it is still coerced.
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "unit": {"@id": "ex:unit", "@type": "@id"}},
+            "@id": "ex:price",
+            "unit": "ex:TWD"
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(
+            expanded["http://example.org/unit"],
+            json!([{"@id": "http://example.org/TWD"}]),
+            "{expanded}"
+        );
     }
 
     #[test]
