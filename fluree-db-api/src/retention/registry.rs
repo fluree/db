@@ -919,6 +919,37 @@ mod tests {
         .unwrap()
     }
 
+    /// A reader without audit access sees no removed occurrence and no
+    /// requester: neither the journal's removals nor an erasure job's
+    /// commits, slots, properties or requester.
+    #[test]
+    fn a_status_without_audit_data_keeps_counts_and_stages() {
+        let mut job = job();
+        job.requester = Some("did:key:alice".into());
+        job.properties = vec!["http://example.org/email".into()];
+        let mut registration = Registration::default();
+        registration.journal.removals = vec![removal(0), removal(1)];
+        registration.erasures = vec![job];
+        let status = crate::retention::RetentionStatus {
+            ledger_id: "t/chunks:main".into(),
+            active: true,
+            registration: Some(registration),
+            maintenance_running: false,
+            overdue: None,
+            removals: 2,
+        }
+        .without_audit_data();
+        let shown = serde_json::to_value(&status).unwrap();
+        let job = &shown["registration"]["erasures"][0];
+        assert_eq!(shown["removals"], 2);
+        assert!(shown["registration"]["journal"].is_null(), "{shown}");
+        assert_eq!(job["stage"], "proving");
+        for audit in ["requester", "properties", "added", "authorizedCommit"] {
+            assert!(job[audit].is_null(), "{audit}: {shown}");
+        }
+        assert_eq!(job["commits"], serde_json::json!([]), "{shown}");
+    }
+
     async fn ledger(name: &str) -> (tempfile::TempDir, Fluree, String) {
         let dir = tempfile::tempdir().unwrap();
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())

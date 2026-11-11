@@ -146,7 +146,9 @@ An unacknowledged replica may continue serving its earlier journal until it catc
 
 ## Status
 
-`GET /v1/fluree/retention/{ledger}` includes the journal:
+`GET /v1/fluree/retention/{ledger}` includes the journal, for a token with the
+`fluree.ledger.audit.*` permission; other readers see only how many removals it holds
+(`removals`):
 
 ```json
 {

@@ -357,6 +357,8 @@ erasure brings the journal, and makes the clone a holder that later erasures rea
 ## Status
 
 `GET /v1/fluree/retention/<ledger>` lists the branch's erasure jobs under `registration.erasures`.
+A token without the `fluree.ledger.audit.*` permission for the ledger sees each job's stage, retries
+and timings, but not its requester, `commits`, properties or `lastError`.
 
 | Field | Meaning |
 |---|---|

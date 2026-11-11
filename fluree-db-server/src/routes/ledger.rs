@@ -1175,7 +1175,8 @@ pub async fn erase_occurrences_tail(
 /// A branch's retention status: whether it is registered for TTL
 /// processing, its activation boundary and watermark, scheduled and expired
 /// counts, the next due time, problems that block or degrade processing, and
-/// whether this node runs the retention worker.
+/// whether this node runs the retention worker. Its removal journal and its
+/// erasures' occurrences and requesters need the audit permission.
 ///
 /// GET /fluree/retention/<ledger...>
 pub async fn retention_status_tail(
@@ -1187,8 +1188,9 @@ pub async fn retention_status_tail(
     if data_auth.mode == crate::config::DataAuthMode::Required && bearer.0.is_none() {
         return Err(ServerError::unauthorized("Bearer token required"));
     }
+    let scope = crate::error::scope_id(&ledger)?;
     if let Some(p) = bearer.0.as_ref() {
-        if !p.can_read(&crate::error::scope_id(&ledger)?) {
+        if !p.can_read(&scope) {
             return Err(ServerError::not_found("Ledger not found"));
         }
     }
@@ -1200,6 +1202,12 @@ pub async fn retention_status_tail(
         .retention_status(&ledger)
         .await
         .map_err(ServerError::Api)?;
+    let audits = bearer.0.as_ref().is_some_and(|p| p.can_audit(&scope));
+    let status = if audits {
+        status
+    } else {
+        status.without_audit_data()
+    };
     Ok(Json(status).into_response())
 }
 

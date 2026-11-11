@@ -138,6 +138,22 @@ async fn removal_makes_raw_commits_audit_data() {
 
     let (status, body) = call(&app, "GET", &show, Some(&reader), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The removal journal is audit data too: a reader sees how many.
+    let retention = format!("/v1/fluree/retention/{ledger}");
+    let (status, audited) = call(&app, "GET", &retention, Some(&auditor), None).await;
+    assert_eq!(status, StatusCode::OK, "{audited}");
+    let removals = audited["registration"]["journal"]["removals"]
+        .as_array()
+        .map_or(0, Vec::len);
+    assert!(removals > 0, "{audited}");
+    let (status, body) = call(&app, "GET", &retention, Some(&reader), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removals"], removals, "{body}");
+    assert!(
+        body["registration"]["journal"]["removals"].is_null(),
+        "{body}"
+    );
     let (status, _) = call(&app, "GET", &show, Some(&auditor), None).await;
     assert_eq!(
         status,

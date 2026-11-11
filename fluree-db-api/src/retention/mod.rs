@@ -96,6 +96,30 @@ pub struct RetentionStatus {
     /// Scheduled occurrences already due, when this process holds the
     /// branch's schedule.
     pub overdue: Option<usize>,
+    /// Removals in the branch's journal. The journal itself, and its
+    /// erasures' occurrences and requesters, are audit data
+    /// ([`Self::without_audit_data`]).
+    pub removals: usize,
+}
+
+impl RetentionStatus {
+    /// The status as shown to a reader without audit access: what was
+    /// removed, where, and who asked for an erasure are left out; counts,
+    /// stages and timings stay.
+    pub fn without_audit_data(mut self) -> Self {
+        if let Some(registration) = &mut self.registration {
+            registration.journal.removals.clear();
+            for job in &mut registration.erasures {
+                job.requester = None;
+                job.authorized_commit = None;
+                job.commits.clear();
+                job.properties.clear();
+                job.added.clear();
+                job.last_error = None;
+            }
+        }
+        self
+    }
 }
 
 impl Fluree {
@@ -169,6 +193,9 @@ impl Fluree {
             registry::read(&self.nameservice_mode, self.registry_objects(), &ledger_id).await?;
         let now = worker::now_ms();
         Ok(RetentionStatus {
+            removals: registration
+                .as_ref()
+                .map_or(0, |r| r.journal.removals.len()),
             active: registration.is_some(),
             overdue: self.retention.cache.peek(&ledger_id, |s| s.overdue(now)),
             registration,
