@@ -22,6 +22,11 @@
   timestamptz, binary, string, and numeric text), in two files, with values whose lexical order
   differs from their natural order, duplicates to group on, and a row that is
   null in every typed column.
+- `silver.versions`: two snapshots (one file each) of rows that do not all
+  yield a solution: the second file holds the top names, among them a row
+  whose `id` (the subject's only column) is null and a row whose `city` is
+  null, so a top-k that counted them would prune the first file, whose
+  `erin` belongs in the answer.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -244,3 +249,25 @@ cells.append(cells_batch(cells_rows[:4]))
 cells.append(cells_batch(cells_rows[4:]))
 cells = catalog.load_table("silver.cells")
 print("cells table_location:", cells.location())
+
+# ---------------------------------------------------------------------------
+# silver.versions: rows that yield no solution sorting above rows that do.
+# ---------------------------------------------------------------------------
+versions_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("city", pa.string()),
+])
+versions = catalog.create_table("silver.versions", schema=versions_schema)
+versions.append(pa.table({
+    "id": pa.array([1, 5], pa.int64()),
+    "name": pa.array(["alice", "erin"]),
+    "city": pa.array(["c1", "c5"]),
+}, schema=versions_schema))
+versions.append(pa.table({
+    "id": pa.array([2, 3, None, 6], pa.int64()),
+    "name": pa.array(["hank", "gina", "zed", "ivan"]),
+    "city": pa.array(["c2", "c3", "c0", None]),
+}, schema=versions_schema))
+versions = catalog.load_table("silver.versions")
+print("versions table_location:", versions.location())
