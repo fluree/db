@@ -26,7 +26,7 @@ async fn facts(ledger: &LedgerState, graph: Option<&str>, subject: &str) -> Vec<
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph"),
     };
     let s = ledger

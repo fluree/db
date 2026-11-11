@@ -89,6 +89,7 @@ The request is malformed or contains invalid data.
 - Type mismatch
 - Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 - A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
+- A search index (BM25, vector, geo) named where a graph is read, as the query target or in `FROM`, `FROM NAMED` or `GRAPH` (`err:db/GraphSourceNotAGraph`). Query a BM25 or vector index with an `f:graphSource` pattern, with its source ledger as the dataset
 - A graph source's connection, auth or storage identity refused before anything is built (`err:api/InvalidGraphSourceConfig`): an unknown field, flat and structured fields mixed, auth given two ways or only partly, or an environment variable the server does not list. The message names the field, never its value. See [Iceberg connection](endpoints.md#iceberg-connection)
 - A graph source's Google credential configuration refused (`err:auth/GoogleCredentialsInvalid`): a Workload Identity Federation configuration with a field outside the accepted subset, a malformed service-account key, or a `quota_project` that is not a project id. Names the field, never its value
 - A path the source's storage identity does not serve (`err:storage/SchemeNotServed`): a `gs://` file on an AWS identity with no GCS interoperability endpoint, an `s3://` file on a Google identity, or a local path a catalog returned. The identity is chosen by the source's `io.storage_auth`, never by the path
@@ -258,6 +259,7 @@ The request conflicts with current server state.
 - A merge, rebase or revert whose result would leave a config setting group's fields outside the config graph or a single-valued setting with two values, or that would carry one branch's config or `#txn-meta` writes into another (`err:db/CommitConflict`; see [Behavior changes](../reference/compatibility.md#behavior-changes))
 - The ledger advanced while a reindex ran (`err:system/ReindexConflict`)
 - Syncing a graph source that has been dropped (`err:db/GraphSourceRetracted`)
+- Querying a graph source that has no R2RML mapping, or one that defines no `rr:TriplesMap` (`err:db/GraphSourceUnmapped`): one registered before registration refused both. Register it again under the same name, with a mapping that defines one, to replace it
 - An Iceberg table that carries merge-on-read delete files (`err:iceberg/MergeOnReadDeletes`)
 
 **Example:**
@@ -451,6 +453,30 @@ An unexpected error occurred on the server.
 - Report to system administrator
 - Retry request
 - Contact support if persists
+
+#### 501 Not Implemented
+
+The server was built without a capability the request needs.
+
+**Common Causes:**
+- Querying a graph source whose reader this build was compiled without
+  (`err:db/GraphSourceUnsupported`): an Iceberg or R2RML source on a build
+  without the `iceberg` feature, a SQL source without `sql`, a Delta source
+  without `delta`. The record was registered by a build that had the reader
+  and shares this nameservice.
+
+**Example:**
+```json
+{
+  "error": "Query error: graph source 'orders:main' is an Iceberg graph source, which this build cannot read: it was compiled without the 'iceberg' feature",
+  "status": 501,
+  "@type": "err:db/GraphSourceUnsupported"
+}
+```
+
+**How to Fix:**
+- Query the source through a server built with the feature the message names
+- Rebuild with that feature
 
 #### 502 Bad Gateway
 

@@ -2,6 +2,7 @@
 
 use crate::binding::BatchError;
 use crate::eval::{ArithmeticError, ComparisonError};
+use std::borrow::Cow;
 use thiserror::Error;
 
 /// Query execution errors
@@ -81,6 +82,21 @@ pub enum QueryError {
         snapshot_id: i64,
     },
 
+    /// A query named a graph, as of `t`, that a later commit (at `floor`)
+    /// dropped: what it held as of `t` is no longer queryable.
+    #[error(
+        "graph <{graph}> was dropped at t={floor}; what it held as of t={t} is no longer \
+         queryable"
+    )]
+    GraphDropped {
+        /// The graph's IRI.
+        graph: String,
+        /// The `t` of the commit that dropped it.
+        floor: i64,
+        /// The `t` the query reads at.
+        t: i64,
+    },
+
     /// A time-pinned graph-source read (`@iso:` / `@recorded:`) names an
     /// instant before the table's oldest retained snapshot, so no snapshot can
     /// answer it. Typed, like [`Self::SnapshotNotFound`], and never satisfied
@@ -149,6 +165,57 @@ pub enum QueryError {
          R2RML scans: {detail}"
     )]
     R2rmlUnsupportedPattern { detail: String },
+
+    /// A registered mapped graph source (Iceberg / R2RML) whose R2RML mapping
+    /// defines no triples: it has none (`empty_mapping: false`), or the one it
+    /// has compiles to no `rr:TriplesMap` (`true`). Only a record stored before
+    /// registration refused both can be in this state.
+    ///
+    /// Typed, and raised wherever the query names the source, so the query
+    /// fails with its cause rather than reading the source as a ledger that is
+    /// not there or as an empty graph.
+    #[error("graph source '{graph_source_id}' {}", unmapped_cause(.empty_mapping))]
+    GraphSourceUnmapped {
+        graph_source_id: String,
+        empty_mapping: bool,
+    },
+
+    /// An index graph source (BM25, vector, geo) named where a graph is read:
+    /// the query target, `FROM` / `FROM NAMED`, or `GRAPH`. An index has no
+    /// triples; its searches find it by the `f:graphSource` id in their own
+    /// pattern, with the source ledger as the dataset.
+    ///
+    /// Typed so the query fails naming the documented form, rather than
+    /// reading the index as an empty graph.
+    #[error("graph source '{graph_source_id}' is {index}, not a graph: {remedy}")]
+    GraphSourceNotAGraph {
+        graph_source_id: String,
+        /// The index kind, with its article ("a BM25 index").
+        index: String,
+        /// How a query reaches it instead.
+        remedy: &'static str,
+    },
+
+    /// A registered graph source no reader in this build exists for: a family
+    /// it was compiled without (an Iceberg / R2RML source without the
+    /// `iceberg` feature, SQL without `sql`, Delta without `delta`), or a type
+    /// it does not recognize (one a newer build registered).
+    ///
+    /// Typed so the query fails naming what the build lacks, rather than
+    /// reading the source as an empty graph.
+    #[error(
+        "graph source '{graph_source_id}' is {family} graph source, which this build cannot \
+         read: {cause}"
+    )]
+    GraphSourceUnsupported {
+        graph_source_id: String,
+        /// The family, with its article ("an Iceberg"), or the unrecognized
+        /// type ("a 'f:FutureSource'").
+        family: Cow<'static, str>,
+        /// Why: the cargo feature it was compiled without, or that it does
+        /// not recognize the type.
+        cause: Cow<'static, str>,
+    },
 
     /// Object storage denied a read of an external table's data (S3 403 /
     /// `AccessDenied`).
@@ -310,6 +377,16 @@ pub enum QueryError {
     Comparison(#[from] ComparisonError),
 }
 
+/// The tail of a [`QueryError::GraphSourceUnmapped`] message.
+fn unmapped_cause(empty_mapping: &bool) -> &'static str {
+    if *empty_mapping {
+        "has an R2RML mapping that defines no rr:TriplesMap; register it again with a mapping \
+         that defines one"
+    } else {
+        "has no R2RML mapping; register it again with a mapping"
+    }
+}
+
 impl QueryError {
     /// Create a dictionary lookup failure with debug context.
     pub fn dictionary_lookup(msg: impl Into<String>) -> Self {
@@ -357,6 +434,20 @@ impl QueryError {
             Self::UngroupedRead(read) => Self::InvalidQuery(read.named_message(vars)),
             other => other,
         }
+    }
+
+    /// A refusal naming a graph source no query reads as a graph: one with no
+    /// mapping or an empty one, an index, or one this build has no reader for.
+    /// A query that names the source fails with it; a `GRAPH ?g` whose `?g`
+    /// took the source's IRI from data reads it instead as a graph outside the
+    /// dataset, which yields no rows for that binding.
+    pub fn is_unreadable_graph_source(&self) -> bool {
+        matches!(
+            self,
+            Self::GraphSourceUnmapped { .. }
+                | Self::GraphSourceNotAGraph { .. }
+                | Self::GraphSourceUnsupported { .. }
+        )
     }
 
     /// Create an [`Self::R2rmlUnsupportedPattern`] refusal with an actionable

@@ -132,6 +132,127 @@ impl ModelEndpoint {
     }
 }
 
+/// An extraction model reached over HTTP that reads a whole document in one
+/// request: the body is an RDF dataset (the document's text and structure,
+/// the ontology, the catalog) and the answer is an RDF graph anchored to the
+/// text's offsets. Not OpenAI-shaped, so it has a slot of its own.
+///
+/// ```toml
+/// [doc.reader]
+/// url = "https://reader.example/extract"
+/// api_key = "$READER_API_KEY"
+/// auth_header = "X-Api-Key"        # default: Authorization: Bearer <key>
+/// models = ["reader-small", "reader-large"]
+/// ```
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReaderEndpoint {
+    /// The URL a request is POSTed to.
+    pub url: String,
+    /// The credential. A value starting with `$` names an environment
+    /// variable holding it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// The header the credential goes in. `Authorization` (the default)
+    /// sends `Bearer <key>`; any other header sends the key as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    /// The model ids this endpoint serves, as `--model` names them. Sent
+    /// with each request as `X-Fluree-Model`. A list, or one string of
+    /// comma-separated ids (what `fluree config set` writes, and what
+    /// `FLUREE_DOC_READER_MODELS` takes).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_list"
+    )]
+    pub models: Vec<String>,
+    /// What the endpoint may keep between requests that share a prefix
+    /// (`ontology`, `catalog`), sent as `X-Fluree-Cache`; `--cache` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<String>,
+}
+
+/// `["a", "b"]` or `"a, b"`, as a list of trimmed, non-empty ids.
+fn string_or_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Models {
+        One(String),
+        Many(Vec<String>),
+    }
+    let split = |s: &str| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    Ok(match Models::deserialize(d)? {
+        Models::One(s) => split(&s),
+        Models::Many(v) => v.iter().flat_map(|s| split(s)).collect(),
+    })
+}
+
+/// Hand-written for the same reason as [`ModelEndpoint`]'s.
+impl std::fmt::Debug for ReaderEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderEndpoint")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("auth_header", &self.auth_header)
+            .field("models", &self.models)
+            .field("cache", &self.cache)
+            .finish()
+    }
+}
+
+impl ReaderEndpoint {
+    /// The credential to send, with `$VAR` indirection resolved.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        let key = self.api_key.as_deref()?.trim();
+        if key.is_empty() {
+            return None;
+        }
+        if let Some(var) = key.strip_prefix('$') {
+            return std::env::var(var).ok().filter(|v| !v.is_empty());
+        }
+        Some(key.to_string())
+    }
+
+    /// Whether `--model <id>` names a model this endpoint serves.
+    pub fn serves(&self, model: &str) -> bool {
+        self.models.iter().any(|m| m.eq_ignore_ascii_case(model))
+    }
+
+    fn apply_env(&mut self) {
+        let var = |field: &str| std::env::var(format!("FLUREE_DOC_READER_{field}")).ok();
+        if let Some(v) = var("URL") {
+            self.url = v;
+        }
+        if let Some(v) = var("API_KEY") {
+            self.api_key = Some(v);
+        }
+        if let Some(v) = var("AUTH_HEADER") {
+            self.auth_header = Some(v);
+        }
+        if let Some(v) = var("MODELS") {
+            self.models = v
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(v) = var("CACHE") {
+            self.cache = Some(v);
+        }
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+}
+
 /// How extraction is asked and what is kept, per project, so every run
 /// over a corpus makes the same ask. Paths are relative to the project.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -171,6 +292,13 @@ pub struct DocConfig {
     pub vlm: Option<ModelEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction: Option<ExtractionConfig>,
+    /// An HTTP reader serving the extraction models it lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader: Option<ReaderEndpoint>,
+    /// The extraction model `--model` defaults to: one the reader serves,
+    /// or a language model name for `[doc.llm]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl DocConfig {
@@ -186,6 +314,12 @@ impl DocConfig {
             let mut ep = field.take().unwrap_or_default();
             ep.apply_env(slot);
             *field = ep.is_usable().then_some(ep);
+        }
+        let mut reader = self.reader.take().unwrap_or_default();
+        reader.apply_env();
+        self.reader = reader.is_usable().then_some(reader);
+        if let Ok(model) = std::env::var("FLUREE_DOC_MODEL") {
+            self.model = Some(model).filter(|m| !m.trim().is_empty());
         }
         self
     }
@@ -313,6 +447,15 @@ mod tests {
     }
 
     #[test]
+    fn reader_models_take_a_list_or_a_comma_separated_string() {
+        let list: ReaderEndpoint =
+            serde_json::from_str(r#"{"url":"u","models":["a"," b "]}"#).unwrap();
+        assert_eq!(list.models, vec!["a", "b"]);
+        let one: ReaderEndpoint = serde_json::from_str(r#"{"url":"u","models":"a, b,"}"#).unwrap();
+        assert_eq!(one.models, vec!["a", "b"]);
+    }
+
+    #[test]
     fn crop_reader_falls_back_to_llm() {
         let llm = ModelEndpoint {
             url: "u".into(),
@@ -327,6 +470,7 @@ mod tests {
             llm: Some(llm.clone()),
             vlm: None,
             extraction: None,
+            ..Default::default()
         };
         assert_eq!(cfg.crop_reader(), Some(&llm));
     }
@@ -345,6 +489,7 @@ mod tests {
             llm: None,
             vlm: None,
             extraction: None,
+            ..Default::default()
         }
         .fill_from_gateway("https://stack/v1", "tok");
         let emb = cfg.embedding.unwrap();

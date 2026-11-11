@@ -3185,6 +3185,7 @@ mod tests {
             txn_meta: commit.txn_meta.clone(),
             graph_delta: commit.graph_delta.clone(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let mut envelope_bytes = Vec::new();
         encode_envelope_fields(&envelope, &mut envelope_bytes).unwrap();
@@ -3289,6 +3290,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -3323,6 +3325,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -3366,6 +3369,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid1 = store_commit(&storage, &commit1).await;
         ns.publish_commit("test:main", 1, &cid1).await.unwrap();
@@ -3396,6 +3400,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid2 = store_commit(&storage, &commit2).await;
         ns.publish_commit("test:main", 2, &cid2).await.unwrap();
@@ -3424,6 +3429,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -4089,6 +4095,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -4132,6 +4139,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -4684,6 +4692,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -5647,6 +5656,7 @@ mod embedded_tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let mut envelope_bytes = Vec::new();
         encode_envelope_fields(&envelope, &mut envelope_bytes).unwrap();
@@ -5784,6 +5794,7 @@ mod embedded_tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
@@ -5837,6 +5848,7 @@ mod embedded_tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let cid = store_commit(&storage, &commit).await;
         ns.publish_commit("test:main", 1, &cid).await.unwrap();
