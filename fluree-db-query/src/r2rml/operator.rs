@@ -123,14 +123,23 @@ struct PartialParentIndex {
     lookup: ParentLookup,
     /// Every resolved key: in `lookup`, or absent from the parent.
     resolved: HashSet<Vec<String>>,
-    /// Key-filtered parent reads so far.
-    probes: usize,
-    /// Data files those reads were planned to read (when the provider says).
-    files_probed: u64,
+    /// The key-filtered reads each referencing map's windows have made, by
+    /// the map's IRI. The index is shared, but each map's probes are bounded
+    /// on their own ([`Self::worth_probing`]): a probe that is cheap for one
+    /// map stays cheap however much another map has probed.
+    spent: HashMap<String, ProbeSpend>,
     /// Bytes charged to the query's memory budget for `lookup` and
     /// `resolved`, released when the index is given up for a whole read.
     charged: usize,
     source: ParentSource,
+}
+
+/// The key-filtered reads of a parent one referencing map has made.
+#[derive(Debug, Default, Clone, Copy)]
+struct ProbeSpend {
+    probes: usize,
+    /// Data files those reads were planned to read (when the provider says).
+    files: u64,
 }
 
 /// What reading a parent by its join columns takes: everything a
@@ -171,8 +180,7 @@ impl PartialParentIndex {
         Self {
             lookup: ParentLookup::new(),
             resolved: HashSet::new(),
-            probes: 0,
-            files_probed: 0,
+            spent: HashMap::new(),
             charged: 0,
             source,
         }
@@ -245,21 +253,37 @@ impl PartialParentIndex {
             .collect()
     }
 
-    /// Whether reading the parent by these keys can cost less than reading
-    /// it whole. With the keyed read's planned file counts: when it skips
-    /// files, and every keyed read so far plus this one reads fewer files than
-    /// the whole table, so the reads a scan makes before (perhaps) reading the
-    /// parent whole never add up to more than one whole read. Without them:
-    /// once, so a scan whose later window needs more keys reads the parent
-    /// whole after at most one read that did not suffice.
-    fn worth_probing(&self, counts: Option<crate::r2rml::ScanFileCounts>) -> bool {
+    /// Whether reading the parent by these keys, for a window of `map`'s
+    /// rows, can cost less than reading it whole. With the keyed read's
+    /// planned file counts: when it skips files, and every keyed read `map`
+    /// has made so far plus this one reads fewer files than the whole table,
+    /// so the reads a map's windows make before (perhaps) reading the parent
+    /// whole never add up to more than one whole read. Without them: once per
+    /// map, so a map whose later window needs more keys reads the parent whole
+    /// after at most one read that did not suffice.
+    ///
+    /// Counted per map: what another map's probes read is sunk cost, not a
+    /// reason to refuse this one. The choice for this window is between this
+    /// probe and a whole read now, and a probe that skips files is the cheaper
+    /// of the two whatever was read before. The budget only caps how much one
+    /// map's sequence of windows can read before giving up; the worst case is
+    /// one whole read's worth of probes per referencing map, plus one whole
+    /// read, which then serves every map.
+    fn worth_probing(&self, map: &str, counts: Option<crate::r2rml::ScanFileCounts>) -> bool {
+        let spent = self.spent.get(map).copied().unwrap_or_default();
         match counts {
             Some(counts) => {
-                counts.pruned > 0
-                    && self.files_probed + counts.selected < counts.selected + counts.pruned
+                counts.pruned > 0 && spent.files + counts.selected < counts.selected + counts.pruned
             }
-            None => self.probes == 0,
+            None => spent.probes == 0,
         }
+    }
+
+    /// Record a keyed read for `map` planned to read `files` data files.
+    fn spend(&mut self, map: &str, files: u64) {
+        let spent = self.spent.entry(map.to_string()).or_default();
+        spent.probes += 1;
+        spent.files += files;
     }
 
     /// Read the parent rows of `keys` through `filters` (from
@@ -273,11 +297,9 @@ impl PartialParentIndex {
         keys: HashSet<Vec<String>>,
         filters: Vec<crate::r2rml::ScanFilter>,
     ) -> Result<()> {
-        self.probes += 1;
         tracing::debug!(
             parent = %self.source.parent_tm_iri,
             keys = keys.len(),
-            probe = self.probes,
             "R2RML parent: reading the rows of a window's join keys"
         );
         let mut stream = provider
@@ -2011,13 +2033,15 @@ impl R2rmlScanOperator {
     /// each parent `joins` names (the window's map's), by each of the columns
     /// it names. The keys not yet resolved are probed when there are few
     /// enough to push and a keyed read is worth it
-    /// ([`PartialParentIndex::worth_probing`]); otherwise the parent is read
-    /// whole once and the index becomes complete, so a scan never reads a
-    /// parent whole more than once.
+    /// ([`PartialParentIndex::worth_probing`], counted for `map`, the
+    /// window's); otherwise the parent is read whole once and the index
+    /// becomes complete for every map, so a scan never reads a parent whole
+    /// more than once.
     async fn resolve_parent_keys(
         &mut self,
         ctx: &ExecutionContext<'_>,
         parents: &mut HashMap<LookupCacheKey, ParentIndex>,
+        map: &str,
         joins: &ParentJoins,
         window: &[ColumnBatch],
     ) -> Result<()> {
@@ -2057,8 +2081,8 @@ impl R2rmlScanOperator {
                         parent_as_of_t(ctx),
                     )
                     .await?;
-                if partial.worth_probing(counts) {
-                    partial.files_probed += counts.map_or(0, |c| c.selected);
+                if partial.worth_probing(map, counts) {
+                    partial.spend(map, counts.map_or(0, |c| c.selected));
                     probe = Some((keys, filters));
                 }
             }
@@ -2078,7 +2102,7 @@ impl R2rmlScanOperator {
                 None => {
                     tracing::debug!(
                         parent = %partial.source.parent_tm_iri,
-                        probes = partial.probes,
+                        map,
                         "R2RML parent: reading the parent whole"
                     );
                     let source = partial.source.clone();
@@ -2185,6 +2209,7 @@ impl R2rmlScanOperator {
                 self.resolve_parent_keys(
                     ctx,
                     &mut progress.parents,
+                    &progress.tms[i].tm_iri,
                     &progress.tms[i].parent_joins,
                     &window,
                 )
@@ -5822,9 +5847,9 @@ mod tests {
         /// Two maps reference one parent by the same parent column, each
         /// through a column of its own table, over several child windows: the
         /// probe-built index carried from one window's scan to the next serves
-        /// both maps, by each map's own columns. With file counts each window
-        /// probes only what is new; without, the shared index allows one probe
-        /// and then reads the parent whole once, for both maps.
+        /// both maps, by each map's own columns, and each window probes only
+        /// what is new. Each map gets its own probe (the budget without file
+        /// counts is one probe per map).
         #[test]
         fn two_maps_to_one_parent_resolve_their_own_keys_across_child_windows() {
             let tables = |files: bool| {
@@ -5892,12 +5917,87 @@ mod tests {
                 [strings(&["1", "2", "3"]), strings(&["4", "5", "90"])],
                 "each map's keys are probed once, in the first window"
             );
-            let without_counts = probes(false);
+            assert_eq!(
+                probes(false),
+                [strings(&["1", "2", "3"]), strings(&["4", "5", "90"])],
+                "one probe per map"
+            );
+        }
+
+        /// A map's probes are refused by its own budget, never by another
+        /// map's: map B keeps probing while its own reads stay under the whole
+        /// table (10 files) although A's and B's together do not, and is
+        /// refused only once B's alone would reach it.
+        #[test]
+        fn a_map_is_refused_a_probe_by_its_own_budget_only() {
+            let customers = customers_map();
+            let mut index = PartialParentIndex::new(
+                ParentSource::new(&customers, vec!["ID".to_string()]).unwrap(),
+            );
+            let counts = |selected| {
+                Some(crate::r2rml::ScanFileCounts {
+                    selected,
+                    pruned: 10 - selected,
+                })
+            };
+            assert!(index.worth_probing("A", counts(6)));
+            index.spend("A", 6);
             assert!(
-                without_counts == [vec![], strings(&["1", "2", "3"])]
-                    || without_counts == [vec![], strings(&["4", "5", "90"])],
-                "one probe (the first map's keys), then one whole read serving both maps: \
-                 {without_counts:?}"
+                index.worth_probing("B", counts(4)),
+                "A's six files are not B's"
+            );
+            index.spend("B", 4);
+            assert!(index.worth_probing("B", counts(5)), "B: 4 + 5 < 10");
+            index.spend("B", 5);
+            assert!(
+                !index.worth_probing("B", counts(1)),
+                "B: 9 + 1 reaches the whole"
+            );
+            assert!(index.worth_probing("A", counts(3)), "A: 6 + 3 < 10");
+            assert!(
+                !index.worth_probing("A", counts(4)),
+                "A: 6 + 4 reaches the whole"
+            );
+            assert!(
+                !index.worth_probing("C", counts(10)),
+                "a read that skips no file"
+            );
+            // Without file counts: one probe per map.
+            assert!(index.worth_probing("C", None));
+            index.spend("C", 0);
+            assert!(!index.worth_probing("C", None));
+            assert!(index.worth_probing("D", None));
+        }
+
+        /// The probe budget is each map's own: here each map's keyed read
+        /// skips files and reads fewer than the whole parent, but the two
+        /// together read all of it. Each probes; neither is pushed into a
+        /// whole read, which would cost far more than its own probe, by what
+        /// the other map spent.
+        #[test]
+        fn each_map_referencing_a_parent_keeps_its_own_probe_budget() {
+            let tables = one_file_per_customer(
+                Tables::new(vec![1, 2, 3, 4, 5, 6], (1..=10).collect())
+                    .with_suppliers(vec![7, 8, 9, 10]),
+            );
+            let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                .with_predicate("http://ex/address");
+            let rows = run_pattern(&tables, two_maps_mapping(), pattern, None, None, true);
+            assert_eq!(rows.len(), 10);
+            let mut keys: Vec<Vec<String>> = customer_scans(&tables)
+                .iter()
+                .map(|(_, f)| filtered_keys(f))
+                .collect();
+            keys.sort();
+            let sorted = |ids: std::ops::RangeInclusive<i64>| {
+                let mut keys: Vec<String> = ids.map(|id| id.to_string()).collect();
+                keys.sort();
+                keys
+            };
+            assert_eq!(
+                keys,
+                [sorted(1..=6), sorted(7..=10)],
+                "both probe, no whole read"
             );
         }
     }
