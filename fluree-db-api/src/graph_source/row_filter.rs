@@ -53,6 +53,15 @@ impl LogicalScan {
             .sql_query_for_table(name)
             .ok_or_else(|| format!("no triples map has the logical table '{name}'"))?;
         let select = parse_restricted(sql)?;
+        // Checked here too, not only at registration: a mapping registered by
+        // an address that could not be read then is first checked now.
+        for tm in mapping
+            .triples_maps
+            .values()
+            .filter(|tm| tm.table_name() == Some(name))
+        {
+            check_select_list(mapping, tm, &select)?;
+        }
         Ok(Self {
             table: select.table.clone(),
             select: Some(Arc::new(select)),
@@ -110,13 +119,60 @@ pub(crate) fn check_restricted_queries(compiled: &CompiledR2rmlMapping) -> Resul
     let mut maps: Vec<_> = compiled
         .triples_maps
         .values()
-        .filter_map(|tm| tm.sql_query().map(|sql| (tm.iri.as_str(), sql)))
+        .filter_map(|tm| tm.sql_query().map(|sql| (tm.iri.as_str(), sql, tm)))
         .collect();
-    maps.sort_unstable();
-    for (iri, sql) in maps {
-        parse_restricted(sql).map_err(|e| format!("triples map <{iri}>: {e}"))?;
+    maps.sort_unstable_by_key(|(iri, sql, _)| (*iri, *sql));
+    for (iri, sql, tm) in maps {
+        let select = parse_restricted(sql).map_err(|e| format!("triples map <{iri}>: {e}"))?;
+        check_select_list(compiled, tm, &select)?;
     }
     Ok(())
+}
+
+/// Refuse a select list that leaves out a column the map reads.
+///
+/// In R2RML a query's result columns are the logical table's columns, so a
+/// term map, or a join condition of a map that references this one, can only
+/// name a column the query selects. `SELECT *` selects every column.
+fn check_select_list(
+    compiled: &CompiledR2rmlMapping,
+    tm: &fluree_db_r2rml::mapping::TriplesMap,
+    select: &RestrictedSelect,
+) -> Result<(), String> {
+    let Some(selected) = &select.columns else {
+        return Ok(());
+    };
+    let mut read: Vec<&str> = tm.referenced_columns();
+    for other in compiled.triples_maps.values() {
+        for pom in &other.predicate_object_maps {
+            if let fluree_db_r2rml::mapping::ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                if rom.parent_triples_map == tm.iri {
+                    read.extend(
+                        rom.join_conditions
+                            .iter()
+                            .map(|jc| jc.parent_column.as_str()),
+                    );
+                }
+            }
+        }
+    }
+    read.sort_unstable();
+    read.dedup();
+    let missing: Vec<&str> = read
+        .into_iter()
+        .filter(|column| !selected.iter().any(|s| s == column))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "triples map <{}>: rr:sqlQuery selects {}, but the map reads {}, which it does not \
+         select. A query's result columns are its logical table's columns: add them to the \
+         select list, or use SELECT *",
+        tm.iri,
+        selected.join(", "),
+        missing.join(", "),
+    ))
 }
 
 /// The schema field `column` names, exactly as written.
@@ -479,6 +535,56 @@ mod tests {
         assert_eq!(plain.table, "crm.orders");
         assert!(plain.select.is_none());
         assert!(LogicalScan::resolve(&compiled, "sqlQuery:0000000000000000").is_err());
+    }
+
+    /// A select list is the logical table's columns: a map reading a column it
+    /// leaves out is refused, at registration and when the alias resolves.
+    /// `SELECT *`, and a list naming every column read, register.
+    #[test]
+    fn a_select_list_must_cover_the_columns_the_map_reads() {
+        assert!(check_restricted_queries(&mapping("SELECT * FROM t WHERE a = 1")).is_ok());
+        assert!(
+            check_restricted_queries(&mapping("SELECT customer_id, name FROM t WHERE a = 1"))
+                .is_ok()
+        );
+        let compiled = mapping("SELECT customer_id FROM t WHERE a = 1");
+        let message = check_restricted_queries(&compiled).expect_err("name is not selected");
+        assert!(
+            message.contains("selects customer_id, but the map reads name"),
+            "{message}"
+        );
+        let alias = compiled
+            .triples_maps
+            .values()
+            .next()
+            .unwrap()
+            .table_name()
+            .unwrap();
+        let at_resolve = LogicalScan::resolve(&compiled, alias).expect_err("refused at resolve");
+        assert_eq!(at_resolve, message);
+    }
+
+    /// A map referenced by another reads its join's parent columns too.
+    #[test]
+    fn a_select_list_must_cover_a_referencing_join_parent_column() {
+        let ttl = r#"@base <http://example.org/> .
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+            <#Customer> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "SELECT id FROM crm.customers WHERE is_current = 1" ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] .
+            <#Order> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "crm.orders" ] ;
+                rr:subjectMap [ rr:template "http://example.org/order/{order_id}" ] ;
+                rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [
+                    rr:parentTriplesMap <#Customer> ;
+                    rr:joinCondition [ rr:child "customer_ref" ; rr:parent "customer_key" ] ] ] ."#;
+        let compiled = R2rmlLoader::from_turtle(ttl).unwrap().compile().unwrap();
+        let message = check_restricted_queries(&compiled).expect_err("customer_key not selected");
+        assert!(
+            message.contains("selects id, but the map reads customer_key"),
+            "{message}"
+        );
     }
 
     #[test]
