@@ -287,8 +287,9 @@ proving node.
 
 While the cluster collects, a write that names commits it did not store in the same request is
 refused, since nothing checked them: the nameservice ref endpoint's commit-head push
-(`POST /v1/fluree/nameservice/refs/:alias/commit`, used by ref-based sync), and transfers through the
-library API on a member. Writes through the cluster's transaction, push, merge, rebase and revert
+(`POST /v1/fluree/nameservice/refs/:alias/commit`, used by ref-based sync), which answers `501`
+naming `POST /v1/fluree/push/{ledger}` to use instead, and transfers through the library API on a
+member. Writes through the cluster's transaction, push, merge, rebase and revert
 endpoints, archive restores and named-graph drops are checked and accepted.
 
 A member hands out a ledger's raw history (clones, pulls, commit pages, object requests,
