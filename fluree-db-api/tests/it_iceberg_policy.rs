@@ -1613,7 +1613,7 @@ async fn sources_with_model(
             .mount()
             .await;
         let mut cfg = fluree_db_api::SqlCreateConfig::new(
-            &format!("{name}-sql"),
+            format!("{name}-sql"),
             server.uri(),
             PEOPLE_R2RML.to_string(),
         );
@@ -1680,7 +1680,7 @@ async fn graph_scope_rows_match_direct(
         ),
     ];
     let mut wrong = Vec::new();
-    for (label, q) in shapes.iter_mut() {
+    for (label, q) in &mut shapes {
         q["@context"] = context();
         q["select"] = json!(["?s", "?n"]);
         if let Some(o) = &opts {
