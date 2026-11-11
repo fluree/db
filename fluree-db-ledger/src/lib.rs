@@ -1223,6 +1223,19 @@ impl LedgerState {
         }
     }
 
+    /// Apply a commit's drops, then the revivals its graph delta records,
+    /// ahead of its flakes. The caller must register the envelope's graphs
+    /// first and hide dropped graphs from its concrete index store afterward.
+    /// Shared by peer catch-up and commit transfer.
+    pub fn apply_commit_graph_lifecycle(&mut self, commit: &Commit) {
+        let dropped = self
+            .snapshot
+            .graph_registry
+            .graph_ids_of_drops(&commit.graph_drops);
+        self.apply_graph_drops(&dropped, commit.t);
+        self.revive_graphs(commit.graph_delta.values().map(String::as_str), commit.t);
+    }
+
     /// Apply a single commit to the existing ledger state (incremental update).
     ///
     /// This is the fast path for `UpdatePlan::CommitCatchUp` — loads one commit's
@@ -1279,10 +1292,6 @@ impl LedgerState {
             }
         }
 
-        // Collect graph IRIs from graph_delta
-        let graph_iris: std::collections::HashSet<String> =
-            commit.graph_delta.values().cloned().collect();
-
         // Apply ns_split_mode first (immutable after user namespace allocation).
         // Must happen before apply_envelope_deltas so that a genesis commit
         // declaring a non-default mode doesn't fail the immutability check
@@ -1293,15 +1302,10 @@ impl LedgerState {
 
         // Apply namespace + graph deltas to snapshot
         Arc::make_mut(&mut self.snapshot)
-            .apply_envelope_deltas(&commit.namespace_delta, &graph_iris)?;
+            .apply_envelope_deltas(&commit.namespace_delta, commit.graph_delta.values())?;
         // Then the commit's drops, ahead of its own flakes, and the dropped
         // graphs it writes again.
-        let dropped = self
-            .snapshot
-            .graph_registry
-            .graph_ids_of_drops(&commit.graph_drops);
-        self.apply_graph_drops(&dropped, commit_t);
-        self.revive_graphs(graph_iris.iter().map(String::as_str), commit_t);
+        self.apply_commit_graph_lifecycle(&commit);
 
         // Generate commit metadata flakes
         let mut meta_flakes = generate_commit_flakes(&commit, ledger_id, commit_t);

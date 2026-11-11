@@ -33,8 +33,8 @@ use crate::ast::annotation::{Annotation, AnnotationVerb, ReifierId, TripleTerm};
 use crate::ast::pattern::{ServiceEndpoint, SubSelect};
 use crate::ast::query::DescribeTarget;
 use crate::ast::{
-    BlankNode, BlankNodeValue, Expression, GraphName, GraphPattern, GroupCondition, Iri, IriValue,
-    Literal, LiteralValue, OrderExpr, PredicateTerm, QuadPatternElement, QueryBody, QuotedTriple,
+    BlankNode, Expression, GraphName, GraphPattern, GroupCondition, Iri, IriValue, Literal,
+    LiteralValue, OrderExpr, PredicateTerm, QuadPatternElement, QueryBody, QuotedTriple,
     SelectVariable, SelectVariables, SolutionModifiers, SparqlAst, SubjectTerm, Term,
     TriplePattern, UpdateOperation, Var, VarOrIri,
 };
@@ -734,12 +734,7 @@ impl<'p> Substitution<'p> {
                 crate::parse::expr::triple_term_to_expr(stored_nodes_named(*triple))
                     .map_err(|reason| ParamError::new(&var.name, reason))
             }
-            Term::BlankNode(node) => stored_node_iri(&node).map(Expression::Iri).ok_or_else(|| {
-                ParamError::new(
-                    &var.name,
-                    "is a blank node, which can't be used in an expression",
-                )
-            }),
+            Term::BlankNode(node) => Ok(Expression::Iri(stored_node_iri(&node))),
             _ => Err(ParamError::new(&var.name, "can't be used in an expression")),
         }
     }
@@ -792,27 +787,19 @@ impl<'p> Substitution<'p> {
     }
 }
 
-/// A stored node's `_:fdb-…` id as an IRI term; `None` for an anonymous node.
-fn stored_node_iri(node: &BlankNode) -> Option<Iri> {
-    match &node.value {
-        BlankNodeValue::Labeled(label) => Some(Iri::full(format!("_:{label}"), node.span)),
-        BlankNodeValue::Anon => None,
-    }
+/// A stored node's `_:fdb-…` id as an IRI term.
+fn stored_node_iri(node: &BlankNode) -> Iri {
+    Iri::full(format!("_:{}", node.label), node.span)
 }
 
 /// `triple` with each stored node in it, nested triple terms included, named
 /// by its `_:fdb-…` id.
 fn stored_nodes_named(mut triple: TripleTerm) -> TripleTerm {
     if let SubjectTerm::BlankNode(node) = &triple.subject {
-        if let Some(iri) = stored_node_iri(node) {
-            triple.subject = SubjectTerm::Iri(iri);
-        }
+        triple.subject = SubjectTerm::Iri(stored_node_iri(node));
     }
     triple.object = match triple.object {
-        Term::BlankNode(node) => match stored_node_iri(&node) {
-            Some(iri) => Term::Iri(iri),
-            None => Term::BlankNode(node),
-        },
+        Term::BlankNode(node) => Term::Iri(stored_node_iri(&node)),
         Term::TripleTerm(inner) => Term::TripleTerm(Box::new(stored_nodes_named(*inner))),
         other => other,
     };
@@ -917,7 +904,7 @@ mod tests {
             matches!(objects[3], Term::Iri(Iri { value: crate::ast::IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/x")
         );
         assert!(
-            matches!(objects[4], Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+            matches!(objects[4], Term::BlankNode(BlankNode { label: l, .. }) if l.as_ref() == "fdb-1")
         );
         assert!(
             matches!(objects[5], Term::Literal(Literal { value: LiteralValue::Typed { value, .. }, .. }) if value.as_ref() == "2024-01-02")
@@ -1023,7 +1010,7 @@ mod tests {
             panic!("expected a nested triple term, got {:?}", outer.object)
         };
         assert!(
-            matches!(&inner.subject, SubjectTerm::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+            matches!(&inner.subject, SubjectTerm::BlankNode(BlankNode { label: l, .. }) if l.as_ref() == "fdb-1")
         );
         assert!(matches!(
             &inner.object,
@@ -1071,7 +1058,7 @@ mod tests {
             matches!(&patterns[0].object, Term::Iri(Iri { value: IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/x")
         );
         assert!(
-            matches!(&patterns[1].object, Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+            matches!(&patterns[1].object, Term::BlankNode(BlankNode { label: l, .. }) if l.as_ref() == "fdb-1")
         );
     }
 
