@@ -440,6 +440,7 @@ impl Fluree {
             let key = FactKey::of(flake);
             let (asserted, removal) = current.iter().find(|(f, _)| FactKey::of(f) == key)?;
             Some(Removal {
+                requester: None,
                 request_id: removal.request_id.clone(),
                 commit: cid.to_string(),
                 slot,
@@ -472,6 +473,7 @@ async fn removed_spans<'a>(
     let ended = ends
         .into_iter()
         .map(|end| Removal {
+            requester: None,
             request_id: end.by.request_id.clone(),
             commit: end.commit.to_string(),
             slot: end.slot,

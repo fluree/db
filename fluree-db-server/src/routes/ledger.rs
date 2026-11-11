@@ -1118,13 +1118,15 @@ pub async fn info_ledger_tail(
 
 /// Remove selected occurrences from what a ledger serves: current and
 /// historical application queries stop returning them, and raw commits that
-/// hold them become audit data. Admin-protected; a peer forwards it to the
-/// transaction server.
+/// hold them become audit data. Admin-protected; the admin token's identity
+/// is recorded with each removal. A peer forwards it to the transaction
+/// server.
 ///
 /// POST /fluree/remove/<ledger...>
 pub async fn remove_occurrences_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
+    principal: Option<axum::Extension<crate::routes::admin_auth::AdminPrincipal>>,
     request: Request,
 ) -> Result<Response> {
     if state.config.server_role == ServerRole::Peer {
@@ -1134,9 +1136,10 @@ pub async fn remove_occurrences_tail(
     let cell = Arc::new(std::sync::OnceLock::new());
     let _ = cell.set(Arc::clone(&state.committer));
     let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
+    let requester = principal.map(|axum::Extension(p)| p.identity.unwrap_or(p.issuer));
     let receipt = state
         .fluree
-        .remove_occurrences_with(&writer, &ledger, request)
+        .remove_occurrences_by(&writer, &ledger, request, requester)
         .await
         .map_err(ServerError::Api)?;
     Ok(Json(receipt).into_response())
@@ -2721,7 +2724,6 @@ pub async fn revert_preview(
     .await
 }
 
-/// Forward a transaction request to the transaction server (peer mode)
 /// The JSON body of `request`.
 async fn json_body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T> {
     let bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
@@ -2731,6 +2733,7 @@ async fn json_body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T
         .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))
 }
 
+/// Forward a transaction request to the transaction server (peer mode)
 pub(super) async fn forward_write_request(state: &AppState, request: Request) -> Response {
     let client = match state.forwarding_client.as_ref() {
         Some(c) => c,

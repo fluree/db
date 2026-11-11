@@ -80,12 +80,18 @@ async fn authenticated_shape_passes_the_auth_gate() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// The sweep deletes index artifacts, so both its forms must sit behind the
-/// same outer auth gate as every other admin write rather than relying on
-/// route matching alone.
+/// The sweep deletes index artifacts, and a removal or an erasure takes
+/// history out of what a ledger serves, so each must sit behind the same
+/// outer auth gate as every other admin write rather than relying on route
+/// matching alone.
 #[tokio::test]
-async fn unauthenticated_sweep_is_rejected_before_downstream_work() {
-    for uri in ["/v1/fluree/sweep", "/v1/fluree/sweep/plan"] {
+async fn unauthenticated_sweep_and_removal_are_rejected_before_downstream_work() {
+    for uri in [
+        "/v1/fluree/sweep",
+        "/v1/fluree/sweep/plan",
+        "/v1/fluree/remove/test:main",
+        "/v1/fluree/erase/test:main",
+    ] {
         let (_tmp, state) = state_with_admin_auth_required().await;
 
         let resp = build_router(state)

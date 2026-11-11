@@ -49,12 +49,12 @@ impl StorageProxyPrincipal {
         self.storage_all || !self.storage_ledgers.is_empty()
     }
 
-    /// Check if principal is authorized for a specific ledger alias
     /// Audit-log access to `alias`; storage scopes do not imply it.
     pub fn can_audit(&self, alias: &fluree_db_api::LedgerId) -> bool {
         self.audit_all || self.audit_ledgers.contains(alias)
     }
 
+    /// Check if principal is authorized for a specific ledger alias
     pub fn is_authorized_for_ledger(&self, alias: &fluree_db_api::LedgerId) -> bool {
         self.storage_all || self.storage_ledgers.contains(alias)
     }

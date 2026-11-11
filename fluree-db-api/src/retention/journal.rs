@@ -128,6 +128,10 @@ pub struct Removal {
     /// subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Who asked for the removal, as the server authenticated them: audit
+    /// data, as the removal is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<String>,
 }
 
 impl Removal {
@@ -406,6 +410,7 @@ mod tests {
     #[test]
     fn what_a_base_lacks_is_what_merging_adds() {
         let removal = |slot| Removal {
+            requester: None,
             request_id: "r".into(),
             commit: "bafy".into(),
             slot,
@@ -452,6 +457,7 @@ mod tests {
     #[test]
     fn a_known_subject_is_merged_in_and_never_lost() {
         let removal = |subject: Option<&str>| Removal {
+            requester: None,
             request_id: "r".into(),
             commit: "bafy".into(),
             slot: 3,
@@ -490,6 +496,7 @@ mod tests {
     #[test]
     fn merging_repeated_incoming_occurrences_preserves_order_and_subject_checks() {
         let removal = |commit: &str, slot, subject: Option<&str>| Removal {
+            requester: None,
             request_id: "first".into(),
             commit: commit.into(),
             slot,
@@ -506,6 +513,7 @@ mod tests {
                 removal("b", 1, None),
                 removal("a", 2, None),
                 Removal {
+                    requester: None,
                     request_id: "later".into(),
                     ..removal("a", 1, Some("subject"))
                 },
@@ -537,6 +545,7 @@ mod tests {
             generation: 2,
             history_rules: vec![rule(0, None)],
             removals: vec![Removal {
+                requester: None,
                 request_id: "r1".into(),
                 commit: "bafy".into(),
                 slot: 4,

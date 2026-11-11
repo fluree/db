@@ -351,6 +351,60 @@ fn select(subject: &str, object: Option<JsonValue>) -> fluree_db_api::retention:
     }
 }
 
+/// A removal records who asked with each occurrence it removes, as an
+/// erasure records its requester: audit data, which status shows only to
+/// an auditor.
+#[tokio::test]
+async fn a_removal_records_who_asked() {
+    use fluree_db_api::retention::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
+    struct Direct<'a>(&'a Fluree);
+    #[async_trait::async_trait]
+    impl RetentionWriter for Direct<'_> {
+        async fn submit(
+            &self,
+            ledger_id: &str,
+            batch: RetentionBatch,
+        ) -> fluree_db_api::Result<SubmitOutcome> {
+            outcome_of(self.0.commit_retention_batch(ledger_id, batch).await)
+        }
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-requester").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences_by(
+            &Direct(&fluree),
+            &id,
+            select("alice", None),
+            Some("did:key:z6MkAdmin".into()),
+        )
+        .await
+        .expect("remove");
+    let status = fluree.retention_status(&id).await.expect("status");
+    let removals = &status
+        .registration
+        .as_ref()
+        .expect("registered")
+        .journal
+        .removals;
+    assert!(!removals.is_empty());
+    assert!(removals
+        .iter()
+        .all(|r| r.requester.as_deref() == Some("did:key:z6MkAdmin")));
+    let redacted = status.without_audit_data();
+    assert!(redacted
+        .registration
+        .expect("registered")
+        .journal
+        .removals
+        .is_empty());
+}
+
 #[tokio::test]
 async fn removing_one_occurrence_preserves_the_others() {
     let fluree = FlureeBuilder::memory().build_memory();

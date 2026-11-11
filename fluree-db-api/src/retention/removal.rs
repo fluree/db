@@ -166,9 +166,29 @@ impl Fluree {
         ledger_id: &str,
         request: RemovalRequest,
     ) -> Result<RemovalReceipt> {
-        self.remove_widened(writer, ledger_id, &request, Widening::default())
+        self.remove_occurrences_by(writer, ledger_id, request, None)
             .await
-            .map(|r| r.receipt)
+    }
+
+    /// [`Self::remove_occurrences_with`], recording `requester`, the
+    /// identity that asked as the caller authenticated it, with each
+    /// removal: audit data, as the removal is.
+    pub async fn remove_occurrences_by(
+        &self,
+        writer: &dyn RetentionWriter,
+        ledger_id: &str,
+        request: RemovalRequest,
+        requester: Option<String>,
+    ) -> Result<RemovalReceipt> {
+        self.remove_widened(
+            writer,
+            ledger_id,
+            &request,
+            Widening::default(),
+            requester.as_deref(),
+        )
+        .await
+        .map(|r| r.receipt)
     }
 
     /// [`Self::remove_occurrences_with`], widened as `widening` says.
@@ -178,6 +198,7 @@ impl Fluree {
         ledger_id: &str,
         request: &RemovalRequest,
         widening: Widening,
+        requester: Option<&str>,
     ) -> Result<Removed> {
         if request.occurrences.is_empty() && request.matching.is_empty() {
             return Err(ApiError::http(
@@ -258,7 +279,7 @@ impl Fluree {
             }
 
             let request_id = request_id(&ledger_id, scope_t, &located);
-            let removals = entries(&read, &request_id, &located, &spans, retracted_t);
+            let removals = entries(&read, &request_id, &located, &spans, retracted_t, requester);
             let properties = removals.iter().map(|r| r.predicate.clone()).collect();
             let registration = self
                 .record_removals(&ledger_id, read.since(), removals)
@@ -320,7 +341,7 @@ impl Fluree {
                 Err(e) => return Err(e),
             };
             let request_id = request_id(&ledger_id, read.scope_t, &found.located);
-            let removals = entries(&read, &request_id, &found.located, &found.spans, None);
+            let removals = entries(&read, &request_id, &found.located, &found.spans, None, None);
             return Ok(Some(ReceivedRemoval {
                 ledger_id,
                 since: read.since(),
@@ -685,6 +706,7 @@ fn entries(
     located: &[Located],
     spans: &[(i64, Option<i64>)],
     retracted_t: Option<i64>,
+    requester: Option<&str>,
 ) -> Vec<Removal> {
     let snapshot = &read.state.snapshot;
     located
@@ -701,6 +723,7 @@ fn entries(
             subject: snapshot
                 .decode_sid(&loc.flake.s)
                 .map(|iri| super::journal::subject_fingerprint(&iri)),
+            requester: requester.map(str::to_string),
         })
         .collect()
 }

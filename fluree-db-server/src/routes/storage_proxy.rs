@@ -1072,11 +1072,6 @@ mod tests {
     use super::*;
     use fluree_db_core::DictKind;
 
-    /// Direct pin of the object-endpoint kind allowlist. The integration
-    /// tests exercise the endpoint end-to-end, but a re-widened allowlist
-    /// could still 404 there for downstream reasons (unresolvable gs id,
-    /// missing bytes) — this asserts the gate itself, so serving a new kind
-    /// is always a deliberate edit here plus #1539-style design work.
     /// On a ledger with a removal, every kind served but its config is audit
     /// data.
     #[test]
@@ -1099,6 +1094,11 @@ mod tests {
         assert!(!is_audit_kind(ContentKind::LedgerConfig));
     }
 
+    /// Direct pin of the object-endpoint kind allowlist. The integration
+    /// tests exercise the endpoint end-to-end, but a re-widened allowlist
+    /// could still 404 there for downstream reasons (unresolvable gs id,
+    /// missing bytes) — this asserts the gate itself, so serving a new kind
+    /// is always a deliberate edit here plus #1539-style design work.
     #[test]
     fn object_kind_allowlist_pins_served_and_excluded_kinds() {
         for kind in [

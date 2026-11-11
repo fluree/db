@@ -891,6 +891,7 @@ mod tests {
 
     fn removal(n: usize) -> Removal {
         Removal {
+            requester: None,
             request_id: "removal-1".into(),
             commit: format!("commit-{n}"),
             slot: n as u32,

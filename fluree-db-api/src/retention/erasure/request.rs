@@ -157,8 +157,15 @@ impl Fluree {
         self.refuse_spelled(&ledger_id, &branches, &removal_request)
             .await?;
         let mut removed = Accepted::default();
-        self.remove_on(writer, &branches, &removal_request, true, &mut removed)
-            .await?;
+        self.remove_on(
+            writer,
+            &branches,
+            &removal_request,
+            requester.as_deref(),
+            true,
+            &mut removed,
+        )
+        .await?;
         for round in 0.. {
             // Other ledgers holding the same commits, such as copies restored
             // from an archive, read the replacements too: the occurrences
@@ -188,8 +195,15 @@ impl Fluree {
                         .collect(),
                     matching: Vec::new(),
                 };
-                self.remove_on(writer, &copies, &named, false, &mut removed)
-                    .await?;
+                self.remove_on(
+                    writer,
+                    &copies,
+                    &named,
+                    requester.as_deref(),
+                    false,
+                    &mut removed,
+                )
+                .await?;
                 branches.extend(copies);
             }
             // The admission lock is this process's: on a cluster another
@@ -227,8 +241,15 @@ impl Fluree {
                     ),
                 ));
             }
-            self.remove_on(writer, &appeared, &removal_request, false, &mut removed)
-                .await?;
+            self.remove_on(
+                writer,
+                &appeared,
+                &removal_request,
+                requester.as_deref(),
+                false,
+                &mut removed,
+            )
+            .await?;
             branches.extend(appeared);
         }
         let Accepted {
@@ -318,6 +339,7 @@ impl Fluree {
         writer: &dyn RetentionWriter,
         branches: &[String],
         request: &RemovalRequest,
+        requester: Option<&str>,
         requested: bool,
         into: &mut Accepted,
     ) -> Result<()> {
@@ -333,7 +355,10 @@ impl Fluree {
                 skip_foreign: !requested,
                 bounded: false,
             };
-            let removed = match self.remove_widened(writer, branch, request, widening).await {
+            let removed = match self
+                .remove_widened(writer, branch, request, widening, requester)
+                .await
+            {
                 Ok(removed) => removed,
                 // Nothing of the request on this other branch.
                 Err(e) if !requested && (e.is_not_found() || e.status_code() == 404) => continue,

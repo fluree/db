@@ -636,6 +636,7 @@ mod tests {
 
     fn removal(subject: Option<&str>, commit: &str) -> Removal {
         Removal {
+            requester: None,
             request_id: "r".into(),
             commit: commit.into(),
             slot: 0,
