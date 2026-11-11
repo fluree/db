@@ -660,6 +660,13 @@ an Iceberg graph source:
   subjects the same way.
 - A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
   its row order can differ from one run to the next. The rows are the same.
+- The fixed order has a cost where the data files differ widely in size: the
+  reads still overlap, but rows are taken in file order, not as each read
+  finishes. It shows most on a query that must read the whole table before its
+  `LIMIT` applies, such as a grouped one: over a table with uneven files, a
+  grouped query with a `LIMIT` measured about 13% slower than reading in
+  completion order. Any `LIMIT` or `OFFSET` takes the fixed order, with or
+  without an `ORDER BY`.
 - Pages hold together only while the table does: an append or compaction between
   two page requests changes the snapshot, and with it the order. For paging that
   must survive table changes, order by a unique key (`ORDER BY ?id`).
