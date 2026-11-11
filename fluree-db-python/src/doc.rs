@@ -457,8 +457,9 @@ fn exchange_key(
                 .and_then(|v| v.as_str())
                 .unwrap_or("the API key was refused")
         );
+        // A 401 never gets here (a developer key, above).
         return Err(match status {
-            401 | 403 => ReadError::Refused { status, message },
+            403 => ReadError::Refused { status, message },
             _ => ReadError::Other(message),
         });
     };
