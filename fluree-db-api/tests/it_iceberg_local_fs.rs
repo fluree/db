@@ -3438,6 +3438,70 @@ async fn order_by_limit_over_a_scan_its_input_binds_answers_the_bound_rows() {
     );
 }
 
+/// A scan-side top-k counts the rows it reads, so it runs only over a map
+/// whose rows cannot repeat a triple. `people_window` declares no key: the
+/// top-k is declined and every file is read, to the same answer the keyed
+/// map gives after reading only the file holding the top ids.
+#[tokio::test]
+async fn a_top_k_over_a_keyless_map_reads_every_file() {
+    allow_fixture_roots();
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let keyed = keyed_by_id(WINDOW_PEOPLE_R2RML, "silver.people_window");
+    for (name, mapping) in [
+        ("topk-keyless", WINDOW_PEOPLE_R2RML),
+        ("topk-keyed", keyed.as_str()),
+    ] {
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, &location, mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+    }
+    for (name, prunes) in [("topk-keyless", false), ("topk-keyed", true)] {
+        let before = store.find_events("scan-side top-k prune").len();
+        let sparql = format!(
+            "SELECT ?id FROM <{name}:main> WHERE {{ ?s <http://example.org/id> ?id }} \
+             ORDER BY DESC(?id) LIMIT 2"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+        assert_eq!(answer_ids(&result), [3000, 2999], "{name}: {result}");
+        let jsonld = serde_json::json!({
+            "from": format!("{name}:main"),
+            "select": ["?id"],
+            "where": {"@id": "?s", "http://example.org/id": "?id"},
+            "orderBy": "(desc ?id)",
+            "limit": 2,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {name}: {e}"));
+        assert_eq!(
+            answer_ids(&result),
+            [3000, 2999],
+            "JSON-LD {name}: {result}"
+        );
+        let pruned = store.find_events("scan-side top-k prune")[before..]
+            .iter()
+            .any(|e| e.fields.get("files_pruned").is_some_and(|n| n != "0"));
+        assert_eq!(pruned, prunes, "{name}: whether the top-k pruned files");
+    }
+}
+
 /// `ORDER BY … LIMIT k` over a scan whose rows are joined to its input (a
 /// `VALUES` block, here) answers the top k of the JOINED rows. The scan-side
 /// top-k keeps the k best rows the reader returns and skips every file that

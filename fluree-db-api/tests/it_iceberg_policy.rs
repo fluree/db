@@ -1120,32 +1120,35 @@ async fn graph_scoped_builder_enforces_governed_source() {
 /// (a `double` bound does not sort as the plain literals an un-annotated
 /// column maps to) and only over a map whose rows cannot repeat a triple, so
 /// `topk-people` declares the score's datatype and the table's key: it is
-/// the source the top-k would prune.
+/// the source the top-k would prune. `topk-people-keyless` declares the
+/// datatype alone and pins the decline over a map with no key.
 ///
 /// Selects only `?s`: the fixture's scores differ from the native twin's, but
 /// the rank order is identical, so the top-k subject set must match.
 #[tokio::test]
 async fn topk_limit_is_declined_under_view_policy() {
     const TOPK_GS: &str = "topk-people:main";
+    const TOPK_KEYLESS: &str = "topk-people-keyless:main";
     let fluree = setup().await;
-    let topk_mapping = PEOPLE_R2RML
-        .replace(
-            r#"rr:tableName "silver.people" ]"#,
-            r#"rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#,
-        )
-        .replace(
-            r#"rr:objectMap [ rr:column "score" ]"#,
-            r#"rr:objectMap [ rr:column "score" ; rr:datatype <http://www.w3.org/2001/XMLSchema#double> ]"#,
-        );
-    assert_eq!(topk_mapping.matches("db#key").count(), 1);
-    assert_eq!(topk_mapping.matches("XMLSchema#double").count(), 1);
-    fluree
-        .create_r2rml_graph_source(
-            R2rmlCreateConfig::new_direct("topk-people", table_location(), topk_mapping)
-                .with_mapping_media_type("text/turtle"),
-        )
-        .await
-        .expect("create graph source");
+    let typed = PEOPLE_R2RML.replace(
+        r#"rr:objectMap [ rr:column "score" ]"#,
+        r#"rr:objectMap [ rr:column "score" ; rr:datatype <http://www.w3.org/2001/XMLSchema#double> ]"#,
+    );
+    let keyed = typed.replace(
+        r#"rr:tableName "silver.people" ]"#,
+        r#"rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#,
+    );
+    assert_eq!(typed.matches("XMLSchema#double").count(), 1);
+    assert_eq!(keyed.matches("db#key").count(), 1);
+    for (name, mapping) in [("topk-people", keyed), ("topk-people-keyless", typed)] {
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, table_location(), mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+    }
     let policies = vec![deny(
         "ex:hide-top",
         on_subject("http://example.org/person/5"),
@@ -1207,6 +1210,18 @@ async fn topk_limit_is_declined_under_view_policy() {
             .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
         "unpoliced, the top-k must prune the alice file: {:?}",
         prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
+    );
+    // The same typed map without the key declines the top-k even unpoliced:
+    // its rows could repeat a triple, which the bound would count twice.
+    let before = store.find_events("scan-side top-k prune").len();
+    assert_eq!(
+        run_topk(TOPK_KEYLESS, Vec::new(), 1).await,
+        "[[\"http://example.org/person/5\"]]",
+        "unpoliced top-1 over the keyless source"
+    );
+    assert!(
+        store.find_events("scan-side top-k prune")[before..].is_empty(),
+        "the keyless source must decline the top-k"
     );
 }
 

@@ -592,6 +592,13 @@ enum JoinPlan {
 struct MapSolutions {
     /// No two of the map's rows yield the same solution of the pattern and no
     /// row yields one twice: the map's rows are its solutions.
+    ///
+    /// This, and not the absence of deduplication, is what a scan-side top-k
+    /// needs. Its bound rests on k rows the map has read; when those are k
+    /// distinct solutions, each is in the pass's deduplicated answer whichever
+    /// map's copy is kept, so a row the bound prunes ranks below k solutions
+    /// of the answer and cannot be in its top k. A map whose rows can repeat
+    /// a solution has no such k, and declines.
     rows_distinct: bool,
     /// The map's solutions go through the pass's [`ScanProgress::seen`] set:
     /// its rows are not its solutions, or another map in the pass can yield
