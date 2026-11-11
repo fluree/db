@@ -205,24 +205,30 @@ fn rfc3339_ms(text: &str) -> Option<i64> {
         .map(|d| d.timestamp_millis())
 }
 
-/// When `commit`'s relative lifetimes start: the original's write time on a
-/// replay ([`db::LIFETIME_START`]), otherwise the commit's own time.
-pub(crate) fn lifetime_start(commit: &Commit) -> Option<&str> {
-    commit
-        .txn_meta
-        .iter()
-        .find_map(|e| match (&*e.predicate_name, &e.value) {
-            (
-                db::LIFETIME_START,
-                TxnMetaValue::TypedLiteral { value, .. } | TxnMetaValue::String(value),
-            ) if e.predicate_ns == FLUREE_DB => Some(value.as_str()),
-            _ => None,
-        })
-        .or(commit.time.as_deref())
-}
-
-fn lifetime_start_ms(commit: &Commit) -> Option<i64> {
-    lifetime_start(commit).and_then(rfc3339_ms)
+/// When `commit`'s relative lifetimes start (epoch ms): when its write
+/// arrived. That is the original's on a replay ([`db::LIFETIME_START`]), the
+/// commit's `db:receivedAt` where it records one (a write with a backdated
+/// event time counts from its arrival, not from that time), and otherwise
+/// its time.
+pub(crate) fn lifetime_start_ms(commit: &Commit) -> Option<i64> {
+    let entry = |name: &str| {
+        commit
+            .txn_meta
+            .iter()
+            .find(|e| e.predicate_ns == FLUREE_DB && *e.predicate_name == *name)
+            .map(|e| &e.value)
+    };
+    let replayed = entry(db::LIFETIME_START).and_then(|v| match v {
+        TxnMetaValue::TypedLiteral { value, .. } | TxnMetaValue::String(value) => rfc3339_ms(value),
+        _ => None,
+    });
+    let received = || match entry(db::RECEIVED_AT) {
+        Some(TxnMetaValue::Long(ms)) => Some(*ms),
+        _ => None,
+    };
+    replayed
+        .or_else(received)
+        .or_else(|| commit.time.as_deref().and_then(rfc3339_ms))
 }
 
 fn is_marked(commit: &Commit) -> bool {

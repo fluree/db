@@ -242,12 +242,15 @@ pub(crate) fn replayed_lifetimes(
         .cloned()
         .collect();
     if retention || engine::carries_retention_input(&original.txn_meta) {
-        if let Some(start) = engine::lifetime_start(original) {
+        let start = engine::lifetime_start_ms(original)
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        if let Some(start) = start {
             entries.push(fluree_db_core::TxnMetaEntry::new(
                 FLUREE_DB,
                 db::LIFETIME_START,
                 fluree_db_core::TxnMetaValue::TypedLiteral {
-                    value: start.to_string(),
+                    value: start,
                     dt_ns: fluree_vocab::namespaces::XSD,
                     dt_name: fluree_vocab::xsd_names::DATE_TIME.to_string(),
                 },

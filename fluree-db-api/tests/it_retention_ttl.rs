@@ -177,6 +177,44 @@ async fn expires_at_sets_an_absolute_deadline() {
         .is_empty());
 }
 
+/// A relative lifetime counts from when its write arrived: a backfill with
+/// an event time years back keeps its lifetime from its arrival, instead of
+/// expiring at the first pass.
+#[tokio::test]
+async fn a_backdated_write_counts_its_lifetime_from_its_arrival() {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-backdated").await;
+    let arrived = now_ms();
+    let state = fluree.ledger(&id).await.expect("ledger");
+    fluree
+        .insert_with_opts(
+            state,
+            &json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 3600}}),
+            TxnOpts::default(),
+            CommitOpts::default()
+                .with_timestamp("2021-03-15T00:00:00Z")
+                .with_received_at(
+                    chrono::DateTime::from_timestamp_millis(arrived)
+                        .unwrap()
+                        .to_rfc3339(),
+                ),
+            &fluree.default_index_config(),
+        )
+        .await
+        .expect("backdated insert");
+    let report = fluree
+        .run_retention_at(&id, arrived + 1_000)
+        .await
+        .expect("pass");
+    assert_eq!((report.pending, report.expired), (1, 0), "{report:?}");
+    let report = fluree
+        .run_retention_at(&id, arrived + 3_601_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+}
+
 #[tokio::test]
 async fn a_ledger_without_retention_input_is_never_registered() {
     let fluree = FlureeBuilder::memory().build_memory();
