@@ -103,10 +103,13 @@ impl ParentIndex {
 
 /// A parent index built by semi-join probes (#2239): for a window of
 /// referencing rows, the parent is read with the window's unresolved join
-/// keys pushed as filters, and the rows read are folded in. The filter keeps
-/// every parent row whose key it keeps, so each key read is complete (its
-/// keep-min is exact), and a probed key nothing came back for is absent from
-/// the parent (a dangling FK, never probed again).
+/// keys pushed as filters, and the rows of those keys are folded in. A
+/// provider may apply the filters exactly, only partly, or not at all (it may
+/// prune files by their bounds alone), but never drops a row the filters
+/// keep: every row of a probed key comes back, so its keep-min is exact, and
+/// a probed key nothing came back for is absent from the parent (a dangling
+/// FK, never probed again). A row of another key may come back too, but not
+/// necessarily with every other row of its key, so it is not folded.
 ///
 /// Like a [`CompleteParentLookup`], it is a fact about the parent alone,
 /// keyed like it by [`LookupCacheKey`]: it holds no referencing columns, so
@@ -281,7 +284,7 @@ impl PartialParentIndex {
                 parent_tm,
                 &self.source.parent_cols,
                 &batch,
-                Some(&mut self.resolved),
+                Some(&keys),
             );
         }
         self.resolved.extend(keys);
@@ -3634,15 +3637,15 @@ async fn build_parent_lookup(
 }
 
 /// Fold one batch of a parent table into `lookup`: each row's join key maps to
-/// its subject, and a duplicate key keeps the minimum subject. Every non-null
-/// key read is also added to `keys_read` when given. Returns the number of
+/// its subject, and a duplicate key keeps the minimum subject. With `only`,
+/// a row whose key is not in it is skipped. Returns the number of
 /// duplicate-key collisions.
 fn fold_parent_batch(
     lookup: &mut ParentLookup,
     parent_tm: &TriplesMap,
     parent_columns: &[String],
     batch: &ColumnBatch,
-    mut keys_read: Option<&mut HashSet<Vec<String>>>,
+    only: Option<&HashSet<Vec<String>>>,
 ) -> u64 {
     let mut dup_key_collisions = 0u64;
     for row_idx in 0..batch.num_rows {
@@ -3651,10 +3654,8 @@ fn fold_parent_batch(
             Some(k) => k,
             None => continue, // Null in join key - skip
         };
-        if let Some(keys_read) = keys_read.as_deref_mut() {
-            if !keys_read.contains(&key) {
-                keys_read.insert(key.clone());
-            }
+        if only.is_some_and(|only| !only.contains(&key)) {
+            continue;
         }
 
         // Materialize parent subject
@@ -4931,6 +4932,11 @@ mod tests {
             /// provider reports scan file counts: a file is read when a key
             /// falls within its bounds, as min/max pruning decides.
             files: Option<Vec<(i64, i64)>>,
+            /// `customers` as data files of `(ID, VID)` rows, read the way a
+            /// provider that prunes by file bounds alone reads them: a keyed
+            /// read returns every row of each file whose `ID` bounds admit a
+            /// key, not only the keys' rows. Replaces `customers` and `files`.
+            customer_files: Option<Vec<Vec<(i64, i64)>>>,
             scans: Mutex<Vec<(String, Vec<ScanFilter>)>>,
         }
         impl Tables {
@@ -4941,6 +4947,7 @@ mod tests {
                     supp_cust: Vec::new(),
                     customers,
                     files: None,
+                    customer_files: None,
                     scans: Mutex::new(Vec::new()),
                 }
             }
@@ -4955,6 +4962,27 @@ mod tests {
             fn with_suppliers(mut self, supp_cust: Vec<i64>) -> Self {
                 self.supp_cust = supp_cust;
                 self
+            }
+            fn with_customer_files(mut self, files: Vec<Vec<(i64, i64)>>) -> Self {
+                self.customer_files = Some(files);
+                self
+            }
+            /// The `customer_files` a read through `filters` selects, by
+            /// their `ID` bounds.
+            fn selected_customer_files(&self, filters: &[ScanFilter]) -> Vec<&Vec<(i64, i64)>> {
+                let keys: Vec<i64> = filtered_keys(filters)
+                    .iter()
+                    .map(|k| k.parse().unwrap())
+                    .collect();
+                self.customer_files
+                    .iter()
+                    .flatten()
+                    .filter(|file| {
+                        let lo = file.iter().map(|r| r.0).min().unwrap();
+                        let hi = file.iter().map(|r| r.0).max().unwrap();
+                        filters.is_empty() || keys.iter().any(|k| lo <= *k && *k <= hi)
+                    })
+                    .collect()
             }
         }
         fn keeps(filters: &[ScanFilter], column: &str, value: i64) -> bool {
@@ -4998,6 +5026,13 @@ mod tests {
                 filters: &[ScanFilter],
                 _as_of_t: Option<i64>,
             ) -> Result<Option<crate::r2rml::ScanFileCounts>> {
+                if let Some(files) = &self.customer_files {
+                    let selected = self.selected_customer_files(filters).len() as u64;
+                    return Ok(Some(crate::r2rml::ScanFileCounts {
+                        selected,
+                        pruned: files.len() as u64 - selected,
+                    }));
+                }
                 let Some(files) = &self.files else {
                     return Ok(None);
                 };
@@ -5043,6 +5078,17 @@ mod tests {
                     i64_batch(vec![
                         ("SID", (1..=n).collect()),
                         ("SUPP_CUST", self.supp_cust.clone()),
+                    ])
+                } else if self.customer_files.is_some() {
+                    let rows: Vec<(i64, i64)> = self
+                        .selected_customer_files(filters)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    i64_batch(vec![
+                        ("ID", rows.iter().map(|r| r.0).collect()),
+                        ("VID", rows.iter().map(|r| r.1).collect()),
                     ])
                 } else {
                     let mut ids = Vec::new();
@@ -5311,6 +5357,39 @@ mod tests {
             let scans = customer_scans(&tables);
             assert_eq!(scans.len(), 1, "{scans:?}");
             assert!(scans[0].1.is_empty(), "read whole: {scans:?}");
+        }
+
+        /// A provider that prunes by file bounds alone returns, for a probed
+        /// key, rows of other keys from the files it reads, without the rows
+        /// of those keys in files it skipped. Folded, such a key would be
+        /// resolved from part of its rows: here customer 5's rows sit in both
+        /// files, and a probe for the dangling 4 reads only the first, whose
+        /// 5 is not the smaller subject. Only the probed keys' rows are
+        /// folded, so 5 is read with all its rows and keeps the same subject
+        /// as a whole read.
+        #[test]
+        fn a_probe_folds_only_the_keys_it_probed() {
+            let tables = || {
+                Tables::new(vec![4, 5], Vec::new())
+                    .with_customer_files(vec![vec![(3, 31), (5, 52)], vec![(5, 51), (6, 61)]])
+            };
+            let pattern = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/customer")
+            };
+            for budget in [None, Some(1)] {
+                let whole = run_pattern(&tables(), mapping(), pattern(), None, budget, false);
+                assert_eq!(
+                    whole,
+                    [vec![
+                        "http://ex/order/2".to_string(),
+                        "http://ex/customer/51".to_string()
+                    ]],
+                    "keep-min over both files"
+                );
+                let probed = run_pattern(&tables(), mapping(), pattern(), None, budget, true);
+                assert_eq!(probed, whole, "LIMIT {budget:?}");
+            }
         }
 
         fn customer_ref(column: &str) -> ObjectMap {
