@@ -723,6 +723,10 @@ name = "query_cold_reload"
 harness = false
 
 [[bench]]
+name = "query_time_travel_below_index"
+harness = false
+
+[[bench]]
 name = "reindex_full"
 harness = false
 

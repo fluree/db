@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_bm25_graph_drop.rs"]
+mod it_bm25_graph_drop;
 #[path = "it_config_graph.rs"]
 mod it_config_graph;
 #[path = "it_constraints_cross_ledger.rs"]
@@ -15,6 +17,10 @@ mod it_default_context;
 mod it_graph_commit;
 #[path = "it_graph_source_bm25.rs"]
 mod it_graph_source_bm25;
+// Only a build without the iceberg reader has anything to refuse here.
+#[cfg(not(feature = "iceberg"))]
+#[path = "it_graph_source_unbuilt_reader.rs"]
+mod it_graph_source_unbuilt_reader;
 #[path = "it_jsonld_graph_scope.rs"]
 mod it_jsonld_graph_scope;
 #[path = "it_materialize_named_graph.rs"]

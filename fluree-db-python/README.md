@@ -13,9 +13,9 @@ pip install fluree                # or "fluree[pandas]", "fluree[polars]"
 ```
 
 Wheels are published for Linux (x86-64 and arm64, glibc 2.28 or later),
-macOS on Apple silicon, and Windows (x86-64), for CPython 3.10 and later —
-the platforms the Fluree CLI ships on. The package version is the version of
-the Fluree engine inside it.
+macOS 14 or later on Apple silicon, and Windows (x86-64), for CPython 3.10
+and later — the platforms the Fluree CLI ships on. The package version is
+the version of the Fluree engine inside it.
 
 ```python
 import fluree
@@ -70,6 +70,10 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 - Named graphs are created by writing to them (TriG, SPARQL `GRAPH`, or a
   JSON-LD node's `"@graph"`). `ledger.graphs()` lists them, and
   `ledger.drop_graph(iri)` retracts one's contents in a single commit.
+  `ledger.import_graph(iri, path)` bulk-loads Turtle, N-Triples or JSON-LD
+  files into a graph the ledger does not have yet, as `conn.create(name,
+  source=path)` loads a new ledger; the graph shares the ledger's IRIs, so it
+  joins with the rest of it.
 
 A property value in a JSON-LD dict may be any value a query returns, and
 reads back as it went in: a `fluree.IRI` or `BlankNode` is a reference to that

@@ -4,7 +4,7 @@ Graph sources enable querying specialized indexes and external data sources usin
 
 ## Concept
 
-A **graph source** is anything you can address by a graph name/IRI and query as part of a single execution. Some graph sources are ledger-backed RDF graphs; others are backed by different systems optimized for specific query patterns.
+A **graph source** is a non-ledger source a query can read as part of a single execution. A mapped source (Iceberg, R2RML, SQL, Delta) is a graph: you address it by its graph name/IRI, like a ledger. A search index (BM25, vector) is not a graph: a search pattern in the query names it, and the dataset is its source ledger.
 
 **Regular Ledger:**
 - Stored as RDF triples
@@ -210,6 +210,8 @@ Graph sources come in two flavors with different query models:
 
 - **Iceberg sources** — queried transparently using standard SPARQL/JSON-LD patterns (FROM, GRAPH, or as a direct query target)
 - **Search indexes** (BM25, Vector) — queried using the `f:graphSource` / `f:searchText` pattern
+
+An index source is **not a dataset member**. It has no triples, and its search pattern finds it by the `f:graphSource` id, so a dataset never needs it. Naming one where a graph is read (the query target, `FROM`, `FROM NAMED`, or `GRAPH`) answers **HTTP 400 `err:db/GraphSourceNotAGraph`**, which names the form to use: an `f:graphSource` pattern, with the index's source ledger as the dataset.
 
 ### Iceberg (Transparent)
 
