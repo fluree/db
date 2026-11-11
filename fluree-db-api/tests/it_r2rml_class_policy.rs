@@ -351,7 +351,6 @@ fn kinds_source(alias: &str) -> Source {
 /// R2: a combined class and property restriction decides a map whose class
 /// comes from a column.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn a_class_and_property_policy_decides_a_column_typed_map() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();

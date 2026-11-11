@@ -157,12 +157,19 @@ impl R2rmlPolicyGate {
         }
         let per_subject = !view.by_subject.is_empty();
         let has_class_policies = view.restrictions.iter().any(|r| r.class_policy);
+        // Every class any restriction is selected by, whatever it targets: a
+        // restriction on a property of a class (`f:onProperty` with
+        // `f:onClass`) is indexed by its property, not its class, yet its
+        // verdict turns on the class all the same.
         let mut policy_classes: Vec<String> = view
-            .by_class
-            .keys()
+            .restrictions
+            .iter()
+            .filter(|r| r.class_policy)
+            .flat_map(|r| r.for_classes.iter())
             .filter_map(|c| snapshot.decode_sid(c))
             .collect();
         policy_classes.sort();
+        policy_classes.dedup();
         let mut policy_subjects: Option<Vec<String>> = view
             .by_subject
             .keys()
