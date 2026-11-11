@@ -7903,6 +7903,89 @@ fn doc_ingest_recovers_from_a_reading_a_failed_run_left_behind() {
     assert_eq!(sparql_rows(&tmp, "memos", stamped), 1);
 }
 
+/// The answer recorded from the reader's service, committed as `ingest`
+/// commits it and inserted as `doc read` prints it: the transactor takes
+/// its annotated typed literal (`t:total`, an `xsd:decimal` with the claim
+/// behind it) and its typed mention values, not only IRI objects.
+#[test]
+fn doc_ingest_and_insert_take_the_recorded_answer() {
+    const ANSWER: &str =
+        include_str!("../../fluree-db-doc/tests/fixtures/reader/invoice-answer.jsonld");
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let docs = tmp.path().join("invoices");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("invoice.md"),
+        "Invoice\n\nInvoice no.: DX-2026-07731\nSupplier: Daxin Scientific Supply Co., Ltd.\nDate: 2026/08/06\n\nTotal: NT$5,170.00\n",
+    )
+    .unwrap();
+    let answer: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+    let (url, seen) = spawn_stub_reader(vec![answer]);
+    let reader = |cmd: &mut Command| {
+        cmd.env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+            .arg("--no-cache");
+    };
+    let total = |graph: &str| {
+        format!(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?v WHERE {{ {graph} {{ ?s <urn:example:check:total> ?v FILTER(datatype(?v) = xsd:decimal && ?v = 5170) }} }}"
+        )
+    };
+    let claim = |graph: &str| {
+        format!(
+            "SELECT ?c WHERE {{ {graph} {{ ?c <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s <urn:example:check:total> ?o )>> ; <https://ns.flur.ee/extract#score> ?score }} }}"
+        )
+    };
+    let dated = |graph: &str| {
+        format!(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?m WHERE {{ {graph} {{ ?m <http://www.w3.org/1999/02/22-rdf-syntax-ns#value> ?v FILTER(datatype(?v) = xsd:date) }} }}"
+        )
+    };
+
+    let mut ingest = fluree_cmd(&tmp);
+    ingest.args(["doc", "ingest", "invoices", "-l", "invoices", "--no-embed"]);
+    reader(&mut ingest);
+    ingest.assert().success();
+    let g = "GRAPH <urn:fluree:doc:invoice.md/reading>";
+    assert_eq!(sparql_rows(&tmp, "invoices", &total(g)), 1);
+    assert_eq!(sparql_rows(&tmp, "invoices", &claim(g)), 1);
+    assert_eq!(sparql_rows(&tmp, "invoices", &dated(g)), 1);
+
+    let out = tmp.path().join("invoice.jsonld");
+    let mut read = fluree_cmd(&tmp);
+    read.args(["doc", "read", "invoices/invoice.md", "-o"])
+        .arg(&out);
+    reader(&mut read);
+    read.assert().success();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    fluree_cmd(&tmp)
+        .args(["create", "inserted"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["insert", "inserted", "-f"])
+        .arg(&out)
+        .assert()
+        .success();
+    let default = "";
+    assert_eq!(sparql_rows(&tmp, "inserted", &total(default)), 1);
+    assert_eq!(sparql_rows(&tmp, "inserted", &claim(default)), 1);
+    // The run is the commit's metadata.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "inserted",
+            "SELECT ?run FROM NAMED <inserted:main#txn-meta> WHERE { GRAPH <inserted:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }"
+        ),
+        1
+    );
+}
+
 /// A document read in two calls is a transaction per call: as JSON-LD on
 /// stdout it is refused before anything is sent, naming `-o` and `--format
 /// trig`; with `-o` each call goes to a file of its own, which `fluree
