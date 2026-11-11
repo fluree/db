@@ -59,7 +59,7 @@ WHERE {
 }
 ```
 
-A lifetime can also be a duration, `{| f:ttl "PT1H"^^xsd:dayTimeDuration |}`. For a deadline, write `f:expiresAt "2026-10-21T12:00:00Z"^^xsd:dateTime`. Turtle and TriG ingest accept the same annotation blocks.
+A lifetime can also be a duration, `{| f:ttl "PT1H"^^xsd:dayTimeDuration |}`. For a deadline, write `f:expiresAt "2026-10-21T12:00:00Z"^^xsd:dateTime`. Turtle and TriG transactions accept the same annotation blocks. Bulk import does not apply lifetimes: an import holding `@ttl`, `@expiresAt`, `f:ttl` or `f:expiresAt`, in an annotation or a TriG `GRAPH <#txn-meta>` block, is refused. Import the data without them, then write the values that expire with a transaction.
 
 ### Cypher: `fluree.ttl` and `fluree.expiresAt`
 

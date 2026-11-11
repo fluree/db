@@ -9,3 +9,6 @@ mod it_retention_history;
 
 #[path = "it_retention_erasure.rs"]
 mod it_retention_erasure;
+
+#[path = "it_retention_import.rs"]
+mod it_retention_import;

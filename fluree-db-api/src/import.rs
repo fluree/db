@@ -826,6 +826,7 @@ impl From<fluree_db_transact::TransactError> for ImportError {
         use fluree_db_transact::TransactError as TE;
         match e {
             TE::InvalidVector(_) | TE::DatatypeLimitExceeded { .. } => Self::Invalid(e),
+            TE::LifetimeImportUnsupported { .. } => Self::Refused(e.to_string()),
             e => Self::Transact(e.to_string()),
         }
     }

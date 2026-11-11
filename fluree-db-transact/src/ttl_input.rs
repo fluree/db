@@ -10,6 +10,23 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
+/// Refuse a lifetime predicate (`f:ttl`, `f:expiresAt`) in bulk-imported
+/// data, which applies none.
+pub fn refuse_imported_lifetime(
+    predicate_ns: u16,
+    predicate_name: &str,
+) -> Result<(), crate::TransactError> {
+    use fluree_vocab::db;
+    if predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+        && (predicate_name == db::TTL || predicate_name == db::EXPIRES_AT)
+    {
+        return Err(crate::TransactError::LifetimeImportUnsupported {
+            predicate: predicate_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// A JSON TTL value: a non-negative whole number of seconds, or a day/time
 /// duration string.
 pub fn ttl_seconds_from_json(value: &serde_json::Value) -> Result<u64, String> {
