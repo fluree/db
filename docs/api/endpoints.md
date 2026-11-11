@@ -1846,7 +1846,7 @@ POST /validate/{ledger...}
 }
 ```
 
-- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `graph` — IRI of the named data graph to validate (default: the default graph). It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graphs the ledger config lists for it, whichever shapes are used.
 - `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
 - `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
 - `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
@@ -1889,6 +1889,7 @@ POST /validate/{ledger...}
 - `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
 - `401 Unauthorized` — authentication required and missing
 - `404 Not Found` — ledger or named graph not found (or not authorized)
+- `500 Internal Server Error` — the ledger config could not be read (`err:storage/ReadFailure`); validation does not run without it
 
 **Examples:**
 
