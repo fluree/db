@@ -4227,9 +4227,12 @@ async fn generate_upsert_deletions(
 /// Presence with `mode = Reject` means violations cause the transaction to
 /// fail; `mode = Warn` means violations are returned for the caller to log.
 #[cfg(feature = "shacl")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShaclGraphPolicy {
     pub mode: fluree_db_core::ledger_config::ValidationMode,
+    /// The graph's `f:additionalDataSource` graphs, read with it when its
+    /// nodes are checked.
+    pub additional_data_g_ids: Vec<GraphId>,
 }
 
 /// Outcome of a staged SHACL validation, split by mode so the caller can
@@ -4287,8 +4290,13 @@ pub async fn validate_view_with_shacl(
     // a nested shape) rather than raised, so severity and the graph's mode
     // apply to it as they do to a result (below).
     let constraint_failures = std::sync::Arc::new(fluree_db_shacl::ConstraintFailures::default());
+    let additional_data_g_ids = per_graph_policy
+        .iter()
+        .map(|(g_id, policy)| (*g_id, policy.additional_data_g_ids.clone()))
+        .collect();
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
         .with_membership_graphs(membership_g_ids.to_vec())
+        .with_additional_data_graphs(additional_data_g_ids)
         .with_constraint_failures(std::sync::Arc::clone(&constraint_failures));
     let enabled_graphs: HashSet<GraphId> = per_graph_policy.keys().copied().collect();
     let report = validate_staged_nodes(
