@@ -113,6 +113,16 @@ impl Bm25Manifest {
         self.snapshots.drain(..remove_count);
         removed
     }
+
+    /// Remove the snapshots from before `t`, returning their CIDs for the
+    /// caller to delete once a manifest without them is published.
+    pub fn retire_before(&mut self, t: i64) -> Vec<ContentId> {
+        let keep_from = self.snapshots.partition_point(|s| s.index_t < t);
+        self.snapshots
+            .drain(..keep_from)
+            .map(|s| s.snapshot_id)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +155,25 @@ mod tests {
 
         assert_eq!(m.snapshots.len(), 3);
         assert_eq!(m.head().unwrap().index_t, 20);
+    }
+
+    #[test]
+    fn retire_before_keeps_snapshots_from_t_on() {
+        let mut m = Bm25Manifest::new("test:main");
+        for t in [5, 10, 20] {
+            m.append(Bm25SnapshotEntry::new(
+                t,
+                test_cid(format!("snap-{t}").as_bytes()),
+            ));
+        }
+        assert_eq!(m.retire_before(10), vec![test_cid(b"snap-5")]);
+        assert_eq!(
+            m.snapshots.iter().map(|s| s.index_t).collect::<Vec<_>>(),
+            [10, 20]
+        );
+        assert!(m.retire_before(10).is_empty());
+        assert_eq!(m.retire_before(21).len(), 2);
+        assert!(m.head().is_none());
     }
 
     #[test]

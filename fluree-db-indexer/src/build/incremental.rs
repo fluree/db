@@ -832,6 +832,7 @@ pub async fn incremental_index(
 
     // ---- Phase 1: Resolve incremental commits ----
     let resolve_config = IncrementalResolveConfig {
+        ledger_id: ledger_id.to_string(),
         base_root_id: base_root_id.clone(),
         head_commit_id,
         from_t,
@@ -841,7 +842,7 @@ pub async fn incremental_index(
         pending_commit_cids: config.pending_commit_cids.clone(),
         commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
     };
-    let novelty = resolve_incremental_commits_v6(
+    let mut novelty = resolve_incremental_commits_v6(
         content_store.clone(),
         resolve_config,
         Arc::clone(&upload_budget),
@@ -851,10 +852,11 @@ pub async fn incremental_index(
         IncrementalResolveError::Resolve(crate::run_index::ResolverError::Unindexable(msg)) => {
             IndexerError::Unindexable(msg)
         }
+        IncrementalResolveError::NeedsRebuild(why) => IndexerError::IncrementalAbort(why),
         e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
     })?;
 
-    if novelty.records.is_empty() {
+    if novelty.records.is_empty() && novelty.purged_graphs.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
         // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
@@ -874,6 +876,14 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
+    // A drop can take annotated edges, and the annotation arena is
+    // ledger-wide: drop it rather than seal one that may still hold them.
+    // Annotation reads fall back to scanning until a full reindex seals one.
+    let mut config = config;
+    if !novelty.purged_graphs.is_empty() {
+        config.attachment_events = None;
+    }
+    let purged_cids = std::mem::take(&mut novelty.purged_cids);
     index_novelty(
         content_store,
         tracker,
@@ -881,7 +891,7 @@ pub async fn incremental_index(
         base_root_id,
         novelty,
         config,
-        Vec::new(),
+        purged_cids,
     )
     .await
 }
@@ -2041,6 +2051,9 @@ pub(crate) async fn index_novelty(
         // clamp applies on every incremental (not just the fallback) so ndv
         // survives register loss in a previously fallback-seeded sketch.
         let mut prior_properties = prior_properties;
+        // A purged graph starts from nothing: what the sketch counted of it
+        // the drop took.
+        prior_properties.retain(|key, _| !novelty.purged_graphs.contains(&key.g_id));
         let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
             std::collections::HashMap::new();
         if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {

@@ -1158,8 +1158,8 @@ impl Connection {
         }
     }
 
-    /// Retract every fact in named graph `graph` in one commit; the dict
-    /// `fluree.Commit` is built from (`id` `None` when it held nothing).
+    /// Drop named graph `graph` and its history in one commit, which
+    /// retracts nothing; the dict `fluree.Commit` is built from.
     fn drop_graph<'py>(
         &self,
         py: Python<'py>,

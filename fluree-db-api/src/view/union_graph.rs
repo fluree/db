@@ -19,14 +19,14 @@ use crate::{Fluree, Result};
 
 /// `view`'s user named graphs, each under the name that reads it back
 /// ([`TargetLedger::enumeration_name`]): every registered graph a name
-/// reaches except the reserved `#txn-meta` / `#config` graphs, a graph an
-/// earlier version registered under the ledger's address listed as
-/// `L#<address>`. The set `GRAPH ?g` ranges over.
+/// reaches except the reserved `#txn-meta` / `#config` graphs and a graph
+/// dropped as of the view, a graph an earlier version registered under the
+/// ledger's address listed as `L#<address>`. The set `GRAPH ?g` ranges over.
 fn user_graphs(view: &GraphDb) -> impl Iterator<Item = (GraphId, Cow<'_, str>)> {
     let registry = &view.snapshot.graph_registry;
     let ledger_id = &view.snapshot.ledger_id;
     registry
-        .iter_entries()
+        .iter_visible_entries(view.t)
         .filter(|(g_id, _)| *g_id >= FIRST_USER_GRAPH_ID)
         .filter_map(move |(g_id, iri)| {
             TargetLedger::new(ledger_id, registry)

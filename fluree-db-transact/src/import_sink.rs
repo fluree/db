@@ -1354,6 +1354,7 @@ mod inner {
                 txn_meta: Vec::new(),
                 graph_delta: HashMap::new(),
                 ns_split_mode: None,
+                graph_drops: Vec::new(),
             }
         }
 
