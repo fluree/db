@@ -505,23 +505,31 @@ impl QueuedRequest {
     /// Tie the envelope to one submission, so that its address is that
     /// submission's alone. See [`QueuedTransact::submission`].
     pub fn stamp_submission(&mut self, submission: String) {
-        let slot = match self {
+        *self.submission_slot() = Some(submission);
+    }
+
+    /// Where each variant keeps its submission stamp. The one place that
+    /// knows, so that stamping and [`Self::canonical_body_bytes`] cannot
+    /// disagree about it: a new variant has to choose its slot here to
+    /// compile.
+    fn submission_slot(&mut self) -> &mut Option<String> {
+        match self {
             Self::Transact(t) => &mut t.submission,
             Self::Push(p) => &mut p.submission,
             Self::PushWithMerges(p) => &mut p.push.submission,
             Self::Revert(r) => &mut r.submission,
             Self::Merge(m) => &mut m.submission,
             Self::Rebase(r) => &mut r.submission,
-        };
-        *slot = Some(submission);
+        }
     }
 
     /// Canonical bytes used to derive the idempotency body CID. Skips
     /// per-request transient context (commit-opts timestamp, tracking
-    /// flags, governance metadata) so a retry of the same logical
-    /// request produces the same body CID even when the client recomputes
-    /// those fields between attempts. The full envelope still carries
-    /// them — only the idempotency comparison is normalized.
+    /// flags, governance metadata) and the submission stamp, so a retry
+    /// of the same logical request produces the same body CID even when
+    /// the client recomputes those fields between attempts. The full
+    /// envelope still carries them — only the idempotency comparison is
+    /// normalized.
     ///
     /// The bytes are order-canonical: the payload is projected through
     /// [`CanonicalValue`](crate::raft::state_machine::CanonicalValue),
@@ -533,39 +541,31 @@ impl QueuedRequest {
     /// silently defeating idempotency dedup.
     #[cfg(feature = "raft")]
     pub fn canonical_body_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
-        let mut payload = match self {
-            // Transact: the transaction body is the only semantically
-            // identifying field. txn_opts / commit_opts / tracking /
-            // governance can drift between retries (timestamps, request
-            // IDs, observability toggles) without changing what the
-            // commit means.
-            QueuedRequest::Transact(t) => return canonical_json_bytes(&t.body),
-            // Push / Revert / Merge / Rebase envelopes carry only stable
-            // fields (content-addressed commit ids, selection / strategy
-            // descriptors, branch names) besides the submission, so
-            // hashing the rest of the envelope is equivalent to hashing
-            // the canonical body.
-            QueuedRequest::Push(p) => serde_json::to_value(p)?,
-            QueuedRequest::PushWithMerges(p) => {
-                let mut payload = serde_json::to_value(p)?;
-                if let Some(push) = payload.get_mut("push") {
-                    forget_submission(push);
-                }
-                payload
-            }
-            QueuedRequest::Revert(r) => serde_json::to_value(r)?,
-            QueuedRequest::Merge(m) => serde_json::to_value(m)?,
-            QueuedRequest::Rebase(r) => serde_json::to_value(r)?,
-        };
-        forget_submission(&mut payload);
-        canonical_value_bytes(&payload)
-    }
-}
-
-#[cfg(feature = "raft")]
-fn forget_submission(payload: &mut serde_json::Value) {
-    if let Some(fields) = payload.as_object_mut() {
-        fields.remove("submission");
+        // Transact: the transaction body is the only semantically
+        // identifying field. txn_opts / commit_opts / tracking /
+        // governance can drift between retries (timestamps, request
+        // IDs, observability toggles) without changing what the
+        // commit means. The body never holds the stamp, so the largest
+        // payload is hashed without a copy.
+        if let Self::Transact(t) = self {
+            return canonical_json_bytes(&t.body);
+        }
+        // Push / Revert / Merge / Rebase envelopes carry only stable
+        // fields (content-addressed commit ids, selection / strategy
+        // descriptors, branch names) besides the stamp, so hashing the
+        // envelope with its stamp cleared is equivalent to hashing the
+        // canonical body. These envelopes are small, so the copy is
+        // cheap.
+        let mut unstamped = self.clone();
+        *unstamped.submission_slot() = None;
+        match &unstamped {
+            Self::Transact(t) => canonical_json_bytes(&t.body),
+            Self::Push(p) => canonical_json_bytes(p),
+            Self::PushWithMerges(p) => canonical_json_bytes(p),
+            Self::Revert(r) => canonical_json_bytes(r),
+            Self::Merge(m) => canonical_json_bytes(m),
+            Self::Rebase(r) => canonical_json_bytes(r),
+        }
     }
 }
 
@@ -576,12 +576,8 @@ fn forget_submission(payload: &mut serde_json::Value) {
 /// on map insertion or `HashMap` iteration order.
 #[cfg(feature = "raft")]
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, QueuedRequestCodecError> {
-    canonical_value_bytes(&serde_json::to_value(value)?)
-}
-
-#[cfg(feature = "raft")]
-fn canonical_value_bytes(json: &serde_json::Value) -> Result<Vec<u8>, QueuedRequestCodecError> {
-    let canonical = crate::raft::state_machine::CanonicalValue::from(json);
+    let json = serde_json::to_value(value)?;
+    let canonical = crate::raft::state_machine::CanonicalValue::from(&json);
     Ok(serde_json::to_vec(&canonical)?)
 }
 
