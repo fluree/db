@@ -4078,7 +4078,7 @@ When triggering indexing through the Rust API instead, see `Fluree::reindex` and
 
 ### POST /remove/{ledger-id}
 
-Remove selected occurrences of facts from what a ledger serves, now and in history. See [History retention](../transactions/history-retention.md#targeted-removal). Admin-protected; in a cluster the request is forwarded to the leader.
+Remove selected occurrences of facts from what a ledger serves, now and in history. See [History retention](../transactions/history-retention.md#targeted-removal). Admin-protected; the admin token's identity is recorded with each removal (`requester` in the journal, which only auditors see). In a cluster the request is forwarded to the leader.
 
 **URL:**
 ```
