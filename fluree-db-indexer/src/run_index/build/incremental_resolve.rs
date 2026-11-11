@@ -865,17 +865,7 @@ pub async fn resolve_incremental_commits_v6(
                 "V6 incremental resolve: links replayed"
             );
         }
-        let new_terms: Vec<(u32, u32, Vec<u8>)> = builder
-            .entries_sorted()
-            .into_iter()
-            .map(|(h, key)| {
-                (
-                    fluree_db_core::triple_term::term_handle_p_id(h),
-                    fluree_db_core::triple_term::term_handle_seq(h),
-                    key.to_be_bytes().to_vec(),
-                )
-            })
-            .collect();
+        let new_terms = builder.new_term_entries();
         let mut wms: std::collections::BTreeMap<u32, u32> = base_wms.into_iter().collect();
         for (p_id, wm) in builder.watermarks() {
             wms.insert(p_id, wm);
