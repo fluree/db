@@ -172,6 +172,23 @@ fn details_dispatch(
     }
 }
 
+/// A string a `"@type": "@vocab"` term coerces: a term or compact IRI, else
+/// relative to `@vocab`, else to `@base`. `None` for a term defined as
+/// `null`, which names no IRI.
+fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    match details(s, ctx, true) {
+        (_, Some(entry)) if entry.null_mapping => Ok(None),
+        (expanded, Some(_)) => Ok(Some(expanded)),
+        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
+    }
+}
+
+/// A `@type` value's IRI; `None` for a term defined as `null`.
+fn type_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let (expanded, entry) = details_dispatch(s, ctx, true, strict)?;
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(expanded))
+}
+
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
 fn is_vector_type(type_val: Option<&TypeValue>) -> bool {
     matches!(
@@ -210,6 +227,21 @@ fn parse_node_value(
     match value {
         JsonValue::Null => Ok(vec![]),
 
+        // A term typed `@json` makes its whole value one JSON literal,
+        // whatever its shape. A string `@value` on a JSON literal is read
+        // as an already serialized document, so a string goes in serialized:
+        // `"hello"` is the JSON string, not the text `hello`.
+        _ if type_val == Some(&TypeValue::Json) => {
+            let literal = match value {
+                JsonValue::String(_) => JsonValue::String(crate::normalize::normalize(value)),
+                _ => value.clone(),
+            };
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), literal);
+            obj.insert("@type".to_string(), json!("@json"));
+            Ok(vec![JsonValue::Object(obj)])
+        }
+
         JsonValue::Bool(b) => {
             let mut obj = Map::new();
             obj.insert("@value".to_string(), json!(*b));
@@ -244,21 +276,25 @@ fn parse_node_value(
                 return Ok(vec![JsonValue::Object(obj)]);
             }
 
-            // Check for language tag
-            let lang = entry
-                .and_then(|e| e.language.as_ref())
-                .and_then(|l| l.as_ref())
-                .or(context.language.as_ref());
+            if type_val == Some(&TypeValue::Vocab) {
+                return Ok(vocab_value_iri(s, context, strict)?
+                    .map(|iri| json!({"@id": iri}))
+                    .into_iter()
+                    .collect());
+            }
 
             let mut obj = Map::new();
             obj.insert("@value".to_string(), json!(s));
 
+            // A term's datatype excludes any language, the default one
+            // included; a term's own `@language`, even `null`, overrides
+            // the default.
             if let Some(TypeValue::Iri(t)) = type_val {
-                if lang.is_some() {
-                    return Err(JsonLdError::LanguageWithType);
-                }
                 obj.insert("@type".to_string(), json!(t));
-            } else if let Some(lang) = lang {
+            } else if let Some(lang) = match entry.and_then(|e| e.language.as_ref()) {
+                Some(term_language) => term_language.as_ref(),
+                None => context.language.as_ref(),
+            } {
                 obj.insert("@language".to_string(), json!(lang));
             }
 
@@ -320,14 +356,6 @@ fn parse_node_value(
         }
 
         JsonValue::Object(map) => {
-            // Check for @json type
-            if type_val == Some(&TypeValue::Json) {
-                let mut obj = Map::new();
-                obj.insert("@value".to_string(), value.clone());
-                obj.insert("@type".to_string(), json!("@json"));
-                return Ok(vec![JsonValue::Object(obj)]);
-            }
-
             // Check for @list
             if is_list_item(map) {
                 let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
@@ -382,6 +410,45 @@ fn parse_node_value(
                 }
             }
 
+            // `@container: @index`: the keys only index the values, which
+            // expand as the property's values.
+            if let Some(e) = entry.filter(|e| {
+                e.container
+                    .as_ref()
+                    .is_some_and(|c| c.contains(&Container::Index))
+            }) {
+                // The keys would become values of the index property;
+                // refused rather than dropped.
+                if let Some(property) = &e.index {
+                    return Err(JsonLdError::InvalidContext {
+                        message: format!(
+                            "a property-valued @index (\"{property}\") is not supported"
+                        ),
+                    });
+                }
+                let unindexed = ContextEntry {
+                    container: e.container.as_ref().map(|containers| {
+                        containers
+                            .iter()
+                            .filter(|c| **c != Container::Index)
+                            .cloned()
+                            .collect()
+                    }),
+                    ..e.clone()
+                };
+                let mut results = Vec::new();
+                for (index, item) in map {
+                    results.extend(parse_node_value(
+                        item,
+                        Some(&unindexed),
+                        context,
+                        &path.key(index),
+                        strict,
+                    )?);
+                }
+                return Ok(results);
+            }
+
             // Otherwise, expand as nested node
             let ctx = if let Some(e) = entry {
                 if let Some(ref nested) = e.context {
@@ -420,22 +487,30 @@ fn parse_value_object(
         None => None,
     };
 
-    // Get type from entry if not explicit
-    let type_iri = explicit_type.or_else(|| {
-        entry.as_ref().and_then(|e| match &e.type_ {
+    let explicit_language = map
+        .get("@language")
+        .or_else(|| map.get("language"))
+        .and_then(|l| l.as_str());
+
+    // The object's own `@type` and `@language` exclude each other. Its own
+    // language overrides the datatype its term would give, and a datatype
+    // excludes the default language.
+    let type_iri = match explicit_type {
+        Some(_) if explicit_language.is_some() => return Err(JsonLdError::LanguageWithType),
+        Some(t) => Some(t),
+        None if explicit_language.is_some() => None,
+        None => entry.as_ref().and_then(|e| match &e.type_ {
             Some(TypeValue::Iri(t)) => Some(t.clone()),
             Some(TypeValue::Id) => Some("@id".to_string()),
             _ => None,
-        })
-    });
-
-    // Check for language
-    let lang = map
-        .get("@language")
-        .or_else(|| map.get("language"))
-        .and_then(|l| l.as_str())
-        .map(std::string::ToString::to_string)
-        .or_else(|| context.language.clone());
+        }),
+    };
+    let lang = match type_iri {
+        Some(_) => None,
+        None => explicit_language
+            .map(std::string::ToString::to_string)
+            .or_else(|| context.language.clone()),
+    };
 
     // Build result
     let mut obj = Map::new();
@@ -450,9 +525,6 @@ fn parse_value_object(
         obj.insert("@value".to_string(), val.clone());
 
         if let Some(t) = type_iri {
-            if lang.is_some() {
-                return Err(JsonLdError::LanguageWithType);
-            }
             obj.insert("@type".to_string(), json!(t));
         } else if let Some(l) = lang {
             obj.insert("@language".to_string(), json!(l));
@@ -488,12 +560,12 @@ fn parse_type<'c>(
 
     if let Some(type_val) = type_val {
         let types: Vec<String> = match type_val {
-            JsonValue::String(s) => vec![iri_dispatch(s, context, true, strict)?],
+            JsonValue::String(s) => type_iri(s, context, strict)?.into_iter().collect(),
             JsonValue::Array(arr) => {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     if let Some(s) = v.as_str() {
-                        result.push(iri_dispatch(s, context, true, strict)?);
+                        result.extend(type_iri(s, context, strict)?);
                     }
                 }
                 result
@@ -743,6 +815,9 @@ fn expand_node_entries(
         let key_path = path.key(k);
 
         let (expanded_key, entry) = details_dispatch(k, context, true, strict)?;
+        if entry.as_ref().is_some_and(|e| e.null_mapping) {
+            continue;
+        }
 
         // Handle @graph: the keyword, an alias of it, or the legacy bare
         // `graph` key when the context does not define `graph` as a property
@@ -1620,5 +1695,196 @@ mod tests {
             matches!(err, JsonLdError::InvalidGraphValue { .. }),
             "{err}"
         );
+    }
+
+    const EX: &str = "http://example.org/";
+    const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+    /// The expanded values of `ex:p` in `doc`.
+    fn values_of_p(doc: JsonValue) -> JsonValue {
+        let expanded = crate::expand(&doc).unwrap();
+        expanded[format!("{EX}p")].clone()
+    }
+
+    /// A `@vocab`-typed term's string is a term, a compact IRI, or relative
+    /// to `@vocab`; with no `@vocab`, relative to `@base`.
+    #[test]
+    fn vocab_typed_term_expands_strings_as_iris() {
+        let ctx = json!({
+            "ex": EX,
+            "@vocab": "http://vocab.org/",
+            "K": "http://terms.org/K",
+            "p": {"@id": "ex:p", "@type": "@vocab"}
+        });
+        let values = values_of_p(json!({"@context": ctx, "p": ["K", "ex:L", "M"]}));
+        assert_eq!(
+            values,
+            json!([
+                {"@id": "http://terms.org/K"},
+                {"@id": "http://example.org/L"},
+                {"@id": "http://vocab.org/M"}
+            ])
+        );
+
+        let based = json!({"@base": "http://base.org/", "p": {"@id": EX.to_owned() + "p", "@type": "@vocab"}});
+        let values = values_of_p(json!({"@context": based, "p": "N"}));
+        assert_eq!(values, json!([{"@id": "http://base.org/N"}]));
+    }
+
+    /// A datatype, from the term or the value object, excludes the default
+    /// language; a value object naming both is still refused.
+    #[test]
+    fn datatype_excludes_the_default_language() {
+        let ctx = json!({
+            "@language": "en",
+            "p": {"@id": EX.to_owned() + "p", "@type": XSD_INTEGER}
+        });
+        assert_eq!(
+            values_of_p(json!({"@context": ctx, "p": "5"})),
+            json!([{"@value": "5", "@type": XSD_INTEGER}])
+        );
+        assert_eq!(
+            values_of_p(
+                json!({"@context": {"@language": "en"}, (EX.to_owned() + "p"): {"@value": "6", "@type": XSD_INTEGER}})
+            ),
+            json!([{"@value": "6", "@type": XSD_INTEGER}])
+        );
+        let both = json!({(EX.to_owned() + "p"): {"@value": "7", "@type": XSD_INTEGER, "@language": "en"}});
+        assert!(matches!(
+            crate::expand(&both),
+            Err(JsonLdError::LanguageWithType)
+        ));
+    }
+
+    /// A value object's own language overrides the datatype its term gives.
+    #[test]
+    fn value_object_language_overrides_the_term_datatype() {
+        let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": XSD_INTEGER}});
+        assert_eq!(
+            values_of_p(json!({"@context": ctx, "p": {"@value": "cinq", "@language": "fr"}})),
+            json!([{"@value": "cinq", "@language": "fr"}])
+        );
+    }
+
+    #[test]
+    fn term_language_null_clears_the_default() {
+        let ctx = json!({
+            "@language": "en",
+            "p": {"@id": EX.to_owned() + "p", "@language": null},
+            "q": EX.to_owned() + "q"
+        });
+        let expanded =
+            crate::expand(&json!({"@context": ctx, "p": "plain", "q": "tagged"})).unwrap();
+        assert_eq!(expanded[format!("{EX}p")], json!([{"@value": "plain"}]));
+        assert_eq!(
+            expanded[format!("{EX}q")],
+            json!([{"@value": "tagged", "@language": "en"}])
+        );
+    }
+
+    /// A term defined as `null` maps to no IRI: its property is dropped, not
+    /// expanded against `@vocab`, and the definition reads back as `null`.
+    #[test]
+    fn null_term_drops_its_property() {
+        let ctx = json!({"@vocab": EX, "gone": null, "also": {"@id": null}});
+        let expanded = crate::expand(&json!({
+            "@context": ctx,
+            "gone": "x",
+            "also": "y",
+            "p": "kept"
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({format!("{EX}p"): [{"@value": "kept"}]}),
+            "{expanded}"
+        );
+
+        let parsed = ParsedContext::parse(None, &ctx).unwrap();
+        assert!(parsed.get("gone").is_some_and(|e| e.null_mapping));
+        assert_eq!(parsed.to_json()["gone"], JsonValue::Null);
+    }
+
+    /// A `null` term names no IRI as a value either: a `@vocab` term's value
+    /// and a `@type` naming it are dropped, not kept as the bare key.
+    #[test]
+    fn null_term_names_no_value_iri() {
+        let ctx = json!({
+            "@vocab": EX,
+            "gone": null,
+            "p": {"@type": "@vocab"}
+        });
+        let expanded = crate::expand(&json!({
+            "@context": ctx,
+            "@id": "http://example.org/s",
+            "@type": ["gone", "Kept"],
+            "p": ["gone", "kept"]
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({
+                "@id": "http://example.org/s",
+                "@type": [format!("{EX}Kept")],
+                format!("{EX}p"): [{"@id": format!("{EX}kept")}]
+            }),
+            "{expanded}"
+        );
+    }
+
+    /// An `@index` map's keys index its values and carry no data; a
+    /// property-valued index, whose keys would be data, is refused.
+    #[test]
+    fn index_container_keys_only_index_the_values() {
+        let ctx = json!({
+            "ex": EX,
+            "p": {"@id": "ex:p", "@container": ["@index", "@set"]}
+        });
+        let values = values_of_p(json!({
+            "@context": ctx,
+            "p": {
+                "first": {"@id": "ex:a", "ex:q": "in a"},
+                "second": ["text", {"@value": 3}]
+            }
+        }));
+        assert_eq!(
+            values,
+            json!([
+                {"@id": "http://example.org/a", "http://example.org/q": [{"@value": "in a"}]},
+                {"@value": "text"},
+                {"@value": 3}
+            ])
+        );
+
+        // Refused where a map uses it, not for a context that only carries it.
+        let by_property = json!({
+            "ex": EX,
+            "p": {"@id": "ex:p", "@container": "@index", "@index": "ex:q"}
+        });
+        assert!(crate::expand(&json!({"@context": by_property, "p": {"k": "v"}})).is_err());
+        let unused = crate::expand(&json!({"@context": by_property, "ex:r": "v"})).unwrap();
+        assert_eq!(unused, json!({format!("{EX}r"): [{"@value": "v"}]}));
+        let parsed = ParsedContext::parse(None, &by_property).unwrap();
+        assert_eq!(parsed.to_json()["p"]["@index"], json!("ex:q"));
+    }
+
+    /// A `@json`-typed term makes the whole value one JSON literal, whatever
+    /// its shape; an array is not split into values.
+    #[test]
+    fn json_typed_term_keeps_the_whole_value() {
+        let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": "@json"}});
+        for value in [json!(5), json!(true), json!([1, {"a": [2]}])] {
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": value})),
+                json!([{"@value": value, "@type": "@json"}])
+            );
+        }
+        // A string goes in serialized, as the explicit form writes a document.
+        for (value, document) in [("text", r#""text""#), ("5", r#""5""#), ("{}", r#""{}""#)] {
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": value})),
+                json!([{"@value": document, "@type": "@json"}])
+            );
+        }
     }
 }
