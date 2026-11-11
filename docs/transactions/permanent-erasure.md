@@ -461,8 +461,8 @@ On a 16-vCPU host, the measured proving times are:
 A request typically touches two or three commits per branch: the assertion, its retraction, and the
 removal's own retraction. A commit of more than 50,000 operations cannot be erased: the request is
 refused (`422`) when it is made, since proving one that size would not finish within the default
-timeout. A large import commit is the usual case. The ZK prototype report (`prototypes/zk-redaction/README.md`) has the full
-measurements.
+timeout. A large import commit is the usual case. The [ZK redaction feasibility study](../design/zk-redaction-feasibility.md) has
+the full measurements.
 
 ## Limits
 

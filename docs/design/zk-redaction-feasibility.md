@@ -1,8 +1,13 @@
-# ZK redaction prototype
+# ZK redaction feasibility study
 
-RISC Zero proofs about Fluree V4 commit blobs, built for PR 4 of `DATA_ERASURE.md` as an isolated
-feasibility experiment. The prototype is excluded from the main workspace, so RISC Zero never
-enters a Fluree build.
+The feasibility study behind [permanent erasure](../transactions/permanent-erasure.md): RISC Zero
+proofs about Fluree V4 commit blobs, built as an isolated experiment before the production prover
+(`fluree-prover`). Its measurements decided that erasure through proved replacements was viable.
+
+The prototype's code is no longer in the tree. It lived in `prototypes/zk-redaction`, outside the
+Cargo workspace, and last appears at commit `0a8d5c9c7bf627726a73fd4bfc5c1cb4c88987fe`; the paths below are within that directory
+there. Production erasure ships only the redaction claim. The authentication, selective-disclosure
+and ancestry claims below were never built into the product, and can be revived from that commit.
 
 It proves four separate claims, each one a separate guest program or mode:
 
@@ -22,8 +27,8 @@ trustworthy time anchor: a timestamp inside a commit proves only what was record
 ### Redaction
 
 The guest reads a commit blob, either an original V4 commit or a previous replacement, and the
-slots to remove. It runs the transform in `fluree-db-redaction` (a workspace crate since PR 5A;
-the prototype began with it as `core`) and commits a `Statement`:
+slots to remove. It runs the transform in `fluree-db-redaction` (now a workspace crate; the
+prototype began with it as `core`) and commits a `Statement`:
 
 | Field | Meaning |
 |---|---|
@@ -62,8 +67,8 @@ The two modes differ in what they reveal, not only in cost:
 - **Choosing the mode.** `Expose` is a choice made per proof, trading this for cost, and nothing
   selects it by default.
 - **Unsigned commits.** The two modes coincide. The original CID, which every verifier holds,
-  already allows the same test. `DATA_ERASURE.md` records this as a limit of the approach: ZK
-  "does not remove information already exposed by an original digest".
+  already allows the same test. This is a limit of the approach: zero knowledge does not
+  remove information an original digest already exposes.
 
 A verifier (`host/src/bin/verify.rs`) needs none of the original bytes. It needs:
 
@@ -139,28 +144,16 @@ covers the whole chain.
 
 ## Reproducing
 
-```sh
-# Core tests, against Fluree's own commit writer and reader (any machine):
-cargo test -p fluree-db-redaction --features host-sha          # from the repository root
-cargo test -p fluree-db-redaction --features host-sha,c-zstd
+Check out commit `0a8d5c9c7bf627726a73fd4bfc5c1cb4c88987fe` and follow `prototypes/zk-redaction/README.md` there: building the guests
+and proving needs Linux x86-64 and the RISC Zero toolchain (risc0 3.0.6). The transform's own tests
+still run from today's tree:
 
-# Guests, host and proofs (Linux x86-64; installs risc0 3.0.6):
-curl -L https://risczero.com/install | bash && rzup install
-cargo build --release -p host --bins
-cargo test --release -p host              # rejection tests, proving included
-target/release/host execute               # redaction cycle counts, every scenario
-target/release/host execute-auth          # authentication cycle counts
-target/release/host prove medium          # writes medium.{receipt,replacement,expect.json}
-target/release/verify medium              # fresh process, no original bytes
-target/release/host prove second          # both erasures of one commit
-target/release/verify second              # the chain, back to the original CID
-target/release/host authenticate medium 1 # claim, and a disclosure of slot 1 (seed not kept)
-target/release/verify disclose medium
-target/release/host execute-chain         # a chain link's cycle counts, by commit size
-target/release/host chain 4 1000          # four linked 1,000-operation commits
+```sh
+cargo test -p fluree-db-redaction --features host-sha
+cargo test -p fluree-db-redaction --features host-sha,c-zstd
 ```
 
-`RISC0_SKIP_BUILD=1 cargo check -p host` checks the host without building the guests.
+## Scenarios
 
 The guests decompress with the reference C zstd decoder (`fluree-db-redaction`'s `c-zstd`
 feature, on by default in `methods/guest`), linked against a C allocator over the guest's own.
@@ -421,11 +414,11 @@ A request touches about 2–3 commits per branch: the assertion, the retraction 
 and the removal's own retraction. That makes about 60 commit proofs a day, against one prover's
 250 (signed, verified) to 380 (unsigned): the prover is busy 16–24% of the day. A week of
 requests arriving at once, about 420 proofs, takes about 40 hours at 5.7 minutes each, inside
-the 7-day target. Through PR 5A's workflow on the same instance type, a signed 1,000-operation
+the 7-day target. Through the production prover on the same instance type, a signed 1,000-operation
 commit with its signature verified proved in 260 s (3 segments, 2.75M cycles, about 9.6 GB
 peak memory).
 
 Verdict: the gate is passed. Proving per erasure request with SHA-256, batching each commit's
 removals into one proof, meets the targets as a background operation run apart from
-transactions. PR 5 was built on that basis, as erasure through verified replacements and then
-physical purge; see [Permanent erasure](../../docs/transactions/permanent-erasure.md).
+transactions. Permanent erasure was built on that basis, as erasure through verified replacements and then
+physical purge; see [Permanent erasure](../transactions/permanent-erasure.md).

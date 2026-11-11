@@ -76,6 +76,10 @@ touching the fence, expiry, or eviction semantics of `kv`.
 
 How `fluree-db-consensus` replicates writes across a cluster: the queue → stage → apply flow, log entry types, snapshot model, and the rationale behind splitting "decisions" (in the Raft log) from "bytes" (in the shared content-addressed store). Operator-facing recipe lives in [Raft clusters (replicated writes)](../operations/raft-clusters.md).
 
+### [ZK redaction feasibility study](zk-redaction-feasibility.md)
+
+The experiment behind permanent erasure: what RISC Zero proofs about commit blobs can show (redaction, commit authentication and selective disclosure, ancestry), their measured proving cost, and the gate assessment that led to erasure through proved replacements. Its prototype code is no longer in the tree; the study names the commit that holds it.
+
 ## Related Documentation
 
 - [Crate Map](../reference/crate-map.md) - Workspace architecture
