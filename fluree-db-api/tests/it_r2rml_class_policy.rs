@@ -512,10 +512,14 @@ async fn each_type_triple_is_decided_on_the_class_it_states() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// R6: a subject two maps mint, each with its own `rr:class`, holds both
-/// classes.
+/// A subject two maps mint, each with its own `rr:class`, holds both
+/// classes. A row shows only its own map's, so it is shown only when every
+/// class set its subject could hold allows it: the answer holds no row the
+/// native ledger hides, and the rows of subjects only one map mints that the
+/// other map's class would hide are hidden too (customer 8 under a deny of
+/// the EU map's class). The map whose rows were decided that way is
+/// reported on the tracked response.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn a_subject_two_maps_mint_holds_both_maps_classes() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();
@@ -564,33 +568,84 @@ async fn a_subject_two_maps_mint_holds_both_maps_classes() {
         ],
     };
     let lanes = register(&fluree, &source).await;
+    let native = format!("{}-native:main", source.alias);
+    let customer = |id: i64| ex(&format!("customer/{id}"));
     let mut wrong = Vec::new();
-    for (policies, default_allow) in [
+    for (policies, default_allow, want) in [
         (
             vec![policy("ex:p", false, on_class(&ex("Restricted")))],
             true,
+            Vec::<(i64, &str)>::new(),
         ),
-        (vec![policy("ex:p", true, on_class(&ex("Customer")))], false),
+        (
+            vec![policy("ex:p", true, on_class(&ex("Customer")))],
+            false,
+            vec![(7, "Ada"), (8, "Bo")],
+        ),
     ] {
-        wrong.extend(
-            disagreements(
-                &fluree,
-                &source,
-                &lanes,
-                &[names()],
-                &policies,
-                default_allow,
-            )
-            .await,
-        );
+        for jsonld in [false, true] {
+            let oracle = run(&fluree, &native, &names(), &policies, default_allow, jsonld).await;
+            let mut expected: Vec<String> = want
+                .iter()
+                .map(|(id, name)| {
+                    if jsonld {
+                        format!("{} | {name}", customer(*id))
+                    } else {
+                        format!("{name} | {}", customer(*id))
+                    }
+                })
+                .collect();
+            expected.sort();
+            for lane in &lanes {
+                for fast in [true, false] {
+                    set_fast_paths_disabled(!fast);
+                    let got = run(&fluree, lane, &names(), &policies, default_allow, jsonld).await;
+                    set_fast_paths_disabled(false);
+                    if got != expected || !got.iter().all(|r| oracle.contains(r)) {
+                        wrong.push(format!(
+                            "{lane} jsonld={jsonld} fast={fast}: {got:?}, expected {expected:?} \
+                             within native {oracle:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // The tracked response names the map whose rows were hidden.
+    for lane in &lanes {
+        let q = json!({
+            "from": lane,
+            "opts": {
+                "policy": [policy("ex:p", false, on_class(&ex("Restricted")))],
+                "default-allow": true,
+                "meta": { "policy": true }
+            },
+            "select": ["?s", "?n"],
+            "where": { "@id": "?s", "http://example.org/name": "?n" },
+        });
+        let response = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_tracked()
+            .await
+            .expect("tracked query");
+        let maps = response
+            .policy_enforcement
+            .map(|e| e.undecidable_class_maps)
+            .unwrap_or_default();
+        if maps != vec!["http://example.org/mapping#Us".to_string()] {
+            wrong.push(format!("{lane}: undecidable_class_maps {maps:?}"));
+        }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// R6: a subject several rows mint, each deriving a class from a column,
-/// holds every row's class.
+/// A subject several rows mint, each deriving a class from a column, holds
+/// every row's class, which one row does not show. Where a class a policy
+/// targets could be derived by another row and the decision turns on it, the
+/// query is refused, naming the map and the remedies; where no row can
+/// derive a targeted class, the rows are decided as on the native ledger.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn a_subject_several_rows_mint_holds_every_rows_class() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();
@@ -634,7 +689,145 @@ async fn a_subject_several_rows_mint_holds_every_rows_class() {
         )],
     };
     let lanes = register(&fluree, &source).await;
+    let mut wrong = Vec::new();
     let policies = [policy("ex:p", false, on_class(&ex("city/Boston")))];
-    let wrong = disagreements(&fluree, &source, &lanes, &[names()], &policies, true).await;
+    for jsonld in [false, true] {
+        for lane in &lanes {
+            for fast in [true, false] {
+                set_fast_paths_disabled(!fast);
+                let got = run(&fluree, lane, &names(), &policies, true, jsonld).await;
+                set_fast_paths_disabled(false);
+                let refused = got.len() == 1
+                    && got[0].contains("cannot be decided")
+                    && got[0].contains("mapping#History")
+                    && got[0].contains("f:key")
+                    && got[0].contains("rr:sqlQuery");
+                if !refused {
+                    wrong.push(format!("{lane} jsonld={jsonld} fast={fast}: {got:?}"));
+                }
+            }
+        }
+    }
+    // A class no row's template can mint changes no decision.
+    let other = [policy("ex:p", false, on_class(&ex("Other")))];
+    wrong.extend(disagreements(&fluree, &source, &lanes, &[names()], &other, true).await);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A decision is not monotone in the subject's classes: an `f:required`
+/// restriction, once it applies, sets the others aside, so a denial can
+/// vanish as classes are added. Three maps mint one template: one declares
+/// no class, one declares `ex:D`, one `ex:R`; `ex:D` is denied and `ex:R`
+/// carries a required allow. Customer 7 is minted by the classless map and
+/// the `ex:D` map only, so it holds `ex:D` and the native ledger hides it;
+/// its row from the classless map is decided over every class set it could
+/// hold, so it is not shown, though no class and both classes would allow
+/// it.
+#[tokio::test]
+async fn a_required_restriction_is_decided_over_every_class_set() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let map = |name: &str, table: &str, class: Option<&str>| {
+        let class = class.map_or(String::new(), |c| format!(" ; rr:class ex:{c}"));
+        format!(
+            r#"
+            <http://example.org/mapping#{name}> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "{table}" ; f:key ( "{key}" ) ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{{{key}}}"{class} ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+            "#,
+            key = if table == "sets.customers_current" {
+                "customer_id"
+            } else {
+                "id"
+            }
+        )
+    };
+    let current: [(i64, &str); 6] = [
+        (1, "alice"),
+        (2, "robert"),
+        (3, "carol"),
+        (4, "dave"),
+        (5, "erin-m"),
+        (6, "frank"),
+    ];
+    let mut graph = Vec::new();
+    for (id, name, _) in US {
+        graph.push(json!({ "@id": ex(&format!("customer/{id}")), ex("name"): name }));
+    }
+    for (id, name, _) in EU {
+        graph.push(
+            json!({ "@id": ex(&format!("customer/{id}")), "@type": ex("D"), ex("name"): name }),
+        );
+    }
+    for (id, name) in current {
+        graph.push(
+            json!({ "@id": ex(&format!("customer/{id}")), "@type": ex("R"), ex("name"): name }),
+        );
+    }
+    let three = |rows: Vec<Vec<Value>>,
+                 name: &'static str,
+                 cols: Vec<(&'static str, &'static str)>| { (name, cols, rows) };
+    let source = Source {
+        alias: "required-classes".to_string(),
+        namespace: "sets",
+        mapping: format!(
+            "{PREFIXES}{}{}{}",
+            map("Plain", "sets.customers_us", None),
+            map("Denied", "sets.customers_eu", Some("D")),
+            map("Required", "sets.customers_current", Some("R"))
+        ),
+        graph,
+        tables: vec![
+            three(
+                US.iter()
+                    .map(|(i, n, c)| vec![json!(i), json!(n), json!(c)])
+                    .collect(),
+                "sets.customers_us",
+                vec![("id", "bigint"), ("name", "varchar"), ("city", "varchar")],
+            ),
+            three(
+                EU.iter()
+                    .map(|(i, n, c)| vec![json!(i), json!(n), json!(c)])
+                    .collect(),
+                "sets.customers_eu",
+                vec![("id", "bigint"), ("name", "varchar"), ("city", "varchar")],
+            ),
+            three(
+                current
+                    .iter()
+                    .map(|(i, n)| vec![json!(i), json!(n)])
+                    .collect(),
+                "sets.customers_current",
+                vec![("customer_id", "bigint"), ("name", "varchar")],
+            ),
+        ],
+    };
+    let lanes = register(&fluree, &source).await;
+    let mut required = policy("ex:r", true, on_class(&ex("R")));
+    required["https://ns.flur.ee/db#required"] = json!(true);
+    let policies = [policy("ex:d", false, on_class(&ex("D"))), required];
+    let native = format!("{}-native:main", source.alias);
+    let mut wrong = Vec::new();
+    for jsonld in [false, true] {
+        let oracle = run(&fluree, &native, &names(), &policies, true, jsonld).await;
+        assert!(
+            !oracle.iter().any(|r| r.contains("customer/7")),
+            "native hides customer 7: {oracle:?}"
+        );
+        for lane in &lanes {
+            for fast in [true, false] {
+                set_fast_paths_disabled(!fast);
+                let got = run(&fluree, lane, &names(), &policies, true, jsonld).await;
+                set_fast_paths_disabled(false);
+                if !got.iter().all(|r| oracle.contains(r)) || got.is_empty() {
+                    wrong.push(format!(
+                        "{lane} jsonld={jsonld} fast={fast}: {got:?} not within native {oracle:?}"
+                    ));
+                }
+            }
+        }
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

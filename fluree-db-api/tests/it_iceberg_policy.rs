@@ -38,6 +38,7 @@ const PEOPLE_R2RML: &str = r#"
 "#;
 
 /// `rdf:type` derived from a column (one class per person), no `rr:class`.
+/// Keyed by `id`, so each row's class is its subject's.
 const KINDS_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -45,7 +46,7 @@ const KINDS_R2RML: &str = r#"
 
     <http://example.org/mapping#KindMapping>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:logicalTable [ rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
         rr:predicateObjectMap [
             rr:predicate rdf:type ;
@@ -1634,4 +1635,48 @@ async fn a_governed_source_named_by_graph_keeps_its_own_policy() {
         );
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A class-targeted view policy over a map deriving `rdf:type` from a
+/// column, whose table declares no key: another row could give a subject a
+/// class this row does not show, so the policy cannot be decided per row and
+/// the query is refused, naming the map and the remedy.
+#[tokio::test]
+async fn a_class_policy_over_unkeyed_derived_classes_is_refused() {
+    let fluree = setup().await;
+    let keyless = KINDS_R2RML.replace(
+        r#"rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#,
+        r#"rr:tableName "silver.people" ]"#,
+    );
+    assert_ne!(keyless, KINDS_R2RML);
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("local-kinds-keyless", table_location(), keyless)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let q = json!({
+        "@context": context(),
+        "from": "local-kinds-keyless:main",
+        "opts": {
+            "policy": [deny("ex:c", on_class("http://example.org/kind/alice"))],
+            "default-allow": true
+        },
+        "select": ["?s", "?name"],
+        "where": { "@id": "?s", "ex:name": "?name" },
+    });
+    let err = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect_err("a class policy the rows cannot decide is refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("cannot be decided")
+            && text.contains("KindMapping")
+            && text.contains("f:key"),
+        "{text}"
+    );
 }

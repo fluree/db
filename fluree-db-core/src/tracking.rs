@@ -210,6 +210,13 @@ pub struct PolicyEnforcement {
     /// graph to run a policy query against. Empty on native ledgers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unevaluable_policies: Vec<String>,
+    /// Triples maps of a graph source (Iceberg / SQL) whose subjects other
+    /// maps can also mint with other classes, where a class-targeted view
+    /// policy's decision depended on those classes: a row is shown only when
+    /// every class set its subject could hold allows it, so some rows a
+    /// native ledger would show may be hidden. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undecidable_class_maps: Vec<String>,
 }
 
 /// Fuel limit exceeded. Field values are micro-fuel; use the helpers for fuel decimals.
@@ -409,10 +416,17 @@ impl Tracker {
                             unevaluable_policies.push(id);
                         }
                     }
+                    let mut undecidable_class_maps = prev.undecidable_class_maps;
+                    for map in state.undecidable_class_maps {
+                        if !undecidable_class_maps.contains(&map) {
+                            undecidable_class_maps.push(map);
+                        }
+                    }
                     PolicyEnforcement {
                         enforced: true,
                         denies_all_data: prev.denies_all_data && state.denies_all_data,
                         unevaluable_policies,
+                        undecidable_class_maps,
                     }
                 }
                 None => state,
@@ -438,6 +452,31 @@ impl Tracker {
             });
             if !state.unevaluable_policies.iter().any(|id| id == policy_id) {
                 state.unevaluable_policies.push(policy_id.to_string());
+            }
+        }
+    }
+
+    /// Record a triples map whose rows a class-targeted view policy decided
+    /// over every class set its subjects could hold (see
+    /// [`PolicyEnforcement::undecidable_class_maps`]).
+    pub fn record_undecidable_class_map(&self, triples_map: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || triples_map.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state
+                .undecidable_class_maps
+                .iter()
+                .any(|m| m == triples_map)
+            {
+                state.undecidable_class_maps.push(triples_map.to_string());
             }
         }
     }
@@ -712,6 +751,7 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
@@ -719,6 +759,7 @@ mod tests {
                 enforced: true,
                 denies_all_data: true,
                 unevaluable_policies: Vec::new(),
+                undecidable_class_maps: Vec::new(),
             })
         );
     }
@@ -734,6 +775,7 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         let tally = t.tally().unwrap();
         assert_eq!(tally.policy, None);
@@ -749,11 +791,13 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: false,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
@@ -761,6 +805,7 @@ mod tests {
                 enforced: true,
                 denies_all_data: false,
                 unevaluable_policies: Vec::new(),
+                undecidable_class_maps: Vec::new(),
             })
         );
     }

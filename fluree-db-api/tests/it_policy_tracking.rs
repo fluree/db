@@ -187,6 +187,7 @@ async fn read_tracked_under_policies_reports_executed_and_allowed() {
             enforced: true,
             denies_all_data: false,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }),
         "policies are present, so the view set is not empty"
     );
@@ -230,6 +231,7 @@ async fn read_tracked_zero_policy_identity_reports_deny_all() {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }),
     );
 }

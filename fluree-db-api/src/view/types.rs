@@ -867,6 +867,7 @@ impl GraphDb {
             // `evaluate::allow_view_flake`, before any policy runs.
             denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         })
     }
 }

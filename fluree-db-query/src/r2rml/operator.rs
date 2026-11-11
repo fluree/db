@@ -2562,7 +2562,7 @@ impl R2rmlScanOperator {
 /// cannot resolve, while a view policy decides by class: reading the rows as
 /// classless would decide them on fewer classes than their subjects hold.
 fn unresolved_class_error(graph_source_id: &str, triples_map: &str) -> QueryError {
-    QueryError::Policy(format!(
+    QueryError::InvalidQuery(format!(
         "Graph source '{graph_source_id}': triples map <{triples_map}> takes its rdf:type \
          from a reference whose parent cannot be read, so a class-targeted view policy \
          cannot be decided on its rows"
@@ -4272,7 +4272,8 @@ impl Operator for R2rmlScanOperator {
             .compiled_mapping(&self.pattern.graph_source_id, as_of_t)
             .await?;
 
-        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id)?;
+        self.policy_gate =
+            R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id).await?;
         self.mapping = Some(mapping);
         self.state = OperatorState::Open;
 
