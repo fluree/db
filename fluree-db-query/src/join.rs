@@ -11,7 +11,7 @@ use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     branch_or_none, object_probe_lane_plan, overlay_holds_ops, p_id_or_none,
-    subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps, RowFate,
+    subject_probe_lane_plan, LaneOutput, ObjectProbeOps, ProbeLanePlan, ProbeOps, RowFate,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -839,6 +839,9 @@ pub struct NestedLoopJoinOperator {
     /// subjects repeat across many rows, and each reverse dictionary lookup
     /// costs microseconds.
     batched_key_memo: FxHashMap<Sid, Option<u64>>,
+    /// Decoded keys accumulated while the plan was deferred hold no id yet;
+    /// the flush resolves them only once a lane will read them.
+    batched_keys_unresolved: bool,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
     /// doesn't buffer ~100k left rows before producing anything. Each flush
@@ -1093,6 +1096,7 @@ impl NestedLoopJoinOperator {
             batched_overlay_deferred: false,
             per_row_backlog: VecDeque::new(),
             batched_key_memo: FxHashMap::default(),
+            batched_keys_unresolved: false,
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1359,6 +1363,7 @@ impl Operator for NestedLoopJoinOperator {
         self.logged_runtime_mode = false;
         self.batched_key_memo.clear();
         self.batched_overlay_deferred = false;
+        self.batched_keys_unresolved = false;
         self.per_row_backlog.clear();
 
         tracing::trace!(
@@ -1561,53 +1566,22 @@ impl Operator for NestedLoopJoinOperator {
                 // Batched path: extract the bound key directly to avoid dictionary round-trips.
                 // - Subject-batched: key is subject s_id (bound to right subject).
                 // - Object-batched: key is object s_id (bound to right object).
-                let left_col = if self.batched_object_eligible {
-                    self.object_left_col.unwrap()
-                } else {
-                    self.subject_left_col.unwrap()
-                };
-
+                let left_col = self.batched_left_col();
                 let resolved: Option<u64> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
-                    // A subject minted after the last index resolves to a
-                    // novelty s_id — the same id space the overlay ops are
-                    // translated into — so novelty-only left subjects stay on
-                    // the batched lane (the merge injects their facts) instead
-                    // of each paying a per-row fallback scan. The dictionaries
-                    // are read only for a decoded subject.
-                    let mut memo = ctx
-                        .eager_materialization
-                        .then_some(&mut self.batched_key_memo);
-                    let mut resolve_subject = |sid: &Sid| -> Option<u64> {
-                        let lookup = || {
-                            TermDicts::of(ctx)?
-                                .subject_id(sid.namespace_code, &sid.name)
-                                .ok()
-                                .flatten()
-                        };
-                        let Some(memo) = memo.as_deref_mut() else {
-                            return lookup();
-                        };
-                        if let Some(&hit) = memo.get(sid) {
-                            return hit;
-                        }
-                        let s_id = lookup();
-                        if memo.len() >= BATCHED_KEY_MEMO_CAP {
-                            memo.clear();
-                        }
-                        memo.insert(sid.clone(), s_id);
-                        s_id
-                    };
-                    match left_batch.get_by_col(left_row, left_col) {
-                        Binding::EncodedSid { s_id, .. } => Some(*s_id),
-                        Binding::Sid { sid, .. } => resolve_subject(sid),
-                        Binding::IriMatch { primary_sid, .. } => resolve_subject(primary_sid),
-                        Binding::Unbound => None,
-                        _ => {
-                            // For subject/predicate bindings we already screened invalid types.
-                            // For object-batched mode, non-ref objects can't be converted to s_id.
-                            None
-                        }
+                    let binding = left_batch.get_by_col(left_row, left_col);
+                    if self.batched_overlay_deferred
+                        && matches!(binding, Binding::Sid { .. } | Binding::IriMatch { .. })
+                    {
+                        // The deferred plan may send these rows per-row,
+                        // which never reads the id.
+                        self.batched_keys_unresolved = true;
+                        Some(0)
+                    } else {
+                        let memo = ctx
+                            .eager_materialization
+                            .then_some(&mut self.batched_key_memo);
+                        resolve_left_key(ctx, memo, binding)
                     }
                 };
 
@@ -1934,7 +1908,8 @@ impl NestedLoopJoinOperator {
         else {
             return false;
         };
-        crate::fast_path_common::probe_lane_admission(ctx, &[pred]).is_none()
+        crate::fast_path_common::probe_lane_admission(ctx, &[pred], LaneOutput::DecodesForEager)
+            .is_none()
             && store.sid_to_p_id(pred).is_some()
             && !crate::fast_path_common::overlay_ops_cached(
                 ctx,
@@ -1961,9 +1936,44 @@ impl NestedLoopJoinOperator {
         )
     }
 
+    /// The left column the batched lane keys on.
+    fn batched_left_col(&self) -> usize {
+        if self.batched_object_eligible {
+            self.object_left_col.unwrap()
+        } else {
+            self.subject_left_col.unwrap()
+        }
+    }
+
+    /// Resolve keys accumulated unresolved. Rows whose key has no id go to
+    /// the per-row path, as they would have when accumulated.
+    fn resolve_accumulated_keys(&mut self, ctx: &ExecutionContext<'_>) {
+        let left_col = self.batched_left_col();
+        let mut memo = ctx
+            .eager_materialization
+            .then_some(&mut self.batched_key_memo);
+        let batches = &self.stored_left_batches;
+        let backlog = &mut self.per_row_backlog;
+        self.batched_accumulator
+            .retain_mut(|(batch_idx, left_row, key)| {
+                let binding = batches[*batch_idx].get_by_col(*left_row, left_col);
+                match resolve_left_key(ctx, memo.as_deref_mut(), binding) {
+                    Some(s_id) => {
+                        *key = s_id;
+                        true
+                    }
+                    None => {
+                        backlog.push_back((*batch_idx, *left_row));
+                        false
+                    }
+                }
+            });
+    }
+
     /// Hand the accumulated rows to the per-row path. Their stored batches
     /// stay: the backlog drains before another flush can clear them.
     fn reroute_accumulator_per_row(&mut self) {
+        self.batched_keys_unresolved = false;
         self.per_row_backlog.extend(
             self.batched_accumulator
                 .drain(..)
@@ -2001,8 +2011,15 @@ impl NestedLoopJoinOperator {
             self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
         }
         if matches!(self.batched_overlay_mode, ProbeLanePlan::Decline) {
+            tracing::debug!(
+                input_rows = self.batched_accumulator.len(),
+                "join batched probe: overlay plan declined; per-row"
+            );
             self.reroute_accumulator_per_row();
             return Ok(());
+        }
+        if std::mem::take(&mut self.batched_keys_unresolved) {
+            self.resolve_accumulated_keys(ctx);
         }
 
         let accum_len = self.batched_accumulator.len();
@@ -2038,13 +2055,13 @@ impl NestedLoopJoinOperator {
 
     /// Clear all batched accumulator state after a flush or early return.
     fn clear_batched_state(&mut self) {
-        debug_assert!(
-            self.per_row_backlog.is_empty(),
-            "per-row backlog rows reference the stored left batches"
-        );
         self.batched_accumulator.clear();
-        self.stored_left_batches.clear();
-        self.current_left_batch_stored_idx = None;
+        // Backlog rows still read their stored batches; the backlog drains
+        // before any further left row, so the next flush clears them.
+        if self.per_row_backlog.is_empty() {
+            self.stored_left_batches.clear();
+            self.current_left_batch_stored_idx = None;
+        }
     }
 
     /// Decide how the batched lanes handle the active overlay this call.
@@ -2052,7 +2069,9 @@ impl NestedLoopJoinOperator {
     /// The subject-probe and exists lanes merge overlay ops per probed
     /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
     /// object. Decline cases route to the overlay-correct per-row fallback
-    /// BEFORE any accumulation, so a flush never reroutes mid-stream.
+    /// before any accumulation, except for a plan deferred to the first flush
+    /// ([`Self::defers_batched_overlay`]): that flush hands its rows to the
+    /// per-row path when the plan declines.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
         // The lane planners' own admission, so an overlay-free graph settles
         // as `Clean` without needing a store — and its history and policy
@@ -2063,7 +2082,9 @@ impl NestedLoopJoinOperator {
             Some(pred) => &[pred],
             None => &[],
         };
-        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
+        if let Some(plan) =
+            crate::fast_path_common::probe_lane_admission(ctx, preds, LaneOutput::DecodesForEager)
+        {
             return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
@@ -2076,9 +2097,9 @@ impl NestedLoopJoinOperator {
             return Ok(ProbeLanePlan::Decline);
         };
         if self.batched_object_eligible {
-            object_probe_lane_plan(ctx, store, pred)
+            object_probe_lane_plan(ctx, store, pred, LaneOutput::DecodesForEager)
         } else {
-            subject_probe_lane_plan(ctx, store, pred)
+            subject_probe_lane_plan(ctx, store, pred, LaneOutput::DecodesForEager)
         }
     }
 
@@ -3042,6 +3063,42 @@ fn term_matches_probe_value(
         }
         Term::Value(value) => decoded == value,
     }
+}
+
+/// The raw subject id a batched lane keys a left binding on. Decoded
+/// bindings read the dictionaries (through `memo` when given); a subject
+/// minted after the last index resolves to its novelty id, the id space the
+/// overlay ops are translated into.
+fn resolve_left_key(
+    ctx: &ExecutionContext<'_>,
+    memo: Option<&mut FxHashMap<Sid, Option<u64>>>,
+    binding: &Binding,
+) -> Option<u64> {
+    let sid = match binding {
+        Binding::EncodedSid { s_id, .. } => return Some(*s_id),
+        Binding::Sid { sid, .. } => sid,
+        Binding::IriMatch { primary_sid, .. } => primary_sid,
+        // Object-lane non-ref objects have no subject id.
+        _ => return None,
+    };
+    let lookup = || {
+        TermDicts::of(ctx)?
+            .subject_id(sid.namespace_code, &sid.name)
+            .ok()
+            .flatten()
+    };
+    let Some(memo) = memo else {
+        return lookup();
+    };
+    if let Some(&hit) = memo.get(sid) {
+        return hit;
+    }
+    let s_id = lookup();
+    if memo.len() >= BATCHED_KEY_MEMO_CAP {
+        memo.clear();
+    }
+    memo.insert(sid.clone(), s_id);
+    s_id
 }
 
 /// Object binding for a row of the subject-probe lane. Refs stay raw

@@ -29,7 +29,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
-    star_probe_lane_plan, subject_probe_lane_plan, ProbeLanePlan, ProbeOps,
+    star_probe_lane_plan, subject_probe_lane_plan, LaneOutput, ProbeLanePlan, ProbeOps,
 };
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::join::{
@@ -184,6 +184,9 @@ pub struct PropertyJoinOperator {
     /// How the other predicates are read, planned on the first chunk whose
     /// subjects all have encoded ids.
     lanes: Option<ChunkLanes>,
+    /// Eager `Sid` keys resolve to ids only when a planned lane will walk
+    /// them; otherwise each lookup is wasted on the scans.
+    eager_keys_to_ids: bool,
     stats: ProbeStats,
 }
 
@@ -219,6 +222,15 @@ impl ChunkLanes {
     fn has_scan(&self) -> bool {
         matches!(self, ChunkLanes::PerPredicate(lanes)
             if lanes.iter().any(|lane| matches!(lane, PredicateLane::Scan { .. })))
+    }
+
+    fn has_batched(&self) -> bool {
+        match self {
+            ChunkLanes::SpotStar { .. } => true,
+            ChunkLanes::PerPredicate(lanes) => lanes
+                .iter()
+                .any(|lane| matches!(lane, PredicateLane::Probe { .. })),
+        }
     }
 }
 
@@ -436,7 +448,7 @@ impl PropertyJoinOperator {
                 .collect();
             if predicates.len() == remaining.len() {
                 let pred_refs: Vec<&Sid> = predicates.iter().map(|(_, sid)| sid).collect();
-                match star_probe_lane_plan(ctx, store, &pred_refs)? {
+                match star_probe_lane_plan(ctx, store, &pred_refs, LaneOutput::DecodesForEager)? {
                     ProbeLanePlan::Decline => {}
                     ProbeLanePlan::Clean => {
                         return Ok(ChunkLanes::SpotStar {
@@ -463,7 +475,12 @@ impl PropertyJoinOperator {
                 .then(|| try_normalize_pred_sid(store, &predicate.pred_ref))
                 .flatten();
             let lane = match pred_sid {
-                Some(pred_sid) => match subject_probe_lane_plan(ctx, store, &pred_sid)? {
+                Some(pred_sid) => match subject_probe_lane_plan(
+                    ctx,
+                    store,
+                    &pred_sid,
+                    LaneOutput::DecodesForEager,
+                )? {
                     ProbeLanePlan::Decline => PredicateLane::Scan { pred_idx },
                     ProbeLanePlan::Clean => PredicateLane::Probe {
                         pred_idx,
@@ -580,6 +597,14 @@ impl PropertyJoinOperator {
             if emit_pos.is_some() && objects.is_none() {
                 continue;
             }
+            // The plan depends only on the predicates and the overlay, so an
+            // eager caller settles it before keying any subject.
+            if ctx.eager_materialization && !ctx.is_multi_ledger() && self.lanes.is_none() {
+                let lanes = self.plan_lanes(ctx)?;
+                self.eager_keys_to_ids = lanes.has_batched();
+                self.lanes = Some(lanes);
+            }
+            let to_ids = self.sid_keys_to_ids(ctx);
 
             let mut stop = None;
             for row in start..subjects.len() {
@@ -588,7 +613,7 @@ impl PropertyJoinOperator {
                     break;
                 }
                 let subject = &subjects[row];
-                let Some(key) = Self::subject_key(ctx, subject)? else {
+                let Some(key) = Self::subject_key(ctx, subject, to_ids)? else {
                     continue;
                 };
                 // Chunks must be ascending id ranges so they partition the
@@ -837,6 +862,7 @@ impl PropertyJoinOperator {
         chunk_start: usize,
     ) -> Result<()> {
         let emit_pos = self.emit_positions[pred_idx];
+        let to_ids = self.sid_keys_to_ids(ctx);
         let mut scan = self.predicate_scan(ctx, pred_idx);
         scan.open(ctx).await?;
         while let Some(batch) = scan.next_batch(ctx).await? {
@@ -851,7 +877,7 @@ impl PropertyJoinOperator {
             }
             self.stats.scan_rows_total += batch.len() as u64;
             for (row, subject) in subjects.iter().enumerate() {
-                let Some(key) = Self::subject_key(ctx, subject)? else {
+                let Some(key) = Self::subject_key(ctx, subject, to_ids)? else {
                     continue;
                 };
                 let Some((idx, _, entry)) = self.subject_values.get_full_mut(&key) else {
@@ -1047,6 +1073,7 @@ impl PropertyJoinOperator {
             chunk_schedule: None,
             last_driver_id: None,
             lanes: None,
+            eager_keys_to_ids: false,
             stats: ProbeStats::default(),
         })
     }
@@ -1112,7 +1139,17 @@ impl PropertyJoinOperator {
         })
     }
 
-    fn subject_key(ctx: &ExecutionContext<'_>, subject: &Binding) -> Result<Option<SubjectKey>> {
+    /// Whether single-ledger `Sid` keys resolve to ids. See
+    /// [`Self::subject_key`].
+    fn sid_keys_to_ids(&self, ctx: &ExecutionContext<'_>) -> bool {
+        !ctx.eager_materialization || self.eager_keys_to_ids
+    }
+
+    fn subject_key(
+        ctx: &ExecutionContext<'_>,
+        subject: &Binding,
+        sid_to_id: bool,
+    ) -> Result<Option<SubjectKey>> {
         if ctx.is_multi_ledger() {
             return Self::subject_key_multi(ctx, subject);
         }
@@ -1124,15 +1161,17 @@ impl PropertyJoinOperator {
         // all-`Id` key set) could never engage the batched walks under an
         // overlay.
         //
-        // Eager `Sid`s (reasoning) normalize too: in one ledger they share
-        // this store's namespace codes, and multi-ledger keys took
-        // `subject_key_multi` above. A policy does not gate this: the batched
+        // Eager `Sid`s (reasoning) normalize too, when a batched lane will
+        // read the ids (`sid_to_id`): in one ledger they share this store's
+        // namespace codes, and multi-ledger keys took `subject_key_multi`
+        // above. Every eager row is a `Sid`, so with no batched lane the keys
+        // stay `Sid` throughout and still agree. A policy does not gate this: the batched
         // walks an all-`Id` key set enables (`subject_probe_lane_plan` /
         // `star_probe_lane_plan`) decide per predicate whether the view
         // policy can touch them, and decline to the filtered scans when it
         // can.
         Ok(Self::subject_key_single(subject).map(|key| match key {
-            SubjectKey::Sid(sid) => {
+            SubjectKey::Sid(sid) if sid_to_id => {
                 let resolved = crate::object_binding::TermDicts::of(ctx).and_then(|dicts| {
                     dicts
                         .subject_id(sid.namespace_code, &sid.name)
@@ -1341,6 +1380,7 @@ impl Operator for PropertyJoinOperator {
             self.driver_pending = None;
             self.last_driver_id = None;
             self.lanes = None;
+            self.eager_keys_to_ids = false;
             self.rows_emitted = 0;
             self.stats = ProbeStats::default();
 
@@ -1520,6 +1560,7 @@ impl Operator for PropertyJoinOperator {
         self.current_indices.clear();
         self.driver_pending = None;
         self.lanes = None;
+        self.eager_keys_to_ids = false;
     }
 
     fn estimated_rows(&self) -> Option<usize> {

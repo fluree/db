@@ -993,3 +993,125 @@ ex:p3 ex:friend ex:q3 . ex:p4 ex:friend ex:q4 . ex:p5 ex:friend ex:q5 .
     }
     drop(guard);
 }
+
+const DECLINE_EVENT: &str = "join batched probe: overlay plan declined; per-row";
+
+const REROUTE_MARKERS: usize = 3000;
+const REROUTE_RULE_INPUTS: [usize; 4] = [3, 7, 1500, 2999];
+
+/// `ex:board` levels `REROUTE_MARKERS` subjects. Stored `ex:caseId`s index the
+/// predicate and outnumber the markers in the planner's stats, so the markers
+/// drive; a datalog rule derives `ex:caseId`s for early and late markers.
+fn reroute_data() -> Value {
+    let mut graph = Vec::new();
+    for i in 0..REROUTE_MARKERS {
+        graph.push(json!({"@id": "ex:board", "ex:levels": {"@id": format!("ex:s{i}")}}));
+    }
+    for i in 0..4000 {
+        graph.push(json!({"@id": format!("ex:k{i}"), "ex:caseId": format!("stored-k{i}")}));
+    }
+    for i in 0..10 {
+        graph.push(json!({"@id": format!("ex:s{i}"), "ex:caseId": format!("stored-s{i}")}));
+    }
+    for i in REROUTE_RULE_INPUTS {
+        graph.push(json!({"@id": format!("ex:s{i}"), "ex:parent": {"@id": format!("ex:p{i}")}}));
+    }
+    json!({"@context": ctx(), "@graph": graph})
+}
+
+/// The rule derives `ex:caseId` strings no dictionary holds, so translating
+/// the predicate's overlay fails and the deferred plan declines. `LIMIT`
+/// starts the flush schedule small, so the first flush is not the last: it
+/// hands its rows to the per-row path while left rows remain, and the rest
+/// follow per row. Once the failed translation is cached, a rerun declines
+/// before accumulating anything.
+#[tokio::test(flavor = "current_thread")]
+async fn a_deferred_plan_declining_mid_stream_keeps_every_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-reroute:main";
+    let oracle_id = "it/reasoning-reroute-oracle:main";
+    let rule = json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "http://example.org/ns/rule/caseId",
+        "f:rule": {"@type": "f:sparql", "@value": format!(
+            "{SPARQL_PREFIXES}CONSTRUCT {{ ?x ex:caseId ?id }} \
+             WHERE {{ ?x ex:parent ?y BIND(CONCAT(\"derived-\", STR(?y)) AS ?id) }}"
+        )}
+    });
+    for id in [ledger_id, oracle_id] {
+        let ledger = genesis_ledger_for_fluree(&fluree, id);
+        let ledger = fluree
+            .insert(ledger, &reroute_data())
+            .await
+            .expect("seed")
+            .ledger;
+        fluree.insert(ledger, &rule).await.expect("rule");
+    }
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let view = fluree.db(ledger_id).await.expect("view");
+    let oracle = fluree.db(oracle_id).await.expect("oracle");
+
+    let jsonld = json!({
+        "@context": ctx(),
+        "select": ["?x", "?id"],
+        "where": [{"@id": "ex:board", "ex:levels": "?x"}, {"@id": "?x", "ex:caseId": "?id"}],
+        "reasoning": "datalog",
+        "limit": 1024
+    });
+    let sparql = format!(
+        "# PRAGMA reasoning: datalog\n{SPARQL_PREFIXES}\
+         SELECT ?x ?id WHERE {{ ex:board ex:levels ?x . ?x ex:caseId ?id }} LIMIT 1024"
+    );
+    let expected = sorted(
+        (0..10)
+            .map(|i| json!([format!("ex:s{i}"), format!("stored-s{i}")]))
+            .chain(REROUTE_RULE_INPUTS.iter().map(|i| {
+                json!([
+                    format!("ex:s{i}"),
+                    format!("derived-http://example.org/ns/p{i}")
+                ])
+            }))
+            .collect(),
+    );
+
+    let (store, guard) = init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    for (run, surface, input) in [
+        ("cold", "JSON-LD", QueryInput::JsonLd(&jsonld)),
+        ("cached", "SPARQL", QueryInput::Sparql(&sparql)),
+        ("cached", "JSON-LD", QueryInput::JsonLd(&jsonld)),
+    ] {
+        let label = format!("{run} ({surface})");
+        let declines = store.find_events(DECLINE_EVENT).len();
+        assert_eq!(
+            query_rows(&fluree, &oracle, input).await,
+            expected,
+            "{label}: oracle"
+        );
+        assert_eq!(
+            query_rows(&fluree, &view, input).await,
+            expected,
+            "{label}: indexed"
+        );
+        let mid_stream: Vec<usize> = store.find_events(DECLINE_EVENT)[declines..]
+            .iter()
+            .filter_map(|e| e.fields.get("input_rows")?.parse().ok())
+            .collect();
+        if run == "cold" {
+            assert!(
+                mid_stream.iter().any(|&rows| rows < REROUTE_MARKERS),
+                "{label}: a flush before the last should decline; declined flushes: {mid_stream:?}"
+            );
+        } else {
+            assert!(
+                mid_stream.is_empty(),
+                "{label}: a cached failed translation declines before accumulating; \
+                 declined flushes: {mid_stream:?}"
+            );
+        }
+    }
+    drop(guard);
+}

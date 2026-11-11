@@ -10,7 +10,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey,
-    fast_path_store, normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan,
+    fast_path_store, normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan, LaneOutput,
     ProbeLanePlan, ProbeOps, PsotSubjectSeek, RowFate, SharedOverlayOps,
 };
 use crate::ir::triple::{Ref, TriplePattern};
@@ -1144,15 +1144,10 @@ impl CyclicBgpOperator {
         if ctx.to_t < store.max_t() {
             return Ok((false, vec![None; n]));
         }
-        // The cascade emits encoded bindings; eager (reasoning) callers are
-        // owed decoded ones.
-        if crate::fast_path_common::eager_with_overlay(ctx) {
-            return Ok((false, vec![None; n]));
-        }
         let mut ops_per_edge = Vec::with_capacity(n);
         for edge in self.plan.edges.iter() {
             let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-            match subject_probe_lane_plan(ctx, store, &pred_sid)? {
+            match subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)? {
                 ProbeLanePlan::Clean => ops_per_edge.push(None),
                 ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
                 ProbeLanePlan::Decline => {

@@ -28,8 +28,8 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
-    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, ObjectProbeOps,
-    ProbeLanePlan, ProbeOps,
+    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, LaneOutput,
+    ObjectProbeOps, ProbeLanePlan, ProbeOps,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -436,10 +436,12 @@ impl PatternOptionalBuilder {
         let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
             return Ok(None);
         };
-        Ok(match object_probe_lane_plan(ctx, store, &pred_sid)? {
-            ProbeLanePlan::Decline => None,
-            plan => Some((Arc::clone(store), pred_sid, plan)),
-        })
+        Ok(
+            match object_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)? {
+                ProbeLanePlan::Decline => None,
+                plan => Some((Arc::clone(store), pred_sid, plan)),
+            },
+        )
     }
 
     /// The bound-object lane: one sorted OPST pass over every required row's
@@ -763,7 +765,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
             return false;
         };
         !matches!(
-            subject_probe_lane_plan(ctx, store, &pred_sid),
+            subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
             Err(_) | Ok(ProbeLanePlan::Decline)
         )
     }
@@ -840,7 +842,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
         // Novelty merges per probed subject; unmergeable overlays fall back
         // to the per-row scan (whose cursor merges the overlay).
-        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
         if matches!(lane_plan, ProbeLanePlan::Decline) {
             return Ok(None);
         }
@@ -1170,10 +1172,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
     /// grouped triple, so the operator never buffers the driving side
     /// just to fall back per-row.
     fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
-        if ctx.is_multi_ledger()
-            || crate::fast_path_common::eager_with_overlay(ctx)
-            || self.triples.iter().any(|tp| tp.dtc.is_some())
-        {
+        if ctx.is_multi_ledger() || self.triples.iter().any(|tp| tp.dtc.is_some()) {
             return false;
         }
         let Some(store) = ctx.binary_store.as_ref() else {
@@ -1184,7 +1183,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 return false;
             };
             !matches!(
-                subject_probe_lane_plan(ctx, store, &pred_sid),
+                subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
                 Err(_) | Ok(ProbeLanePlan::Decline)
             )
         })
@@ -1227,20 +1226,22 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             );
             return Ok(None);
         };
-        if crate::fast_path_common::eager_with_overlay(ctx) {
-            tracing::debug!(
-                predicate_count = self.triples.len(),
-                start_row,
-                reason = "eager-materialization",
-                "grouped optional builder fallback"
-            );
-            return Ok(None);
-        }
         if self.triples.iter().any(|tp| tp.dtc.is_some()) {
             tracing::debug!(
                 predicate_count = self.triples.len(),
                 start_row,
                 reason = "datatype-constraint",
+                "grouped optional builder fallback"
+            );
+            return Ok(None);
+        }
+        // Admission declines this encoded lane for an eager caller at
+        // planning; say so before resolving every row's subject id.
+        if crate::fast_path_common::eager_with_overlay(ctx) {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                reason = "eager-materialization",
                 "grouped optional builder fallback"
             );
             return Ok(None);
@@ -1317,7 +1318,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             };
-            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
             if matches!(lane_plan, ProbeLanePlan::Decline) {
                 tracing::debug!(
                     predicate_count = self.triples.len(),

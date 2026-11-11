@@ -2403,10 +2403,13 @@ fn cached_ops_entry(
     Ok(computed)
 }
 
-/// Cross-query layer under [`cached_ops_entry`], for eager callers only: a
+/// Cross-query layer under [`cached_ops_entry`], for reasoning queries only: a
 /// reasoning materialization's derived extents cost a dictionary translation
 /// per fact and are read by query after query, so they are translated once.
-/// Novelty extents are bounded by indexing and stay per-execution.
+/// Novelty extents are bounded by indexing and stay per-execution, and so do
+/// other eager callers: a datalog fixpoint pass (rule bodies run with
+/// reasoning off) builds an overlay no later query reads, and a dataset
+/// member's overlay is plain novelty.
 fn ops_cross_query(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -2419,17 +2422,16 @@ fn ops_cross_query(
         return compute();
     };
     if let Some(hit) = global_pred_ops_cache().get(&key) {
-        return Ok(Some(hit));
+        return Ok(hit);
     }
     let computed = compute()?;
-    if let Some(ops) = &computed {
-        global_pred_ops_cache().insert(key, ops.clone());
-    }
+    global_pred_ops_cache().insert(key, computed.clone());
     Ok(computed)
 }
 
-/// The cross-query key, or `None` when the caller isn't eager or its overlay
-/// cannot vouch for its content (see `GlobalTranslationKey`).
+/// The cross-query key, or `None` when the caller isn't an eager reasoning
+/// query or its overlay cannot vouch for its content (see
+/// `GlobalTranslationKey`).
 fn pred_ops_key(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -2437,7 +2439,7 @@ fn pred_ops_key(
     order: RunSortOrder,
     pred_sid: &Sid,
 ) -> Option<PredOpsKey> {
-    if !ctx.eager_materialization {
+    if !(ctx.eager_materialization && ctx.reasoning_active) {
         return None;
     }
     let content_version = ctx.overlay().content_version()?;
@@ -2457,7 +2459,11 @@ fn pred_ops_key(
 
 type PredOpsKey = (crate::binary_scan::GlobalTranslationKey, Sid);
 
-/// Budget of the cross-query per-predicate cache, in ops (~40 B each).
+/// Budget of the cross-query per-predicate cache, in ops (~40 B each), so
+/// up to ~160 MiB per process. It sits beside the scan's
+/// `global_translation_cache` (4 whole-overlay translations under the same
+/// `GlobalTranslationKey`), which can hold the same derived extent again:
+/// the scan translates a whole graph's overlay, a lane one predicate's.
 const PRED_OPS_CACHE_MAX_OPS: usize = 1 << 22;
 
 /// What one entry's key, LRU node and allocations cost against
@@ -2468,18 +2474,19 @@ const PRED_OPS_ENTRY_COST: usize = 8;
 /// LRU of per-predicate resolved ops, bounded by what it retains: one
 /// derived `rdf:type` extent can hold millions, and every commit mints new
 /// keys. Empty results aren't retained; computing one is a walk that finds
-/// nothing.
+/// nothing. A failed translation (`None`) is: it walks the whole extent and
+/// fails the same way for the same key.
 struct PredOpsCache {
     inner: std::sync::Mutex<PredOpsLru>,
 }
 
 struct PredOpsLru {
-    entries: lru::LruCache<PredOpsKey, SharedOverlayOps>,
+    entries: lru::LruCache<PredOpsKey, Option<SharedOverlayOps>>,
     retained: usize,
 }
 
-fn pred_ops_entry_cost(ops: &SharedOverlayOps) -> usize {
-    ops.len() + PRED_OPS_ENTRY_COST
+fn pred_ops_entry_cost(ops: &Option<SharedOverlayOps>) -> usize {
+    ops.as_ref().map_or(0, |ops| ops.len()) + PRED_OPS_ENTRY_COST
 }
 
 impl PredOpsCache {
@@ -2498,7 +2505,8 @@ impl PredOpsCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn get(&self, key: &PredOpsKey) -> Option<SharedOverlayOps> {
+    /// `Some(None)` is a cached translation failure.
+    fn get(&self, key: &PredOpsKey) -> Option<Option<SharedOverlayOps>> {
         self.lock().entries.get(key).cloned()
     }
 
@@ -2506,9 +2514,9 @@ impl PredOpsCache {
         self.lock().entries.contains(key)
     }
 
-    fn insert(&self, key: PredOpsKey, ops: SharedOverlayOps) {
+    fn insert(&self, key: PredOpsKey, ops: Option<SharedOverlayOps>) {
         let cost = pred_ops_entry_cost(&ops);
-        if ops.is_empty() || cost > PRED_OPS_CACHE_MAX_OPS {
+        if ops.as_ref().is_some_and(|ops| ops.is_empty()) || cost > PRED_OPS_CACHE_MAX_OPS {
             return;
         }
         let mut lru = self.lock();
@@ -2879,10 +2887,22 @@ pub(crate) fn policy_lane_for_predicates(
     verdict
 }
 
-/// An eager (reasoning) caller with an overlay to merge. Lanes that emit
-/// their own encoded bindings decline it; [`probe_lane_admission`] does not.
+/// An eager (reasoning) caller with an overlay to merge.
 pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
     ctx.eager_materialization && !ctx.overlay_free_single_graph()
+}
+
+/// What a probe lane emits, which decides whether an eager caller with an
+/// overlay may take it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneOutput {
+    /// Encoded bindings. Eager callers are owed decoded ones (a datalog rule
+    /// head built from an encoded binding derives nothing), so admission
+    /// declines them.
+    Encoded,
+    /// Decoded bindings under eager materialization, as the per-row scan
+    /// emits, or no bindings at all.
+    DecodesForEager,
 }
 
 /// Admission shared by every probe lane and by the join's early routing
@@ -2898,6 +2918,7 @@ pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
 pub(crate) fn probe_lane_admission(
     ctx: &ExecutionContext<'_>,
     pred_sids: &[&Sid],
+    output: LaneOutput,
 ) -> Option<ProbeLanePlan> {
     if ctx.is_history_range() {
         return Some(ProbeLanePlan::Decline);
@@ -2915,9 +2936,11 @@ pub(crate) fn probe_lane_admission(
     if ctx.overlay_free_single_graph() {
         return Some(ProbeLanePlan::Clean);
     }
-    // Eager callers (reasoning) are admitted: the resolved ops carry the
-    // derived facts, and `build_probe_object_binding` decodes under eager.
-    // A lane that emits its own encoded bindings declines eager itself.
+    // An eager caller's resolved ops carry the derived facts, so a lane that
+    // decodes what it emits can merge them.
+    if ctx.eager_materialization && output == LaneOutput::Encoded {
+        return Some(ProbeLanePlan::Decline);
+    }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
         return Some(ProbeLanePlan::Decline);
     }
@@ -2941,8 +2964,9 @@ pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
+    output: LaneOutput,
 ) -> Result<ProbeLanePlan> {
-    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid], output) {
         return Ok(plan);
     }
     if eager_declines_unindexed(ctx, store, pred_sid) {
@@ -2978,8 +3002,9 @@ pub fn object_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
+    output: LaneOutput,
 ) -> Result<ProbeLanePlan> {
-    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid], output) {
         return Ok(plan);
     }
     if eager_declines_unindexed(ctx, store, pred_sid) {
@@ -3020,8 +3045,9 @@ pub fn star_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sids: &[&Sid],
+    output: LaneOutput,
 ) -> Result<ProbeLanePlan> {
-    if let Some(plan) = probe_lane_admission(ctx, pred_sids) {
+    if let Some(plan) = probe_lane_admission(ctx, pred_sids, output) {
         return Ok(plan);
     }
     if pred_sids
@@ -4795,7 +4821,7 @@ mod tests {
         let cache = PredOpsCache::new();
         let keys = 4 * PRED_OPS_CACHE_MAX_OPS / PRED_OPS_ENTRY_COST;
         for version in 0..keys as u64 {
-            cache.insert(pred_ops_test_key(version), pred_ops_of(0));
+            cache.insert(pred_ops_test_key(version), Some(pred_ops_of(0)));
         }
         assert_eq!(
             cache.lock().entries.len(),
@@ -4805,7 +4831,7 @@ mod tests {
 
         let one = pred_ops_of(1);
         for version in 0..keys as u64 {
-            cache.insert(pred_ops_test_key(version), Arc::clone(&one));
+            cache.insert(pred_ops_test_key(version), Some(Arc::clone(&one)));
         }
         let lru = cache.lock();
         let per_entry = 1 + PRED_OPS_ENTRY_COST;
@@ -4817,10 +4843,10 @@ mod tests {
     fn pred_ops_cache_evicts_least_recent_to_its_budget() {
         let cache = PredOpsCache::new();
         let half = pred_ops_of(PRED_OPS_CACHE_MAX_OPS / 2 - PRED_OPS_ENTRY_COST);
-        cache.insert(pred_ops_test_key(1), Arc::clone(&half));
-        cache.insert(pred_ops_test_key(2), Arc::clone(&half));
+        cache.insert(pred_ops_test_key(1), Some(Arc::clone(&half)));
+        cache.insert(pred_ops_test_key(2), Some(Arc::clone(&half)));
         assert!(cache.get(&pred_ops_test_key(1)).is_some());
-        cache.insert(pred_ops_test_key(3), Arc::clone(&half));
+        cache.insert(pred_ops_test_key(3), Some(Arc::clone(&half)));
         assert!(cache.contains(&pred_ops_test_key(1)), "recently read");
         assert!(
             !cache.contains(&pred_ops_test_key(2)),
@@ -4830,10 +4856,65 @@ mod tests {
         assert!(cache.lock().retained <= PRED_OPS_CACHE_MAX_OPS);
 
         let oversized = pred_ops_of(PRED_OPS_CACHE_MAX_OPS);
-        cache.insert(pred_ops_test_key(4), oversized);
+        cache.insert(pred_ops_test_key(4), Some(oversized));
         assert!(
             !cache.contains(&pred_ops_test_key(4)),
             "larger than the budget"
         );
+    }
+
+    /// Eager callers with an overlay are owed decoded bindings, so only a
+    /// lane that decodes them is admitted; on an overlay-free graph every
+    /// lane is `Clean`.
+    #[test]
+    fn probe_lane_admission_admits_eager_only_for_decoding_lanes() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
+        use fluree_db_novelty::Novelty;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let pred = Sid::new(100, "p");
+        let mut novelty = Novelty::new(0);
+        let flake = Flake {
+            g: None,
+            s: Sid::new(100, "s"),
+            p: pred.clone(),
+            o: FlakeValue::Ref(Sid::new(100, "o")),
+            dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+            t: 1,
+            op: true,
+            m: None,
+        };
+        novelty
+            .apply_commit(vec![flake], 1, &Default::default())
+            .unwrap();
+        let admit =
+            |ctx: &ExecutionContext<'_>, output| probe_lane_admission(ctx, &[&pred], output);
+
+        let plain = ExecutionContext::with_overlay(&snapshot, &vars, &novelty);
+        assert!(admit(&plain, LaneOutput::Encoded).is_none());
+
+        let eager =
+            ExecutionContext::with_overlay(&snapshot, &vars, &novelty).with_eager_materialization();
+        assert!(matches!(
+            admit(&eager, LaneOutput::Encoded),
+            Some(ProbeLanePlan::Decline)
+        ));
+        assert!(admit(&eager, LaneOutput::DecodesForEager).is_none());
+
+        let clean = ExecutionContext::new(&snapshot, &vars).with_eager_materialization();
+        for output in [LaneOutput::Encoded, LaneOutput::DecodesForEager] {
+            assert!(matches!(admit(&clean, output), Some(ProbeLanePlan::Clean)));
+        }
+    }
+
+    #[test]
+    fn pred_ops_cache_keeps_a_failed_translation() {
+        let cache = PredOpsCache::new();
+        cache.insert(pred_ops_test_key(1), None);
+        assert!(matches!(cache.get(&pred_ops_test_key(1)), Some(None)));
+        let lru = cache.lock();
+        assert_eq!(lru.retained, PRED_OPS_ENTRY_COST);
     }
 }
