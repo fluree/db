@@ -146,8 +146,8 @@ impl ModelEndpoint {
 /// ```
 ///
 /// With `account = true` the credential is this machine's `fluree login`
-/// instead of `api_key`, and `url` defaults to the account's own reader
-/// (`<api base>/grounding`).
+/// instead of `api_key` (a reader with both is refused), and `url`
+/// defaults to the account's own reader (`<api base>/grounding`).
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ReaderEndpoint {
     /// The URL a request is POSTed to. May be left out with `account`,

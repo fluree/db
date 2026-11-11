@@ -8088,6 +8088,38 @@ fn doc_read_through_the_account_renews_a_refused_token_or_says_the_sign_in_is_go
     );
 }
 
+/// `account = true` beside an `api_key` is refused, whichever of the file
+/// and the environment set each: the run would otherwise use one and
+/// quietly ignore the other.
+#[test]
+fn doc_read_refuses_an_account_reader_with_a_key() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_API_KEY", "k-123")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "both `account = true` and an `api_key`",
+        ))
+        .stderr(predicate::str::contains("pick one"));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
 /// `FLUREE_DOC_READER_ACCOUNT` takes yes or no and nothing else: `on` is an
 /// error, not a quiet no that would turn off `account = true` in the file.
 #[test]

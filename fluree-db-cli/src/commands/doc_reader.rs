@@ -37,6 +37,20 @@ pub async fn resolve(endpoint: &ReaderEndpoint) -> CliResult<(String, Option<Cre
     if !endpoint.account {
         return Ok((endpoint.url.clone(), Credential::from_endpoint(endpoint)));
     }
+    // Two credentials for one reader is a mistake to name, not a choice to
+    // make quietly: either way it would be the wrong one for someone.
+    if endpoint
+        .api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return Err(CliError::Config(
+            "[doc.reader] has both `account = true` and an `api_key` \
+             (or FLUREE_DOC_READER_API_KEY): pick one\n  hint: remove `api_key` to read \
+             through this machine's sign-in, or `account` to read with the key"
+                .into(),
+        ));
+    }
     let session = account_session(false).await?;
     let url = if endpoint.url.trim().is_empty() {
         format!("{}/grounding", session.api_base_url.trim_end_matches('/'))
