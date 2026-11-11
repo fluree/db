@@ -33,8 +33,10 @@ pages and images are read with the parser's deterministic tier only, and
 1. ``api_key`` with ``auth_header``: that key, sent as is in that header,
    to ``url``.
 2. ``api_key`` alone: a Fluree.ai API key (``flk_…``) is traded for an
-   access token (reused for the hour it lasts); any other key is sent as
-   ``Authorization: Bearer``, as the CLI's ``[doc.reader] api_key`` is.
+   access token (reused for the hour it lasts), or, when the service won't
+   trade it (a developer key, which calls the reader itself), sent as it
+   is; any other key is sent as ``Authorization: Bearer``, as the CLI's
+   ``[doc.reader] api_key`` is.
 3. No ``api_key``: this machine's ``fluree login``, else the
    ``FLUREE_AI_API_KEY`` environment variable (as in 2). Each is sent only
    to its own service; a ``url`` elsewhere is called with no credential.

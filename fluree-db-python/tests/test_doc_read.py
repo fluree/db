@@ -127,6 +127,7 @@ class Stub:
         self.reader_status = 200
         self.earlier = False
         self.token_expires = FAR
+        self.exchange_status = 200
         self.refresh_answer: tuple[int, dict] = (200, {
             "access_token": jwt(FAR), "refresh_token": "flk_rotated",
             "account": {"org_name": "Rotated Org", "email": "a@example.org"},
@@ -137,7 +138,11 @@ class Stub:
             def do_POST(self):  # noqa: N802
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
                 stub.seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
-                if self.path == "/v1/auth/token":
+                if self.path == "/v1/auth/token" and stub.exchange_status != 200:
+                    self._send(stub.exchange_status, {"error": {
+                        "message": "Invalid API key", "status": stub.exchange_status,
+                        "error": "invalid_api_key"}})
+                elif self.path == "/v1/auth/token":
                     self._send(200, {"accessToken": "exchanged-token", "expiresAt": stub.token_expires})
                 elif self.path == "/v1/oauth/token":
                     self._send(*stub.refresh_answer)
@@ -367,6 +372,17 @@ def test_an_api_key_is_traded_for_a_token_once_an_hour(stub, files, monkeypatch)
     assert h1["x-api-key"] == "flk_test"
     assert h1["user-agent"].startswith("fluree-python/")
     assert h2["authorization"] == "Bearer exchanged-token"
+
+
+def test_a_developer_key_the_exchange_refuses_goes_to_the_reader_as_is(stub, files):
+    # Only a connection's key trades for a token; a developer key is the
+    # bearer itself, checked by the reader's service.
+    stub.exchange_status = 401
+    fluree.doc.read(files / "memo.md", ontology=files / "onto.ttl", model="stub-reader",
+                    url=stub.base + "/v1/grounding", api_key="flk_dev_secret")
+    assert stub.paths() == ["/v1/auth/token", "/v1/grounding"]
+    (_, _, _), (_, headers, _) = stub.seen
+    assert headers["authorization"] == "Bearer flk_dev_secret"
 
 
 def test_an_api_key_that_isnt_a_service_key_is_a_bearer_token(stub, files):

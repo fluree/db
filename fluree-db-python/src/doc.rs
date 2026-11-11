@@ -6,9 +6,11 @@
 //! The credential:
 //! 1. `api_key` with `auth_header`: that key, in that header, as is, to `url`;
 //! 2. `api_key` alone: a Fluree.ai API key (`flk_…`) is traded for an hour's
-//!    access token at `<service>/v1/auth/token` (and reused while it lasts);
-//!    any other key goes as `Authorization: Bearer`, as the CLI's
-//!    `[doc.reader] api_key` does;
+//!    access token at `<service>/v1/auth/token` (and reused while it lasts),
+//!    or, when that refuses it (401: a developer key, which only calls
+//!    services directly), sent to the reader as a bearer token; any other
+//!    key goes as `Authorization: Bearer`, as the CLI's `[doc.reader]
+//!    api_key` does;
 //! 3. with no `api_key`: this machine's `fluree login` (`account.toml` in the
 //!    global config directory, refreshed when it is about to expire, as the
 //!    CLI does), else `FLUREE_AI_API_KEY` as in 2. Either is sent only to its
@@ -436,14 +438,21 @@ fn exchange_key(
         .map_err(|e| ReadError::Other(format!("{service}/v1/auth/token: {e}")))?;
     let status = response.status().as_u16();
     let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
+    // A developer key is refused here (only a connection's key trades for a
+    // token) and is sent to the reader as it is, which checks it there.
+    if status == 401 {
+        return Ok((url, Some(Credential::Bearer(key.to_string()))));
+    }
     let Some(token) = body
         .get("accessToken")
         .and_then(|v| v.as_str())
         .filter(|_| status == 200)
     else {
+        // The service nests its envelope: `{"error": {"message", "error"}}`.
         let message = format!(
             "{service}/v1/auth/token: {status} {}",
-            body.get("message")
+            body.pointer("/error/message")
+                .or_else(|| body.get("message"))
                 .or_else(|| body.get("error"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("the API key was refused")
