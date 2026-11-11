@@ -826,6 +826,7 @@ async fn routed_rows(
 #[tokio::test(flavor = "current_thread")]
 async fn a_cold_lane_leaves_a_selective_input_per_row() {
     const MENTORED: usize = 400;
+    const WARM_RETRIES: usize = 2;
     const WIDE: usize = 60;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-selective:main";
@@ -889,14 +890,27 @@ async fn a_cold_lane_leaves_a_selective_input_per_row() {
         ("wide", &wide, &all_wide, true),
         ("warm", &selective, &one, true),
     ] {
-        for (lane, (jsonld, sparql)) in queries {
+        for (idx, (lane, (jsonld, sparql))) in queries.iter().enumerate() {
             for (surface, input) in [
                 ("JSON-LD", QueryInput::JsonLd(jsonld)),
                 ("SPARQL", QueryInput::Sparql(sparql)),
             ] {
                 let label = format!("{phase} {lane} ({surface})");
-                let (rows, flushed, per_row, spans) =
-                    routed_rows(&fluree, &view, &store, lane, input).await;
+                let mut routed = routed_rows(&fluree, &view, &store, lane, input).await;
+                // The warm phase reads the ops `wide` translated, keyed by
+                // the materialization's content version. Sibling tests can
+                // evict that materialization from the reasoning cache, and its
+                // rebuild gets a new version, so rerun `wide` and retry. A real
+                // regression fails every attempt.
+                for _ in 0..WARM_RETRIES {
+                    if phase != "warm" || routed.1 {
+                        break;
+                    }
+                    let (wide_jsonld, _) = &wide[idx].1;
+                    query_rows(&fluree, &view, QueryInput::JsonLd(wide_jsonld)).await;
+                    routed = routed_rows(&fluree, &view, &store, lane, input).await;
+                }
+                let (rows, flushed, per_row, spans) = routed;
                 assert_eq!(&rows, expected, "{label}: rows");
                 assert_eq!(
                     (flushed, per_row),
@@ -998,6 +1012,7 @@ const DECLINE_EVENT: &str = "join batched probe: overlay plan declined; per-row"
 
 const REROUTE_MARKERS: usize = 3000;
 const REROUTE_RULE_INPUTS: [usize; 4] = [3, 7, 1500, 2999];
+const CACHED_RETRIES: usize = 2;
 
 /// `ex:board` levels `REROUTE_MARKERS` subjects. Stored `ex:caseId`s index the
 /// predicate and outnumber the markers in the planner's stats, so the markers
@@ -1085,21 +1100,35 @@ async fn a_deferred_plan_declining_mid_stream_keeps_every_row() {
         ("cached", "JSON-LD", QueryInput::JsonLd(&jsonld)),
     ] {
         let label = format!("{run} ({surface})");
-        let declines = store.find_events(DECLINE_EVENT).len();
         assert_eq!(
             query_rows(&fluree, &oracle, input).await,
             expected,
             "{label}: oracle"
         );
-        assert_eq!(
-            query_rows(&fluree, &view, input).await,
-            expected,
-            "{label}: indexed"
-        );
-        let mid_stream: Vec<usize> = store.find_events(DECLINE_EVENT)[declines..]
-            .iter()
-            .filter_map(|e| e.fields.get("input_rows")?.parse().ok())
-            .collect();
+        let indexed_declines = || async {
+            let declines = store.find_events(DECLINE_EVENT).len();
+            assert_eq!(
+                query_rows(&fluree, &view, input).await,
+                expected,
+                "{label}: indexed"
+            );
+            store.find_events(DECLINE_EVENT)[declines..]
+                .iter()
+                .filter_map(|e| e.fields.get("input_rows")?.parse().ok())
+                .collect::<Vec<usize>>()
+        };
+        let mut mid_stream = indexed_declines().await;
+        // The failed translation is cached under the materialization's
+        // content version. Sibling tests can evict that materialization from
+        // the reasoning cache, and its rebuild gets a new version, so the run
+        // that rebuilds it declines mid-stream once more. Retry; without the
+        // cached failure every attempt declines mid-stream.
+        for _ in 0..CACHED_RETRIES {
+            if run == "cold" || mid_stream.is_empty() {
+                break;
+            }
+            mid_stream = indexed_declines().await;
+        }
         if run == "cold" {
             assert!(
                 mid_stream.iter().any(|&rows| rows < REROUTE_MARKERS),
