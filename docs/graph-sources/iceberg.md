@@ -1201,11 +1201,15 @@ native twin of the same data):
 
 A source read through a graph scope is filtered by its own policy (the
 request's and the source's model), whatever governs the graph the query
-reads by default: as a dataset's named graph (`from-named` / `FROM NAMED`),
-or named by IRI in a JSON-LD `graph` pattern of a query over one ledger,
-which reads it as a named graph the same way. A graph variable bound to a
-source's name in a query whose dataset does not include the source is
-refused, governed source or not; name the source in `from-named`.
+reads by default. That holds for a dataset's named graph (`from-named` /
+`FROM NAMED`, including an unbound `GRAPH ?g` ranging over them), and for a
+JSON-LD query over one ledger that names the source in a `graph` pattern or
+gives it to the pattern's graph variable as a `values` or `bind` constant:
+the query reads the source as a named graph the same way. A graph variable
+bound to a source's name from data, outside the query's dataset, is refused
+with `400` `err:db/InvalidQuery`, governed source or not: name the source in
+`from-named` (SPARQL: `FROM NAMED <iri>`) and use `GRAPH <iri>` or
+`VALUES ?g { <iri> }`.
 
 Not supported: **`f:query`** policies. A virtual source has no graph to run the
 policy query against, so a targeted `f:query` evaluates as "no rows" and
