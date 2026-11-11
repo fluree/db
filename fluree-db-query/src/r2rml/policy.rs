@@ -314,6 +314,28 @@ impl R2rmlPolicyGate {
         let (enforcer, encoder) = match ctx.dataset.and_then(|ds| ds.named_graph(graph_source_id)) {
             Some(graph) => (graph.policy_enforcer.clone(), Some(graph.snapshot.clone())),
             None => {
+                // Outside a dataset the context's policy is the source's own
+                // only where the context was built for it. A source a query
+                // over another graph reaches through `GRAPH` (a graph variable
+                // bound to its IRI) would be read under that graph's policy,
+                // or none: refuse it.
+                let in_graph_scope = matches!(
+                    &ctx.active_graph,
+                    crate::dataset::ActiveGraph::Named(iri) if iri.as_ref() == graph_source_id
+                );
+                let other_policy = ctx
+                    .policy_source
+                    .as_deref()
+                    .is_some_and(|source| source != graph_source_id);
+                if in_graph_scope && other_policy {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "Graph source '{graph_source_id}' is reached through a GRAPH scope whose \
+                         graph is bound from data, outside the query's dataset, where the view \
+                         policy in force is not the source's own. Name it in from-named \
+                         (SPARQL: FROM NAMED <{graph_source_id}>) and use GRAPH \
+                         <{graph_source_id}> or VALUES ?g {{ <{graph_source_id}> }}."
+                    )));
+                }
                 if ctx.allow_unfiltered() {
                     return Ok(None);
                 }

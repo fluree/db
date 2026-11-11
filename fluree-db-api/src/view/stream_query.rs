@@ -318,10 +318,12 @@ impl Fluree {
         query_json: &serde_json::Value,
         options: &QueryExecutionOptions,
     ) -> Result<DataSetDb> {
-        let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec_as(
+        let (mut spec, qc_opts) = crate::query::helpers::parse_dataset_spec_as(
             query_json,
             options.server_identity.as_ref(),
         )?;
+        self.route_graph_scoped_sources(&mut spec, query_json)
+            .await?;
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
