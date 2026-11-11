@@ -56,6 +56,9 @@
 use fluree_db_api::{ApiError, FlureeBuilder, FlureeR2rmlProvider, R2rmlCreateConfig};
 use futures::TryStreamExt;
 
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
 // Top-k cases over `silver.versions`, in a module of their own.
 mod iceberg_local_fs_top_k;
 

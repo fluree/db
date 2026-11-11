@@ -1,10 +1,7 @@
 //! Scan-side top-k over rows that do not all yield a solution: a module of
 //! `it_iceberg_local_fs`, over the `silver.versions` fixture.
 
-use super::{allow_fixture_roots, FlureeBuilder, R2rmlCreateConfig};
-
-#[path = "support/span_capture.rs"]
-mod span_capture;
+use super::{allow_fixture_roots, span_capture, FlureeBuilder, R2rmlCreateConfig};
 
 /// The `(?v, ?n)` rows of a SPARQL (bindings) or JSON-LD (array of rows)
 /// result, sorted.
