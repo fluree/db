@@ -689,7 +689,12 @@ async fn a_provisional_query_over_a_filtered_map_answers_as_the_registered_sourc
     );
     let tables = ["customers_history", "orders"]
         .into_iter()
-        .map(|t| (format!("silver.{t}"), format!("{}/silver/{t}", fixtures_dir())))
+        .map(|t| {
+            (
+                format!("silver.{t}"),
+                format!("{}/silver/{t}", fixtures_dir()),
+            )
+        })
         .collect();
     let provisional = fluree
         .query_provisional_r2rml_over_local_tables_for_test(
