@@ -7287,6 +7287,7 @@ WHERE {
     assert_eq!(seen.lock().unwrap().len(), 2);
     assert_eq!(sparql_rows(&tmp, "memos", &fact), 0);
     assert_eq!(sparql_rows(&tmp, "memos", &claim), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &annotation), 0);
     assert_eq!(sparql_rows(&tmp, "memos", &link), 1);
     assert!(sparql_rows(&tmp, "memos", runs) >= 2);
 
@@ -7736,4 +7737,168 @@ fn doc_ingest_reader_sends_nothing_for_a_document_with_no_text() {
         .assert()
         .success();
     assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+/// `rel` under the project: `docs/memo.md`'s text, repeated past what one
+/// reader call takes, so the document is read in two.
+fn write_two_call_memo(tmp: &TempDir, rel: &str) {
+    let mut memo = std::fs::read_to_string(tmp.path().join("docs/memo.md")).unwrap();
+    while memo.len() < 70_000 {
+        memo.push_str(
+            "\nThe board reviewed the quarterly staffing plan in detail and agreed on it.\n",
+        );
+    }
+    std::fs::write(tmp.path().join(rel), memo).unwrap();
+}
+
+fn ingest_with_stub_reader(tmp: &TempDir, url: &str) -> Command {
+    let mut cmd = fluree_cmd(tmp);
+    cmd.env("FLUREE_DOC_READER_URL", url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "docs", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .arg("--no-cache");
+    cmd
+}
+
+/// Claims in `doc`'s reading graph, all or those of one run.
+fn reading_claims(tmp: &TempDir, doc: &str, run: Option<&str>) -> usize {
+    let run = run.map_or(String::new(), |r| {
+        format!("; <http://www.w3.org/ns/prov#wasGeneratedBy> <{r}>")
+    });
+    sparql_rows(
+        tmp,
+        "memos",
+        &format!(
+            "SELECT ?c WHERE {{ GRAPH <urn:fluree:doc:{doc}/reading> {{ ?c a <https://ns.flur.ee/extract#Claim> {run} }} }}"
+        ),
+    )
+}
+
+/// A document read in two calls is two commits into one reading graph,
+/// each with its own run as its metadata, the second call's offsets moved
+/// into the document's text; a re-read replaces both calls' readings.
+#[test]
+fn doc_ingest_commits_each_call_of_a_reading_into_one_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    write_two_call_memo(&tmp, "docs/memo.md");
+    let (url, seen) = spawn_stub_reader(vec![
+        stub_reading(0.9, true),
+        stub_reading(0.8, true),
+        stub_reading(0.6, true),
+        stub_reading(0.4, false),
+    ]);
+    ingest_with_stub_reader(&tmp, &url)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reading: 2 call(s), 2,064 tokens"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    let g = "<urn:fluree:doc:memo.md/reading>";
+    assert_eq!(reading_claims(&tmp, "memo.md", None), 2);
+    // The same fact, read in both calls, is one triple with two claims.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            &format!("SELECT ?s WHERE {{ GRAPH {g} {{ ?s <https://schema.org/worksFor> ?o }} }}")
+        ),
+        1
+    );
+    // A commit per call, each with its run.
+    let runs = "SELECT ?run FROM NAMED <memos:main#txn-meta> WHERE { GRAPH <memos:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }";
+    assert_eq!(sparql_rows(&tmp, "memos", runs), 2);
+    // The second call's two mentions sit past the first call's text.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            &format!(
+                "SELECT ?m WHERE {{ GRAPH {g} {{ ?m <http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#beginIndex> ?b FILTER(?b > 1000) }} }}"
+            )
+        ),
+        2
+    );
+
+    ingest_with_stub_reader(&tmp, &url)
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert_eq!(reading_claims(&tmp, "memo.md", None), 1);
+    assert_eq!(
+        reading_claims(&tmp, "memo.md", Some("urn:fluree:run:01TEST60")),
+        1
+    );
+    assert_eq!(sparql_rows(&tmp, "memos", runs), 4);
+}
+
+/// A reading whose commit fails partway fails that document, not the run:
+/// the next document is read and committed. Its first call's reading is
+/// left in the reading graph with no document node, and the next run, with
+/// no earlier ingest to retract, still clears it before committing the new
+/// reading.
+#[test]
+fn doc_ingest_recovers_from_a_reading_a_failed_run_left_behind() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Read first (by name), in two calls; `memo.md` after it, in one.
+    write_two_call_memo(&tmp, "docs/memo-2.md");
+    // Metadata in Fluree's own namespace, which no transaction may set:
+    // the reading parses, and its commit is refused.
+    let mut refused = stub_reading(0.8, true);
+    refused["txn-meta"]["https://ns.flur.ee/db#t"] = serde_json::json!(7);
+    let (url, seen) = spawn_stub_reader(vec![
+        stub_reading(0.9, true),
+        refused,
+        stub_reading(0.7, true),
+        stub_reading(0.6, true),
+        stub_reading(0.5, true),
+    ]);
+    let out = ingest_with_stub_reader(&tmp, &url)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 1 failed",
+        ))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("✗") && l.contains("memo-2.md") && l.contains("committing")),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("✓") && l.contains("memo.md") && !l.contains("memo-2")),
+        "{stdout}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // The first call's reading went in; the document node did not.
+    assert_eq!(
+        reading_claims(&tmp, "memo-2.md", Some("urn:fluree:run:01TEST90")),
+        1
+    );
+    let stamped =
+        "SELECT ?g WHERE { <urn:fluree:doc:memo-2.md> <https://ns.flur.ee/doc#readingGraph> ?g }";
+    assert_eq!(sparql_rows(&tmp, "memos", stamped), 0);
+
+    ingest_with_stub_reader(&tmp, &url)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 ingested, 1 unchanged, 0 failed",
+        ));
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    assert_eq!(
+        reading_claims(&tmp, "memo-2.md", Some("urn:fluree:run:01TEST90")),
+        0
+    );
+    assert_eq!(reading_claims(&tmp, "memo-2.md", None), 2);
+    assert_eq!(sparql_rows(&tmp, "memos", stamped), 1);
 }

@@ -614,6 +614,42 @@ async fn asserted_edges(
         .collect())
 }
 
+/// Commit one document, returning the `t` of its last commit: the earlier
+/// ingest's nodes retracted (`previous`), the reading graph cleared (when
+/// named), each reader call's transaction in it, its run that commit's
+/// metadata, and then the document node. The node stamps the document as
+/// read, so it goes last: a failure before it leaves the document to be
+/// read again next run.
+async fn commit_document(
+    f: &Fluree,
+    alias: &str,
+    doc_iri: &str,
+    previous: bool,
+    clear_reading: Option<&str>,
+    readings: &[Value],
+    tx: &Value,
+) -> CliResult<i64> {
+    let g = f.graph(alias);
+    if previous {
+        // Edges the earlier extraction wrote outlive its nodes only while
+        // some other relation still supports them.
+        let edges = asserted_edges(f, alias, doc_iri).await?;
+        g.transact()
+            .sparql_update(&graph::retract_update(doc_iri))
+            .commit()
+            .await?;
+        drop_unsupported_edges(f, alias, &edges).await?;
+    }
+    // Cleared, not dropped, so it stays queryable at its commits.
+    if let Some(reading_graph) = clear_reading {
+        clear_reading_graph(f, alias, reading_graph).await?;
+    }
+    for reading in readings {
+        g.transact().insert(reading).commit().await?;
+    }
+    Ok(g.transact().insert(tx).commit().await?.receipt.t)
+}
+
 /// Clear a document's reading graph before its new reading is committed.
 /// A graph with nothing in it (the document was never read by a reader, or
 /// read to nothing) has nothing to clear.
@@ -808,6 +844,13 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             _ => None,
         };
 
+        let reads_with_reader = matches!(
+            &extraction,
+            Some(Extraction {
+                reader: Some(_),
+                ..
+            })
+        );
         let (doc, extracted) = match &extraction {
             Some(Extraction {
                 reader: Some(reader),
@@ -965,31 +1008,42 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
 
         let mut commit_note = String::new();
         if let Some(f) = &fluree {
-            let g = f.graph(&alias);
-            if previous.is_some() {
-                // Edges the earlier extraction wrote outlive its nodes only
-                // while some other relation still supports them.
-                let edges = asserted_edges(f, &alias, &doc.doc_iri).await?;
-                g.transact()
-                    .sparql_update(&graph::retract_update(&doc.doc_iri))
-                    .commit()
-                    .await?;
-                drop_unsupported_edges(f, &alias, &edges).await?;
-            }
             // An earlier reader's reading goes whole, whatever reads the
-            // document now: its graph holds nothing but readings. Cleared,
-            // not dropped, so it stays queryable at its commits.
-            if previous.is_some() {
-                clear_reading_graph(f, &alias, &reading_graph).await?;
+            // document now, and so does whatever a run that failed partway
+            // left in the reading graph with no document node to say so: a
+            // reader reading it clears it even with no earlier ingest.
+            let clear_reading = previous.is_some() || reads_with_reader;
+            let committed = commit_document(
+                f,
+                &alias,
+                &doc.doc_iri,
+                previous.is_some(),
+                clear_reading.then_some(reading_graph.as_str()),
+                &readings,
+                &tx,
+            )
+            .await;
+            match committed {
+                Ok(t) => commit_note = format!("  t={t}"),
+                // This document's failure, not the run's: the next is read.
+                // With no document node committed, the next run reads it
+                // again and clears what this one left.
+                Err(e) => {
+                    let mut why = format!("committing: {e}");
+                    if let Some(read) = extracted.as_ref().and_then(|x| x.read.as_ref()) {
+                        let usage = read.usage.note();
+                        if !usage.is_empty() {
+                            why.push_str(&format!(" (reading: {usage})"));
+                        }
+                        totals.reader_usage.add(&read.usage);
+                        totals.reader_calls += read.calls();
+                        totals.reader_cached += read.cached();
+                    }
+                    println!("  {} {label}  {why}", "✗".red());
+                    totals.failed += 1;
+                    continue;
+                }
             }
-            // One commit per call, its run that commit's metadata; the
-            // document node, which stamps the document as read, last, so a
-            // reading that fails to commit is read again next run.
-            for reading in &readings {
-                f.graph(&alias).transact().insert(reading).commit().await?;
-            }
-            let result = g.transact().insert(&tx).commit().await?;
-            commit_note = format!("  t={}", result.receipt.t);
         }
 
         let source = if doc.parsed.from_cache {
