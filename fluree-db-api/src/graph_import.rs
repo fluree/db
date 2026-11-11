@@ -79,6 +79,23 @@ pub(crate) struct GraphImportSeed {
 }
 
 impl GraphImportSeed {
+    /// Annotations indexed before they were stored as links leave no term
+    /// dictionary for an import's triple terms to extend. A source without
+    /// any imports as it would into any other ledger.
+    pub(crate) fn refuse_terms_without_links(
+        &self,
+        imports_terms: bool,
+    ) -> Result<(), ImportError> {
+        if imports_terms && self.base_root.has_annotations && self.base_root.term_dict.is_none() {
+            return Err(ImportError::Refused(format!(
+                "{}'s index predates its annotations' links; reindex it before importing \
+                 annotations or triple terms into one of its graphs",
+                self.base_root.ledger_id
+            )));
+        }
+        Ok(())
+    }
+
     /// The ledger's graphs, IRI → g_id, less a dropped graph the import
     /// refills: the import's commits register that one again.
     pub(crate) fn graph_ids(&self) -> HashMap<String, fluree_db_core::GraphId> {
@@ -872,15 +889,6 @@ async fn load_seed(
         BinaryIndexStore::load_from_root_v6(Arc::clone(&content_store), &base_root, None)
             .await
             .map_err(storage_error)?;
-    // Annotations indexed before they were stored as links leave no term
-    // dictionary for the import's terms to extend.
-    if base_root.has_annotations && base_root.term_dict.is_none() {
-        return Err(ImportError::Refused(format!(
-            "{}'s index predates its annotations' links; reindex it before importing \
-             into one of its graphs",
-            record.ledger_id
-        )));
-    }
     let base_terms = match &base_root.term_dict {
         Some(refs) => Some(Arc::new(
             TermDictReader::from_refs_reusing(Arc::clone(&content_store), refs, None, None)

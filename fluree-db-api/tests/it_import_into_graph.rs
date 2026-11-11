@@ -1231,6 +1231,55 @@ async fn annotations_import_into_a_graph_of_an_unannotated_ledger() {
     );
 }
 
+/// A ledger indexed by 4.2.3, before annotations were stored as links
+/// (`tests/fixtures/prelink-annotations`), has no term dictionary for an
+/// import's triple terms to extend: an annotated source is refused, a plain
+/// one imports.
+#[tokio::test]
+async fn a_pre_link_ledger_refuses_only_an_import_that_carries_terms() {
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    const PRE_LINK: &str = "ann:main";
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prelink-annotations"),
+        dir.path(),
+    );
+    let fluree = fluree_at(dir.path());
+
+    let refused = import_into(&fluree, PRE_LINK, &[("claims.ttl", GRAPH_CLAIMS)], GRAPH)
+        .await
+        .expect_err("an annotated source is refused");
+    assert!(refused.contains("reindex"), "{refused}");
+
+    import_into(&fluree, PRE_LINK, &[("a.ttl", SOURCE_A)], GRAPH)
+        .await
+        .expect("a plain source imports");
+    let rows = fluree_at(dir.path())
+        .query_from()
+        .sparql(&format!(
+            "PREFIX ex: <{EX}> SELECT ?s ?p ?o FROM <{PRE_LINK}> FROM NAMED <{PRE_LINK}#{GRAPH}> \
+             WHERE {{ GRAPH <{PRE_LINK}#{GRAPH}> {{ ?s ?p ?o }} }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("query the imported graph");
+    assert!(
+        !support::normalize_sparql_bindings(&rows).is_empty(),
+        "{rows}"
+    );
+}
+
 /// A memory-backed connection whose nameservice can hold or fail an index
 /// publish, over [`seed_ledger`]'s ledger, and the storage and nameservice a
 /// second connection to it needs.

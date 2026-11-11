@@ -6785,6 +6785,9 @@ where
                 }
             })
             .collect();
+        if let Some(seed) = seed {
+            seed.refuse_terms_without_links(commits.iter().any(|c| c.term_table.is_some()))?;
+        }
         // The meta chunk is always the last chunk when present.
         let txn_meta_commit = commits.last().cloned();
 
