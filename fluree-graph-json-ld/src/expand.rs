@@ -173,13 +173,20 @@ fn details_dispatch(
 }
 
 /// A string a `"@type": "@vocab"` term coerces: a term or compact IRI, else
-/// relative to `@vocab`, else to `@base`.
-fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<String> {
-    let (expanded, entry) = details(s, ctx, true);
-    if entry.is_some() {
-        return Ok(expanded);
+/// relative to `@vocab`, else to `@base`. `None` for a term defined as
+/// `null`, which names no IRI.
+fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    match details(s, ctx, true) {
+        (_, Some(entry)) if entry.null_mapping => Ok(None),
+        (expanded, Some(_)) => Ok(Some(expanded)),
+        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
     }
-    iri_dispatch(s, ctx, false, strict)
+}
+
+/// A `@type` value's IRI; `None` for a term defined as `null`.
+fn type_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let (expanded, entry) = details_dispatch(s, ctx, true, strict)?;
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(expanded))
 }
 
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
@@ -221,10 +228,16 @@ fn parse_node_value(
         JsonValue::Null => Ok(vec![]),
 
         // A term typed `@json` makes its whole value one JSON literal,
-        // whatever its shape.
+        // whatever its shape. A string `@value` on a JSON literal is read
+        // as an already serialized document, so a string goes in serialized:
+        // `"hello"` is the JSON string, not the text `hello`.
         _ if type_val == Some(&TypeValue::Json) => {
+            let literal = match value {
+                JsonValue::String(_) => JsonValue::String(crate::normalize::normalize(value)),
+                _ => value.clone(),
+            };
             let mut obj = Map::new();
-            obj.insert("@value".to_string(), value.clone());
+            obj.insert("@value".to_string(), literal);
             obj.insert("@type".to_string(), json!("@json"));
             Ok(vec![JsonValue::Object(obj)])
         }
@@ -264,12 +277,10 @@ fn parse_node_value(
             }
 
             if type_val == Some(&TypeValue::Vocab) {
-                let mut obj = Map::new();
-                obj.insert(
-                    "@id".to_string(),
-                    json!(vocab_value_iri(s, context, strict)?),
-                );
-                return Ok(vec![JsonValue::Object(obj)]);
+                return Ok(vocab_value_iri(s, context, strict)?
+                    .map(|iri| json!({"@id": iri}))
+                    .into_iter()
+                    .collect());
             }
 
             let mut obj = Map::new();
@@ -406,6 +417,15 @@ fn parse_node_value(
                     .as_ref()
                     .is_some_and(|c| c.contains(&Container::Index))
             }) {
+                // The keys would become values of the index property;
+                // refused rather than dropped.
+                if let Some(property) = &e.index {
+                    return Err(JsonLdError::InvalidContext {
+                        message: format!(
+                            "a property-valued @index (\"{property}\") is not supported"
+                        ),
+                    });
+                }
                 let unindexed = ContextEntry {
                     container: e.container.as_ref().map(|containers| {
                         containers
@@ -528,12 +548,12 @@ fn parse_type<'c>(
 
     if let Some(type_val) = type_val {
         let types: Vec<String> = match type_val {
-            JsonValue::String(s) => vec![iri_dispatch(s, context, true, strict)?],
+            JsonValue::String(s) => type_iri(s, context, strict)?.into_iter().collect(),
             JsonValue::Array(arr) => {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     if let Some(s) = v.as_str() {
-                        result.push(iri_dispatch(s, context, true, strict)?);
+                        result.extend(type_iri(s, context, strict)?);
                     }
                 }
                 result
@@ -1762,6 +1782,33 @@ mod tests {
         assert_eq!(parsed.to_json()["gone"], JsonValue::Null);
     }
 
+    /// A `null` term names no IRI as a value either: a `@vocab` term's value
+    /// and a `@type` naming it are dropped, not kept as the bare key.
+    #[test]
+    fn null_term_names_no_value_iri() {
+        let ctx = json!({
+            "@vocab": EX,
+            "gone": null,
+            "p": {"@type": "@vocab"}
+        });
+        let expanded = crate::expand(&json!({
+            "@context": ctx,
+            "@id": "http://example.org/s",
+            "@type": ["gone", "Kept"],
+            "p": ["gone", "kept"]
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({
+                "@id": "http://example.org/s",
+                "@type": [format!("{EX}Kept")],
+                format!("{EX}p"): [{"@id": format!("{EX}kept")}]
+            }),
+            "{expanded}"
+        );
+    }
+
     /// An `@index` map's keys index its values and carry no data; a
     /// property-valued index, whose keys would be data, is refused.
     #[test]
@@ -1786,8 +1833,16 @@ mod tests {
             ])
         );
 
-        let by_property = json!({"p": {"@id": "ex:p", "@container": "@index", "@index": "ex:q"}});
-        assert!(crate::expand(&json!({"@context": by_property, "p": {}})).is_err());
+        // Refused where a map uses it, not for a context that only carries it.
+        let by_property = json!({
+            "ex": EX,
+            "p": {"@id": "ex:p", "@container": "@index", "@index": "ex:q"}
+        });
+        assert!(crate::expand(&json!({"@context": by_property, "p": {"k": "v"}})).is_err());
+        let unused = crate::expand(&json!({"@context": by_property, "ex:r": "v"})).unwrap();
+        assert_eq!(unused, json!({format!("{EX}r"): [{"@value": "v"}]}));
+        let parsed = ParsedContext::parse(None, &by_property).unwrap();
+        assert_eq!(parsed.to_json()["p"]["@index"], json!("ex:q"));
     }
 
     /// A `@json`-typed term makes the whole value one JSON literal, whatever
@@ -1795,10 +1850,17 @@ mod tests {
     #[test]
     fn json_typed_term_keeps_the_whole_value() {
         let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": "@json"}});
-        for value in [json!("text"), json!(5), json!(true), json!([1, {"a": [2]}])] {
+        for value in [json!(5), json!(true), json!([1, {"a": [2]}])] {
             assert_eq!(
                 values_of_p(json!({"@context": ctx, "p": value})),
                 json!([{"@value": value, "@type": "@json"}])
+            );
+        }
+        // A string goes in serialized, as the explicit form writes a document.
+        for (value, document) in [("text", r#""text""#), ("5", r#""5""#), ("{}", r#""{}""#)] {
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": value})),
+                json!([{"@value": document, "@type": "@json"}])
             );
         }
     }

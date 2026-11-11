@@ -83,7 +83,8 @@ Deviations from the JSON-LD 1.1 expansion algorithm:
 - A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
 - A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 - A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
-- `@container` values `@id`, `@type` and `@graph` are refused, as is a property-valued `@index`.
+- `@container` values `@id`, `@type` and `@graph` are refused. A property-valued `@index` is refused where an index map uses it.
+- A string `@value` on a value object typed `@json` is read as a serialized JSON document: `{"@value": "{\"a\": 1}", "@type": "@json"}` is the object, not a string. A string under a term typed `@json` is the JSON string itself.
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
@@ -428,12 +429,29 @@ Related JSON-LD changes: graph names must be absolute IRIs (a relative one is re
 
 A bulk JSON-LD import (`fluree create --from`, `.jsonld` and `.jsonl`/`.ndjson`) now writes `@graph` scoping as a transaction does: a node's graph selector puts it and the nodes nested in it in that graph, and a JSON-LD named graph puts its content there, through the same graph-name table a transaction and a TriG import use. In 4.2.4 such documents imported with their graph selectors folded into the default graph and the named graphs' content dropped. A few documents that imported before now fail, naming what they cannot place: an unknown `@`-keyword on a node (it used to be dropped), and a graph name a transaction refuses as well. `"config"` and `"txn-meta"` stay refused, as in a TriG import. Each `.jsonl` line is read as a document of its own under the shared context.
 
+#### JSON-LD term definitions coerce values as JSON-LD 1.1 defines
+
+A transaction, a bulk import and a JSON-LD query now read these term definitions as JSON-LD 1.1 does. A document that uses one writes different values than it did:
+
+- **`"@type": "@vocab"`**: a string value is an IRI (a term, a compact IRI, or relative to `@vocab`, else `@base`). It was stored as a string.
+- **`"@type": "@json"`**: the whole value is one JSON literal. A number, boolean or string was stored as an `xsd` value, and an array was split into separate values, its objects becoming nodes. A string is the JSON string, so `"5"` is not the number.
+- **`"@language": null`** on a term: its strings are untagged. They took the default language.
+- **A default `@language` with a datatype**, from the term or the value object: the datatype wins and the value has no language. The document was refused.
+- **`"@container": "@index"`**: the map's values are the property's values and the keys are dropped. The map was stored as a blank node with the keys as its properties.
+- **A term defined as `null`, or with `"@id": null`**: its property is dropped, and so is a `@vocab` value or `@type` that names it. The bare `null` form failed to parse, and the `"@id": null` form wrote the key as a property relative to `@vocab`.
+- **A property-valued `@index`** (`"@index": "<property>"`): an index map under such a term is refused. Its keys were dropped silently.
+
+A JSON-LD `where` clause reads a `@vocab` and a `@json` term the same way, so a pattern written under the context of the insert matches what the insert wrote: `"status": "Active"` looks for the IRI, and `"doc": 5` for the JSON literal `5`. A variable, and a value object (`{"@value": ...}`), keep their meaning under a `@json` term. A pattern on a term defined as `null` is refused. A map in `where` stays a node pattern under an `@index` term: to match a value written through an index map, write the value itself (`"m": "x"`, not `"m": {"a": "x"}`).
+
+Data already stored is not rewritten; see the next section for what that means for values these terms wrote before.
+
 #### Data written by an earlier release that reads differently
 
 No stored format changes. These kinds of earlier data behave differently after the upgrade:
 
 - **A config with two values for one setting-group pointer** (for example two `f:shaclDefaults` or `f:policyDefaults` groups on the config subject, typically a split config plus a corrected one written beside it). The reader now uses the non-empty group whose IRI sorts lowest; earlier releases could pick an empty one. A SHACL or policy group that had no effect therefore takes effect, including a stored `f:defaultAllow false`. Ledger info reports this as `ambiguous-pointer`. Remove the group you do not want, in the config graph.
 - **Edges written through a reverse-defined term** (a context term with `"@reverse"`). With `"childOf": {"@reverse": "ex:child"}`, the node `{"@id": "ex:kid", "childOf": {"@id": "ex:mom"}}` means `ex:mom ex:child ex:kid`. Earlier releases stored `ex:kid ex:child ex:mom`, as if the term were not reversed. The term is now read as JSON-LD defines it, so the same document no longer reaches an edge an earlier release stored: deleting with it does nothing. To repair a predicate that was written only through a reverse term, flip its edges once, for example `DELETE { ?s ex:child ?o } INSERT { ?o ex:child ?s } WHERE { ?s ex:child ?o }`. If it was also written in the forward direction, select only the edges the reverse term wrote.
+- **Values written through a `@vocab`, `@json` or `@index` term** (see [JSON-LD term definitions coerce values as JSON-LD 1.1 defines](#json-ld-term-definitions-coerce-values-as-json-ld-11-defines)). They keep the shape the earlier release stored, and the same context now reads and writes the new one, so a `where` pattern, a delete or an upsert written through the term no longer reaches them. A string stored through a `@vocab` term becomes the IRI with one update, here for terms relative to `http://example.org/`: `DELETE { ?s ex:status ?old } INSERT { ?s ex:status ?new } WHERE { ?s ex:status ?old FILTER(isLiteral(?old)) BIND(IRI(CONCAT("http://example.org/", STR(?old))) AS ?new) }`. Values stored through a `@json` or an `@index` term have no general rewrite (a split array does not record which values it held together): delete them by the property's full IRI and write the documents again.
 - **Facts an update stored under a fallback namespace code.** A `where` constant in a namespace the ledger had not seen yet was stored under a fallback code, so once the namespace got its own code, a lookup by the IRI missed those facts. Every IRI an update writes is now stored under its canonical code. Facts already stored the fallback way stay split from the IRI's other facts; there is no migration.
 - **Vectors of more than one length on one property.** An earlier release could store vectors of several lengths on one property in one graph. Writes to such a property refuse any further length (see [A property keeps one vector length per graph](#a-property-keeps-one-vector-length-per-graph)). To fix it, export the ledger and import it into a new one, keeping one length per property or moving the others to another property.
 

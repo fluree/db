@@ -2284,6 +2284,18 @@ fn parse_literal_value_with_meta(
 
             // Handle @json specially
             if type_iri == "@json" || expanded_type == rdf::JSON {
+                // A template variable, written bare or as the JSON string a
+                // `@json`-typed term serializes it to.
+                if let (true, Value::String(s)) = (object_var_parsing, val) {
+                    let name = s
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.strip_suffix('"'))
+                        .unwrap_or(s);
+                    if name.starts_with('?') && !name.contains(['"', '\\']) {
+                        let var_id = vars.get_or_insert(name);
+                        return Ok(ParsedValue::new(TemplateTerm::Var(var_id)));
+                    }
+                }
                 // Canonicalizing here gives one term per value, regardless
                 // of how the writer serialized it (#1781). A string `@value`
                 // holds an already serialized document, so it is
@@ -2729,6 +2741,12 @@ mod tests {
                 with(json!({"d": {"@id": "ex:d", "@type": "@json"}})),
                 json!({"d": [1, {"a": true}]}),
                 json!({"ex:d": {"@value": [1, {"a": true}], "@type": "@json"}}),
+            ),
+            // A string is a JSON string, not a serialized document.
+            (
+                with(json!({"d": {"@id": "ex:d", "@type": "@json"}})),
+                json!({"d": "5"}),
+                json!({"ex:d": {"@value": "\"5\"", "@type": "@json"}}),
             ),
             (
                 with(json!({"@language": "en", "n": {"@id": "ex:n", "@type": "xsd:integer"}})),

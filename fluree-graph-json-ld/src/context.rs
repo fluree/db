@@ -43,6 +43,9 @@ pub struct ContextEntry {
     /// Defined as `null`, or with `"@id": null`: the term maps to no IRI, so
     /// a property using it is dropped rather than expanded against `@vocab`.
     pub null_mapping: bool,
+    /// A property-valued `@index`, unsupported: an index map under this
+    /// term is refused.
+    pub index: Option<String>,
 }
 
 impl ContextEntry {
@@ -108,6 +111,9 @@ impl ContextEntry {
                     ),
                 );
             }
+        }
+        if let Some(ref index) = self.index {
+            obj.insert("@index".to_string(), JsonValue::String(index.clone()));
         }
         if let Some(ref lang) = self.language {
             match lang {
@@ -593,14 +599,8 @@ fn parse_context_entry(
                     "@container" => {
                         entry.container = Some(parse_container(v)?);
                     }
-                    // An index map's keys would become values of this
-                    // property; refused rather than dropped.
                     "@index" => {
-                        return Err(JsonLdError::InvalidContext {
-                            message: format!(
-                                "term '{key}': a property-valued @index is not supported"
-                            ),
-                        });
+                        entry.index = v.as_str().map(str::to_string);
                     }
                     "@context" => {
                         let nested = ParsedContext::parse_guarded(

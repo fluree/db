@@ -879,11 +879,37 @@ fn parse_property(
         )));
     }
 
+    let term_type = context_entry.as_ref().and_then(|e| e.type_.as_ref());
+
+    // A `@json` term's value is one JSON literal, whatever its shape, as a
+    // transaction writes it. Pattern syntax keeps its meaning: a variable,
+    // a value object, an annotation.
+    if term_type == Some(&TypeValue::Json) {
+        let is_pattern_syntax = match value {
+            JsonValue::String(s) => ctx.object_var_parsing && is_variable(s),
+            JsonValue::Object(obj) => {
+                ["@value", "@language", "@variable", ANNOTATION_KEY, EDGE_KEY]
+                    .iter()
+                    .any(|k| obj.contains_key(*k))
+            }
+            JsonValue::Null => true,
+            _ => false,
+        };
+        if !is_pattern_syntax {
+            let document = fluree_graph_ir::canonicalize_json_value(value);
+            query.add_pattern(build_triple_pattern(
+                subject,
+                predicate,
+                UnresolvedTerm::string(document),
+                is_reverse,
+                Some(fluree_vocab::rdf::JSON),
+            ));
+            return Ok(());
+        }
+    }
+
     // Determine if this property is typed as @id or @vocab (reference)
-    let mut is_ref_type = context_entry
-        .as_ref()
-        .and_then(|e| e.type_.as_ref())
-        .is_some_and(|t| matches!(t, TypeValue::Id | TypeValue::Vocab));
+    let mut is_ref_type = term_type.is_some_and(|t| matches!(t, TypeValue::Id | TypeValue::Vocab));
 
     // rdf:type always expects an IRI object, even if not annotated in @context.
     if matches!(predicate, UnresolvedTerm::Iri(ref iri) if iri.as_ref() == RDF_TYPE) {
