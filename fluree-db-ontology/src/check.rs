@@ -4,24 +4,26 @@
 //!
 //! - **will fail**: what a request carrying this ontology would be refused
 //!   for (no class, a term that can't be given a label, a catalog record
-//!   without a label or an IRI, over a request limit);
+//!   without a label or an IRI, `xt:example` or an extraction result, over a
+//!   request limit);
 //! - **adapted**: what the model reads another way, by the input policy
 //!   ([`crate::policy`]);
 //! - **not shown**: what the model never sees, by predicate;
 //! - **advice**: what the evidence says improves a reading (descriptions,
-//!   labels in words rather than column names, a smaller vocabulary).
+//!   labels in words rather than column names, a smaller vocabulary, event
+//!   classes whose kinds the reader can find).
 //!
 //! `adapted` and `not_shown` use the keys an extraction response reports
 //! them under, so they compare line for line with a real request's.
 
 use crate::estimate::{self, Estimate, Sizes};
-use crate::policy::{self, Adapted, Shown};
+use crate::policy::{self, Adapted, Shown, ShownTerm};
 use crate::read::{Parsed, Quad, Split};
 use crate::slice::{self, Slice, UnknownSeed};
 use crate::vocab::*;
 use crate::words::{self, local_name};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// More properties than this in one prompt is more than the model was
 /// shaped on.
@@ -75,6 +77,12 @@ pub struct Report {
     pub classes: usize,
     pub properties: usize,
     pub records: usize,
+    /// Of the classes, those declared `xt:EventClass` and read as event
+    /// classes: an event subclass of one is read as one of its kinds instead.
+    pub event_classes: usize,
+    /// The event kinds the reader reads: one per catalog record of an event
+    /// class's kind class, and one per event subclass.
+    pub event_kinds: usize,
     /// Whether the file used a request's graph roles (`xt:ontology`, ...).
     pub by_graph: bool,
     pub will_fail: Vec<Finding>,
@@ -224,7 +232,9 @@ fn check_parts(
     }
     let records = records(&record_quads);
     catalog_findings(&records, &shown, &mut will_fail, &mut advice);
+    refused_terms(ontology, catalog, &mut will_fail);
     ontology_advice(&shown, &not_shown, &mut advice);
+    let event_kinds = event_advice(ontology, catalog, &shown, &records, &mut advice);
 
     let terms: Vec<_> = shown
         .classes
@@ -295,6 +305,10 @@ fn check_parts(
         classes: shown.classes.len(),
         properties: shown.properties.len(),
         records: records.len(),
+        // an event subclass is read as a kind of its parent, not as an
+        // event class of its own
+        event_classes: shown.events.len() - shown.subtypes.len(),
+        event_kinds,
         by_graph,
         will_fail,
         adapted: adapted.counts,
@@ -370,6 +384,163 @@ fn catalog_findings(
             &long,
         ));
     }
+}
+
+/// Statements a reader refuses wherever they appear: `xt:example` (example
+/// phrases are no longer read) and extraction results, which are not
+/// evidence.
+fn refused_terms(ontology: &[Quad], catalog: &[Quad], will_fail: &mut Vec<Finding>) {
+    let subjects = |f: &dyn Fn(&str) -> bool| -> Vec<String> {
+        let found: BTreeSet<String> = ontology
+            .iter()
+            .chain(catalog)
+            .filter(|q| f(&q.predicate))
+            .map(|q| {
+                q.subject
+                    .as_iri()
+                    .map_or_else(|| policy::nt(&q.subject), str::to_string)
+            })
+            .collect();
+        found.into_iter().collect()
+    };
+    let examples = subjects(&|p| p == XT_EXAMPLE);
+    if !examples.is_empty() {
+        will_fail.push(Finding::new(
+            "example-refused",
+            "A reader refuses xt:example. Say what the examples show in the description instead: rdfs:comment for a class or property, skos:definition for a catalog record. `fluree ontology from` drops them.",
+            &examples,
+        ));
+    }
+    let annotated = subjects(&|p| RESULT_PREDICATES.contains(&p));
+    if !annotated.is_empty() {
+        will_fail.push(Finding::new(
+            "extraction-annotations",
+            "These carry extraction results (xt:entity, xt:score, xt:accepted, rdf:reifies and the like), which a reader refuses as request input. `fluree ontology from` drops them.",
+            &annotated,
+        ));
+    }
+}
+
+/// An event class's kinds, as a reader finds them: through the one class
+/// labelled "<the event class's label> kind" and the one property labelled
+/// "kind", from the catalog records of that class. A subclass of an event
+/// class that is an event class too is read as one of its kinds. Returns how
+/// many kinds are read.
+fn event_advice(
+    ontology: &[Quad],
+    catalog: &[Quad],
+    shown: &Shown,
+    records: &[Record],
+    advice: &mut Vec<Finding>,
+) -> usize {
+    let label = |t: &ShownTerm| t.label.as_deref().map(|l| l.trim().to_lowercase());
+    let is_event = |t: &ShownTerm| shown.events.contains(&t.iri);
+    // The classes that aren't event classes, by label, built once so a
+    // class's kind class is one lookup: linear in the class count.
+    let mut by_label: HashMap<String, Vec<&ShownTerm>> = HashMap::new();
+    for class in shown.classes.values().filter(|c| !is_event(c)) {
+        if let Some(l) = label(class) {
+            by_label.entry(l).or_default().push(class);
+        }
+    }
+    let kind_classes = |of: &ShownTerm| -> &[&ShownTerm] {
+        label(of)
+            .and_then(|l| by_label.get(&format!("{l} kind")))
+            .map_or(&[], Vec::as_slice)
+    };
+    let kind_properties = shown
+        .properties
+        .values()
+        .filter(|p| label(p).as_deref() == Some("kind"))
+        .count();
+
+    let mut unmarked = Vec::new();
+    let mut subtypes = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut no_property = Vec::new();
+    let mut no_records = Vec::new();
+    let mut kinds_read = shown.subtypes.len();
+    for class in shown.classes.values() {
+        let kinds = kind_classes(class);
+        if !is_event(class) {
+            if !kinds.is_empty() {
+                unmarked.push(class.iri.clone());
+            }
+            if class
+                .parent
+                .as_ref()
+                .is_some_and(|p| shown.events.contains(p))
+            {
+                subtypes.push(class.iri.clone());
+            }
+            continue;
+        }
+        match kinds {
+            [] => {}
+            [_] if kind_properties != 1 => no_property.push(class.iri.clone()),
+            [kind] => {
+                let n = records
+                    .iter()
+                    .filter(|r| r.classes.contains(&kind.iri))
+                    .count();
+                if n == 0 {
+                    no_records.push(class.iri.clone());
+                }
+                kinds_read += n;
+            }
+            _ => ambiguous.push(class.iri.clone()),
+        }
+    }
+    let undeclared: BTreeSet<String> = ontology
+        .iter()
+        .chain(catalog)
+        .filter(|q| q.is(RDF_TYPE) && q.object.as_iri() == Some(XT_EVENT_CLASS))
+        .filter_map(|q| q.subject.as_iri())
+        .filter(|iri| !shown.classes.contains_key(*iri))
+        .map(str::to_string)
+        .collect();
+    let undeclared: Vec<String> = undeclared.into_iter().collect();
+
+    let findings: [(&'static str, String, &[String]); 6] = [
+        (
+            "event-class-not-marked",
+            "These classes have a kind class (one labelled \"<label> kind\") but aren't declared xt:EventClass, so the reader reads them as ordinary classes: it finds no events of them and reads no kinds. Declare each `a rdfs:Class, xt:EventClass` (xt: is https://ns.flur.ee/extract#).".into(),
+            &unmarked,
+        ),
+        (
+            "event-class-undeclared",
+            "These are declared xt:EventClass but not as classes (rdfs:Class or owl:Class), so the reader doesn't read them as event classes. In a file without graph roles they are read as catalog records.".into(),
+            &undeclared,
+        ),
+        (
+            "event-subtype-not-marked",
+            "These classes are subclasses of an event class but aren't declared xt:EventClass themselves, so the reader reads them as ordinary classes, not as kinds of the event. Declare them xt:EventClass too.".into(),
+            &subtypes,
+        ),
+        (
+            "event-kind-ambiguous",
+            "These event classes have more than one class labelled \"<label> kind\", so the reader reads none of their kinds. Keep one.".into(),
+            &ambiguous,
+        ),
+        (
+            "event-kind-property",
+            format!(
+                "These event classes have a kind class, but the reader reads kinds through the one property labelled \"kind\", and the ontology has {kind_properties}."
+            ),
+            &no_property,
+        ),
+        (
+            "event-kind-no-records",
+            "These event classes have a kind class, but the catalog holds no records of it, so there are no kinds to read. Add a record for each kind (if they're in another file, check with --catalog).".into(),
+            &no_records,
+        ),
+    ];
+    for (code, message, terms) in findings {
+        if !terms.is_empty() {
+            advice.push(Finding::new(code, message, terms));
+        }
+    }
+    kinds_read
 }
 
 fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &mut Vec<Finding>) {
@@ -463,7 +634,7 @@ fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &
     if hidden_axes > 0 {
         advice.push(Finding {
             code: "domain-range-not-shown",
-            message: "An HTTP reader doesn't see rdfs:domain or rdfs:range (nor schema.org's domainIncludes and rangeIncludes). Say in each property's description what it connects (\"the organization that employs the person\"), or restate it as a SHACL property shape on the class.".into(),
+            message: "The model behind an HTTP reader isn't shown rdfs:domain or rdfs:range (nor schema.org's domainIncludes and rangeIncludes), though the reader still writes its answer by them: a datatype range sets a value's type, and a domain or class range keeps an entity a node. To help the model find what a property connects, say it in the property's description (\"the organization that employs the person\"), or restate it as a SHACL property shape on the class.".into(),
             count: hidden_axes,
             examples: Vec::new(),
         });
@@ -496,4 +667,153 @@ pub fn thousands(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read::{parse, RdfFormat};
+
+    const PREFIXES: &str = r"@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+        @prefix xt: <https://ns.flur.ee/extract#> .
+        @prefix ex: <https://ex.com/> .
+        ";
+
+    fn report(ttl: &str) -> Report {
+        let parsed = parse(&format!("{PREFIXES}{ttl}"), RdfFormat::Turtle, None).unwrap();
+        check(&parsed, &CheckOptions::default()).unwrap()
+    }
+
+    fn codes(findings: &[Finding]) -> Vec<&'static str> {
+        findings.iter().map(|f| f.code).collect()
+    }
+
+    fn finding<'a>(findings: &'a [Finding], code: &str) -> &'a Finding {
+        findings.iter().find(|f| f.code == code).unwrap()
+    }
+
+    /// An event class, its kind class, the kind property and two kinds.
+    const COMMITMENTS: &str = r#"
+        ex:Commitment a rdfs:Class, xt:EventClass ; rdfs:label "commitment" ;
+          rdfs:comment "Something a person says they will do." .
+        ex:CommitmentKind a rdfs:Class ; rdfs:label "commitment kind" ;
+          rdfs:comment "What sort of thing was promised." .
+        ex:kind a rdf:Property ; rdfs:label "kind" ; rdfs:comment "The kind of a commitment." .
+        ex:Callback a ex:CommitmentKind ; skos:prefLabel "callback" .
+        ex:SendQuote a ex:CommitmentKind ; skos:prefLabel "send a quote" .
+        "#;
+
+    #[test]
+    fn an_event_class_is_shown_with_its_kinds() {
+        let r = report(COMMITMENTS);
+        assert!(r.passes(), "{:?}", r.will_fail);
+        assert_eq!(
+            (r.classes, r.event_classes, r.event_kinds, r.records),
+            (2, 1, 2, 2)
+        );
+        assert!(
+            !r.not_shown.contains_key("rdf:type xt:EventClass"),
+            "{:?}",
+            r.not_shown
+        );
+        assert!(
+            !codes(&r.advice).iter().any(|c| c.starts_with("event-")),
+            "{:?}",
+            r.advice
+        );
+    }
+
+    #[test]
+    fn a_class_with_kinds_that_isnt_an_event_class_is_found() {
+        let r = report(&COMMITMENTS.replace("a rdfs:Class, xt:EventClass", "a rdfs:Class"));
+        assert_eq!(r.event_classes, 0);
+        let f = finding(&r.advice, "event-class-not-marked");
+        assert_eq!(f.examples, ["https://ex.com/Commitment"]);
+    }
+
+    #[test]
+    fn kinds_the_reader_cant_find_are_found() {
+        // a second "kind" property, and no records of the kind class
+        let two_properties = COMMITMENTS.to_string()
+            + r#"ex:sort a rdf:Property ; rdfs:label "Kind " ; rdfs:comment "Also a kind." ."#;
+        let r = report(&two_properties);
+        let f = finding(&r.advice, "event-kind-property");
+        assert!(f.message.ends_with("has 2."), "{}", f.message);
+        let no_records: String = COMMITMENTS
+            .lines()
+            .filter(|l| !l.contains("a ex:CommitmentKind"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            finding(&report(&no_records).advice, "event-kind-no-records").examples,
+            ["https://ex.com/Commitment"]
+        );
+        let two_kind_classes = COMMITMENTS.to_string()
+            + r#"ex:CommitmentType a rdfs:Class ; rdfs:label "Commitment kind" ."#;
+        assert!(codes(&report(&two_kind_classes).advice).contains(&"event-kind-ambiguous"));
+    }
+
+    #[test]
+    fn event_subtypes_and_undeclared_event_classes_are_found() {
+        let r = report(
+            r#"
+            ex:Meeting a rdfs:Class, xt:EventClass ; rdfs:label "meeting" .
+            ex:BoardMeeting a rdfs:Class ; rdfs:label "board meeting" ; rdfs:subClassOf ex:Meeting .
+            ex:Offsite a rdfs:Class, xt:EventClass ; rdfs:label "offsite" ; rdfs:subClassOf ex:Meeting .
+            ex:Launch a xt:EventClass ; rdfs:label "launch" .
+            "#,
+        );
+        // Offsite is read as a kind of Meeting, not as an event class
+        assert_eq!((r.event_classes, r.event_kinds), (1, 1));
+        // the subtype is shown as a kind of its parent, and its own
+        // statements are counted as a reader counts them
+        assert_eq!(r.not_shown.get(policy::NOT_A_SHOWN_TERM), Some(&4));
+        assert_eq!(
+            finding(&r.advice, "event-subtype-not-marked").examples,
+            ["https://ex.com/BoardMeeting"]
+        );
+        assert_eq!(
+            finding(&r.advice, "event-class-undeclared").examples,
+            ["https://ex.com/Launch"]
+        );
+    }
+
+    /// Nested event subclasses are each a kind of their parent: one event
+    /// class, read with two kinds.
+    #[test]
+    fn nested_event_subclasses_are_kinds_of_one_event_class() {
+        let r = report(
+            r#"
+            ex:A a rdfs:Class, xt:EventClass ; rdfs:label "a" .
+            ex:B a rdfs:Class, xt:EventClass ; rdfs:label "b" ; rdfs:subClassOf ex:A .
+            ex:C a rdfs:Class, xt:EventClass ; rdfs:label "c" ; rdfs:subClassOf ex:B .
+            "#,
+        );
+        assert_eq!((r.event_classes, r.event_kinds), (1, 2));
+    }
+
+    #[test]
+    fn examples_and_extraction_results_are_refused() {
+        let r = report(
+            r#"
+            ex:Person a rdfs:Class ; rdfs:label "person" ; xt:example "Ada Lovelace" .
+            ex:ada a ex:Person ; skos:prefLabel "Ada" ; xt:score 0.9 .
+            "#,
+        );
+        assert!(!r.passes());
+        assert_eq!(
+            codes(&r.will_fail),
+            ["example-refused", "extraction-annotations"]
+        );
+        assert_eq!(
+            finding(&r.will_fail, "example-refused").examples,
+            ["https://ex.com/Person"]
+        );
+        assert_eq!(
+            finding(&r.will_fail, "extraction-annotations").examples,
+            ["https://ex.com/ada"]
+        );
+    }
 }

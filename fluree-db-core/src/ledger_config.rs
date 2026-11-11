@@ -101,6 +101,10 @@ pub struct ShaclDefaults {
     pub enabled: Option<bool>,
     /// `f:shapesSource` — reference to graph containing SHACL shapes.
     pub shapes_source: Option<GraphSourceRef>,
+    /// `f:additionalDataSource` — graphs read with the validated graph, as
+    /// one graph, when its nodes are checked. Which nodes are checked still
+    /// comes from the validated graph alone.
+    pub additional_data_sources: Vec<GraphSourceRef>,
     /// `f:validationMode` — reject or warn on validation failure.
     pub validation_mode: Option<ValidationMode>,
     /// Override control for this setting group.
@@ -280,6 +284,7 @@ impl ShaclDefaults {
     pub fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.shapes_source.is_none()
+            && self.additional_data_sources.is_empty()
             && self.validation_mode.is_none()
             && self.override_control.is_default()
     }

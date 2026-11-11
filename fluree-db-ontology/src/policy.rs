@@ -18,9 +18,9 @@
 //! - a term still without a label takes its IRI's local name in words
 //!   ([`term_words`]).
 //!
-//! What the model then shows of a class or property is its declaration,
-//! label, comment, one parent class and the SHACL node shapes that target a
-//! class. Everything else in the caller's ontology is "not shown", counted by
+//! What the model then shows of a class or property is its declaration
+//! (an event class's `xt:EventClass` with it), label, comment, one parent
+//! class and the SHACL node shapes that target a class. Everything else in the caller's ontology is "not shown", counted by
 //! predicate against the ontology as the caller wrote it. Both counts use the
 //! keys an extraction response reports them under, so the two can be
 //! compared line for line.
@@ -51,6 +51,7 @@ const SHOWN_TYPES: &[&str] = &[
     OWL_CLASS,
     OWL_OBJECT_PROPERTY,
     OWL_DATATYPE_PROPERTY,
+    XT_EVENT_CLASS,
 ];
 const SHOWN_PREDICATES: &[&str] = &[RDFS_LABEL, RDFS_COMMENT];
 const TERM_TYPES: &[&str] = &[RDFS_CLASS, RDF_PROPERTY];
@@ -607,6 +608,12 @@ pub struct ShownTerm {
 pub struct Shown {
     pub classes: BTreeMap<String, ShownTerm>,
     pub properties: BTreeMap<String, ShownTerm>,
+    /// The classes also declared `xt:EventClass`.
+    pub events: BTreeSet<String>,
+    /// The event classes whose shown parent is an event class: each is read
+    /// as a kind of its parent, under the parent's label and its own, in
+    /// place of itself.
+    pub subtypes: BTreeSet<String>,
     pub shapes: Vec<NodeShape>,
 }
 
@@ -654,6 +661,24 @@ impl Shown {
         for (iri, term) in &mut shown.classes {
             term.parent = first(&Term::iri(iri), RDFS_SUBCLASS_OF);
         }
+        shown.events = adapted
+            .iter()
+            .filter(|q| q.is(RDF_TYPE) && q.object.as_iri() == Some(XT_EVENT_CLASS))
+            .filter_map(|q| q.subject.as_iri())
+            .filter(|iri| shown.classes.contains_key(*iri))
+            .map(str::to_string)
+            .collect();
+        shown.subtypes = shown
+            .events
+            .iter()
+            .filter(|iri| {
+                shown.classes[*iri]
+                    .parent
+                    .as_ref()
+                    .is_some_and(|p| shown.events.contains(p))
+            })
+            .cloned()
+            .collect();
         shown.shapes = compile_shapes(adapted)
             .into_iter()
             .filter(|s| s.targets.iter().any(|t| shown.classes.contains_key(t)))
@@ -714,7 +739,11 @@ pub fn not_shown(
             None
         } else {
             let name = s.as_iri();
-            let class = name.and_then(|n| shown.classes.get(n));
+            // an event subtype is shown as a kind of its parent, not as
+            // itself, and a reader counts its statements so
+            let class = name
+                .filter(|n| !shown.subtypes.contains(*n))
+                .and_then(|n| shown.classes.get(n));
             let property = name.is_some_and(|n| shown.properties.contains_key(n));
             let pair = |set: &HashSet<(String, String)>| {
                 o.as_iri().is_some_and(|v| {
