@@ -4909,6 +4909,68 @@ mod tests {
         }
     }
 
+    /// Only a reasoning query's translated ops outlive its execution. Other
+    /// eager callers (a datalog fixpoint pass runs its rule bodies with
+    /// reasoning off; a dataset member's overlay is plain novelty) keep them
+    /// per-execution, as non-eager callers do.
+    #[test]
+    fn only_reasoning_queries_keep_ops_across_queries() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
+        use fluree_db_novelty::Novelty;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let pred = Sid::new(100, "p");
+        let mut novelty = Novelty::new(0);
+        let flake = Flake {
+            g: None,
+            s: Sid::new(100, "s"),
+            p: pred.clone(),
+            o: FlakeValue::Ref(Sid::new(100, "o")),
+            dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+            t: 1,
+            op: true,
+            m: None,
+        };
+        novelty
+            .apply_commit(vec![flake], 1, &Default::default())
+            .unwrap();
+        // A store of its own: its id keeps this test's keys apart from every
+        // other test's in the process-wide cache.
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let ctx = |eager: bool, reasoning: bool| {
+            let ctx = ExecutionContext::with_time_and_overlay(&snapshot, &vars, 1, None, &novelty)
+                .with_binary_store(Arc::clone(&store), 0)
+                .with_reasoning_active(reasoning);
+            if eager {
+                ctx.with_eager_materialization()
+            } else {
+                ctx
+            }
+        };
+        let kept_by_a_later_query = |eager: bool, reasoning: bool| {
+            let first = ctx(eager, reasoning);
+            let ops = cached_overlay_ops(&first, &store, 0, RunSortOrder::Psot, &pred).unwrap();
+            assert!(
+                ops.is_none_or(|ops| !ops.is_empty()),
+                "an empty result is never kept"
+            );
+            assert!(
+                overlay_ops_cached(&first, &store, 0, RunSortOrder::Psot, &pred),
+                "cached for the execution that computed them"
+            );
+            overlay_ops_cached(&ctx(eager, reasoning), &store, 0, RunSortOrder::Psot, &pred)
+        };
+
+        assert!(!kept_by_a_later_query(false, false), "a plain query");
+        assert!(
+            !kept_by_a_later_query(true, false),
+            "an eager non-reasoning caller"
+        );
+        assert!(kept_by_a_later_query(true, true), "a reasoning query");
+    }
+
     #[test]
     fn pred_ops_cache_keeps_a_failed_translation() {
         let cache = PredOpsCache::new();
