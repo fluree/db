@@ -1,5 +1,5 @@
-//! Erased history in transfers (`DATA_ERASURE.md`, "Transferring erased
-//! history"). An erased commit never travels as bytes under its original
+//! Erased history in transfers (`docs/transactions/permanent-erasure.md`,
+//! "Archives", "Clones and pulls" and "Pushes"). An erased commit never travels as bytes under its original
 //! CID, which its replacement does not match: it travels as its erasure
 //! chain, with its latest replacement, every step's receipt, and what
 //! authorized each step. A receiver verifies the chain, checks each step

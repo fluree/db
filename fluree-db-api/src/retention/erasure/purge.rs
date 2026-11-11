@@ -1,5 +1,6 @@
 //! Physical purge: what holds the values of a ledger's published erasures,
-//! inventoried before anything is deleted (DATA_ERASURE.md, 5B).
+//! inventoried before anything is deleted (`docs/transactions/permanent-erasure.md`,
+//! "Purge").
 
 use std::collections::{BTreeMap, BTreeSet};
 

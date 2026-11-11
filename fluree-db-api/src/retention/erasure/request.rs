@@ -503,10 +503,12 @@ impl Fluree {
     }
 
     pub(crate) fn erasure_runtime(&self) -> Result<&std::sync::Arc<super::ErasureRuntime>> {
-        self.retention
-            .erasure
-            .get()
-            .ok_or_else(|| unsupported("permanent erasure needs a single node with file storage"))
+        self.retention.erasure.get().ok_or_else(|| {
+            unsupported(
+                "permanent erasure needs file storage: a single node, or a cluster whose \
+                 members share it",
+            )
+        })
     }
 
     /// Announce that `ledger_id`'s stored history changed in place (an

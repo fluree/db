@@ -1,5 +1,5 @@
-//! Permanent erasure (`DATA_ERASURE.md`, PR 5A): selected occurrences are
-//! removed from the commits that hold them, under proof.
+//! Permanent erasure (`docs/transactions/permanent-erasure.md`): selected
+//! occurrences are removed from the commits that hold them, under proof.
 //!
 //! A request is first a targeted removal on every branch that holds an
 //! occurrence (current values retracted, history suppressed), widened so an

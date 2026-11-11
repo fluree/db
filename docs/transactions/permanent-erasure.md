@@ -13,6 +13,30 @@ Once an erasure is published, a [purge](#purge) deletes the original commit file
 of what the request removed that this node's storage holds: transaction documents, index files,
 derived search indexes and scratch files.
 
+## What erasure does not guarantee
+
+- **A guessed value can be confirmed on an unsigned commit.** The original commit's CID stays as its
+  identity, and that CID is a hash of the original bytes. Anyone who can rebuild every other byte of
+  the commit can test guesses at the erased value against it. That is practical when the value has
+  few possible values (a flag, a postcode, a birth date). On a signed commit the signature keeps the
+  bytes out of reach, unless the request [exposes the signatures](#signatures).
+- **IRIs stay.** Subjects, predicates and graph names are identifiers, not values, and erasure does not
+  remove them (see [Limits](#limits)).
+- **File storage only.** A single node, or a cluster whose members share file storage. Memory and S3
+  storage cannot hold an erasure (see [Scope](#scope)).
+- **Only this node's storage is purged.** Backups, other clones, exports already made, and the memory
+  of processes that have not refreshed keep what they hold.
+- **Deleting is not sanitizing.** A purge unlinks files. The filesystem, an SSD's wear levelling or a
+  snapshotting volume can keep the old blocks until they are overwritten.
+
+To make erasure as strong as it can be on a ledger that may need it:
+
+- [Sign its commits](../security/commit-signing.md), so a commit's CID cannot be used to confirm a
+  guess.
+- Keep personal data out of IRIs: use opaque ids (`ex:user-8f3a…`, not `mailto:alice@example.org`).
+- Use [encryption at rest](../security/encryption.md), so blocks a purge leaves on disk are unreadable,
+  and backups with it.
+
 ## Scope
 
 - **Deployments:** a single node with file storage (`--storage-path`), or a Raft cluster whose members

@@ -12,7 +12,9 @@ names it: a path, or a bare command name looked up on the `PATH`. At startup it 
 another release makes proofs every check refuses. Without a prover of its release, the server runs
 and refuses erasure requests (`501`), and its discovery document reports `erasure.proving: false`.
 
-Builds exist for Linux (x86-64 and arm64) and macOS on Apple silicon.
+Builds exist for Linux (x86-64 and arm64) and macOS on Apple silicon. The Linux builds need glibc 2.39 or
+later (Ubuntu 24.04, Debian 13 or RHEL 10, or newer). On an older system, run the server's `erasure`
+Docker image, which ships the prover, or build the prover from source.
 
 ## Subcommands
 

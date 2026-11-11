@@ -167,6 +167,8 @@ The retention worker runs on the node that owns background maintenance: the serv
 
 Expiration is **best-effort and eventual**. A value disappears after its deadline plus up to one interval plus processing time. Expiration commits use transaction capacity like any write, and they wait when the ledger's novelty is near its limit so that ordinary writes come first. If no maintenance owner is running, nothing expires and scheduled values become overdue.
 
+The server always runs one. A Rust application embedding Fluree runs one by calling `Fluree::start_maintenance(housekeeping, Some(retention_options))` on an instance with a background indexer. Without a background indexer, run passes yourself: `Fluree::run_retention(ledger_id)` registers the ledger if its commits carry retention input, then retracts what is due, and is meant to be called on a schedule, such as every 15 seconds (the server's default interval).
+
 Commits and annotations written before a ledger's first TTL-aware write are not treated as instructions, even if they happen to use `f:ttl`.
 
 ### Status

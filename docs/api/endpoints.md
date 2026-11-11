@@ -4121,6 +4121,57 @@ Either list may be empty. `matching[].graph` names a graph (absent for the defau
 - `401 Unauthorized` - Admin token required
 - `404 Not Found` - Ledger not found, or nothing in its history matches the request
 
+### POST /erase/{ledger-id}
+
+Permanently erase selected occurrences from the commits that hold them, under a zero-knowledge proof. See [Permanent erasure](../transactions/permanent-erasure.md). Admin-protected; the admin token's identity is recorded as the requester. In a cluster the request is forwarded to the leader.
+
+**URL:**
+```
+POST /erase/{ledger-id}
+```
+
+**Request Body:**
+
+```json
+{
+  "matching": [
+    {
+      "subject": "https://example.org/alice",
+      "predicate": "https://example.org/email",
+      "object": "alice@example.org"
+    }
+  ],
+  "occurrences": [{ "commit": "bafy...", "slot": 3 }],
+  "signatures": "verify"
+}
+```
+
+`matching` and `occurrences` select occurrences as `POST /remove/{ledger-id}` does. `signatures` is `verify` (the default: the proof verifies a signed commit's signatures) or `expose` (faster for signed commits, at a privacy cost; see [Signatures](../transactions/permanent-erasure.md#signatures)).
+
+**Response:**
+
+```json
+{
+  "requestId": "erasure-3f1c...",
+  "manifest": [{ "commit": "bafy...", "slot": 4 }, { "commit": "bafy...", "slot": 0 }],
+  "commits": 2,
+  "authorizedT": 43,
+  "stage": "proving",
+  "removals": [{ "ledgerId": "people:main", "removal": { "requestId": "removal-...", "...": "..." } }]
+}
+```
+
+The request returns once the occurrences are removed from what every branch serves and the job is recorded; proving and publishing run in the background. Follow the job in `GET /retention/{ledger-id}`. Repeating a request returns the same job.
+
+**Status Codes:**
+- `200 OK` - Accepted (or already accepted)
+- `400 Bad Request` - A malformed selector or commit id
+- `401 Unauthorized` - Admin token required
+- `404 Not Found` - Ledger not found, or nothing in its history matches the request
+- `409 Conflict` - A triple term on a ledger holding the commits spells an erased fact, or branches kept being created while the request was accepted (retry)
+- `422 Unprocessable Entity` - An affected commit cannot be erased: not a v4 SHA2-256 commit, or more than 50,000 operations. The occurrences are still removed from what the ledger serves.
+- `501 Not Implemented` - Erasure is unavailable here: memory or S3 storage, a query peer, no prover of this release, or erasure disabled
+
 ### POST /sweep
 
 Reclaim index artifacts that no index chain references. Admin-protected — requires the admin Bearer token when admin auth is enabled.

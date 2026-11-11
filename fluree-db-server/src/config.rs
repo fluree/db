@@ -576,8 +576,9 @@ pub struct ServerConfig {
     /// The `fluree-prover` binary that proves permanent erasures (default:
     /// `fluree-prover` beside this binary, else on the PATH)
     ///
-    /// A single node with file storage (`--storage-path`) only. Without a
-    /// prover of this release, erasure requests are refused.
+    /// File storage (`--storage-path`) only: a single node, or a Raft
+    /// cluster whose members share it. Without a prover of this release,
+    /// erasure requests are refused.
     #[arg(long, env = "FLUREE_ERASURE_PROVER")]
     pub erasure_prover: Option<PathBuf>,
 
