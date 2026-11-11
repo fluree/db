@@ -23,7 +23,7 @@ use crate::slice::{self, Slice, UnknownSeed};
 use crate::vocab::*;
 use crate::words::{self, local_name};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// More properties than this in one prompt is more than the model was
 /// shaped on.
@@ -77,7 +77,8 @@ pub struct Report {
     pub classes: usize,
     pub properties: usize,
     pub records: usize,
-    /// Of the classes, those declared `xt:EventClass`.
+    /// Of the classes, those declared `xt:EventClass` and read as event
+    /// classes: an event subclass of one is read as one of its kinds instead.
     pub event_classes: usize,
     /// The event kinds the reader reads: one per catalog record of an event
     /// class's kind class, and one per event subclass.
@@ -304,7 +305,9 @@ fn check_parts(
         classes: shown.classes.len(),
         properties: shown.properties.len(),
         records: records.len(),
-        event_classes: shown.events.len(),
+        // an event subclass is read as a kind of its parent, not as an
+        // event class of its own
+        event_classes: shown.events.len() - shown.subtypes.len(),
         event_kinds,
         by_graph,
         will_fail,
@@ -432,15 +435,18 @@ fn event_advice(
 ) -> usize {
     let label = |t: &ShownTerm| t.label.as_deref().map(|l| l.trim().to_lowercase());
     let is_event = |t: &ShownTerm| shown.events.contains(&t.iri);
-    let kind_classes = |of: &ShownTerm| -> Vec<&ShownTerm> {
-        let Some(wanted) = label(of).map(|l| format!("{l} kind")) else {
-            return Vec::new();
-        };
-        shown
-            .classes
-            .values()
-            .filter(|k| !is_event(k) && label(k).as_deref() == Some(&*wanted))
-            .collect()
+    // The classes that aren't event classes, by label, built once so a
+    // class's kind class is one lookup: linear in the class count.
+    let mut by_label: HashMap<String, Vec<&ShownTerm>> = HashMap::new();
+    for class in shown.classes.values().filter(|c| !is_event(c)) {
+        if let Some(l) = label(class) {
+            by_label.entry(l).or_default().push(class);
+        }
+    }
+    let kind_classes = |of: &ShownTerm| -> &[&ShownTerm] {
+        label(of)
+            .and_then(|l| by_label.get(&format!("{l} kind")))
+            .map_or(&[], Vec::as_slice)
     };
     let kind_properties = shown
         .properties
@@ -469,7 +475,7 @@ fn event_advice(
             }
             continue;
         }
-        match kinds.as_slice() {
+        match kinds {
             [] => {}
             [_] if kind_properties != 1 => no_property.push(class.iri.clone()),
             [kind] => {
@@ -759,7 +765,8 @@ mod tests {
             ex:Launch a xt:EventClass ; rdfs:label "launch" .
             "#,
         );
-        assert_eq!((r.event_classes, r.event_kinds), (2, 1));
+        // Offsite is read as a kind of Meeting, not as an event class
+        assert_eq!((r.event_classes, r.event_kinds), (1, 1));
         // the subtype is shown as a kind of its parent, and its own
         // statements are counted as a reader counts them
         assert_eq!(r.not_shown.get(policy::NOT_A_SHOWN_TERM), Some(&4));
@@ -771,6 +778,20 @@ mod tests {
             finding(&r.advice, "event-class-undeclared").examples,
             ["https://ex.com/Launch"]
         );
+    }
+
+    /// Nested event subclasses are each a kind of their parent: one event
+    /// class, read with two kinds.
+    #[test]
+    fn nested_event_subclasses_are_kinds_of_one_event_class() {
+        let r = report(
+            r#"
+            ex:A a rdfs:Class, xt:EventClass ; rdfs:label "a" .
+            ex:B a rdfs:Class, xt:EventClass ; rdfs:label "b" ; rdfs:subClassOf ex:A .
+            ex:C a rdfs:Class, xt:EventClass ; rdfs:label "c" ; rdfs:subClassOf ex:B .
+            "#,
+        );
+        assert_eq!((r.event_classes, r.event_kinds), (1, 2));
     }
 
     #[test]
