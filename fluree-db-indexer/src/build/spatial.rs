@@ -18,10 +18,12 @@ use crate::run_index;
 /// Two-phase approach:
 /// 1. Build the index and collect all serialized blobs with locally-computed
 ///    SHA-256 hashes (synchronous — no async needed).
-/// 2. Upload all blobs to CAS using `content_write_bytes` (async).
+/// 2. Upload all blobs to CAS using `ContentStore::put` (async).
 ///
 /// This avoids re-entering `block_on` from within a sync closure, which would
 /// deadlock inside the `spawn_blocking` + `handle.block_on()` pattern.
+///
+/// `on_put` sees each uploaded blob and root, e.g. to seed a local artifact cache.
 ///
 /// Returns per-graph spatial arena refs for inclusion in `IndexRoot`.
 pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
@@ -29,6 +31,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
     predicates: &run_index::PredicateDict,
     ledger_id: &str,
     content_store: &C,
+    on_put: impl Fn(&ContentId, &[u8]),
 ) -> Result<Vec<(GraphId, Vec<SpatialArenaRef>)>> {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -102,6 +105,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
                 expected_hash,
                 "CAS content_hash mismatch for spatial blob"
             );
+            on_put(&cid, blob_bytes);
         }
 
         // Construct ContentIds from the content hashes.
@@ -138,6 +142,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
             .put(ContentKind::SpatialIndex, &root_json)
             .await
             .map_err(|e| IndexerError::StorageWrite(format!("spatial root CAS write: {e}")))?;
+        on_put(&root_cid, &root_json);
 
         per_graph.entry(g_id).or_default().push(SpatialArenaRef {
             p_id,
