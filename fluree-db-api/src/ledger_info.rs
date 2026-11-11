@@ -1498,6 +1498,7 @@ fn map_source(tm: &fluree_db_r2rml::mapping::TriplesMap) -> (Option<String>, boo
 
 /// The distinct tables a mapping's triples maps read, sorted: an `rr:sqlQuery`
 /// map's `FROM` table rather than its query alias.
+#[cfg_attr(not(feature = "iceberg"), allow(dead_code))]
 pub(crate) fn mapping_source_tables(mapping: &CompiledR2rmlMapping) -> Vec<String> {
     let mut tables: Vec<String> = mapping
         .triples_maps
