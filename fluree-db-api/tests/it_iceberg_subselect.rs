@@ -729,6 +729,143 @@ async fn what_a_sub_select_cannot_lower_still_refuses() {
     );
 }
 
+/// A sub-select outside the source's graph block (the user wrote one, so
+/// nothing wraps the query) is evaluated when its body reads the source only
+/// through a graph block of its own, which lowers it there, or reads no index
+/// at all. Only a body that reads the empty default view refuses (see
+/// `what_a_sub_select_cannot_lower_still_refuses`).
+#[tokio::test]
+async fn a_sub_select_outside_the_graph_block_reads_through_its_own() {
+    let fluree = setup().await;
+    let graph = fluree.graph(LAKE);
+    let handle_sparql = |body: String| {
+        let graph = &graph;
+        async move {
+            let rows = graph
+                .query()
+                .with_r2rml()
+                .sparql(&format!("{PREFIX}{body}"))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{body}: {e}"));
+            rows_of(&rows)
+        }
+    };
+    let handle_jsonld = |query: Value| {
+        let graph = &graph;
+        async move {
+            let rows = graph
+                .query()
+                .with_r2rml()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            jsonld_rows(&rows)
+        }
+    };
+
+    // The body reads the source through its own graph block.
+    let expected = sparql_agrees(&fluree, "SPARQL grouped", GROUPED).await;
+    assert_eq!(expected.len(), 50, "{expected:?}");
+    let rows = handle_sparql(format!(
+        "SELECT ?n ?k WHERE {{ GRAPH <{LAKE}> {{ ?c ex:name ?n }} \
+         {{ SELECT ?c (COUNT(?o) AS ?k) WHERE {{ GRAPH <{LAKE}> {{ ?o ex:customer ?c }} }} \
+            GROUP BY ?c }} }}"
+    ))
+    .await;
+    assert_eq!(rows, expected, "SPARQL: a body with its own graph block");
+
+    let grouped_jsonld = |inner_where: Value, outer: Value| {
+        json!({
+            "@context": ctx(),
+            "select": ["?n", "?k"],
+            "where": [outer, ["query", {
+                "@context": ctx(),
+                "select": ["?c", "(as (count ?o) ?k)"],
+                "where": inner_where,
+                "groupBy": ["?c"]
+            }]]
+        })
+    };
+    let mut expected = grouped_jsonld(
+        json!({"@id": "?o", "ex:customer": "?c"}),
+        json!({"@id": "?c", "ex:name": "?n"}),
+    );
+    expected["from"] = json!("{G}");
+    let expected = jsonld_agrees(&fluree, "JSON-LD grouped", &expected).await;
+    assert_eq!(expected.len(), 50, "{expected:?}");
+    let rows = handle_jsonld(grouped_jsonld(
+        json!([["graph", LAKE, {"@id": "?o", "ex:customer": "?c"}]]),
+        json!(["graph", LAKE, {"@id": "?c", "ex:name": "?n"}]),
+    ))
+    .await;
+    assert_eq!(rows, expected, "JSON-LD: a body with its own graph block");
+
+    // The body reads no index: only a VALUES.
+    let expected = sparql_agrees(
+        &fluree,
+        "SPARQL VALUES",
+        "SELECT ?c ?n FROM <{G}> WHERE { \
+           VALUES ?c { <http://example.org/customer/1> <http://example.org/customer/2> } \
+           ?c ex:name ?n }",
+    )
+    .await;
+    assert_eq!(expected.len(), 2, "{expected:?}");
+    let rows = handle_sparql(format!(
+        "SELECT ?c ?n WHERE {{ GRAPH <{LAKE}> {{ ?c ex:name ?n }} \
+         {{ SELECT ?c WHERE {{ VALUES ?c {{ <http://example.org/customer/1> \
+            <http://example.org/customer/2> }} }} }} }}"
+    ))
+    .await;
+    assert_eq!(rows, expected, "SPARQL: a VALUES-only body");
+
+    let two = json!([{"@id": "ex:customer/1"}, {"@id": "ex:customer/2"}]);
+    let expected = jsonld_agrees(
+        &fluree,
+        "JSON-LD VALUES",
+        &json!({
+            "@context": ctx(),
+            "from": "{G}",
+            "select": ["?c", "?n"],
+            "where": [["values", ["?c", two.clone()]], {"@id": "?c", "ex:name": "?n"}]
+        }),
+    )
+    .await;
+    assert_eq!(expected.len(), 2, "{expected:?}");
+    let rows = handle_jsonld(json!({
+        "@context": ctx(),
+        "select": ["?c", "?n"],
+        "where": [
+            ["graph", LAKE, {"@id": "?c", "ex:name": "?n"}],
+            ["query", {
+                "@context": ctx(),
+                "select": ["?c"],
+                "where": [["values", ["?c", two]]]
+            }]
+        ]
+    }))
+    .await;
+    assert_eq!(rows, expected, "JSON-LD: a VALUES-only body");
+
+    // A body that reads the default view still refuses, on JSON-LD too.
+    let err = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&grouped_jsonld(
+            json!({"@id": "?o", "ex:customer": "?c"}),
+            json!(["graph", LAKE, {"@id": "?c", "ex:name": "?n"}]),
+        ))
+        .execute_formatted()
+        .await
+        .expect_err("JSON-LD: a body outside every graph scope must refuse")
+        .to_string();
+    assert!(
+        err.contains("subquery") && err.contains("graph block"),
+        "{err}"
+    );
+}
+
 /// A JSON-LD sub-select with a slice is planned after the `VALUES` that binds
 /// its key and seeded with it per outer row, which is sound only because a
 /// scan binds that variable in every row it emits: a row leaving it unbound

@@ -125,9 +125,13 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
 /// snapshot, and return silently-wrong results: `p+` nothing at all, `p*`/`p?`
 /// the zero-length identity match only.
 ///
-/// A sub-select is refused here too, although the rewrite lowers one inside a
-/// graph scope: out here nothing lowers its body, so it would read the same
-/// empty snapshot (an ungrouped `COUNT` answering 0). The API layer calls this before
+/// A sub-select is refused here too when its body reads this view (a triple or
+/// list pattern outside every `GRAPH` scope of its own), although the rewrite
+/// lowers one inside a graph scope: out here nothing lowers that body, so it
+/// would read the same empty snapshot (an ungrouped `COUNT` answering 0). A
+/// sub-select whose body reads only through its own `GRAPH` blocks, or reads
+/// nothing (only `VALUES` or `BIND`), is evaluated like any other, and the
+/// paths inside its body are still collected. The API layer calls this before
 /// execution and refuses with [`unsupported_subscope_error`], so the refusal
 /// does not depend on whether the query happens to contain a `GRAPH` block.
 ///
@@ -145,34 +149,47 @@ pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static st
     kinds
 }
 
-fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Vec<&'static str>) {
+/// Collect into `kinds`; returns whether `patterns` read this view through a
+/// triple or list pattern outside every `GRAPH` scope.
+fn collect_unsupported_outside_graph_scopes(
+    patterns: &[Pattern],
+    kinds: &mut Vec<&'static str>,
+) -> bool {
+    let mut reads_view = false;
     for pattern in patterns {
         match pattern {
             // The path kinds the rewriter flags, named identically so one
-            // query reads the same whichever guard refuses it, and a
-            // sub-select, whose body no rewrite reaches out here (see above).
+            // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
-            Pattern::Subquery(_) => kinds.push("subquery"),
+            // A sub-select whose body reads this view, which no rewrite
+            // reaches out here (see above).
+            Pattern::Subquery(sq) => {
+                if collect_unsupported_outside_graph_scopes(&sq.patterns, kinds) {
+                    kinds.push("subquery");
+                    reads_view = true;
+                }
+            }
+            // The leaves that read this view's index.
+            Pattern::Triple(_) | Pattern::ListView(_) => reads_view = true,
             // Containers whose bodies evaluate against this view.
             Pattern::Optional(inner)
             | Pattern::Minus(inner)
             | Pattern::Exists(inner)
             | Pattern::NotExists(inner)
             | Pattern::DefaultGraphSource { patterns: inner } => {
-                collect_unsupported_outside_graph_scopes(inner, kinds);
+                reads_view |= collect_unsupported_outside_graph_scopes(inner, kinds);
             }
             Pattern::Union(branches) => {
                 for branch in branches {
-                    collect_unsupported_outside_graph_scopes(branch, kinds);
+                    reads_view |= collect_unsupported_outside_graph_scopes(branch, kinds);
                 }
             }
-            // Everything else is either a leaf, routed elsewhere, or its own
-            // scope — see the doc comment. Listed exhaustively so a new pattern
-            // variant that reads this view's index forces a decision here.
-            Pattern::Triple(_)
-            | Pattern::ListView(_)
-            | Pattern::Filter(_)
+            // Everything else is either a leaf that reads no index, routed
+            // elsewhere, or its own scope — see the doc comment. Listed
+            // exhaustively so a new pattern variant that reads this view's
+            // index forces a decision here.
+            Pattern::Filter(_)
             | Pattern::Bind { .. }
             | Pattern::Unwind { .. }
             | Pattern::Values { .. }
@@ -187,6 +204,7 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             | Pattern::AnnotationTarget { .. } => {}
         }
     }
+    reads_view
 }
 
 /// The typed refusal for an R2RML graph-source query carrying `unconverted`
@@ -3735,6 +3753,59 @@ mod tests {
             ))])
             .is_empty(),
             "a SERVICE body runs elsewhere and may have a native index"
+        );
+    }
+
+    /// A sub-select outside every graph scope is refused only when its body
+    /// reads this view: a body that reads through its own `GRAPH` block is
+    /// lowered there, and one that reads nothing (`VALUES`, `BIND`) needs no
+    /// index. Paths inside a body are still flagged.
+    #[test]
+    fn out_of_scope_scan_flags_a_sub_select_only_when_its_body_reads_this_view() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        use crate::ir::GraphName;
+
+        let sub = |patterns: Vec<Pattern>| {
+            Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], patterns))
+        };
+        let reads = || triple(0, PRED, Term::Var(VarId(1)));
+        let in_graph = |patterns: Vec<Pattern>| Pattern::Graph {
+            name: GraphName::Iri("gs:main".into()),
+            patterns,
+        };
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![reads()])]),
+            vec!["subquery"]
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![Pattern::Optional(vec![reads()])])]),
+            vec!["subquery"],
+            "an OPTIONAL in the body reads this view too"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![sub(vec![reads()])])])
+                .contains(&"subquery"),
+            "a nested body that reads this view"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![in_graph(vec![reads()])])]).is_empty(),
+            "a body that reads only through its own graph block"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![])]).is_empty(),
+            "a body that reads no index"
+        );
+        let path = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "edge"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        ));
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![path, in_graph(vec![reads()])])]),
+            vec!["property path"],
+            "a path in the body is still flagged"
         );
     }
 
