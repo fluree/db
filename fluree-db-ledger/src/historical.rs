@@ -197,6 +197,11 @@ impl HistoricalLedgerView {
             }
             None => (LedgerSnapshot::genesis(&record.ledger_id), 0),
         };
+        // An index copied from another branch names that branch, as the head
+        // load re-stamps (see `LedgerState::load`): the view is of this one.
+        if snapshot.ledger_id != record.ledger_id {
+            snapshot.ledger_id = record.ledger_id.clone();
+        }
 
         // Build novelty from commits between index_t and target_t.
         // When we are in overlay-only mode (use_index=false), this replays *all*
