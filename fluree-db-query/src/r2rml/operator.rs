@@ -1118,11 +1118,19 @@ impl R2rmlScanOperator {
             return None;
         };
         let col = value_pushdown_column(&pom.object_map)?;
+        let Some(required_columns) = topk_required_columns(&self.pattern, triples_map) else {
+            tracing::debug!(
+                triples_map = %triples_map.iri,
+                "r2rml topk declined: a star member's value may be missing from a non-null row"
+            );
+            return None;
+        };
         Some(crate::r2rml::ScanTopK {
             sort_column: col.to_string(),
             k,
             ascending,
             order: term_order(&pom.object_map)?,
+            required_columns,
         })
     }
 
@@ -2659,11 +2667,73 @@ fn topk_residual_filter_present(pattern: &R2rmlPattern) -> bool {
 ///   (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`), and other providers apply only
 ///   what they can state exactly. No provider promises the emitted rows are
 ///   exactly the filtered rows, so a pushed filter counts as residual here.
+///   This arm is defence in depth: no plan reaches it today. Every source of
+///   a scan filter is a condition the first two arms already decline on or
+///   that keeps the directive from being recorded: a FILTER comparison or a
+///   single-variable `VALUES` set pushed to the scan stays in the plan as a
+///   `FilterOperator` or a join, neither of which passes a top-k down (a
+///   FILTER the scan consumed is a residual filter); a constant object, star
+///   constraint or constant subject is a residual filter; and the subject keys
+///   a child window binds come from a child that binds a produced variable.
+///
+/// One more is handled elsewhere: a row whose subject or star member is
+/// NULL mints no solution (the directive names those columns,
+/// [`topk_required_columns`], and the heap skips such a row).
 fn topk_feed_may_drop_rows(
     pattern: &R2rmlPattern,
     scan_filters: &[crate::r2rml::ScanFilter],
 ) -> bool {
     topk_residual_filter_present(pattern) || !scan_filters.is_empty()
+}
+
+/// The columns a row of `triples_map` must hold non-null to yield a solution
+/// of `pattern`, for [`crate::r2rml::ScanTopK::required_columns`]; `None` when
+/// no set of columns says so.
+///
+/// A row yields a solution when it mints a subject and, for a same-subject
+/// star, a value for every member. A subject is minted from non-null columns
+/// (every placeholder of a template, or its one column; a constant needs
+/// none). A member yields a value when its one object map does: a column or a
+/// template from non-null columns, a constant always. A member with several
+/// object maps yields one when any of them does, which no single set of
+/// columns states, and a reference yields one only when its key matches a
+/// parent row, which no column of this table states: both are `None`.
+fn topk_required_columns(pattern: &R2rmlPattern, triples_map: &TriplesMap) -> Option<Vec<String>> {
+    let mut columns: Vec<String> = Vec::new();
+    let sm = &triples_map.subject_map;
+    if sm.constant.is_none() {
+        if let Some(column) = &sm.column {
+            columns.push(column.clone());
+        } else if let Some(template) = &sm.template {
+            columns.extend(extract_template_columns(template));
+        }
+    }
+    let members = pattern
+        .predicate_filter
+        .iter()
+        .filter(|_| pattern.object_var.is_some())
+        .map(String::as_str)
+        .chain(pattern.star_bindings.iter().map(|(p, _)| p.as_str()));
+    for pred in members {
+        let mut poms = triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|pom| pom.predicate_map.as_constant() == Some(pred));
+        let (Some(pom), None) = (poms.next(), poms.next()) else {
+            return None;
+        };
+        match &pom.object_map {
+            ObjectMap::Column { column, .. } => columns.push(column.clone()),
+            ObjectMap::Template { template, .. } => {
+                columns.extend(extract_template_columns(template));
+            }
+            ObjectMap::Constant { .. } => {}
+            ObjectMap::RefObjectMap(_) => return None,
+        }
+    }
+    columns.sort();
+    columns.dedup();
+    Some(columns)
 }
 
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
@@ -4465,6 +4535,93 @@ mod tests {
             ObjectConstant::Scalar(ScanValue::Bool(true)),
         )];
         assert!(topk_residual_filter_present(&star_constraint));
+    }
+
+    /// The columns a top-k's bound requires non-null: the subject's (every
+    /// placeholder, read from the template itself) and each star member's;
+    /// none for a constant. A member no column decides (a reference, or a
+    /// predicate with two object maps) gives none at all, so the directive is
+    /// declined.
+    #[test]
+    fn topk_required_columns_name_what_a_solution_needs() {
+        use fluree_db_r2rml::mapping::{PredicateMap, RefObjectMap, SubjectMap};
+        let pom = |p: &str, om: ObjectMap| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(p),
+            object_map: om,
+        };
+        let tm = TriplesMap::new("#V", "versions")
+            .with_subject_template("http://ex/v/{id}/{from}")
+            .with_predicate_object(pom("http://ex/amount", ObjectMap::column("AMT")))
+            .with_predicate_object(pom("http://ex/city", ObjectMap::column("CITY")))
+            .with_predicate_object(pom(
+                "http://ex/label",
+                ObjectMap::template("L-{code}", vec!["code".to_string()]),
+            ))
+            .with_predicate_object(pom("http://ex/kind", ObjectMap::constant_literal("v")))
+            .with_predicate_object(pom(
+                "http://ex/owner",
+                ObjectMap::RefObjectMap(RefObjectMap::new("#P", "OWNER", "ID")),
+            ))
+            .with_predicate_object(pom("http://ex/alias", ObjectMap::column("A1")))
+            .with_predicate_object(pom("http://ex/alias", ObjectMap::column("A2")));
+        assert!(
+            tm.subject_map.template_columns.is_empty(),
+            "built without them"
+        );
+        let base = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+            .with_predicate("http://ex/amount");
+        let cols = |pattern: &R2rmlPattern| topk_required_columns(pattern, &tm);
+        assert_eq!(
+            cols(&base),
+            Some(vec![
+                "AMT".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        let star = |pred: &str| {
+            base.clone()
+                .with_star_bindings(vec![(pred.to_string(), VarId(2))])
+        };
+        assert_eq!(
+            cols(&star("http://ex/city")),
+            Some(vec![
+                "AMT".to_string(),
+                "CITY".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(&star("http://ex/label")),
+            Some(vec![
+                "AMT".to_string(),
+                "code".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(&star("http://ex/kind")),
+            Some(vec![
+                "AMT".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(&star("http://ex/owner")),
+            None,
+            "a reference may dangle"
+        );
+        assert_eq!(cols(&star("http://ex/alias")), None, "two object maps");
+
+        let mut constant = tm.clone();
+        constant.subject_map = SubjectMap::constant("http://ex/the");
+        assert_eq!(
+            topk_required_columns(&base, &constant),
+            Some(vec!["AMT".to_string()])
+        );
     }
 
     /// `set_topk` records no directive for a scan whose child binds a variable
