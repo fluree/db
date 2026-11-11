@@ -1423,3 +1423,216 @@ async fn authorization_crawl_preserves_policy_across_formatting_terminals() {
         }
     }
 }
+
+/// Graph sources governed by a model that hides every `ex:Person`: an
+/// Iceberg source and, with `sql`, a SQL source over the same rows.
+async fn graph_governed_sources(fluree: &fluree_db_api::Fluree) -> Vec<&'static str> {
+    const MODEL: &str = "governance-graph:main";
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class" },
+                    { "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("graph-governed", table_location(), PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle")
+                .with_model(MODEL),
+        )
+        .await
+        .expect("governed source");
+    #[allow(unused_mut)]
+    let mut sources = vec!["graph-governed:main"];
+    #[cfg(feature = "sql")]
+    {
+        let rows = (1..=5)
+            .map(|id| vec![json!(id), json!(format!("p{id}")), json!(50 + id)])
+            .collect();
+        let server = fake_sql::FakeSql::new()
+            .table(fake_sql::Table::new(
+                "silver.people",
+                &[("id", "bigint"), ("name", "varchar"), ("score", "bigint")],
+                rows,
+            ))
+            .mount()
+            .await;
+        let mut cfg = fluree_db_api::SqlCreateConfig::new(
+            "graph-governed-sql",
+            server.uri(),
+            PEOPLE_R2RML.to_string(),
+        );
+        cfg.model = Some(MODEL.to_string());
+        fluree
+            .create_sql_graph_source(cfg)
+            .await
+            .expect("governed sql source");
+        // The server lives on this test's runtime; dropping it would stop it.
+        std::mem::forget(server);
+        sources.push("graph-governed-sql:main");
+    }
+    sources
+}
+
+/// Rows of a formatted result, SPARQL or JSON-LD.
+fn result_len(v: &Value) -> usize {
+    v.as_array()
+        .map(Vec::len)
+        .or_else(|| v["results"]["bindings"].as_array().map(Vec::len))
+        .unwrap_or(usize::MAX)
+}
+
+/// Every query in `shapes` against `source` answers as many rows as the source
+/// queried directly under the same request options does (an error counts as
+/// a disagreement).
+async fn graph_scope_disagreements(
+    fluree: &fluree_db_api::Fluree,
+    source: &str,
+    shapes: Vec<(String, Result<Value, String>, Option<Value>)>,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (label, got, opts) in shapes {
+        let mut direct = json!({
+            "@context": context(),
+            "from": source,
+            "select": ["?s", "?n"],
+            "where": { "@id": "?s", "ex:name": "?n" },
+        });
+        if let Some(opts) = opts {
+            direct["opts"] = opts;
+        }
+        let direct = fluree
+            .query_from()
+            .jsonld(&direct)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{source} direct: {e}"));
+        assert_eq!(
+            result_len(&direct),
+            0,
+            "{source}: the model hides every person"
+        );
+        match got {
+            Ok(v) if result_len(&v) == result_len(&direct) => {}
+            Ok(v) => wrong.push(format!(
+                "{source} {label}: {} rows where the source answers {}: {v}",
+                result_len(&v),
+                result_len(&direct)
+            )),
+            Err(e) => wrong.push(format!("{source} {label}: error {e}")),
+        }
+    }
+    wrong
+}
+
+/// A governed graph source that is a named graph of a dataset keeps its own
+/// view policy when the query reaches it through `GRAPH`, whatever the
+/// default graph's policy: none, or a request policy that would allow its
+/// rows. Its model hides every `ex:Person`, so each shape answers as the
+/// source queried directly with the same request does: no rows.
+#[tokio::test]
+#[ignore = "fixed by the class-policy decisions change"]
+async fn a_governed_source_in_a_dataset_keeps_its_own_policy() {
+    let fluree = setup().await;
+    let mut wrong = Vec::new();
+    for source in graph_governed_sources(&fluree).await {
+        let named = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "from-named": [source],
+            "select": ["?s", "?n"],
+            "where": [["graph", source, { "@id": "?s", "ex:name": "?n" }]],
+        });
+        let request_opts = json!({
+            "policy": [allow("ex:anyName", on_property("http://example.org/name"))],
+            "default-allow": true
+        });
+        let mut with_opts = named.clone();
+        with_opts["opts"] = request_opts.clone();
+        let sparql = format!(
+            "SELECT ?s ?n FROM <{NATIVE}> FROM NAMED <{source}> \
+             WHERE {{ GRAPH <{source}> {{ ?s <http://example.org/name> ?n }} }}"
+        );
+        let run_jsonld = |q: Value| {
+            let fluree = &fluree;
+            async move {
+                fluree
+                    .query_from()
+                    .jsonld(&q)
+                    .execute_formatted()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let shapes = vec![
+            (
+                "JSON-LD from + from-named + graph".to_string(),
+                run_jsonld(named).await,
+                None,
+            ),
+            (
+                "JSON-LD from + from-named + graph, request policy".to_string(),
+                run_jsonld(with_opts).await,
+                Some(request_opts),
+            ),
+            (
+                "SPARQL FROM + FROM NAMED + GRAPH".to_string(),
+                fluree
+                    .query_from()
+                    .sparql(&sparql)
+                    .execute_formatted()
+                    .await
+                    .map_err(|e| e.to_string()),
+                None,
+            ),
+        ];
+        wrong.extend(graph_scope_disagreements(&fluree, source, shapes).await);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A governed graph source named by `GRAPH` inside a query over one ledger
+/// keeps its own view policy.
+#[tokio::test]
+#[ignore = "fixed by the class-policy decisions change"]
+async fn a_governed_source_named_by_graph_keeps_its_own_policy() {
+    let fluree = setup().await;
+    let mut wrong = Vec::new();
+    for source in graph_governed_sources(&fluree).await {
+        let q = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "select": ["?s", "?n"],
+            "where": [["graph", source, { "@id": "?s", "ex:name": "?n" }]],
+        });
+        let got = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_formatted()
+            .await
+            .map_err(|e| e.to_string());
+        wrong.extend(
+            graph_scope_disagreements(
+                &fluree,
+                source,
+                vec![("JSON-LD from + graph".to_string(), got, None)],
+            )
+            .await,
+        );
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

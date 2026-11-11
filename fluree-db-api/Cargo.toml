@@ -240,6 +240,14 @@ name = "it_iceberg_policy"
 path = "tests/it_iceberg_policy.rs"
 required-features = ["iceberg", "native"]
 
+# A class-targeted view policy over an R2RML source is decided on every class
+# the subject holds, checked against a native ledger under the same policy.
+# Own binary: it flips the process-wide fast-path switch.
+[[test]]
+name = "it_r2rml_class_policy"
+path = "tests/it_r2rml_class_policy.rs"
+required-features = ["iceberg", "native"]
+
 # Patterns over tables whose rows mint the same triple more than once answer
 # over the set of triples, checked against a native ledger holding them. Own
 # binary: it flips the process-wide fast-path switch, sets
