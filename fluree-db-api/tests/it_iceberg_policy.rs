@@ -1545,7 +1545,6 @@ async fn graph_scope_disagreements(
 /// rows. Its model hides every `ex:Person`, so each shape answers as the
 /// source queried directly with the same request does: no rows.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn a_governed_source_in_a_dataset_keeps_its_own_policy() {
     let fluree = setup().await;
     let mut wrong = Vec::new();

@@ -4234,7 +4234,7 @@ impl Operator for R2rmlScanOperator {
             .compiled_mapping(&self.pattern.graph_source_id, as_of_t)
             .await?;
 
-        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id);
+        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id)?;
         self.mapping = Some(mapping);
         self.state = OperatorState::Open;
 

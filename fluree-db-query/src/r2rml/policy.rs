@@ -84,33 +84,54 @@ pub(crate) struct R2rmlPolicyGate {
     /// TriplesMap IRI → predicate IRI → allowed, for subject-independent maps.
     /// Nested so a lookup borrows both keys and only a miss allocates.
     static_cache: HashMap<String, HashMap<String, bool>>,
+    /// The snapshot the policy's targets are encoded against, where it is not
+    /// the context's own (a source reached through `GRAPH` in a dataset).
+    encoder: Option<LedgerSnapshot>,
 }
 
 impl R2rmlPolicyGate {
-    /// Build the gate for this scan, or `None` when no view policy is active
-    /// (no enforcer, or a root enforcer) and the scan may run unfiltered.
+    /// Build the gate for this scan of `graph_source_id`, or `None` when no
+    /// view policy governs the source and the scan may run unfiltered.
+    ///
+    /// The policy that governs a source is its own. In a dataset the source is
+    /// a graph with its own enforcer (built from the request and the source's
+    /// model), and a scan reached through `GRAPH` runs in a context switched
+    /// from another graph, whose enforcer is that graph's: the dataset's entry
+    /// for the source is taken first. Outside a dataset the context's enforcer
+    /// is the source's own. Where filtering is required and no enforcer can be
+    /// resolved for the source, the scan is refused rather than run
+    /// unfiltered.
     pub(crate) fn build(
         ctx: &ExecutionContext<'_>,
         mapping: &CompiledR2rmlMapping,
         graph_source_id: &str,
-    ) -> Option<Self> {
-        if ctx.allow_unfiltered() {
-            return None;
-        }
-        // Reaching here with no enforcer would be a contradiction: `allow_unfiltered`
-        // said filtering is required. It cannot happen today — that predicate is
-        // false either because this context's own enforcer is non-root, or because
-        // `ctx.dataset` has a policy, and `with_graph_ref` supplies the graph's
-        // enforcer and clears `dataset` before a scan opens. Asserted rather than
-        // silently scanning unfiltered, so a future path that opens a scan on a
-        // dataset-level context fails in CI instead of leaking.
-        debug_assert!(
-            ctx.policy_enforcer.is_some(),
-            "R2RML scan on {graph_source_id}: filtering required but no enforcer in scope"
-        );
-        let enforcer = ctx.policy_enforcer.as_ref()?;
+    ) -> Result<Option<Self>> {
+        // The source's own graph in a dataset carries the snapshot its policy
+        // was built against: targets and classes are encoded there, which a
+        // context switched to the source from another graph does not share.
+        let (enforcer, encoder) = match ctx.dataset.and_then(|ds| ds.named_graph(graph_source_id)) {
+            Some(graph) => (graph.policy_enforcer.clone(), Some(graph.snapshot.clone())),
+            None => {
+                if ctx.allow_unfiltered() {
+                    return Ok(None);
+                }
+                match ctx.policy_enforcer.clone() {
+                    Some(enforcer) => (Some(enforcer), None),
+                    None => {
+                        return Err(QueryError::Policy(format!(
+                            "Graph source '{graph_source_id}': a view policy applies to this \
+                             query, but none could be resolved for the source; refusing to \
+                             read it unfiltered"
+                        )))
+                    }
+                }
+            }
+        };
+        let Some(enforcer) = enforcer.filter(|e| !e.is_root()) else {
+            return Ok(None);
+        };
         let base = enforcer.policy();
-        let snapshot = ctx.active_snapshot;
+        let snapshot = encoder.as_ref().unwrap_or(ctx.active_snapshot);
 
         let stats = mapping_class_stats(mapping, snapshot);
         let mut view = build_policy_set(
@@ -172,7 +193,7 @@ impl R2rmlPolicyGate {
             })
             .collect();
 
-        Some(Self {
+        Ok(Some(Self {
             policy,
             per_subject,
             has_class_policies,
@@ -181,7 +202,8 @@ impl R2rmlPolicyGate {
             policy_classes,
             policy_subjects,
             static_cache: HashMap::new(),
-        })
+            encoder,
+        }))
     }
 
     /// Whether this map's rows carry classes the mapping cannot know
@@ -402,7 +424,7 @@ impl R2rmlPolicyGate {
             }
         }
 
-        let snapshot = ctx.active_snapshot;
+        let snapshot = self.encoder.as_ref().unwrap_or(ctx.active_snapshot);
         let mut classes: Vec<Sid> = self.tm_classes.get(&tm.iri).cloned().unwrap_or_default();
         classes.extend(row_classes.iter().filter_map(|c| snapshot.encode_iri(c)));
         let subject_sid = match (self.per_subject, subject) {
