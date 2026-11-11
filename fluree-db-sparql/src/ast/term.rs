@@ -132,11 +132,13 @@ pub enum IriValue {
     },
 }
 
-/// A blank node.
+/// A blank node. Every blank node carries a label: the parser gives each
+/// anonymous `[]` a reserved one, so the copies a `;` or `,` list makes of it
+/// all denote one node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlankNode {
-    /// The blank node value
-    pub value: BlankNodeValue,
+    /// The label, without the `_:` prefix
+    pub label: Arc<str>,
     /// Source span
     pub span: SourceSpan,
 }
@@ -145,27 +147,10 @@ impl BlankNode {
     /// Create a labeled blank node (e.g., `_:label`).
     pub fn labeled(label: impl AsRef<str>, span: SourceSpan) -> Self {
         Self {
-            value: BlankNodeValue::Labeled(Arc::from(label.as_ref())),
+            label: Arc::from(label.as_ref()),
             span,
         }
     }
-
-    /// Create an anonymous blank node (e.g., `[]` or `[ :p :o ]`).
-    pub fn anon(span: SourceSpan) -> Self {
-        Self {
-            value: BlankNodeValue::Anon,
-            span,
-        }
-    }
-}
-
-/// The value of a blank node.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BlankNodeValue {
-    /// Labeled blank node (`_:label`)
-    Labeled(Arc<str>),
-    /// Anonymous blank node (`[]`)
-    Anon,
 }
 
 /// A literal value.
@@ -578,10 +563,7 @@ mod tests {
     #[test]
     fn test_blank_node() {
         let labeled = BlankNode::labeled("b1", SourceSpan::new(0, 4));
-        assert!(matches!(labeled.value, BlankNodeValue::Labeled(_)));
-
-        let anon = BlankNode::anon(SourceSpan::new(0, 2));
-        assert!(matches!(anon.value, BlankNodeValue::Anon));
+        assert_eq!(labeled.label.as_ref(), "b1");
     }
 
     #[test]
