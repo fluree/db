@@ -10,7 +10,10 @@
 //! `about page`). Domains, ranges and other axioms stay: the model doesn't
 //! see them, but a reading is still checked against them. What a reader
 //! refuses wherever it appears (`xt:example`, extraction results) is
-//! dropped. An optional slice cuts the vocabulary first.
+//! dropped, and a result record goes whole: a blank node that carries a
+//! result, or an IRI with nothing left but its types once its results go
+//! (either would be refused as a catalog record). An optional slice cuts the
+//! vocabulary first.
 //!
 //! The catalog, if the file has one, is kept, except that a record with
 //! `rdfs:label` and no SKOS label (a vocabulary's enumeration members) gets
@@ -21,7 +24,7 @@ use crate::policy;
 use crate::read::{Parsed, Quad};
 use crate::slice::{self, Slice, UnknownSeed};
 use crate::vocab::{
-    RDFS_COMMENT, RDFS_LABEL, RESULT_PREDICATES, SKOS_ALT_LABEL, SKOS_DEFINITION,
+    RDFS_COMMENT, RDFS_LABEL, RDF_TYPE, RESULT_PREDICATES, SKOS_ALT_LABEL, SKOS_DEFINITION,
     SKOS_HIDDEN_LABEL, SKOS_PREF_LABEL, WELL_KNOWN_PREFIXES, XT_EXAMPLE,
 };
 use crate::words;
@@ -104,18 +107,18 @@ pub fn rewrite(parsed: &Parsed, seeds: &[String], depth: usize) -> Result<Rewrit
     for (key, n) in skos_for_records(&mut catalog) {
         counts.insert(key.to_string(), n);
     }
+    // refused wherever they appear: they go, counted
+    let (examples, annotations) = (
+        count_dropped(&mut quads, &mut catalog, |q| &*q.predicate == XT_EXAMPLE),
+        drop_results(&mut quads, &mut catalog),
+    );
     let records = crate::check::records(&catalog).len();
     quads.extend(catalog);
-    // refused wherever they appear: they go, counted
-    let before = quads.len();
-    quads.retain(|q| &*q.predicate != XT_EXAMPLE);
-    let examples = before - quads.len();
-    let before = quads.len();
-    quads.retain(|q| !RESULT_PREDICATES.contains(&&*q.predicate));
-    let annotations = before - quads.len();
     for (key, n) in [
         (EXAMPLES_DROPPED, examples),
-        (ANNOTATIONS_DROPPED, annotations),
+        (ANNOTATIONS_DROPPED, annotations.statements),
+        (RESULT_RECORDS_DROPPED, annotations.records_dropped),
+        (ANNOTATED_RECORDS_KEPT, annotations.records_kept),
     ] {
         if n > 0 {
             counts.insert(key.to_string(), n);
@@ -142,6 +145,74 @@ pub const RECORD_LABELS: &str = "skos:prefLabel from rdfs:label (catalog)";
 pub const RECORD_DEFINITIONS: &str = "skos:definition from rdfs:comment (catalog)";
 pub const EXAMPLES_DROPPED: &str = "xt:example dropped";
 pub const ANNOTATIONS_DROPPED: &str = "extraction annotations dropped";
+pub const RESULT_RECORDS_DROPPED: &str = "extraction result records dropped whole";
+pub const ANNOTATED_RECORDS_KEPT: &str =
+    "records kept without their extraction annotations (check they are records)";
+
+/// Drop the statements `refused` matches from both halves; how many.
+fn count_dropped(
+    quads: &mut Vec<Quad>,
+    catalog: &mut Vec<Quad>,
+    refused: impl Fn(&Quad) -> bool,
+) -> usize {
+    let before = quads.len() + catalog.len();
+    quads.retain(|q| !refused(q));
+    catalog.retain(|q| !refused(q));
+    before - quads.len() - catalog.len()
+}
+
+/// What dropping extraction results took.
+struct ResultsDropped {
+    /// Result statements (`xt:entity`, `xt:score`, ...).
+    statements: usize,
+    /// Subjects dropped whole, as results and nothing else.
+    records_dropped: usize,
+    /// Subjects with a label or description of their own, kept without
+    /// their results: they may be real records.
+    records_kept: usize,
+}
+
+/// Drop extraction results. A subject that carries one goes whole when it
+/// can only be a result: a blank node, or an IRI with nothing but `rdf:type`
+/// besides its results (kept, it would be a record without a label). So do
+/// statements pointing at a blank node that went. Any other subject keeps
+/// everything but its results.
+fn drop_results(quads: &mut Vec<Quad>, catalog: &mut Vec<Quad>) -> ResultsDropped {
+    let is_result = |q: &Quad| RESULT_PREDICATES.contains(&&*q.predicate);
+    let carriers: HashSet<Term> = quads
+        .iter()
+        .chain(catalog.iter())
+        .filter(|q| is_result(q))
+        .map(|q| q.subject.clone())
+        .collect();
+    let mut own: HashSet<Term> = HashSet::new();
+    for q in quads.iter().chain(catalog.iter()) {
+        if carriers.contains(&q.subject) && !is_result(q) && &*q.predicate != RDF_TYPE {
+            own.insert(q.subject.clone());
+        }
+    }
+    let whole: HashSet<Term> = carriers
+        .iter()
+        .filter(|s| s.is_blank() || !own.contains(*s))
+        .cloned()
+        .collect();
+    let results = quads
+        .iter()
+        .chain(catalog.iter())
+        .filter(|q| is_result(q))
+        .count();
+    let refused = |q: &Quad| {
+        is_result(q)
+            || whole.contains(&q.subject)
+            || (q.object.is_blank() && whole.contains(&q.object))
+    };
+    count_dropped(quads, catalog, refused);
+    ResultsDropped {
+        statements: results,
+        records_dropped: whole.len(),
+        records_kept: carriers.len() - whole.len(),
+    }
+}
 
 /// Rewrite shown terms' labels that read as identifiers into words; how
 /// many were.
@@ -351,6 +422,10 @@ mod tests {
         let out = rewrite(&parsed, &[], 1).unwrap();
         assert_eq!(out.adapted.get(EXAMPLES_DROPPED), Some(&2));
         assert_eq!(out.adapted.get(ANNOTATIONS_DROPPED), Some(&2));
+        // a labelled record keeps its label, and the summary says so
+        assert_eq!(out.adapted.get(ANNOTATED_RECORDS_KEPT), Some(&1));
+        assert_eq!(out.adapted.get(RESULT_RECORDS_DROPPED), None);
+        assert_eq!(out.records, 1);
         // the event class keeps its declaration
         assert!(out
             .quads
@@ -366,6 +441,50 @@ mod tests {
         let report = crate::check::check(&again, &Default::default()).unwrap();
         assert!(report.passes(), "{:?}", report.will_fail);
         assert_eq!(report.event_classes, 1);
+    }
+
+    /// A subject that is only a result goes whole, blank or not, with what
+    /// points at a blank one, so what `from` writes passes `check`.
+    #[test]
+    fn a_result_record_is_dropped_whole() {
+        let parsed = parse(
+            r#"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+               @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+               @prefix xt: <https://ns.flur.ee/extract#> .
+               @prefix ex: <https://ex.com/> .
+               ex:Claim a rdfs:Class ; rdfs:label "claim" .
+               ex:Person a rdfs:Class ; rdfs:label "person" .
+               ex:alice a ex:Person ; skos:prefLabel "Alice" ; ex:made [ a ex:Claim ; xt:entity ex:alice ; xt:score 0.9 ] .
+               ex:c1 a ex:Claim ; xt:entity ex:alice ; xt:accepted true ."#,
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let out = rewrite(&parsed, &[], 1).unwrap();
+        assert_eq!(out.adapted.get(RESULT_RECORDS_DROPPED), Some(&2));
+        assert_eq!(out.adapted.get(ANNOTATIONS_DROPPED), Some(&4));
+        assert_eq!(out.adapted.get(ANNOTATED_RECORDS_KEPT), None);
+        assert_eq!(out.records, 1);
+        let alice = Term::iri("https://ex.com/alice");
+        assert!(!out
+            .quads
+            .iter()
+            .any(|q| q.subject.is_blank() || q.object.is_blank()));
+        assert!(!out
+            .quads
+            .iter()
+            .any(|q| q.subject == Term::iri("https://ex.com/c1")));
+        assert!(out.quads.iter().any(|q| q.subject == alice));
+        let ttl = serialize(
+            &out.quads,
+            &used_prefixes(&out.quads, &parsed.prefixes),
+            OutputFormat::Turtle,
+        )
+        .unwrap();
+        let again = parse(&ttl, RdfFormat::Turtle, None).unwrap();
+        let report = crate::check::check(&again, &Default::default()).unwrap();
+        assert!(report.passes(), "{:?}", report.will_fail);
+        assert_eq!(report.records, 1);
     }
 
     #[test]
