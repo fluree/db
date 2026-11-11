@@ -3,27 +3,27 @@
 //! The indexer's catch-up tick ([`Housekeeping`]) starts it and wakes it; it
 //! then also runs on its own, shorter interval, because TTLs come due on
 //! quiet ledgers that have nothing to index. Each pass covers the branches
-//! registered as active. A branch becomes active when the background indexer
-//! is about to build commits that carry retention input
-//! ([`BuildObserver`]): that check happens before the index can cover those
-//! commits, so a crash cannot lose an activation.
+//! registered as active. A branch becomes active when an index build reads
+//! commits that carry retention input
+//! ([`IndexResult::retention_input_from_t`]): it is registered before the
+//! root is published, so a crash cannot lose an activation, and a ledger
+//! that never uses retention pays nothing for the check.
 
 // The worker loop and build observer run on native targets only; on wasm32
 // the runtime state they drive is unused.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use fluree_db_core::ContentId;
 #[cfg(not(target_arch = "wasm32"))]
-use fluree_db_indexer::{BuildObserver, Housekeeping};
+use fluree_db_indexer::{BuildObserver, Housekeeping, IndexResult};
 use fluree_db_nameservice::NsRecord;
 use tokio::sync::Notify;
 
-use super::engine::{probe_activation, probe_pending, PassReport, ScheduleCache};
+use super::engine::{PassReport, ScheduleCache};
 use super::registry;
 use super::writer::{RetentionBatch, RetentionWriter, SubmitOutcome};
 use super::RetentionLimits;
@@ -32,13 +32,8 @@ use crate::{Fluree, Result};
 /// The retention state one `Fluree` instance keeps in memory.
 #[derive(Default)]
 pub(crate) struct RetentionRuntime {
-    /// Branches known to be registered, with the incarnation the
-    /// registration was read for where it is known: one created again under
-    /// the name has its own registration, or none.
-    active: parking_lot::Mutex<HashMap<String, Option<Incarnation>>>,
-    /// Unregistered branches, with the incarnation whose chain was probed
-    /// and the commit `t` it was probed through.
-    probed: parking_lot::Mutex<HashMap<String, (Incarnation, i64)>>,
+    /// Branches known to be registered.
+    active: parking_lot::Mutex<HashSet<String>>,
     /// Wakes the worker.
     pub(crate) nudge: Arc<Notify>,
     /// A worker runs in this process.
@@ -73,35 +68,14 @@ pub(crate) struct RetentionRuntime {
     pub(crate) erasure: std::sync::OnceLock<Arc<super::erasure::ErasureRuntime>>,
 }
 
-/// Which ledger a record under a name is: one created again under a
-/// dropped one's name has another fence and storage root.
-type Incarnation = (Option<fluree_db_nameservice::Fence>, Option<u128>);
-
-fn incarnation(record: &NsRecord) -> Incarnation {
-    (
-        record.fence,
-        record
-            .storage_root
-            .as_ref()
-            .and_then(fluree_db_core::StorageRoot::instance_bits),
-    )
-}
-
 impl RetentionRuntime {
     pub(crate) fn mark_active(&self, ledger_id: &str) {
-        self.mark_registered(ledger_id, None);
-    }
-
-    fn mark_registered(&self, ledger_id: &str, incarnation: Option<Incarnation>) {
-        self.active
-            .lock()
-            .insert(ledger_id.to_string(), incarnation);
-        self.probed.lock().remove(ledger_id);
+        self.active.lock().insert(ledger_id.to_string());
         self.nudge.notify_one();
     }
 
     fn active_ledgers(&self) -> Vec<String> {
-        self.active.lock().keys().cloned().collect()
+        self.active.lock().iter().cloned().collect()
     }
 
     pub(crate) fn running(&self) -> bool {
@@ -210,8 +184,9 @@ async fn drive(worker: Weak<Worker>, nudge: Arc<Notify>) {
     }
 }
 
-/// Registers branches as the background indexer reaches commits that carry
-/// retention input.
+/// Gives the background indexer's builds the history retention removed,
+/// and registers a branch for retention before an index covers the commits
+/// carrying its retention input.
 #[cfg(not(target_arch = "wasm32"))]
 struct RetentionBuildObserver {
     fluree: Weak<Fluree>,
@@ -223,15 +198,10 @@ impl BuildObserver for RetentionBuildObserver {
     async fn before_build(
         &self,
         record: &NsRecord,
-        pending: Option<&[(i64, ContentId)]>,
     ) -> std::result::Result<fluree_db_indexer::BuildDirectives, String> {
         let Some(fluree) = self.fluree.upgrade() else {
             return Ok(Default::default());
         };
-        fluree
-            .observe_build_for_retention(record, pending)
-            .await
-            .map_err(|e| format!("retention activation check: {e}"))?;
         let history_suppression = fluree
             .suppressed_history_for_index(record.ledger_id.as_ref())
             .await
@@ -239,6 +209,24 @@ impl BuildObserver for RetentionBuildObserver {
         Ok(fluree_db_indexer::BuildDirectives {
             history_suppression,
         })
+    }
+
+    async fn before_publish(
+        &self,
+        _record: &NsRecord,
+        built: &IndexResult,
+    ) -> std::result::Result<(), String> {
+        if built.retention_input_from_t.is_none() {
+            return Ok(());
+        }
+        let fluree = self
+            .fluree
+            .upgrade()
+            .ok_or("retention registration: the instance is gone")?;
+        fluree
+            .register_built_retention(built)
+            .await
+            .map_err(|e| format!("retention registration: {e}"))
     }
 }
 
@@ -405,71 +393,46 @@ impl Fluree {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn observe_build_for_retention(
+    /// Register `built`'s branch for retention from the earliest commit
+    /// carrying retention input the build read. Call it before publishing
+    /// the root: once an index covers those commits, no build reads them
+    /// again. Nothing when the build read none.
+    pub(crate) async fn register_built_retention(
         &self,
-        record: &NsRecord,
-        pending: Option<&[(i64, ContentId)]>,
+        built: &fluree_db_indexer::IndexResult,
     ) -> Result<()> {
-        let id = record.ledger_id.to_string();
-        let registered = Some(incarnation(record));
-        if self.retention.active.lock().get(&id) == Some(&registered) {
+        let Some(since) = built.retention_input_from_t else {
             return Ok(());
-        }
+        };
+        let id = built.ledger_id.to_string();
+        registry::activate(self.publisher()?, self.registry_objects(), &id, since).await?;
+        self.retention.mark_active(&id);
+        Ok(())
+    }
+
+    /// Register `branch_id` for retention as `source_id` is, before the
+    /// branch adopts the source's index: its builds never read the commits
+    /// that index covers. Nothing when the source is not registered.
+    pub(crate) async fn register_retention_as(
+        &self,
+        source_id: &str,
+        branch_id: &str,
+    ) -> Result<()> {
         let ns = self.publisher()?;
-        if registry::read(ns, self.registry_objects(), &id)
+        let Some(source) = registry::read(ns, self.registry_objects(), source_id)
             .await?
             .1
-            .is_some()
-        {
-            self.retention.mark_registered(&id, registered);
-            return Ok(());
-        }
-        let Some(head) = record.commit_head_id.clone() else {
+        else {
             return Ok(());
         };
-        let probed = match self.retention.probed.lock().get(&id) {
-            Some((probed, t)) if *probed == incarnation(record) => *t,
-            _ => 0,
-        };
-        let from = record.index_t.max(probed);
-        if record.commit_t <= from {
-            return Ok(());
-        }
-        if let Some(source) = &record.source_branch {
-            let source_id = format!("{}:{source}", record.name);
-            if let Some(r) = registry::read(ns, self.registry_objects(), &source_id)
-                .await?
-                .1
-            {
-                registry::activate(ns, self.registry_objects(), &id, r.active_since_t).await?;
-                self.retention.mark_registered(&id, registered);
-                return Ok(());
-            }
-        }
-        let store = self
-            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
-            .await?;
-        // The list may lag the record; only one covering every commit
-        // since the index stands in for the walk.
-        let covered = pending.filter(|pending| {
-            fluree_db_indexer::pending_covers_range(pending, record.index_t, &head)
-        });
-        let found = match covered {
-            Some(pending) => probe_pending(store.as_ref(), pending, from).await?,
-            None => probe_activation(store.as_ref(), &head, from).await?,
-        };
-        match found {
-            Some(since) => {
-                registry::activate(ns, self.registry_objects(), &id, since).await?;
-                self.retention.mark_registered(&id, registered);
-            }
-            None => {
-                self.retention
-                    .probed
-                    .lock()
-                    .insert(id, (incarnation(record), record.commit_t));
-            }
-        }
+        registry::activate(
+            ns,
+            self.registry_objects(),
+            branch_id,
+            source.active_since_t,
+        )
+        .await?;
+        self.retention.mark_active(branch_id);
         Ok(())
     }
 }

@@ -161,7 +161,7 @@ Expiration commits are made by the system (`f:identity` is `urn:fluree:system:re
 
 The retention worker runs on the node that owns background maintenance: the server's background indexer, or the Raft leader in a cluster. It:
 
-1. Notices a ledger's first TTL input when the background indexer reaches the commit that carries it, and registers the ledger.
+1. Notices a ledger's first TTL input when an index build first reads the commit that carries it, and registers the ledger before that index is published. Until a build reaches it, the worker does not act on the ledger, so a value's expiry can be delayed by up to one indexing cycle. A ledger that never uses TTL adds no work to its index builds.
 2. Derives an expiry schedule from the ledger's commits, and persists it with the commit it covers, so a restart resumes where it left off.
 3. On each pass (every `--retention-interval-secs`, default 15 seconds), retracts what is due in one commit. The commit is made only if the ledger's head is still the one the batch was checked against. A concurrent write, such as a renewal, sends the batch back to be recomputed.
 

@@ -167,6 +167,7 @@ impl Fluree {
                 }
             }
         };
+        self.register_built_retention(&built).await?;
         self.publisher()?
             .publish_index_allow_equal_fenced(
                 record.ledger_id.as_str(),
@@ -202,6 +203,7 @@ impl Fluree {
             config,
         )
         .await?;
+        self.register_built_retention(&built).await?;
         self.publisher()?
             .publish_index_allow_equal_fenced(
                 record.ledger_id.as_str(),

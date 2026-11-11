@@ -969,22 +969,24 @@ impl Housekeeping for Housekeepings {
 /// it can be installed once the worker is running.
 type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
 
-/// Work the background worker runs before it builds a ledger's index, with
+/// Work the background worker runs around a build of a ledger's index, with
 /// the record it builds from: see [`IndexerHandle::set_build_observer`].
-///
-/// An error skips the build, which is retried, so what the observer must see
-/// before the index covers it is never indexed past unseen.
 #[async_trait::async_trait]
 pub trait BuildObserver: Send + Sync {
-    /// `pending` lists the commits after the record's index, ascending by
-    /// `t`, when the nameservice keeps that list: the commits the build
-    /// fetches. Like the build, an observer trusts it only once
-    /// [`crate::pending_covers_range`] says it covers the record's range.
+    /// Runs before the build. An error skips the build, which is retried.
     async fn before_build(
         &self,
         record: &fluree_db_nameservice::NsRecord,
-        pending: Option<&[(i64, fluree_db_core::ContentId)]>,
     ) -> std::result::Result<BuildDirectives, String>;
+
+    /// Runs once `result` is built from `record` and before it is published:
+    /// what the build read that the index will cover. An error leaves the
+    /// root unpublished, and the build is retried.
+    async fn before_publish(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+        result: &IndexResult,
+    ) -> std::result::Result<(), String>;
 }
 
 /// What a [`BuildObserver`] asks of the build it was shown.
@@ -2400,11 +2402,8 @@ impl BackgroundIndexerWorker {
         };
 
         let observer = self.build_observer.read().ok().and_then(|o| o.clone());
-        if let Some(observer) = observer {
-            match observer
-                .before_build(&record, job_config.pending_commit_cids.as_deref())
-                .await
-            {
+        if let Some(observer) = &observer {
+            match observer.before_build(&record).await {
                 Ok(directives) => {
                     job_config.history_suppression = directives.history_suppression;
                 }
@@ -2425,6 +2424,13 @@ impl BackgroundIndexerWorker {
 
         match result {
             Ok(index_result) => {
+                if let Some(observer) = &observer {
+                    if let Err(e) = observer.before_publish(&record, &index_result).await {
+                        warn!(ledger_id = %ledger_id, error = %e, "build observer failed; publish deferred");
+                        self.schedule_retry(ledger_id, &e).await;
+                        return;
+                    }
+                }
                 // Try to publish
                 if let Err(e) = crate::publish_index_result(
                     &content_store,
@@ -4898,6 +4904,86 @@ mod tests {
         // Idle and halt-free, the entry may already be pruned.
         assert!(handle.status(&ledger).await.is_none_or(|s| !s.halted));
         run.abort();
+    }
+
+    /// The build reports the earliest commit carrying retention input to the
+    /// observer before publishing, and a refusal there leaves the root
+    /// unpublished.
+    #[tokio::test]
+    async fn a_refused_publish_hook_leaves_the_build_unpublished() {
+        struct Refusing(std::sync::Mutex<Vec<Option<i64>>>);
+        #[async_trait::async_trait]
+        impl BuildObserver for Refusing {
+            async fn before_build(
+                &self,
+                _: &NsRecord,
+            ) -> std::result::Result<BuildDirectives, String> {
+                Ok(BuildDirectives::default())
+            }
+            async fn before_publish(
+                &self,
+                _: &NsRecord,
+                built: &IndexResult,
+            ) -> std::result::Result<(), String> {
+                self.0.lock().unwrap().push(built.retention_input_from_t);
+                Err("refused".into())
+            }
+        }
+
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let commit = |t: i64, parents: Vec<ContentId>, marked: bool| Commit {
+            id: None,
+            t,
+            time: None,
+            flakes: vec![make_flake(1, "ex:alice", 1, "ex:age", t, t)],
+            parents,
+            txn: None,
+            namespace_delta: HashMap::from([(1, "ex:".to_string())]),
+            txn_signature: None,
+            commit_signatures: Vec::new(),
+            redaction: None,
+            txn_meta: if marked {
+                vec![fluree_db_core::TxnMetaEntry::new(
+                    fluree_vocab::namespaces::FLUREE_DB,
+                    fluree_vocab::db::RETENTION_CONTROL,
+                    fluree_db_core::TxnMetaValue::Boolean(true),
+                )]
+            } else {
+                Vec::new()
+            },
+            graph_delta: HashMap::new(),
+            ns_split_mode: None,
+            graph_drops: Vec::new(),
+        };
+        let first = store_commit(&storage, &commit(1, Vec::new(), false)).await;
+        let second = store_commit(&storage, &commit(2, vec![first], true)).await;
+        let third = store_commit(&storage, &commit(3, vec![second.clone()], true)).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
+        ns.publish_commit("test:main", 3, &third).await.unwrap();
+
+        let config = IndexerConfig::small()
+            .with_data_dir(std::env::temp_dir().join("fluree-test-orch-publish-hook"));
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            Arc::clone(&ns) as Arc<dyn IndexingNameService>,
+            config,
+        );
+        let observer = Arc::new(Refusing(std::sync::Mutex::default()));
+        handle.set_build_observer(observer.clone());
+        let ledger = id("test:main");
+        let _waiter = handle.trigger(&ledger, 3).await;
+        worker.process_ledger(&ledger).await;
+
+        assert_eq!(*observer.0.lock().unwrap(), vec![Some(2)]);
+        let record = ns.lookup("test:main").await.unwrap().unwrap();
+        assert_eq!(record.index_t, 0, "a refused hook publishes nothing");
+        let states = handle.trigger.states.lock().await;
+        let state = states.get(&ledger).expect("state exists");
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(state.last_error.as_deref(), Some("refused"));
     }
 
     #[tokio::test]

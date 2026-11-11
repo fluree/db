@@ -1146,6 +1146,9 @@ pub struct SharedResolverState {
     graph_floors: HashMap<String, i64>,
     /// [`Self::graph_floors`] by this run's graph ids, filled as ops meet them.
     graph_floor_ids: HashMap<GraphId, Option<i64>>,
+    /// The earliest `t` among the resolved commits whose txn-meta carries
+    /// retention input ([`fluree_vocab::txn_meta::is_retention_input`]).
+    pub retention_input_from_t: Option<i64>,
 }
 
 impl SharedResolverState {
@@ -1197,6 +1200,7 @@ impl SharedResolverState {
             link_synth: super::link_synth::LinkSynth::new(),
             graph_floors: HashMap::new(),
             graph_floor_ids: HashMap::new(),
+            retention_input_from_t: None,
         }
     }
 
@@ -1351,6 +1355,7 @@ impl SharedResolverState {
             link_synth: super::link_synth::LinkSynth::new(),
             graph_floors: HashMap::new(),
             graph_floor_ids: HashMap::new(),
+            retention_input_from_t: None,
         })
     }
 
@@ -1510,6 +1515,11 @@ impl SharedResolverState {
             }
         }
         self.fulltext_hook_config = config;
+    }
+
+    fn note_retention_input(&mut self, t: i64) {
+        self.retention_input_from_t =
+            Some(self.retention_input_from_t.map_or(t, |from| from.min(t)));
     }
 
     /// Skip every op on a graph from before the graph's latest drop among the
@@ -2241,6 +2251,10 @@ impl SharedResolverState {
 
         // User-provided txn_meta entries
         for entry in &envelope.txn_meta {
+            if fluree_vocab::txn_meta::is_retention_input(entry.predicate_ns, &entry.predicate_name)
+            {
+                self.note_retention_input(envelope.t);
+            }
             count += self.emit_txn_meta_entry_chunk(commit_s_id, g_id, t, entry, chunk)?;
         }
 

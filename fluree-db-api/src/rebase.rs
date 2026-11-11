@@ -946,7 +946,8 @@ impl crate::Fluree {
 
     /// Copy index artifacts from source to branch (best-effort), and
     /// publish them on the branch where newer than its own. The index now in
-    /// the branch's namespace, if any.
+    /// the branch's namespace, if any. The branch takes the source's
+    /// retention registration first; failing that, it takes no index.
     async fn copy_source_index(
         &self,
         source_id: &str,
@@ -956,6 +957,13 @@ impl crate::Fluree {
         source_record: &fluree_db_nameservice::NsRecord,
     ) -> Option<(ContentId, i64)> {
         let index_cid = source_record.index_head_id.as_ref()?;
+        if let Err(e) = self.register_retention_as(source_id, branch_id).await {
+            tracing::warn!(
+                %e, source = %source_id, branch = %branch_id,
+                "retention registration failed during rebase; branch will replay from genesis"
+            );
+            return None;
+        }
         if let Err(e) = self
             .copy_index_to_branch(source_id, branch, index_cid)
             .await

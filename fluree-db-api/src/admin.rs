@@ -3012,6 +3012,7 @@ impl crate::Fluree {
         }
 
         // 5. Publish new index (allows same t for reindex via AdminPublisher)
+        self.register_built_retention(&index_result).await?;
         self.publisher()?
             .publish_index_allow_equal_fenced(
                 &ledger_id,

@@ -1083,6 +1083,7 @@ pub async fn erase_index_events(
         },
         fuel: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
+        retention_input_from_t: None,
     })
 }
 
@@ -1232,6 +1233,7 @@ async fn incremental_index_with(
             stats: IndexStats::default(),
             fuel: None,
             basis: fluree_db_nameservice::WriteBasis::default(),
+            retention_input_from_t: novelty.shared.retention_input_from_t,
         });
     }
 
@@ -1277,6 +1279,7 @@ pub(crate) async fn index_novelty(
     replaced_cids: Vec<ContentId>,
     erased_events: std::collections::BTreeMap<fluree_db_core::GraphId, Vec<(RunRecordV2, bool)>>,
 ) -> Result<IndexResult> {
+    let retention_input_from_t = novelty.shared.retention_input_from_t;
     let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
     let upload_budget = Arc::new(Semaphore::new(upload_buffer));
 
@@ -4623,6 +4626,7 @@ pub(crate) async fn index_novelty(
         // Outer entry point fills fuel from the tracker tally.
         fuel: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
+        retention_input_from_t,
     })
 }
 
@@ -4777,6 +4781,7 @@ pub async fn compact_pool_deltas(
             total_bytes: root_bytes.len(),
         },
         fuel: None,
+        retention_input_from_t: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
     }))
 }

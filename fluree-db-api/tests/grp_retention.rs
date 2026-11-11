@@ -12,3 +12,6 @@ mod it_retention_erasure;
 
 #[path = "it_retention_import.rs"]
 mod it_retention_import;
+
+#[path = "it_retention_registration.rs"]
+mod it_retention_registration;

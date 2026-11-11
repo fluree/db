@@ -1481,7 +1481,10 @@ where
 
             drop(_span_v3);
 
-            Ok(result)
+            Ok(IndexResult {
+                retention_input_from_t: shared.retention_input_from_t,
+                ..result
+            })
         })
     })
     .await

@@ -2016,6 +2016,14 @@ pub mod txn_meta {
         outside_reserved_or_in(ns, name, TXN_META)
     }
 
+    /// Whether this txn-meta predicate is retention input: the marker a
+    /// write carrying lifetimes or retention config gets, or a transaction's
+    /// default lifetime.
+    pub fn is_retention_input(ns: u16, name: &str) -> bool {
+        use crate::db::{EXPIRES_AT, RETENTION_CONTROL, TTL};
+        ns == FLUREE_DB && matches!(name, RETENTION_CONTROL | TTL | EXPIRES_AT)
+    }
+
     fn outside_reserved_or_in(ns: u16, name: &str, fluree_db_names: &[&str]) -> bool {
         !RESERVED_NAMESPACES.contains(&ns) || (ns == FLUREE_DB && fluree_db_names.contains(&name))
     }

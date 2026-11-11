@@ -110,6 +110,11 @@ pub struct IndexResult {
     /// the build started from: a branch dropped or replaced during the
     /// build, or reached by an erasure, refuses it.
     pub basis: fluree_db_nameservice::WriteBasis,
+    /// The earliest `t` among the commits this build read whose txn-meta
+    /// carries retention input. Whoever publishes the root registers the
+    /// branch for retention from this `t` first: once published, the index
+    /// covers those commits, and no later build reads them again.
+    pub retention_input_from_t: Option<i64>,
 }
 
 /// Statistics from index building
@@ -221,6 +226,7 @@ pub async fn build_index_for_record_with_tracker(
                     stats: IndexStats::default(),
                     fuel,
                     basis: fluree_db_nameservice::WriteBasis::default(),
+                    retention_input_from_t: None,
                 });
             }
         }
@@ -665,6 +671,7 @@ mod publish_barrier_tests {
             ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
+            retention_input_from_t: None,
             basis: fluree_db_nameservice::WriteBasis::default(),
         };
         publish_index_result(&store, &publisher, &result)
