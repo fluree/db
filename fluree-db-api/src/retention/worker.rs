@@ -298,6 +298,23 @@ impl Fluree {
         self.run_retention_at(ledger_id, now_ms()).await
     }
 
+    /// [`run_retention`](Self::run_retention) for a branch already
+    /// registered, and nothing (`None`) for one that is not: one
+    /// configuration read, never the walk of its commits that registering
+    /// one takes. Meant for a scheduled sweep over every ledger on a host
+    /// whose builds register them
+    /// ([`install_retention_build_hook`](Self::install_retention_build_hook)).
+    pub async fn run_registered_retention(&self, ledger_id: &str) -> Result<Option<PassReport>> {
+        if registry::read_stored(self.publisher()?, ledger_id)
+            .await?
+            .1
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.run_retention_at(ledger_id, now_ms()).await.map(Some)
+    }
+
     /// [`run_retention`](Self::run_retention) as of `now_ms` (epoch ms): due
     /// times are compared against it rather than the clock.
     pub async fn run_retention_at(&self, ledger_id: &str, now_ms: i64) -> Result<PassReport> {

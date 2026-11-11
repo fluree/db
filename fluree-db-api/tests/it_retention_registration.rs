@@ -108,6 +108,25 @@ async fn a_rebase_onto_a_registered_source_registers_the_branch() {
     assert!(registered(&fluree, dev).await);
 }
 
+/// A scheduled pass over a ledger that is not registered does nothing:
+/// it neither walks the commits nor registers the ledger, which is left to
+/// the build that first covers its retention input. Once registered, it
+/// runs.
+#[tokio::test]
+async fn a_registered_only_pass_skips_a_ledger_its_builds_have_not_registered() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/reg-scheduled:main";
+    fluree.create_ledger("it/reg-scheduled").await.unwrap();
+    insert(&fluree, id, lifetime("ex:a")).await;
+    assert!(fluree.run_registered_retention(id).await.unwrap().is_none());
+    assert!(!registered(&fluree, id).await);
+
+    fluree.build_index(id).await.expect("build");
+    assert!(registered(&fluree, id).await);
+    let report = fluree.run_registered_retention(id).await.unwrap();
+    assert!(report.is_some_and(|r| !r.inactive));
+}
+
 /// A ledger created again under a dropped one's name is registered for its
 /// own lifetimes.
 #[tokio::test]

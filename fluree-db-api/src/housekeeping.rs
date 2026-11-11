@@ -595,4 +595,20 @@ impl Fluree {
         }
         true
     }
+
+    /// Attach retention's build hook to this instance's background indexer,
+    /// with no worker: for a host with no process running between requests
+    /// (a function invoked per event), whose builds must still register a
+    /// ledger before an index covers its first TTL input, and apply its
+    /// `f:noHistory` rules. Expiration then runs through
+    /// [`run_registered_retention`](Self::run_registered_retention) on the
+    /// host's own schedule. A ledger that never used retention adds no
+    /// reads to its builds. Returns `false` without a background indexer.
+    pub fn install_retention_build_hook(self: &Arc<Self>) -> bool {
+        let crate::tx::IndexingMode::Background(handle) = &self.indexing_mode else {
+            return false;
+        };
+        handle.set_build_observer(self.retention_build_observer());
+        true
+    }
 }

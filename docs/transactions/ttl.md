@@ -169,6 +169,17 @@ Expiration is **best-effort and eventual**. A value disappears after its deadlin
 
 The server always runs one. A Rust application embedding Fluree runs one by calling `Fluree::start_maintenance(housekeeping, Some(retention_options))` on an instance with a background indexer. Without a background indexer, run passes yourself: `Fluree::run_retention(ledger_id)` registers the ledger if its commits carry retention input, then retracts what is due, and is meant to be called on a schedule, such as every 15 seconds (the server's default interval).
 
+### Hosts without a background process
+
+A host that runs only while handling a request, such as a function invoked per event, has no worker between requests. It runs retention in two parts:
+
+1. **Its index builds register ledgers.** Call `Fluree::install_retention_build_hook()` on the instance whose background indexer builds the ledgers' indexes. A build then registers a ledger before its index covers the first commit carrying TTL input, and applies the ledger's `f:noHistory` rules. A ledger that never used retention adds no reads to its builds.
+2. **A schedule runs the passes.** Invoke a function on a timer (every minute, for example) that calls `Fluree::run_registered_retention(ledger_id)` for each ledger. A ledger that is not registered costs one configuration read and is skipped. Values expire within about one interval of their deadline.
+
+Do not call `run_retention` on every ledger from a schedule: on a ledger that is not registered, it reads every commit back to the first, looking for retention input, each time it runs. Call it once for a ledger whose TTL input was indexed before the build hook was installed.
+
+Each invocation starts without the schedule in memory: it reads the persisted schedule, catches up from the commits after it, and saves it again when it changed. Two invocations racing are safe: expirations commit only against the head they were checked against, and the registration is updated with a compare-and-swap.
+
 Commits and annotations written before a ledger's first TTL-aware write are not treated as instructions, even if they happen to use `f:ttl`.
 
 ### Status
