@@ -40,7 +40,7 @@ use crate::ir::R2rmlPattern;
 use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::R2rmlPolicyGate;
-use crate::r2rml::ColumnBatchStream;
+use crate::r2rml::{ColumnBatchStream, ScanOrder};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{
@@ -460,6 +460,12 @@ pub struct R2rmlScanOperator {
     /// View-policy gate, built at open when a non-root policy is active. `None`
     /// = unfiltered scan (see `r2rml::policy`).
     policy_gate: Option<R2rmlPolicyGate>,
+    /// The row order the main table scan owes the query (see [`ScanOrder`]):
+    /// deterministic unless the planner set `Any` for a query with no slice.
+    /// Parent lookups always scan deterministically. Overridden to
+    /// deterministic at run time when the execution context requires it (see
+    /// [`ExecutionContext::deterministic_scans`]).
+    scan_order: ScanOrder,
     /// State
     state: OperatorState,
 }
@@ -540,7 +546,24 @@ impl R2rmlScanOperator {
             topk: None,
             consumed_filter,
             policy_gate: None,
+            scan_order: ScanOrder::Deterministic,
             state: OperatorState::Created,
+        }
+    }
+
+    /// Set the row order the main table scan owes the query (the planner's
+    /// [`PlanningContext::scan_order`](crate::temporal_mode::PlanningContext)).
+    pub fn with_scan_order(mut self, order: ScanOrder) -> Self {
+        self.scan_order = order;
+        self
+    }
+
+    /// The order the main table scan runs in under `ctx`.
+    fn main_scan_order(&self, ctx: &ExecutionContext<'_>) -> ScanOrder {
+        if ctx.deterministic_scans {
+            ScanOrder::Deterministic
+        } else {
+            self.scan_order
         }
     }
 
@@ -1114,28 +1137,31 @@ impl R2rmlScanOperator {
                 && self.row_budget.is_none()
                 && self.topk.is_none();
             let cache_key = (table_name.to_string(), projection.clone());
+            let scan_order = self.main_scan_order(ctx);
             let stream: ColumnBatchStream = if !cacheable {
                 table_provider
-                    .scan_table(
+                    .scan_table_ordered(
                         &self.pattern.graph_source_id,
                         table_name,
                         &projection,
                         &scan_filters,
                         main_scan_topk.as_ref(),
                         as_of_t,
+                        scan_order,
                     )
                     .await?
             } else if let Some(cached) = self.scan_cache.get(&cache_key) {
                 replay_stream(Arc::clone(cached))
             } else {
                 let fresh = table_provider
-                    .scan_table(
+                    .scan_table_ordered(
                         &self.pattern.graph_source_id,
                         table_name,
                         &projection,
                         &scan_filters,
                         main_scan_topk.as_ref(),
                         as_of_t,
+                        scan_order,
                     )
                     .await?;
                 match collect_scan_capped(fresh, materialize_window_rows(), ctx).await? {

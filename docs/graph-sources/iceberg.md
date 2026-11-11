@@ -593,6 +593,23 @@ ORDER BY DESC(?date)
 LIMIT 100
 ```
 
+### Row order and paging
+
+A query with no `ORDER BY` has no defined row order; SPARQL leaves it open. Over
+an Iceberg graph source:
+
+- A query with a `LIMIT` or `OFFSET` anywhere in it, sub-queries included, reads
+  the table's data files in a fixed order: smallest file first, ties in commit
+  order. Run again over the same snapshot, it returns the same rows in the same
+  order, so pages fetched with `LIMIT n OFFSET k×n` partition the answer: no row
+  is skipped or repeated. Subgraph crawls (`"select": {"?s": ["*"]}`) page their
+  subjects the same way.
+- A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
+  its row order can differ from one run to the next. The rows are the same.
+- Pages hold together only while the table does: an append or compaction between
+  two page requests changes the snapshot, and with it the order. For paging that
+  must survive table changes, order by a unique key (`ORDER BY ?id`).
+
 ## Materialization (into a native ledger)
 
 Querying a graph source reads the Iceberg table on the fly. Native Fluree

@@ -42,10 +42,11 @@ use fluree_db_iceberg::io::{ColumnBatch, SendIcebergStorage, SendParquetReader};
 use fluree_db_iceberg::metadata::TableMetadata;
 use fluree_db_iceberg::scan::{ScanConfig, SendScanPlanner};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanOrder,
+};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
-use futures::StreamExt;
 
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{build_preview_storage, catalog_client};
@@ -100,6 +101,7 @@ impl EphemeralR2rmlProvider {
         &self,
         table_name: &str,
         projection: &[String],
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // The engine passes the mapping's logical table name for every scan.
         let table_id = parse_table_identifier(table_name).map_err(|e| {
@@ -201,36 +203,29 @@ impl EphemeralR2rmlProvider {
         }
 
         // Read data files with bounded parallelism, streaming each file's batches
-        // to the operator as it completes (spawned so the stream is `Send + Sync`,
-        // matching the persisted scan's shape).
+        // to the operator in the order the query owes, as the persisted scan does.
         let storage = Arc::new(storage);
         let concurrency = tasks.len().clamp(1, 8);
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
+        Ok(super::r2rml::read_files_in_order(
+            tasks,
+            match order {
+                ScanOrder::Deterministic => super::r2rml::EmitOrder::SmallestFirst,
+                ScanOrder::Any => super::r2rml::EmitOrder::Completion,
+            },
+            concurrency,
+            move |task| {
                 let storage = Arc::clone(&storage);
                 async move {
-                    tokio::spawn(async move {
-                        let reader = SendParquetReader::new(storage.as_ref());
-                        reader.read_task(&task).await.map_err(|e| {
-                            QueryError::Internal(format!(
-                                "Failed to read Parquet file '{}': {e}",
-                                task.data_file.file_path
-                            ))
-                        })
+                    let reader = SendParquetReader::new(storage.as_ref());
+                    reader.read_task(&task).await.map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read Parquet file '{}': {e}",
+                            task.data_file.file_path
+                        ))
                     })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
                 }
-            })
-            .buffer_unordered(concurrency)
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
-                }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-
-        Ok(Box::pin(stream))
+            },
+        ))
     }
 }
 
@@ -261,7 +256,22 @@ impl R2rmlTableProvider for EphemeralR2rmlProvider {
         _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
-        self.scan_provisional_table(table_name, projection).await
+        self.scan_provisional_table(table_name, projection, ScanOrder::Deterministic)
+            .await
+    }
+
+    async fn scan_table_ordered(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
+        _as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scan_provisional_table(table_name, projection, order)
+            .await
     }
 }
 
@@ -343,8 +353,6 @@ impl crate::Fluree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use async_trait::async_trait;
     use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
     use fluree_db_query::error::Result as QResult;
@@ -354,6 +362,7 @@ mod tests {
     use fluree_db_r2rml::mapping::{
         CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
     };
+    use futures::StreamExt;
     use std::collections::HashMap;
     use std::sync::Arc;
 

@@ -3807,6 +3807,7 @@ dependencies = [
  "fluree-graph-ir",
  "fluree-graph-turtle",
  "fluree-vocab",
+ "indexmap 2.13.0",
  "once_cell",
  "regex",
  "serde",

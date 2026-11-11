@@ -18,6 +18,9 @@
 //! - `people_window` — the same five appends with every snapshot RETAINED: a
 //!   healthy source that got ahead of its job, so the window resolves and is
 //!   read incrementally, and is too large to commit in one pass.
+//! - `people_paged` — the same five appends again, read only by the paging
+//!   test, which slows one of its data files by name; a table of its own keeps
+//!   that file name out of every other test's reads.
 //! - `amounts` — decimal columns for FILTER pushdown: `ratio` is `decimal(38,9)`
 //!   (BigQuery's `NUMERIC`) with values one grid step either side of 0.05 and
 //!   1.05; `price` is `decimal(5,2)`, too narrow to hold a literal like 1000.
@@ -37,6 +40,7 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/people fluree-db-api/tests/fixtures/iceberg/silver/people
 //! cp -r /tmp/fluree-local-iceberg/silver/people_backlog fluree-db-api/tests/fixtures/iceberg/silver/people_backlog
 //! cp -r /tmp/fluree-local-iceberg/silver/people_window fluree-db-api/tests/fixtures/iceberg/silver/people_window
+//! cp -r /tmp/fluree-local-iceberg/silver/people_paged fluree-db-api/tests/fixtures/iceberg/silver/people_paged
 //! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
 //! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
 //! ```
@@ -3246,4 +3250,272 @@ async fn a_materialize_read_before_a_rename_keeps_the_renamed_column() {
         .expect("pinned materialize read");
     let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
     assert_eq!(names_of(&batches), early, "pinned stream");
+}
+
+/// An unsliced answer holds every person once, and (streamed in completion
+/// order) the slowed first file's 600 persons last.
+fn assert_unsliced_in_completion_order(rows: &[i64], fixed_order: &[i64], surface: &str) {
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        (1..=3000).collect::<Vec<i64>>(),
+        "{surface}: unsliced, every person once"
+    );
+    let mut slowed = fixed_order[..600].to_vec();
+    slowed.sort_unstable();
+    let mut tail = rows[rows.len() - 600..].to_vec();
+    tail.sort_unstable();
+    assert_eq!(
+        tail, slowed,
+        "{surface}: unsliced, the slowed file's rows come last (completion order)"
+    );
+}
+
+/// The person number at the end of a subject IRI, compacted or not
+/// (`…/person/17` and `ex:person/17` both give 17).
+fn person_number(iri: &str) -> i64 {
+    iri.rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("not a person IRI: {iri}"))
+}
+
+/// A client paging an unordered graph-source query with LIMIT/OFFSET (no ORDER
+/// BY) sees the pages partition the answer: one execution after another, a
+/// sliced query emits the table's files smallest first (ties in commit order),
+/// whatever order the file reads finish in.
+///
+/// `people_paged` is five 600-row commits, one data file each, ids ascending
+/// in commit order, so the deterministic order is each commit's persons in
+/// order, the commits taken by data-file size. The first file in that order is
+/// read 200 ms late (the debug-build hook `FLUREE_DEBUG_ICEBERG_SLOW_READ`), so
+/// every other read finishes before it: emitted in completion order, its rows
+/// would come last.
+///
+/// A query with no slice cannot observe its order, so it streams files as
+/// their reads finish, and the slowed file's rows do come last there. A crawl
+/// pages subjects itself (an OFFSET with no LIMIT reaches its flat query as no
+/// slice), so it asks for the deterministic order explicitly. The materialize
+/// read keeps commit order, persons 1..=3000.
+#[tokio::test]
+async fn unordered_pages_partition_a_multi_file_answer() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+
+    // Each commit's data file, in commit order: the snapshot with sequence
+    // number n names its manifest list `snap-<id>-<n>-<uuid>.avro`, and
+    // pyiceberg names that commit's data file `<…>-<uuid>.parquet`.
+    let metadata_dir = table_dir.join("metadata");
+    let mut metadata_files: Vec<std::path::PathBuf> = std::fs::read_dir(&metadata_dir)
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    metadata_files.sort();
+    let final_meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(metadata_files.last().expect("metadata files")).expect("read metadata"),
+    )
+    .expect("parse metadata");
+    let mut snapshots: Vec<&serde_json::Value> = final_meta["snapshots"]
+        .as_array()
+        .expect("snapshots")
+        .iter()
+        .collect();
+    snapshots.sort_by_key(|s| s["sequence-number"].as_i64().expect("sequence"));
+    let data_files: Vec<std::path::PathBuf> = std::fs::read_dir(table_dir.join("data"))
+        .expect("data dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    let commit_files: Vec<(String, u64)> = snapshots
+        .iter()
+        .map(|snapshot| {
+            let manifest_list = snapshot["manifest-list"].as_str().expect("manifest list");
+            let uuid = manifest_list
+                .trim_end_matches(".avro")
+                .rsplit('-')
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("-");
+            let file = data_files
+                .iter()
+                .find(|p| p.to_string_lossy().ends_with(&format!("{uuid}.parquet")))
+                .unwrap_or_else(|| panic!("no data file for {uuid}"));
+            let name = file
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string();
+            (name, std::fs::metadata(file).expect("file size").len())
+        })
+        .collect();
+    assert_eq!(commit_files.len(), 5, "five commits: {commit_files:?}");
+    // The query's emit order: commits by data-file size, ties in commit order
+    // (a stable sort over commit order).
+    let mut by_size: Vec<usize> = (0..commit_files.len()).collect();
+    by_size.sort_by_key(|&c| commit_files[c].1);
+    assert_ne!(
+        by_size,
+        (0..commit_files.len()).collect::<Vec<_>>(),
+        "the fixture's sizes must not already be in commit order, or size order and commit \
+         order are indistinguishable: {commit_files:?}"
+    );
+    let everyone: Vec<i64> = by_size
+        .iter()
+        .flat_map(|&c| {
+            let lo = i64::try_from(c).expect("commit") * 600 + 1;
+            lo..lo + 600
+        })
+        .collect();
+    let first_file = commit_files[by_size[0]].0.clone();
+    // The hook matches the path the manifest records (the table's original
+    // location, which the staged copy is remapped from), so it names the file
+    // by its name. No other test reads `people_paged`, so no other test's read
+    // matches; the hook reads the variable on every read, and the guard clears
+    // it when this test ends, pass or fail.
+    struct SlowRead;
+    impl Drop for SlowRead {
+        fn drop(&mut self) {
+            std::env::remove_var("FLUREE_DEBUG_ICEBERG_SLOW_READ");
+        }
+    }
+    std::env::set_var("FLUREE_DEBUG_ICEBERG_SLOW_READ", &first_file);
+    let _slow_read = SlowRead;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
+    let location = format!("file://{}", table_dir.display());
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("paged", &location, &mapping)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let fluree = &fluree;
+    const PAGE: usize = 500;
+
+    // SPARQL.
+    let sparql = |page: Option<usize>| async move {
+        let paging = page.map_or(String::new(), |k| {
+            format!(" LIMIT {PAGE} OFFSET {}", k * PAGE)
+        });
+        let rows = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s FROM <paged:main> WHERE {{ ?s <http://example.org/name> ?n }}{paging}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL page {page:?}: {e}"));
+        rows["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings: {rows}"))
+            .iter()
+            .map(|b| person_number(b["s"]["value"].as_str().expect("an IRI")))
+            .collect::<Vec<i64>>()
+    };
+    let pages = || async {
+        let mut paged = Vec::new();
+        for k in 0..everyone.len().div_ceil(PAGE) {
+            paged.extend(sparql(Some(k)).await);
+        }
+        paged
+    };
+    assert_eq!(
+        pages().await,
+        everyone,
+        "SPARQL: the pages partition the answer"
+    );
+    assert_eq!(pages().await, everyone, "SPARQL: a second run agrees");
+    let unsliced = sparql(None).await;
+    assert_unsliced_in_completion_order(&unsliced, &everyone, "SPARQL");
+
+    // JSON-LD.
+    let jsonld = |page: Option<usize>| async move {
+        let mut query = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "paged:main",
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:name": "?n"},
+        });
+        if let Some(k) = page {
+            query["limit"] = serde_json::json!(PAGE);
+            query["offset"] = serde_json::json!(k * PAGE);
+        }
+        let rows = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD page {page:?}: {e}"));
+        rows.as_array()
+            .unwrap_or_else(|| panic!("rows: {rows}"))
+            .iter()
+            .map(|row| {
+                let s = row.as_array().map_or(row, |r| &r[0]);
+                person_number(s.as_str().expect("an IRI"))
+            })
+            .collect::<Vec<i64>>()
+    };
+    let mut paged = Vec::new();
+    for k in 0..everyone.len().div_ceil(PAGE) {
+        paged.extend(jsonld(Some(k)).await);
+    }
+    assert_eq!(paged, everyone, "JSON-LD: the pages partition the answer");
+    let unsliced = jsonld(None).await;
+    assert_unsliced_in_completion_order(&unsliced, &everyone, "JSON-LD");
+
+    // A crawl with an OFFSET and no LIMIT: the subjects after the first 2,900
+    // in the deterministic order.
+    let crawl = fluree
+        .query_from()
+        .jsonld(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "paged:main",
+            "select": {"?s": ["@id"]},
+            "where": {"@id": "?s", "ex:name": "?n"},
+            "offset": 2900,
+        }))
+        .execute_formatted()
+        .await
+        .expect("crawl");
+    let crawled: Vec<i64> = crawl
+        .as_array()
+        .unwrap_or_else(|| panic!("a crawl answers an array: {crawl}"))
+        .iter()
+        .map(|doc| person_number(doc["@id"].as_str().expect("an @id")))
+        .collect();
+    assert_eq!(
+        crawled,
+        everyone[2900..],
+        "crawl: OFFSET in the fixed order"
+    );
+
+    // The materialize read streams the same files the same way.
+    let scan = FlureeR2rmlProvider::new(fluree)
+        .scan_for_materialize_stream("paged:main", "silver.people_paged", &[], None, None, None)
+        .await
+        .expect("materialize read");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = b.column_by_name("id").expect("an id column");
+            (0..b.num_rows)
+                .map(|i| ids.get_i64(i).expect("an id"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=3000).collect::<Vec<i64>>(),
+        "materialize read: commit order"
+    );
 }

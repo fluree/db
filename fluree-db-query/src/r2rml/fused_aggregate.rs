@@ -1416,6 +1416,11 @@ pub struct FusedR2rmlAggregateOperator {
     /// K≥2 or ≥2-ref shape declines to the generic pipeline. Rides ON TOP of `multifact`
     /// and `FLUREE_FUSED_R2RML_AGG_JOIN`, which remain independently killable underneath.
     multifact_gen: bool,
+    /// The row order the folded table scan owes the query (see
+    /// [`crate::r2rml::ScanOrder`]): deterministic unless the planner set `Any`
+    /// for a query with no slice, and deterministic whenever the execution
+    /// context requires it.
+    scan_order: crate::r2rml::ScanOrder,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1448,7 +1453,15 @@ impl FusedR2rmlAggregateOperator {
             output_bound: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"),
             multifact: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"),
             multifact_gen: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN"),
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
+    }
+
+    /// Set the row order the folded table scan owes the query (the planner's
+    /// `PlanningContext::scan_order`).
+    pub fn with_scan_order(mut self, order: crate::r2rml::ScanOrder) -> Self {
+        self.scan_order = order;
+        self
     }
 
     /// Resolve the predicate IRI a pattern object variable is bound by.
@@ -1873,14 +1886,20 @@ impl Operator for FusedR2rmlAggregateOperator {
             }
         }
 
+        let scan_order = if ctx.deterministic_scans {
+            crate::r2rml::ScanOrder::Deterministic
+        } else {
+            self.scan_order
+        };
         let mut stream = table_provider
-            .scan_table(
+            .scan_table_ordered(
                 &resolved.pattern.graph_source_id,
                 &resolved.table_name,
                 &resolved.projection,
                 &resolved.scan_filters,
                 None,
                 as_of_t,
+                scan_order,
             )
             .await?;
 
