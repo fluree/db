@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
-use fluree_db_binary_index::dict::DictTreeReader;
+use fluree_db_binary_index::dict::{DictTreeReader, TermDictReader};
 use fluree_db_binary_index::format::index_root::NamedGraphRouting;
 use fluree_db_binary_index::{BinaryIndexStore, IndexRoot};
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, Storage};
@@ -70,12 +70,32 @@ pub(crate) struct GraphImportSeed {
     pub string_tree: Arc<DictTreeReader>,
     /// `base_root`'s index, which names existing subjects (class stats).
     pub base_store: Arc<BinaryIndexStore>,
+    /// `base_root`'s triple-term dictionary, which the import's terms are
+    /// looked up in, if it has one.
+    pub base_terms: Option<Arc<TermDictReader>>,
     /// Reads the ledger's artifacts — those it inherits from a parent
     /// branch included — and writes new ones.
     pub content_store: Arc<dyn ContentStore>,
 }
 
 impl GraphImportSeed {
+    /// Annotations indexed before they were stored as links leave no term
+    /// dictionary for an import's triple terms to extend. A source without
+    /// any imports as it would into any other ledger.
+    pub(crate) fn refuse_terms_without_links(
+        &self,
+        imports_terms: bool,
+    ) -> Result<(), ImportError> {
+        if imports_terms && self.base_root.has_annotations && self.base_root.term_dict.is_none() {
+            return Err(ImportError::Refused(format!(
+                "{}'s index predates its annotations' links; reindex it before importing \
+                 annotations or triple terms into one of its graphs",
+                self.base_root.ledger_id
+            )));
+        }
+        Ok(())
+    }
+
     /// The ledger's graphs, IRI → g_id, less a dropped graph the import
     /// refills: the import's commits register that one again.
     pub(crate) fn graph_ids(&self) -> HashMap<String, fluree_db_core::GraphId> {
@@ -125,6 +145,10 @@ pub(crate) struct GraphBuild<'a> {
         Option<fluree_db_indexer::stats::SpotClassStats>,
     )>,
     pub dicts: SeededDicts,
+    /// The terms the import added to the ledger's triple-term dictionary, as
+    /// `(inner p_id, seq, key bytes)`, and the dictionary's watermarks after.
+    pub new_terms: Vec<(u32, u32, Vec<u8>)>,
+    pub term_watermarks: Vec<(u32, u32)>,
     pub namespace_codes: &'a HashMap<u16, String>,
     pub language_tags: Vec<String>,
     /// The import's commit metadata: the meta chunk, remapped like any other.
@@ -139,8 +163,7 @@ pub(crate) struct GraphBuild<'a> {
 pub(crate) struct SplicedIndex {
     pub root_id: ContentId,
     pub index_t: i64,
-    /// Whether the graph holds statement annotations, which leaves the
-    /// ledger without an annotation arena until a reindex.
+    /// Whether the graph holds statement annotations.
     pub has_annotations: bool,
 }
 
@@ -238,6 +261,21 @@ pub(crate) async fn splice_graph_into_index(
         &namespace_codes,
     );
 
+    // The graph's live links per inner predicate, unknown without its stats.
+    let graph_links = graph.stats.as_ref().map(|(id_stats, _)| {
+        let reifies = fluree_db_core::rdf_reifies_sid();
+        let reifies_p_id = predicate_sids
+            .iter()
+            .position(|(ns, name)| *ns == reifies.namespace_code && *name == *reifies.name)
+            .map(|p_id| p_id as u32);
+        fluree_db_indexer::stats::link_stat_entries(&id_stats.term_rows, reifies_p_id, |p_id| {
+            predicate_sids
+                .get(p_id as usize)
+                .cloned()
+                .unwrap_or((0, String::new()))
+        })
+    });
+
     let mut root = base.clone();
     if seed.refills {
         // What the drop left of the graph — the arenas a purge keeps — goes,
@@ -271,7 +309,7 @@ pub(crate) async fn splice_graph_into_index(
     if dicts.needs_wide {
         root.subject_id_encoding = fluree_db_core::SubjectIdEncoding::Wide;
     }
-    root.has_annotations |= (0..predicate_sids.len() as u32).any(is_reifies);
+    root.has_annotations |= annotated;
     root.namespace_codes = namespace_codes;
     root.predicate_sids = predicate_sids;
     root.graph_iris = dicts.graph_iris;
@@ -296,14 +334,25 @@ pub(crate) async fn splice_graph_into_index(
         merged.graphs = Some(graphs);
         root.stats = Some(merged);
     }
+    if let Some(stats) = root.stats.as_mut() {
+        stats.links = match (stats.links.take(), graph_links) {
+            (Some(mut links), Some(added)) => {
+                for entry in added {
+                    match links.iter_mut().find(|l| l.sid == entry.sid) {
+                        Some(known) => known.count += entry.count,
+                        None => links.push(entry),
+                    }
+                }
+                links.sort_by(|a, b| a.sid.cmp(&b.sid));
+                Some(links)
+            }
+            (links, _) if !annotated => links,
+            _ => None,
+        };
+    }
 
     // ---- txn-meta, through the incremental indexer ----
     let records = txn_meta_records(&graph.txn_meta).map_err(ImportError::Io)?;
-    let term_watermarks = root
-        .term_dict
-        .as_ref()
-        .map(|r| r.watermarks.clone())
-        .unwrap_or_default();
     let shared = SharedResolverState::from_index_root(&root, &root.ledger_id)
         .map_err(|e| ImportError::IndexBuild(format!("spliced root dictionaries: {e}")))?;
     let novelty = IncrementalNovelty {
@@ -324,8 +373,8 @@ pub(crate) async fn splice_graph_into_index(
         base_vector_counts: HashMap::new(),
         base_numbig_counts: HashMap::new(),
         fulltext_string_bytes: HashMap::new(),
-        new_terms: Vec::new(),
-        term_watermarks: term_watermarks.clone(),
+        new_terms: graph.new_terms,
+        term_watermarks: graph.term_watermarks,
         purged_graphs: Vec::new(),
         purged_cids: Vec::new(),
     };
@@ -840,6 +889,14 @@ async fn load_seed(
         BinaryIndexStore::load_from_root_v6(Arc::clone(&content_store), &base_root, None)
             .await
             .map_err(storage_error)?;
+    let base_terms = match &base_root.term_dict {
+        Some(refs) => Some(Arc::new(
+            TermDictReader::from_refs_reusing(Arc::clone(&content_store), refs, None, None)
+                .await
+                .map_err(storage_error)?,
+        )),
+        None => None,
+    };
 
     Ok(GraphImportSeed {
         graph_iri,
@@ -856,6 +913,7 @@ async fn load_seed(
         subject_tree: Arc::new(subject_tree),
         string_tree: Arc::new(string_tree),
         base_store: Arc::new(base_store),
+        base_terms,
         content_store,
     })
 }

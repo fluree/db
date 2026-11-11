@@ -2311,6 +2311,10 @@ pub mod config_iris {
     /// `f:shapesSource` — GraphRef pointing to SHACL shapes graph
     pub const SHAPES_SOURCE: &str = "https://ns.flur.ee/db#shapesSource";
 
+    /// `f:additionalDataSource` — GraphRef (repeatable) to a graph read with
+    /// each validated graph when SHACL checks its nodes
+    pub const ADDITIONAL_DATA_SOURCE: &str = "https://ns.flur.ee/db#additionalDataSource";
+
     /// `f:validationMode` — IRI: f:ValidationReject or f:ValidationWarn
     pub const VALIDATION_MODE: &str = "https://ns.flur.ee/db#validationMode";
 

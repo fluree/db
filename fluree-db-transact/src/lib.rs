@@ -102,8 +102,8 @@ pub use parse::{
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{
-    generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions,
-    DELETE_WITNESSED_SITE,
+    drop_needs_unrestricted_identity, generate_txn_id, stage, stage_flakes, stage_with_graph_delta,
+    StageOptions, DELETE_WITNESSED_SITE,
 };
 pub use staged_dicts::{
     attach_binary_provider, attach_staged_dicts, detach_binary_provider, graphs_to_hide,

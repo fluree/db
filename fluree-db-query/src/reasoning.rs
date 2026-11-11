@@ -78,6 +78,25 @@ impl OverlayProvider for ReasoningOverlay<'_> {
         self.content_version
     }
 
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // The base's whole-graph count bounds its range count.
+        let base = self
+            .base
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+            .or_else(|| self.base.overlay_flake_count(g_id))?;
+        let derived = self
+            .derived
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)?;
+        Some(base + derived)
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

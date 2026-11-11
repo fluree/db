@@ -165,8 +165,12 @@ struct ActiveJob {
 }
 
 impl ActiveJob {
+    /// A terminal state is published only after its record is written, and
+    /// the task does nothing after that but return, so the job is over as
+    /// soon as its state leaves `Running`.
     fn is_running(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
+            && self.progress.read().state == KeyRotationState::Running
     }
 }
 
@@ -717,19 +721,20 @@ async fn run_sweep(
     let mut since_checkpoint = 0u64;
     let mut last_checkpoint = Instant::now();
 
-    // Checkpoint: publish to the in-process view and, for a real run, to storage.
+    // Checkpoint: write the record (for a real run), then publish to the
+    // in-process view, which must never be ahead of the record.
     async fn checkpoint(
         storage: &Arc<dyn Storage>,
         shared: &parking_lot::RwLock<KeyRotationProgress>,
         progress: &mut KeyRotationProgress,
     ) {
         progress.updated_at = now_secs();
-        *shared.write() = progress.clone();
         if !progress.dry_run {
             if let Err(e) = write_record(storage, progress).await {
                 tracing::warn!(%e, "key rotation: failed to checkpoint progress record");
             }
         }
+        *shared.write() = progress.clone();
     }
 
     // Units before the last one finished were finished too, or are new
@@ -780,12 +785,12 @@ async fn run_sweep(
                 // Clear the heartbeat after the checkpoint so the record is
                 // stale to the next holder without losing the cursor.
                 progress.updated_at = 0;
-                *shared.write() = progress.clone();
                 if !dry_run {
                     if let Err(e) = write_record(&storage, &progress).await {
                         tracing::warn!(%e, "key rotation: failed to release progress record");
                     }
                 }
+                *shared.write() = progress.clone();
                 return;
             }
 
