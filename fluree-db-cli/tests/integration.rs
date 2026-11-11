@@ -7016,7 +7016,28 @@ fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
                 log.push(request);
                 log.len() - 1
             };
-            let payload = answers[n.min(answers.len() - 1)].to_string();
+            let answer = &answers[n.min(answers.len() - 1)];
+            // `{"__status": 429, "__headers": ["Retry-After: 3600"], "body": …}`
+            // answers that status, with those headers, instead.
+            if let Some(status) = answer.get("__status").and_then(serde_json::Value::as_u64) {
+                let payload = answer["body"].to_string();
+                let headers: String = answer["__headers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|h| format!("{h}\r\n"))
+                    .collect();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+                continue;
+            }
+            let payload = answer.to_string();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nX-Fluree-Serialized-Tokens: 1032\r\nX-Fluree-Ontology-Not-Shown: rdfs:domain=1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -7579,4 +7600,45 @@ fn doc_ingest_reader_sends_nothing_for_a_document_with_no_text() {
         .assert()
         .success();
     assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+/// A reader that asks for a wait past what a call waits (an account over a
+/// quota) ends an ingest at that document, with one error that says how
+/// long: every document after it would be refused the same way, so none of
+/// them is sent, and nothing is resent.
+#[test]
+fn doc_ingest_stops_when_the_reader_asks_to_wait_past_the_cap() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    for copy in ["docs/memo-2.md", "docs/memo-3.md"] {
+        std::fs::copy(tmp.path().join("docs/memo.md"), tmp.path().join(copy)).unwrap();
+    }
+    let (url, seen) = spawn_stub_reader(vec![serde_json::json!({
+        "__status": 429,
+        "__headers": ["Retry-After: 3600"],
+        "body": { "error": { "message": "Monthly quota reached", "status": 429, "error": "quota_exceeded" } }
+    })]);
+    let out = fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "docs", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "leaving 2 document(s) unread that would fail the same way",
+        ))
+        .stderr(predicate::str::contains(
+            "429 quota_exceeded: Monthly quota reached",
+        ))
+        .stderr(predicate::str::contains("the reader asks to wait 3600s"))
+        .stderr(predicate::str::contains(
+            "hint: the reader refuses every call for about 60 min",
+        ))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches('✗').count(), 1, "{stdout}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }

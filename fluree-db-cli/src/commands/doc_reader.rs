@@ -12,7 +12,7 @@ use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_doc::reader::{Credential, Read, ReaderClient, Session, CACHE_MODES};
-use fluree_db_doc::{DocCache, PreparedDocument, ReaderEndpoint};
+use fluree_db_doc::{DocCache, DocError, PreparedDocument, ReaderEndpoint};
 
 /// What every document of a run is read with, and what the run reports
 /// about its catalog.
@@ -62,16 +62,59 @@ pub async fn setup(
     })
 }
 
+/// Why a document's read failed, and so whether a run of several goes on.
+/// `doc ingest` keeps one rule for every failure: one of this document
+/// marks it ✗ and the next document is read; one that every remaining
+/// document is sure to meet too ends the run with a single message, rather
+/// than a ✗ (and a refused call) for each.
+pub enum ReadFailure {
+    /// This document's own: a refused or bad answer, a reading that won't
+    /// parse.
+    Document(CliError),
+    /// One the next document would meet too (see [`read_document`]).
+    Run(CliError),
+}
+
+impl From<ReadFailure> for CliError {
+    fn from(failure: ReadFailure) -> Self {
+        match failure {
+            ReadFailure::Document(e) | ReadFailure::Run(e) => e,
+        }
+    }
+}
+
 /// Read one parsed document, saying each wait for capacity on stderr.
 /// Blocking, so run it on a blocking thread.
+///
+/// A reader that asks for a wait past what a call waits
+/// ([`DocError::Unavailable`], such as an account over a quota) ends the run
+/// ([`ReadFailure::Run`]): it refuses every call until the wait is over.
 pub fn read_document(
     setup: &ReaderSetup,
     doc: &PreparedDocument,
     requests_to: Option<&std::path::Path>,
-) -> CliResult<Read> {
-    Ok(setup.session.read(doc, requests_to, &|wait| {
-        eprintln!("    {} {wait}", "…".dimmed());
-    })?)
+) -> Result<Read, ReadFailure> {
+    setup
+        .session
+        .read(doc, requests_to, &|wait| {
+            eprintln!("    {} {wait}", "…".dimmed());
+        })
+        .map_err(|e| match e {
+            DocError::Unavailable { wait, .. } => ReadFailure::Run(CliError::Remote(format!(
+                "{e}\n  hint: the reader refuses every call for about {}; try again after that",
+                about(wait)
+            ))),
+            e => ReadFailure::Document(e.into()),
+        })
+}
+
+/// A wait as a person would say it: seconds, minutes or hours.
+fn about(wait: std::time::Duration) -> String {
+    match wait.as_secs() {
+        s @ 0..120 => format!("{s}s"),
+        s @ 120..7_200 => format!("{} min", s.div_ceil(60)),
+        s => format!("{} h", s.div_ceil(3_600)),
+    }
 }
 
 /// What reading a document would take, with nothing sent (`--dry-run`):

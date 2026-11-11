@@ -704,8 +704,11 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     let mut dimensions: Option<usize> = None;
     let parser_revision = fluree_db_doc::parse::DOC_PARSE_REV.to_string();
     let chunking = format!("{}/{}", args.min_chars, args.max_chars);
+    // A failure every remaining document would meet too: the run stops at
+    // it, and says so once, after what it did is indexed and totalled.
+    let mut stopped: Option<CliError> = None;
 
-    for (path, relative) in &inputs {
+    for (n, (path, relative)) in inputs.iter().enumerate() {
         let label = relative.as_str();
 
         // Skip what the ledger already holds from these same inputs, unless told otherwise.
@@ -816,10 +819,16 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
                     match read {
                         Ok(read) => (doc, Some(read_extracted(read, reader_relations))),
-                        Err(e) => {
+                        Err(doc_reader::ReadFailure::Document(e)) => {
                             println!("  {} {label}  reading: {e}", "✗".red());
                             totals.failed += 1;
                             continue;
+                        }
+                        Err(doc_reader::ReadFailure::Run(e)) => {
+                            println!("  {} {label}  reading: the run stops here", "✗".red());
+                            totals.failed += 1;
+                            stopped = Some(run_stopped(e, label, inputs.len() - n - 1));
+                            break;
                         }
                     }
                 }
@@ -1169,10 +1178,26 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             totals.unescalated
         );
     }
+    if let Some(e) = stopped {
+        return Err(e);
+    }
     if totals.failed > 0 {
         return Err(CliError::ExitCode(1));
     }
     Ok(())
+}
+
+/// The error a run ends with when a document's failure is one every
+/// remaining document would meet too: what failed, where the run stopped,
+/// and what it left unread. What was read before it is kept.
+fn run_stopped(e: CliError, label: &str, left: usize) -> CliError {
+    let context = match left {
+        0 => label.to_string(),
+        n => format!(
+            "the run stopped at {label}, leaving {n} document(s) unread that would fail the same way"
+        ),
+    };
+    e.context(context)
 }
 
 fn announce(

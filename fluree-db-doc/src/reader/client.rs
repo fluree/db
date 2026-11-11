@@ -20,6 +20,8 @@
 //! A resend waits the time the endpoint names, never less. Waiting is capped
 //! at [`MAX_WAIT`] across a call's resends, and attempts at [`ATTEMPTS`]: a
 //! wait that would pass the cap fails at once, naming the wait asked for.
+//! One that passes it on its own is [`DocError::Unavailable`], since every
+//! call is refused until it is over, and a caller with more to read stops.
 //! Every wait is reported through the caller's `on_wait`, so a model
 //! starting from cold shows as waiting rather than as a hang.
 
@@ -276,6 +278,25 @@ impl ReaderClient {
             // The wait the endpoint names, never cut short: a resend before
             // it is sure to be refused again.
             let wait = Duration::from_secs(secs.max(1));
+            let past_the_cap = || {
+                format!(
+                    "{message}; the reader asks to wait {}s, and a call waits at most {}s in all \
+                     ({}s so far), so it is not resent",
+                    wait.as_secs(),
+                    MAX_WAIT.as_secs(),
+                    waited.as_secs()
+                )
+            };
+            // A wait past the cap on its own holds for every call until it
+            // is over (an account over a quota), not for this one alone.
+            if wait > MAX_WAIT {
+                return Err(DocError::Unavailable {
+                    model: model.to_string(),
+                    status,
+                    wait,
+                    message: past_the_cap(),
+                });
+            }
             if attempt >= ATTEMPTS {
                 return Err(refused(format!(
                     "still refused after {ATTEMPTS} attempts and {}s of waiting: {message}",
@@ -283,13 +304,7 @@ impl ReaderClient {
                 )));
             }
             if waited + wait > MAX_WAIT {
-                return Err(refused(format!(
-                    "{message}; the reader asks to wait {}s, and a call waits at most {}s in all \
-                     ({}s so far), so it is not resent",
-                    wait.as_secs(),
-                    MAX_WAIT.as_secs(),
-                    waited.as_secs()
-                )));
+                return Err(refused(past_the_cap()));
             }
             on_wait(&format!(
                 "{model}: {message}; trying again in {}s (attempt {} of {ATTEMPTS})",
@@ -529,10 +544,15 @@ mod tests {
     }
 
     /// A wait longer than a call may wait in all fails at once, saying the
-    /// wait asked for; it is never resent early.
+    /// wait asked for; it is never resent early. It is told apart
+    /// ([`DocError::Unavailable`], with the wait), since every call meets
+    /// it until the wait is over.
     #[test]
     fn a_wait_past_the_cap_is_not_resent() {
-        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+        for (status, code) in [
+            ("429 Too Many Requests", 429),
+            ("503 Service Unavailable", 503),
+        ] {
             let (url, seen) = stub(vec![http(status, &["Retry-After: 301"], "slow down")]);
             let err = ReaderClient::new(&endpoint(&url))
                 .with_sleep(|_| panic!("no wait expected"))
@@ -542,6 +562,12 @@ mod tests {
             let text = err.to_string();
             assert!(text.contains("asks to wait 301s"), "{text}");
             assert!(text.contains("at most 300s in all (0s so far)"), "{text}");
+            match err {
+                DocError::Unavailable { status, wait, .. } => {
+                    assert_eq!((status, wait), (code, Duration::from_secs(301)));
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 
@@ -582,6 +608,12 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("asks to wait 120s"), "{text}");
         assert!(text.contains("(240s so far)"), "{text}");
+        // This call's waits ran out, but the next call's start afresh: the
+        // endpoint isn't refusing every call.
+        assert!(
+            matches!(err, DocError::Endpoint { status: 503, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
