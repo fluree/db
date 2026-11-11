@@ -107,6 +107,13 @@ fn on_class_property(class: &str, property: &str) -> Value {
     })
 }
 
+/// A fake SQL endpoint table: `(name, columns, rows)`.
+type Table = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    Vec<Vec<Value>>,
+);
+
 /// A graph source over the fixtures, with the triples its mapping defines.
 struct Source {
     alias: String,
@@ -116,18 +123,10 @@ struct Source {
     graph: Vec<Value>,
     /// The fake SQL endpoint's tables: `(name, columns, rows)`.
     #[allow(dead_code)]
-    tables: Vec<(
-        &'static str,
-        Vec<(&'static str, &'static str)>,
-        Vec<Vec<Value>>,
-    )>,
+    tables: Vec<Table>,
 }
 
-fn people_table() -> (
-    &'static str,
-    Vec<(&'static str, &'static str)>,
-    Vec<Vec<Value>>,
-) {
+fn people_table() -> Table {
     (
         "silver.people",
         vec![("id", "bigint"), ("name", "varchar")],
@@ -545,7 +544,7 @@ async fn a_subject_two_maps_mint_holds_both_maps_classes() {
     };
     let mut graph = Vec::new();
     for (class, rows) in [("Customer", &US), ("Restricted", &EU)] {
-        for (id, name, _) in rows.iter() {
+        for (id, name, _) in rows {
             graph.push(json!({
                 "@id": ex(&format!("customer/{id}")),
                 "@type": ex(class),

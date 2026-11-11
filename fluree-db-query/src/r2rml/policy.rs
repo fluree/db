@@ -103,6 +103,9 @@ pub(crate) struct R2rmlPolicyGate {
     /// Final decisions, by map, triple and the row's classes, for
     /// subject-independent policies.
     decision_cache: HashMap<(String, String, Vec<String>), bool>,
+    /// Policy evaluations run (tests read it).
+    #[cfg(test)]
+    evaluations: std::sync::atomic::AtomicUsize,
 }
 
 /// The most classes beyond a row's own that a decision is enumerated over
@@ -491,6 +494,8 @@ impl R2rmlPolicyGate {
             enumerate,
             graph_source_id: graph_source_id.to_string(),
             decision_cache: HashMap::new(),
+            #[cfg(test)]
+            evaluations: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -1004,6 +1009,9 @@ impl R2rmlPolicyGate {
         object: Option<&str>,
         classes: &[Sid],
     ) -> Result<bool> {
+        #[cfg(test)]
+        self.evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapshot = self.encoder.as_ref().unwrap_or(ctx.active_snapshot);
         let subject_sid = match (self.per_subject, subject) {
             (true, Some(iri)) => encode(snapshot, iri),
@@ -1342,6 +1350,163 @@ mod tests {
             ),
             (vec![], vec![]),
             "a subject one row's shows its derived classes"
+        );
+    }
+
+    /// A gate over `mapping` for one view restriction.
+    fn gate_for(
+        mapping: &CompiledR2rmlMapping,
+        restriction: fluree_db_policy::PolicyRestriction,
+        default_allow: bool,
+    ) -> R2rmlPolicyGate {
+        use crate::policy::QueryPolicyEnforcer;
+        use std::sync::Arc;
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let view = build_policy_set(vec![restriction], None, PolicyAction::View, None);
+        let wrapper = PolicyWrapper::new(
+            view,
+            PolicySet::default(),
+            false,
+            default_allow,
+            HashMap::new(),
+        );
+        let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+            wrapper, None,
+        ))));
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer);
+        futures::executor::block_on(R2rmlPolicyGate::build(&ctx, mapping, "gs:main"))
+            .expect("build")
+            .expect("a gate")
+    }
+
+    fn restriction(
+        mode: TargetMode,
+        targets: &[&str],
+        classes: &[&str],
+        allow: bool,
+    ) -> fluree_db_policy::PolicyRestriction {
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        fluree_db_policy::PolicyRestriction {
+            id: "ex:p".to_string(),
+            target_mode: mode,
+            targets: targets.iter().map(|t| encode(&snapshot, t)).collect(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: if allow {
+                fluree_db_policy::PolicyValue::Allow
+            } else {
+                fluree_db_policy::PolicyValue::Deny
+            },
+            required: false,
+            message: None,
+            class_policy: !classes.is_empty(),
+            for_classes: classes.iter().map(|c| encode(&snapshot, c)).collect(),
+            class_check_needed: !classes.is_empty(),
+        }
+    }
+
+    fn decide(gate: &mut R2rmlPolicyGate, tm: &TriplesMap, pred: &str) -> bool {
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        futures::executor::block_on(gate.allows(&ctx, tm, None, pred, None, &[])).expect("decide")
+    }
+
+    /// Without a class-targeted restriction nothing about other maps'
+    /// classes is worked out and each (map, predicate) costs one evaluation,
+    /// as before; with one, a map another differently classed map overlaps is
+    /// decided over its class sets.
+    #[test]
+    fn a_policy_without_classes_costs_one_evaluation_per_decision() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = templated(
+            "http://ex/us",
+            "http://ex/c/{id}",
+            &["http://ex/Customer"],
+            vec![],
+        );
+        let eu = templated(
+            "http://ex/eu",
+            "http://ex/c/{id}",
+            &["http://ex/Restricted"],
+            vec![],
+        );
+        let mapping = CompiledR2rmlMapping::new(vec![us.clone(), eu]);
+
+        let by_property = restriction(TargetMode::OnProperty, &["http://ex/age"], &[], false);
+        let mut gate = gate_for(&mapping, by_property, true);
+        assert!(
+            gate.scope.overlaps.is_empty(),
+            "no scope without class policies"
+        );
+        assert!(decide(&mut gate, &us, "http://ex/name"));
+        assert!(decide(&mut gate, &us, "http://ex/name"));
+        assert!(!decide(&mut gate, &us, "http://ex/age"));
+        assert_eq!(
+            gate.evaluations.load(Relaxed),
+            2,
+            "one per (map, predicate)"
+        );
+
+        let by_class = restriction(TargetMode::OnClass, &[], &["http://ex/Restricted"], false);
+        let mut gate = gate_for(&mapping, by_class, true);
+        assert!(
+            !decide(&mut gate, &us, "http://ex/name"),
+            "denied for the EU map's class"
+        );
+        assert_eq!(
+            gate.evaluations.load(Relaxed),
+            2,
+            "own, and own with the extra class"
+        );
+        assert!(!decide(&mut gate, &us, "http://ex/name"));
+        assert_eq!(gate.evaluations.load(Relaxed), 2, "cached");
+    }
+
+    /// More extra classes than the enumeration's cap refuse the decision,
+    /// naming the map and the count.
+    #[test]
+    fn a_decision_over_too_many_extra_classes_is_refused() {
+        let classes: Vec<String> = (0..=MAX_EXTRA_CLASSES)
+            .map(|i| format!("http://ex/K{i}"))
+            .collect();
+        let mut maps = vec![templated(
+            "http://ex/plain",
+            "http://ex/c/{id}",
+            &[],
+            vec![],
+        )];
+        for (i, c) in classes.iter().enumerate() {
+            maps.push(templated(
+                &format!("http://ex/m{i}"),
+                "http://ex/c/{id}",
+                &[c],
+                vec![],
+            ));
+        }
+        let mapping = CompiledR2rmlMapping::new(maps.clone());
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let mut required = restriction(TargetMode::OnClass, &[], &class_refs, true);
+        required.required = true;
+        let mut gate = gate_for(&mapping, required, true);
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let err = futures::executor::block_on(gate.allows(
+            &ctx,
+            &maps[0],
+            None,
+            "http://ex/name",
+            None,
+            &[],
+        ))
+        .expect_err("refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("http://ex/plain")
+                && text.contains(&format!("{}", MAX_EXTRA_CLASSES + 1)),
+            "{text}"
         );
     }
 
