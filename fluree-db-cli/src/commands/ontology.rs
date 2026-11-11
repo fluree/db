@@ -234,7 +234,7 @@ fn print_report(file: &Path, report: &Report, names: &Names) {
         names,
     );
     print_counts(
-        "Not read by the reader",
+        "Not shown to the model",
         &report.not_shown,
         &report.examples.not_shown,
         names,

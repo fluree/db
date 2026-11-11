@@ -13,7 +13,7 @@ document against your ontology: the `[doc.reader]` that `fluree doc ingest`
 can read with. `check` mirrors the ontology input policy such a reader applies.
 `fluree doc ingest`'s language-model extractor (`[doc.llm]`) reads more of an
 ontology than an HTTP reader does (domains and ranges, `schema:domainIncludes`,
-every parent class), so the "not read" counts and the advice about domains,
+every parent class), so the "not shown" counts and the advice about domains,
 ranges and parents describe an HTTP reader only.
 
 They read files only: no `.fluree/` directory, no ledger, and nothing is sent
@@ -45,7 +45,7 @@ For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
 ## What an HTTP reader reads
 
-Of each class and property, an HTTP reader sees:
+Of each class and property, an HTTP reader shows its model:
 
 - its `rdfs:label`;
 - its `rdfs:comment`;
@@ -53,9 +53,13 @@ Of each class and property, an HTTP reader sees:
 - the SHACL node shapes that target a class (their supported constraints);
 - the IRI's local name (the namespace is hidden).
 
-It does not see `rdfs:domain` or `rdfs:range` (unless a shape on the class
-restates them), a second parent, `skos:altLabel`, `owl:equivalentClass`, OWL
-restrictions, or other axioms.
+The model is not shown `rdfs:domain` or `rdfs:range` (unless a shape on the
+class restates them), a second parent, `skos:altLabel`, `owl:equivalentClass`,
+OWL restrictions, or other axioms. Domains and ranges still shape the answer
+after the model has read: a property with a datatype range takes a literal of
+that type (a value the text doesn't give in that form is kept as a claim that
+is not accepted, so its triple isn't asserted), and a domain or class range
+keeps an entity a node.
 
 Input it has no place for is adapted rather than refused (input policy
 `ontology-adapter-v1`):
@@ -143,7 +147,7 @@ Applies the input policy locally and reports, in four parts:
   without a SKOS label or an IRI, `xt:example` or an extraction result, a
   window over its token limit, a file over the byte limit).
 - **Read another way**: what the policy adapted, counted by kind.
-- **Not read**: the ontology's triples the reader never sees,
+- **Not shown to the model**: the ontology's triples the model never sees,
   counted by predicate (`rdfs:domain`, `owl:equivalentClass`, `rdfs:subClassOf
   (a second parent)`, `(not a shown term)` for triples about something that is
   neither a class nor a property, ...).
@@ -184,7 +188,7 @@ Read another way by the reader
   rdfs:label from skos:prefLabel          2  e.g. ex:Bank, ex:Custodian
   rdfs:label from the IRI                 1  e.g. ex:Asset
 
-Not read by the reader
+Not shown to the model
   owl:onProperty                          1
   owl:someValuesFrom                      1
   rdf:type owl:Restriction                1

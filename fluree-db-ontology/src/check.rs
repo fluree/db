@@ -628,7 +628,7 @@ fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &
     if hidden_axes > 0 {
         advice.push(Finding {
             code: "domain-range-not-shown",
-            message: "An HTTP reader doesn't see rdfs:domain or rdfs:range (nor schema.org's domainIncludes and rangeIncludes). Say in each property's description what it connects (\"the organization that employs the person\"), or restate it as a SHACL property shape on the class.".into(),
+            message: "The model behind an HTTP reader isn't shown rdfs:domain or rdfs:range (nor schema.org's domainIncludes and rangeIncludes), though the reader still writes its answer by them: a datatype range sets a value's type, and a domain or class range keeps an entity a node. To help the model find what a property connects, say it in the property's description (\"the organization that employs the person\"), or restate it as a SHACL property shape on the class.".into(),
             count: hidden_axes,
             examples: Vec::new(),
         });
