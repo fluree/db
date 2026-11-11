@@ -647,6 +647,17 @@ fn process_literal<S: GraphSink>(
 
     // Handle the actual value
     match val {
+        // A string `@value` holds an already serialized JSON document, and
+        // takes the string path below.
+        Value::Object(_) | Value::Array(_) | Value::Number(_) | Value::Bool(_)
+            if datatype.is_json() =>
+        {
+            let json_str = crate::normalize::normalize(val);
+            Ok(ProcessedValue::Single(sink.term_literal_value(
+                LiteralValue::Json(Arc::from(json_str.as_str())),
+                Datatype::rdf_json(),
+            )))
+        }
         Value::String(s) => {
             if language.is_some() {
                 // Language-tagged string
@@ -704,15 +715,8 @@ fn process_literal<S: GraphSink>(
         Value::Bool(b) => Ok(ProcessedValue::Single(
             sink.term_literal_value(LiteralValue::Boolean(*b), datatype),
         )),
-        // Handle @json typed values
         Value::Object(_) | Value::Array(_) => {
-            if datatype.is_json() {
-                let json_str = crate::normalize::normalize(val);
-                Ok(ProcessedValue::Single(sink.term_literal_value(
-                    LiteralValue::Json(Arc::from(json_str.as_str())),
-                    Datatype::rdf_json(),
-                )))
-            } else if matches!(val, Value::Array(_))
+            if matches!(val, Value::Array(_))
                 && datatype.as_iri() == fluree_vocab::fluree::EMBEDDING_VECTOR
             {
                 // Vector arrays come through here once JSON-LD expansion produces
@@ -768,6 +772,30 @@ mod tests {
         assert!(
             matches!(&triple.o, Term::Literal { value: LiteralValue::String(s), .. } if s.as_ref() == "Alice")
         );
+    }
+
+    /// A JSON literal whose `@value` is a number or a boolean is a JSON
+    /// document, as an object or array one is, not an `xsd` value.
+    #[test]
+    fn json_literal_of_a_scalar_is_a_json_document() {
+        for (value, document) in [(json!(5), "5"), (json!(true), "true")] {
+            let expanded = json!([{
+                "@id": "http://example.org/s",
+                "http://example.org/p": [{"@value": value, "@type": "@json"}]
+            }]);
+            let mut sink = GraphCollectorSink::new();
+            to_graph_events(&expanded, &mut sink).unwrap();
+            let triple = sink.graph().iter().next().unwrap().clone();
+            assert!(
+                matches!(
+                    &triple.o,
+                    Term::Literal { value: LiteralValue::Json(json), datatype, .. }
+                        if json.as_ref() == document && datatype.is_json()
+                ),
+                "{:?}",
+                triple.o
+            );
+        }
     }
 
     #[test]
