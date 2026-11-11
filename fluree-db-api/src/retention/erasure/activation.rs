@@ -102,13 +102,19 @@ impl Fluree {
 
     /// Install the erasures of the activated manifest `manifest` on this
     /// member: they read as their replacements from here on. Then the
-    /// cached state of `holders` is evicted and reads of commits begun
-    /// before are waited out.
+    /// cached state of `holders` is evicted, reads of commits begun before
+    /// are waited out, and a refresh of each is announced to the peers
+    /// following this member.
     pub async fn install_erasures(&self, manifest: &str, holders: &[String]) -> Result<()> {
         let runtime = self.erasure_runtime()?;
         let erased = runtime.index.manifest(manifest).await?;
         runtime.index.install_manifest(erased);
         self.evict_erased(holders).await;
+        for holder in holders {
+            if let Ok(id) = fluree_db_core::LedgerId::parse(holder) {
+                self.announce_refresh(&id).await;
+            }
+        }
         Ok(())
     }
 }

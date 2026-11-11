@@ -725,7 +725,8 @@ async fn an_activation_refused_under_the_hold_releases_it() {
 
 /// An activation that applied but whose response was lost is found applied
 /// once the member has installed its manifest, which it reads by: its map
-/// object is written then, and the job records it.
+/// object is written then, and the job records it. Installing announces a
+/// refresh of each holder to the peers following the member.
 #[tokio::test]
 async fn an_activation_whose_response_was_lost_completes() {
     let dir = tempfile::tempdir().unwrap();
@@ -740,11 +741,22 @@ async fn an_activation_whose_response_was_lost_completes() {
     let manifest = cluster.applied.lock()[0].clone();
     assert!(map_objects(&fluree).await.is_empty());
     assert!(!reads_replacement(&fluree, &id, &asserted).await);
+    let mut events = fluree
+        .event_bus()
+        .subscribe(fluree_db_nameservice::SubscriptionScope::all())
+        .receiver;
     // This member's installer installs what the cluster applied.
     fluree
         .install_erasures(&manifest, std::slice::from_ref(&id))
         .await
         .unwrap();
+    let mut refreshed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let fluree_db_nameservice::NameServiceEvent::LedgerRefresh { ledger_id } = event {
+            refreshed.push(ledger_id.to_string());
+        }
+    }
+    assert_eq!(refreshed, std::slice::from_ref(&id));
     assert!(reads_replacement(&fluree, &id, &asserted).await);
     assert!(map_objects(&fluree).await.is_empty());
 
