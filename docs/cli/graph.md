@@ -89,7 +89,7 @@ The source holds default-graph data: Turtle, N-Triples, JSON-LD, or JSONL/NDJSON
 
 Statement annotations and triple terms import with the graph: RDF 1.2 annotations (`{| … |}`, `<< … >>`, `~ reifier`), triple terms as values (`<<( s p o )>>`, nested ones included), JSON-LD `@annotation` / `@reifies`, and CSV / Cypher edge properties under `--edge-properties annotated`. They read at full speed once the import publishes. A triple the ledger already reifies or names keeps its term, so an annotation in the new graph and one in the default graph are annotations of the same triple, and a query for that triple finds both.
 
-The following are refused with nothing written: a graph the ledger already has registered, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, the source formats above, and a ledger whose index holds annotations from before they were stored as `rdf:reifies` links (run [`fluree reindex`](reindex.md) first).
+A graph the ledger dropped can be imported into again; it starts empty, under the IRI and `g_id` it had. The following are refused with nothing written: a graph the ledger already has, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, the source formats above, and a ledger whose index holds annotations from before they were stored as `rdf:reifies` links (run [`fluree reindex`](reindex.md) first).
 
 **If an import fails.** Until its last step an import publishes nothing, so a failure leaves the ledger as it was, including when another writer moved the ledger's head during the import. The last step publishes the import's commits and then its index. If the index does not publish, because publishing it fails or the process stops in between, the import is in the ledger all the same: the error says it is published through `t=…`, and queries see the graph, read from the import's commits until an index covers them. Every load of the ledger reads those commits into memory until then, so after a large import run [`fluree reindex`](reindex.md). The log records each import's commit head and index root (`publishing graph import`) before it publishes them.
 
@@ -116,7 +116,7 @@ Imported 1.2M flakes into graph <http://example.org/graph/products> of 'mydb:mai
 
 ### fluree graph drop
 
-Drop a single named graph from one branch by transactionally retracting every triple currently asserted in it.
+Drop a single named graph, and its history, from one branch: SPARQL `DROP GRAPH`.
 
 **Usage:**
 
@@ -139,14 +139,15 @@ fluree graph drop <IRI> [OPTIONS]
 
 **Description:**
 
-`fluree graph drop` is **transactional and history-preserving**:
+`fluree graph drop` takes the graph out of the ledger:
 
-- The drop produces one new commit at `t = current + 1` whose flakes are retractions of every triple currently asserted under the target graph IRI.
-- A query `as-of` an earlier `t` (e.g. via `--at t:<N>`, `--at-time`, or a dataset `TimeSpec`) still sees the graph populated.
-- The graph IRI keeps its `g_id`; a subsequent insert into the same IRI lands in the same logical graph rather than a new slot.
+- The drop produces one new commit at `t = current + 1`, which retracts nothing. It reads none of the graph's facts, so it takes the same time for a graph of any size.
+- Nothing the graph held is queryable afterwards. A query that names it `as-of` an earlier `t` (e.g. via `--at t:<N>`, `--at-time`, or a dataset `TimeSpec`) is refused, rather than answered as if the graph had been empty.
+- The graph no longer exists: `fluree graph list` leaves it out, and dropping it again reports that it does not exist. Writing to the same IRI starts it afresh, holding only what is written from then on.
+- The commits that wrote the dropped facts keep them. A branch created at a `t` before the drop (`fluree branch create <name> --at t:<N>`) reads them.
 - Drops are per-branch — sibling branches that share the same graph IRI are not touched.
-- Idempotent: re-running the drop on an already-empty graph reports `committed: false`, `retracted: 0` and produces no new commit.
-- **One commit, sized by the graph.** Every retraction lands in that commit, so a graph holding more facts than `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default 10,000,000; `0` disables) is refused before it is read. A drop that fits that limit but not the ledger's novelty limit (`--reindex-max-bytes`) is refused at commit. Drop a larger graph in batches, e.g. `DELETE { GRAPH <g> { ?s ?p ?o } } WHERE { GRAPH <g> { VALUES ?s { … } ?s ?p ?o } }`.
+- The next index build removes the graph's data from the index.
+- Only an identity without a restricting policy may drop a graph. To empty a graph and keep its history, use SPARQL `CLEAR GRAPH <iri>` instead.
 
 The following are rejected with a clear error (no commit is produced):
 
@@ -154,7 +155,7 @@ The following are rejected with a clear error (no commit is produced):
 - The **system graphs** — `urn:fluree:{ledger_id}#txn-meta` and `urn:fluree:{ledger_id}#config`.
 - **Relative references** — `<IRI>` must be an absolute IRI with a valid `<scheme>:<rest>` head (e.g. `urn:...`, `http://...`).
 - **Whitespace / control characters / RFC 3987-excluded characters** — leading/trailing whitespace is rejected, not silently trimmed.
-- **Unknown graph IRIs** — return a 404-shaped "not registered" error; the registry is never silently extended by a drop.
+- **Unknown graph IRIs** — a graph that does not exist, a dropped one included, returns a 404-shaped "does not exist" error.
 
 **Examples:**
 
@@ -170,16 +171,10 @@ fluree graph drop http://example.org/graphs/scratch --ledger mydb:feature-x
 fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
 ```
 
-**Output (committed):**
+**Output:**
 
 ```
-Dropped graph <urn:example:org/payroll> from 'mydb:main' — retracted 42 flakes (t=18).
-```
-
-**Output (no-op):**
-
-```
-Graph <urn:example:org/payroll> in 'mydb:main' was already empty — no commit produced (t=17).
+Dropped graph <urn:example:org/payroll> from 'mydb:main' (t=18).
 ```
 
 ## See Also

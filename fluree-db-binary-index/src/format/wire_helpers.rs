@@ -411,8 +411,7 @@ pub(crate) fn read_dict_pack_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
     })
 }
 
-/// Wire-format version of the term-dictionary section. Version 1 has no
-/// object reverse tree.
+/// Wire-format version of the term-dictionary section.
 const TERM_DICT_REFS_VERSION: u8 = 2;
 
 /// Write triple-term dictionary refs.
@@ -463,7 +462,7 @@ pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
 /// Read triple-term dictionary refs written by [`write_term_dict_refs`].
 pub(crate) fn read_term_dict_refs(data: &[u8], pos: &mut usize) -> io::Result<TermDictRefs> {
     let version = read_u8_at(data, pos)?;
-    if !(1..=TERM_DICT_REFS_VERSION).contains(&version) {
+    if version != TERM_DICT_REFS_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("term dict refs: unsupported version {version}"),
@@ -496,7 +495,7 @@ pub(crate) fn read_term_dict_refs(data: &[u8], pos: &mut usize) -> io::Result<Te
         watermarks.push((p_id, wm));
     }
     let term_count = read_u64_at(data, pos)?;
-    let object_reverse = if version >= 2 && read_u8_at(data, pos)? != 0 {
+    let object_reverse = if read_u8_at(data, pos)? != 0 {
         Some(read_dict_tree_refs(data, pos)?)
     } else {
         None
@@ -528,38 +527,6 @@ pub(crate) fn read_dict_tree_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
         leaves.push(read_cid(data, pos)?);
     }
     Ok(DictTreeRefs { branch, leaves })
-}
-
-#[cfg(test)]
-mod term_dict_wire_tests {
-    use super::*;
-
-    /// A version-1 section (no object tree) still decodes, as a dictionary
-    /// without one.
-    #[test]
-    fn a_version_one_term_dict_reads_without_an_object_tree() {
-        let cid = ContentId::new(fluree_db_core::ContentKind::Commit, b"x");
-        let refs = TermDictRefs {
-            forward_packs: Vec::new(),
-            reverse: DictTreeRefs {
-                branch: cid.clone(),
-                leaves: vec![cid],
-            },
-            watermarks: vec![(1, 2)],
-            term_count: 3,
-            object_reverse: None,
-        };
-        let mut v2 = Vec::new();
-        write_term_dict_refs(&mut v2, &refs);
-        let mut v1 = v2[..v2.len() - 1].to_vec();
-        v1[0] = 1;
-        let mut pos = 0;
-        assert_eq!(read_term_dict_refs(&v1, &mut pos).unwrap(), refs);
-        assert_eq!(pos, v1.len());
-        let mut pos = 0;
-        assert_eq!(read_term_dict_refs(&v2, &mut pos).unwrap(), refs);
-        assert_eq!(pos, v2.len());
-    }
 }
 
 #[cfg(test)]

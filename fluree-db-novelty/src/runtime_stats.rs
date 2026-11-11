@@ -1235,7 +1235,7 @@ fn graph_id_for_flake(snapshot: &LedgerSnapshot, flake: &Flake) -> GraphId {
     };
     snapshot
         .decode_sid(g_sid)
-        .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+        .and_then(|iri| snapshot.graph_registry.assigned_graph_id(&iri))
         .unwrap_or(0)
 }
 

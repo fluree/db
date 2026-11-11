@@ -135,6 +135,80 @@ async fn fetch_noting_local(
     Ok((content_store.get(id).await?, false))
 }
 
+/// Append the geometries a spatial index holds as `SpatialEntry`s, one per
+/// distinct (subject, geometry, t, op). The cell index has one entry per
+/// covering cell, so re-adding per cell entry would multiply the index by its
+/// covering size on every rebuild.
+async fn load_prior_spatial_entries(
+    content_store: &dyn ContentStore,
+    g_id: fluree_db_core::GraphId,
+    sp_ref: &fluree_db_binary_index::SpatialArenaRef,
+    out: &mut Vec<crate::spatial_hook::SpatialEntry>,
+) -> Result<()> {
+    let p_id = sp_ref.p_id;
+    let root_bytes = fetch_cached_index_bytes(
+        content_store,
+        &sp_ref.root_cid,
+        format!("spatial root load for g{g_id}:p{p_id}"),
+    )
+    .await?;
+    let spatial_root: fluree_db_spatial::SpatialIndexRoot = serde_json::from_slice(&root_bytes)
+        .map_err(|e| {
+            IndexerError::StorageRead(format!("spatial root decode for g{g_id}:p{p_id}: {e}"))
+        })?;
+
+    // Pre-fetch all blobs for the sync load_from_cas closure.
+    let mut blob_cache: HashMap<String, Vec<u8>> = HashMap::new();
+    for cid in [&sp_ref.manifest, &sp_ref.arena]
+        .into_iter()
+        .chain(&sp_ref.leaflets)
+    {
+        let bytes = fetch_cached_index_bytes(content_store, cid, "spatial blob fetch").await?;
+        blob_cache.insert(cid.digest_hex(), bytes);
+    }
+    let blob_cache = Arc::new(blob_cache);
+    let snapshot =
+        fluree_db_spatial::SpatialIndexSnapshot::load_from_cas(spatial_root, move |hash| {
+            blob_cache.get(hash).cloned().ok_or_else(|| {
+                fluree_db_spatial::error::SpatialError::ChunkNotFound(hash.to_string())
+            })
+        })
+        .map_err(|e| {
+            IndexerError::IncrementalAbort(format!(
+                "spatial snapshot load failed for g_id={g_id}, p_id={p_id}: {e}; \
+                 falling back to full rebuild for correctness"
+            ))
+        })?;
+
+    let cell_entries = snapshot.cell_index().scan_range(0, u64::MAX).map_err(|e| {
+        IndexerError::IncrementalAbort(format!(
+            "spatial cell scan failed for g_id={g_id}, p_id={p_id}: {e}; \
+                 falling back to full rebuild for correctness"
+        ))
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    for ce in cell_entries {
+        if !seen.insert((ce.subject_id, ce.geo_handle, ce.t, ce.op)) {
+            continue;
+        }
+        let Some(arena_entry) = snapshot.arena().get(ce.geo_handle) else {
+            continue;
+        };
+        let Ok(wkt) = std::str::from_utf8(&arena_entry.wkt) else {
+            continue;
+        };
+        out.push(crate::spatial_hook::SpatialEntry {
+            g_id,
+            subject_id: ce.subject_id,
+            p_id,
+            wkt: wkt.to_string(),
+            t: ce.t,
+            is_assert: ce.is_assert(),
+        });
+    }
+    Ok(())
+}
+
 async fn upload_dict_blob_cached(
     content_store: &dyn ContentStore,
     dict: fluree_db_core::DictKind,
@@ -888,6 +962,7 @@ pub async fn incremental_index(
 
     // ---- Phase 1: Resolve incremental commits ----
     let resolve_config = IncrementalResolveConfig {
+        ledger_id: ledger_id.to_string(),
         base_root_id: base_root_id.clone(),
         head_commit_id,
         from_t,
@@ -896,7 +971,7 @@ pub async fn incremental_index(
         pending_commit_cids: config.pending_commit_cids.clone(),
         commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
     };
-    let novelty = resolve_incremental_commits_v6(
+    let mut novelty = resolve_incremental_commits_v6(
         content_store.clone(),
         resolve_config,
         Arc::clone(&upload_budget),
@@ -906,10 +981,11 @@ pub async fn incremental_index(
         IncrementalResolveError::Resolve(crate::run_index::ResolverError::Unindexable(msg)) => {
             IndexerError::Unindexable(msg)
         }
+        IncrementalResolveError::NeedsRebuild(why) => IndexerError::IncrementalAbort(why),
         e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
     })?;
 
-    if novelty.records.is_empty() {
+    if novelty.records.is_empty() && novelty.purged_graphs.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
         // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
@@ -930,6 +1006,7 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
+    let purged_cids = std::mem::take(&mut novelty.purged_cids);
     index_novelty(
         content_store,
         tracker,
@@ -937,7 +1014,7 @@ pub async fn incremental_index(
         base_root_id,
         novelty,
         config,
-        Vec::new(),
+        purged_cids,
     )
     .await
 }
@@ -1009,6 +1086,18 @@ pub(crate) async fn index_novelty(
     let base_pool = base_root.pool.as_ref();
     let has_own_trees: std::collections::HashSet<fluree_db_core::GraphId> =
         base_root.named_graphs.iter().map(|ng| ng.g_id).collect();
+    // Pooled graphs a drop in the window took (`novelty.purged_graphs`): they
+    // leave the pool with nothing of what they held, and one the window
+    // writes again is placed as a graph new to the index.
+    let pool_purge: Vec<fluree_db_core::GraphId> = base_pool.map_or_else(Vec::new, |pool| {
+        novelty
+            .purged_graphs
+            .iter()
+            .copied()
+            .filter(|g| pool.contains(*g))
+            .collect()
+    });
+    let purged = |g: fluree_db_core::GraphId| pool_purge.binary_search(&g).is_ok();
     let mut pool_writes: Vec<fluree_db_core::GraphId> = Vec::new();
     let mut promote: Vec<fluree_db_core::GraphId> = Vec::new();
     for (&g_id, indices) in &by_graph {
@@ -1017,7 +1106,9 @@ pub(crate) async fn index_novelty(
         {
             continue;
         }
-        let pooled = base_pool.and_then(|p| p.member(g_id));
+        let pooled = base_pool
+            .and_then(|p| p.member(g_id))
+            .filter(|_| !purged(g_id));
         let size = window_size(
             pooled.map_or(GraphSize::default(), |m| GraphSize {
                 rows: m.rows.into(),
@@ -1033,13 +1124,25 @@ pub(crate) async fn index_novelty(
         }
     }
     if let Some(pool) = base_pool {
-        promote.extend(
-            pool.graph_ids()
-                .filter(|g| !by_graph.contains_key(g) && placement.pinned_dedicated(*g)),
-        );
+        promote.extend(pool.graph_ids().filter(|g| {
+            !by_graph.contains_key(g) && placement.pinned_dedicated(*g) && !purged(*g)
+        }));
     }
     promote.sort_unstable();
     let promoted = read_pooled_graph_logs(&content_store, base_root, &promote).await?;
+    let purged_logs = read_pooled_graph_logs(&content_store, base_root, &pool_purge).await?;
+    // Every graph whose pooled rows and history this build drops.
+    let mut leaving: Vec<fluree_db_core::GraphId> =
+        promote.iter().chain(&pool_purge).copied().collect();
+    leaving.sort_unstable();
+    leaving.dedup();
+    for &g_id in &pool_purge {
+        // One the pool takes again keeps its membership: the GSPO merge's
+        // tally takes it from its old size to what the window wrote.
+        if pool_writes.binary_search(&g_id).is_err() {
+            root_builder.remove_from_pool(g_id);
+        }
+    }
 
     let concurrency = config.incremental_max_concurrency.max(1);
     // Graphs written to trees of their own: every graph with novelty outside
@@ -1165,10 +1268,10 @@ pub(crate) async fn index_novelty(
     }
 
     // The pool: one update per pooled order for every pooled graph this
-    // window writes, which also drops the promoted graphs. Each promoted
-    // identity rides along as an `OP_PURGE` marker so the update touches
+    // window writes, which also drops the graphs leaving it. Each of their
+    // identities rides along as an `OP_PURGE` marker so the update touches
     // every leaflet that holds it.
-    if !pool_writes.is_empty() || !promote.is_empty() {
+    if !pool_writes.is_empty() || !leaving.is_empty() {
         let pooled_write = |rec: &RunRecordV2| pool_writes.binary_search(&rec.g_id).is_ok();
         let mut records: Vec<(RunRecordV2, u8)> = novelty
             .records
@@ -1184,7 +1287,7 @@ pub(crate) async fn index_novelty(
             .filter(|(rec, _)| pooled_write(rec))
             .map(|(rec, &op)| (*rec, op))
             .collect();
-        for log in promoted.values() {
+        for log in promoted.values().chain(purged_logs.values()) {
             let mut seen: std::collections::HashSet<FactIdentityKey> =
                 std::collections::HashSet::new();
             for rec in log
@@ -1197,7 +1300,7 @@ pub(crate) async fn index_novelty(
                 }
             }
         }
-        let purge = Arc::new(promote.clone());
+        let purge = Arc::new(leaving.clone());
         // No pool yet: write one from this window's pooled graphs alone.
         let fresh_pool = base_pool.is_none().then(|| {
             Arc::new(
@@ -1226,12 +1329,12 @@ pub(crate) async fn index_novelty(
                                 pool.delta(order),
                                 window_events,
                                 base_rows,
-                                !promote.is_empty(),
+                                !leaving.is_empty(),
                             )
                     })
                     .map(|&order| (order, pool.delta(order)))
                     .collect();
-                delta_run_events(content_store.as_ref(), &folds, &promote).await?
+                delta_run_events(content_store.as_ref(), &folds, &leaving).await?
             }
             None => Vec::new(),
         };
@@ -1590,9 +1693,7 @@ pub(crate) async fn index_novelty(
     // and patching any (g_id, p_id) that have new/extended data.
     // The resolver already populated shared.numbigs/vectors/spatial_hook/fulltext_hook.
     {
-        use fluree_db_binary_index::{
-            FulltextArenaRef, GraphArenaRefs, SpatialArenaRef, VectorDictRef,
-        };
+        use fluree_db_binary_index::{FulltextArenaRef, GraphArenaRefs, VectorDictRef};
         use std::collections::BTreeMap;
 
         let mut arenas_by_gid: BTreeMap<fluree_db_core::GraphId, GraphArenaRefs> = BTreeMap::new();
@@ -2108,212 +2209,48 @@ pub(crate) async fn index_novelty(
 
             // ---- Spatial arena rebuild (per affected predicate) ----
             //
-            // For each (g_id, p_id) with novelty spatial entries, rebuild the
-            // spatial index from scratch: load all prior entries from the existing
-            // snapshot, combine with novelty, build + upload a new index.
+            // Each (g_id, p_id) with novelty spatial entries is rebuilt from its
+            // prior entries plus novelty, by the builder the full rebuild uses.
             // Unchanged spatial arenas carry forward by CID.
             if has_new_spatial {
-                let spatial_entries = novelty
+                let novelty_entries = novelty
                     .shared
                     .spatial_hook
                     .as_ref()
                     .map(super::super::spatial_hook::SpatialHook::entries)
                     .unwrap_or(&[]);
+                let touched: std::collections::BTreeSet<(fluree_db_core::GraphId, u32)> =
+                    novelty_entries.iter().map(|e| (e.g_id, e.p_id)).collect();
 
-                // Group novelty entries by (g_id, p_id).
-                let mut grouped: BTreeMap<
-                    (fluree_db_core::GraphId, u32),
-                    Vec<&crate::spatial_hook::SpatialEntry>,
-                > = BTreeMap::new();
-                for entry in spatial_entries {
-                    grouped
-                        .entry((entry.g_id, entry.p_id))
-                        .or_default()
-                        .push(entry);
-                }
-
-                for ((g_id, p_id), new_entries) in grouped {
-                    let pred_iri = novelty
-                        .shared
-                        .predicates
-                        .resolve(p_id)
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let config = fluree_db_spatial::SpatialCreateConfig::new(
-                        format!("spatial:g{g_id}p{p_id}"),
-                        ledger_id.to_string(),
-                        pred_iri.clone(),
-                    );
-                    let mut builder = fluree_db_spatial::SpatialIndexBuilder::new(config);
-
-                    // Load prior entries from the existing spatial snapshot (if any).
-                    let ga = arenas_by_gid.get(&g_id);
-                    let existing_ref = ga.and_then(|a| a.spatial.iter().find(|s| s.p_id == p_id));
-                    let mut prior_count = 0u64;
-
-                    if let Some(sp_ref) = existing_ref {
-                        // Load the SpatialIndexRoot + snapshot from CAS.
-                        let root_bytes = fetch_cached_index_bytes(
+                let mut entries = Vec::new();
+                for &(g_id, p_id) in &touched {
+                    let prior = arenas_by_gid
+                        .get(&g_id)
+                        .and_then(|ga| ga.spatial.iter().find(|s| s.p_id == p_id));
+                    if let Some(sp_ref) = prior {
+                        load_prior_spatial_entries(
                             content_store.as_ref(),
-                            &sp_ref.root_cid,
-                            format!("spatial root load for g{g_id}:p{p_id}"),
+                            g_id,
+                            sp_ref,
+                            &mut entries,
                         )
                         .await?;
-                        let spatial_root: fluree_db_spatial::SpatialIndexRoot =
-                            serde_json::from_slice(&root_bytes).map_err(|e| {
-                                IndexerError::StorageRead(format!(
-                                    "spatial root decode for g{g_id}:p{p_id}: {e}"
-                                ))
-                            })?;
-
-                        // Pre-fetch all blobs for the sync load_from_cas closure.
-                        let mut blob_cache: std::collections::HashMap<String, Vec<u8>> =
-                            std::collections::HashMap::new();
-                        for cid in [&sp_ref.manifest, &sp_ref.arena] {
-                            let bytes = fetch_cached_index_bytes(
-                                content_store.as_ref(),
-                                cid,
-                                "spatial blob fetch",
-                            )
-                            .await?;
-                            blob_cache.insert(cid.digest_hex(), bytes);
-                        }
-                        for leaflet_cid in &sp_ref.leaflets {
-                            let bytes = fetch_cached_index_bytes(
-                                content_store.as_ref(),
-                                leaflet_cid,
-                                "spatial leaflet fetch",
-                            )
-                            .await?;
-                            blob_cache.insert(leaflet_cid.digest_hex(), bytes);
-                        }
-
-                        let cache_arc = std::sync::Arc::new(blob_cache);
-                        match fluree_db_spatial::SpatialIndexSnapshot::load_from_cas(
-                            spatial_root,
-                            move |hash| {
-                                cache_arc.get(hash).cloned().ok_or_else(|| {
-                                    fluree_db_spatial::error::SpatialError::ChunkNotFound(
-                                        hash.to_string(),
-                                    )
-                                })
-                            },
-                        ) {
-                            Ok(snapshot) => {
-                                let all_entries = snapshot
-                                    .cell_index()
-                                    .scan_range(0, u64::MAX)
-                                    .unwrap_or_default();
-                                for ce in &all_entries {
-                                    if let Some(arena_entry) = snapshot.arena().get(ce.geo_handle) {
-                                        if let Ok(wkt_str) = std::str::from_utf8(&arena_entry.wkt) {
-                                            let _ = builder.add_geometry(
-                                                ce.subject_id,
-                                                wkt_str,
-                                                ce.t,
-                                                ce.is_assert(),
-                                            );
-                                            prior_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                return Err(IndexerError::IncrementalAbort(format!(
-                                    "spatial snapshot load failed for g_id={g_id}, \
-                                     p_id={p_id}: {e}; falling back to full rebuild \
-                                     for correctness"
-                                )));
-                            }
-                        }
                     }
+                }
+                entries.extend(novelty_entries.iter().cloned());
 
-                    // Feed novelty entries.
-                    for entry in &new_entries {
-                        let _ = builder.add_geometry(
-                            entry.subject_id,
-                            &entry.wkt,
-                            entry.t,
-                            entry.is_assert,
-                        );
-                    }
+                let built = super::spatial::build_and_upload_spatial_indexes(
+                    &entries,
+                    &novelty.shared.predicates,
+                    ledger_id,
+                    content_store.as_ref(),
+                    |cid, bytes| {
+                        cache_artifact_bytes(content_store.as_ref(), cid, bytes, "spatial");
+                    },
+                )
+                .await?;
 
-                    let build_result = builder.build().map_err(|e| {
-                        IndexerError::Other(format!("spatial build g{g_id}:p{p_id}: {e}"))
-                    })?;
-
-                    if build_result.entries.is_empty() {
-                        continue;
-                    }
-
-                    // Upload via the same two-phase pattern as the full build.
-                    let mut pending_blobs: Vec<(String, Vec<u8>)> = Vec::new();
-                    let write_result = build_result
-                        .write_to_cas(|bytes| {
-                            use sha2::{Digest, Sha256};
-                            let hash_hex = hex::encode(Sha256::digest(bytes));
-                            pending_blobs.push((hash_hex.clone(), bytes.to_vec()));
-                            Ok(hash_hex)
-                        })
-                        .map_err(|e| IndexerError::Other(format!("spatial CAS build: {e}")))?;
-
-                    for (_hash, blob_bytes) in &pending_blobs {
-                        let cid = content_store
-                            .put(ContentKind::SpatialIndex, blob_bytes)
-                            .await
-                            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                        cache_artifact_bytes(&*content_store, &cid, blob_bytes, "spatial_blob");
-                    }
-
-                    // Build CIDs.
-                    let spatial_codec = ContentKind::SpatialIndex.to_codec();
-                    let root_json = serde_json::to_vec(&write_result.root)
-                        .map_err(|e| IndexerError::Other(format!("spatial root serialize: {e}")))?;
-                    let root_cid = content_store
-                        .put(ContentKind::SpatialIndex, &root_json)
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    cache_artifact_bytes(&*content_store, &root_cid, &root_json, "spatial_root");
-                    let manifest_cid =
-                        ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address)
-                            .ok_or_else(|| {
-                            IndexerError::StorageWrite(format!(
-                                "invalid spatial manifest hash for g_id={g_id}, p_id={p_id}: {}",
-                                write_result.manifest_address
-                            ))
-                        })?;
-                    let arena_cid =
-                        ContentId::from_hex_digest(spatial_codec, &write_result.arena_address)
-                            .ok_or_else(|| {
-                                IndexerError::StorageWrite(format!(
-                                    "invalid spatial arena hash for g_id={g_id}, p_id={p_id}: {}",
-                                    write_result.arena_address
-                                ))
-                            })?;
-                    let leaflet_cids: Vec<ContentId> = write_result
-                        .leaflet_addresses
-                        .iter()
-                        .enumerate()
-                        .map(|(i, h)| {
-                            ContentId::from_hex_digest(spatial_codec, h).ok_or_else(|| {
-                                IndexerError::StorageWrite(format!(
-                                    "invalid spatial leaflet hash [{i}] for \
-                                     g_id={g_id}, p_id={p_id}: {h}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    let new_ref = SpatialArenaRef {
-                        p_id,
-                        root_cid,
-                        manifest: manifest_cid,
-                        arena: arena_cid,
-                        leaflets: leaflet_cids,
-                    };
-
-                    // Replace or insert in graph arenas.
+                for (g_id, refs) in built {
                     let ga = arenas_by_gid.entry(g_id).or_insert_with(|| GraphArenaRefs {
                         g_id,
                         numbig: Vec::new(),
@@ -2321,30 +2258,20 @@ pub(crate) async fn index_novelty(
                         spatial: Vec::new(),
                         fulltext: vec![],
                     });
-
-                    if let Some(pos) = ga.spatial.iter().position(|s| s.p_id == p_id) {
-                        // GC old spatial CIDs.
-                        let old = &ga.spatial[pos];
-                        root_builder.add_replaced_cids(vec![
-                            old.root_cid.clone(),
-                            old.manifest.clone(),
-                            old.arena.clone(),
-                        ]);
-                        root_builder.add_replaced_cids(old.leaflets.clone());
-                        ga.spatial[pos] = new_ref;
-                    } else {
-                        ga.spatial.push(new_ref);
-                        ga.spatial.sort_by_key(|s| s.p_id);
+                    for new_ref in refs {
+                        if let Some(pos) = ga.spatial.iter().position(|s| s.p_id == new_ref.p_id) {
+                            let old = std::mem::replace(&mut ga.spatial[pos], new_ref);
+                            root_builder.add_replaced_cids(vec![
+                                old.root_cid,
+                                old.manifest,
+                                old.arena,
+                            ]);
+                            root_builder.add_replaced_cids(old.leaflets);
+                        } else {
+                            ga.spatial.push(new_ref);
+                            ga.spatial.sort_by_key(|s| s.p_id);
+                        }
                     }
-
-                    tracing::debug!(
-                        g_id,
-                        p_id,
-                        predicate = %pred_iri,
-                        prior_entries = prior_count,
-                        novelty_entries = new_entries.len(),
-                        "incremental V6: spatial index rebuilt for (graph, predicate)"
-                    );
                 }
             }
 
@@ -2426,6 +2353,9 @@ pub(crate) async fn index_novelty(
         // clamp applies on every incremental (not just the fallback) so ndv
         // survives register loss in a previously fallback-seeded sketch.
         let mut prior_properties = prior_properties;
+        // A purged graph starts from nothing: what the sketch counted of it
+        // the drop took.
+        prior_properties.retain(|key, _| !novelty.purged_graphs.contains(&key.g_id));
         let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
             std::collections::HashMap::new();
         if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {

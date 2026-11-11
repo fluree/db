@@ -215,6 +215,9 @@ pub struct StagedLedger {
     /// [`OverlayProvider::list_predicates`]: the base novelty's and the
     /// staged flakes'.
     list_predicates: Option<Arc<std::collections::HashSet<Sid>>>,
+    /// Graphs the staged transaction drops (see `Commit::graph_drops`),
+    /// ascending. The base already reads without them.
+    graph_drops: Vec<GraphId>,
 }
 
 impl StagedLedger {
@@ -265,8 +268,24 @@ impl StagedLedger {
             content_version: fluree_db_core::overlay::next_overlay_content_version(),
             dicts_cover_staged: false,
             list_predicates,
+            graph_drops: Vec::new(),
             base,
         })
+    }
+
+    /// Record that the staged transaction drops `g_ids`. The caller has
+    /// applied the drops to the base already, so that the view reads as the
+    /// commit will; the commit records them.
+    pub fn with_graph_drops(mut self, mut g_ids: Vec<GraphId>) -> Self {
+        g_ids.sort_unstable();
+        g_ids.dedup();
+        self.graph_drops = g_ids;
+        self
+    }
+
+    /// The graphs the staged transaction drops, ascending.
+    pub fn graph_drops(&self) -> &[GraphId] {
+        &self.graph_drops
     }
 
     /// Whether the base snapshot's range provider dictionaries cover the

@@ -240,32 +240,54 @@ pub struct Txn {
     pub sync_graph: Option<GraphSel>,
 }
 
-/// A SPARQL graph-management operation, executed by whole-graph scan/re-home
-/// at staging time (SPARQL 1.1 Update §3.2). Carried on [`Txn::graph_mgmt`].
+/// A SPARQL graph-management operation (SPARQL 1.1 Update §3.2), executed at
+/// staging time. Carried on [`Txn::graph_mgmt`].
 ///
 /// `CREATE` and a `SILENT` `LOAD` of an unfetchable source lower to an ordinary
-/// empty no-op `Txn` (Fluree cannot represent an empty named graph — roadmap
-/// D-6), so they are **not** represented here.
+/// `Txn` that writes no flake (a `CREATE` registers its graph through
+/// `write_graphs`), so they are **not** represented here.
 #[derive(Debug, Clone)]
 pub enum GraphMgmtOp {
-    /// Retract every flake in the target graph(s). Backs both `CLEAR` and
-    /// `DROP` — the two are indistinguishable in Fluree's flake-tagged model
-    /// (the registry is additive-only and the harness cannot observe an empty
-    /// graph), so `DROP ≡ CLEAR` (roadmap decision D-6).
+    /// Retract every flake in the target graph(s) (`CLEAR`). The graphs
+    /// remain, and so does their history: a query as of an earlier `t` still
+    /// sees what they held.
     Clear(GraphTarget),
 
+    /// Take the target graph(s) out of the ledger (`DROP`): nothing they held
+    /// is queryable afterwards, at the head or as of any earlier `t`. The
+    /// commits that wrote it keep it, so a rebuild that ignores the drop — a
+    /// branch from before it, say — recovers it. The commit records the drop
+    /// and retracts nothing (see `Commit::graph_drops`).
+    ///
+    /// A named graph no longer exists until something writes to it again; the
+    /// default graph always exists, so `DROP DEFAULT` leaves it empty, without
+    /// its history. The reserved system graphs cannot be dropped, and only an
+    /// unrestricted identity may drop at all: the drop takes facts a policy
+    /// may hide from the caller.
+    Drop {
+        /// The graph(s) to drop.
+        target: GraphTarget,
+        /// `SILENT`: dropping a graph that does not exist is a no-op rather
+        /// than an error.
+        silent: bool,
+    },
+
     /// Copy all flakes from `from` into `to` (`ADD`), optionally clearing the
-    /// destination first (`COPY`, `MOVE`) and/or the source afterwards
-    /// (`MOVE`). A `from == to` transfer is a no-op (staging short-circuits).
+    /// destination first (`COPY`, `MOVE`) and/or dropping the source
+    /// afterwards (`MOVE`). A `from == to` transfer is a no-op (staging
+    /// short-circuits).
     Transfer {
         /// Source graph to scan.
         from: GraphSel,
         /// Destination graph to assert the copied flakes into.
         to: GraphSel,
         /// Retract the destination before copying (COPY / MOVE, not ADD).
+        /// The destination lives on, so it is cleared, keeping its history.
         clear_dest: bool,
-        /// Retract the source after copying (MOVE only).
-        clear_src: bool,
+        /// Drop the source after copying (MOVE only): the source ceases to
+        /// exist, as [`GraphMgmtOp::Drop`] — and needs an unrestricted
+        /// identity for the same reason.
+        drop_src: bool,
         /// `SILENT`: suppress the "source graph does not exist" error. Per
         /// SPARQL 1.1 Update §3.2, a transfer from a never-registered source
         /// graph errors unless `SILENT`; without the guard COPY/MOVE would
@@ -341,16 +363,18 @@ impl Txn {
     }
 
     /// Retract every flake in a named graph (the non-SPARQL analog of
-    /// `CLEAR GRAPH <iri>`). In Fluree's model this is indistinguishable from
-    /// [`Txn::drop_graph`] (roadmap D-6).
+    /// `CLEAR GRAPH <iri>`). The graph and its history remain.
     pub fn clear_graph(iri: impl Into<String>) -> Self {
         Txn::graph_mgmt(GraphMgmtOp::Clear(GraphTarget::Graph(iri.into())))
     }
 
-    /// Drop a named graph (retract all of its flakes). `DROP ≡ CLEAR` in
-    /// Fluree's additive-only registry model (roadmap D-6).
+    /// Drop a named graph (the non-SPARQL analog of `DROP GRAPH <iri>`): it
+    /// and its history are no longer queryable. See [`GraphMgmtOp::Drop`].
     pub fn drop_graph(iri: impl Into<String>) -> Self {
-        Txn::clear_graph(iri)
+        Txn::graph_mgmt(GraphMgmtOp::Drop {
+            target: GraphTarget::Graph(iri.into()),
+            silent: false,
+        })
     }
 
     /// Retract every flake in the default graph.
@@ -367,7 +391,7 @@ impl Txn {
             from: GraphSel::Graph(from.into()),
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: true,
-            clear_src: false,
+            drop_src: false,
             // Builder-API COPY errors on a never-registered source, matching
             // non-SILENT SPARQL COPY (roadmap O3).
             silent: false,
@@ -378,16 +402,16 @@ impl Txn {
         txn
     }
 
-    /// Move all flakes from one named graph into another — copy semantics plus
-    /// retraction of the source (the non-SPARQL analog of `MOVE <from> TO
-    /// <to>`). A destination equal to the source is a no-op.
+    /// Move all flakes from one named graph into another — copy semantics, then
+    /// the source is dropped (the non-SPARQL analog of `MOVE <from> TO <to>`).
+    /// A destination equal to the source is a no-op.
     pub fn move_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
         let to_iri = to.into();
         let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
             from: GraphSel::Graph(from.into()),
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: true,
-            clear_src: true,
+            drop_src: true,
             // Builder-API MOVE errors on a never-registered source, matching
             // non-SILENT SPARQL MOVE (roadmap O3).
             silent: false,
@@ -405,7 +429,7 @@ impl Txn {
             from: GraphSel::Graph(from.into()),
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: false,
-            clear_src: false,
+            drop_src: false,
             // Builder-API ADD errors on a never-registered source, matching
             // non-SILENT SPARQL ADD (roadmap O3).
             silent: false,

@@ -344,7 +344,7 @@ async fn transfer_named_to_named_survives_reindex() {
                 let g_id = post
                     .snapshot
                     .graph_registry
-                    .graph_id_for_iri(g)
+                    .assigned_graph_id(g)
                     .expect("registered graph");
                 let anns = support::decode_annotations_for_subject(
                     &post,
@@ -428,7 +428,7 @@ async fn transfer_default_to_named_synthesized_anchor_survives_reindex() {
             let g2_id = post
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri(g2)
+                .assigned_graph_id(g2)
                 .expect("registered graph");
             for g_id in [0, g2_id] {
                 let anns = support::decode_annotations_for_subject(
@@ -588,7 +588,7 @@ async fn indexed_named_graph_annotation_stays_writable() {
         .ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri("http://example.org/claims-graph")
+        .assigned_graph_id("http://example.org/claims-graph")
         .expect("registered graph");
     let anns =
         support::decode_annotations_for_subject(&both.ledger, g_id, "http://example.org/alice")

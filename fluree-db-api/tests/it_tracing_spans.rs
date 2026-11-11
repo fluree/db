@@ -1076,13 +1076,16 @@ async fn ac9_cyclic_bgp_operator_spans() {
 
 /// Seed + reindex + one novelty commit against a file-backed ledger, so a
 /// query's scan open takes the binary path and runs `overlay_translate`
-/// (memory-only ledgers never open a binary cursor).
+/// (memory-only ledgers never open a binary cursor). No background indexer:
+/// one that indexed the novelty commit before the query would leave the scan
+/// nothing to translate.
 #[cfg(feature = "native")]
 async fn seed_overlay_ledger() -> (fluree_db_api::Fluree, tempfile::TempDir) {
     use fluree_db_api::ReindexOptions;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
         .build()
         .expect("build");
     let ledger = fluree

@@ -48,7 +48,7 @@ graph.
 
 | Option | Description |
 |--------|-------------|
-| `--graph <iri>` | Validate a named data graph instead of the default graph |
+| `--graph <iri>` | Validate a named data graph instead of the default graph. It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl-across-graphs.md) graphs the ledger config lists for it |
 | `--shacl <file>` | Shapes file (Turtle, N-Triples or JSON-LD; TriG is refused). **Replaces** the ledger's attached shapes by default |
 | `--shacl-graph <iri>` | Named graph in the target ledger holding the shapes (conflicts with `--shacl`) |
 | `--include-attached` | Union ad-hoc shapes with the attached shapes instead of replacing them |

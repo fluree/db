@@ -199,35 +199,27 @@ pub struct GraphSourceDropReport {
     pub warnings: Vec<String>,
 }
 
-/// Report of a `drop_named_graph` call.
+/// Report of a `drop_named_graph` call: SPARQL `DROP GRAPH`.
 ///
-/// Named-graph drops are **transactional**: they produce a normal commit that
-/// retracts every triple currently asserted in `graph_iri` at the time the
-/// drop runs. History is preserved — queries `as-of` an earlier `t` still see
-/// the graph populated; only HEAD-time queries see it empty. The graph IRI
-/// remains registered so it can be re-populated by a later insert.
-///
-/// `retracted` and `committed` together describe the outcome:
-/// - graph existed and had data → `retracted > 0`, `committed = true`
-/// - graph existed but was already empty → `retracted = 0`, `committed = false`
-/// - graph IRI was unknown → the call returns `ApiError::NotFound` instead of
-///   producing a report.
+/// The drop commits at `t = current + 1` and retracts nothing: the graph and
+/// what it held stop being queryable, at the head and as of any earlier `t`,
+/// while the commits that wrote it keep it. The graph no longer exists until
+/// something writes to it again. A graph that does not exist, the dropped one
+/// included, returns `ApiError::NotFound` instead of producing a report.
 #[derive(Debug, Clone, Default)]
 pub struct DropNamedGraphReport {
     /// Full `ledger:branch` identifier the drop targeted.
     pub ledger_id: String,
     /// Graph IRI that was dropped (echoed for clarity).
     pub graph_iri: String,
-    /// Number of flakes retracted by the drop commit. `0` if the graph was
-    /// already empty (no commit was produced in that case).
+    /// Always `0`: a drop retracts nothing. Kept for clients of the
+    /// retracting drop, which read it.
     pub retracted: usize,
-    /// Whether a new commit was created. `false` when there was nothing to
-    /// retract and the call was a no-op.
+    /// Whether a new commit was created: always, on success.
     pub committed: bool,
-    /// Current commit `t` for the branch after the drop. Equal to the
-    /// pre-drop `t` when `committed = false`.
+    /// Commit `t` of the drop.
     pub t: i64,
-    /// The drop commit's id; `None` when `committed = false`.
+    /// The drop commit's id.
     pub commit_id: Option<ContentId>,
 }
 
@@ -1318,14 +1310,14 @@ impl crate::Fluree {
         Ok(report)
     }
 
-    /// Drop a named graph from a single branch by retracting every triple
-    /// currently asserted under `graph_iri`.
+    /// Drop a named graph from a single branch: SPARQL `DROP GRAPH <iri>`.
     ///
-    /// This is a **transactional** drop: it produces one normal commit at
-    /// `t = current_t + 1` whose flakes are all retractions of the graph's
-    /// current contents. History is preserved — a query `as-of` an earlier
-    /// `t` still sees the graph populated. The graph IRI remains registered
-    /// so it can be re-populated by a later insert.
+    /// One commit at `t = current_t + 1` records the drop and retracts
+    /// nothing. The graph and its history stop being queryable — a query
+    /// `as-of` an earlier `t` naming it is refused — while the commits that
+    /// wrote it keep it, so a branch from before the drop still has it. The
+    /// graph no longer exists until something writes to it again, under the
+    /// same IRI.
     ///
     /// # Arguments
     ///
@@ -1343,28 +1335,24 @@ impl crate::Fluree {
     ///   g_id 1).
     /// - The system `config` graph (`urn:fluree:{ledger_id}#config`, g_id 2).
     ///
-    /// An unknown user graph IRI (one that is not in the ledger's graph
-    /// registry) returns `ApiError::NotFound`.
+    /// A graph that does not exist — not registered in the ledger's graph
+    /// registry, or dropped and not written since — returns
+    /// `ApiError::NotFound`.
     ///
     /// # Behavior
     ///
     /// 1. Normalizes the ledger id (`":main"` default).
     /// 2. Resolves `graph_iri` against the snapshot's `GraphRegistry`.
-    /// 3. Stages SPARQL `DROP GRAPH <iri>` ([`fluree_db_transact::Txn::drop_graph`]):
-    ///    one commit retracting every fact the graph holds, read by the
-    ///    whole-graph scan.
-    /// 4. If the graph is already empty, no commit is produced and
-    ///    `committed = false` is reported.
+    /// 3. Stages [`fluree_db_transact::Txn::drop_graph`] and commits it. The
+    ///    drop reads none of the graph's facts, so its cost does not depend
+    ///    on the graph's size.
     ///
     /// # Errors
     ///
     /// - `ApiError::Http(400)` — `graph_iri` is empty, malformed, or names a
     ///   protected system graph.
-    /// - `ApiError::NotFound` — the ledger does not exist, or `graph_iri` is
-    ///   not registered in this ledger's graph registry.
-    /// - `TransactError::WholeGraphScanTooLarge` — the graph holds more facts
-    ///   than the whole-graph scan's memory backstop
-    ///   (`FLUREE_MAX_GRAPH_SCAN_FLAKES`), refused before they are read.
+    /// - `ApiError::NotFound` — the ledger does not exist, or the graph does
+    ///   not.
     pub async fn drop_named_graph(
         &self,
         ledger_id: &str,
@@ -1412,16 +1400,16 @@ impl crate::Fluree {
         info!(ledger_id = %ledger_id, graph_iri = %graph_iri, "Dropping named graph");
 
         let handle = self.ledger_cached(&ledger_id).await?;
-        let pre_drop_t = handle.t().await;
         let view = handle.snapshot().await;
         let snapshot = &view.snapshot;
 
         let g_id = snapshot
             .graph_registry
-            .graph_id_for_iri(graph_iri)
+            .assigned_graph_id(graph_iri)
+            .filter(|g_id| !snapshot.graph_registry.is_dropped(*g_id))
             .ok_or_else(|| {
                 ApiError::NotFound(format!(
-                    "Named graph '{graph_iri}' is not registered in ledger '{ledger_id}'"
+                    "Named graph '{graph_iri}' does not exist in ledger '{ledger_id}'"
                 ))
             })?;
 
@@ -1435,36 +1423,23 @@ impl crate::Fluree {
 
         drop(view);
 
-        // `DROP GRAPH`, not `DELETE { GRAPH <g> { ?s ?p ?o } } WHERE { … }`:
-        // the WHERE form matches every fact with no ceiling before the commit
-        // refuses an oversized delta, while the whole-graph scan refuses a
-        // graph past its backstop before reading it.
         let txn = fluree_db_transact::Txn::drop_graph(graph_iri);
         let result = self.stage(&handle).txn(txn).execute().await?;
-        let retracted = result.receipt.flake_count;
-        let committed = retracted > 0;
-        let new_t = if committed {
-            result.receipt.t
-        } else {
-            pre_drop_t
-        };
 
         info!(
             ledger_id = %ledger_id,
             graph_iri = %graph_iri,
-            retracted,
-            committed,
-            t = new_t,
+            t = result.receipt.t,
             "Named graph dropped",
         );
 
         Ok(DropNamedGraphReport {
             ledger_id: ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
-            retracted,
-            committed,
-            t: new_t,
-            commit_id: committed.then(|| result.receipt.commit_id.clone()),
+            retracted: 0,
+            committed: true,
+            t: result.receipt.t,
+            commit_id: Some(result.receipt.commit_id),
         })
     }
 
@@ -1684,7 +1659,7 @@ impl crate::Fluree {
         };
         let handle = self.ledger_cached(ledger_id).await?;
         let ledger = handle.snapshot().await.to_ledger_state();
-        let Some(g_id) = ledger.snapshot.graph_registry.graph_id_for_iri(iri) else {
+        let Some(g_id) = ledger.snapshot.graph_registry.assigned_graph_id(iri) else {
             return Ok(false);
         };
         if g_id < FIRST_USER_GRAPH_ID {
@@ -2804,7 +2779,35 @@ impl crate::Fluree {
         // index can't be loaded (e.g. first-ever reindex of a commits-only
         // ledger) we fall back to empty — only the `@fulltext` datatype path
         // will contribute entries, which matches pre-config behavior.
-        if let Some(state) = ledger_state.as_ref() {
+        //
+        // An index from before config graphs were read across ledgers can
+        // hold one as an ordinary graph, where no config is read. The rebuild
+        // reads it as the config graph, so its full-text settings are read
+        // from the commits as well.
+        let from_commits = match ledger_state.as_ref() {
+            Some(state) if state.snapshot.graph_registry.has_config_in_user_slot() => {
+                let mut unindexed = record.clone();
+                unindexed.index_head_id = None;
+                let loaded = match self.branched_content_store(&ledger_id).await {
+                    Ok(store) => fluree_db_ledger::LedgerState::load_with_store(store, unindexed)
+                        .await
+                        .map_err(ApiError::from),
+                    Err(e) => Err(e),
+                };
+                match loaded {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "reindex: failed to load the commits for the config read; configured fulltext properties will be skipped"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(state) = from_commits.as_ref().or(ledger_state.as_ref()) {
             // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
             // first-ever reindex (no prior index, all config in novelty)
             // the config query isn't filtered out by

@@ -402,6 +402,11 @@ pub struct ExecutionContext<'a> {
     /// by an EXACT `rr:class` match and a subclass-entailed subject would be
     /// silently dropped. Defaults to `false` (no reasoning).
     pub reasoning_active: bool,
+    /// The reasoning materialization's translated overlay ops, shared across
+    /// the queries reading it (see [`crate::reasoning_ops`]). Set with
+    /// `reasoning_active` when the query has derived facts; propagated across
+    /// per-graph derivations, which use it only while reading its overlay.
+    pub reasoning_ops: Option<crate::reasoning_ops::ReasoningOpsHandle>,
     /// The snapshot this context was originally constructed from.
     ///
     /// Equal to `active_snapshot` in the common single-graph case. In per-graph
@@ -532,6 +537,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
@@ -594,6 +600,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
@@ -660,6 +667,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
@@ -715,6 +723,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
@@ -769,6 +778,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
@@ -825,6 +835,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
@@ -1469,15 +1480,47 @@ impl<'a> ExecutionContext<'a> {
     /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
     /// names no graph, or it names a reserved system graph or the default graph
     /// (the ledger's own address, even if a registered graph shares the text).
+    ///
+    /// A graph dropped as of `to_t` names no graph here either, as one that
+    /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
         match self.single_db_graph_position(iri)? {
             fluree_db_core::GraphPosition::Registered { g_id, .. }
-                if g_id >= FIRST_USER_GRAPH_ID =>
+                if g_id >= FIRST_USER_GRAPH_ID
+                    && self
+                        .active_snapshot
+                        .graph_registry
+                        .visible_at(g_id, self.to_t) =>
             {
                 Some(g_id)
             }
             _ => None,
         }
+    }
+
+    /// Refuse a `GRAPH <iri>` naming a user graph that a commit after `to_t`
+    /// dropped: the query asks what the graph held then, which the drop took,
+    /// and reading that as an empty graph would answer something else.
+    pub fn refuse_dropped_graph(&self, iri: &str) -> crate::error::Result<()> {
+        if !self.active_snapshot.graph_registry.has_drops() {
+            return Ok(());
+        }
+        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
+            self.single_db_graph_position(iri)
+        {
+            if let Some(floor) = self
+                .active_snapshot
+                .graph_registry
+                .drop_after(g_id, self.to_t)
+            {
+                return Err(crate::error::QueryError::GraphDropped {
+                    graph: iri.to_string(),
+                    floor,
+                    t: self.to_t,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
@@ -1502,7 +1545,7 @@ impl<'a> ExecutionContext<'a> {
         let registry = &self.active_snapshot.graph_registry;
         let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
         registry
-            .iter_entries()
+            .iter_visible_entries(self.to_t)
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
             .filter_map(|(g, iri)| {
                 target
@@ -1564,6 +1607,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
@@ -1629,6 +1673,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
@@ -1690,6 +1735,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             // A fresh per-graph scope: dataset members are stamped at the
             // member boundary by their owning `DatasetOperator`, and the
@@ -1792,6 +1838,12 @@ impl<'a> ExecutionContext<'a> {
     /// Force eager materialization of binary-scan bindings.
     pub fn with_eager_materialization(mut self) -> Self {
         self.eager_materialization = true;
+        self
+    }
+
+    /// See [`reasoning_ops`](Self::reasoning_ops).
+    pub fn with_reasoning_ops(mut self, ops: crate::reasoning_ops::ReasoningOpsHandle) -> Self {
+        self.reasoning_ops = Some(ops);
         self
     }
 

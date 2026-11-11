@@ -270,6 +270,40 @@ pub enum TransactError {
     )]
     DefaultGraphNameAsGraph,
 
+    /// A write named the config graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own config graph, which a
+    /// write names by the branch's own config graph IRI or `config`. The graph
+    /// registry reads any ledger's config graph IRI as this ledger's config
+    /// graph only so that history written under another name (a branch's
+    /// source, a copy) replays into it.
+    #[error(
+        "<{graph_iri}> is the config graph of '{named}', not of this ledger; \
+         write this ledger's config to <{own}> or the `config` graph"
+    )]
+    OtherLedgersConfigGraph {
+        /// The config graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+        /// This ledger's own config graph IRI.
+        own: String,
+    },
+
+    /// A write named the txn-meta graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own txn-meta graph, which no
+    /// write names: a transaction adds metadata to its own commit in a
+    /// `#txn-meta` block.
+    #[error(
+        "<{graph_iri}> is the txn-meta graph of '{named}', not of this ledger; a \
+         transaction adds metadata to its own commit in a `#txn-meta` block"
+    )]
+    OtherLedgersTxnMetaGraph {
+        /// The txn-meta graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+    },
+
     /// A bulk RDF import (`fluree create --from`, the server's source-import
     /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
     ///
@@ -301,6 +335,15 @@ pub enum TransactError {
     #[error("source graph <{graph_iri}> does not exist for ADD/COPY/MOVE; use SILENT to ignore")]
     SourceGraphNotFound {
         /// The missing source graph IRI the transfer attempted to read.
+        graph_iri: String,
+    },
+
+    /// A `DROP GRAPH` named a graph that does not exist: never registered, or
+    /// dropped already and not written since. An error unless `SILENT`, per
+    /// SPARQL 1.1 Update §3.2.2.
+    #[error("graph <{graph_iri}> does not exist; use DROP SILENT to ignore")]
+    GraphNotFound {
+        /// The graph IRI the drop named.
         graph_iri: String,
     },
 

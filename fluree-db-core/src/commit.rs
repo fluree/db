@@ -219,6 +219,20 @@ pub struct Commit {
     /// - `2+`: user-defined named graphs
     pub graph_delta: HashMap<GraphId, String>,
 
+    /// Graphs this commit drops, by IRI, ascending; the default graph is
+    /// [`crate::DEFAULT_GRAPH_IRI`], which no named graph may take.
+    ///
+    /// A dropped graph's facts before this commit's `t` are no longer
+    /// queryable, at the head or as of any earlier `t`; the commits that wrote
+    /// them keep them. The drops apply before the commit's `graph_delta` and
+    /// flakes, so a commit can drop a graph and write it afresh: writing into a
+    /// dropped graph registers it again, under the same g_id. The default
+    /// graph can be dropped this way and stays the default graph.
+    ///
+    /// By IRI, as replay reads `graph_delta`: a reader numbers graphs its own
+    /// way (a rebuilt index assigns them in the order it meets them).
+    pub graph_drops: Vec<String>,
+
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<crate::ns_encoding::NsSplitMode>,
@@ -239,6 +253,7 @@ impl Commit {
             commit_signatures: Vec::new(),
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
+            graph_drops: Vec::new(),
             ns_split_mode: None,
         }
     }
@@ -361,6 +376,9 @@ pub struct CommitEnvelope {
     /// Used by `ApiLedgerConfigProvider` to short-circuit when the config
     /// graph was never registered anywhere in the chain.
     pub graph_delta: HashMap<GraphId, String>,
+
+    /// Graphs this commit drops. Same shape as [`Commit::graph_drops`].
+    pub graph_drops: Vec<String>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
@@ -507,16 +525,17 @@ pub enum GraphRegistrationProbe {
 }
 
 /// Probe the commit DAG envelope-only to discover whether a named graph
-/// IRI was ever registered, and at what `t` it first appeared.
+/// IRI `names_graph` accepts was ever registered, and at what `t` it first
+/// appeared.
 ///
 /// Walks the chain via byte-range envelope reads (~128 KiB per envelope on
 /// range-capable backends), inspects each envelope's `graph_delta` for
-/// `graph_iri`, and returns:
+/// such an IRI, and returns:
 ///
 /// - [`Found(t)`](GraphRegistrationProbe::Found) — the smallest `t`
-///   where the IRI appears in any commit's `graph_delta`.
+///   where one appears in any commit's `graph_delta`.
 /// - [`NotFound`](GraphRegistrationProbe::NotFound) — every commit was a
-///   v4 envelope and none registered the IRI.
+///   v4 envelope and none registered one.
 /// - [`Inconclusive`](GraphRegistrationProbe::Inconclusive) — at least one
 ///   envelope was v3 (or an unknown future version) and could not be
 ///   inspected for `graph_delta`. Walk short-circuits and returns
@@ -543,7 +562,7 @@ pub enum GraphRegistrationProbe {
 pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
-    graph_iri: &str,
+    names_graph: impl Fn(&str) -> bool,
 ) -> Result<GraphRegistrationProbe> {
     let mut earliest: Option<i64> = None;
     let mut frontier = vec![head_id.clone()];
@@ -565,7 +584,7 @@ pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
         if version != codec::VERSION {
             return Ok(GraphRegistrationProbe::Inconclusive);
         }
-        if envelope.graph_delta.values().any(|iri| iri == graph_iri) {
+        if envelope.graph_delta.values().any(|iri| names_graph(iri)) {
             earliest = Some(match earliest {
                 Some(e) => e.min(envelope.t),
                 None => envelope.t,
@@ -627,9 +646,14 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+) -> Result<(
+    Vec<(i64, ContentId)>,
+    crate::ns_encoding::NsSplitMode,
+    Vec<CommitGraphLifecycle>,
+)> {
     let mut result = Vec::new();
     let mut split_mode = crate::ns_encoding::NsSplitMode::default();
+    let mut lifecycles = Vec::new();
     let mut next = Some(head_id.clone());
 
     while let Some(cid) = next {
@@ -652,6 +676,13 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         if let Some(mode) = envelope.ns_split_mode {
             split_mode = mode;
         }
+        if !envelope.graph_drops.is_empty() || !envelope.graph_delta.is_empty() {
+            lifecycles.push(CommitGraphLifecycle {
+                t: envelope.t,
+                drops: envelope.graph_drops.clone(),
+                written: envelope.graph_delta.values().cloned().collect(),
+            });
+        }
         // Given that invariant the parent's `t` is at most this one's minus
         // one, so once that is at or below the stop point the parent is out
         // of range and is never fetched.
@@ -663,7 +694,20 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         result.push((envelope.t, cid));
     }
 
-    Ok((result, split_mode))
+    Ok((result, split_mode, lifecycles))
+}
+
+/// One commit's graph lifecycle, as the first-parent walk reads it from the
+/// envelope: the graphs it drops (`Commit::graph_drops`) and the graphs its
+/// `graph_delta` writes.
+#[derive(Debug, Clone)]
+pub struct CommitGraphLifecycle {
+    /// The commit's `t`.
+    pub t: i64,
+    /// The graphs it drops, by IRI.
+    pub drops: Vec<String>,
+    /// The graphs its `graph_delta` writes, by IRI.
+    pub written: Vec<String>,
 }
 
 /// Walk a branch's first-parent lineage from a head CID, collecting
@@ -686,17 +730,23 @@ pub async fn collect_first_parent_cids<C: ContentStore + ?Sized>(
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<Vec<(i64, ContentId)>> {
-    let (cids, _split_mode) = walk_first_parent(store, head_id, stop_at_t).await?;
+    let (cids, _split_mode, _lifecycles) = walk_first_parent(store, head_id, stop_at_t).await?;
     Ok(cids)
 }
 
 /// Like [`collect_first_parent_cids`], and also return the authoritative
-/// `NsSplitMode` for the lineage.
+/// `NsSplitMode` for the lineage and, newest first, the graph lifecycle of
+/// every commit that drops or registers a graph — what a rebuild needs to
+/// leave out what the drops took.
 pub async fn collect_first_parent_cids_with_split_mode<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+) -> Result<(
+    Vec<(i64, ContentId)>,
+    crate::ns_encoding::NsSplitMode,
+    Vec<CommitGraphLifecycle>,
+)> {
     walk_first_parent(store, head_id, stop_at_t).await
 }
 
@@ -993,6 +1043,10 @@ pub struct BranchSide {
     /// Its remaining flakes copy the other side's changes, so a caller that
     /// folds or replays `commits` must leave those out.
     pub own: Vec<ContentId>,
+    /// Whether one of `commits` drops a graph (`Commit::graph_drops`). A drop
+    /// is no set of flakes to fold or replay onto other history, so an
+    /// operation that would do either refuses.
+    pub drops_graphs: bool,
 }
 
 /// What two branches changed since they last shared a commit. Built by
@@ -1162,16 +1216,22 @@ fn line_above(line: &[(ContentId, CommitEnvelope)], other: &Ancestry) -> BranchS
     let above = line.iter().take_while(|(cid, _)| !other.contains(cid));
     let mut commits = Vec::new();
     let mut own = Vec::new();
+    let mut drops_graphs = false;
     for (cid, envelope) in above {
         let merged_in = &envelope.parents[1.min(envelope.parents.len())..];
         if merged_in.is_empty() || !merged_in.iter().all(|p| other.contains(p)) {
             own.push(cid.clone());
         }
+        drops_graphs |= !envelope.graph_drops.is_empty();
         commits.push(cid.clone());
     }
     commits.reverse();
     own.reverse();
-    BranchSide { commits, own }
+    BranchSide {
+        commits,
+        own,
+        drops_graphs,
+    }
 }
 
 // =============================================================================
@@ -1661,6 +1721,7 @@ mod tests {
             namespace_delta: HashMap::from([(100, "ex:".to_string())]),
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
+            graph_drops: Vec::new(),
             ns_split_mode: None,
         };
 

@@ -3161,7 +3161,7 @@ impl ScopeRegistry {
     /// The graph `iri` names in the ledger, if the ledger registers it.
     pub(crate) fn graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
         match self {
-            Self::Ledger(names) => names.graph_id_for_iri(iri),
+            Self::Ledger(names) => names.assigned_graph_id(iri),
             Self::Empty => None,
             #[cfg(test)]
             Self::Fixed(ids) => ids.get(iri).copied(),
@@ -4599,6 +4599,7 @@ pub(crate) async fn load_ledger_or_missing(
     // actually loaded: SSE watermarks carry canonical ids, and a request that
     // spelled the ledger `mydb` would otherwise never find one.
     // If no watermark available (SSE hasn't seen ledger), treat as current (lenient policy)
+    let mut handle = handle;
     if let Some(watermark) = peer_state.watermark(handle.id()) {
         match handle.check_freshness(&watermark).await {
             FreshnessCheck::Stale => {
@@ -4613,6 +4614,13 @@ pub(crate) async fn load_ledger_or_missing(
                 if let Some(mgr) = fluree.ledger_manager() {
                     mgr.reload(handle.id()).await.map_err(ServerError::Api)?;
                     state.refresh_counter.fetch_add(1, Ordering::Relaxed);
+                    // A reload swaps the cached handle's state in place, but one
+                    // evicted meanwhile leaves this handle as it was: the cache's
+                    // current handle is the reloaded one, or loads afresh.
+                    handle = fluree
+                        .ledger_cached(handle.id())
+                        .await
+                        .map_err(ServerError::Api)?;
                 }
             }
             FreshnessCheck::Current => {

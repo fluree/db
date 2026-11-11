@@ -5,7 +5,7 @@
 //! and geometry arenas to CAS.
 
 use fluree_db_binary_index::SpatialArenaRef;
-use fluree_db_core::{ContentId, ContentKind, GraphId, Storage};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, GraphId};
 
 use crate::error::{IndexerError, Result};
 use crate::run_index;
@@ -18,22 +18,20 @@ use crate::run_index;
 /// Two-phase approach:
 /// 1. Build the index and collect all serialized blobs with locally-computed
 ///    SHA-256 hashes (synchronous — no async needed).
-/// 2. Upload all blobs to CAS using `content_write_bytes` (async).
+/// 2. Upload all blobs to CAS using `ContentStore::put` (async).
 ///
 /// This avoids re-entering `block_on` from within a sync closure, which would
 /// deadlock inside the `spawn_blocking` + `handle.block_on()` pattern.
 ///
+/// `on_put` sees each uploaded blob and root, e.g. to seed a local artifact cache.
+///
 /// Returns per-graph spatial arena refs for inclusion in `IndexRoot`.
-// Kept for: full-rebuild spatial upload pipeline (rebuild.rs collects spatial
-// entries but does not yet call this; wiring deferred to rebuild-spatial milestone).
-// Use when: rebuild.rs is extended to upload spatial indexes after Phase C remap.
-#[expect(dead_code)]
-pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
+pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
     entries: &[crate::spatial_hook::SpatialEntry],
     predicates: &run_index::PredicateDict,
     ledger_id: &str,
-    namespace: &fluree_db_core::StorageNamespace,
-    storage: &S,
+    content_store: &C,
+    on_put: impl Fn(&ContentId, &[u8]),
 ) -> Result<Vec<(GraphId, Vec<SpatialArenaRef>)>> {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -98,14 +96,16 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
 
         // Phase 2: Upload all collected blobs to CAS.
         for (expected_hash, blob_bytes) in &pending_blobs {
-            let cas_result = storage
-                .content_write_bytes(ContentKind::SpatialIndex, namespace, blob_bytes)
+            let cid = content_store
+                .put(ContentKind::SpatialIndex, blob_bytes)
                 .await
                 .map_err(|e| IndexerError::StorageWrite(format!("spatial CAS write: {e}")))?;
             debug_assert_eq!(
-                &cas_result.content_hash, expected_hash,
+                &cid.digest_hex(),
+                expected_hash,
                 "CAS content_hash mismatch for spatial blob"
             );
+            on_put(&cid, blob_bytes);
         }
 
         // Construct ContentIds from the content hashes.
@@ -139,17 +139,11 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
         // Serialize SpatialIndexRoot as JSON and write to CAS.
         let root_json = serde_json::to_vec(&write_result.root)
             .map_err(|e| IndexerError::Other(format!("spatial root serialize: {e}")))?;
-        let root_cas = storage
-            .content_write_bytes(ContentKind::SpatialIndex, namespace, &root_json)
+        let root_cid = content_store
+            .put(ContentKind::SpatialIndex, &root_json)
             .await
             .map_err(|e| IndexerError::StorageWrite(format!("spatial root CAS write: {e}")))?;
-        let root_cid = ContentId::from_hex_digest(spatial_codec, &root_cas.content_hash)
-            .ok_or_else(|| {
-                IndexerError::Other(format!(
-                    "invalid spatial root hash: {}",
-                    root_cas.content_hash
-                ))
-            })?;
+        on_put(&root_cid, &root_json);
 
         per_graph.entry(g_id).or_default().push(SpatialArenaRef {
             p_id,

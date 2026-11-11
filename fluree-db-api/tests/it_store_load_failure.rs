@@ -27,8 +27,9 @@ fn build(db: &Path, store_load_retry: Duration) -> fluree_db_api::Fluree {
 }
 
 /// A store that cannot load: the branch of the subject reverse dictionary
-/// of `ledger_id`'s published root, which a store load reads first, moved
-/// aside. [`Self::repair`] puts it back.
+/// of `ledger_id`'s published root (or of the root [`Self::hide_root`]
+/// names), which a store load reads first, moved aside. [`Self::repair`]
+/// puts it back.
 struct BrokenStore {
     file: PathBuf,
     aside: PathBuf,
@@ -45,15 +46,13 @@ impl BrokenStore {
         Self::hide_root(fluree, db, ledger_id, &record.index_head_id.unwrap()).await
     }
 
-    /// [`Self::hide`] for the root `root_id`, published or not.
     async fn hide_root(
         fluree: &fluree_db_api::Fluree,
         db: &Path,
         ledger_id: &str,
         root_id: &fluree_db_core::ContentId,
     ) -> Self {
-        let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
-        let store = fluree.content_store(&namespace);
+        let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
         let bytes = store.get(root_id).await.unwrap();
         let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
         let digest = root.dict_refs.subject_reverse.branch.digest_hex();
@@ -212,11 +211,12 @@ async fn a_reload_that_cannot_load_the_store_keeps_the_ledger_it_has() {
     let handle = fluree.ledger_cached(id).await.unwrap();
     assert!(handle.snapshot().await.binary_store.is_some());
 
-    // The rebuilt root's store breaks before the root is published. This
-    // connection's cache listener applies a published root by itself, and
-    // a root it had already applied would leave the reload nothing to read.
+    // The new root's store is broken before it is published: the publish
+    // has the cache's event listener install the root on its own, and a
+    // store it loaded first would be reused by the reload, which then reads
+    // nothing from storage.
     let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
-    let rebuilt = fluree_db_indexer::rebuild_index_from_commits(
+    let built = fluree_db_indexer::rebuild_index_from_commits(
         fluree.branched_content_store(id).await.unwrap(),
         id,
         &record,
@@ -224,8 +224,8 @@ async fn a_reload_that_cannot_load_the_store_keeps_the_ledger_it_has() {
     )
     .await
     .unwrap();
-    let broken = BrokenStore::hide_root(&fluree, db.path(), id, &rebuilt.root_id).await;
-    support::publish_built_index(&fluree, id, rebuilt.index_t, &rebuilt.root_id).await;
+    let broken = BrokenStore::hide_root(&fluree, db.path(), id, &built.root_id).await;
+    support::publish_built_index(&fluree, id, built.index_t, &built.root_id).await;
     let manager = fluree.ledger_manager().expect("caching enabled");
     load_failure(
         manager

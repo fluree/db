@@ -96,6 +96,7 @@
   - [Access control policies](guides/cookbook-policies.md)
   - [Sharing data with downstream consumers](guides/sharing-data.md)
   - [SHACL validation](guides/cookbook-shacl.md)
+  - [SHACL across named graphs](guides/cookbook-shacl-across-graphs.md)
   - [Edge annotations](guides/cookbook-edge-annotations.md)
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
   - [Custom stages in Python](guides/custom-stages-python.md)
