@@ -24,8 +24,9 @@
 //!
 //! A purge then deletes the originals and every other copy of what the
 //! erasure removed (see [`purge`]).
-//! Supported: a single node with file storage, v4 commits with SHA2-256
-//! CIDs. Requests elsewhere are refused.
+//! Supported: file storage, on a single node or a cluster whose members
+//! share it, and v4 commits with SHA2-256 CIDs. Requests elsewhere are
+//! refused.
 
 mod activation;
 pub(crate) mod index;
