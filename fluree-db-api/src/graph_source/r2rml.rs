@@ -1288,7 +1288,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
         config.validate()?;
-        let model_warnings = self
+        let mut model_warnings = self
             .validate_source_model(config.iceberg.model.as_deref())
             .await?;
         self.refuse_direct_storage_the_policy_refuses(
@@ -1310,6 +1310,9 @@ impl crate::Fluree {
         // query's alias.
         if let Some(compiled) = &registered.compiled {
             table_names = crate::ledger_info::mapping_source_tables(compiled);
+            if config.iceberg.model.is_some() {
+                model_warnings.extend(fluree_db_query::r2rml::class_overlap_warnings(compiled));
+            }
         }
         let mapping_address = registered.address;
         let table_count = table_names.len();

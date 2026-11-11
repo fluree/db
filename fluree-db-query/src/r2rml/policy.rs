@@ -202,7 +202,42 @@ impl ClassScope {
     }
 }
 
-/// The prefixes a class `tm` derives from its row starts with (see
+/// Warnings, for a source registered with a model, about subjects whose
+/// classes one row cannot show: each pair of triples maps whose subjects are
+/// not provably apart and that declare different classes, or where one derives
+/// classes from its row. A class-targeted view policy decides such a map's
+/// rows over every class set its subjects could hold, hiding rows a decision
+/// on one row's classes would show (or, where the classes come from rows the
+/// scan does not read, refusing the query).
+pub fn class_overlap_warnings(mapping: &CompiledR2rmlMapping) -> Vec<String> {
+    let scope = ClassScope::of(mapping);
+    let mut maps: Vec<&TriplesMap> = mapping.triples_maps.values().collect();
+    maps.sort_by(|a, b| a.iri.cmp(&b.iri));
+    let mut warnings = Vec::new();
+    for (i, a) in maps.iter().enumerate() {
+        for b in &maps[i + 1..] {
+            if a.subjects_provably_disjoint(b) {
+                continue;
+            }
+            let differ = scope.statics.get(&a.iri) != scope.statics.get(&b.iri)
+                || scope.derives.contains_key(&a.iri)
+                || scope.derives.contains_key(&b.iri);
+            if differ {
+                warnings.push(format!(
+                    "triples maps <{}> and <{}> can mint the same subjects with different \
+                     classes; a class-targeted view policy decides their rows over every class \
+                     set a subject could hold, and may hide rows a native ledger would show \
+                     (give them subject templates that keep them apart, or target such \
+                     policies by property or subject)",
+                    a.iri, b.iri
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+/// The prefixes a class `tm` derives from its row starts with (see/// The prefixes a class `tm` derives from its row starts with (see
 /// [`ClassScope::derives`]); `None` (outer) when it derives none.
 fn derived_class_prefixes(
     mapping: &CompiledR2rmlMapping,
@@ -1218,6 +1253,133 @@ mod tests {
             predicate_map: PredicateMap::Constant(pred.to_string()),
             object_map,
         }
+    }
+
+    fn templated(
+        iri: &str,
+        template: &str,
+        classes: &[&str],
+        poms: Vec<PredicateObjectMap>,
+    ) -> TriplesMap {
+        let mut map = tm(iri, classes, poms);
+        map.subject_map.template = Some(template.to_string());
+        map
+    }
+
+    /// The classes a subject may hold beyond a row's own: overlapping maps'
+    /// declared classes, and classes a deriving map's template can mint where
+    /// a row may not show them; only targeted classes count, and none without
+    /// a targeted class.
+    #[test]
+    fn extra_classes_come_from_overlap_and_unproven_derivation() {
+        let us = templated(
+            "http://ex/us",
+            "http://ex/c/{id}",
+            &["http://ex/Customer"],
+            vec![],
+        );
+        let eu = templated(
+            "http://ex/eu",
+            "http://ex/c/{id}",
+            &["http://ex/Restricted"],
+            vec![],
+        );
+        let apart = templated(
+            "http://ex/other",
+            "http://ex/o/{id}",
+            &["http://ex/Secret"],
+            vec![],
+        );
+        let hist = templated(
+            "http://ex/hist",
+            "http://ex/h/{id}",
+            &[],
+            vec![pom(
+                rdf::TYPE,
+                ObjectMap::Template {
+                    template: "http://ex/city/{city}".to_string(),
+                    columns: vec!["city".to_string()],
+                    term_type: fluree_db_r2rml::mapping::TermType::Iri,
+                    datatype: None,
+                    language: None,
+                },
+            )],
+        );
+        let mapping = CompiledR2rmlMapping::new(vec![us, eu, apart, hist]);
+        let mut scope = ClassScope::of(&mapping);
+        let own = |c: &[&str]| c.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let targeted = own(&[
+            "http://ex/Restricted",
+            "http://ex/Secret",
+            "http://ex/city/Boston",
+            "http://ex/Other",
+        ]);
+        assert_eq!(
+            scope.extra("http://ex/us", &own(&["http://ex/Customer"]), &targeted),
+            (own(&["http://ex/Restricted"]), vec![]),
+            "an overlapping map's class; a provably apart map's is not"
+        );
+        assert_eq!(
+            scope.extra("http://ex/us", &own(&["http://ex/Customer"]), &[]),
+            (vec![], vec![]),
+            "no targeted class, nothing to consider"
+        );
+        assert_eq!(
+            scope.extra(
+                "http://ex/hist",
+                &own(&["http://ex/city/Denver"]),
+                &targeted
+            ),
+            (vec![], own(&["http://ex/city/Boston"])),
+            "only classes the template can mint"
+        );
+        scope.unique.insert("http://ex/hist".to_string(), true);
+        assert_eq!(
+            scope.extra(
+                "http://ex/hist",
+                &own(&["http://ex/city/Denver"]),
+                &targeted
+            ),
+            (vec![], vec![]),
+            "a subject one row's shows its derived classes"
+        );
+    }
+
+    #[test]
+    fn overlap_warnings_name_differently_classed_overlapping_maps() {
+        let mapping = CompiledR2rmlMapping::new(vec![
+            templated(
+                "http://ex/us",
+                "http://ex/c/{id}",
+                &["http://ex/Customer"],
+                vec![],
+            ),
+            templated(
+                "http://ex/eu",
+                "http://ex/c/{id}",
+                &["http://ex/Restricted"],
+                vec![],
+            ),
+            templated(
+                "http://ex/same",
+                "http://ex/c/{id}",
+                &["http://ex/Customer"],
+                vec![],
+            ),
+            templated(
+                "http://ex/other",
+                "http://ex/o/{id}",
+                &["http://ex/Secret"],
+                vec![],
+            ),
+        ]);
+        let warnings = class_overlap_warnings(&mapping);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("http://ex/eu")),
+            "{warnings:?}"
+        );
+        assert!(!warnings.iter().any(|w| w.contains("http://ex/other")));
     }
 
     #[test]
