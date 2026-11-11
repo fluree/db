@@ -458,7 +458,6 @@ async fn a_shared_predicate_is_decided_on_each_subjects_classes() {
 /// R5: a map declaring a schema class beside a data class decides each
 /// `rdf:type` triple on the class it states.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn each_type_triple_is_decided_on_the_class_it_states() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();

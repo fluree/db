@@ -276,12 +276,28 @@ impl R2rmlPolicyGate {
                 .collect();
             preds.push(rdf::TYPE.to_string());
             for pred in preds {
-                let otherwise = self.allows(ctx, tm, None, &pred, &[]).await?;
+                // A type triple is decided on the class it states; a map
+                // stating classes whose triples are decided apart is not one
+                // verdict, and the lane declines it.
+                let mut decided: Option<bool> = None;
+                if pred == rdf::TYPE {
+                    for class in static_classes(tm) {
+                        let allowed = self.allows(ctx, tm, None, &pred, Some(&class), &[]).await?;
+                        if decided.is_some_and(|d| d != allowed) {
+                            return Ok(None);
+                        }
+                        decided = Some(allowed);
+                    }
+                }
+                let otherwise = match decided {
+                    Some(allowed) => allowed,
+                    None => self.allows(ctx, tm, None, &pred, None, &[]).await?,
+                };
                 let mut classes = Vec::new();
                 if by_class {
                     for class in self.policy_classes.clone() {
                         let allowed = self
-                            .allows(ctx, tm, None, &pred, std::slice::from_ref(&class))
+                            .allows(ctx, tm, None, &pred, None, std::slice::from_ref(&class))
                             .await?;
                         if allowed != otherwise {
                             classes.push((class, allowed));
@@ -290,7 +306,9 @@ impl R2rmlPolicyGate {
                 }
                 let mut by_subject = Vec::new();
                 for subject in &subjects {
-                    let allowed = self.allows(ctx, tm, Some(subject), &pred, &[]).await?;
+                    let allowed = self
+                        .allows(ctx, tm, Some(subject), &pred, None, &[])
+                        .await?;
                     if allowed != otherwise {
                         by_subject.push((subject.clone(), allowed));
                     }
@@ -333,7 +351,28 @@ impl R2rmlPolicyGate {
             return Ok(true);
         }
         for pred in required_predicates(pattern, tm) {
-            if !self.allows(ctx, tm, None, &pred, &[]).await? {
+            // A type triple is decided on the class it states: the map can
+            // yield when one of the classes the pattern can read is viewable.
+            let objects: Vec<Option<String>> = if pred == rdf::TYPE {
+                match (&pattern.class_filter, pattern.type_var) {
+                    (Some(class), _) => vec![Some(class.clone())],
+                    (None, Some(_)) => static_classes(tm).into_iter().map(Some).collect(),
+                    (None, None) => vec![None],
+                }
+            } else {
+                vec![None]
+            };
+            let mut any = false;
+            for object in &objects {
+                if self
+                    .allows(ctx, tm, None, &pred, object.as_deref(), &[])
+                    .await?
+                {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
                 return Ok(false);
             }
         }
@@ -358,21 +397,37 @@ impl R2rmlPolicyGate {
         let type_var = pattern.type_var;
         let needs_type = type_var.is_some() && !required.iter().any(|p| p == rdf::TYPE);
         let no_classes: Vec<String> = Vec::new();
+        // The class a row's type triple states, which decides it: the class
+        // the pattern selects, else the row's projected `?type`. A pattern
+        // reading neither (a bare subject) is decided on no specific class.
+        let type_object = |row: &[(VarId, Binding)]| -> Option<String> {
+            match (&pattern.class_filter, type_var) {
+                (Some(class), _) => Some(class.clone()),
+                (None, Some(tv)) => bound_iri(row, tv).map(str::to_string),
+                (None, None) => None,
+            }
+        };
 
-        // When no view restriction targets subjects and the map derives no row
-        // classes, every input to a decision is fixed for the whole window: the
-        // subject is ignored (`allows` substitutes `any_subject`) and the class
-        // set is the map's own. Settle `required` and the projected `rdf:type`
-        // once here rather than re-asking them for each of up to a window's
-        // worth of rows; only a bound predicate variable still varies per row.
-        if !self.per_subject && row_classes.is_none() {
+        // When no view restriction targets subjects, the map derives no row
+        // classes, and no type triple's class varies by row, every input to a
+        // decision is fixed for the whole window: the subject is ignored
+        // (`allows` substitutes `any_subject`) and the class set is the map's
+        // own. Settle `required` once here rather than re-asking it for each
+        // of up to a window's worth of rows; only a bound predicate variable
+        // still varies per row.
+        let type_varies = type_var.is_some() && pattern.class_filter.is_none();
+        if !self.per_subject && row_classes.is_none() && !type_varies {
             for pred in &required {
-                if !self.allows(ctx, tm, None, pred, &no_classes).await? {
+                let object = pattern
+                    .class_filter
+                    .as_deref()
+                    .filter(|_| pred == rdf::TYPE);
+                if !self
+                    .allows(ctx, tm, None, pred, object, &no_classes)
+                    .await?
+                {
                     return Ok(Vec::new());
                 }
-            }
-            if needs_type && !self.allows(ctx, tm, None, rdf::TYPE, &no_classes).await? {
-                return Ok(Vec::new());
             }
             let Some(pv) = predicate_var else {
                 return Ok(rows);
@@ -380,7 +435,10 @@ impl R2rmlPolicyGate {
             let mut kept = Vec::with_capacity(rows.len());
             for row in rows {
                 let ok = match bound_iri(&row, pv) {
-                    Some(p) => self.allows(ctx, tm, None, p, &no_classes).await?,
+                    Some(p) => {
+                        let object = wildcard_type_object(pattern, &row, p);
+                        self.allows(ctx, tm, None, p, object, &no_classes).await?
+                    }
                     None => true,
                 };
                 if ok {
@@ -400,9 +458,11 @@ impl R2rmlPolicyGate {
                 Some(s) => Some(s),
                 None => subject_var.and_then(|sv| bound_iri(&row, sv)),
             };
+            let type_class = type_object(&row);
             let mut ok = true;
             for pred in &required {
-                if !self.allows(ctx, tm, subject, pred, classes).await? {
+                let object = type_class.as_deref().filter(|_| pred == rdf::TYPE);
+                if !self.allows(ctx, tm, subject, pred, object, classes).await? {
                     ok = false;
                     break;
                 }
@@ -410,12 +470,15 @@ impl R2rmlPolicyGate {
             if ok {
                 if let Some(pv) = predicate_var {
                     if let Some(p) = bound_iri(&row, pv) {
-                        ok = self.allows(ctx, tm, subject, p, classes).await?;
+                        let object = wildcard_type_object(pattern, &row, p);
+                        ok = self.allows(ctx, tm, subject, p, object, classes).await?;
                     }
                 }
             }
             if ok && needs_type {
-                ok = self.allows(ctx, tm, subject, rdf::TYPE, classes).await?;
+                ok = self
+                    .allows(ctx, tm, subject, rdf::TYPE, type_class.as_deref(), classes)
+                    .await?;
             }
             if ok {
                 kept.push(row);
@@ -424,22 +487,32 @@ impl R2rmlPolicyGate {
         Ok(kept)
     }
 
-    /// Whether a `(subject, predicate)` flake produced by `tm` is viewable.
-    /// `subject` is only consulted when the view set targets subjects.
+    /// Whether a `(subject, predicate, object)` flake produced by `tm` is
+    /// viewable. `subject` is only consulted when the view set targets
+    /// subjects. `object` is the class a type triple states, which a type
+    /// triple is decided on (a schema class is always viewable, as on a
+    /// native ledger); `None` for any other triple, or a type triple of no
+    /// specific class, which takes a placeholder no schema class matches.
     async fn allows(
         &mut self,
         ctx: &ExecutionContext<'_>,
         tm: &TriplesMap,
         subject: Option<&str>,
         pred: &str,
+        object: Option<&str>,
         row_classes: &[String],
     ) -> Result<bool> {
+        let object = object.filter(|_| pred == rdf::TYPE);
         let static_decision = !self.per_subject && row_classes.is_empty();
+        let cache_key = match object {
+            Some(class) => format!("{pred} {class}"),
+            None => pred.to_string(),
+        };
         if static_decision {
             if let Some(&allowed) = self
                 .static_cache
                 .get(tm.iri.as_str())
-                .and_then(|preds| preds.get(pred))
+                .and_then(|preds| preds.get(&cache_key))
             {
                 return Ok(allowed);
             }
@@ -453,15 +526,11 @@ impl R2rmlPolicyGate {
             _ => self.any_subject.clone(),
         };
         let pred_sid = encode(snapshot, pred);
-        // The object only matters for the schema-flake bypass (rdf:type whose
-        // object is itself a schema class); data rows never qualify, and
-        // `f:query` never runs here, so a class ref / placeholder suffices.
+        // The object only matters for the schema-flake bypass (an rdf:type
+        // whose object is itself a schema class); `f:query` never runs here.
         let object = if pred == rdf::TYPE {
             FlakeValue::Ref(
-                classes
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| self.any_subject.clone()),
+                object.map_or_else(|| self.any_subject.clone(), |c| encode(snapshot, c)),
             )
         } else {
             FlakeValue::Long(0)
@@ -483,10 +552,23 @@ impl R2rmlPolicyGate {
             self.static_cache
                 .entry(tm.iri.clone())
                 .or_default()
-                .insert(pred.to_string(), allowed);
+                .insert(cache_key, allowed);
         }
         Ok(allowed)
     }
+}
+
+/// The class a wildcard row's triple states when its bound predicate is
+/// `rdf:type`: the row's object.
+fn wildcard_type_object<'r>(
+    pattern: &R2rmlPattern,
+    row: &'r [(VarId, Binding)],
+    predicate: &str,
+) -> Option<&'r str> {
+    if predicate != rdf::TYPE {
+        return None;
+    }
+    pattern.object_var.and_then(|ov| bound_iri(row, ov))
 }
 
 /// Surface every `f:query` policy in the view set: it cannot run against a
