@@ -844,7 +844,7 @@ mod tests {
             matches!(objects[3], Term::Iri(Iri { value: crate::ast::IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/x")
         );
         assert!(
-            matches!(objects[4], Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+            matches!(objects[4], Term::BlankNode(BlankNode { label: l, .. }) if l.as_ref() == "fdb-1")
         );
         assert!(
             matches!(objects[5], Term::Literal(Literal { value: LiteralValue::Typed { value, .. }, .. }) if value.as_ref() == "2024-01-02")
@@ -927,7 +927,7 @@ mod tests {
             matches!(&patterns[0].object, Term::Iri(Iri { value: IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/x")
         );
         assert!(
-            matches!(&patterns[1].object, Term::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+            matches!(&patterns[1].object, Term::BlankNode(BlankNode { label: l, .. }) if l.as_ref() == "fdb-1")
         );
     }
 
