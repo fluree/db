@@ -188,6 +188,23 @@ async fn seed_twin(fluree: &Fluree) {
         .insert(twin, &json!({ "@graph": graph }))
         .await
         .expect("seed twin");
+
+    // The twin was copied through a star over every customer property, which
+    // would silently leave out a customer missing one. Count the customers on
+    // both sides by class alone, so twin agreement cannot hide a scan that
+    // drops rows.
+    for g in [LAKE, TWIN] {
+        let count = sparql_json(
+            fluree,
+            &format!("SELECT (COUNT(?c) AS ?n) FROM <{g}> WHERE {{ ?c a ex:Customer }}"),
+        )
+        .await
+        .expect("count customers");
+        assert_eq!(
+            count["results"]["bindings"][0]["n"]["value"], "50",
+            "{g}: the fixture has 50 customers"
+        );
+    }
 }
 
 async fn sparql_json(fluree: &Fluree, body: &str) -> Result<Value, String> {
@@ -393,6 +410,23 @@ async fn a_distinct_sub_select_joins_on_its_key() {
 #[tokio::test]
 async fn a_top_k_sub_select_keeps_its_slice() {
     let fluree = setup().await;
+    // The slices are compared as row sets, which is sound only when no two
+    // amounts tie at a cut: with a tie, either row is a correct answer.
+    let amounts = sparql_json(
+        &fluree,
+        &format!("SELECT ?a FROM <{LAKE}> WHERE {{ ?o ex:amount ?a }}"),
+    )
+    .await
+    .expect("amounts");
+    let amounts: Vec<&str> = amounts["results"]["bindings"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|b| b["a"]["value"].as_str().expect("amount"))
+        .collect();
+    let distinct: std::collections::HashSet<&str> = amounts.iter().copied().collect();
+    assert_eq!(amounts.len(), 200, "every order has an amount");
+    assert_eq!(distinct.len(), 200, "no two orders share an amount");
     let rows = sparql_agrees(
         &fluree,
         "SPARQL top-k",
