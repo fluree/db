@@ -34,7 +34,8 @@ use crate::migration::{
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
-    merge_heads, ns_context, parse_record, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION,
+    merge_heads, ns_context, parse_record, snapshot_index, IndexRef, NsFileV2, NsIndexFileV2,
+    NS_VERSION,
 };
 use crate::WriteBasis;
 use crate::{
@@ -980,6 +981,7 @@ impl crate::BranchLifecycle for FileNameService {
         let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
+        let index = snapshot_index(&snapshot);
 
         let outcome = self
             .storage
@@ -998,10 +1000,25 @@ impl crate::BranchLifecycle for FileNameService {
             .await?;
 
         match outcome {
-            CasOutcome::Written => Ok(()),
-            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
-            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
+            CasOutcome::Written => {}
+            CasOutcome::Aborted(true) => return Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => return Err(NameServiceError::not_found(ledger_id)),
         }
+
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        let index_address = Self::index_address(&ledger_name, &branch);
+        self.storage
+            .compare_and_swap(&index_address, move |bytes| {
+                let Some(data) = bytes else {
+                    return Ok(CasAction::Abort(()));
+                };
+                let mut file: NsIndexFileV2 = deserialize_json(data)?;
+                file.index = index.clone();
+                Ok(CasAction::Write(serialize_json(&file)?))
+            })
+            .await?;
+        Ok(())
     }
 
     async fn pending_commit_cids(

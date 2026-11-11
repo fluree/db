@@ -988,6 +988,8 @@ where
         let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
+        let index_key = self.index_key(&ledger_name, &branch);
+        let index = crate::ns_format::snapshot_index(&snapshot);
 
         let outcome = self
             .storage
@@ -1006,10 +1008,20 @@ where
             .await?;
 
         match outcome {
-            CasOutcome::Written => Ok(()),
-            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
-            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
+            CasOutcome::Written => {}
+            CasOutcome::Aborted(true) => return Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => return Err(NameServiceError::not_found(ledger_id)),
         }
+
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        self.cas_update::<NsIndexFileV2, _>(&index_key, move |existing| {
+            existing.map(|mut file| {
+                file.index = index.clone();
+                file
+            })
+        })
+        .await
     }
 }
 
@@ -2541,6 +2553,35 @@ mod tests {
             .unwrap();
         let after = ns.lookup("mydb:main").await.unwrap().unwrap();
         assert_eq!((after.index_head_id, after.index_t), (Some(index), 5));
+    }
+
+    /// A reset moves the index back, even below one in the separate index
+    /// file, which otherwise wins at an equal or higher `t`.
+    #[tokio::test]
+    async fn reset_head_moves_the_index_back() {
+        let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+        publish_commit(&ns, "mydb:main", 3, &dummy_cid("commit-3")).await;
+        let basis = ns.lookup("mydb:main").await.unwrap().unwrap().write_basis();
+        ns.publish_index_fenced("mydb:main", basis.clone(), 3, &dummy_cid("index-3"))
+            .await
+            .unwrap();
+        for (index, t) in [(Some(dummy_cid("index-1")), 1), (None, 0)] {
+            ns.reset_head_fenced(
+                "mydb:main",
+                basis.clone(),
+                crate::NsRecordSnapshot {
+                    commit_head_id: Some(dummy_cid("commit-3")),
+                    commit_t: 3,
+                    index_head_id: index.clone(),
+                    index_t: t,
+                },
+            )
+            .await
+            .unwrap();
+            let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+            assert_eq!((record.index_head_id, record.index_t), (index, t));
+        }
     }
 
     #[tokio::test]
