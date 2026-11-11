@@ -130,7 +130,7 @@ rather than missed, and the fix is to wire it in with `#[path]`.
 The env-mutation rule is **not** mechanically enforced. Detecting it means
 scanning Rust source for call shapes, which costs more in false positives and
 blind spots than review does; it is a convention, so honour it when adding a
-test. The instrumentation rule is narrower, four exact call paths, so it is
+test. The instrumentation rule is narrower, five exact call shapes, so it is
 checked (`scoped_subscribers_use_the_floor`, above).
 
 The check lives in the `fluree-test-support` crate, so adopting it in a third

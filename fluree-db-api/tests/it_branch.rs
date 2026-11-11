@@ -921,6 +921,28 @@ async fn drop_branch_with_children_deferred() {
         .unwrap();
     assert!(record.retracted);
 
+    // Users no longer see dev; the nameservice still lists it, since a
+    // soft-dropped branch is restorable and GC must protect what it reads.
+    let mut listed: Vec<String> = fluree
+        .list_branches("mydb")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, ["feature", "main"]);
+    let mut recorded: Vec<String> = fluree
+        .nameservice()
+        .branch_records("mydb")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+    recorded.sort();
+    assert_eq!(recorded, ["dev", "feature", "main"]);
+
     // feature still works (can transact)
     let feature = fluree.ledger("mydb:feature").await.unwrap();
     let txn2 = json!({
@@ -1359,4 +1381,52 @@ async fn create_branch_at_pre_fork_commit_succeeds() {
         )
         .await
         .expect("a commit before the fork is still on dev's line");
+}
+
+/// A branch's history runs through its source's commits: reindexing it reads
+/// them from the source.
+#[tokio::test]
+async fn reindexing_a_branch_reads_its_source_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let ledger = fluree.create_ledger("reindexdb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:main", "ex:name": "on main"}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("reindexdb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("reindexdb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({"@context": ctx, "@id": "ex:dev", "ex:name": "on dev"}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .reindex("reindexdb:dev", fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex the branch");
+    let rows = fluree
+        .query_connection(&json!({
+            "@context": ctx, "from": "reindexdb:dev",
+            "select": "?n", "where": {"@id": "?s", "ex:name": "?n"}
+        }))
+        .await
+        .unwrap();
+    let dev = fluree.ledger("reindexdb:dev").await.unwrap();
+    assert_eq!(
+        extract_names(&rows.to_jsonld(&dev.snapshot).unwrap()),
+        vec!["on dev", "on main"]
+    );
 }

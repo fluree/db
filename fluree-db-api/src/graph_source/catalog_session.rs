@@ -435,7 +435,7 @@ mod tests {
     use fluree_db_iceberg::io::S3IcebergStorage;
 
     fn creds(expires_in_secs: Option<i64>) -> VendedCredentials {
-        VendedCredentials {
+        VendedCredentials::S3(fluree_db_iceberg::credential::S3Credentials {
             access_key_id: "AKIA".to_string(),
             secret_access_key: "secret".to_string(),
             session_token: Some("token".to_string()),
@@ -443,7 +443,7 @@ mod tests {
             endpoint: None,
             region: Some("us-east-2".to_string()),
             path_style: false,
-        }
+        })
     }
 
     fn resp(loc: &str, creds: Option<VendedCredentials>) -> LoadTableResponse {
@@ -627,6 +627,7 @@ mod tests {
             key.clone(),
             &resp("s3://snap-A.json", Some(creds(Some(3600)))),
         );
+        #[allow(deprecated)]
         let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await
@@ -659,6 +660,7 @@ mod tests {
         // on; the r2rml helper test drives the same contract end-to-end.
         let s = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        #[allow(deprecated)]
         let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await

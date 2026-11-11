@@ -171,7 +171,7 @@ A few operational knobs are environment-only (no CLI flag):
 | `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
 | `FLUREE_REASONING_MAX_MEMORY_MB` | derived from the fact budget | Server-wide default materialization budget (max megabytes of derived facts). Unset, it is derived from the effective fact budget so the fact cap binds first; set it to bound memory directly. Overridden per ledger by `f:reasoningMaxMemoryMb` and per query by `"reasoningBudget"`. |
 | `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
-| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `DROP`, `COPY`, `MOVE`). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
+| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `COPY`, `MOVE`; `DROP` reads nothing and is not limited). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
 | `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
 | `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
 | `FLUREE_STORAGE_ALLOW_UNLOCKED` | off | Open a file storage directory on a filesystem that cannot lock it (some network and FUSE mounts). Unset, such a directory fails to open; set, nothing stops a second process from opening it too. See [One process per directory](storage.md#one-process-per-directory). |
@@ -340,7 +340,7 @@ Example connection config (`connection.jsonld`):
 
 - `--connection-config` and `--storage-path` are mutually exclusive. If both are set, `--connection-config` takes precedence (a warning is logged).
 - Server-level settings (`--cache-max-mb`, `--indexing-enabled`, `--reindex-min-bytes`, `--reindex-max-bytes`) override any equivalent values from the connection config.
-- `--indexing-enabled` defaults to `true`. Set `--indexing-enabled=false` (or `FLUREE_INDEXING_ENABLED=false`, or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage.
+- `--indexing-enabled` defaults to `true`. Set `--indexing-enabled=false` (or `FLUREE_INDEXING_ENABLED=false`, or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage. File storage is not shared that way: the server locks its directory ([One process per directory](storage.md#one-process-per-directory)).
 - AWS credentials and region are resolved via the standard AWS SDK chain (env vars, instance profile, `~/.aws/config`, etc.) — they are not part of the connection config.
 - The connection config can use `envVar` indirection for sensitive fields like S3 bucket names or encryption keys (see [ConfigurationValue](../reference/connection-config-jsonld.md#configurationvalue-env-var-indirection)).
 
@@ -499,13 +499,13 @@ Enable background indexing and configure novelty backpressure thresholds:
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
 
-Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)):
+Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)). The age guard (`--gc-min-time-mins`) decides, the ceiling (`--gc-hard-max-old-indexes`) backs it up for ledgers that publish fast, and the floor (`--gc-max-old-indexes`) is optional. These settings apply only on a server that runs the indexer; a peer, or a server with indexing disabled, collects nothing:
 
 | Flag                         | Env Var                           | Default | Description                                     |
 | ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
-| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions to retain before GC |
-| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version, so keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. ANDed with the count, so the slower of the two wins |
-| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | unset   | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so set it well above the versions published during your longest query |
+| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `0`     | Old index versions always kept, whatever their age |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minutes a superseded index version is kept, so a query that started on it can finish. Keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. Decides retention, up to `--gc-hard-max-old-indexes` |
+| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | `10`    | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so raise it above the versions published during your longest query |
 
 Config file equivalent:
 
@@ -514,9 +514,9 @@ Config file equivalent:
 enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
-# gc_max_old_indexes = 5
+# gc_max_old_indexes = 0
 # gc_min_time_mins = 15
-# gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
+# gc_hard_max_old_indexes = 10     # past 10 old versions, collect even inside the age guard
 ```
 
 ## Server Role Configuration
@@ -1010,9 +1010,9 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100`                                                                   |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
-| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions to retain before GC          | `5`                                                                     |
-| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `15`                              |
-| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
+| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions always kept, whatever their age | `0`                                                                  |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minutes a superseded index version is kept, so a query that started on it can finish | `15`                              |
+| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | `10` |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
@@ -1164,30 +1164,43 @@ See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federati
 
 ## Memory Allocator (mimalloc)
 
-`fluree-db-server` and `fluree-db-cli` expose an opt-in `mimalloc` Cargo feature
-that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimalloc).
-It is **off by default** — enable it in your release build:
+The `fluree` binary (`fluree-db-cli`), `fluree-db-server` and the Python package
+use [mimalloc](https://github.com/microsoft/mimalloc) as their global allocator.
+It is the `mimalloc` Cargo feature, on by default.
+
+**Why it is the default:**
+
+- Under sustained writes with frequent index builds, the system allocator
+  (glibc) keeps most of the memory the process frees, so resident memory climbs
+  until the host runs out. On a 64 GB host serving a 236M-flake ledger, RSS
+  reached 42–63 GB with glibc, of which a `malloc_trim` could return about 30 GB;
+  with mimalloc it stayed between 16 and 32 GB.
+- Allocation-heavy, multicore query paths run faster, most notably
+  R2RML/Iceberg graph-source scans, which materialize many RDF terms in
+  parallel: TPC-H Q1 over a 6M-row Iceberg table took ~62s with the system
+  allocator and ~31s with mimalloc.
+
+**Building without it:** turn off default features and list the ones you
+want, for example
 
 ```bash
-cargo build --release -p fluree-db-cli --features mimalloc
+cargo build --release -p fluree-db-cli --no-default-features \
+  --features server,iceberg,sql,delta,shacl,aws,graphql
 ```
 
-**When it helps:** allocation-heavy, multicore query paths — most notably
-R2RML/Iceberg graph-source scans, which materialize many RDF terms in parallel.
-On those workloads the system allocator's lock contention caps the parallel
-speedup; mimalloc roughly doubles the realized gain (e.g. TPC-H Q1 over a 6M-row
-Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
+**Embedding Fluree in your own binary:** a library cannot choose the
+allocator for the program that links it, so an application built on
+`fluree-db-api` (or `fluree-db-server` as a library) uses whatever allocator
+it declares. To get the same behavior, declare mimalloc in the application's
+binary:
 
-**Tradeoffs (operational, not semantic):**
+```rust
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
 
-- Changes the allocator for *every* allocation in the process (HTTP, query,
-  import, caches, AWS/Iceberg clients, tracing buffers).
-- Usually better multicore throughput and lower fragmentation, but may retain
-  more RSS due to per-thread heaps — relevant for large scans that already peak
-  high. Track RSS, p95 query latency, and concurrent-query behavior during a
-  soak before making it the default.
-- New native dependency in the binary; verify it builds for your target
-  (e.g. musl/cross builds) and keep a system-allocator fallback build.
+The Python package's extension module declares it for its own allocations
+only; Python's objects stay with Python's allocator.
 
 Pair it with bounded query parallelism so a single large scan cannot monopolize
 cores and allocator pressure under concurrent load.
@@ -1203,13 +1216,19 @@ environment-only.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `FLUREE_ICEBERG_LOCAL_ROOTS` | unset (local tables **disabled**) | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem, in the style of `PATH`. Unset, a Direct `table_location` that is a `file://` URI or an absolute path is **refused when the graph source is created**, with an error naming this switch. When set, such locations are permitted *and* every path read — table location, metadata, manifests, data files — is confined to these directories, so a manifest reference that climbs out of the table root (`.../table/../../../etc/passwd`) is refused rather than followed. Containment is checked textually and against the canonical path, so a symlink out of a root does not escape it. `/` allows the whole filesystem — reasonable on a single-tenant workstation, risky on a shared deployment. See [Iceberg graph sources](../graph-sources/iceberg.md#enabling-local-tables). |
-| `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` | unset (none) | Comma-separated names of environment variables that an `iceberg/map`, browse or preview request may name as its catalog secret (`auth_bearer_env`, `oauth2_client_secret_env`). A request naming any other variable is refused. The request also chooses where the secret is sent, so list only variables that hold catalog credentials. Does not apply to a local CLI, which reads its own environment. See [Iceberg graph sources](../graph-sources/iceberg.md#stored-configuration-format-nameservice). |
+| `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` | unset (none) | Comma-separated names of environment variables that a graph-source request (every Iceberg route, `sql/map`, every Delta route) may name as a secret: `auth_bearer_env`, `oauth2_client_secret_env`, `azure_client_secret_env`, or an `{"env_var": …}` anywhere in a structured `catalog`, `io`, `auth` or `unity` (a Google service-account key included). A request naming any other variable is refused with `400` (`err:api/InvalidGraphSourceConfig`). The request also chooses where the secret is sent, so list only variables that hold graph-source credentials. Does not apply to a local CLI or Python process, which reads its own environment. See [Iceberg connection](../api/endpoints.md#iceberg-connection). |
+| `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` | `all` | Which identities a graph source may borrow from the host, rather than carry itself: a comma-separated list of `aws` (the ambient AWS credential chain: reading object storage, and calling an AWS Glue or S3 Tables catalog), `azure` (the ambient Azure credentials a Delta source with no `io.azure` of its own reads Azure storage with), `google-metadata` (the GCE/GKE metadata server's service account), `google-adc` (the host's application-default credentials file) and `google-wif` (Workload Identity Federation signed with the host's own AWS identity), or `all` or `none`. A source asking for one not listed is refused with `403` (`err:auth/HostIdentityRefused`), naming this variable. Read once at startup; a value that does not parse, or set-but-empty, allows none. On a stack shared by tenants, restrict it: a WIF configuration is not secret, so with `google-wif` allowed one tenant could paste another's and act as it on Google. An embedder can instead give each tenant its own AWS subject (`Fluree::with_aws_subject_credentials`), which this policy does not gate. |
+| `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS` | unset (any bucket) | Comma-separated bucket names a source reading with the ambient AWS identity may read; any other is refused with `403` (`err:auth/HostIdentityRefused`). While it is set, an ambient source may not name an `s3_endpoint` either (an endpoint can address a bucket of its own), and is refused the same way. Set-but-empty allows none. It governs storage reads only: an AWS Glue or S3 Tables catalog call is gated by `aws` in `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` alone. Read once at startup. |
+| `FLUREE_GOOGLE_METADATA_URL` | unset (Google's own) | Operator-only Google override: the GCE metadata server URL every Google `metadata` identity mints its tokens from, for tests against a mock or an unusual deployment. Never per source: a stored `google_metadata` `metadata_url` other than this is refused. Read once at startup. |
+| `FLUREE_GOOGLE_TOKEN_HOSTS` | unset (Google's APIs only) | Operator-only Google override: comma-separated hosts, beyond Google's own APIs (`https` on `googleapis.com` and its subdomains), that a token minted from a **host** identity (the metadata server's, the host's application-default credentials, WIF signed with the host's AWS identity) may be sent to: `host` matches that host exactly, `*.example.com` its subdomains. A request for any other host is refused with `403` (`err:auth/HostIdentityRefused`, naming this variable) before a token is minted, so a source cannot name its own catalog or endpoint and collect the server's token. A source's own identity (a service-account key, WIF signed with an embedder's per-tenant subject) is not limited. For tests (a mock on `127.0.0.1`) and private endpoints. Read once at startup. |
+| `FLUREE_GCS_ENDPOINT` | unset (`https://storage.googleapis.com`) | Operator-only Google override: the endpoint every Google-identity GCS read goes to, for tests against a mock or private access. Never per source. A host identity's token is sent there only if it is one of Google's APIs or listed in `FLUREE_GOOGLE_TOKEN_HOSTS`; otherwise the source's storage is refused. Read once at startup. |
 | `FLUREE_ICEBERG_LOADTABLE_CACHE` | on | Master switch for all REST catalog caching. Set to `0`/`false`/`off` to build a fresh catalog client and reload the table on **every** scan (restores a per-scan OAuth exchange + `loadTable` round-trip). Disables the client/OAuth reuse, the cross-query `loadTable` cache, and the per-query snapshot pin. **Materialize refusal:** because disabling the cache also disables the per-query snapshot pin, `fluree materialize` **refuses to build** a twin while this is off (the twin's stamped watermark could not be guaranteed to describe its contents) — re-enable the cache to materialize. |
 | `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` | `60` | TTL (seconds) for the **cross-query** `loadTable`-response cache. A REST `loadTable` GET against a catalog such as Snowflake Horizon costs ~1.3–3 s, so caching it lets a burst of queries against the same table skip the round-trip. The TTL bounds how stale a snapshot a *new* query may observe; `0` disables the cross-query layer (leaving only the per-query pin). Every cache read is additionally gated on vended-credential expiry (30 s buffer), so a long TTL never hands out about-to-expire credentials. |
 | `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS` | `300` | TTL (seconds) for the **persisted** `loadTable` pointer: a table's current `metadata_location`, kept in the on-disk catalog cache so a restarted process can resolve the table without a catalog round-trip. Within the TTL a query reads that location without asking the catalog (see the freshness note below). `0` disables pointer persistence. |
 | `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` | `900` | TTL (seconds) for the process-wide REST **catalog-client** cache (the reused OAuth token + HTTPS pool). The cache is keyed by a fingerprint of the raw config JSON, which does **not** change when a secret referenced by env var / secret store is rotated; this TTL bounds how long a rotated secret stays stale before the client is rebuilt and re-authenticated. `0` rebuilds the client every query (restoring a per-query OAuth exchange). The same TTL bounds the shared handle of a [Delta table](../graph-sources/delta.md#performance): its remembered log state, and, for a table named in Unity Catalog, where the name points. |
 | `FLUREE_R2RML_SCAN_CACHE` | on | Toggles the correlated-join inner-scan cache, which reuses a materialized inner (dimension) table across a join's child batches instead of re-scanning it per batch. Set to `0`/`false`/`off` to restore per-child-batch re-scans. |
 | `FLUREE_R2RML_LIMIT_PUSHDOWN` | on | Toggles pushing a query's `LIMIT` into the R2RML scan as a row budget, so a scan stops after enough output rows instead of draining the table. Set to `0`/`false`/`off` to always scan fully. |
+| `FLUREE_R2RML_CHILD_WINDOW` | on | Toggles joining a correlated R2RML scan's input a window of rows at a time. Each pass over the scan's table joins one window, so a scan under a large input (an `ORDER BY` crawl, an OPTIONAL over a whole class) makes a few passes instead of one per thousand input rows. Under a `LIMIT` the first window is sized to the row budget and later ones grow; otherwise a window holds up to `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` input rows. Set to `0`/`false`/`off` to restore one pass per input batch. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | Toggles pushing simple date/int/bool/string FILTER comparisons into the Iceberg reader for **row-group pruning** (skip groups whose min/max rule out the predicate) and **exact row filtering** (drop non-matching rows during decode — e.g. `= "Acme"` on a name/code column). The in-engine FILTER remains the authority, so this only ever affects performance. Set to `0`/`false`/`off` to disable both. |
 | `FLUREE_R2RML_FILTER_CONSUMPTION` | on | Toggles folding a fully scan-local FILTER into the single R2RML scan that produces its variables, dropping the standalone filter operator so a `LIMIT` budget can reach the scan (a `FILTER + LIMIT` fact query then stops early). The scan re-applies the filter with the same evaluator, so results are unchanged. Set to `0`/`false`/`off` to keep the filter downstream (no early termination). |
 | `FLUREE_FUSED_VECTOR_FOLD` | on | Toggles the vectorized GROUP BY fold (a borrowed-key dense-id dict) for fused R2RML aggregates. Set to `0`/`false`/`off` to restore the byte-identical owned-key `HashMap` fold that clones a fresh key every row. Read at fused-operator construction (per query). |
@@ -1217,15 +1236,17 @@ environment-only.
 | `FLUREE_FUSED_R2RML_MULTIFACT` | on | Toggles the fused multi-fact branching-star join (one GROUP-KEY branch + one SEMI-JOIN branch). Set to `0`/`false`/`off` to decline the branching star to the generic pipeline (byte-identical). Read at fused-operator construction (per query). |
 | `FLUREE_FUSED_R2RML_MULTIFACT_GEN` | on | Toggles the S1/S2 generality WIDENING over the one-of-each cut: K≥2 SEMI-JOIN branches (S1) and ≥2 ref-IRI GROUP-BY keys (S2). Set to `0`/`false`/`off` to decline ONLY that increment — a K=1 branching star and a single ref-IRI key still fuse (byte-identical to before the widening). Rides on top of `FLUREE_FUSED_R2RML_MULTIFACT` / `FLUREE_FUSED_R2RML_AGG_JOIN` (either of those off declines the whole family). Read at fused-operator construction (per query). |
 | `FLUREE_ARROW_DIRECT_DECODE` | on | Toggles building a column directly from an Arrow array, skipping the two-hop per-cell intermediate. Set to `0`/`false`/`off` to restore the byte-identical two-hop decode. |
-| `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` | Target table rows materialized into RDF-term bindings per parallel window. Bounds resident memory during a scan (materialization explodes the compact columnar form into fat binding rows). Also caps the size of an inner scan eligible for the inner-scan cache above. |
+| `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` | Target table rows materialized into RDF-term bindings per parallel window. Bounds resident memory during a scan (materialization explodes the compact columnar form into fat binding rows). Also caps the size of an inner scan eligible for the inner-scan cache above, and how many input rows a correlated scan holds per pass over its table (`FLUREE_R2RML_CHILD_WINDOW`). |
 | `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |
 | `FLUREE_DELTA_SCAN_CONCURRENCY` | `min(cores, files, 32)` | Number of data files of a Delta table read concurrently within one scan. Raise it for high-latency remote object stores. |
 | `FLUREE_DELTA_LOG_CACHE_MB` | `256` | Memory (MB), across all Delta tables, for the data-file lists remembered between queries so a query reads only the commits added since the last one instead of replaying the table's log. A table whose list does not fit is planned from its log on every query. `0` remembers nothing. |
 | `FLUREE_DELTA_FOOTER_CACHE_MB` | `128` | Memory (MB), across all Delta tables, for the Parquet footers and page indexes of data files kept between queries. Data files are immutable, so a kept footer is never stale. `0` keeps none: every query re-reads the footer of every file it opens. |
 | `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` | `1024` | Memory budget (MB) for one materialize pass's subject accumulator — the pass's dominant memory term (one retained node per distinct subject in the window). A window whose **estimated** accumulator exceeds the budget fails with a typed error *before any commit* (nothing partially applied, watermark un-advanced) instead of the process being OOM-killed. The failure is deterministic and recurs every poll until the budget or the window changes: shorten the poll interval so incremental windows stay small, or raise the budget for a large full read. `0` disables the gate. |
 | `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS` | `30` | How old a materialize window may grow before an *empty* poll still persists its watermark. Skipping watermark writes on no-data polls keeps the state ledger from taking ~1,200 empty commits/hour, but never refreshing lets the stored snapshot age out of the source's snapshot retention — after which every poll degrades to a full table read. This bound is the compromise: quiet tables refresh their watermark at most once per interval. |
-| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. A read pinned to a snapshot is never bounded: a pinned full read returns that snapshot whole, and a pinned window returns the whole window. A Delta source's change data feed window stops at the commit boundary past the budget and the watermark advances to that version. `0` disables the bound and reads the whole window in one pass. |
+| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. A read pinned to a snapshot is never bounded: a pinned full read returns that snapshot whole, and a pinned window returns the whole window. A Delta source's change data feed window stops at the commit boundary past the budget and the watermark advances to that version; its whole reads (the first pass, `force_full`, and the fallback when the feed cannot serve a window) are never bounded. `0` disables the bound and reads the whole window in one pass. |
 | `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` | `108` | Estimated bytes of novelty one materialized row costs; used only to convert the novelty ceiling into the row budget above. Set this, rather than the row budget, when rows are much wider or narrower, so the budget keeps tracking the ceiling. |
+
+**Google BigLake.** BigLake bills every request to the project named in `x-goog-user-project` and refuses one that names none, whatever the identity: user (application-default) credentials, a service account, Workload Identity Federation and the metadata server alike. Set `quota_project` on the catalog's Google auth. `fluree iceberg map` and Python's `map_iceberg` default it to the project of a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse; an HTTP request names it. A missing one is a `403` `err:catalog/QuotaProjectRequired`. That quota project bills BigLake only: storage reads with `storage_auth: catalog` use the catalog's identity but send GCS no billing project. The minimum roles for the catalog identity, as validated against BigLake federation, are in [Google BigLake](../graph-sources/iceberg.md#google-biglake).
 
 **Caching model.** Catalog access is cached at two scopes. Within a single query,
 the first scan of a table pins its `metadata_location`, so every scan in that

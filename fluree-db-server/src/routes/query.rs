@@ -2916,9 +2916,12 @@ async fn execute_query(
     }
 
     // Shared storage mode: use load_ledger_for_query with freshness checking.
-    // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
-    // ledger; those resolve through the connection/dataset path, which queries
-    // them via their source engine instead of loading a ledger (#1369).
+    // The alias may name a mapped graph source (Iceberg, R2RML, SQL, Delta)
+    // rather than a ledger; that resolves through the connection/dataset path,
+    // which queries it via its source engine instead of loading a ledger
+    // (#1369). Resolving a source no query reads as a graph (an index, an
+    // unmapped one, one this build has no reader for) is refused with its
+    // typed error.
     let ledger = match load_ledger_or_missing(state, ledger_id, &span).await {
         Ok(l) => l,
         Err(e) => {
@@ -2926,9 +2929,10 @@ async fn execute_query(
             if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
                 return Err(e);
             }
-            // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather
-            // than a ledger. A registered source runs through the dataset path
-            // (queried via its source engine); a delimited format on a real
+            // The alias may name a mapped graph source rather than a ledger. A
+            // registered one runs through the dataset path (queried via its
+            // source engine), and resolving one no query reads as a graph is
+            // refused with its typed error; a delimited format on a real
             // source gets the explicit format error (matching the SPARQL
             // handler). A genuinely-missing ledger returns a clean NotFound
             // (404 + NotFound span) instead of being misreported by that path.
@@ -3157,7 +3161,7 @@ impl ScopeRegistry {
     /// The graph `iri` names in the ledger, if the ledger registers it.
     pub(crate) fn graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
         match self {
-            Self::Ledger(names) => names.graph_id_for_iri(iri),
+            Self::Ledger(names) => names.assigned_graph_id(iri),
             Self::Empty => None,
             #[cfg(test)]
             Self::Fixed(ids) => ids.get(iri).copied(),
@@ -3589,6 +3593,8 @@ async fn execute_sparql_ledger(
     );
     async move {
         let span = tracing::Span::current();
+        let execution =
+            || query_execution_options(state).with_rdf_list_view(headers.rdf_list_view);
 
         // If the SPARQL includes FROM/FROM NAMED, interpret them as dataset clauses
         // selecting named graphs *within this ledger* (multi-named-graph support).
@@ -3662,7 +3668,7 @@ async fn execute_sparql_ledger(
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(json_fmt_config.clone())
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_formatted()
                     .await
                     .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?
@@ -3679,7 +3685,7 @@ async fn execute_sparql_ledger(
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(json_fmt_config.clone())
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_formatted()
                     .await
                     .inspect_err(|_| {
@@ -3720,7 +3726,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(fmt.formatter())
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_formatted_string()
                     .await
                     .inspect_err(|_| {
@@ -3735,7 +3741,7 @@ async fn execute_sparql_ledger(
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute_formatted()
                 .await
                 .inspect_err(|_| {
@@ -3825,7 +3831,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .tracking(tracking_opts)
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_tracked()
                     .await;
                 let response = match response {
@@ -3874,7 +3880,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(fluree_db_api::FormatterConfig::sparql_xml())
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_formatted_string()
                     .await
                     .map_err(ServerError::Api)?;
@@ -3895,7 +3901,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(fmt.formatter())
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_formatted_string()
                     .await
                     .map_err(ServerError::Api)?;
@@ -3934,7 +3940,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(config)
-                    .execution_options(query_execution_options(state))
+                    .execution_options(execution())
                     .execute_formatted()
                     .await
                     .map_err(ServerError::Api)?;
@@ -3953,7 +3959,7 @@ async fn execute_sparql_ledger(
                 .query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute_formatted()
                 .await
                 .map_err(ServerError::Api)?;
@@ -4001,7 +4007,7 @@ async fn execute_sparql_ledger(
                         .query()
                         .sparql(sparql)
                         .format(json_fmt_config.clone())
-                        .execution_options(query_execution_options(state))
+                        .execution_options(execution())
                         .execute_formatted()
                         .await
                         .map_err(|e| {
@@ -4054,7 +4060,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .tracking(tracking_opts)
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute_tracked()
                 .await
             {
@@ -4107,7 +4113,7 @@ async fn execute_sparql_ledger(
             let result = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute()
                 .await
                 .map_err(|e| {
@@ -4149,7 +4155,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fluree_db_api::FormatterConfig::sparql_xml())
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
@@ -4170,7 +4176,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fmt.formatter())
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
@@ -4211,7 +4217,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(config)
-                .execution_options(query_execution_options(state))
+                .execution_options(execution())
                 .execute_formatted()
                 .await
                 .inspect_err(|_| {
@@ -4230,7 +4236,7 @@ async fn execute_sparql_ledger(
             .query(fluree.as_ref())
             .sparql(sparql)
             .format(json_fmt_config)
-            .execution_options(query_execution_options(state))
+            .execution_options(execution())
             .execute_formatted()
             .await
             .inspect_err(|_| {

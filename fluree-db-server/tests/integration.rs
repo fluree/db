@@ -194,8 +194,8 @@ async fn http_queries_use_fast_paths_after_background_index_publication() {
 // `f:ledger` field with a 500) nor 404 as a missing ledger. The bogus catalog
 // (`s3://nonexistent`) means execution can't return rows, but the response must
 // prove the alias resolved AND reached the source engine: the error is the
-// engine's own "Iceberg graph source config" failure, never `f:ledger` and
-// never a not-found. (A readable in-tree source — which needs Iceberg test
+// engine's own failure on the mapping's table (`actor` names no namespace),
+// never `f:ledger` and never a not-found. (A readable in-tree source — which needs Iceberg test
 // infra — would additionally assert returned rows.)
 #[cfg(feature = "iceberg")]
 #[tokio::test]
@@ -219,9 +219,14 @@ async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
         "rr:subjectMap [ rr:template \"https://ex/{id}\" ] ; ",
         "rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"as_name\" ] ] ."
     );
-    let create =
-        fluree_db_api::R2rmlCreateConfig::new_direct("actor", "s3://nonexistent/actor", mapping)
-            .with_mapping_media_type("text/turtle");
+    // Three segments: registration validates the stored config as a query
+    // does, and a Direct location must name its `namespace/table`.
+    let create = fluree_db_api::R2rmlCreateConfig::new_direct(
+        "actor",
+        "s3://nonexistent/films/actor",
+        mapping,
+    )
+    .with_mapping_media_type("text/turtle");
     state
         .fluree
         .create_r2rml_graph_source(create)
@@ -259,7 +264,7 @@ async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
         "graph-source alias should resolve and route to the engine, not 404; body={body}"
     );
     assert!(
-        err.contains("graph source") || err.contains("iceberg"),
+        err.contains("graph source") || err.contains("iceberg") || err.contains("table identifier"),
         "alias query should reach the graph-source engine (expected an Iceberg/graph-source config error); status={status} body={body}"
     );
 }

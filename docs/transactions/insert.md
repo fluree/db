@@ -414,7 +414,7 @@ The JSON-LD 1.1 named-graph form is accepted too: an object whose `@id` names th
 }
 ```
 
-Graph names are absolute IRIs, or compact IRIs your `@context` expands; relative names are refused. `"default"` names the default graph, and `"config"` the ledger's config graph (see [Writing config data](../ledger-config/writing-config.md)).
+Graph names are absolute IRIs, or compact IRIs your `@context` expands; a relative name is resolved against the context's `@base`, and refused without one. `"default"` names the default graph, and `"config"` the ledger's config graph (see [Writing config data](../ledger-config/writing-config.md)).
 
 ## Turtle and TriG
 

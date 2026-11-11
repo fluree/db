@@ -100,12 +100,15 @@ pub(crate) struct SequentialStager {
     /// That retraction was staged against the base, so it names the fact as
     /// the base stores it; a later one may name it as an earlier operation
     /// wrote it. See [`Self::drop_reversed_facts`].
-    first_retractions: HashMap<usize, fluree_db_core::Flake>,
-    fold_index: HashMap<SequentialFactKey, usize>,
+    first_retractions: FxHashMap<usize, fluree_db_core::Flake>,
+    fold_index: FxHashMap<SequentialFactKey, usize>,
     /// Simulated sequential per-op graph-id assignment, so the merged view's
     /// routing matches the ids each op's staging (and each intermediate
     /// envelope apply) used.
     sim_registry: fluree_db_core::GraphRegistry,
+    /// Graphs of the ORIGINAL base an operation dropped, which the commit
+    /// records. `original` reads without them from the first such drop on.
+    drops: std::collections::BTreeSet<GraphId>,
     merged_graph_iris: Vec<String>,
     seen_graph_iris: std::collections::HashSet<String>,
     txn_meta: Vec<TxnMetaEntry>,
@@ -132,6 +135,10 @@ pub(crate) struct SequentialStager {
     /// Staged as one operation of an enclosing request, which shares this
     /// governance and runs the config guard over its own merged result.
     nested: bool,
+    /// The planner stats every virtual state plans from: those of the state
+    /// the request began on, estimates only. Built at the first operation
+    /// that advances the state (`None` until then).
+    planner_stats: Option<Option<Arc<fluree_db_core::StatsView>>>,
 }
 
 /// Fact identity for the sequential fold: `(g, s, p)` and the object as
@@ -148,9 +155,10 @@ impl SequentialStager {
             final_t,
             folded: Vec::new(),
             first_ops: Vec::new(),
-            first_retractions: HashMap::new(),
-            fold_index: HashMap::new(),
+            first_retractions: FxHashMap::default(),
+            fold_index: FxHashMap::default(),
             sim_registry: ledger.snapshot.graph_registry.clone(),
+            drops: std::collections::BTreeSet::new(),
             merged_graph_iris: Vec::new(),
             seen_graph_iris: std::collections::HashSet::new(),
             txn_meta: Vec::new(),
@@ -160,6 +168,7 @@ impl SequentialStager {
             nested: false,
             current: Some(ledger),
             scope: WriteScope::Subjects(FxHashSet::default()),
+            planner_stats: None,
         }
     }
 
@@ -188,6 +197,12 @@ impl SequentialStager {
     /// What governs the request's operations.
     pub(crate) fn governance(&self) -> &RequestGovernance {
         &self.governance
+    }
+
+    /// Whether the virtual state is built: false only after a
+    /// `stage(…, advance: false)`.
+    pub(crate) fn has_state(&self) -> bool {
+        self.current.is_some()
     }
 
     /// The current virtual state (base + every staged operation so far).
@@ -237,6 +252,10 @@ impl SequentialStager {
         // Released before the apply below, whose copy-on-write would
         // otherwise deep-copy everything this pre-operation state shares.
         self.current = None;
+        if !result.view.graph_drops().is_empty() {
+            let mut ns_registry = result.ns_registry.clone();
+            self.drop_graphs(result.view.graph_drops(), &mut ns_registry);
+        }
         // The staged delta, which includes graphs `GRAPH ?g` templates resolved
         // to; needed to advance the virtual state between operations.
         let graph_iris: Vec<String> = result.graph_delta.values().cloned().collect();
@@ -298,17 +317,110 @@ impl SequentialStager {
             // leaving the next operation's WHERE unable to translate the
             // subjects this one introduced.
             let store = fluree_db_transact::detach_binary_provider(&mut state_i);
+            // The `t` this operation staged at, which its own drops took: the
+            // virtual state's next, past the request's commit `t` once earlier
+            // operations advanced it.
+            let op_t = state_i.t() + 1;
             state_i.apply_staged_flakes_for_sequential_staging(
                 flakes_i,
                 &ns_delta,
                 graph_iris.iter().map(String::as_str),
             )?;
+            // A graph an earlier operation dropped exists again once this one
+            // writes it, as it will once the request commits.
+            state_i.revive_graphs(graph_iris.iter().map(String::as_str), op_t);
             if let Some(store) = store {
                 fluree_db_transact::attach_binary_provider(&mut state_i, store);
+            }
+            // The next operation, and any probe of this state, plans from the
+            // base state's stats rather than assembling them over the whole
+            // novelty window again: the state differs from the base only by
+            // this request's own flakes. Estimates only, so a licence the
+            // stats grant the base (a property's objects all refs) can't be
+            // read for this state.
+            if staged_count > 0 {
+                let original = &self.original;
+                let pinned = self.planner_stats.get_or_insert_with(|| {
+                    let base = crate::view::GraphDb::from_ledger_state(original);
+                    fluree_db_query::planner_stats_view(base.as_graph_db_ref())
+                        .map(|view| Arc::new((*view).clone().estimates_only()))
+                });
+                if let Some(stats) = pinned {
+                    state_i.pin_planner_stats(Arc::clone(stats));
+                }
             }
             self.current = Some(state_i);
         }
         Ok(staged_count)
+    }
+
+    /// An operation dropped `g_ids`: what earlier operations wrote to them is
+    /// gone with the rest of what they held, and a graph of the ORIGINAL base
+    /// among them is dropped by the commit, so `original` — what the merged
+    /// fold is judged against and layered over — reads without it. A graph
+    /// the request itself introduced is simply not registered, unless a later
+    /// operation writes it again.
+    fn drop_graphs(&mut self, g_ids: &[GraphId], ns_registry: &mut NamespaceRegistry) {
+        let mut graphs: FxHashSet<Option<Sid>> = FxHashSet::default();
+        let mut of_original: Vec<GraphId> = Vec::new();
+        for &g_id in g_ids {
+            if g_id == fluree_db_core::DEFAULT_GRAPH_ID {
+                graphs.insert(None);
+                of_original.push(g_id);
+                continue;
+            }
+            let Some(iri) = self.sim_registry.iri_for_graph_id(g_id).map(str::to_string) else {
+                continue;
+            };
+            graphs.insert(Some(ns_registry.sid_for_iri(&iri)));
+            if self
+                .original
+                .snapshot
+                .graph_registry
+                .assigned_graph_id(&iri)
+                == Some(g_id)
+            {
+                of_original.push(g_id);
+            }
+            if self.seen_graph_iris.remove(&iri) {
+                self.merged_graph_iris.retain(|seen| *seen != iri);
+            }
+        }
+
+        let folded = std::mem::take(&mut self.folded);
+        let first_ops = std::mem::take(&mut self.first_ops);
+        let mut first_retractions = std::mem::take(&mut self.first_retractions);
+        for (i, (flake, first_op)) in folded.into_iter().zip(first_ops).enumerate() {
+            if graphs.contains(&flake.g) {
+                continue;
+            }
+            if let Some(retraction) = first_retractions.remove(&i) {
+                self.first_retractions.insert(self.folded.len(), retraction);
+            }
+            self.folded.push(flake);
+            self.first_ops.push(first_op);
+        }
+
+        if !of_original.is_empty() {
+            self.original.apply_graph_drops(&of_original, self.final_t);
+            fluree_db_transact::hide_dropped_graphs(&mut self.original);
+            self.drops.extend(of_original);
+        }
+        let ids = fluree_db_transact::FactIdentity::new(&self.original);
+        self.fold_index = self
+            .folded
+            .iter()
+            .enumerate()
+            .map(|(i, flake)| {
+                let key: SequentialFactKey = (
+                    flake.g.clone(),
+                    flake.s.clone(),
+                    flake.p.clone(),
+                    ids.of_flake(flake),
+                );
+                (key, i)
+            })
+            .collect();
     }
 
     /// Drop the folded facts that a later operation reversed back to how the
@@ -439,7 +551,7 @@ impl SequentialStager {
         }
         let mut graph_delta: FxHashMap<u16, String> = FxHashMap::default();
         for iri in &self.merged_graph_iris {
-            if let Some(g_id) = self.sim_registry.graph_id_for_iri(iri) {
+            if let Some(g_id) = self.sim_registry.assigned_graph_id(iri) {
                 graph_delta.insert(g_id, iri.clone());
             }
         }
@@ -449,7 +561,8 @@ impl SequentialStager {
         // graphs by IRI, so leaving one out renumbers nothing.
         graph_delta.retain(|_, iri| !netted_away.contains(&ns_registry.sid_for_iri(iri)));
 
-        let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?;
+        let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?
+            .with_graph_drops(self.drops.into_iter().collect());
         if !self.nested {
             guard_request_view(&view, &ns_registry, &graph_delta).await?;
         }
@@ -701,7 +814,10 @@ fn stored_shacl_policy(
     view: &StagedLedger,
     config: &LedgerConfig,
     ctx: &StagedShaclContext<'_>,
-) -> Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>> {
+) -> std::result::Result<
+    Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>>,
+    fluree_db_transact::TransactError,
+> {
     let mut map = HashMap::new();
     for g_id in written_user_graphs(view) {
         let graph_iri = if g_id == fluree_db_core::DEFAULT_GRAPH_ID {
@@ -724,12 +840,18 @@ fn stored_shacl_policy(
                     g_id,
                     fluree_db_transact::ShaclGraphPolicy {
                         mode: shacl.validation_mode,
+                        additional_data_g_ids: resolve_additional_data_g_ids(
+                            resolved.shacl.as_ref(),
+                            &view.base().snapshot,
+                            view.base().t(),
+                            ctx.graph_delta,
+                        )?,
                     },
                 );
             }
         }
     }
-    (!map.is_empty()).then_some(map)
+    Ok((!map.is_empty()).then_some(map))
 }
 
 /// The IRI of a named graph a staged flake landed in: the transaction's own
@@ -964,20 +1086,23 @@ pub(crate) async fn open_cross_ledger_shapes_model(
     // and open. Error loudly rather than dropping membership — a silent
     // `None` would make every M-only value read as "not a member" and
     // reject writes with spurious `sh:class` violations.
-    let model_g_id =
-        crate::cross_ledger::resolve_selector_g_id(&model_db.snapshot, &resolved.graph_iri)
-            .map_err(|e| {
-                fluree_db_transact::TransactError::Parse(format!(
-                    "cross-ledger value-set graph resolution failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                fluree_db_transact::TransactError::Parse(format!(
-                    "cross-ledger value-set graph {} not present in model ledger {} at t={} \
+    let model_g_id = crate::cross_ledger::resolve_selector_g_id(
+        &model_db.snapshot,
+        &resolved.graph_iri,
+        model_db.t,
+    )
+    .map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "cross-ledger value-set graph resolution failed: {e}"
+        ))
+    })?
+    .ok_or_else(|| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "cross-ledger value-set graph {} not present in model ledger {} at t={} \
                      (shapes resolved but vocabulary graph missing)",
-                    resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
-                ))
-            })?;
+            resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
+        ))
+    })?;
     Ok(Some(CrossLedgerShapesModel {
         resolved,
         model_db,
@@ -1094,6 +1219,7 @@ fn probe_shacl_compile_cache(
 pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let source = config
         .and_then(|c| c.shacl.as_ref())
@@ -1102,44 +1228,139 @@ pub(crate) fn resolve_shapes_source_g_ids(
     let Some(source) = source else {
         return Ok(vec![0]);
     };
+    Ok(vec![resolve_shacl_graph_source(
+        source,
+        snapshot,
+        "f:shapesSource",
+        t,
+    )?])
+}
 
-    // Temporal / trust / rollback / cross-ledger dimensions of GraphSourceRef
-    // aren't yet supported for SHACL — reject early rather than silently
-    // ignoring them. Matches the policy resolver's shape.
-    if source.ledger.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with cross-ledger f:ledger reference is not yet supported".into(),
-        ));
+/// Resolve a graph's `f:additionalDataSource` graphs as of `t`: the graphs
+/// read with it when its nodes are checked. A graph this transaction creates
+/// resolves through its routing, so the write that creates a source graph is
+/// checked against it. A graph neither the ledger nor the transaction knows
+/// is an error, as are the txn-meta and config graphs, which hold no data to
+/// check against.
+#[cfg(feature = "shacl")]
+pub(crate) fn resolve_additional_data_g_ids(
+    shacl: Option<&fluree_db_core::ledger_config::ShaclDefaults>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
+    graph_delta: Option<&FxHashMap<u16, String>>,
+) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
+    const SETTING: &str = "f:additionalDataSource";
+    let sources = shacl
+        .map(|s| s.additional_data_sources.as_slice())
+        .unwrap_or_default();
+    let mut g_ids = Vec::with_capacity(sources.len());
+    for source in sources {
+        reject_unsupported_graph_ref(source, SETTING)?;
+        let g_id = match source.graph_selector.as_deref() {
+            None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+            Some(iri) if iri == config_iris::DEFAULT_GRAPH => {
+                Some(fluree_db_core::DEFAULT_GRAPH_ID)
+            }
+            Some(iri) if iri == config_iris::TXN_META_GRAPH => {
+                Some(fluree_db_core::TXN_META_GRAPH_ID)
+            }
+            Some(iri) => existing_source_graph(snapshot, iri, t)?.or_else(|| {
+                graph_delta?
+                    .iter()
+                    .find(|(_, routed)| routed.as_str() == iri)
+                    .map(|(g_id, _)| *g_id)
+            }),
+        }
+        .ok_or_else(|| graph_not_found(source, SETTING))?;
+        let system_graph = match g_id {
+            fluree_db_core::TXN_META_GRAPH_ID => Some("txn-meta"),
+            fluree_db_core::CONFIG_GRAPH_ID => Some("config"),
+            _ => None,
+        };
+        if let Some(name) = system_graph {
+            return Err(fluree_db_transact::TransactError::Parse(format!(
+                "{SETTING} cannot name the {name} graph"
+            )));
+        }
+        g_ids.push(g_id);
     }
-    if source.at_t.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:atT (temporal pinning) is not yet supported".into(),
-        ));
-    }
-    if source.trust_policy.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:trustPolicy is not yet supported".into(),
-        ));
-    }
-    if source.rollback_guard.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:rollbackGuard is not yet supported".into(),
-        ));
-    }
+    Ok(g_ids)
+}
 
-    let g_id = match source.graph_selector.as_deref() {
+/// Resolve one same-ledger SHACL `GraphSourceRef` against `snapshot`'s
+/// registry; `setting` names it in errors.
+#[cfg(feature = "shacl")]
+fn resolve_shacl_graph_source(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    setting: &str,
+    t: i64,
+) -> std::result::Result<GraphId, fluree_db_transact::TransactError> {
+    reject_unsupported_graph_ref(source, setting)?;
+    match source.graph_selector.as_deref() {
         Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        Some(iri) => existing_source_graph(snapshot, iri, t)?,
         None => Some(0u16),
-    };
-
-    match g_id {
-        Some(id) => Ok(vec![id]),
-        None => Err(fluree_db_transact::TransactError::Parse(format!(
-            "f:shapesSource graph '{}' not found in this ledger's graph registry",
-            source.graph_selector.as_deref().unwrap_or("<none>"),
-        ))),
     }
+    .ok_or_else(|| graph_not_found(source, setting))
+}
+
+/// Temporal / trust / rollback / cross-ledger dimensions of `GraphSourceRef`
+/// aren't yet supported for SHACL sources — reject early rather than
+/// silently ignoring them. Matches the policy resolver's shape.
+#[cfg(feature = "shacl")]
+fn reject_unsupported_graph_ref(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    setting: &str,
+) -> std::result::Result<(), fluree_db_transact::TransactError> {
+    let unsupported = if source.ledger.is_some() {
+        Some("cross-ledger f:ledger reference")
+    } else if source.at_t.is_some() {
+        Some("f:atT (temporal pinning)")
+    } else if source.trust_policy.is_some() {
+        Some("f:trustPolicy")
+    } else if source.rollback_guard.is_some() {
+        Some("f:rollbackGuard")
+    } else {
+        None
+    };
+    match unsupported {
+        Some(option) => Err(fluree_db_transact::TransactError::Parse(format!(
+            "{setting} with {option} is not yet supported"
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(feature = "shacl")]
+fn graph_not_found(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    setting: &str,
+) -> fluree_db_transact::TransactError {
+    fluree_db_transact::TransactError::Parse(format!(
+        "{setting} graph '{}' not found in this ledger's graph registry",
+        source.graph_selector.as_deref().unwrap_or("<none>"),
+    ))
+}
+
+/// The graph a configured source names by `iri` as of `t`, `None` when it
+/// does not exist then. One a drop after `t` took is refused, as a query
+/// naming it as of `t` is.
+fn existing_source_graph(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    iri: &str,
+    t: i64,
+) -> std::result::Result<Option<GraphId>, fluree_db_transact::TransactError> {
+    snapshot
+        .graph_registry
+        .existing_graph_id(iri, t)
+        .map_err(|floor| {
+            fluree_db_transact::TransactError::Query(fluree_db_query::QueryError::GraphDropped {
+                graph: iri.to_string(),
+                floor,
+                t,
+            })
+        })
 }
 
 /// Apply SHACL policy to an already-staged [`StagedLedger`].
@@ -1189,7 +1410,10 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
 
     // 1. Stored shapes: each written graph's own enabled/mode from config.
     //    Graphs absent from the map are not validated.
-    let mut stored_policy = config.and_then(|c| stored_shacl_policy(view, c, &ctx));
+    let mut stored_policy = match config {
+        Some(config) => stored_shacl_policy(view, config, &ctx)?,
+        None => None,
+    };
 
     // Commit replay (which has no resolver) with a cross-ledger source skips
     // stored-shape re-validation: the origin already validated against M,
@@ -1367,7 +1591,8 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 } else {
                     // Same-ledger path. Resolve `f:shapesSource` into concrete
                     // graph IDs; default to `[0]` when unset.
-                    let shapes_g_ids = resolve_shapes_source_g_ids(config, &base.snapshot)?;
+                    let base_t = base.t();
+                    let shapes_g_ids = resolve_shapes_source_g_ids(config, &base.snapshot, base_t)?;
                     membership_g_ids = shapes_g_ids.clone();
                     cache_source = Some(CachedShapeSource::Local(shapes_g_ids.clone()));
                     shapes_g_ids
@@ -1595,13 +1820,12 @@ fn inline_shapes_policy(
 > {
     use fluree_db_core::ledger_config::{OverrideControl, ValidationMode};
 
-    let policy = fluree_db_transact::ShaclGraphPolicy {
-        mode: ctx
-            .requested_validation_mode
-            .unwrap_or(ValidationMode::Reject),
-    };
+    let mode = ctx
+        .requested_validation_mode
+        .unwrap_or(ValidationMode::Reject);
     let mut map = HashMap::new();
     for g_id in written_user_graphs(view) {
+        let mut additional_data_g_ids = Vec::new();
         if let Some(config) = config {
             // The default graph, or a named graph whose IRI nothing records,
             // reads the ledger-wide group.
@@ -1629,8 +1853,20 @@ fn inline_shapes_policy(
                     });
                 }
             }
+            additional_data_g_ids = resolve_additional_data_g_ids(
+                resolved.shacl.as_ref(),
+                &view.base().snapshot,
+                view.base().t(),
+                ctx.graph_delta,
+            )?;
         }
-        map.insert(g_id, policy);
+        map.insert(
+            g_id,
+            fluree_db_transact::ShaclGraphPolicy {
+                mode,
+                additional_data_g_ids,
+            },
+        );
     }
     Ok((!map.is_empty()).then_some(map))
 }
@@ -2181,7 +2417,11 @@ async fn resolve_per_graph_unique_sids(
 
             // Local: resolve to g_ids and scan.
             if !local_sources.is_empty() {
-                let local_g_ids = resolve_constraint_source_g_ids_for(&local_sources, snapshot)?;
+                let local_g_ids = resolve_constraint_source_g_ids_for(
+                    &local_sources,
+                    snapshot,
+                    annotations_from.t(),
+                )?;
                 for source_g_id in local_g_ids {
                     let annotations =
                         read_enforce_unique_from_graph(annotations_from, source_g_id).await?;
@@ -2253,6 +2493,7 @@ async fn resolve_per_graph_unique_sids(
 fn resolve_constraint_source_g_ids_for(
     sources: &[&fluree_db_core::ledger_config::GraphSourceRef],
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let mut g_ids = Vec::new();
     for source in sources {
@@ -2281,7 +2522,7 @@ fn resolve_constraint_source_g_ids_for(
 
         let g_id = match source.graph_selector.as_deref() {
             Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-            Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+            Some(iri) => existing_source_graph(snapshot, iri, t)?,
             None => Some(0u16), // no selector → default graph
         };
         match g_id {
@@ -2559,12 +2800,14 @@ pub struct StageResult {
 
 impl StageResult {
     /// Committing this stage would change nothing, so the commit is skipped:
-    /// an update, upsert or sync that staged no flakes and registers no new
-    /// graph. A registration-only stage (SPARQL `CREATE GRAPH`) still
-    /// commits so the registration persists. An insert that staged nothing
-    /// reaches the commit, which reports it as empty.
+    /// an update, upsert or sync that staged no flakes, registers no new
+    /// graph and drops none. A registration-only stage (SPARQL `CREATE
+    /// GRAPH`) still commits so the registration persists, and a drop-only
+    /// one (`DROP GRAPH`, which retracts nothing) so the drop does. An insert
+    /// that staged nothing reaches the commit, which reports it as empty.
     pub(crate) fn is_noop(&self, txn_type: TxnType) -> bool {
         !self.view.has_staged()
+            && self.view.graph_drops().is_empty()
             && !self
                 .view
                 .base()

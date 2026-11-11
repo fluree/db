@@ -76,7 +76,11 @@ WHERE {
 
 In SPARQL, `FROM NAMED` identifies **named graphs in the dataset**. In Fluree, these are often *graph sources* such as:
 - another ledger (federation / multi-ledger queries), or
-- a graph source (search, tabular mapping, etc.).
+- a mapped graph source (an Iceberg, R2RML, SQL or Delta table mapping).
+
+A search index (BM25, vector) is not a dataset member: it is queried with an
+`f:graphSource` pattern, with its source ledger in the dataset, and naming it in
+`FROM` / `FROM NAMED` is refused with `err:db/GraphSourceNotAGraph`.
 
 Note: On the **ledger-scoped HTTP query endpoint** (`POST /query/{ledger}`), `FROM` / `FROM NAMED` is also supported, but is interpreted as selecting **named graphs inside that same ledger**. Use the connection-scoped endpoint (`POST /query`) when you want a dataset that spans multiple ledgers.
 
@@ -627,11 +631,13 @@ WHERE {
 
 ### Connection-Bound Mode
 
-When querying across multiple ledgers, use SERVICE to select which ledger each pattern executes against:
+When querying across multiple ledgers, use SERVICE to select which ledger each pattern executes against. Each ledger a SERVICE names must be in the query's dataset, so list it with `FROM NAMED`:
 
 ```sparql
 -- Connection-bound: SERVICE selects the target ledger
 SELECT ?name ?stock
+FROM NAMED <sales:main>
+FROM NAMED <inventory:main>
 WHERE {
   SERVICE <fluree:ledger:sales:main> {
     GRAPH <http://example.org/graphs/products> {

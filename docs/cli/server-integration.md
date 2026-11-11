@@ -508,11 +508,11 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 
 - `POST {api_base_url}/drop-graph` with `{ ledger, graph }`
 
-Drops a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted in it. History is preserved —
-queries `as-of` an earlier `t` still see the graph populated. The graph IRI
-remains registered so it can be re-populated by a later insert. Refuses the
-default graph and the system `txn-meta` / `config` graphs. Same admin auth
+Drops a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`, one commit that retracts nothing. A query naming the
+graph as of an earlier `t` is refused afterwards; a later write to the IRI
+starts the graph afresh. Refuses the default graph and the system
+`txn-meta` / `config` graphs. Same admin auth
 bracket as `/create`, `/drop`, `/reindex`. See
 [Drop Named Graph Contract](#drop-named-graph-contract).
 
@@ -1450,24 +1450,21 @@ The reference server's `Fluree::drop_named_graph`:
    - the default graph (empty / `g_id == 0`),
    - the `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`, `g_id == 1`),
    - the `config` graph (`urn:fluree:{ledger_id}#config`, `g_id == 2`).
-3. **Resolves** `graph` against the snapshot's `GraphRegistry`. An unknown
-   IRI returns `404` rather than silently registering a new graph slot.
-4. **Stages and commits** a SPARQL UPDATE equivalent to
-   `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }`
-   through the same pipeline used by user updates. This produces one new
-   commit at `t = current_t + 1` whose flakes are retractions only.
-5. **Reports a no-op** (`committed: false`, `retracted: 0`) when the graph
-   was already empty — no new commit is created.
+3. **Resolves** `graph` against the snapshot's `GraphRegistry`. A graph
+   that does not exist, a dropped one included, returns `404`.
+4. **Stages and commits** SPARQL `DROP GRAPH <iri>` through the same
+   pipeline used by user updates: one new commit at `t = current_t + 1`
+   that records the drop and retracts nothing.
 
 Key properties:
 
-- **History preserving.** A query `as-of` an earlier `t` still sees every
-  triple that was previously asserted in the graph.
+- **Takes the history.** Nothing the graph held is queryable afterwards; a
+  query naming it as of a `t` before the drop is refused. The commits keep
+  the facts, so a branch created before the drop has them.
 - **Per-branch scope.** Drops only affect the branch in `ledger`. Sibling
   branches that share the same graph IRI are not touched.
-- **Registry stable.** The graph IRI keeps its `g_id`; a subsequent
-  insert into the same IRI lands in the same logical graph rather than a
-  new slot.
+- **Same IRI, fresh graph.** A later write to the IRI starts the graph
+  afresh, holding only what is written from then on.
 
 ### Response (`200 OK`)
 
@@ -1475,7 +1472,7 @@ Key properties:
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -1485,13 +1482,12 @@ Key properties:
 |-------|------|-------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted. |
 | `graph_iri` | string | Graph IRI that was dropped (echoed). |
-| `retracted` | integer | Number of flakes retracted by the drop commit. `0` when the graph was already empty. |
-| `committed` | bool | `true` when a new commit was produced; `false` for a no-op drop on an empty graph. |
-| `t` | integer | Current commit `t` for the branch after the drop. Equal to the pre-drop `t` when `committed` is `false`. |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | bool | `true`: the drop commits. A server whose drop retracts the graph's facts reports `false` for an empty graph, and the CLI prints that as a no-op. |
+| `t` | integer | Commit `t` of the drop. |
 
 The CLI's `fluree graph drop` printer (`commands/graph.rs`) reads
-`ledger_id`, `graph_iri`, `retracted`, `committed`, and `t` — populate
-them all.
+`ledger_id`, `graph_iri`, `committed`, and `t` — populate them all.
 
 ### Error responses
 
@@ -1499,8 +1495,8 @@ them all.
 |--------|------|
 | `400` | `graph` is empty, has whitespace or any IRI-excluded character, lacks a `<scheme>:<rest>` head (relative reference), or names a system graph (default, `txn-meta`, `config`); malformed JSON body. |
 | `401` / `403` | Admin token required and absent/invalid. |
-| `404` | Ledger does not exist; or `graph` is not registered in the ledger's graph registry. |
-| `5xx` | Storage / nameservice / commit-write errors during the retract commit. |
+| `404` | Ledger does not exist; or `graph` does not exist in it. |
+| `5xx` | Storage / nameservice / commit-write errors during the drop commit. |
 
 ### Reference implementation
 
@@ -1995,10 +1991,20 @@ The same handshake optionally accepts **raw source data** — the formats `flure
 
 - **Discovery:** add `"source-upload"` to `import.modes` and advertise `import.source_formats` (the reference server lists `ttl/nt/nq/trig/jsonld/json/jsonl/ndjson` — each optionally `.gz`/`.zst` — plus `csv/cypher/cyp/cql`). The CLI checks `source-upload` before attempting; absent it, `--remote --from <non-flpack>` errors with a `.flpack` fallback hint.
 - **Mint:** `"source_kind": "source"` (default `"flpack"`) plus `"filename"` (its extension drives format detection; the staged object must keep it). CSV/Cypher uploads may also send `"edge_properties": "annotated"|"plain"|"nary"` and `"base_iri"`; the CLI forwards its corresponding create flags. Reject unsupported extensions, option values, and missing filenames with `400`.
+- **Blank nodes:** a single-file import mints blank-node ids from a salt (the ledger id by default) and the file's name. Import the staged file under the last component of `"filename"` so the ids match a direct import of the same file. A mint may carry `"skolem_namespace"` to replace the salt, as `--skolem-namespace` does; advertise `"source-upload-skolem"` when you honor it. The CLI refuses to send the option to a server without that mode, since an ignored salt changes every blank node's id.
 - **Complete:** run the bulk-import pipeline over the staged file (converting CSV/Cypher to JSON-LD shards first) in the same async worker slot as a restore. On success, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`.
 - **Raft caveat:** the pipeline publishes nameservice heads directly and repeatedly, outside any replicated write log — do not offer `source-upload` on consensus-replicated deployments (the reference server omits the mode and 400s the mint).
 
-Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::run_remote_source_import`.
+#### Into a new graph of an existing ledger
+
+A source upload may instead fill a new named graph of an existing ledger, which backs `fluree graph import <iri> --from <file>` against a server.
+
+- **Discovery:** add `"source-upload-graph"` to `import.modes` alongside `"source-upload"`. The CLI checks it before uploading: a server that ignores an unknown `"graph"` field would create a ledger instead.
+- **Mint:** `"graph": "<iri>"` with `"source_kind": "source"`; `"ledger"` names the existing ledger. Reject `"graph"` on a `.flpack` mint, the default graph and the ledger's system graphs with `400`, and a ledger that does not exist with `404`, before the upload.
+- **Complete:** run `Fluree::import_into_graph(ledger, graph).import(path)` rather than `create`. On success, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`, where the import's commits run from `base_t + 1` to `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh. One failure leaves the import in the ledger: `ImportError::PublishedWithoutIndex`, an index publish that failed after the import's commits were published. Its message says so; report it as is, not as an import that wrote nothing.
+- No reindex follows an annotated graph: it would rebuild the whole ledger's index. `has_annotations: true` tells the client the ledger's annotation index waits for one.
+
+Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::upload_source_import`, called by `run_remote_source_import` and `fluree-db-cli/src/commands/graph.rs`.
 
 ## Storage Proxy Contract
 
@@ -2382,25 +2388,45 @@ Existing endpoint, extended with graph source fallback. Request body is unchange
 
 Creates an Iceberg graph source with an R2RML mapping that defines how table rows become RDF triples. This is a write operation and should be admin-protected (same middleware as `/create` and `/drop`).
 
-**Request body fields:**
+The CLI sends the connection **structured**: `catalog` and `io` objects exactly as the stored config spells them (see [Iceberg connection](../api/endpoints.md#iceberg-connection)), built by the same conversion its local `map` uses, so a remote and a local map store the same record. A server must also keep accepting the legacy flat fields below from other clients, through one converter, and must refuse a body that mixes the two forms. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+
+```json
+{
+  "name": "warehouse-orders",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://polaris.example.com/api/catalog",
+    "catalog_type": "polaris",
+    "warehouse": "my-warehouse",
+    "auth": { "type": "bearer", "token": { "env_var": "POLARIS_TOKEN" } }
+  },
+  "io": { "vended_credentials": true, "s3_path_style": false }
+}
+```
+
+**Legacy flat request body fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Graph source name (no colons) |
 | `mode` | string | No | `"rest"` (default), `"direct"`, `"glue"` (AWS Glue Data Catalog), or `"s3tables"` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST mode | REST catalog URI |
-| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`); required for REST, Glue and S3 Tables modes if not specified in R2RML mapping |
+| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`). The R2RML mapping's `rr:tableName` entries name the tables |
 | `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`), or a `file://` URI / absolute local path under `FLUREE_ICEBERG_LOCAL_ROOTS` |
 | `region` | string | No | AWS region of the Glue / S3 Tables API (Glue and S3 Tables modes) |
 | `catalog_id` | string | No | Glue catalog id for cross-account access (Glue mode; default: the caller's account) |
 | `table_bucket_arn` | string | S3 Tables mode | S3 Tables table-bucket ARN (`arn:aws:s3tables:<region>:<account>:bucket/<name>`) |
-| `r2rml` | string | No | Inline R2RML mapping content (Turtle). Without it the source is a plain Iceberg source with no mapping |
+| `r2rml` | string | Yes | Inline R2RML mapping content (Turtle). A request without it is a 400 and registers nothing |
 | `r2rml_type` | string | No | Mapping media type; default `"text/turtle"` (JSON-LD mappings are not supported yet) |
 | `branch` | string | No | Branch name (default: `"main"`) |
-| `auth_bearer` | string | No | Bearer token for REST catalog auth |
+| `auth_bearer` / `auth_bearer_env` | string | No | Bearer token for REST catalog auth, or the name of a listed server environment variable holding it |
 | `oauth2_token_url` | string | No | OAuth2 token endpoint |
-| `oauth2_client_id` | string | No | OAuth2 client ID |
-| `oauth2_client_secret` | string | No | OAuth2 client secret |
+| `oauth2_client_id` | string | No | OAuth2 client ID (default: empty) |
+| `oauth2_client_secret` / `oauth2_client_secret_env` | string | No | OAuth2 client secret, or a listed variable holding it |
+| `oauth2_scope`, `oauth2_audience` | string | No | OAuth2 scope and audience |
+| `auth_google_metadata`, `auth_google_scopes` | boolean, string | No | The GCE/GKE metadata server's identity, and its scopes |
 | `warehouse` | string | No | Warehouse identifier (REST mode) |
 | `no_vended_credentials` | boolean | No | Disable vended credentials (default: `false`) |
 | `s3_region` | string | No | S3 region override |
@@ -2409,7 +2435,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 
 **Validation rules:**
 - `name` must not be empty or contain `:`
-- `r2rml`, when given, must parse and compile as an R2RML mapping (it defines how table rows become RDF triples); its table and column names are not checked against the tables here (see [Iceberg → Schema Mismatch](../graph-sources/iceberg.md#schema-mismatch))
+- `r2rml` must parse and compile as an R2RML mapping (it defines how table rows become RDF triples); its table and column names are not checked against the tables here (see [Iceberg → Schema Mismatch](../graph-sources/iceberg.md#schema-mismatch))
 - `mode` must be one of `rest`, `direct`, `glue`, `s3tables` (any case)
 - REST mode requires `catalog_uri`; requires `table` unless specified in R2RML mapping's `rr:tableName`
 - Direct mode requires `table_location`: an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path, which is accepted only under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables))
@@ -2417,7 +2443,19 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 - S3 Tables mode requires `table_bucket_arn` (a well-formed S3 Tables bucket ARN, any AWS partition) and `table` unless specified in R2RML mapping's `rr:tableName`; a `region` that contradicts the ARN's region is refused
 - `region` and `s3_region` must be AWS region codes (e.g. `us-east-1`) in Glue and S3 Tables modes
 - Glue and S3 Tables modes read with the server's ambient AWS credentials; vended credentials are turned off for them
-- OAuth2 fields must all be provided together (url + id + secret)
+- OAuth2 needs `oauth2_token_url` and the client secret; any OAuth2 field without both is refused (400), not ignored
+- One way to authenticate: a bearer beside OAuth2 or a Google identity is refused (400), as is a literal beside its `_env` variable
+- An unknown field, inside the structured objects too, is refused (400, `err:api/InvalidGraphSourceConfig`), as is a variable not listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`
+
+**Stored connections and mappings (optional):** a remote that stores catalog connections and R2RML mappings under ids of its own can take them by reference. With `--stored-catalog <ID>` / `--stored-mapping <ID>`, the CLI sends `stored_catalog_id` / `stored_mapping_id` in place of the connection (and, for a stored mapping, of `r2rml` / `r2rml_type`). Beside a reference the body carries only `name`, `table`, `branch`, `model`, `default_allow`, and `r2rml` / `r2rml_type` when the mapping is not stored. It never carries `catalog`, `io`, `mode` or any flat connection or auth field:
+
+```json
+{ "name": "warehouse-orders", "stored_mapping_id": "<mapping-id>" }
+{ "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "table": "sales.orders", "r2rml": "@prefix rr: ...", "r2rml_type": "text/turtle" }
+{ "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "stored_mapping_id": "<mapping-id>", "table": "sales.orders" }
+```
+
+A stored mapping implies its connection, and `table` defaults to its first table. With `stored_catalog_id` and an inline `r2rml`, `table` is required. As with an inline connection, a mapping is required: the CLI refuses `stored_catalog_id` without `r2rml` or `stored_mapping_id`. The CLI does not ask whether a server supports references. A server that does not, such as the Fluree server, refuses the request and registers nothing: a body without `r2rml` lacks the mapping it requires, and one with `r2rml` carries a field it does not know. A `400`, `404` or `422` to a by-reference request is shown with the server's message and a hint that covers both causes: a remote without stored connections or mappings, or an id that names nothing it has. Ids are trimmed before they are sent.
 
 **Example — REST catalog with R2RML:**
 
@@ -2476,17 +2514,20 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `graph_source_id` | string | Always | Created ID (e.g., `"warehouse-orders:main"`) |
 | `table_identifier` | string | Always | Table identifier or derived from location |
 | `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
-| `connection_tested` | boolean | Always | Whether catalog connection was verified (tested for REST mode only; always `false` for Direct, Glue and S3 Tables) |
-| `mapping_source` | string | With `r2rml` | Content address of the stored R2RML mapping |
-| `triples_map_count` | integer | With `r2rml` | Number of TriplesMap definitions found |
-| `mapping_validated` | boolean | With `r2rml` | Whether mapping was parsed and compiled successfully |
+| `connection_tested` | boolean | Always | Whether every table the mapping names loaded at registration, the way a query loads it: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata (Direct) |
+| `connection_check` | object | Always | What that check found: an `outcome` (`verified`, `table_failed`, `catalog_unreachable`, `client_failed`, `timed_out`, `no_tables`) and its fields; see [`POST /iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) |
+| `mapping_source` | string | Always | Content address of the stored R2RML mapping |
+| `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
+| `table_count` | integer | Always | Number of distinct tables the mapping reads |
+| `table_names` | string[] | Always | Those tables, sorted |
+| `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |
 
 **Error responses:**
-- `400 Bad Request` — validation failures (missing fields, invalid mode, bad table identifier, an `r2rml` that does not parse or compile)
+- `400 Bad Request` — validation failures (missing fields, `r2rml` among them; invalid mode, bad table identifier, an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap`)
 - `409 Conflict` — graph source with this name already exists (if your nameservice enforces uniqueness)
 - `500 Internal Server Error` — nameservice write failure
 
-A REST catalog that cannot be reached does not fail the request: the source is created and the response carries `connection_tested: false`.
+The check reads table metadata only and stops after 10 s. A table that cannot be loaded in that time does not fail the request: the source is created and the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
 
 ### Querying graph sources
 

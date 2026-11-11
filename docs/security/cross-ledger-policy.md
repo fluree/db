@@ -544,8 +544,9 @@ Two related bounds, both off by default:
 - A transaction-requested `opts.validationMode: "warn"` is
   honored only where an operator has written an
   `f:shaclDefaults` group whose `f:overrideControl` permits it.
-  A ledger with shapes but no `#config` graph enforces
-  unconditionally and ignores the request.
+  A ledger whose config does not enable SHACL validates nothing
+  against its stored shapes, so there is nothing for the request
+  to relax (see [SHACL](../ledger-config/setting-groups.md)).
 
 ## Cross-ledger datalog rules
 
@@ -616,7 +617,7 @@ closed when configured:
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
 | `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. Exception: a [virtual graph source](#virtual-graph-sources-iceberg--sql) looks the identity's classes up in M. |
-| `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
+| `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. Any ledger's config graph IRI (`urn:fluree:<ledger>#config`) is refused the same way. |
 | Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 
 The other reserved fields and source predicates may land in
@@ -643,7 +644,7 @@ The specific failure modes operators see:
 |-------------------------------|---------|
 | `ModelLedgerMissing`          | The named model ledger isn't present or is retracted on this instance. |
 | `GraphMissingAtT`             | The model ledger exists but the named graph IRI isn't in its graph registry. |
-| `ReservedGraphSelected`       | The selector targets `#config` or `#txn-meta` on M. |
+| `ReservedGraphSelected`       | The selector targets `#config` or `#txn-meta` on M, or any ledger's config graph IRI. |
 | `TranslationFailed`           | The policy graph was read but couldn't be projected to the wire format (typically corruption or a dictionary loss in M). |
 | `UnsupportedFeature`          | A reserved field (`f:atT` / `f:trustPolicy` / `f:rollbackGuard`) was set. |
 | `CrossInstanceUnsupported`    | `f:ledger` names a ledger on a different instance. |

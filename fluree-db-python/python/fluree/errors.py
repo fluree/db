@@ -69,11 +69,15 @@ class PermissionDeniedError(FlureeError, PermissionError):
 
 
 class ConflictError(FlureeError):
-    """A concurrent change won; retrying against the new state may succeed.
+    """The request conflicts with the current state of what it names.
 
-    When a commit lost a race, ``expected_t`` is the ledger ``t`` it was
-    built on and ``head_t`` the ``t`` another commit had moved it to; both
-    are ``None`` for other conflicts."""
+    When a commit lost a race to a concurrent change, ``expected_t`` is the
+    ledger ``t`` it was built on and ``head_t`` the ``t`` another commit had
+    moved it to; retrying against the new state may succeed, and
+    :meth:`fluree.Ledger.transact` does. Both are ``None`` for the other
+    conflicts, which a retry does not clear: the ledger already exists, a
+    graph source was dropped or has no R2RML mapping, or a table carries
+    merge-on-read deletes. Change the resource or the request instead."""
 
     expected_t: int | None = None
     head_t: int | None = None

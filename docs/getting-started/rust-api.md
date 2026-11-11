@@ -169,6 +169,46 @@ async fn main() -> Result<()> {
 removes it only on full success (unless `.cleanup(false)` is set). On failure, it keeps the
 session directory and logs its path for debugging.
 
+#### Into a new named graph of an existing ledger
+
+`import_into_graph` runs the same pipeline into a named graph the ledger does not have yet, and
+takes the same tuning options:
+
+```rust
+let result = fluree
+    .import_into_graph("mydb:main", "http://example.org/graph/products")
+    .import("./products")
+    .threads(8)
+    .execute()
+    .await?;
+
+let graph = result.graph.expect("a graph import names its graph");
+println!(
+    "<{}> is g_id {}, commits t={}..{}",
+    graph.iri, graph.g_id, graph.base_t + 1, result.t
+);
+```
+
+- Every statement lands in the named graph, and the import's commits follow the ledger's head,
+  so a full reindex from the commits rebuilds the same ledger.
+- An IRI or string the ledger already holds keeps its id, so the graph joins with the rest of
+  the ledger. The new graph's index is built in bulk and spliced into the ledger's existing
+  index; nothing else is rebuilt.
+- A ledger with commits after its index is indexed first. Writes through the same `Fluree`'s
+  cached ledger wait until the import publishes; reads go on against the head it started from.
+  A writer that does not share that cache (another process, another `Fluree`, or one built
+  without ledger caching) is not held: if it commits first, the import fails with nothing
+  published.
+- `ImportError::PublishedWithoutIndex { t, .. }` is the one failure after which the import is in
+  the ledger: its commits are published through `t` and its index is not. Queries read the graph
+  from those commits until an index covers them, which `Fluree::reindex` builds. A future
+  dropped while the import publishes can leave the ledger the same way.
+- The source holds default-graph data (Turtle, N-Triples, JSON-LD, JSONL/NDJSON). An existing
+  graph, `urn:default`, the system graphs, TriG / N-Quads, and JSON-LD that names graphs of its
+  own are refused with `ImportError::Refused` (or `ImportError::Invalid`), with nothing written.
+- `result.has_annotations` reports a graph with statement annotations: the ledger's annotation
+  index is then set aside, and annotation queries read by scan until `Fluree::reindex`.
+
 ### With S3 Storage
 
 Requires `fluree-db-api` feature `aws` and standard AWS credential/region configuration.
@@ -246,6 +286,7 @@ Connection node:
 - `cacheMaxMb`
 - `indexStorage`, `commitStorage`
 - `primaryPublisher` (publisher node)
+- `defaults.indexing`: `reindexMinBytes`, `reindexMaxBytes`, `indexingEnabled`, and the [index retention](#index-retention) settings `gcMinTimeMins`, `maxOldIndexes`, `gcHardMaxOldIndexes`
 
 Storage node:
 - Any storage: `AES256Key`, or `AES256Keys` + `AES256CurrentKey` (mutually exclusive; put the key on `indexStorage`)
@@ -1621,49 +1662,60 @@ async fn main() -> Result<()> {
 
 ### Background Indexing
 
+Persistent builders (`file`, `s3`, `ipfs`) run a background indexer: once a ledger's novelty passes the soft threshold, it builds and publishes a new index version. The memory builder does not; call `with_indexing()` to enable it. Build inside a tokio runtime.
+
 ```rust
-use fluree_db_api::{FlureeBuilder, BackgroundIndexerWorker, Result};
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use fluree_db_api::{FlureeBuilder, Result, TriggerIndexOptions};
+use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fluree = Arc::new(FlureeBuilder::file("./data").build_async().await?);
+    let fluree = FlureeBuilder::file("./data")
+        // Novelty bytes that start an index build, and the hard limit at which
+        // writes are rejected until the indexer catches up.
+        .with_indexing_thresholds(1_000_000, 512 * 1024 * 1024)
+        .build_async()
+        .await?;
 
-    // Start background indexer
-    let indexer = BackgroundIndexerWorker::new(
-        fluree.clone(),
-        Duration::from_secs(5), // Index interval
-    );
-
-    let indexer_handle = indexer.start();
-
-    // Application logic
-    let ledger = fluree.create_ledger("mydb").await?;
-
-    // Transactions will be indexed automatically in background
+    fluree.create_ledger("mydb").await?;
     for i in 0..100 {
         let txn = json!({
             "@context": {"ex": "http://example.org/ns/"},
             "@graph": [{"@id": format!("ex:item{}", i), "ex:value": i}]
         });
-
-        fluree.graph("mydb:main")
-            .transact()
-            .insert(&txn)
-            .commit()
-            .await?;
+        fluree.graph("mydb:main").transact().insert(&txn).commit().await?;
     }
 
-    // Wait for indexing to complete
-    sleep(Duration::from_secs(10)).await;
-
-    // Shutdown indexer
-    indexer_handle.shutdown().await?;
-
+    // Wait until everything committed so far is indexed.
+    fluree
+        .trigger_index("mydb:main", TriggerIndexOptions::default())
+        .await?;
     Ok(())
 }
 ```
+
+Call `without_indexing()` when another process, such as a dedicated indexer, maintains the index for the same storage. That needs storage several processes can share: a file storage directory is used by one process at a time ([One process per directory](../operations/storage.md#one-process-per-directory)).
+
+### Index retention
+
+Each index build supersedes the previous version. New queries read the newest one, but a query already running keeps reading the version it started on, so the indexer keeps superseded versions for a while before it collects them:
+
+- **Age guard** (default 15 minutes): a superseded version is kept this long.
+- **Ceiling** (default 10): past this many old versions, a version is collected even inside the age guard.
+- **Floor** (default 0): optionally, the newest this many old versions are always kept, whatever their age.
+
+```rust
+use fluree_db_api::{FlureeBuilder, IndexerConfig};
+
+// Floor, age guard in minutes, ceiling; `None` keeps a default.
+let builder = FlureeBuilder::file("./data").with_gc_settings(None, Some(30), Some(40));
+
+// Or remove the ceiling, so the age guard alone decides:
+let config = IndexerConfig::default().with_gc_hard_max_old_indexes(None);
+let builder = FlureeBuilder::file("./data").with_indexer_config(config);
+```
+
+A query that outlasts its version's retention can lose that version while it reads. Size the age guard from your longest query, and the ceiling from how many versions the ledger publishes during it. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention) for how the settings combine and how to monitor them.
 
 ### BM25 Full-Text Search
 

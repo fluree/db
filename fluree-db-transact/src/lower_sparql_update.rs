@@ -54,6 +54,7 @@ use fluree_db_sparql::ast::{
     TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
+use fluree_graph_ir::syntax::reserved_blank_label;
 use thiserror::Error;
 
 use crate::ir::{
@@ -117,10 +118,7 @@ impl BlankNodeCounter {
         Self { next: 0 }
     }
 
-    /// The label of a template `[]`. A label can't start with `-`, so no
-    /// hand-written `_:label` collides with it (a user's `_:b0` next to a
-    /// template `[]` used to fuse into one node). Mid-label `-` is legal, so
-    /// the skolemized `fdb-…--anon{N}` serializes as written.
+    /// The label of a template `[]`.
     fn next(&mut self) -> String {
         format!("_:{}", self.mint("anon"))
     }
@@ -132,7 +130,7 @@ impl BlankNodeCounter {
     }
 
     fn mint(&mut self, kind: &str) -> String {
-        let label = format!("-{kind}{}", self.next);
+        let label = reserved_blank_label(kind, self.next);
         self.next += 1;
         label
     }
@@ -879,23 +877,21 @@ pub fn lower_sparql_update(
             lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         // Graph-management verbs. CLEAR/DROP/ADD/COPY/MOVE lower to a
-        // graph-management directive executed by whole-graph scan at staging
-        // time; CREATE and SILENT LOAD lower to an empty no-op transaction;
-        // non-SILENT remote LOAD is a documented divergence (D-5).
-        UpdateOperation::Clear(gm) | UpdateOperation::Drop(gm) => {
-            lower_clear_drop(gm, prologue, opts)?
-        }
+        // graph-management directive executed at staging time; CREATE and
+        // SILENT LOAD lower to a transaction that writes no flake; non-SILENT
+        // remote LOAD is a documented divergence (D-5).
+        UpdateOperation::Clear(gm) => lower_clear(gm, prologue, opts)?,
+        UpdateOperation::Drop(gm) => lower_drop(gm, prologue, opts)?,
         UpdateOperation::Create(create) => {
-            // Fluree cannot represent an empty named graph (roadmap D-6), so
-            // CREATE stages no flakes — but it DOES register the graph IRI in
-            // the additive registry (same `write_graphs` mechanism as a
-            // transfer destination). Registration is what O3's source-existence
-            // check consults, so `CREATE GRAPH <g>` followed by a non-SILENT
-            // `COPY <g> TO <h>` is a legitimate empty source rather than the
-            // contradictory "source graph does not exist" error. CREATE of an
-            // ALREADY-registered graph stays a no-op rather than the spec's
-            // §3.2.2 error (D-6: the registry can't distinguish an
-            // intentionally-created empty graph from an emptied one), so
+            // CREATE stages no flakes, but it DOES register the graph IRI
+            // (same `write_graphs` mechanism as a transfer destination), or
+            // brings a dropped graph back. Registration is what O3's
+            // source-existence check consults, so `CREATE GRAPH <g>` followed
+            // by a non-SILENT `COPY <g> TO <h>` is a legitimate empty source
+            // rather than the contradictory "source graph does not exist"
+            // error. CREATE of a graph that exists stays a no-op rather than
+            // the spec's §3.2.2 error (D-6: an intentionally-created empty
+            // graph and an emptied one are the same to the registry), so
             // `silent` has nothing to suppress; the graph remains
             // non-enumerable until a flake lands in it.
             let iri = expand_iri(&create.graph, prologue)?;
@@ -915,7 +911,6 @@ pub fn lower_sparql_update(
     // persisted namespace map omits them, and post-commit SELECT can't resolve
     // the predicate IRI back to the same Sid.
     txn.namespace_delta = ns.delta().clone();
-    txn.rdf_list_view = true;
     Ok(txn)
 }
 
@@ -956,30 +951,35 @@ fn graph_or_default_to_sel(
     })
 }
 
-/// Lower `CLEAR`/`DROP` to a graph-management retract-all directive.
+/// Lower `CLEAR` to a graph-management retract-all directive.
 ///
-/// `DROP ≡ CLEAR` in Fluree's model (roadmap D-6): the graph registry is
-/// additive-only and an emptied graph is indistinguishable from a dropped one.
-///
-/// The parsed `SILENT` flag is deliberately not consulted: in the D-6 model a
-/// CLEAR/DROP of an unregistered graph is a no-op rather than the spec's
-/// "graph does not exist" error, so there is no error for SILENT to suppress —
-/// a documented divergence, symmetric with CREATE-of-existing staying a no-op.
-fn lower_clear_drop(
-    gm: &GraphMgmtRef,
-    prologue: &Prologue,
-    opts: TxnOpts,
-) -> Result<Txn, LowerError> {
+/// The parsed `SILENT` flag is deliberately not consulted: a CLEAR of an
+/// unregistered graph is a no-op rather than the spec's "graph does not exist"
+/// error, so there is no error for SILENT to suppress — a documented
+/// divergence, symmetric with CREATE-of-existing staying a no-op.
+fn lower_clear(gm: &GraphMgmtRef, prologue: &Prologue, opts: TxnOpts) -> Result<Txn, LowerError> {
     let target = graph_ref_all_to_target(&gm.target, prologue)?;
     Ok(Txn::graph_mgmt(GraphMgmtOp::Clear(target)).with_opts(opts))
 }
 
+/// Lower `DROP` to a graph-management drop directive
+/// ([`GraphMgmtOp::Drop`]). Dropping a named graph that does not exist is an
+/// error unless `SILENT`, as the spec has it.
+fn lower_drop(gm: &GraphMgmtRef, prologue: &Prologue, opts: TxnOpts) -> Result<Txn, LowerError> {
+    let target = graph_ref_all_to_target(&gm.target, prologue)?;
+    Ok(Txn::graph_mgmt(GraphMgmtOp::Drop {
+        target,
+        silent: gm.silent,
+    })
+    .with_opts(opts))
+}
+
 /// Lower `ADD`/`COPY`/`MOVE` to a graph-management transfer directive.
 ///
-/// Composes over the CLEAR primitive: COPY/MOVE clear the destination first,
-/// MOVE additionally clears the source afterward. A destination named graph is
-/// recorded in `write_graphs` so the commit registers it even when it
-/// did not previously exist (COPY/ADD into a fresh graph).
+/// COPY/MOVE clear the destination first, keeping its history, and MOVE
+/// drops the source afterward. A destination named graph is recorded in
+/// `write_graphs` so the commit registers it even when it did not previously
+/// exist (COPY/ADD into a fresh graph).
 fn lower_transfer(
     t: &GraphTransfer,
     prologue: &Prologue,
@@ -988,7 +988,7 @@ fn lower_transfer(
 ) -> Result<Txn, LowerError> {
     let from = graph_or_default_to_sel(&t.from, prologue)?;
     let to = graph_or_default_to_sel(&t.to, prologue)?;
-    let (clear_dest, clear_src) = match mode {
+    let (clear_dest, drop_src) = match mode {
         TransferMode::Add => (false, false),
         TransferMode::Copy => (true, false),
         TransferMode::Move => (true, true),
@@ -997,7 +997,7 @@ fn lower_transfer(
         from,
         to: to.clone(),
         clear_dest,
-        clear_src,
+        drop_src,
         // Thread SILENT through so staging can suppress the missing-source
         // error (SPARQL §3.2 / roadmap O3) exactly when the user opted in.
         silent: t.silent,
@@ -1081,7 +1081,6 @@ fn lower_insert_data(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1137,7 +1136,6 @@ fn lower_delete_data(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1242,7 +1240,6 @@ fn lower_delete_where(
         txn_meta: Vec::new(),
         write_graphs: BTreeSet::new(),
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1308,7 +1305,6 @@ fn lower_delete_where_with_graphs(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1562,7 +1558,6 @@ fn lower_modify(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })

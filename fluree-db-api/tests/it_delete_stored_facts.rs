@@ -218,7 +218,7 @@ async fn deleting_an_absent_fact_commits_nothing() {
 #[tokio::test]
 async fn a_delete_in_a_new_graph_commits_nothing() {
     const NEW: &str = "http://example.org/new";
-    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.graph_id_for_iri(NEW);
+    let registered = |r: &TransactResult| r.ledger.snapshot.graph_registry.assigned_graph_id(NEW);
     for indexed in [false, true] {
         let seed = json!({"@id": "ex:s", "ex:p": "present"});
 
@@ -1665,7 +1665,8 @@ async fn transfer_seed(
 /// a name the identity may change beside the salary it may not. A fact the
 /// destination holds is restated, not skipped unseen: when the identity
 /// cannot view it, both sides go to the modify check, as for upsert and
-/// sync. (MOVE also retracts the source, which this identity may not.)
+/// sync. MOVE drops its source, which only an identity without a restricting
+/// policy may do, so it is refused before either graph is read.
 #[tokio::test]
 async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
     let mut failures = Vec::new();
@@ -1682,6 +1683,44 @@ async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
                     r,
                     &format!("{verb}, dest_holds={dest_holds}, indexed={indexed}"),
                 ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// ADD of a list into a graph holding its own list on the same subject and
+/// property is refused with one answer whether or not that graph already
+/// holds the list beside it, as a chain: the chain is restated, not skipped
+/// unseen, so an identity that cannot view it learns nothing of it. One
+/// that can commits nothing.
+#[tokio::test]
+async fn adding_a_list_held_as_a_chain_restates_it() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for dest_holds in [false, true] {
+            let seed = format!(
+                "INSERT DATA {{ GRAPH <{G1}> {{ ex:alice ex:items (1 2) }} \
+                 GRAPH <{G2}> {{ ex:alice ex:items (3 4) }} }}"
+            );
+            let (_d, fluree, mut ledger) = seeded_with("chain-restate", &seed, indexed).await;
+            let add = format!("ADD <{G1}> TO <{G2}>");
+            if dest_holds {
+                ledger = sparql_update(&fluree, ledger, &add).await.ledger;
+            }
+            let t = ledger.t();
+            let policy = name_only(&ledger).await;
+            let r = sparql_update_as(&fluree, ledger.clone(), &add, policy).await;
+            failures.extend(not_refused(
+                r,
+                &format!("dest_holds={dest_holds}, indexed={indexed}"),
+            ));
+            if dest_holds {
+                let policy = view_all_modify_name(&ledger).await;
+                let r = sparql_update_as(&fluree, ledger, &add, policy)
+                    .await
+                    .expect("restating a viewable chain");
+                no_commit(&r, t, &format!("viewable, indexed={indexed}"));
             }
         }
     }
@@ -1728,7 +1767,7 @@ async fn a_delete_naming_a_graph_the_ledger_lacks_commits_nothing() {
         ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .is_some()
     };
     for indexed in [false, true] {
@@ -1802,7 +1841,7 @@ async fn graph_objects(ledger: &LedgerState, iri: Option<&str>) -> Vec<String> {
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph"),
     };
     let s = ledger.snapshot.encode_iri(&format!("{EX}s")).expect("s");
@@ -1894,7 +1933,7 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
             ledger
                 .snapshot
                 .graph_registry
-                .graph_id_for_iri(&id)
+                .assigned_graph_id(&id)
                 .is_some(),
             "the fixture registers a graph under the ledger's address"
         );
