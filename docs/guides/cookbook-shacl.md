@@ -520,8 +520,8 @@ A book whose `ex:author` is `ex:pratchett` conforms — `ex:pratchett` is a `sch
 
 Fluree resolves this in two tiers:
 
-1. **Fast path**: the ledger's indexed schema hierarchy (`SchemaHierarchy`). Expanded at engine build time so same-class and descendant-class matches are O(1) hashmap hits.
-2. **Live fallback**: when the subclass relation was asserted in the current transaction (or any earlier unindexed commit), the fast path misses. The engine then walks `rdfs:subClassOf` via a BFS on the database's SPOT index. This walk reads the **default graph**, matching how `SchemaHierarchy` is built, plus the `f:shapesSource` graphs and any [`f:additionalDataSource`](#validating-against-other-graphs) graphs, so a value-set or catalog can carry its own class hierarchy. The record's own named graph is not read automatically: its subclass edges count only when it is itself listed as an `f:additionalDataSource`, as a catalog listed ledger-wide is when a record is written to the catalog.
+1. **Fast path**: the ledger's current schema hierarchy (`SchemaHierarchy`), built from the default graph's committed and unindexed state. Expanded at engine build time so same-class and descendant-class matches are O(1) hashmap hits.
+2. **Live fallback**: when the subclass relation was asserted in the current transaction, or lives in a graph other than the default graph, the fast path misses. The engine then walks `rdfs:subClassOf` via a BFS on the database's SPOT index. This walk reads the **default graph**, matching how `SchemaHierarchy` is built, plus the `f:shapesSource` graphs and any [`f:additionalDataSource`](#validating-against-other-graphs) graphs, so a value-set or catalog can carry its own class hierarchy. The record's own named graph is not read automatically: its subclass edges count only when it is itself listed as an `f:additionalDataSource`, as a catalog listed ledger-wide is when a record is written to the catalog.
 
 ## Predicate-target shapes
 
@@ -666,7 +666,7 @@ Semantics and limits:
 - **One graph, so a fact counts once.** A triple stored in both graphs is one value. A fact only a listed graph holds counts too, so a listed graph can make a record fail as well as pass: `sh:maxCount` sees its values and `sh:closed` sees its properties.
 - **Checked when written.** Removing an entry from the catalog does not re-check the records that reference it; a record is checked again the next time it is written.
 - **The transaction's own changes count.** A transaction that adds a catalog entry and a record referencing it passes; one that removes an entry and writes a record using it fails. A transaction may create a listed graph.
-- **Per graph.** An entry in `f:graphOverrides` can give a graph its own list, which replaces the ledger-wide list for that graph. List the ledger-wide graphs again if that graph should read them too.
+- **Per graph.** An entry in `f:graphOverrides` can give a graph its own list, which replaces the ledger-wide list for that graph. List the ledger-wide graphs again if that graph should read them too. A per-graph group that sets no list inherits the ledger-wide one, so to have a graph read no other graph, list the graph itself: it is read anyway, and only its own subclass edges are added.
 - **Full reads.** Checks read the listed graphs whatever the writer's policy lets them read, so a violation can show a writer a value from a graph their policy hides.
 - **Errors, not skips.** A graph the ledger does not know, and the transaction is not creating, fails the write: a mistyped graph would otherwise hide data a shape should see. The config and txn-meta graphs cannot be listed. Only this ledger's graphs can be listed for now, so `f:ledger`, `f:atT`, `f:trustPolicy` and `f:rollbackGuard` are refused. A cross-ledger `f:shapesSource` works with it.
 - **Config only.** No request can change the list.

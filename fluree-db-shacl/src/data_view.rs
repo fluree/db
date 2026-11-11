@@ -81,20 +81,25 @@ impl<'a> DataView<'a> {
         test: RangeTest,
         match_val: RangeMatch,
     ) -> Result<Vec<Flake>> {
-        let mut flakes = self.graph.range(index, test, match_val.clone()).await?;
         if self.additional.is_empty() {
-            return Ok(flakes);
+            return Ok(self.graph.range(index, test, match_val).await?);
         }
-        let mut seen: HashSet<Flake> = flakes.iter().cloned().collect();
+        let mut flakes = self.graph.range(index, test, match_val.clone()).await?;
+        let mut extra = Vec::new();
         for &g_id in self.additional {
             // Copy and re-point rather than `GraphDbRef::new`, which would
             // drop the tracker and the runtime dictionaries.
             let mut source = self.graph;
             source.g_id = g_id;
-            for flake in source.range(index, test, match_val.clone()).await? {
-                if seen.insert(flake.clone()) {
-                    flakes.push(flake);
-                }
+            extra.extend(source.range(index, test, match_val.clone()).await?);
+        }
+        if extra.is_empty() {
+            return Ok(flakes);
+        }
+        let mut seen: HashSet<Flake> = flakes.iter().cloned().collect();
+        for flake in extra {
+            if seen.insert(flake.clone()) {
+                flakes.push(flake);
             }
         }
         flakes.sort_by(|a, b| index.compare(a, b));

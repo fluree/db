@@ -360,6 +360,7 @@ full semantics.
 | A record that should fail still commits after a catalog edit | Records are checked when written. Run `fluree validate --graph` on the graphs that read the catalog. |
 | A shape does not apply to a record typed in the catalog | Shapes apply by what the record's own graph says. Type the record in its own graph. |
 | A graph-specific list ignores the ledger-wide sources | A per-graph list replaces the ledger-wide one. List those graphs again in the override. |
+| A graph still reads the ledger-wide sources after its override removed them | An override with no list inherits the ledger-wide one. To have a graph read no other graph, list the graph itself. |
 
 ## Related documentation
 

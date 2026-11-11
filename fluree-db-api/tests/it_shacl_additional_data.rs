@@ -4,6 +4,7 @@
 
 #![cfg(all(feature = "native", feature = "shacl"))]
 
+use crate::support;
 use fluree_db_api::validate::ValidateOptions;
 use fluree_db_api::{ApiError, Fluree, FlureeBuilder};
 use fluree_db_transact::TransactError;
@@ -108,10 +109,44 @@ async fn ledger(
     overrides: &[(&str, &[&str])],
 ) -> (Fluree, String) {
     let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = seed(&fluree, name, data, sources, overrides).await;
+    (fluree, ledger_id)
+}
+
+/// Like [`ledger`], on a file-backed ledger whose seed is then in a published
+/// index rather than in novelty.
+async fn indexed_ledger(
+    dir: &tempfile::TempDir,
+    name: &str,
+    data: &str,
+    sources: &[&str],
+    overrides: &[(&str, &[&str])],
+) -> (Fluree, String) {
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .expect("build");
+    let ledger_id = seed(&fluree, name, data, sources, overrides).await;
+    support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+    let ledger = fluree.ledger(&ledger_id).await.expect("reload");
+    assert!(
+        ledger.snapshot.range_provider.is_some(),
+        "expected the seed in a binary index"
+    );
+    (fluree, ledger_id)
+}
+
+async fn seed(
+    fluree: &Fluree,
+    name: &str,
+    data: &str,
+    sources: &[&str],
+    overrides: &[(&str, &[&str])],
+) -> String {
     fluree.create_ledger(name).await.expect("create ledger");
     let ledger_id = format!("{name}:main");
     write(
-        &fluree,
+        fluree,
         &ledger_id,
         &format!(
             "{SHAPES}{data}{}",
@@ -120,7 +155,7 @@ async fn ledger(
     )
     .await
     .expect("shapes, data and config");
-    (fluree, ledger_id)
+    ledger_id
 }
 
 async fn write(fluree: &Fluree, ledger_id: &str, trig: &str) -> fluree_db_api::Result<()> {
@@ -251,6 +286,117 @@ async fn sh_class_follows_subclass_edges_in_a_source() {
     assert_violation(
         write(&fluree, &ledger_id, &own_edge).await,
         "org-a is not listed, so its own subclass edge is not read",
+    );
+}
+
+/// The subclass rules hold once the edges are in an index. The index root's
+/// hierarchy is extracted from every graph, so `sh:class` must not read it:
+/// an unlisted graph's own edge would count after a build and not before.
+#[tokio::test]
+async fn sh_class_subclass_edges_after_an_index_build() {
+    let data = format!(
+        "{}{}",
+        in_graph(
+            CATALOG,
+            "ex:coffee a ex:Arabica . ex:Arabica rdfs:subClassOf ex:Commodity .",
+        ),
+        in_graph(
+            ORG_A,
+            "ex:tea a ex:Assam . ex:Assam rdfs:subClassOf ex:Commodity .",
+        ),
+    );
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, ledger_id) = indexed_ledger(
+        &dir,
+        "it/additional-data/subclass-indexed",
+        &data,
+        &[&format!("<{CATALOG}>")],
+        &[],
+    )
+    .await;
+
+    let coffee = in_graph(
+        ORG_A,
+        "ex:listing-1 a ex:Listing ; ex:commodity ex:coffee .",
+    );
+    write(&fluree, &ledger_id, &coffee)
+        .await
+        .expect("the indexed catalog's subclass edge counts");
+
+    let tea = in_graph(ORG_A, "ex:listing-2 a ex:Listing ; ex:commodity ex:tea .");
+    assert_violation(
+        write(&fluree, &ledger_id, &tea).await,
+        "org-a is not listed, so its own indexed subclass edge is not read",
+    );
+}
+
+/// A per-graph list replaces the ledger's for subclass edges too, once
+/// they are indexed.
+#[tokio::test]
+async fn a_per_graph_list_replaces_the_ledger_list_after_an_index_build() {
+    const ORG_B_CATALOG: &str = "http://example.org/org-b-catalog";
+    let data = format!(
+        "{}{}",
+        in_graph(CATALOG, "ex:Spice rdfs:subClassOf ex:Commodity ."),
+        in_graph(ORG_B_CATALOG, "ex:saffron a ex:Spice ."),
+    );
+    let org_b_catalog = format!("<{ORG_B_CATALOG}>");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, ledger_id) = indexed_ledger(
+        &dir,
+        "it/additional-data/override-indexed",
+        &data,
+        &[&format!("<{CATALOG}>")],
+        &[(ORG_B, &[&org_b_catalog])],
+    )
+    .await;
+
+    let saffron = in_graph(
+        ORG_B,
+        "ex:listing-1 a ex:Listing ; ex:commodity ex:saffron .",
+    );
+    assert_violation(
+        write(&fluree, &ledger_id, &saffron).await,
+        "org-b's list replaces the ledger's, so the catalog's edge is not read",
+    );
+}
+
+/// A default-graph subclass edge retracted after an index build stops
+/// counting at once, not at the next build.
+#[tokio::test]
+async fn a_retracted_indexed_subclass_edge_stops_counting() {
+    let data = format!(
+        "ex:Assam rdfs:subClassOf ex:Commodity .\n{}",
+        in_graph(CATALOG, "ex:tea a ex:Assam ."),
+    );
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (fluree, ledger_id) = indexed_ledger(
+        &dir,
+        "it/additional-data/retracted-edge",
+        &data,
+        &[&format!("<{CATALOG}>")],
+        &[],
+    )
+    .await;
+
+    let first = in_graph(ORG_A, "ex:listing-1 a ex:Listing ; ex:commodity ex:tea .");
+    write(&fluree, &ledger_id, &first)
+        .await
+        .expect("the indexed default-graph edge counts");
+
+    sparql_update(
+        &fluree,
+        &ledger_id,
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         DELETE DATA { ex:Assam rdfs:subClassOf ex:Commodity }",
+    )
+    .await
+    .expect("retract the edge");
+
+    let second = in_graph(ORG_A, "ex:listing-2 a ex:Listing ; ex:commodity ex:tea .");
+    assert_violation(
+        write(&fluree, &ledger_id, &second).await,
+        "the retracted edge still counted",
     );
 }
 

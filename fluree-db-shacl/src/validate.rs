@@ -2805,9 +2805,10 @@ fn validate_pair_constraint(
 /// via `class_ctx`, so a shared value-set (e.g. a list of US states defined in
 /// the shapes graph) is discoverable even when the referencing records live in
 /// a different graph. Resolution uses, in order:
-/// 1. Direct / indexed-hierarchy match against the `SchemaHierarchy`.
-/// 2. Live `rdfs:subClassOf` walk (schema graph 0 unioned with the vocabulary
-///    graphs) for novelty-added or vocabulary-local relations.
+/// 1. Direct / hierarchy match against the engine's current default-graph
+///    `SchemaHierarchy`.
+/// 2. Live `rdfs:subClassOf` walk (schema graph 0 unioned with the listed and
+///    vocabulary graphs) for source-local relations.
 ///
 /// When `class_ctx` is present its per-transaction memo collapses repeated
 /// `(value, class, focus graph)` checks to a single lookup. A value with no
@@ -2831,9 +2832,10 @@ async fn validate_class_constraint(
     let cross_ledger: Option<CrossLedgerMembership<'_>> = class_ctx.and_then(|c| c.cross_ledger);
 
     // Fast-path acceptable set: expected_class + its descendants per the
-    // indexed-schema hierarchy. Misses novelty-added subclass relations;
-    // we fall through to `is_subclass_of` (a db walk) for those.
-    let hierarchy = db.graph.snapshot.schema_hierarchy();
+    // engine's current default-graph hierarchy. Not the index root's schema:
+    // that one is extracted from every graph and keeps a retracted edge until
+    // the next build. Source-local edges fall through to `is_subclass_of`.
+    let hierarchy = class_ctx.and_then(|c| c.hierarchy);
     let mut hierarchy_accepted: HashSet<Sid> = HashSet::new();
     hierarchy_accepted.insert(expected_class.clone());
     if let Some(h) = &hierarchy {
@@ -2948,7 +2950,7 @@ async fn value_conforms_to_class(
         }
     }
 
-    // Fast path: any indexed-hierarchy match.
+    // Fast path: any hierarchy match.
     if value_types.iter().any(|t| hierarchy_accepted.contains(t)) {
         return Ok(true);
     }

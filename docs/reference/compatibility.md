@@ -384,6 +384,8 @@ Schema triples (`rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:ra
 
 The class and property hierarchy that policy targeting, SHACL targeting, GraphQL interfaces and `rdfs` reasoning read is now built from the default graph's current state alone. A retracted `rdfs:subClassOf` or `rdfs:subPropertyOf` edge stops counting at once; it used to count until the next index build. An edge in a named graph no longer counts at all; it used to count after an index build.
 
+SHACL `sh:class` now reads the same hierarchy. A retracted edge stops counting at once, and an edge in a named graph counts only when that graph is an `f:shapesSource` or [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graph. Before, both counted for `sh:class` until the next index build, so a value that conformed only through such an edge could be accepted on an indexed ledger and refused on an unindexed one.
+
 #### SHACL is enforced only where the ledger config enables it (breaking)
 
 Shapes no longer enable SHACL on their own. A ledger that holds shapes but has no config setting `f:shaclEnabled true` used to validate every write against them in reject mode; it now validates nothing until its config enables SHACL, ledger-wide or per graph. Ledgers whose config already enables SHACL are unchanged, and so are configs without a SHACL group, which were already unenforced. The same applies to shapes published through GraphQL or `fluree model entity define`, and to branch merge, rebase, revert and push. In a GraphQL schema, `sh:minCount ≥ 1` makes a field non-null only where the config enables SHACL; elsewhere the field is nullable.
