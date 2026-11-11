@@ -1574,10 +1574,6 @@ pub fn build_virtual_ledger_info(
             // `classes()` rather than its `table_name()`. The ref predicate's
             // `@id` datatype already flows through `poms` above; this adds the
             // per-target-class counts the native `/info` carries.
-            //
-            // A parent that keeps only some of its table's rows drops the
-            // references to the rows it leaves out (no join partner, no
-            // triple), so the child's row count only bounds that predicate.
             let ref_targets: Vec<(String, Vec<String>)> = tm
                 .predicate_object_maps
                 .iter()
@@ -1590,23 +1586,58 @@ pub fn build_virtual_ledger_info(
                     Some((pred.to_string(), parent.classes().to_vec()))
                 })
                 .collect();
-            let bounded_refs: std::collections::BTreeSet<&str> = tm
-                .predicate_object_maps
-                .iter()
-                .filter_map(|pom| {
-                    let ObjectMap::RefObjectMap(rom) = &pom.object_map else {
-                        return None;
-                    };
-                    let parent = mapping.get(&rom.parent_triples_map)?;
-                    (!map_source(parent).1)
-                        .then(|| pom.predicate_map.as_constant())
-                        .flatten()
-                })
-                .collect();
-            let pred_rows = |pred: &str| match rows {
-                MapRows::Exact(n) if bounded_refs.contains(pred) => MapRows::AtMost(n),
-                rows => rows,
-            };
+            // A reference from or into a filtered map has no exact count. The
+            // child's row count bounds it only when each child row names at
+            // most one parent subject: the parent's subject columns are among
+            // its join columns. Otherwise a filtered parent can keep two rows
+            // with one child key and different subjects, so one child row
+            // yields two triples, and nothing metadata knows bounds the
+            // count. (A reference between two unfiltered maps keeps the
+            // child's row count, as before.)
+            let mut ref_rows: BTreeMap<&str, MapRows> = BTreeMap::new();
+            for pom in &tm.predicate_object_maps {
+                let ObjectMap::RefObjectMap(rom) = &pom.object_map else {
+                    continue;
+                };
+                let (Some(pred), Some(parent)) = (
+                    pom.predicate_map.as_constant(),
+                    mapping.get(&rom.parent_triples_map),
+                ) else {
+                    continue;
+                };
+                let parent_filtered = !map_source(parent).1;
+                let MapRows::AtMost(n) = (match rows {
+                    MapRows::Exact(n) if parent_filtered => MapRows::AtMost(n),
+                    rows => rows,
+                }) else {
+                    continue;
+                };
+                let one_subject_per_key = parent
+                    .subject_map
+                    .template_columns
+                    .iter()
+                    .chain(parent.subject_map.column.iter())
+                    .all(|column| {
+                        rom.join_conditions
+                            .iter()
+                            .any(|jc| &jc.parent_column == column)
+                    });
+                let bound = if one_subject_per_key {
+                    MapRows::AtMost(n)
+                } else {
+                    MapRows::AtMost(None)
+                };
+                // A predicate with two references keeps the weaker answer.
+                ref_rows
+                    .entry(pred)
+                    .and_modify(|seen| {
+                        if matches!(bound, MapRows::AtMost(None)) {
+                            *seen = bound;
+                        }
+                    })
+                    .or_insert(bound);
+            }
+            let pred_rows = |pred: &str| ref_rows.get(pred).copied().unwrap_or(rows);
 
             for class in tm.classes() {
                 let cls = classes.entry(class.clone()).or_default();
@@ -4096,8 +4127,10 @@ mod tests {
     /// A filtered map (an `rr:sqlQuery` with a `WHERE`) keeps only some of its
     /// table's rows, so no metadata knows its count: every count it contributes
     /// to is `null`, with `count-upper-bound` the sum of the contributing maps'
-    /// table row counts. A reference into a filtered parent is bounded too (a
-    /// child row whose parent the filter drops yields no triple). Unfiltered
+    /// table row counts. A reference into a filtered parent is bounded by the
+    /// child's rows when the parent's subject columns are among its join
+    /// columns (one parent subject per child key), and not bounded at all when
+    /// they are not (two kept parent rows can share a child key). Unfiltered
     /// counts keep their value and carry no bound.
     #[test]
     fn test_virtual_ledger_info_filtered_map_counts_are_bounds() {
@@ -4119,7 +4152,14 @@ mod tests {
                 rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] ;
                 rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [
                     rr:parentTriplesMap <#Current> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] ;
+                rr:predicateObjectMap [ rr:predicate ex:customerVersion ; rr:objectMap [
+                    rr:parentTriplesMap <#CurrentVersion> ;
                     rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] .
+            <#CurrentVersion> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/version/{customer_id}/{valid_from}" ;
+                                rr:class ex:CustomerVersion ] .
         "#;
         let mapping = fluree_db_r2rml::R2rmlLoader::from_turtle(ttl)
             .unwrap()
@@ -4177,6 +4217,18 @@ mod tests {
         let props = &stats["properties"];
         assert_eq!(props["http://ex.org/customer"]["count"], JsonValue::Null);
         assert_eq!(props["http://ex.org/customer"]["count-upper-bound"], 7);
+        // The version subject is keyed by (customer_id, valid_from) and joined
+        // on customer_id alone: two kept versions of one customer give one
+        // order two references, so the order count bounds nothing.
+        let version = &props["http://ex.org/customerVersion"];
+        assert_eq!(version["count"], JsonValue::Null, "{version}");
+        assert!(version.get("count-upper-bound").is_none(), "{version}");
+        let version_ref = &order["properties"]["http://ex.org/customerVersion"];
+        assert_eq!(
+            version_ref["types"]["@id"],
+            JsonValue::Null,
+            "{version_ref}"
+        );
         assert_eq!(props["http://ex.org/name"]["count"], JsonValue::Null);
         assert_eq!(props["http://ex.org/name"]["count-upper-bound"], 13);
         assert_eq!(props["http://ex.org/total"]["count"], 7);
