@@ -291,6 +291,9 @@ impl TermDictReader {
 pub struct TermDictBuilder {
     map: HashMap<TermKey, u64>,
     next_seq: HashMap<u32, u32>,
+    /// Terms the dictionary this builder continues already holds
+    /// ([`Self::keep`]); not among the builder's own.
+    kept: HashMap<TermKey, u64>,
 }
 
 impl TermDictBuilder {
@@ -307,18 +310,26 @@ impl TermDictBuilder {
                 .iter()
                 .map(|(p_id, wm)| (*p_id, wm.saturating_add(1)))
                 .collect(),
+            kept: HashMap::new(),
         }
+    }
+
+    /// Record that the dictionary this builder continues holds `key` under
+    /// `handle`: lookups return it, and it is not one of the builder's own
+    /// terms ([`Self::entries_sorted`], [`Self::upload`]).
+    pub fn keep(&mut self, key: TermKey, handle: u64) {
+        self.kept.insert(key, handle);
     }
 
     /// The handle already assigned to `key` in this builder.
     pub fn get(&self, key: &TermKey) -> Option<u64> {
-        self.map.get(key).copied()
+        self.kept.get(key).or_else(|| self.map.get(key)).copied()
     }
 
     /// The handle for `key`, allocating one under its inner predicate if new.
     pub fn get_or_insert(&mut self, key: TermKey) -> io::Result<u64> {
-        if let Some(h) = self.map.get(&key) {
-            return Ok(*h);
+        if let Some(h) = self.get(&key) {
+            return Ok(h);
         }
         let next = self.next_seq.entry(key.p_id).or_insert(0);
         // The sequences above are novelty's provisional handles.
@@ -335,7 +346,7 @@ impl TermDictBuilder {
         Ok(handle)
     }
 
-    /// Distinct terms interned so far.
+    /// Distinct terms the builder allocated, kept ones aside.
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -345,15 +356,32 @@ impl TermDictBuilder {
         self.map.is_empty()
     }
 
-    /// Every interned term as `(handle, key)`, ascending by handle, which is
-    /// `(p_id, seq)` order: what an incremental pack append consumes.
+    /// Every term the builder allocated as `(handle, key)`, ascending by
+    /// handle, which is `(p_id, seq)` order: what an incremental pack append
+    /// consumes.
     pub fn entries_sorted(&self) -> Vec<(u64, TermKey)> {
         let mut v: Vec<(u64, TermKey)> = self.map.iter().map(|(k, h)| (*h, *k)).collect();
         v.sort_unstable_by_key(|(h, _)| *h);
         v
     }
 
-    /// `(p_id, highest seq allocated)` per predicate with at least one term.
+    /// [`Self::entries_sorted`] as `(inner p_id, seq, key bytes)`: what an
+    /// incremental dictionary append takes as its new terms.
+    pub fn new_term_entries(&self) -> Vec<(u32, u32, Vec<u8>)> {
+        self.entries_sorted()
+            .into_iter()
+            .map(|(h, key)| {
+                (
+                    term_handle_p_id(h),
+                    term_handle_seq(h),
+                    key.to_be_bytes().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// `(p_id, highest seq allocated)` per predicate with at least one term,
+    /// the watermarks the builder continued included.
     pub fn watermarks(&self) -> Vec<(u32, u32)> {
         let mut wms: Vec<(u32, u32)> = self
             .next_seq
@@ -678,5 +706,19 @@ mod tests {
         assert_eq!(term_handle_seq(h), 42);
         let h0 = b.get_or_insert(key(1, 6, 2)).unwrap();
         assert_eq!(term_handle_seq(h0), 0);
+    }
+
+    /// A kept term answers with the handle the base dictionary gave it, and
+    /// only the builder's own terms are new.
+    #[test]
+    fn kept_terms_keep_their_handle_and_are_not_new() {
+        let mut b = TermDictBuilder::above_watermarks(&[(5, 41)]);
+        b.keep(key(1, 5, 2), term_handle(5, 7));
+        assert_eq!(b.get_or_insert(key(1, 5, 2)).unwrap(), term_handle(5, 7));
+        let new = b.get_or_insert(key(1, 5, 3)).unwrap();
+        assert_eq!(new, term_handle(5, 42));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.entries_sorted(), vec![(new, key(1, 5, 3))]);
+        assert_eq!(b.watermarks(), vec![(5, 42)]);
     }
 }

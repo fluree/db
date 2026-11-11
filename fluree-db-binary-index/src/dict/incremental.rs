@@ -368,14 +368,14 @@ pub fn update_reverse_tree(
             let estimated_bytes = estimate_leaf_bytes(&merged);
 
             if estimated_bytes > split_threshold {
-                // Split into two leaves
-                let mid = merged.len() / 2;
-                let (first_half, second_half) = merged.split_at(mid);
-
-                let a = encode_and_track(first_half, &mut new_leaves);
-                let b = encode_and_track(second_half, &mut new_leaves);
-                branch_entries.push(a);
-                branch_entries.push(b);
+                // As many leaves as the merge needs, not two: a bulk append
+                // (a graph import's terms) can land far more than one leaf's
+                // worth in a single leaf's range.
+                let pieces = estimated_bytes.div_ceil(target_leaf_bytes).max(2);
+                for k in 0..pieces {
+                    let piece = &merged[k * merged.len() / pieces..(k + 1) * merged.len() / pieces];
+                    branch_entries.push(encode_and_track(piece, &mut new_leaves));
+                }
             } else {
                 let entry = encode_and_track(&merged, &mut new_leaves);
                 branch_entries.push(entry);
@@ -871,6 +871,33 @@ mod tests {
             });
             assert!(found, "entry key_{i:04} not found in any leaf");
         }
+    }
+
+    #[test]
+    fn a_large_batch_into_one_leaf_is_cut_into_target_size_leaves() {
+        let (branch, leaf_bytes) = build_test_tree(&[make_reverse_entry("key_000000", 0)]);
+        let new_entries: Vec<ReverseEntry> = (1..20_000)
+            .map(|i| make_reverse_entry(&format!("key_{i:06}"), i))
+            .collect();
+        let target = 4096;
+        let result = update_reverse_tree(&branch, &new_entries, target, &mut |idx| {
+            Ok(leaf_bytes[idx].clone())
+        })
+        .unwrap();
+
+        let limit = (target as f64 * SPLIT_FACTOR) as usize;
+        let mut ids = Vec::new();
+        for artifact in &result.new_leaves {
+            assert!(
+                artifact.bytes.len() <= limit,
+                "a {} byte leaf against a {target} byte target",
+                artifact.bytes.len()
+            );
+            let leaf = ReverseLeaf::from_bytes(&artifact.bytes).unwrap();
+            ids.extend(leaf.iter().map(|(_, id)| id));
+        }
+        assert_eq!(ids, (0..20_000).collect::<Vec<u64>>());
+        assert_eq!(result.branch.leaves.len(), result.new_leaves.len());
     }
 
     #[test]

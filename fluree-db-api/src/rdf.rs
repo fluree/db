@@ -525,7 +525,8 @@ mod tests {
              ex:z a \"a literal type\" .\n\
              ex:g {{ ex:a ex:age 42 {{| ex:by _:who |}} . _:who ex:name \"W\" .\n\
                     ex:doc ex:says <<( ex:c ex:p <<( ex:d ex:q \"z\" )>> )>> .\n\
-                    ex:claim rdf:reifies <<( ex:e ex:p ex:f )>> . }}"
+                    ex:claim rdf:reifies <<( ex:e ex:p ex:f )>> . }}\n\
+             _:g2 {{ ex:a ex:p 1 . _:g2 ex:label \"g\" }}"
         );
         let mut dataset = parse(&doc, RdfFormat::TriG, None).unwrap();
         dataset.canonicalize();

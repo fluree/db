@@ -401,11 +401,10 @@ fn spawn_release_task(
 /// it a single blip leaks the blob permanently, since nothing
 /// re-proposes a release.
 ///
-/// Where the cluster collects, the envelope is left to its collection:
-/// another queued request may share its address (a merge's, rebase's or
-/// revert's envelope holds only stable fields), and this node may apply
-/// the release late, or again when it replays its log. Reconciliation
-/// finds it once nothing names it.
+/// Where the cluster collects, the envelope is left to its collection,
+/// which alone deletes blobs there: this node may apply the release late,
+/// or again when it replays its log. Reconciliation finds it once nothing
+/// names it.
 pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
     if fluree.collected_by_cluster().await {
         return;

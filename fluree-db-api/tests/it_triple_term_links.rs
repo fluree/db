@@ -155,6 +155,47 @@ async fn reindex_rebuilds_the_links_and_the_dictionary() {
     );
 }
 
+/// A reifier in a later chunk links a term new to the import, then one an
+/// earlier chunk interned. The earlier term has the lower handle, so once
+/// their ordinals resolve the two links sort the other way round. A lookup
+/// bound to either link finds it, on the import's index and on a rebuild.
+#[tokio::test]
+async fn a_lookup_bound_to_a_link_finds_it_whatever_its_handle_order() {
+    const FIRST: &str = "@prefix ex: <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+ex:x rdf:reifies <<( ex:alice ex:knows ex:bob )>> .
+";
+    const SECOND: &str = "@prefix ex: <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+ex:r rdf:reifies <<( ex:carol ex:knows ex:dave )>> , <<( ex:alice ex:knows ex:bob )>> .
+";
+    let alias = "it/triple-term-links:handle-order";
+    let (fluree, imported) = import(&[("a.ttl", FIRST), ("b.ttl", SECOND)], alias).await;
+    let check = |label: &'static str, ledger: LedgerState| {
+        let fluree = &fluree;
+        async move {
+            for term in [
+                "<<( ex:alice ex:knows ex:bob )>>",
+                "<<( ex:carol ex:knows ex:dave )>>",
+            ] {
+                let got = run_link_query(
+                    fluree,
+                    &ledger,
+                    format!("SELECT ?n WHERE {{ ex:r rdf:reifies {term} BIND(1 AS ?n) }}"),
+                )
+                .await;
+                assert_eq!(got, strings(&[&["1"]]), "[{label}] {term}");
+            }
+        }
+    };
+    check("import", imported).await;
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    check("rebuild", fluree.ledger(alias).await.expect("reload")).await;
+}
+
 async fn links(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Vec<Vec<String>> {
     let sparql = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
                   SELECT ?r ?t WHERE { ?r rdf:reifies ?t } ORDER BY ?r";

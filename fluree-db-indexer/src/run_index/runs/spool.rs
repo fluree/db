@@ -981,6 +981,12 @@ impl Iterator for SortedCommitReaderV2 {
 
 /// Merge source that streams V2 sorted-commit records, applies global remaps,
 /// and exposes the result through the standard V2 merge interface.
+///
+/// Subject and string remaps are monotone, so remapped records stay in the
+/// commit's order. A triple term's handle is not monotone in its ordinal (a
+/// term interned by an earlier chunk, or held by the ledger, has the lower
+/// handle), so in a chunk with a term table the records that differ only in
+/// their term are re-sorted as a group before they are handed out.
 pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     reader: SortedCommitReaderV2,
     subject_remap: S,
@@ -989,6 +995,18 @@ pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     scope: GraphScope,
     term_ctx: Option<Arc<TermRemapCtx>>,
     current: Option<RunRecordV2>,
+    /// Only for a chunk with a term table: a chunk without one holds no
+    /// triple-term records, and its records take the plain path.
+    regroup: Option<Box<TermRegroup>>,
+}
+
+#[derive(Default)]
+struct TermRegroup {
+    /// The rest of a re-sorted group, in order.
+    pending: std::collections::VecDeque<RunRecordV2>,
+    /// The remapped record that ended a group.
+    lookahead: Option<RunRecordV2>,
+    group: Vec<RunRecordV2>,
 }
 
 impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
@@ -1001,6 +1019,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
         scope: GraphScope,
         term_ctx: Option<Arc<TermRemapCtx>>,
     ) -> io::Result<Self> {
+        let regroup = term_ctx.as_ref().map(|_| Box::default());
         let mut reader = Self {
             reader: SortedCommitReaderV2::open(path, record_count)?,
             subject_remap,
@@ -1009,13 +1028,74 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
             scope,
             term_ctx,
             current: None,
+            regroup,
         };
         reader.advance_to_next()?;
         Ok(reader)
     }
 
+    #[inline]
     fn advance_to_next(&mut self) -> io::Result<()> {
-        self.current = None;
+        if self.regroup.is_some() {
+            return self.advance_regrouped();
+        }
+        self.current = self.next_remapped()?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn advance_regrouped(&mut self) -> io::Result<()> {
+        let mut regroup = self.regroup.take().expect("a chunk with a term table");
+        let result = self.next_regrouped(&mut regroup);
+        self.regroup = Some(regroup);
+        result
+    }
+
+    fn next_regrouped(&mut self, rg: &mut TermRegroup) -> io::Result<()> {
+        use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
+        use fluree_db_core::o_type::{DecodeKind, OType};
+
+        if let Some(record) = rg.pending.pop_front() {
+            self.current = Some(record);
+            return Ok(());
+        }
+        self.current = match rg.lookahead.take() {
+            Some(record) => Some(record),
+            None => self.next_remapped()?,
+        };
+        let Some(first) = self.current else {
+            return Ok(());
+        };
+        if OType::from_u16(first.o_type).decode_kind() != DecodeKind::TripleTermDict {
+            return Ok(());
+        }
+        let same_group = |r: &RunRecordV2| {
+            (r.g_id, r.s_id, r.p_id, r.o_type) == (first.g_id, first.s_id, first.p_id, first.o_type)
+        };
+        rg.group.clear();
+        rg.group.push(first);
+        loop {
+            match self.next_remapped()? {
+                Some(record) if same_group(&record) => rg.group.push(record),
+                other => {
+                    rg.lookahead = other;
+                    break;
+                }
+            }
+        }
+        if rg.group.len() > 1 {
+            // Stable, so a term's ops keep the commit's order. Within the
+            // group every merge order compares as this one does.
+            rg.group.sort_by(cmp_v2_g_spot);
+            rg.pending.extend(rg.group.drain(..));
+            self.current = rg.pending.pop_front();
+        }
+        Ok(())
+    }
+
+    /// The next record the scope accepts, remapped.
+    #[inline]
+    fn next_remapped(&mut self) -> io::Result<Option<RunRecordV2>> {
         while let Some(mut record) = self.reader.next_record()? {
             if !self.scope.accepts(record.g_id) {
                 continue;
@@ -1032,10 +1112,9 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
                 lang_remap,
                 self.term_ctx.as_deref(),
             )?;
-            self.current = Some(record);
-            return Ok(());
+            return Ok(Some(record));
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -1046,6 +1125,7 @@ impl<S: SubjectRemap, R: StringRemap> crate::run_index::runs::streaming_reader::
         self.current.as_ref()
     }
 
+    #[inline]
     fn advance(&mut self) -> io::Result<()> {
         self.advance_to_next()
     }
@@ -1287,27 +1367,59 @@ impl TermRemapCtx {
                 ),
             )
         })?;
-        remap_v2_record(
+        remap_term_entry(
             &mut term,
             subject_remap,
             string_remap,
             lang_remap,
-            Some(self),
+            &mut |inner| self.handle_for(inner, subject_remap, string_remap, lang_remap),
         )?;
-        let o_type = fluree_db_core::o_type::OType::from_u16(term.o_type);
-        if fluree_db_core::triple_term::is_lexical_term_object(o_type) {
-            term.o_key = u64::from(string_remap.get(term.o_key as usize)?);
-        }
-        let key = fluree_db_core::triple_term::TermKey {
-            s_id: term.s_id.as_u64(),
-            p_id: term.p_id,
-            o_type,
-            o_key: term.o_key,
-        };
+        let key = term_key_of(&term);
         self.builder
             .lock()
             .map_err(|_| io::Error::other("term dictionary builder lock poisoned"))?
             .get_or_insert(key)
+    }
+}
+
+/// Translate a term-table entry through a chunk's remaps: its subject, its
+/// object, and its language, as [`remap_v2_record`] does a record, except
+/// that a lexical term object
+/// ([`is_lexical_term_object`](fluree_db_core::triple_term::is_lexical_term_object))
+/// is a string id, and an inner term's `o_key`, its ordinal in the same
+/// table, goes through `inner`.
+pub fn remap_term_entry<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
+    term: &mut RunRecordV2,
+    subject_remap: &S,
+    string_remap: &R,
+    lang_remap: Option<&[u16]>,
+    inner: &mut dyn FnMut(u64) -> io::Result<u64>,
+) -> io::Result<()> {
+    use fluree_db_core::o_type::{DecodeKind, OType};
+    use fluree_db_core::subject_id::SubjectId;
+
+    term.s_id = SubjectId::from_u64(subject_remap.get(term.s_id.as_u64() as usize)?);
+    let o_type = OType::from_u16(term.o_type);
+    term.o_key = match o_type.decode_kind() {
+        DecodeKind::IriRef => subject_remap.get(term.o_key as usize)?,
+        DecodeKind::StringDict => u64::from(string_remap.get(term.o_key as usize)?),
+        DecodeKind::TripleTermDict => inner(term.o_key)?,
+        _ if fluree_db_core::triple_term::is_lexical_term_object(o_type) => {
+            u64::from(string_remap.get(term.o_key as usize)?)
+        }
+        _ => term.o_key,
+    };
+    remap_v2_lang(term, lang_remap);
+    Ok(())
+}
+
+/// The key a translated term-table entry is interned under.
+pub fn term_key_of(term: &RunRecordV2) -> fluree_db_core::triple_term::TermKey {
+    fluree_db_core::triple_term::TermKey {
+        s_id: term.s_id.as_u64(),
+        p_id: term.p_id,
+        o_type: fluree_db_core::o_type::OType::from_u16(term.o_type),
+        o_key: term.o_key,
     }
 }
 
@@ -1325,8 +1437,7 @@ pub fn remap_v2_record<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
     let global_s = subject_remap.get(record.s_id.as_u64() as usize)?;
     record.s_id = SubjectId::from_u64(global_s);
 
-    let mut o_type = OType::from_u16(record.o_type);
-    match o_type.decode_kind() {
+    match OType::from_u16(record.o_type).decode_kind() {
         DecodeKind::IriRef => {
             record.o_key = subject_remap.get(record.o_key as usize)?;
         }
@@ -1345,18 +1456,26 @@ pub fn remap_v2_record<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
         _ => {}
     }
 
-    if let Some(lang_remap) = lang_remap {
-        if let Some(local_lang_id) = o_type.lang_id() {
-            if !lang_remap.is_empty() && local_lang_id != 0 {
-                if let Some(&global_lang_id) = lang_remap.get(local_lang_id as usize) {
-                    o_type = OType::lang_string(global_lang_id);
-                    record.o_type = o_type.as_u16();
-                }
-            }
+    remap_v2_lang(record, lang_remap);
+    Ok(())
+}
+
+/// Translate a record's language tag through `lang_remap`.
+#[inline]
+fn remap_v2_lang(record: &mut RunRecordV2, lang_remap: Option<&[u16]>) {
+    use fluree_db_core::o_type::OType;
+
+    let Some(lang_remap) = lang_remap else {
+        return;
+    };
+    let Some(local_lang_id) = OType::from_u16(record.o_type).lang_id() else {
+        return;
+    };
+    if !lang_remap.is_empty() && local_lang_id != 0 {
+        if let Some(&global_lang_id) = lang_remap.get(local_lang_id as usize) {
+            record.o_type = OType::lang_string(global_lang_id).as_u16();
         }
     }
-
-    Ok(())
 }
 
 #[inline]
@@ -1940,7 +2059,8 @@ pub fn sort_remap_and_write_sorted_commit(
 /// monotone. A merge over an existing dictionary breaks that: existing terms
 /// keep their ids and new ones are numbered above the watermark. Renumbering
 /// each id by the rank of its global id restores it. Rewrites the commit
-/// (re-sorted), its types-map sidecar, and both remap files in place, and
+/// (re-sorted), its term table, its types-map sidecar, and both remap files
+/// in place, and
 /// returns the commit's info and language remap to use from then on.
 pub fn relocalize_sorted_commit(
     info: &SortedCommitInfo,
@@ -1949,16 +2069,7 @@ pub fn relocalize_sorted_commit(
     lang_remap: &[u16],
 ) -> io::Result<(SortedCommitInfo, Vec<u16>)> {
     use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
-
-    // Relocalizing renumbers subjects and strings only; a chunk's triple
-    // terms would keep ids that no longer name their components.
-    if info.term_table.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "an import into a graph of an existing ledger does not support triple terms \
-             or edge annotations yet",
-        ));
-    }
+    use fluree_db_core::o_type::{DecodeKind, OType};
 
     /// `remap` reordered by value, and each old index's rank in that order.
     fn by_rank<T: Copy + Ord>(remap: &[T]) -> (Vec<T>, Vec<u64>) {
@@ -2003,15 +2114,28 @@ pub fn relocalize_sorted_commit(
     let new_lang_remap: Vec<u16> = std::iter::once(0).chain(langs_by_rank).collect();
 
     let mut records: Vec<RunRecordV2> = Vec::with_capacity(info.record_count as usize);
+    let keep_ordinal = &mut |ordinal| Ok(ordinal);
     for record in SortedCommitReaderV2::open(&info.path, info.record_count)? {
         let mut record = record?;
-        remap_v2_record(
-            &mut record,
-            &subject_rank,
-            &string_rank,
-            Some(lang_rank.as_slice()),
-            None,
-        )?;
+        if OType::from_u16(record.o_type).decode_kind() == DecodeKind::TripleTermDict {
+            // A link names its term by ordinal, the term's position in the
+            // table, which renumbering keeps.
+            remap_term_entry(
+                &mut record,
+                &subject_rank,
+                &string_rank,
+                Some(lang_rank.as_slice()),
+                keep_ordinal,
+            )?;
+        } else {
+            remap_v2_record(
+                &mut record,
+                &subject_rank,
+                &string_rank,
+                Some(lang_rank.as_slice()),
+                None,
+            )?;
+        }
         records.push(record);
     }
     records.sort_unstable_by(cmp_v2_g_spot);
@@ -2023,6 +2147,26 @@ pub fn relocalize_sorted_commit(
     }
     let written = writer.finish()?;
     std::fs::rename(&tmp_path, &info.path)?;
+
+    // The term table renumbers in place, entry by entry, so every ordinal
+    // still names its term.
+    if let Some((terms_path, count)) = &info.term_table {
+        let tmp_path = terms_path.with_extension("terms-relocalized");
+        let mut writer = SortedCommitWriterV2::new(&tmp_path, info.chunk_idx)?;
+        for term in SortedCommitReaderV2::open(terms_path, *count)? {
+            let mut term = term?;
+            remap_term_entry(
+                &mut term,
+                &subject_rank,
+                &string_rank,
+                Some(lang_rank.as_slice()),
+                keep_ordinal,
+            )?;
+            writer.push(&term)?;
+        }
+        writer.finish()?;
+        std::fs::rename(&tmp_path, terms_path)?;
+    }
 
     if let Some(types_path) = &info.types_map_path {
         use crate::run_index::build::build_from_commits::TYPES_RECORD_BYTES;
@@ -2789,6 +2933,127 @@ mod tests {
             })
             .collect();
         assert_eq!(edges, vec![(100, 900)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk's links still name the same global terms after relocalizing,
+    /// nested ones included: the term table renumbers in place, so every
+    /// ordinal keeps its entry.
+    #[test]
+    fn relocalized_term_table_names_the_same_terms() {
+        use crate::run_index::resolve::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
+        use fluree_db_binary_index::dict::TermDictBuilder;
+        use fluree_db_core::triple_term::TermKey;
+
+        let dir = std::env::temp_dir().join("fluree_test_relocalize_terms");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut subj_dict = ChunkSubjectDict::new();
+        let alice = subj_dict.get_or_insert(5, b"Alice");
+        let bob = subj_dict.get_or_insert(5, b"Bob");
+        let carol = subj_dict.get_or_insert(5, b"Carol");
+        let r1 = subj_dict.get_or_insert(5, b"r1");
+        let r2 = subj_dict.get_or_insert(5, b"r2");
+        let mut str_dict = ChunkStringDict::new();
+        let a = u64::from(str_dict.get_or_insert(b"a"));
+        let b = u64::from(str_dict.get_or_insert(b"b"));
+
+        const REIFIES: u32 = 30;
+        // Term 0: `<< Carol p10 Alice >>`; term 1: `<< Bob p11 "b" >>`; term
+        // 2: `<< Alice p12 term0 >>`, nested.
+        let terms = vec![
+            make_record(carol, 10, ObjKind::REF_ID, alice, 0),
+            make_record(bob, 11, ObjKind::LEX_ID, b, 0),
+            make_record(alice, 12, ObjKind::TRIPLE_TERM, 0, 0),
+        ];
+        let records = vec![
+            make_record(r1, REIFIES, ObjKind::TRIPLE_TERM, 0, 1),
+            make_record(r2, REIFIES, ObjKind::TRIPLE_TERM, 1, 1),
+            make_record(r2, REIFIES, ObjKind::TRIPLE_TERM, 2, 1),
+            make_record(r1, 20, ObjKind::LEX_ID, a, 1),
+        ];
+        let registry = OTypeRegistry::builtin_only();
+        let info = sort_remap_and_write_sorted_commit(
+            records,
+            terms,
+            subj_dict,
+            str_dict,
+            &dir.join("subjects.voc"),
+            &dir.join("strings.voc"),
+            &dir.join("commit_0.fsv2"),
+            0,
+            None,
+            None,
+            &registry,
+        )
+        .unwrap();
+        assert!(info.term_table.is_some());
+
+        // Sorted-local ids are Alice, Bob, Carol, r1, r2 / "a", "b"; an
+        // existing dictionary gave them global ids in no such order.
+        let subject_path = dir.join("subjects.rmp");
+        let string_path = dir.join("strings.rmp");
+        let subjects: Vec<u8> = [900u64, 100, 500, 300, 700]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        std::fs::write(&subject_path, subjects).unwrap();
+        let strings: Vec<u8> = [7u32, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&string_path, strings).unwrap();
+
+        // Each link's subject and term, the term's inner terms spelled out.
+        let links = |info: &SortedCommitInfo| -> Vec<(u64, Vec<TermKey>)> {
+            let s_remap = MmapSubjectRemap::open(&subject_path).unwrap();
+            let str_remap = MmapStringRemap::open(&string_path).unwrap();
+            let builder = Arc::new(std::sync::Mutex::new(TermDictBuilder::new()));
+            let (terms_path, count) = info.term_table.clone().unwrap();
+            let ctx = TermRemapCtx::load(&terms_path, count, Arc::clone(&builder)).unwrap();
+            let mut handles = Vec::new();
+            for record in SortedCommitReaderV2::open(&info.path, info.record_count).unwrap() {
+                let mut record = record.unwrap();
+                if record.p_id != REIFIES {
+                    continue;
+                }
+                remap_v2_record(&mut record, &s_remap, &str_remap, None, Some(&ctx)).unwrap();
+                handles.push((record.s_id.as_u64(), record.o_key));
+            }
+            let by_handle: std::collections::HashMap<u64, TermKey> = builder
+                .lock()
+                .unwrap()
+                .entries_sorted()
+                .into_iter()
+                .collect();
+            let mut out: Vec<(u64, Vec<TermKey>)> = handles
+                .into_iter()
+                .map(|(s, mut handle)| {
+                    let mut chain = Vec::new();
+                    loop {
+                        let mut key = by_handle[&handle];
+                        let inner = (key.o_type == fluree_db_core::o_type::OType::TRIPLE_TERM)
+                            .then_some(key.o_key);
+                        if inner.is_some() {
+                            key.o_key = 0;
+                        }
+                        chain.push(key);
+                        match inner {
+                            Some(next) => handle = next,
+                            None => break,
+                        }
+                    }
+                    (s, chain)
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let before = links(&info);
+        assert_eq!(before.len(), 3);
+        assert_eq!(before.iter().map(|(_, c)| c.len()).max(), Some(2));
+
+        let (info, _) = relocalize_sorted_commit(&info, &subject_path, &string_path, &[]).unwrap();
+        assert_eq!(links(&info), before);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
