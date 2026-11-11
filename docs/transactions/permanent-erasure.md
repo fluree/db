@@ -384,7 +384,7 @@ It logs whether erasure is available and why not, and its discovery document rep
 | `--disable-erasure` | off | Refuse erasure requests even where a prover is installed. |
 | `--erasure-scratch-dir <dir>` | `<temp>/fluree-erasure` | The prover's temporary files. They hold the plaintext of commits being erased. Each step's directory is removed when the step ends, and a purge removes any that a crashed step left. |
 | `--erasure-prover-threads <n>` | every core | Proving threads. Fewer threads leave transactions their cores. |
-| `--erasure-prover-timeout-secs <n>` | 14400 | A step still running after this long is killed, with its process group, and retried. |
+| `--erasure-prover-timeout-secs <n>` | 14400 | A step still running after this long is killed, with its process group, and retried. A request whose steps time out three times fails. |
 
 Each step runs as its own process, at low priority (nice 10). Proving takes gigabytes of memory
 (about 9.6 GB for a 1,000-operation commit). On Linux the prover asks to be the process the kernel
@@ -430,11 +430,16 @@ On a 16-vCPU host, the measured proving times are:
 | 50,000 operations | about 3 hours |
 
 A request typically touches two or three commits per branch: the assertion, its retraction, and the
-removal's own retraction. The ZK prototype report (`prototypes/zk-redaction/README.md`) has the full
+removal's own retraction. A commit of more than 50,000 operations cannot be erased: the request is
+refused (`422`) when it is made, since proving one that size would not finish within the default
+timeout. A large import commit is the usual case. The ZK prototype report (`prototypes/zk-redaction/README.md`) has the full
 measurements.
 
 ## Limits
 
+- **Commit size.** A commit of more than 50,000 operations cannot be erased (see [Cost](#cost)). The
+  occurrences are still removed from what the ledger serves. A request whose proving steps run out
+  of time three times fails rather than being retried.
 - **Until the purge completes**, the original commit files and index files built before publishing
   remain on disk, and no read path serves them.
 - **IRIs stay in the index dictionaries.** Erasing every fact about a subject, or every reference to a

@@ -325,6 +325,75 @@ async fn a_failed_step_is_retried_and_a_restart_resumes_the_job() {
     );
 }
 
+/// A step that runs out of proving time is tried again, but a job whose
+/// steps time out three times fails: its commit is too large to prove
+/// within the timeout, and trying again would only hold the prover.
+#[tokio::test]
+async fn a_job_fails_at_its_third_proving_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let mut jobs = Vec::new();
+    for (name, timeouts) in [("it/erase-slow", 2), ("it/erase-too-slow", 3)] {
+        let id = ledger(&fluree, name).await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+        )
+        .await;
+        fluree
+            .erase_occurrences(&id, email("alice", "a@secret"), None)
+            .await
+            .expect("erase");
+        prover.time_out_next(timeouts);
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            fluree.run_erasure_pass(&id).await.unwrap();
+        }
+        let status = fluree.retention_status(&id).await.unwrap();
+        jobs.push(status.registration.unwrap().erasures[0].clone());
+    }
+    let (slow, too_slow) = (&jobs[0], &jobs[1]);
+    assert_eq!(slow.timeouts, 2);
+    assert_ne!(slow.stage, ErasureStage::Failed, "{slow:?}");
+    assert!(!slow.commits.iter().all(|c| c.proved.is_none()), "{slow:?}");
+    assert_eq!(too_slow.stage, ErasureStage::Failed, "{too_slow:?}");
+    assert_eq!(too_slow.timeouts, 3);
+    assert!(
+        too_slow
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("too large to prove")),
+        "{too_slow:?}"
+    );
+}
+
+/// Proving a commit past the most operations a proof can cover would only
+/// time out, so its erasure is refused when it is asked for.
+#[tokio::test]
+async fn an_erasure_of_a_commit_too_large_to_prove_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-large").await;
+    let values: Vec<i64> = (0..50_000).collect();
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice",
+               "ex:email": "a@secret", "ex:n": values}),
+    )
+    .await;
+    let refused = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await;
+    assert!(
+        matches!(&refused, Err(ApiError::Http { status: 422, message })
+            if message.contains("more than the 50000")),
+        "{refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_second_erasure_of_a_commit_builds_on_the_first() {
     let dir = tempfile::tempdir().unwrap();

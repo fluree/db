@@ -2348,6 +2348,7 @@ fn received_jobs(
                         false => prepared.properties.clone(),
                     },
                     retries: 0,
+                    timeouts: 0,
                     retry_at_ms: None,
                     last_error: None,
                     published_ms: Some(now),

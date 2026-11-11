@@ -10,9 +10,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 /// Why a step was not proved.
 #[derive(Debug, thiserror::Error)]
 pub enum ProverError {
-    /// The prover could not be run, or did not finish in time.
+    /// The prover could not be run.
     #[error("prover unavailable: {0}")]
     Unavailable(String),
+    /// The prover did not finish within its timeout.
+    #[error("prover timed out: no result in {0:?}")]
+    TimedOut(std::time::Duration),
     /// The prover refused the step (malformed input, invalid slots, a
     /// signature that does not verify): it will not prove on a retry.
     #[error("prover refused the step: {0}")]
@@ -471,7 +474,7 @@ async fn run_limited(
     };
     let (status, (out, too_long), err) = tokio::time::timeout(config.timeout, exchange)
         .await
-        .map_err(|_| ProverError::Unavailable(format!("no result in {:?}", config.timeout)))?
+        .map_err(|_| ProverError::TimedOut(config.timeout))?
         .map_err(unavailable)?;
     if too_long {
         return Err(ProverError::Failed(format!(

@@ -349,6 +349,9 @@ pub struct ErasureJob {
     /// Prover attempts that failed and will be retried.
     #[serde(default)]
     pub retries: u32,
+    /// Prover attempts that ran out of time; the job fails at the third.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub timeouts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,4 +512,8 @@ pub struct PurgeProgress {
     /// What a completed purge could not check, and what to do about it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unverified: Vec<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }

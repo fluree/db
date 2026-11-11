@@ -279,6 +279,7 @@ impl Fluree {
                 false => properties.into_iter().collect(),
             },
             retries: 0,
+            timeouts: 0,
             retry_at_ms: None,
             last_error: None,
             published_ms: None,
@@ -574,6 +575,7 @@ impl Fluree {
                 continue;
             }
             let bytes = self.commit_bytes(&task.branches[0], &cid).await?;
+            refuse_unprovable_size(commit, &bytes)?;
             task.ledger_id = signing_ledger(&bytes, &task.slots, branches)
                 .map_err(|why| unsupported_commit(commit, &why))?;
             out.push(task);
@@ -668,6 +670,25 @@ impl Fluree {
 
 fn unsupported(why: &str) -> ApiError {
     ApiError::http(501, format!("permanent erasure is unsupported here: {why}"))
+}
+
+/// The most operations a commit may hold to be erased. Proving one this
+/// size takes about three hours on 16 cores, inside the prover's default
+/// four-hour timeout; a larger one would only time out.
+const MAX_PROVABLE_OPERATIONS: u32 = 50_000;
+
+fn refuse_unprovable_size(commit: &str, bytes: &[u8]) -> Result<()> {
+    use fluree_db_core::commit::codec::format::CommitHeader;
+    match CommitHeader::read_from(bytes) {
+        Ok(header) if header.op_count > MAX_PROVABLE_OPERATIONS => Err(unsupported_commit(
+            commit,
+            &format!(
+                "it holds {} operations, more than the {MAX_PROVABLE_OPERATIONS} a proof can cover",
+                header.op_count
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn unsupported_commit(commit: &str, why: &str) -> ApiError {
@@ -786,6 +807,31 @@ async fn any_holds(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_commit_past_the_provable_size_is_refused() {
+        use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN, VERSION};
+        let commit = |op_count| {
+            let mut bytes = vec![0; HEADER_LEN];
+            CommitHeader {
+                version: VERSION,
+                flags: 0,
+                t: 1,
+                op_count,
+                envelope_len: 0,
+                sig_block_len: 0,
+            }
+            .write_to(&mut bytes);
+            bytes
+        };
+        assert!(refuse_unprovable_size("c", &commit(MAX_PROVABLE_OPERATIONS)).is_ok());
+        let refused = refuse_unprovable_size("c", &commit(MAX_PROVABLE_OPERATIONS + 1));
+        assert!(
+            matches!(&refused, Err(ApiError::Http { status: 422, message })
+                if message.contains("50001 operations")),
+            "{refused:?}"
+        );
+    }
+
     use super::*;
 
     fn job(n: usize, stage: ErasureStage) -> ErasureJob {
@@ -800,6 +846,7 @@ mod tests {
             commits: Vec::new(),
             properties: Vec::new(),
             retries: 0,
+            timeouts: 0,
             retry_at_ms: None,
             last_error: None,
             published_ms: None,

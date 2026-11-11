@@ -454,7 +454,7 @@ impl Fluree {
             Ok(Some(_)) => Stepped::Proved,
             Ok(None) => Stepped::Nothing,
             Err(StepError::Refused(_)) => Stepped::Refused,
-            Err(StepError::Retry(_)) => Stepped::Failed,
+            Err(StepError::Retry(_) | StepError::TimedOut(_)) => Stepped::Failed,
         };
         if let Err(e) = self
             .record_step(branch, request_id, commit, outcome, retry_ms)
@@ -514,6 +514,7 @@ impl Fluree {
                 Some(StepOutcome::Retry(why)) => {
                     return Err(StepError::Retry(ApiError::internal(why)))
                 }
+                Some(StepOutcome::TimedOut(why)) => return Err(StepError::TimedOut(why)),
                 None => {}
             }
         }
@@ -646,6 +647,7 @@ impl Fluree {
         let started = Instant::now();
         let response = config.prover.prove(&request).await.map_err(|e| match e {
             ProverError::Refused(why) => StepError::Refused(why),
+            timed_out @ ProverError::TimedOut(_) => StepError::TimedOut(timed_out.to_string()),
             other => StepError::Retry(ApiError::internal(other.to_string())),
         })?;
         let prove_ms = started.elapsed().as_millis() as u64;
@@ -791,7 +793,18 @@ impl Fluree {
                 job.stage = ErasureStage::Failed;
                 job.last_error = Some(format!("commit {commit}: {why}"));
             }
-            Err(StepError::Retry(e)) => {
+            Err(StepError::TimedOut(why)) if job.timeouts + 1 >= MAX_PROVE_TIMEOUTS => {
+                job.timeouts += 1;
+                job.stage = ErasureStage::Failed;
+                job.last_error = Some(format!(
+                    "commit {commit}: {why}, {MAX_PROVE_TIMEOUTS} times; it is too large to \
+                     prove within the prover's timeout"
+                ));
+            }
+            Err(e @ (StepError::Retry(_) | StepError::TimedOut(_))) => {
+                if matches!(e, StepError::TimedOut(_)) {
+                    job.timeouts += 1;
+                }
                 job.retries += 1;
                 let wait = retry_ms
                     .saturating_mul(1 << job.retries.saturating_sub(1).min(16))
@@ -1581,9 +1594,24 @@ fn commit_id(commit: &str) -> Result<ContentId> {
 enum StepError {
     /// The prover refused the step: it will not prove on retry.
     Refused(String),
+    /// The prover ran out of time: tried again, up to [`MAX_PROVE_TIMEOUTS`].
+    TimedOut(String),
     /// Anything else: tried again later.
     Retry(ApiError),
 }
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StepError::Refused(why) | StepError::TimedOut(why) => f.write_str(why),
+            StepError::Retry(e) => e.fmt(f),
+        }
+    }
+}
+
+/// How many times a job's steps may run out of proving time before the job
+/// fails: a commit that does not prove in that many tries will not.
+const MAX_PROVE_TIMEOUTS: u32 = 3;
 
 impl From<std::result::Result<Option<ProvedStep>, StepError>> for StepOutcome {
     fn from(outcome: std::result::Result<Option<ProvedStep>, StepError>) -> Self {
@@ -1592,6 +1620,7 @@ impl From<std::result::Result<Option<ProvedStep>, StepError>> for StepOutcome {
             Ok(None) => StepOutcome::Nothing,
             Err(StepError::Refused(why)) => StepOutcome::Refused(why),
             Err(StepError::Retry(e)) => StepOutcome::Retry(e.to_string()),
+            Err(StepError::TimedOut(why)) => StepOutcome::TimedOut(why),
         }
     }
 }

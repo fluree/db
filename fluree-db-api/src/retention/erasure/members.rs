@@ -35,6 +35,8 @@ pub enum StepOutcome {
     Refused(String),
     /// To be tried again.
     Retry(String),
+    /// The prover ran out of time: tried again, up to a limit.
+    TimedOut(String),
 }
 
 /// Where a member is with a step its leader handed it.

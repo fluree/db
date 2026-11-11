@@ -110,7 +110,7 @@ async fn a_refusal_a_timeout_and_a_missing_binary_are_errors() {
     let runner = SubprocessProver::new(config(dir.path(), hangs, Duration::from_secs(3)));
     let outcome = runner.prove(&request()).await;
     assert!(
-        matches!(outcome, Err(ProverError::Unavailable(_))),
+        matches!(outcome, Err(ProverError::TimedOut(_))),
         "{outcome:?}"
     );
     let pid: i32 = std::fs::read_to_string(dir.path().join("grandchild"))

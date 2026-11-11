@@ -21,6 +21,7 @@ pub const TEST_IMAGE_ID: [u32; 8] = [0x7e57_0001; 8];
 #[derive(Debug, Default)]
 pub struct NativeProver {
     failures: AtomicUsize,
+    timeouts: AtomicUsize,
     refusals: AtomicUsize,
     proved: Mutex<Vec<ProveRequest>>,
 }
@@ -29,6 +30,12 @@ impl NativeProver {
     /// Fail the next `n` steps as an unavailable prover would.
     pub fn fail_next(&self, n: usize) {
         self.failures.store(n, Ordering::SeqCst);
+    }
+
+    /// Time out the next `n` steps as a prover does on a commit too large
+    /// to prove within its timeout.
+    pub fn time_out_next(&self, n: usize) {
+        self.timeouts.store(n, Ordering::SeqCst);
     }
 
     /// Refuse the next `n` steps as a prover refuses a commit it cannot
@@ -61,6 +68,13 @@ impl Prover for NativeProver {
             .is_ok()
         {
             return Err(ProverError::Unavailable("told to fail".into()));
+        }
+        if self
+            .timeouts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ProverError::TimedOut(std::time::Duration::ZERO));
         }
         if self
             .refusals
