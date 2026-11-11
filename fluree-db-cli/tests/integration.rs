@@ -8087,3 +8087,22 @@ fn doc_read_through_the_account_renews_a_refused_token_or_says_the_sign_in_is_go
         vec!["/v1/grounding", "/v1/oauth/exchange"]
     );
 }
+
+/// `FLUREE_DOC_READER_ACCOUNT` takes yes or no and nothing else: `on` is an
+/// error, not a quiet no that would turn off `account = true` in the file.
+#[test]
+fn doc_read_refuses_an_account_variable_it_cannot_read() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", tmp.path().join("home"))
+        .env("FLUREE_DOC_READER_ACCOUNT", "on")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "FLUREE_DOC_READER_ACCOUNT=\"on\": expected 1, true or yes, or 0, false or no",
+        ));
+}

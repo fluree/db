@@ -300,7 +300,7 @@ account = true
 models = ["reader-small"]
 ```
 
-Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE,ACCOUNT}` and `FLUREE_DOC_MODEL` override the file.
+Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE,ACCOUNT}` and `FLUREE_DOC_MODEL` override the file. `FLUREE_DOC_READER_ACCOUNT` takes `1`, `true` or `yes`, or `0`, `false` or `no`; any other value is an error.
 
 ### Using a Fluree AI account
 

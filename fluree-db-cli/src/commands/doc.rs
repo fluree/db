@@ -55,7 +55,7 @@ fn cache_root(dirs: &FlureeDir) -> PathBuf {
 /// first, then the global one, so a login done once from the home directory
 /// serves every project.
 async fn resolve_config(dirs: &FlureeDir) -> CliResult<DocConfig> {
-    let config = crate::config::read_doc_config(dirs.config_dir())?.with_env();
+    let config = crate::config::read_doc_config(dirs.config_dir())?.with_env()?;
     let Some(remote_name) = config.remote.clone() else {
         return Ok(config);
     };
@@ -1403,7 +1403,7 @@ pub async fn run_parse(args: DocParseArgs, dirs: Option<&FlureeDir>) -> CliResul
     }
     let config = match dirs {
         Some(dirs) => resolve_config(dirs).await?,
-        None => DocConfig::default().with_env(),
+        None => DocConfig::default().with_env()?,
     };
     let cache = dirs
         .filter(|_| !args.no_cache)
@@ -1495,7 +1495,7 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     }
     let config = match dirs {
         Some(dirs) => resolve_config(dirs).await?,
-        None => DocConfig::default().with_env(),
+        None => DocConfig::default().with_env()?,
     };
     let Some(model) = args.model.clone().or_else(|| config.model.clone()) else {
         return Err(CliError::Usage(
@@ -1685,7 +1685,7 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     // slot, or an account that would fill one. The account is only asked
     // for its token when a vector lane actually runs, so a text search
     // never waits on it.
-    let local = crate::config::read_doc_config(dirs.config_dir())?.with_env();
+    let local = crate::config::read_doc_config(dirs.config_dir())?.with_env()?;
     let can_embed = local.embedding.is_some() || local.remote.is_some();
 
     // Everything available, unless told otherwise: both indexes fused when
