@@ -15,3 +15,6 @@ mod it_retention_import;
 
 #[path = "it_retention_registration.rs"]
 mod it_retention_registration;
+
+#[path = "it_retention_branch_lifetimes.rs"]
+mod it_retention_branch_lifetimes;

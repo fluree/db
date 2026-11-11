@@ -128,7 +128,7 @@ For each newly asserted value, the first of these that is present decides:
 
 An explicit lifetime of `0` (or `PT0S`) means "no automatic expiry" and overrides the lower levels.
 
-A relative lifetime starts at the persisted commit time of the commit that wrote the instruction, never at indexing time, and replay or retries do not restart it. A commit with no recorded time cannot start a relative lifetime: retention reports it in its status instead of guessing.
+A relative lifetime starts at the persisted commit time of the commit that wrote the instruction, never at indexing time, and replay or retries do not restart it. A merge or rebase that brings a value onto another branch does not restart it either: the value keeps the lifetime it was written with, including a transaction default, counted from the commit that first wrote it. Deadlines are to the commit, not the instant, and expiry is best-effort, so a deadline can land a few seconds either side. A commit with no recorded time cannot start a relative lifetime: retention reports it in its status instead of guessing.
 
 ## Renewing and cancelling
 

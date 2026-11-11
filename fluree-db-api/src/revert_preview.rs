@@ -286,6 +286,7 @@ impl crate::Fluree {
                     net: undo,
                     namespace_delta,
                     graph_iris,
+                    ..
                 } = collect_from_commits(commits, Fold::Undo);
                 let branch_state = self.ledger(&branch_id).await?;
                 let staged = self

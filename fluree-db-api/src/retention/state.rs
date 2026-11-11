@@ -9,7 +9,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use fluree_db_core::commit::codec::{decode_flake_batch, encode_flake_batch};
-use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_db_core::{ContentId, Flake, FlakeMeta, FlakeValue, Sid};
 use serde::{Deserialize, Serialize};
 
 /// One fact: graph, subject, predicate and the complete object term.
@@ -114,6 +114,9 @@ pub(crate) struct Retirement {
 pub(crate) struct Schedule {
     /// Commits with `t <= watermark_t` have been discovered.
     pub(crate) watermark_t: i64,
+    /// The commit at `watermark_t`, once one is discovered: a head whose
+    /// line no longer holds it was rewritten under the schedule.
+    pub(crate) watermark_id: Option<ContentId>,
     entries: HashMap<FactKey, Entry>,
     by_due: BTreeSet<(i64, FactKey)>,
     pub(crate) retire: BTreeSet<Retirement>,
@@ -213,6 +216,7 @@ impl Schedule {
         let header = Header {
             version: 1,
             watermark_t: self.watermark_t,
+            watermark_id: self.watermark_id.as_ref().map(ToString::to_string),
             entries: keys
                 .iter()
                 .map(|(_, e)| EntryForm {
@@ -265,8 +269,13 @@ impl Schedule {
         if flakes.len() != header.entries.len() {
             return Err(bad());
         }
+        let watermark_id = header
+            .watermark_id
+            .map(|id| id.parse::<ContentId>().map_err(|e| format!("{e:?}")))
+            .transpose()?;
         let mut schedule = Schedule {
             watermark_t: header.watermark_t,
+            watermark_id,
             problems: header.problems,
             ..Default::default()
         };
@@ -302,6 +311,8 @@ const MAGIC: &[u8; 4] = b"FRS1";
 struct Header {
     version: u32,
     watermark_t: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watermark_id: Option<String>,
     entries: Vec<EntryForm>,
     retire: Vec<RetireForm>,
     problems: Vec<String>,

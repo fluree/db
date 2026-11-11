@@ -471,6 +471,7 @@ impl crate::Fluree {
             net: undo,
             namespace_delta,
             graph_iris,
+            ..
         } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is

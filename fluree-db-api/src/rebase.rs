@@ -380,6 +380,11 @@ impl crate::Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         let source_name_owned = source_name.to_string();
 
+        // The branch takes on the source's history, and its lifetimes: it is
+        // registered for retention as the source is, from the source's
+        // boundary where earlier, before it holds them.
+        self.register_retention_as(&source_id, &branch_id).await?;
+
         // Fast-forward: the branch has no commits of its own to replay.
         let is_fast_forward = diff.source.commits.is_empty();
         if !is_fast_forward {
@@ -483,6 +488,10 @@ impl crate::Fluree {
         let mut skipped = 0;
         let mut replayed = 0;
         let mut pending_replays: Vec<PendingReplay> = Vec::new();
+        // Whether a replay's values may carry a lifetime from a property
+        // policy, besides one its own commit gives them.
+        let retention = self.retention_registered(&source_id).await?
+            || self.retention_registered(&branch_id).await?;
 
         for summary in &summaries {
             let has_conflicts = !summary.conflict_keys.is_empty();
@@ -529,7 +538,7 @@ impl crate::Fluree {
             }
 
             let staged = self
-                .build_replay_commit(current_state, flakes, &commit)
+                .build_replay_commit(current_state, flakes, &commit, retention)
                 .await?;
             let commit_id = staged
                 .commit
@@ -767,6 +776,7 @@ impl crate::Fluree {
         state: LedgerState,
         flakes: Vec<Flake>,
         original_commit: &Commit,
+        retention: bool,
     ) -> Result<StagedCommit> {
         // A commit written before the staging fix can hold a retraction and
         // an assertion of one fact at one `t`. The pair means the fact holds,
@@ -777,7 +787,7 @@ impl crate::Fluree {
         // source installed since the fork. Each replay is validated against
         // the state it lands on; the first violation aborts the whole rebase,
         // which has published nothing yet, naming the commit it stopped on.
-        let (view, outcome) = self
+        let (mut view, outcome) = self
             .stage_validated(
                 state,
                 flakes,
@@ -786,6 +796,11 @@ impl crate::Fluree {
                 "rebase",
             )
             .await?;
+        // The replay keeps the original's lifetimes, counted from when the
+        // original was written: its transaction default, and the start.
+        for entry in crate::retention::replayed_lifetimes(original_commit, retention) {
+            view.push_system_txn_meta(entry);
+        }
         outcome.into_result_with(|report| {
             format!(
                 "replaying commit t={} was refused:\n{report}",
@@ -946,8 +961,8 @@ impl crate::Fluree {
 
     /// Copy index artifacts from source to branch (best-effort), and
     /// publish them on the branch where newer than its own. The index now in
-    /// the branch's namespace, if any. The branch takes the source's
-    /// retention registration first; failing that, it takes no index.
+    /// the branch's namespace, if any. The caller has given the branch the
+    /// source's retention registration.
     async fn copy_source_index(
         &self,
         source_id: &str,
@@ -957,13 +972,6 @@ impl crate::Fluree {
         source_record: &fluree_db_nameservice::NsRecord,
     ) -> Option<(ContentId, i64)> {
         let index_cid = source_record.index_head_id.as_ref()?;
-        if let Err(e) = self.register_retention_as(source_id, branch_id).await {
-            tracing::warn!(
-                %e, source = %source_id, branch = %branch_id,
-                "retention registration failed during rebase; branch will replay from genesis"
-            );
-            return None;
-        }
         if let Err(e) = self
             .copy_index_to_branch(source_id, branch, index_cid)
             .await

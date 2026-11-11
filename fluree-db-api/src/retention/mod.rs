@@ -33,6 +33,7 @@ pub(crate) mod watch;
 mod worker;
 pub mod writer;
 
+pub(crate) use engine::carries_retention_input;
 pub use engine::PassReport;
 pub use registry::Registration;
 pub use removal::{FactSelector, OccurrenceRef, RemovalReceipt, RemovalRequest};
@@ -224,6 +225,38 @@ pub(crate) fn is_ttl_predicate(p: &Sid) -> bool {
 }
 
 /// The txn-meta marker on a commit carrying retention control input.
+/// The txn-meta a replay of `original` (a rebase) records so its values keep
+/// their lifetimes: the original's transaction default, and when the
+/// original was written ([`db::LIFETIME_START`]), where it carries retention
+/// input or `retention` says the ledger may give its values lifetimes.
+pub(crate) fn replayed_lifetimes(
+    original: &fluree_db_core::Commit,
+    retention: bool,
+) -> Vec<fluree_db_core::TxnMetaEntry> {
+    let mut entries: Vec<fluree_db_core::TxnMetaEntry> = original
+        .txn_meta
+        .iter()
+        .filter(|e| {
+            e.predicate_ns == FLUREE_DB && matches!(&*e.predicate_name, db::TTL | db::EXPIRES_AT)
+        })
+        .cloned()
+        .collect();
+    if retention || engine::carries_retention_input(&original.txn_meta) {
+        if let Some(start) = engine::lifetime_start(original) {
+            entries.push(fluree_db_core::TxnMetaEntry::new(
+                FLUREE_DB,
+                db::LIFETIME_START,
+                fluree_db_core::TxnMetaValue::TypedLiteral {
+                    value: start.to_string(),
+                    dt_ns: fluree_vocab::namespaces::XSD,
+                    dt_name: fluree_vocab::xsd_names::DATE_TIME.to_string(),
+                },
+            ));
+        }
+    }
+    entries
+}
+
 pub(crate) fn retention_control_marker() -> fluree_db_core::TxnMetaEntry {
     fluree_db_core::TxnMetaEntry::new(
         FLUREE_DB,

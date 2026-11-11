@@ -747,6 +747,7 @@ impl crate::Fluree {
             },
             namespace_delta,
             graph_iris,
+            retention_input,
         } = source_data;
 
         let current_head_t = target_state.t();
@@ -758,7 +759,7 @@ impl crate::Fluree {
         // nothing written and the target untouched. An empty flake set is
         // valid (e.g., TakeBranch drops all source flakes): the merge commit
         // still records the parent relationship and prevents re-merges.
-        let (view, outcome) = self
+        let (mut view, outcome) = self
             .stage_merge(
                 target_state,
                 source_branch,
@@ -770,6 +771,9 @@ impl crate::Fluree {
             )
             .await?;
         outcome.into_result()?;
+        if retention_input {
+            view.push_system_txn_meta(crate::retention::retention_control_marker());
+        }
 
         // Create merge commit with the source head as an additional parent,
         // propagating namespace and graph deltas from the source branch.
@@ -978,8 +982,14 @@ pub(crate) async fn collect_commit_data(
         changes.retain_changes(cid, &mut commit.flakes);
         commits.push(commit);
     }
+    let retention_input = commits
+        .iter()
+        .any(|c| crate::retention::carries_retention_input(&c.txn_meta));
     Ok((
-        collect_from_commits(commits, Fold::Replay),
+        CollectedCommitData {
+            retention_input,
+            ..collect_from_commits(commits, Fold::Replay)
+        },
         changes.into_keys(),
     ))
 }

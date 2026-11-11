@@ -90,14 +90,15 @@ impl ScheduleCache {
         &self,
         ledger_id: &str,
         blob: Option<&str>,
-        head_t: i64,
+        head: (i64, Option<&ContentId>),
         now_ms: i64,
     ) -> Option<(i64, usize)> {
         let map = self.schedules.lock();
         let cached = map.get(ledger_id)?;
         let s = &cached.schedule;
         (cached.blob.as_deref() == blob
-            && s.watermark_t >= head_t
+            && s.watermark_t == head.0
+            && (s.watermark_id.is_none() || s.watermark_id.as_ref() == head.1)
             && s.retire.is_empty()
             && s.next_due_ms().is_none_or(|due| due > now_ms))
         .then(|| (s.watermark_t, s.len()))
@@ -198,11 +199,141 @@ pub(crate) async fn probe_activation(
     Ok(found)
 }
 
-fn commit_ms(commit: &Commit) -> Option<i64> {
-    let text = commit.time.as_deref()?;
+fn rfc3339_ms(text: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|d| d.timestamp_millis())
+}
+
+/// When `commit`'s relative lifetimes start: the original's write time on a
+/// replay ([`db::LIFETIME_START`]), otherwise the commit's own time.
+pub(crate) fn lifetime_start(commit: &Commit) -> Option<&str> {
+    commit
+        .txn_meta
+        .iter()
+        .find_map(|e| match (&*e.predicate_name, &e.value) {
+            (
+                db::LIFETIME_START,
+                TxnMetaValue::TypedLiteral { value, .. } | TxnMetaValue::String(value),
+            ) if e.predicate_ns == FLUREE_DB => Some(value.as_str()),
+            _ => None,
+        })
+        .or(commit.time.as_deref())
+}
+
+fn lifetime_start_ms(commit: &Commit) -> Option<i64> {
+    lifetime_start(commit).and_then(rfc3339_ms)
+}
+
+fn is_marked(commit: &Commit) -> bool {
+    commit
+        .txn_meta
+        .iter()
+        .any(|e| e.predicate_ns == FLUREE_DB && &*e.predicate_name == db::RETENTION_CONTROL)
+}
+
+fn txn_default(commit: &Commit) -> Option<Lifetime> {
+    commit
+        .txn_meta
+        .iter()
+        .filter(|e| e.predicate_ns == FLUREE_DB)
+        .find_map(Lifetime::of_txn_meta)
+}
+
+/// Where a value a merge brought in began, on the line it merged.
+#[derive(Clone, Copy, Debug)]
+struct Origin {
+    start_ms: Option<i64>,
+    txn_default: Option<Lifetime>,
+}
+
+/// For each of `wanted` (a fact a merge brought in, with the reifier of
+/// the instruction it carries), the commit on the line from `from` that
+/// began its current occurrence or last renewed it with an instruction,
+/// read back along that line's first parents. A fact that commit took from
+/// a merge of its own is followed onto that merge's line. A fact the line
+/// never asserted is left out. Commit-level: a lifetime is close, not exact.
+fn merged_origins(
+    store: &dyn ContentStore,
+    from: ContentId,
+    wanted: HashMap<FactKey, Option<Sid>>,
+) -> futures::future::BoxFuture<'_, Result<HashMap<FactKey, Origin>>> {
+    Box::pin(async move {
+        // A fact's origin, and the line it came from when that commit merged it.
+        type Found = (Origin, Option<ContentId>);
+        let by_reifier: HashMap<Sid, FactKey> = wanted
+            .iter()
+            .filter_map(|(k, r)| r.clone().map(|r| (r, k.clone())))
+            .collect();
+        let mut open: HashSet<FactKey> = wanted.keys().cloned().collect();
+        let mut run: HashMap<FactKey, Found> = HashMap::new();
+        let mut found: HashMap<FactKey, Found> = HashMap::new();
+        let mut next = Some(from);
+        while let Some(cid) = next.filter(|_| !open.is_empty()) {
+            let commit = load_commit_by_id(store, &cid).await?;
+            let here: Found = (
+                Origin {
+                    start_ms: lifetime_start_ms(&commit),
+                    txn_default: txn_default(&commit),
+                },
+                commit.parents.get(1).cloned(),
+            );
+            let mut asserted = HashSet::new();
+            let mut retracted = HashSet::new();
+            let mut renewed = HashSet::new();
+            let marked = is_marked(&commit);
+            for flake in &commit.flakes {
+                if marked && flake.op && is_ttl_predicate(&flake.p) {
+                    if let Some(key) = by_reifier.get(&flake.s).filter(|k| open.contains(*k)) {
+                        renewed.insert(key.clone());
+                    }
+                    continue;
+                }
+                let key = FactKey::of(flake);
+                if open.contains(&key) {
+                    if flake.op {
+                        asserted.insert(key);
+                    } else {
+                        retracted.insert(key);
+                    }
+                }
+            }
+            for key in renewed {
+                open.remove(&key);
+                run.remove(&key);
+                found.insert(key, here.clone());
+            }
+            for key in asserted {
+                if open.contains(&key) {
+                    run.insert(key, here.clone());
+                }
+            }
+            for key in retracted {
+                if let Some(origin) = run.remove(&key) {
+                    open.remove(&key);
+                    found.insert(key, origin);
+                }
+            }
+            next = commit.parents.first().cloned();
+        }
+        found.extend(run);
+
+        let mut lines: HashMap<ContentId, HashMap<FactKey, Option<Sid>>> = HashMap::new();
+        for (key, (_, line)) in &found {
+            if let Some(line) = line {
+                lines
+                    .entry(line.clone())
+                    .or_default()
+                    .insert(key.clone(), wanted.get(key).cloned().flatten());
+            }
+        }
+        let mut origins: HashMap<FactKey, Origin> =
+            found.into_iter().map(|(k, (o, _))| (k, o)).collect();
+        for (line, keys) in lines {
+            origins.extend(merged_origins(store, line, keys).await?);
+        }
+        Ok(origins)
+    })
 }
 
 fn is_system_graph(g_id: GraphId) -> bool {
@@ -277,24 +408,31 @@ impl Ctx<'_> {
     }
 }
 
-/// Discover one commit's retention input into `schedule`.
+/// A value a merge commit brought in, scheduled once its origin on the
+/// merged line is known.
+struct Merged {
+    key: FactKey,
+    /// Its slot, for a new occurrence; `None` renews a current one.
+    slot: Option<u32>,
+    instruction: Option<Instruction>,
+}
+
+/// Discover one commit's retention input into `schedule`. A value a merge
+/// brought in keeps the lifetime it began on the merged line: it counts from
+/// when it was written there, not from the merge (see [`merged_origins`]).
 async fn discover_commit(
     schedule: &mut Schedule,
     commit: &Commit,
+    store: &dyn ContentStore,
     ctx: &mut Ctx<'_>,
     policy: &CompiledPolicy,
 ) -> Result<()> {
     let t = commit.t;
-    let time_ms = commit_ms(commit);
-    let marked = commit
-        .txn_meta
-        .iter()
-        .any(|e| e.predicate_ns == FLUREE_DB && &*e.predicate_name == db::RETENTION_CONTROL);
-    let txn_default = commit
-        .txn_meta
-        .iter()
-        .filter(|e| e.predicate_ns == FLUREE_DB)
-        .find_map(Lifetime::of_txn_meta);
+    let time_ms = lifetime_start_ms(commit);
+    let marked = is_marked(commit);
+    let txn_default = txn_default(commit);
+    let merged_from = commit.parents.get(1).cloned();
+    let mut merged: Vec<Merged> = Vec::new();
 
     // A graph's drop ends what it held, before the commit's own writes:
     // nothing it held is due to expire, and a value written to it again is
@@ -420,51 +558,43 @@ async fn discover_commit(
         if instruction.is_some() {
             asserted.insert(key.clone());
         }
+        // Reasserting a current value is not a new occurrence: only an
+        // explicit instruction renews it.
+        if merged_from.is_some() {
+            let existed =
+                schedule.contains(&key) || !ctx.current(g_id, &key, t - 1).await?.is_empty();
+            if !existed || instruction.is_some() {
+                merged.push(Merged {
+                    slot: (!existed).then_some(slot),
+                    key,
+                    instruction,
+                });
+            }
+            continue;
+        }
         let source = match &instruction {
             Some(i) => Some((i.lifetime, Source::Value)),
-            None => match txn_default {
-                Some(lifetime) => Some((lifetime, Source::Transaction)),
-                None => {
-                    let graph = match &flake.g {
-                        None => None,
-                        Some(g) => ctx.iris.iri(&ctx.state.snapshot, g),
-                    };
-                    let predicate = ctx.iris.iri(&ctx.state.snapshot, &flake.p);
-                    predicate
-                        .and_then(|p| policy.duration(graph.as_deref(), &p))
-                        .map(|s| (Lifetime::Seconds(s), Source::Property))
-                }
-            },
+            None => txn_default
+                .map(|lifetime| (lifetime, Source::Transaction))
+                .or_else(|| property_lifetime(ctx, policy, &key)),
         };
         let Some((lifetime, source)) = source else {
             continue;
         };
-        // Reasserting a current value is not a new occurrence: only an
-        // explicit instruction renews it.
-        let existed = schedule.contains(&key) || !ctx.current(g_id, &key, t - 1).await?.is_empty();
-        if existed {
+        if schedule.contains(&key) || !ctx.current(g_id, &key, t - 1).await?.is_empty() {
             if let Some(instruction) = instruction {
                 renew(schedule, &key, &instruction, t, time_ms);
             }
             continue;
         }
-        match lifetime.due(time_ms) {
-            Ok(Some(due_ms)) => schedule.insert(
-                key,
-                Entry {
-                    due_ms,
-                    occurrence_t: t,
-                    occurrence_slot: slot,
-                    source,
-                    generation_t: t,
-                    reifier: instruction.map(|i| i.reifier),
-                },
-            ),
-            Ok(None) => {}
-            Err(()) => schedule.note_problem(format!(
-                "t {t} has no commit time; its relative TTLs need an explicit backfill time basis"
-            )),
-        }
+        occur(
+            schedule,
+            key,
+            (t, slot),
+            (lifetime, source),
+            instruction,
+            time_ms,
+        );
     }
 
     // Instructions on values this commit did not assert: a renewal (or
@@ -478,10 +608,102 @@ async fn discover_commit(
             continue;
         };
         if schedule.contains(&key) || !ctx.current(g_id, &key, t).await?.is_empty() {
-            renew(schedule, &key, &instruction, t, time_ms);
+            if merged_from.is_some() {
+                merged.push(Merged {
+                    key,
+                    slot: None,
+                    instruction: Some(instruction),
+                });
+            } else {
+                renew(schedule, &key, &instruction, t, time_ms);
+            }
+        }
+    }
+
+    let Some(from) = merged_from.filter(|_| !merged.is_empty()) else {
+        return Ok(());
+    };
+    let wanted = merged
+        .iter()
+        .map(|m| {
+            (
+                m.key.clone(),
+                m.instruction.as_ref().map(|i| i.reifier.clone()),
+            )
+        })
+        .collect();
+    let origins = merged_origins(store, from, wanted).await?;
+    for Merged {
+        key,
+        slot,
+        instruction,
+    } in merged
+    {
+        let origin = origins.get(&key);
+        let start_ms = origin.and_then(|o| o.start_ms).or(time_ms);
+        let Some(slot) = slot else {
+            if let Some(instruction) = instruction {
+                renew(schedule, &key, &instruction, t, start_ms);
+            }
+            continue;
+        };
+        let source = match &instruction {
+            Some(i) => Some((i.lifetime, Source::Value)),
+            None => origin
+                .and_then(|o| o.txn_default)
+                .map(|lifetime| (lifetime, Source::Transaction))
+                .or_else(|| property_lifetime(ctx, policy, &key)),
+        };
+        if let Some(source) = source {
+            occur(schedule, key, (t, slot), source, instruction, start_ms);
         }
     }
     Ok(())
+}
+
+/// The lifetime a property policy gives `key`.
+fn property_lifetime(
+    ctx: &mut Ctx<'_>,
+    policy: &CompiledPolicy,
+    key: &FactKey,
+) -> Option<(Lifetime, Source)> {
+    let graph = match &key.g {
+        None => None,
+        Some(g) => ctx.iris.iri(&ctx.state.snapshot, g),
+    };
+    let predicate = ctx.iris.iri(&ctx.state.snapshot, &key.p)?;
+    policy
+        .duration(graph.as_deref(), &predicate)
+        .map(|s| (Lifetime::Seconds(s), Source::Property))
+}
+
+/// Schedule a new occurrence of `key` at `(t, slot)`, its lifetime counted
+/// from `start_ms`.
+fn occur(
+    schedule: &mut Schedule,
+    key: FactKey,
+    (t, slot): (i64, u32),
+    (lifetime, source): (Lifetime, Source),
+    instruction: Option<Instruction>,
+    start_ms: Option<i64>,
+) {
+    match lifetime.due(start_ms) {
+        Ok(Some(due_ms)) => schedule.insert(
+            key,
+            Entry {
+                due_ms,
+                occurrence_t: t,
+                occurrence_slot: slot,
+                source,
+                generation_t: t,
+                reifier: instruction.map(|i| i.reifier),
+            },
+        ),
+        Ok(None) => {}
+        Err(()) => schedule.note_problem(format!(
+            "t {t} has no commit time; its relative TTLs need an explicit backfill time basis"
+        )),
+    }
 }
 
 /// Apply an explicit instruction to a value's current occurrence. The
@@ -626,7 +848,7 @@ impl Fluree {
             if let Some((watermark_t, pending)) = cache.idle(
                 ledger_id,
                 shell.schedule.as_deref(),
-                record.commit_t,
+                (record.commit_t, record.commit_head_id.as_ref()),
                 now_ms,
             ) {
                 return Ok(PassReport {
@@ -674,11 +896,37 @@ impl Fluree {
                 rule_transitions.push((t, policy.no_history.clone()));
             }
         };
+        // A line rewritten under the schedule (a rebase, a reset) leaves it
+        // holding what commits the branch no longer has decided, and passes
+        // over what the new line brought in below its watermark: it is
+        // rediscovered from the activation boundary.
+        // The published head decides it: a cached state behind it is not a
+        // rewrite.
+        let fresh = || Schedule::starting_after(registration.active_since_t - 1);
+        if schedule.watermark_id.is_some()
+            && (schedule.watermark_t > record.commit_t
+                || (schedule.watermark_t == record.commit_t
+                    && schedule.watermark_id != record.commit_head_id))
+        {
+            schedule = fresh();
+        }
         if schedule.watermark_t < head_t {
             if let Some(head) = state.head_commit_id.clone() {
                 let mut cids =
                     collect_first_parent_cids(store.as_ref(), &head, schedule.watermark_t).await?;
                 cids.reverse();
+                if let (Some(watermark_id), Some((_, oldest))) =
+                    (schedule.watermark_id.clone(), cids.first())
+                {
+                    let oldest = load_commit_envelope_by_id(store.as_ref(), oldest).await?;
+                    if oldest.parents.first() != Some(&watermark_id) {
+                        schedule = fresh();
+                        cids =
+                            collect_first_parent_cids(store.as_ref(), &head, schedule.watermark_t)
+                                .await?;
+                        cids.reverse();
+                    }
+                }
                 cids.truncate(limits.max_commits_per_pass);
                 let mut policy = self
                     .retention_policy_at(&state, schedule.watermark_t)
@@ -686,7 +934,9 @@ impl Fluree {
                 record_rules(schedule.watermark_t, &policy);
                 for (t, cid) in cids {
                     let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                    discover_commit(&mut schedule, &commit, &mut ctx, &policy).await?;
+                    discover_commit(&mut schedule, &commit, store.as_ref(), &mut ctx, &policy)
+                        .await?;
+                    schedule.watermark_id = Some(cid);
                     let writes_config = commit.flakes.iter().any(|f| {
                         f.g.as_ref()
                             .is_some_and(|g| ctx.reverse_graph.get(g) == Some(&CONFIG_GRAPH_ID))
@@ -779,7 +1029,13 @@ impl Fluree {
             registry::update(ns, self.registry_objects(), ledger_id, |current| {
                 // Another owner (or a re-activation) may have moved it on.
                 match current {
-                    Some(c) if c.watermark_t > next.watermark_t => None,
+                    // A rebuilt schedule lowers the watermark this pass read.
+                    Some(c)
+                        if c.watermark_t > next.watermark_t
+                            && c.watermark_t != registration.watermark_t =>
+                    {
+                        None
+                    }
                     Some(c) if c.active_since_t < next.active_since_t => None,
                     _ => {
                         // The journal as it now stands (a removal may have

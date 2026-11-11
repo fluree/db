@@ -1861,6 +1861,11 @@ pub mod db {
     /// not become deletion instructions.
     pub const RETENTION_CONTROL: &str = "retentionControl";
 
+    /// db:lifetimeStart - on a commit that replays an earlier one (a
+    /// rebase): when the original was written, which its relative lifetimes
+    /// count from.
+    pub const LIFETIME_START: &str = "lifetimeStart";
+
     /// db:erasureRequest - on the control commit that authorizes a permanent
     /// erasure: the request's id.
     pub const ERASURE_REQUEST: &str = "erasureRequest";
@@ -1886,7 +1891,8 @@ pub mod db {
     /// Every local name in this namespace a commit's txn-meta holds: the user
     /// claims ([`TXN_META_USER`]) and the entries the system writes
     /// (`f:identity`, `db:receivedAt`, `f:reverts` on a revert,
-    /// `f:retentionControl`, and an erasure's authorization).
+    /// `f:retentionControl`, `f:lifetimeStart` on a replay, and an erasure's
+    /// authorization).
     pub const TXN_META: &[&str] = &[
         MESSAGE,
         AUTHOR,
@@ -1896,6 +1902,7 @@ pub mod db {
         RECEIVED_AT,
         REVERTS,
         RETENTION_CONTROL,
+        LIFETIME_START,
         ERASURE_REQUEST,
         ERASURE_REQUESTER,
         ERASURE_MANIFEST,

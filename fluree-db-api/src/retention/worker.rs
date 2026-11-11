@@ -410,6 +410,16 @@ impl Fluree {
         Ok(())
     }
 
+    /// Whether `ledger_id` is registered for retention.
+    pub(crate) async fn retention_registered(&self, ledger_id: &str) -> Result<bool> {
+        Ok(
+            registry::read(self.publisher()?, self.registry_objects(), ledger_id)
+                .await?
+                .1
+                .is_some(),
+        )
+    }
+
     /// Register `branch_id` for retention as `source_id` is, before the
     /// branch adopts the source's index: its builds never read the commits
     /// that index covers. Nothing when the source is not registered.
