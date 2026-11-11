@@ -25,7 +25,7 @@ use fluree_db_iceberg::{
     },
     metadata::{SnapshotSelection, TableMetadata, WindowCap},
     scan::{
-        topk::{batch_sort_values, plan_topk_read, TopKBound},
+        topk::{batch_sort_values_where, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan,
         SendScanPlanner,
     },
@@ -36,7 +36,7 @@ use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
     ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFileCounts, ScanFilter,
-    ScanTopK, ScanValue, SourceTime, TermOrder,
+    ScanOrder, ScanTopK, ScanValue, SourceTime, TermOrder,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
@@ -2252,7 +2252,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((storage, metadata, metadata_location))
     }
 
-    /// Stream a set of scan tasks as column batches, with bounded parallelism.
+    /// Stream a set of scan tasks as column batches, with bounded parallelism,
+    /// in the tasks' (commit) order (see [`read_files_in_order`]).
     ///
     /// Only `O(iceberg_scan_concurrency)` file decodes are resident at a time, so a
     /// consumer that processes and drops each batch never holds the whole table.
@@ -2273,35 +2274,19 @@ impl<'a> FlureeR2rmlProvider<'a> {
             concurrency, "streaming Parquet files (bounded parallel)"
         );
         let storage = Arc::clone(storage);
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
-                let storage = Arc::clone(&storage);
-                let footers = Arc::clone(&footers);
-                async move {
-                    tokio::spawn(async move {
-                        let reader =
-                            SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
-                        reader.read_task(&task).await.map_err(|e| {
-                            QueryError::Internal(format!(
-                                "Failed to read Parquet file '{}': {e}",
-                                task.data_file.file_path
-                            ))
-                        })
-                    })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
-                }
-            })
-            .buffer_unordered(concurrency)
-            // One file's `Result<Vec<ColumnBatch>>` becomes individual
-            // `Result<ColumnBatch>` items; a read error becomes one error item.
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
-                }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-        Box::pin(stream)
+        read_files_in_order(tasks, EmitOrder::AsListed, concurrency, move |task| {
+            let storage = Arc::clone(&storage);
+            let footers = Arc::clone(&footers);
+            async move {
+                let reader = SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                reader.read_task(&task).await.map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to read Parquet file '{}': {e}",
+                        task.data_file.file_path
+                    ))
+                })
+            }
+        })
     }
 
     /// Read a set of scan tasks into column batches with bounded parallelism.
@@ -3278,7 +3263,32 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         projection: &[String],
         filters: &[ScanFilter],
         topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scan_table_ordered(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+            ScanOrder::Deterministic,
+        )
+        .await
+    }
+
+    /// [`Self::scan_table`] under `order`: a deterministic scan emits its files
+    /// smallest first; an [`ScanOrder::Any`] scan emits them as their reads
+    /// finish.
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // Time the whole scan SETUP (loadTable + planning) as one span; it closes
         // when the stream is constructed. Per-file Parquet decode happens later,
@@ -3298,6 +3308,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             filters,
             topk,
             _as_of_t,
+            order,
         )
         .instrument(span)
         .await
@@ -4781,6 +4792,7 @@ impl FlureeR2rmlProvider<'_> {
     /// resolution (and its per-query snapshot pin) lives in
     /// [`Self::load_table_context`]; this adds the scan-only concerns — the
     /// scan-start log and the Parquet disk cache — and the streaming scan plan.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_table_inner(
         &self,
         graph_source_id: &str,
@@ -4789,6 +4801,7 @@ impl FlureeR2rmlProvider<'_> {
         filters: &[ScanFilter],
         topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // GREP: r2rml-as-of-t — `_as_of_t` is a Fluree `t`, which names no Iceberg
         // state; it is ignored. A time-pinned read arrives as this query's
@@ -4980,7 +4993,9 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         // Read data files with bounded parallelism, streaming each file's batches
-        // to the consumer as the worker completes. Concurrency is capped (see
+        // to the consumer in a fixed order (`read_files_in_order`: an unordered
+        // query answers the same rows in the same order every time, so LIMIT /
+        // OFFSET pages partition its answer). Concurrency is capped (see
         // `iceberg_scan_concurrency`) so only O(concurrency) file decodes are
         // resident — the consumer (R2rmlScanOperator) materializes and aggregates
         // incrementally instead of the whole table being collected here.
@@ -5008,11 +5023,20 @@ impl FlureeR2rmlProvider<'_> {
             // top-k is always correct — the `SortOperator` above is authoritative).
             // The bounds must sort as the terms do: a string column's "9" bound
             // sits above its "100", an integer column's 10 above its 9.
+            // The bound counts only rows that yield a solution: a row with a
+            // NULL in a column the solution needs is dropped after the scan.
+            // A required column this table lacks declines the directive.
+            let required_ids: Option<Vec<i32>> = tk
+                .required_columns
+                .iter()
+                .map(|name| schema.field_by_name(name).map(|f| f.id))
+                .collect();
             let admitted = schema
                 .field_by_name(&tk.sort_column)
                 .filter(|field| !tk.ascending || field.required)
-                .filter(|field| bound_order(field.type_string()) == Some(tk.order));
-            if let Some(field) = admitted {
+                .filter(|field| bound_order(field.type_string()) == Some(tk.order))
+                .zip(required_ids);
+            if let Some((field, required_ids)) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
                 let order = plan_topk_read(
@@ -5062,16 +5086,19 @@ impl FlureeR2rmlProvider<'_> {
                         )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
-                    // rows this scan EMITS, which must be exactly the QUALIFYING
-                    // result rows. The directive is declined upstream
-                    // (`topk_feed_may_drop_rows`) whenever a row this scan emits
-                    // could still be dropped: a residual filter, a join with the
-                    // child on a shared variable, or any pushed filter (which
-                    // this reader may apply only partly). Feeding those rows
-                    // would ride the k-th bound too high and prune files whose
-                    // qualifying rows belong in the true top-k.
+                    // rows this scan EMITS that yield a result row, which must be
+                    // exactly the QUALIFYING result rows, one per solution. Rows
+                    // with a NULL in a `required_columns` column mint no solution
+                    // and are not fed. The directive is declined upstream
+                    // whenever a row could still be dropped otherwise (a residual
+                    // filter, a join with the child on a shared variable, any
+                    // pushed filter, which this reader may apply only partly, or
+                    // a star member no column decides), and where the map's rows
+                    // can repeat a solution, which deduplication emits once.
+                    // Feeding those rows would ride the k-th bound too high and
+                    // prune files whose qualifying rows belong in the true top-k.
                     for b in &batches {
-                        bound.observe_all(batch_sort_values(b, sort_field_id));
+                        bound.observe_all(batch_sort_values_where(b, sort_field_id, &required_ids));
                     }
                     collected.extend(batches);
                     reads += 1;
@@ -5112,55 +5139,44 @@ impl FlureeR2rmlProvider<'_> {
                     return Ok(Box::pin(prefix));
                 }
                 // Parallel fallback tail (same bounded-parallel read as the normal
-                // path). The bound still holds; we just stop paying sequentiality.
+                // path, still in best-first order). The bound still holds; we just
+                // stop paying sequentiality.
                 let concurrency = iceberg_scan_concurrency(tail.len());
                 let tail_stream =
-                    futures::stream::iter(tail)
-                        .map(move |task| {
-                            let storage = Arc::clone(&storage);
-                            let footers = Arc::clone(&footers);
-                            let disk_cache = Arc::clone(&disk_cache);
-                            let cache_dir = cache_dir.clone();
-                            let scope = scope.clone();
-                            let read_span = tracing::debug_span!(
-                                "iceberg.parquet_read",
-                                path = %task.data_file.file_path,
-                                file_size = task.data_file.file_size_in_bytes,
+                    read_files_in_order(tail, EmitOrder::AsListed, concurrency, move |task| {
+                        let storage = Arc::clone(&storage);
+                        let footers = Arc::clone(&footers);
+                        let disk_cache = Arc::clone(&disk_cache);
+                        let cache_dir = cache_dir.clone();
+                        let scope = scope.clone();
+                        let read_span = tracing::debug_span!(
+                            "iceberg.parquet_read",
+                            path = %task.data_file.file_path,
+                            file_size = task.data_file.file_size_in_bytes,
+                        );
+                        async move {
+                            let reader = SendParquetReader::with_caches(
+                                storage.as_ref(),
+                                footers.as_ref(),
+                                &disk_cache,
+                                &cache_dir,
+                                &scope,
                             );
-                            async move {
-                                tokio::spawn(async move {
-                                    let reader = SendParquetReader::with_caches(
-                                        storage.as_ref(),
-                                        footers.as_ref(),
-                                        &disk_cache,
-                                        &cache_dir,
-                                        &scope,
-                                    );
-                                    reader.read_task(&task).instrument(read_span).await.map_err(
-                                        |e| {
-                                            storage_query_error(
-                                                &format!(
-                                                    "Failed to read Parquet file '{}'",
-                                                    task.data_file.file_path
-                                                ),
-                                                e,
-                                            )
-                                        },
-                                    )
-                                })
+                            reader
+                                .read_task(&task)
+                                .instrument(read_span)
                                 .await
                                 .map_err(|e| {
-                                    QueryError::Internal(format!("Parquet read worker failed: {e}"))
-                                })?
-                            }
-                        })
-                        .buffer_unordered(concurrency)
-                        .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                            Ok(batches) => futures::stream::iter(
-                                batches.into_iter().map(Ok).collect::<Vec<_>>(),
-                            ),
-                            Err(e) => futures::stream::iter(vec![Err(e)]),
-                        });
+                                    storage_query_error(
+                                        &format!(
+                                            "Failed to read Parquet file '{}'",
+                                            task.data_file.file_path
+                                        ),
+                                        e,
+                                    )
+                                })
+                        }
+                    });
                 return Ok(Box::pin(prefix.chain(tail_stream)));
             }
         }
@@ -5180,64 +5196,53 @@ impl FlureeR2rmlProvider<'_> {
             concurrency, rowgroup_concurrency, "streaming Parquet files (bounded parallel)"
         );
 
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
+        Ok(read_files_in_order(
+            tasks,
+            EmitOrder::for_query(order),
+            concurrency,
+            move |task| {
                 let storage = Arc::clone(&storage);
                 let footers = Arc::clone(&footers);
                 let disk_cache = Arc::clone(&disk_cache);
                 let cache_dir = cache_dir.clone();
                 let scope = scope.clone();
-                // Create the per-file span HERE, before `tokio::spawn`, so it is
+                // Create the per-file span HERE, before the read is spawned, so it is
                 // parented under the consumer's current span: `tokio::spawn` does
                 // NOT propagate the current span into the spawned task, but a span
                 // records its parent at creation time. Instrumenting the read
                 // future inside the task then times the actual read+decode while
                 // keeping the correct parent (and gives each concurrent read a
-                // distinct span, respecting the `buffer_unordered` fan-out).
+                // distinct span).
                 let read_span = tracing::debug_span!(
                     "iceberg.parquet_read",
                     path = %task.data_file.file_path,
                     file_size = task.data_file.file_size_in_bytes,
                 );
                 async move {
-                    tokio::spawn(async move {
-                        let reader = SendParquetReader::with_caches(
-                            storage.as_ref(),
-                            footers.as_ref(),
-                            &disk_cache,
-                            &cache_dir,
-                            &scope,
-                        )
-                        .with_rowgroup_concurrency(rowgroup_concurrency);
-                        reader
-                            .read_task(&task)
-                            .instrument(read_span)
-                            .await
-                            .map_err(|e| {
-                                storage_query_error(
-                                    &format!(
-                                        "Failed to read Parquet file '{}'",
-                                        task.data_file.file_path
-                                    ),
-                                    e,
-                                )
-                            })
-                    })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+                    let reader = SendParquetReader::with_caches(
+                        storage.as_ref(),
+                        footers.as_ref(),
+                        &disk_cache,
+                        &cache_dir,
+                        &scope,
+                    )
+                    .with_rowgroup_concurrency(rowgroup_concurrency);
+                    reader
+                        .read_task(&task)
+                        .instrument(read_span)
+                        .await
+                        .map_err(|e| {
+                            storage_query_error(
+                                &format!(
+                                    "Failed to read Parquet file '{}'",
+                                    task.data_file.file_path
+                                ),
+                                e,
+                            )
+                        })
                 }
-            })
-            .buffer_unordered(concurrency)
-            // Flatten each file's `Result<Vec<ColumnBatch>>` into individual
-            // `Result<ColumnBatch>` items; a read error becomes one error item.
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
-                }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-
-        Ok(Box::pin(stream))
+            },
+        ))
     }
 }
 
@@ -5269,6 +5274,99 @@ pub(crate) fn narrow_to_row_filter(
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
 fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
+}
+
+/// The order a scan emits its data files in.
+///
+/// `AsListed` and `SmallestFirst` are total orders over one snapshot's plan, so
+/// two executions of one query emit the same rows in the same order whatever
+/// order the reads finish in: a client paging an unordered answer with
+/// LIMIT/OFFSET neither skips nor repeats a row. `Completion` is for a query
+/// with no slice, which cannot observe the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitOrder {
+    /// The order the caller lists the files in: the planner's (commit
+    /// sequence, then path), which a resumable materialize read depends on, or
+    /// the top-k read's best-first order.
+    AsListed,
+    /// Smallest data file first (the manifest's `file_size_in_bytes`), ties in
+    /// listed order: a deterministic query scan. The file at the head of the
+    /// read window is the cheapest to read, so a LIMIT is answered from small
+    /// files and a large file never holds back the files behind it for long.
+    SmallestFirst,
+    /// Each file as its read finishes. Varies from run to run with I/O timing;
+    /// only for a query with no LIMIT or OFFSET (`ScanOrder::Any`).
+    Completion,
+}
+
+impl EmitOrder {
+    /// The order a query scan emits in for the `ScanOrder` the query owes it.
+    pub(crate) fn for_query(order: ScanOrder) -> Self {
+        match order {
+            ScanOrder::Deterministic => Self::SmallestFirst,
+            ScanOrder::Any => Self::Completion,
+        }
+    }
+}
+
+/// Read a scan's data files with up to `concurrency` reads in flight, and emit
+/// each file's batches in `order`.
+///
+/// Every Iceberg scan that emits rows reads its files through here. In a fixed
+/// order (`AsListed`, `SmallestFirst`), a read that finishes ahead of the
+/// earliest pending one holds its slot until that one is emitted (head-of-line
+/// blocking), so resident decodes stay bounded by `concurrency` either way.
+///
+/// `read` builds one file's read; it runs on its own task, so up to
+/// `concurrency` reads progress in parallel while the consumer drains them.
+pub(crate) fn read_files_in_order<R, Fut>(
+    mut tasks: Vec<FileScanTask>,
+    order: EmitOrder,
+    concurrency: usize,
+    read: R,
+) -> ColumnBatchStream
+where
+    R: Fn(FileScanTask) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + 'static,
+{
+    match order {
+        EmitOrder::AsListed | EmitOrder::Completion => {}
+        // Stable: equal sizes keep the listed order.
+        EmitOrder::SmallestFirst => tasks.sort_by_key(|t| t.data_file.file_size_in_bytes),
+    }
+    // Each file's read is built here, when the window admits the file (so its
+    // span is parented under the consumer's), and spawned on its first poll;
+    // both combinators below poll every admitted file, so the reads behind the
+    // earliest one run meanwhile. This is the shape the scan had before it
+    // took an order. (Spawning eagerly as the stream is pulled raised peak RSS
+    // under glibc malloc on a decode-bound COUNT.) The mutex only makes the
+    // pending read `Sync`, as the stream must be; it is never contended.
+    let reads = futures::stream::iter(tasks).map(move |task| {
+        let read = std::sync::Mutex::new(read(task));
+        async move {
+            let read = read
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tokio::spawn(read)
+                .await
+                .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+        }
+    });
+    let concurrency = concurrency.max(1);
+    let files: std::pin::Pin<
+        Box<dyn futures::Stream<Item = QueryResult<Vec<ColumnBatch>>> + Send + Sync>,
+    > = match order {
+        EmitOrder::AsListed | EmitOrder::SmallestFirst => Box::pin(reads.buffered(concurrency)),
+        EmitOrder::Completion => Box::pin(reads.buffer_unordered(concurrency)),
+    };
+    // One file's `Result<Vec<ColumnBatch>>` becomes individual
+    // `Result<ColumnBatch>` items; a read error becomes one error item.
+    Box::pin(
+        files.flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+            Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>()),
+            Err(e) => futures::stream::iter(vec![Err(e)]),
+        }),
+    )
 }
 
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
@@ -8412,5 +8510,175 @@ mod tests {
             .await
             .expect_err("Bob is not served Alice's count");
         assert!(bobs.contains("Failed to load table from catalog"), "{bobs}");
+    }
+}
+
+#[cfg(test)]
+mod emit_order_tests {
+    use super::*;
+    use fluree_db_iceberg::io::batch::{BatchSchema, Column, FieldInfo, FieldType};
+    use fluree_db_iceberg::manifest::{DataFile, FileFormat, PartitionData};
+    use futures::TryStreamExt;
+
+    fn task(i: usize) -> FileScanTask {
+        sized_task(i, 1000)
+    }
+
+    fn sized_task(i: usize, file_size_in_bytes: i64) -> FileScanTask {
+        FileScanTask::for_whole_file(
+            DataFile {
+                file_path: format!("file:///t/data/{i:05}.parquet"),
+                file_format: FileFormat::Parquet,
+                record_count: 1,
+                file_size_in_bytes,
+                partition: PartitionData::default(),
+                column_sizes: None,
+                value_counts: None,
+                null_value_counts: None,
+                nan_value_counts: None,
+                lower_bounds: None,
+                upper_bounds: None,
+                split_offsets: None,
+                sort_order_id: None,
+            },
+            vec![1],
+            None,
+        )
+    }
+
+    /// One batch holding the file's index, so the output names its file.
+    fn batch_of(i: usize) -> ColumnBatch {
+        let schema = BatchSchema::new(vec![FieldInfo {
+            name: "file".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }]);
+        ColumnBatch::new(
+            Arc::new(schema),
+            vec![Column::Int64(vec![Some(i64::try_from(i).unwrap())])],
+        )
+        .unwrap()
+    }
+
+    fn file_of(batch: &ColumnBatch) -> i64 {
+        match batch.column_by_id(1) {
+            Some(Column::Int64(v)) => v[0].unwrap(),
+            other => panic!("unexpected column {other:?}"),
+        }
+    }
+
+    /// The first listed file finishes LAST (its read waits until the last
+    /// file's read is done), and the files are still emitted in listed order.
+    /// Completion-order emission yields 1, 2, 3, 0 here, every time.
+    #[tokio::test]
+    async fn files_are_emitted_in_listed_order_whatever_order_they_finish_in() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::AsListed, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    /// Smallest file first, equal sizes in listed order: files 0..4 of 3000,
+    /// 1000, 2000 and 1000 bytes are emitted 1, 3, 2, 0. The first to emit
+    /// finishes LAST (file 1's read waits until file 0's is done), so
+    /// completion order would put it at the end, and listed order would start
+    /// with file 0.
+    #[tokio::test]
+    async fn smallest_first_emits_by_size_then_listed_order() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let sizes = [3000, 1000, 2000, 1000];
+        let tasks = (0..4).map(|i| sized_task(i, sizes[i])).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::SmallestFirst, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        1 => last_done.notified().await,
+                        0 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order, vec![1, 3, 2, 0]);
+    }
+
+    /// Completion order: the first listed file's read waits until file 3's is
+    /// done, so it is emitted last; the others come as they finish.
+    #[tokio::test]
+    async fn completion_emits_each_file_as_its_read_finishes() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::Completion, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order.len(), 4, "{order:?}");
+        assert_eq!(order[3], 0, "the held-back file comes last: {order:?}");
+    }
+
+    /// A query owes its scan a `ScanOrder`; both providers emit by it.
+    #[test]
+    fn a_query_scan_emits_by_its_scan_order() {
+        assert_eq!(
+            EmitOrder::for_query(ScanOrder::Deterministic),
+            EmitOrder::SmallestFirst
+        );
+        assert_eq!(EmitOrder::for_query(ScanOrder::Any), EmitOrder::Completion);
+    }
+
+    /// A read error is emitted at its file's place in the emit order, after
+    /// the earlier files' rows.
+    #[tokio::test]
+    async fn a_read_error_surfaces_in_emit_order() {
+        let tasks = (0..3).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::AsListed, 3, |task| async move {
+            let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+            if i == 1 {
+                Err(QueryError::Internal("file 1 is unreadable".to_string()))
+            } else {
+                Ok(vec![batch_of(i)])
+            }
+        });
+        let items: Vec<QueryResult<ColumnBatch>> = stream.collect().await;
+        assert_eq!(items.len(), 3);
+        assert_eq!(file_of(items[0].as_ref().unwrap()), 0);
+        assert!(items[1].is_err());
+        assert_eq!(file_of(items[2].as_ref().unwrap()), 2);
     }
 }

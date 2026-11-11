@@ -126,6 +126,7 @@ hashbrown = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
 wiremock = "0.6"
 http.workspace = true
 

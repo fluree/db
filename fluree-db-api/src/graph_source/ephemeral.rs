@@ -44,10 +44,11 @@ use fluree_db_iceberg::io::{
 use fluree_db_iceberg::metadata::TableMetadata;
 use fluree_db_iceberg::scan::{ScanConfig, SendScanPlanner};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanOrder,
+};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
-use futures::StreamExt;
 
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{build_preview_storage, catalog_client};
@@ -119,6 +120,7 @@ impl EphemeralR2rmlProvider {
         &self,
         table_name: &str,
         projection: &[String],
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // The engine passes the mapping's logical table name for every scan: a
         // table, or an `rr:sqlQuery` map's alias, which reads its FROM table
@@ -134,7 +136,7 @@ impl EphemeralR2rmlProvider {
             } => load_from_catalog(conn, client.as_ref(), identity, table_name).await?,
             ProvisionalTables::Local(dirs) => load_local(dirs, table_name).await?,
         };
-        scan_loaded_table(&logical, storage, &metadata, projection).await
+        scan_loaded_table(&logical, storage, &metadata, projection, order).await
     }
 }
 
@@ -233,6 +235,7 @@ async fn scan_loaded_table(
     storage: IcebergStorageBackend,
     metadata: &TableMetadata,
     projection: &[String],
+    order: ScanOrder,
 ) -> QueryResult<ColumnBatchStream> {
     let table_name = logical.table.as_str();
     let schema = metadata.current_schema().ok_or_else(|| {
@@ -301,34 +304,26 @@ async fn scan_loaded_table(
     }
 
     // Read data files with bounded parallelism, streaming each file's batches
-    // to the operator as it completes (spawned so the stream is `Send + Sync`,
-    // matching the persisted scan's shape).
+    // to the operator in the order the query owes, as the persisted scan does.
     let storage = Arc::new(storage);
     let concurrency = tasks.len().clamp(1, 8);
-    let stream = futures::stream::iter(tasks)
-        .map(move |task| {
+    Ok(super::r2rml::read_files_in_order(
+        tasks,
+        super::r2rml::EmitOrder::for_query(order),
+        concurrency,
+        move |task| {
             let storage = Arc::clone(&storage);
             async move {
-                tokio::spawn(async move {
-                    let reader = SendParquetReader::new(storage.as_ref());
-                    reader.read_task(&task).await.map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read Parquet file '{}': {e}",
-                            task.data_file.file_path
-                        ))
-                    })
+                let reader = SendParquetReader::new(storage.as_ref());
+                reader.read_task(&task).await.map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to read Parquet file '{}': {e}",
+                        task.data_file.file_path
+                    ))
                 })
-                .await
-                .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
             }
-        })
-        .buffer_unordered(concurrency)
-        .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-            Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>()),
-            Err(e) => futures::stream::iter(vec![Err(e)]),
-        });
-
-    Ok(Box::pin(stream))
+        },
+    ))
 }
 
 #[async_trait]
@@ -358,7 +353,22 @@ impl R2rmlTableProvider for EphemeralR2rmlProvider {
         _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
-        self.scan_provisional_table(table_name, projection).await
+        self.scan_provisional_table(table_name, projection, ScanOrder::Deterministic)
+            .await
+    }
+
+    async fn scan_table_ordered(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
+        _as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scan_provisional_table(table_name, projection, order)
+            .await
     }
 }
 
@@ -472,17 +482,16 @@ impl crate::Fluree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use async_trait::async_trait;
     use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
     use fluree_db_query::error::Result as QResult;
     use fluree_db_query::r2rml::{
-        ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
+        ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanOrder,
     };
     use fluree_db_r2rml::mapping::{
         CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
     };
+    use futures::StreamExt;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -499,6 +508,8 @@ mod tests {
     struct StubEphemeralProvider {
         mapping: Arc<CompiledR2rmlMapping>,
         tables: HashMap<String, Vec<ColumnBatch>>,
+        /// The row order each scan asked for; `None` for a plain `scan_table`.
+        orders: std::sync::Mutex<Vec<Option<ScanOrder>>>,
     }
 
     #[async_trait]
@@ -526,6 +537,22 @@ mod tests {
             _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
             _as_of_t: Option<i64>,
         ) -> QResult<ColumnBatchStream> {
+            self.orders.lock().unwrap().push(None);
+            let batches = self.tables.get(table).cloned().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(batches).map(Ok)))
+        }
+
+        async fn scan_table_ordered(
+            &self,
+            _gs: &str,
+            table: &str,
+            _projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
+            _as_of_t: Option<i64>,
+            order: ScanOrder,
+        ) -> QResult<ColumnBatchStream> {
+            self.orders.lock().unwrap().push(Some(order));
             let batches = self.tables.get(table).cloned().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(batches).map(Ok)))
         }
@@ -615,6 +642,7 @@ mod tests {
         StubEphemeralProvider {
             mapping: Arc::new(mapping),
             tables,
+            orders: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -707,6 +735,7 @@ mod tests {
         let provider = StubEphemeralProvider {
             mapping: Arc::new(mapping),
             tables,
+            orders: std::sync::Mutex::new(Vec::new()),
         };
         let (_ledger, view) = genesis_view_unregistered();
         let fluree = FlureeBuilder::memory().build_memory();
@@ -774,5 +803,37 @@ mod tests {
             2,
             "both Person subjects bind their name column"
         );
+    }
+
+    /// A provisional-mapping query owes its scan the same order a persisted
+    /// one does: any order with no slice, a fixed one under a LIMIT.
+    #[tokio::test]
+    async fn provisional_scan_order_follows_the_query_slice() {
+        let (_ledger, view) = genesis_view();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let q = "SELECT ?s ?name WHERE { \
+                 ?s a <http://example.org/Person> . \
+                 ?s <http://example.org/name> ?name }";
+        for (suffix, want) in [("", ScanOrder::Any), (" LIMIT 5", ScanOrder::Deterministic)] {
+            let provider = people_provider();
+            let query = format!("{q}{suffix}");
+            let result = fluree
+                .query_view_with_r2rml_options(
+                    &view,
+                    QueryInput::Sparql(&query),
+                    &provider,
+                    &provider,
+                    QueryExecutionOptions::new(),
+                )
+                .await
+                .expect("provisional query succeeds");
+            assert_eq!(row_count(&result), 2, "{query}");
+            let orders = provider.orders.lock().unwrap().clone();
+            assert!(!orders.is_empty(), "{query}: the table was scanned");
+            assert!(
+                orders.iter().all(|o| *o == Some(want)),
+                "{query}: {orders:?}"
+            );
+        }
     }
 }

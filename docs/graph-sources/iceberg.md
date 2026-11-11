@@ -647,6 +647,23 @@ ORDER BY DESC(?date)
 LIMIT 100
 ```
 
+### Row order and paging
+
+A query with no `ORDER BY` has no defined row order; SPARQL leaves it open. Over
+an Iceberg graph source:
+
+- A query with a `LIMIT` or `OFFSET` anywhere in it, sub-queries included, reads
+  the table's data files in a fixed order: smallest file first, ties in commit
+  order. Run again over the same snapshot, it returns the same rows in the same
+  order, so pages fetched with `LIMIT n OFFSET k×n` partition the answer: no row
+  is skipped or repeated. Subgraph crawls (`"select": {"?s": ["*"]}`) page their
+  subjects the same way.
+- A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
+  its row order can differ from one run to the next. The rows are the same.
+- Pages hold together only while the table does: an append or compaction between
+  two page requests changes the snapshot, and with it the order. For paging that
+  must survive table changes, order by a unique key (`ORDER BY ?id`).
+
 ## Materialization (into a native ledger)
 
 Querying a graph source reads the Iceberg table on the fly. Native Fluree
@@ -1363,7 +1380,7 @@ triples map a scan skipped because its predicates were hidden.
 | `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
 | `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch. A table whose count is not read by then has none; the others keep theirs. `0` returns structure only. |
-| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the budget is kept only in the on-disk catalog cache. `0` keeps none in memory. |
+| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the whole budget is held in one oversize slot beside it (the latest such list; a second replaces the first). `0` keeps none in memory. |
 
 ## Troubleshooting
 
