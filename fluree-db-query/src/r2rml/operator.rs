@@ -1521,6 +1521,12 @@ impl R2rmlScanOperator {
                 .map_or(SubjectKeys::Unknown, |iris| {
                     SubjectKeys::of(triples_map, iris)
                 });
+            // Not scanning the map also skips what a provider records on a
+            // scan, such as the snapshot a table was read at (the build
+            // watermark of a materialize session). A query reads no row of
+            // the table and needs no record of it; a materialize build scans
+            // every map's table through its own driver, never through this
+            // skip.
             if matches!(subject_keys, SubjectKeys::NoneProducible) {
                 tracing::debug!(
                     triples_map = %triples_map.iri,
