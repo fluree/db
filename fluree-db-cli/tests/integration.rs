@@ -7974,7 +7974,8 @@ fn doc_ingest_through_the_account_renews_the_token_before_each_document() {
 
 /// With `account = true` the sign-in's token goes only to the account's
 /// own API: a project config's `url` on another host is refused before
-/// anything is sent; one on the account's API, any path, is used.
+/// anything is sent; one on the account's API, any path, is used; and with
+/// no `url` at all (as the docs show it) the account's reader is.
 #[test]
 fn doc_read_through_the_account_refuses_a_url_off_the_accounts_api() {
     let tmp = TempDir::new().unwrap();
@@ -7993,9 +7994,14 @@ fn doc_read_through_the_account_refuses_a_url_off_the_accounts_api() {
     let config = tmp.path().join(".fluree/config.toml");
     let project = std::fs::read_to_string(&config).unwrap();
     let read = |url: &str| {
+        let url = if url.is_empty() {
+            String::new()
+        } else {
+            format!("url = \"{url}\"\n")
+        };
         std::fs::write(
             &config,
-            format!("{project}\n[doc.reader]\naccount = true\nurl = \"{url}\"\nmodels = [\"stub-reader\"]\n"),
+            format!("{project}\n[doc.reader]\naccount = true\n{url}models = [\"stub-reader\"]\n"),
         )
         .unwrap();
         let mut cmd = fluree_cmd(&tmp);
@@ -8016,4 +8022,10 @@ fn doc_read_through_the_account_refuses_a_url_off_the_accounts_api() {
 
     read(&format!("{base}/v1/reader")).assert().success();
     assert_eq!(request_paths(&account_seen), vec!["/v1/reader"]);
+
+    read("").assert().success();
+    assert_eq!(
+        request_paths(&account_seen),
+        vec!["/v1/reader", "/v1/grounding"]
+    );
 }
