@@ -417,7 +417,9 @@ JSON object:
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit. A merge records the merge even when its conflict strategy resolved every flake away.
+- A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
+- A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
@@ -453,6 +455,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
 - `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
@@ -473,7 +476,7 @@ The fields of `POST /push/*ledger`, plus:
 
 - `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
 
-The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit, and none may drop graphs, which a merge cannot bring in. A push that carries any other commit is refused with `422`.
 
 A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
 
@@ -913,7 +916,7 @@ POST /import-upload
   "graph": "http://example.org/graph/products" }
 ```
 
-Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written.
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh.
 
 ## Storage Proxy Endpoints
 
@@ -2414,10 +2417,9 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
 
 ### POST /drop-graph
 
-Drop a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted under that graph IRI. The drop
-runs as a normal commit at `t = current_t + 1` — history at earlier `t`
-values is preserved. Admin-protected.
+Drop a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`. The drop is one commit at `t = current_t + 1` that
+retracts nothing. Admin-protected.
 
 **URL:**
 ```
@@ -2444,7 +2446,7 @@ POST /drop-graph
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -2454,25 +2456,25 @@ POST /drop-graph
 |-------|------|-------------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
 | `graph_iri` | string | Graph IRI that was dropped (echoed) |
-| `retracted` | integer | Number of flakes retracted by the drop commit; `0` for a no-op |
-| `committed` | boolean | `true` when a new commit was produced; `false` for a no-op drop on an empty graph |
-| `t` | integer | Current commit `t` for the branch after the drop |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | boolean | `true`: the drop commits |
+| `t` | integer | Commit `t` of the drop |
 
 **Behavior:**
 
-- **Transactional and history-preserving.** A query `as-of` an earlier `t` still sees the graph populated.
+- **Takes the history.** Nothing the graph held is queryable afterwards, at the head or as of an earlier `t`: a query naming the graph as of a `t` before the drop gets a 404. The commits keep the facts, so a branch created at a `t` before the drop reads them.
+- **The graph no longer exists.** `/info` leaves it out of `named-graphs`, and writing to the same IRI starts it afresh.
+- **Any size.** The drop reads none of the graph's facts, so its cost does not depend on the graph's size; `FLUREE_MAX_GRAPH_SCAN_FLAKES` does not apply.
 - **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
-- **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
-- **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
-- **Bounded.** The drop is one commit holding every retraction. A graph with more facts than `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default 10,000,000; `0` disables) is refused (400) before it is read. A drop larger than the novelty limit (`--reindex-max-bytes`) is refused at commit (413); one that fits only once earlier writes are indexed gets 503.
+- **Refuses missing graphs.** Returns 404 when `graph` does not exist in the ledger, a dropped graph included — the call never registers a graph.
 
 **Status codes:**
 
-- `200 OK` - Drop succeeded (commit produced or no-op)
-- `400 Bad Request` - Malformed IRI, empty IRI, system-graph IRI, or a graph past `FLUREE_MAX_GRAPH_SCAN_FLAKES`
+- `200 OK` - Drop succeeded
+- `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
 - `401`/`403` - Admin token required and absent/invalid
-- `404 Not Found` - Ledger or graph IRI not found
+- `404 Not Found` - Ledger or graph not found
 - `500 Internal Server Error` - Server error
 
 **Examples:**

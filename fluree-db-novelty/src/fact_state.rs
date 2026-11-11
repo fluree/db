@@ -97,6 +97,16 @@ impl NoveltyFactState {
             .is_some_and(|&(t, op)| op && t > self.cutoff)
     }
 
+    /// Forget graph `g`'s window entirely, as dropping the graph does.
+    pub(crate) fn forget_graph(&mut self, g: GraphId) {
+        if let Some(map) = self.graphs.get_mut(g as usize) {
+            *map = None;
+        }
+        if let Some(from) = self.sweep.get_mut(g as usize) {
+            *from = None;
+        }
+    }
+
     /// Drop the ops at or below `cutoff_t` from the window, as trimming
     /// novelty through it does. A graph whose remaining flakes `survivors`
     /// hands over is rebuilt from them now, so a trim that leaves few, or none,
