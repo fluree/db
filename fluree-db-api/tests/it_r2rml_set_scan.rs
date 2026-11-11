@@ -117,8 +117,11 @@ const AMOUNTS: [(i64, &str); 8] = [
 /// one file and the rest in another.
 const LINES: [(i64, i64, i64); 4] = [(1, 42, 100), (2, 42, 100), (3, 43, 50), (4, 44, 40)];
 
-/// `sets.customers_us` and `sets.customers_eu`: `(id, name, city)`.
-const REGIONAL: [(&str, [(i64, &str, &str); 2]); 2] = [
+/// One regional table's rows: `(id, name, city)`.
+type RegionalRows = [(i64, &'static str, &'static str); 2];
+
+/// `sets.customers_us` and `sets.customers_eu`.
+const REGIONAL: [(&str, RegionalRows); 2] = [
     ("us", [(7, "Ada", "Miami"), (8, "Bo", "Austin")]),
     ("eu", [(7, "Ada L.", "Lyon"), (9, "Cy", "Paris")]),
 ];
