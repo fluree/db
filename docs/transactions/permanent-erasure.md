@@ -22,6 +22,9 @@ derived search indexes and scratch files.
   bytes out of reach, unless the request [exposes the signatures](#signatures).
 - **IRIs stay.** Subjects, predicates and graph names are identifiers, not values, and erasure does not
   remove them (see [Limits](#limits)).
+- **Some derived traces stay.** Transaction hashes, the body hashes a request that exposes signatures
+  records, and the index's distinct-value statistics (HLL sketches) can still reflect the erased value.
+  None of them holds the value itself.
 - **File storage only.** A single node, or a cluster whose members share file storage. Memory and S3
   storage cannot hold an erasure (see [Scope](#scope)).
 - **Only this node's storage is purged.** Backups, other clones, exports already made, and the memory

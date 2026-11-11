@@ -1,6 +1,6 @@
 # fluree-prover
 
-Proves redaction steps for permanent erasure (`DATA_ERASURE.md`, PR 5A). Fluree runs it once per
+Proves redaction steps for [permanent erasure](../docs/transactions/permanent-erasure.md). Fluree runs it once per
 step, as a child process at low priority in its own scratch directory: the request frame on
 stdin, the response frame on stdout (`fluree_db_redaction::protocol`). The prover returns the
 replacement and a succinct RISC Zero receipt; Fluree verifies the receipt in-process
