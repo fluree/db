@@ -100,7 +100,11 @@ in one of two ways:
   meeting"), in place of itself.
 
 ```turtle
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
 @prefix xt: <https://ns.flur.ee/extract#> .
+@prefix ex: <https://example.com/> .
 ex:Commitment a rdfs:Class, xt:EventClass ;
   rdfs:label "commitment" ;
   rdfs:comment "Something a person says they will do, to or for someone." .
@@ -236,8 +240,9 @@ Nothing here would make a request fail.
 counts under (`X-Fluree-Ontology-Adapted`, `X-Fluree-Ontology-Not-Shown`), so
 the two compare line for line. `slice` appears only with `--seed`.
 `estimate.document_chars` is the room left for text in one window, at most
-48,000. `event_classes` counts the classes declared `xt:EventClass`, and
-`event_kinds` the kinds the reader will read of them.
+48,000. `event_classes` counts the classes declared `xt:EventClass` that are
+read as event classes (an event subclass of one is read as one of its kinds,
+not counted here), and `event_kinds` the kinds the reader will read of them.
 
 Finding codes: `no-ontology`, `no-class`, `no-label`, `owl-machinery`, `catalog-blank-node`,
 `catalog-no-label`, `example-refused`, `extraction-annotations`,
@@ -247,7 +252,7 @@ Finding codes: `no-ontology`, `no-class`, `no-label`, `owl-machinery`, `catalog-
 `one-parent-shown`, `catalog-class-not-in-ontology`,
 `catalog-long-definition`, `little-room-for-text` and the event findings
 `event-class-not-marked` (a class with a kind class that isn't an event class),
-`event-class-undeclared` (`xt:EventClass` without `rdfs:Class`),
+`event-class-undeclared` (`xt:EventClass` without `rdfs:Class` or `owl:Class`),
 `event-subtype-not-marked`, `event-kind-ambiguous`, `event-kind-property` and
 `event-kind-no-records` are advice.
 
@@ -505,7 +510,12 @@ reads made explicit:
   would read them as catalog records and refuse the request; the summary counts
   them;
 - `xt:example` and extraction results (`xt:score`, `rdf:reifies`, ...)
-  dropped, since a reader refuses them; the summary counts them.
+  dropped, since a reader refuses them; the summary counts them. A result
+  record goes whole: a blank node that carries a result, or an IRI with
+  nothing but its types once its results go (left behind, either would be
+  refused as a catalog record). A subject with a label or description of its
+  own keeps it, without its results, and the summary counts those too, so
+  you can check they are records.
 
 Domains, ranges and other axioms are kept: an HTTP reader doesn't see
 them, but a reading can still be checked against them. Catalog records in the
