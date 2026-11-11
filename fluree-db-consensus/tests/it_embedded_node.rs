@@ -625,3 +625,160 @@ async fn a_branch_keeps_its_worker_across_drained_queues() {
     }
     assert_eq!(worker_spawns("drained/db"), 1);
 }
+
+/// Identical requests write identical envelopes, and an envelope's address is
+/// the hash of its bytes, so they shared one blob: a release for one deleted
+/// it from under another still queued. Here a finished request's retry under
+/// its key releases the envelope it wrote, while an identical request without
+/// a key waits behind a write the ledger lock holds, its envelope not yet read.
+/// The retry goes through a committer with no cache of its own, as one that
+/// reaches another node, or this one after its cache let the key go, does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identical_queued_request_keeps_its_envelope() {
+    use fluree_db_consensus::raft::queued_transactor::QueuedTransactor;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+    use fluree_db_consensus::{Committer, IdempotencyKey};
+
+    let (integration, fluree, node, _dirs) = stand_up(16, |config| config).await;
+    let ledger_id = "embedded/twice:main";
+    fluree
+        .create_ledger("embedded/twice")
+        .await
+        .expect("create ledger");
+    let request = |key: Option<&str>| TransactionRequest {
+        idempotency_key: key.map(|key| IdempotencyKey::new(key).unwrap()),
+        ..bulk_request_round(ledger_id, 1, 0)
+    };
+    node.committer
+        .transact(request(Some("first")))
+        .await
+        .expect("the first lands");
+
+    let handle = fluree
+        .ledger_manager()
+        .expect("ledger manager")
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load ledger");
+    let guard = handle.lock_for_write().await;
+    let queued = async |len: usize| {
+        integration
+            .shared_state
+            .read()
+            .await
+            .queues
+            .get(&RefKey::new("embedded/twice", "main"))
+            .is_some_and(|queue| queue.len() == len)
+    };
+    let committer = Arc::clone(&node.committer);
+    let blocker = tokio::spawn(async move {
+        committer
+            .transact(bulk_request_round(ledger_id, 1, 1))
+            .await
+    });
+    eventually("the blocker is queued", async || queued(1).await).await;
+    let committer = Arc::clone(&node.committer);
+    let identical = tokio::spawn(async move { committer.transact(request(None)).await });
+    eventually("the identical request is queued", async || queued(2).await).await;
+
+    QueuedTransactor::new(
+        Arc::clone(&integration.raft),
+        Arc::clone(&fluree),
+        Arc::clone(&integration.waiter_map),
+        integration.shared_state.clone(),
+    )
+    .transact(request(Some("first")))
+    .await
+    .expect("the retry is answered from the first's record");
+    drop(guard);
+
+    blocker.await.unwrap().expect("the blocker lands");
+    identical
+        .await
+        .unwrap()
+        .expect("the identical request reads its envelope");
+    node.shutdown().await;
+}
+
+/// A retry under a key whose first submission is still queued joins that
+/// entry, which reads the first's envelope. The retry's own envelope is its
+/// alone, so nothing reads it: it is released, not left behind. Every
+/// submission here carries a key, so the queue keeps each queued entry's
+/// envelope until the key's record is evicted, and the only envelope that
+/// can go is the retry's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_that_joins_a_queued_entry_releases_its_own_envelope() {
+    use fluree_db_consensus::raft::queued_transactor::QueuedTransactor;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+    use fluree_db_consensus::{Committer, IdempotencyKey, QueuedRequest};
+
+    let (integration, fluree, node, dirs) = stand_up(17, |config| config).await;
+    let ledger_id = "embedded/joined:main";
+    fluree
+        .create_ledger("embedded/joined")
+        .await
+        .expect("create ledger");
+    let request = |key: &str, round: usize| TransactionRequest {
+        idempotency_key: Some(IdempotencyKey::new(key).unwrap()),
+        ..bulk_request_round(ledger_id, 1, round)
+    };
+    let envelopes = || {
+        std::fs::read_dir(dirs.1.path().join("embedded/joined/main/txn"))
+            .expect("txn dir")
+            .filter(|file| {
+                let bytes = std::fs::read(file.as_ref().unwrap().path()).unwrap();
+                QueuedRequest::from_bytes(&bytes).is_ok()
+            })
+            .count()
+    };
+
+    let handle = fluree
+        .ledger_manager()
+        .expect("ledger manager")
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load ledger");
+    let guard = handle.lock_for_write().await;
+    let queued = async |len: usize| {
+        integration
+            .shared_state
+            .read()
+            .await
+            .queues
+            .get(&RefKey::new("embedded/joined", "main"))
+            .is_some_and(|queue| queue.len() == len)
+    };
+    let committer = Arc::clone(&node.committer);
+    let blocker = tokio::spawn(async move { committer.transact(request("blocker", 1)).await });
+    eventually("the blocker is queued", async || queued(1).await).await;
+    let committer = Arc::clone(&node.committer);
+    let first = tokio::spawn(async move { committer.transact(request("first", 0)).await });
+    eventually("the first is queued", async || queued(2).await).await;
+
+    let retry = QueuedTransactor::new(
+        Arc::clone(&integration.raft),
+        Arc::clone(&fluree),
+        Arc::clone(&integration.waiter_map),
+        integration.shared_state.clone(),
+    );
+    let retry = tokio::spawn(async move { retry.transact(request("first", 0)).await });
+    // Joining binds the retry to the first's entry, which ends the first's
+    // own wait (`WaiterMap::bind`): its return says the retry has joined.
+    eventually("the retry joins the first's entry", async || {
+        first.is_finished()
+    })
+    .await;
+    drop(guard);
+
+    blocker.await.unwrap().expect("the blocker lands");
+    retry
+        .await
+        .unwrap()
+        .expect("the retry gets the first's outcome");
+    assert_eq!(
+        envelopes(),
+        2,
+        "the blocker's and the first's envelopes stay with their records"
+    );
+    node.shutdown().await;
+}

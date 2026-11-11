@@ -630,6 +630,7 @@ impl Worker {
             commit_opts,
             tracking,
             governance,
+            submission: _,
         } = transact;
 
         let ledger_id = self.ref_key.ledger_id();
@@ -828,6 +829,7 @@ impl Worker {
         let QueuedRevert {
             selection,
             strategy,
+            submission: _,
         } = revert;
 
         let ledger_name = self.ref_key.ledger_name.clone();
@@ -923,6 +925,7 @@ impl Worker {
                     commit_cids,
                     blobs,
                     governance,
+                    submission: _,
                 },
             merged_commit_cids,
         } = push;
@@ -1014,6 +1017,7 @@ impl Worker {
             source_branch,
             target_branch,
             strategy,
+            submission: _,
         } = merge;
         let ledger_name = self.ref_key.ledger_name.clone();
         let StagedMerge {
@@ -1102,7 +1106,10 @@ impl Worker {
     /// pre-rebase head so the queue entry completes without
     /// observable mutation.
     async fn process_rebase(&self, rebase: QueuedRebase) -> Result<StagedOutcome, WorkerError> {
-        let QueuedRebase { strategy } = rebase;
+        let QueuedRebase {
+            strategy,
+            submission: _,
+        } = rebase;
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
@@ -1954,6 +1961,7 @@ mod tests {
             commit_opts: CommitOptsRequest::default(),
             tracking: Some(TrackingOptions::default()),
             governance: GovernanceOptions::default(),
+            submission: None,
         }))
     }
 
@@ -1962,6 +1970,7 @@ mod tests {
             commit_cids: vec![cid(5)],
             blobs: HashMap::new(),
             governance: GovernanceOptions::default(),
+            submission: None,
         }))
     }
 
