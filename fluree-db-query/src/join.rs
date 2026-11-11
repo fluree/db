@@ -1908,7 +1908,7 @@ impl NestedLoopJoinOperator {
         else {
             return false;
         };
-        crate::fast_path_common::probe_lane_admission(ctx, &[pred], LaneOutput::DecodesForEager)
+        crate::fast_path_common::probe_lane_admission(ctx, &[pred], self.batched_lane_output())
             .is_none()
             && store.sid_to_p_id(pred).is_some()
             && !crate::fast_path_common::overlay_ops_cached(
@@ -1934,6 +1934,17 @@ impl NestedLoopJoinOperator {
                     < extent
             },
         )
+    }
+
+    /// What this join's batched lane emits. The subject, object and exists
+    /// lanes decode under eager; a lane not listed here is `Encoded`, so
+    /// admission keeps it off reasoning until it decodes too.
+    fn batched_lane_output(&self) -> LaneOutput {
+        if self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible {
+            LaneOutput::DecodesForEager
+        } else {
+            LaneOutput::Encoded
+        }
     }
 
     /// The left column the batched lane keys on.
@@ -2083,7 +2094,7 @@ impl NestedLoopJoinOperator {
             None => &[],
         };
         if let Some(plan) =
-            crate::fast_path_common::probe_lane_admission(ctx, preds, LaneOutput::DecodesForEager)
+            crate::fast_path_common::probe_lane_admission(ctx, preds, self.batched_lane_output())
         {
             return Ok(plan);
         }
@@ -2097,9 +2108,9 @@ impl NestedLoopJoinOperator {
             return Ok(ProbeLanePlan::Decline);
         };
         if self.batched_object_eligible {
-            object_probe_lane_plan(ctx, store, pred, LaneOutput::DecodesForEager)
+            object_probe_lane_plan(ctx, store, pred, self.batched_lane_output())
         } else {
-            subject_probe_lane_plan(ctx, store, pred, LaneOutput::DecodesForEager)
+            subject_probe_lane_plan(ctx, store, pred, self.batched_lane_output())
         }
     }
 
