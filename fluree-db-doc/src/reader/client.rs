@@ -14,10 +14,10 @@
 //! starting, a full queue) and when to come back. Nothing else is resent —
 //! not a timeout, not a dropped connection, not a 503 without the header,
 //! not a 504 (the gateway stopped waiting, and the read may still have
-//! run) — because any of those may follow a read that ran, and a read is
-//! billed. Attempts and total waiting are capped, and every wait is reported
-//! through the caller's `on_wait`, so a model starting from cold shows as
-//! waiting rather than as a hang.
+//! run) — because any of those may follow a read that ran, and a resend
+//! would run it again. Attempts and total waiting are capped, and every wait
+//! is reported through the caller's `on_wait`, so a model starting from cold
+//! shows as waiting rather than as a hang.
 //!
 //! Every answer, an error's included, carries the endpoint's ID for the call
 //! (`X-Fluree-Request-ID`), which an error's message quotes.
@@ -349,7 +349,7 @@ impl ReaderClient {
             let mut message = error_message(&text);
             if status == 504 {
                 message.push_str(
-                    "; the reader may still have read it, and billed it, so it is not resent",
+                    "; the reader may still have run it, so it is not resent (a resend would be a second run)",
                 );
             }
             if let Some(id) = &request_id {
@@ -632,7 +632,12 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
         let text = err.to_string();
         assert!(text.contains("504"), "{text}");
-        assert!(text.contains("not resent"), "{text}");
+        assert!(
+            text.contains("may still have run it, so it is not resent"),
+            "{text}"
+        );
+        // What is billed is the service's to say; a 504 makes no claim.
+        assert!(!text.contains("billed"), "{text}");
         assert!(text.contains("(request req-504)"), "{text}");
     }
 
