@@ -590,7 +590,12 @@ moment. Consequently
   subject policy beside a class policy over a column-derived type, a map
   deriving classes from several columns or maps, and a policy on an
   `OPTIONAL` member of the entity it hides still leave the block to the
-  per-scan lane.
+  per-scan lane. A class-targeted policy over a subject several maps or rows
+  mint is decided over every class set the subject could hold, in both
+  lanes, as for an Iceberg source: see
+  [Class policies over subjects several rows mint](iceberg.md#class-policies-over-subjects-several-rows-mint).
+  The registration probe's keys count as keys there, trusted until the next
+  `fluree sql check`.
 
 ## Running the bridge
 
