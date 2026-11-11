@@ -8029,3 +8029,61 @@ fn doc_read_through_the_account_refuses_a_url_off_the_accounts_api() {
         vec!["/v1/reader", "/v1/grounding"]
     );
 }
+
+/// Any 401 renews the sign-in once, `token_invalid` as well as
+/// `config_stale`, and resends only the refused call. When the renewal
+/// itself is refused (a token that was never valid, with a revoked refresh
+/// token), its own error comes through whole, with the sign-in hint.
+#[test]
+fn doc_read_through_the_account_renews_a_refused_token_or_says_the_sign_in_is_gone() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let token_invalid = serde_json::json!({ "__status": 401, "body": { "error": { "message": "Invalid token", "status": 401, "error": "token_invalid" } } });
+    let read = |answers: Vec<serde_json::Value>| {
+        let (url, seen) = spawn_stub_reader(answers);
+        let base = url.trim_end_matches("/extract").to_string();
+        let home = tmp
+            .path()
+            .join(format!("home-{}", base.rsplit(':').next().unwrap()));
+        write_account(
+            &home,
+            &base,
+            &format!("{base}/v1/oauth/exchange"),
+            &long_lived_jwt(),
+        );
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .env("FLUREE_DOC_READER_ACCOUNT", "true")
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        (cmd, base, seen)
+    };
+
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (mut cmd, _, seen) = read(vec![
+        token_invalid.clone(),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        stub_reading(0.9, true),
+    ]);
+    cmd.assert().success();
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange", "/v1/grounding"]
+    );
+
+    let (mut cmd, base, seen) = read(vec![
+        token_invalid,
+        serde_json::json!({ "__status": 400, "body": { "error": "invalid_grant", "error_description": "refresh token revoked" } }),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("your sign-in is no longer valid"))
+        .stderr(predicate::str::contains(format!(
+            "hint: fluree login --url {base}"
+        )));
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange"]
+    );
+}
