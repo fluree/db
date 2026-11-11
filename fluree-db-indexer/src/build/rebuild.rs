@@ -480,15 +480,28 @@ where
                     .map(super::super::spatial_hook::SpatialHook::into_entries)
                     .unwrap_or_default();
 
+                let mut keep = vec![true; all_entries.len()];
                 for (ci, &(start, end)) in spatial_chunk_ranges.iter().enumerate() {
                     let s_remap = &subject_remaps[ci];
-                    for entry in &mut all_entries[start..end] {
+                    for (entry, keep) in all_entries[start..end]
+                        .iter_mut()
+                        .zip(&mut keep[start..end])
+                    {
                         let local_s = entry.subject_id as usize;
                         if let Some(&global_s) = s_remap.get(local_s) {
                             entry.subject_id = global_s;
+                        } else {
+                            tracing::warn!(
+                                chunk = ci,
+                                local_s,
+                                "spatial entry subject_id remap miss; skipping"
+                            );
+                            *keep = false;
                         }
                     }
                 }
+                let mut keep = keep.into_iter();
+                all_entries.retain(|_| keep.next().unwrap_or(true));
 
                 if !all_entries.is_empty() {
                     tracing::info!(
@@ -1108,6 +1121,7 @@ where
                 &shared.predicates,
                 &ledger_id,
                 &content_store,
+                |_, _| {},
             )
             .await?
             .into_iter()
