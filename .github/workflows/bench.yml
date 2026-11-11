@@ -49,7 +49,7 @@ jobs:
     #     entry in `regression-budget.json` (or vice versa).
     #
     # A cold cache must compile all explicit workspace benchmarks and their
-    # dependencies in release.
+    # dependencies.
     # Use 8 cores / 32 GB and allow cold builds 60 minutes. The previous
     # 4-core job repeatedly timed out during compilation at 45 minutes.
     runs-on: ci-cd-large
@@ -63,8 +63,8 @@ jobs:
       FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
       # This gate checks that benches build and run, not how fast they run, so
       # it skips the release profile's fat LTO and single codegen unit. Under
-      # them, eight concurrent rustc and LTO-link jobs got the runner shut down
-      # partway through every cold build.
+      # them the runner was shut down partway through every cold build, most
+      # likely out of memory (the logs carry no memory figures).
       CARGO_PROFILE_BENCH_LTO: "off"
       CARGO_PROFILE_BENCH_CODEGEN_UNITS: 16
     steps:
@@ -89,8 +89,8 @@ jobs:
         run: cargo test -p fluree-bench-support --test workspace_reconcile
 
       # Select every explicit benchmark target. Bare `cargo bench --workspace`
-      # also builds libraries/binaries as libtest benchmark harnesses under fat
-      # LTO, even though this workspace has no inline #[bench] functions.
+      # also builds libraries/binaries as libtest benchmark harnesses, even
+      # though this workspace has no inline #[bench] functions.
       # The per-PR nextest job already runs the unit and integration tests.
       # Enable the GraphQL bench's required feature explicitly.
       - name: Build benches
