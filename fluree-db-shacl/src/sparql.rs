@@ -38,12 +38,13 @@
 //! equivalent to substitution.
 
 use crate::compile::Severity;
+use crate::data_view::DataView;
 use crate::error::{Result, ShaclError};
 use crate::validate::{FocusNode, ValidationResult};
 use fluree_db_core::{FlakeValue, GraphDbRef, Sid};
 use fluree_db_query::{
-    execute, Binding, ContextConfig, ExecutableQuery, ExecutionContext, Pattern, QueryError, VarId,
-    VarRegistry,
+    execute, Binding, ContextConfig, DataSet, ExecutableQuery, ExecutionContext, GraphRef, Pattern,
+    QueryError, VarId, VarRegistry,
 };
 use fluree_db_sparql::ast::pattern::{GraphPattern, SubSelect};
 use fluree_db_sparql::ast::query::{
@@ -582,6 +583,9 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
         | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::GraphDropped { .. }
+        | QueryError::GraphSourceUnmapped { .. }
+        | QueryError::GraphSourceUnsupported { .. }
         | QueryError::R2rml(_)
         | QueryError::Core(_)
         | QueryError::Batch(_)
@@ -596,6 +600,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::InvalidExpression(_)
         | QueryError::UnsupportedFeature(_)
         | QueryError::R2rmlUnsupportedPattern { .. }
+        | QueryError::GraphSourceNotAGraph { .. }
         | QueryError::Arithmetic(_)
         | QueryError::Comparison(_) => false,
         // The caller names the variables first (`QueryError::name_variables`),
@@ -618,7 +623,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
 /// budgets, storage access and internal faults are always raised
 /// ([`raised_whatever_the_severity`]).
 pub(crate) async fn validate_sparql_constraint(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     focus: &Sid,
     constraint: &SparqlConstraint,
     fallback_path: Option<&Sid>,
@@ -648,7 +653,7 @@ pub(crate) async fn validate_sparql_constraint(
                 constraint,
                 message,
                 severity: exec.failure_severity.unwrap_or(severity),
-                graph_id: db.g_id,
+                graph_id: db.graph.g_id,
             });
             Ok(Vec::new())
         }
@@ -657,7 +662,7 @@ pub(crate) async fn validate_sparql_constraint(
 }
 
 async fn run_sparql_constraint(
-    db: GraphDbRef<'_>,
+    data: DataView<'_>,
     focus: &Sid,
     constraint: &SparqlConstraint,
     fallback_path: Option<&Sid>,
@@ -668,6 +673,7 @@ async fn run_sparql_constraint(
     if constraint.deactivated {
         return Ok(Vec::new());
     }
+    let db = data.graph;
 
     let iri = |sid: &Sid| {
         db.snapshot
@@ -729,11 +735,29 @@ async fn run_sparql_constraint(
     }
     inject_bindings(&mut query.patterns, &bound);
 
+    // With additional data graphs, the query's default graph is their union
+    // with the validated graph, as for every other constraint. Implicit, so
+    // only the default graph changes: `GRAPH` resolves as it would without a
+    // dataset.
+    let union = (!data.additional.is_empty()).then(|| {
+        data.g_ids()
+            .fold(DataSet::new().implicit(), |dataset, g_id| {
+                dataset.with_default_graph(GraphRef::new(
+                    db.snapshot,
+                    g_id,
+                    db.overlay,
+                    db.t,
+                    db.snapshot.ledger_id.as_str(),
+                ))
+            })
+    });
+
     let batches = execute(
         db,
         &vars,
         &ExecutableQuery::simple(query),
         ContextConfig {
+            dataset: union.as_ref(),
             // Charge the constraint query against the validation's fuel
             // budget when the caller tracks one.
             tracker: db.tracker,
@@ -951,6 +975,19 @@ mod tests {
             QueryError::NoSnapshotAtTime { .. } => true, [
                 QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
             ];
+            QueryError::GraphSourceUnmapped { .. } => true, [
+                QueryError::GraphSourceUnmapped {
+                    graph_source_id: s(),
+                    empty_mapping: false,
+                },
+            ];
+            QueryError::GraphSourceUnsupported { .. } => true, [
+                QueryError::GraphSourceUnsupported {
+                    graph_source_id: s(),
+                    family: "an Iceberg".into(),
+                    cause: "c".into(),
+                },
+            ];
             QueryError::R2rml(_) => true, [
                 QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),
             ];
@@ -969,6 +1006,9 @@ mod tests {
             QueryError::OperatorNotOpened => true, [QueryError::OperatorNotOpened];
             QueryError::OperatorAlreadyOpened => true, [QueryError::OperatorAlreadyOpened];
             QueryError::OperatorClosed => true, [QueryError::OperatorClosed];
+            QueryError::GraphDropped { .. } => true, [
+                QueryError::GraphDropped { graph: s(), floor: 2, t: 1 },
+            ];
             QueryError::InvalidQuery(_) => false, [QueryError::InvalidQuery(s())];
             QueryError::UngroupedRead(_) => false, [
                 QueryError::UngroupedRead(fluree_db_query::ir::UngroupedRead {
@@ -984,6 +1024,13 @@ mod tests {
             QueryError::UnsupportedFeature(_) => false, [QueryError::UnsupportedFeature(s())];
             QueryError::R2rmlUnsupportedPattern { .. } => false, [
                 QueryError::R2rmlUnsupportedPattern { detail: s() },
+            ];
+            QueryError::GraphSourceNotAGraph { .. } => false, [
+                QueryError::GraphSourceNotAGraph {
+                    graph_source_id: s(),
+                    index: s(),
+                    remedy: "r",
+                },
             ];
             QueryError::Arithmetic(_) => false, [
                 QueryError::Arithmetic(ArithmeticError::DivideByZero),

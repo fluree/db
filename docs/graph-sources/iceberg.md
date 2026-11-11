@@ -138,7 +138,7 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. With `r2rml`, `table` may be omitted in `glue` and `s3tables` modes, as in `rest`: each `rr:tableName` names a table.
+For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. `table` may be omitted in every mode: each `rr:tableName` in the `r2rml` mapping names a table.
 
 The connection may instead be given structured, as the stored config spells it: a `catalog` object (its `auth` included) and an `io` object (its `storage_auth` included), in place of the flat fields, never beside them. Every Google identity and storage identity is given this way:
 
@@ -159,7 +159,7 @@ The connection may instead be given structured, as the stored config spells it: 
 
 The server stores the `storage_auth` it is sent and infers none: `fluree iceberg map` and Python's `map_iceberg` default a `bq://` warehouse to `catalog` and a `bl://` one to `vended`, but an HTTP request that omits it reads as `vended_credentials` says. The same holds for the catalog's quota project, which BigLake requires (see [Google BigLake](#google-biglake)): the CLI and Python default it to the warehouse's project, and an HTTP request names it. An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
 
-Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+`r2rml` is required: a source's queries are answered from its mapping, so a request without one is a 400 and registers nothing. A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused the same way. A source that answers every query with `409` `err:db/GraphSourceUnmapped` predates that check; see [Unmapped Sources](#unmapped-sources). An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -234,7 +234,7 @@ fluree.create_r2rml_graph_source(config).await?;
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Top-level fields not shown below: `mapping` (the stored R2RML address and media type, which registration always writes; a record without one cannot be queried), and the optional `delete` and `order_by` (materialization conventions) and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -562,7 +562,8 @@ FROM <table>
 
 - The table resolves the way an `rr:tableName` does (`namespace.table`).
 - Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive; quote a column whose name is a keyword.
-- The select list does not shape the rows (the term maps choose the columns read), but a column it names must exist.
+- A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
+- The select list is the logical table's columns, as in R2RML. Every column the map reads (its term maps, and the parent columns of a join into it) must be in the list, or registration refuses the map. A column the list names must exist. `SELECT *` selects every column.
 - Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
 
 **The filter is exact.** It is part of what the map means, not an optimization, so it is applied to every row of every read regardless of `FLUREE_ICEBERG_PREDICATE_PUSHDOWN`. That covers queries, `COUNT`, `ORDER BY … LIMIT`, references into the map, and `fluree materialize`. It also prunes data files and row groups by their statistics. A comparison with a null cell is unknown and drops the row, and only `IS NULL` keeps one. A column added to the table after a data file was written reads as null in that file.
@@ -645,6 +646,23 @@ WHERE {
 ORDER BY DESC(?date)
 LIMIT 100
 ```
+
+### Row order and paging
+
+A query with no `ORDER BY` has no defined row order; SPARQL leaves it open. Over
+an Iceberg graph source:
+
+- A query with a `LIMIT` or `OFFSET` anywhere in it, sub-queries included, reads
+  the table's data files in a fixed order: smallest file first, ties in commit
+  order. Run again over the same snapshot, it returns the same rows in the same
+  order, so pages fetched with `LIMIT n OFFSET k×n` partition the answer: no row
+  is skipped or repeated. Subgraph crawls (`"select": {"?s": ["*"]}`) page their
+  subjects the same way.
+- A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
+  its row order can differ from one run to the next. The rows are the same.
+- Pages hold together only while the table does: an append or compaction between
+  two page requests changes the snapshot, and with it the order. For paging that
+  must survive table changes, order by a unique key (`ORDER BY ?id`).
 
 ## Materialization (into a native ledger)
 
@@ -1409,13 +1427,13 @@ triples map a scan skipped because its predicates were hidden.
 | `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
 | `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch. A table whose count is not read by then has none; the others keep theirs. `0` returns structure only. |
-| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the budget is kept only in the on-disk catalog cache. `0` keeps none in memory. |
+| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the whole budget is held in one oversize slot beside it (the latest such list; a second replaces the first). `0` keeps none in memory. |
 
 ## Troubleshooting
 
 ### Connection Issues
 
-**AWS Glue / S3 Tables.** `fluree iceberg map` tests the connection for REST catalogs only; for these modes it reports `Connection: not tested`, and catalog errors first surface on the first query. To check a connection before querying, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
+**AWS Glue / S3 Tables.** `fluree iceberg map` loads each mapped table through the Glue or S3 Tables catalog, as a query will, and reports `Connection: not verified` when one cannot be loaded; the source is still registered. To check that the credentials can also read the table's storage, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
 
 | Error | Cause |
 |---|---|
@@ -1452,6 +1470,10 @@ Mapping a source compiles the R2RML mapping (a mapping that does not parse or co
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 
 At query time a column the table does not have is read like a NULL: the triples it would supply are not produced, and a row whose subject template names it produces no subject, so the query returns fewer results instead of failing. Only when none of the columns a scan needs exist does the query fail, with HTTP `400` `err:db/InvalidQuery`: `None of the projected columns [...] exist in table schema. Available: [...]`.
+
+### Unmapped Sources
+
+Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
 

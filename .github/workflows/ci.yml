@@ -364,7 +364,7 @@ jobs:
           - os: ubuntu-24.04
             rustflags: "-C link-arg=-fuse-ld=mold"
           # mold is Linux-only; clear the workflow-level linker flag.
-          - os: macos-15
+          - os: macos-26
             rustflags: ""
           - os: windows-2025
             rustflags: ""
@@ -400,6 +400,16 @@ jobs:
           "$py" -m pip install "maturin>=1.9,<2"
           "$py" -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
           "$py" -c 'import glob, zipfile; names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist(); assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), "the wheel carries no LICENSE"'
+
+      # As in python-release.yml: a release's wheel would build for macOS 11
+      # with no error, so the floor is checked on every PR too.
+      - name: The macOS wheel targets macOS 14
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          whl=$(ls dist/*.whl); [[ $whl == *-macosx_14_0_arm64.whl ]]
+          unzip -q -o "$whl" 'fluree/*.so' -d "$RUNNER_TEMP/whl"
+          vtool -show-build "$RUNNER_TEMP"/whl/fluree/*.so | grep 'minos 14.0'
 
       - name: Test on Python 3.10 and 3.14
         shell: bash

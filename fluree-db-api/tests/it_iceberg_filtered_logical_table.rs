@@ -883,3 +883,66 @@ async fn a_key_the_query_does_not_select_is_refused_at_registration() {
         "{message}"
     );
 }
+
+/// The provisional-mapping lane (validating a mapping before it is persisted)
+/// answers a filtered map as a registered source does. It resolves the
+/// query's alias to its `FROM` table, decodes the filter's columns though no
+/// term map reads them, and drops every row the filter excludes. It once
+/// handed the alias to the catalog as a table name and failed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_provisional_query_over_a_filtered_map_answers_as_the_registered_source() {
+    let _serial = SERIAL.lock().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ttl = mapping(CURRENT);
+    create_source(&fluree, "filtered", &ttl).await;
+    let body = "WHERE { ?c a ex:Customer ; ex:name ?n }";
+    let rows = |result: Value| -> Vec<String> {
+        let mut rows: Vec<String> = result["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("not SPARQL JSON: {result}"))
+            .iter()
+            .map(|b| format!("{}|{}", term(&b["c"]), term(&b["n"])))
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let registered = rows(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "PREFIX ex: <http://example.org/> SELECT ?c ?n FROM <{FILTERED}> {body}"
+            ))
+            .execute_formatted()
+            .await
+            .expect("registered source"),
+    );
+    let tables = ["customers_history", "orders"]
+        .into_iter()
+        .map(|t| {
+            (
+                format!("silver.{t}"),
+                format!("{}/silver/{t}", fixtures_dir()),
+            )
+        })
+        .collect();
+    let provisional = fluree
+        .query_provisional_r2rml_over_local_tables_for_test(
+            tables,
+            ttl,
+            format!("PREFIX ex: <http://example.org/> SELECT ?c ?n {body}"),
+        )
+        .await
+        .expect("a provisional query over a filtered map");
+    let provisional = rows(
+        provisional
+            .to_sparql_json(&fluree_db_core::LedgerSnapshot::genesis("provisional:main"))
+            .expect("format"),
+    );
+    assert_eq!(
+        registered,
+        ["customer/1|alice", "customer/2|bob", "customer/4|dave"],
+        "the registered source keeps the current, non-deleted rows"
+    );
+    assert_eq!(provisional, registered);
+}

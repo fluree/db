@@ -141,6 +141,10 @@ struct GraphWork {
     graph_iri: Arc<str>,
     /// The graph variable to bind to `graph_iri` (an enumerated `GRAPH ?g`).
     bind_graph_var: Option<VarId>,
+    /// A data-bound `GRAPH ?g` naming a graph source no query reads as a graph:
+    /// a refusal of that class (`QueryError::is_unreadable_graph_source`) while
+    /// opening means no rows for this binding, not a failed query.
+    unreadable_is_empty: bool,
 }
 
 /// An inner subplan kept open across `next_batch` calls, so its rows stream
@@ -773,7 +777,10 @@ impl Operator for GraphOperator {
                     )
                     .await;
                 self.parent_batch = Some(parent_batch);
-                opened?;
+                match opened {
+                    Err(e) if work.unreadable_is_empty && e.is_unreadable_graph_source() => {}
+                    opened => opened?,
+                }
                 continue;
             }
 
@@ -825,6 +832,7 @@ impl Operator for GraphOperator {
                                     row_idx,
                                     graph_iri: iri.clone(),
                                     bind_graph_var: None,
+                                    unreadable_is_empty: false,
                                 });
                             }
                             // else: graph not found → no output for this row
@@ -832,6 +840,7 @@ impl Operator for GraphOperator {
                             // Single-db: a registered user graph, a name of
                             // the default graph (`single_db_names_default_graph`),
                             // or an R2RML graph source.
+                            ctx.refuse_dropped_graph(iri)?;
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
                             let is_alias = ctx.single_db_names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
@@ -849,6 +858,7 @@ impl Operator for GraphOperator {
                                     row_idx,
                                     graph_iri: iri.clone(),
                                     bind_graph_var: None,
+                                    unreadable_is_empty: false,
                                 });
                             }
                         }
@@ -866,11 +876,17 @@ impl Operator for GraphOperator {
                                             row_idx,
                                             graph_iri: bound_iri,
                                             bind_graph_var: None,
+                                            unreadable_is_empty: false,
                                         });
                                     }
                                     // else: graph not found → no output
                                 } else {
-                                    // Single-db: same resolution as the concrete arm.
+                                    // Single-db: same resolution as the concrete arm,
+                                    // except for an IRI the data supplied that names a
+                                    // graph source no query reads as a graph. A
+                                    // constant naming it is refused; here it is a graph
+                                    // outside the dataset, so this binding yields no
+                                    // rows (SPARQL's answer) and the query goes on.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
                                     let is_alias = ctx.single_db_names_default_graph(&bound_iri);
@@ -879,7 +895,10 @@ impl Operator for GraphOperator {
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
-                                            provider.has_r2rml_mapping(&bound_iri).await?
+                                            match provider.has_r2rml_mapping(&bound_iri).await {
+                                                Err(e) if e.is_unreadable_graph_source() => false,
+                                                probed => probed?,
+                                            }
                                         } else {
                                             false
                                         };
@@ -889,6 +908,9 @@ impl Operator for GraphOperator {
                                             row_idx,
                                             graph_iri: bound_iri,
                                             bind_graph_var: None,
+                                            // An empty mapping surfaces only when the
+                                            // rewrite compiles it, as the work opens.
+                                            unreadable_is_empty: is_r2rml_gs,
                                         });
                                     }
                                 }
@@ -902,6 +924,7 @@ impl Operator for GraphOperator {
                                         row_idx,
                                         graph_iri: iri,
                                         bind_graph_var: Some(*var),
+                                        unreadable_is_empty: false,
                                     });
                                 }
                             } else {
@@ -919,6 +942,7 @@ impl Operator for GraphOperator {
                                         row_idx,
                                         graph_iri: iri,
                                         bind_graph_var: Some(*var),
+                                        unreadable_is_empty: false,
                                     });
                                 }
                             }

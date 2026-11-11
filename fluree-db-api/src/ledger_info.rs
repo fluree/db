@@ -774,7 +774,7 @@ pub(crate) fn resolve_graph_selector(
                 // Try as IRI
                 if let Some(store) = store {
                     store
-                        .graph_id_for_iri(other)
+                        .assigned_graph_id(other)
                         .ok_or_else(|| LedgerInfoError::UnknownGraph(other.to_string()))
                 } else {
                     Err(LedgerInfoError::UnknownGraph(format!(
@@ -799,7 +799,7 @@ pub(crate) fn resolve_graph_selector(
             }
             if let Some(store) = store {
                 store
-                    .graph_id_for_iri(iri)
+                    .assigned_graph_id(iri)
                     .ok_or_else(|| LedgerInfoError::UnknownGraph(iri.clone()))
             } else {
                 Err(LedgerInfoError::UnknownGraph(format!(
@@ -858,9 +858,13 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
         size: default_size,
     });
     // Then every registered graph (txn-meta at g_id=1, config at g_id=2,
-    // user-defined at g_id>=3). `iter_entries` is dense and ordered by
-    // g_id, so the response is deterministic.
-    for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
+    // user-defined at g_id>=3) but a dropped one, which does not exist until
+    // written again. Ordered by g_id, so the response is deterministic.
+    for (g_id, iri) in ledger
+        .snapshot
+        .graph_registry
+        .iter_visible_entries(ledger.t())
+    {
         let (flakes, size) = graph_totals(g_id);
         named_graphs.push(NamedGraph {
             iri: iri.to_string(),
@@ -1556,6 +1560,7 @@ fn map_source(tm: &fluree_db_r2rml::mapping::TriplesMap) -> MapSource {
 
 /// The distinct tables a mapping's triples maps read, sorted: an `rr:sqlQuery`
 /// map's `FROM` table rather than its query alias.
+#[cfg_attr(not(feature = "iceberg"), allow(dead_code))]
 pub(crate) fn mapping_source_tables(mapping: &CompiledR2rmlMapping) -> Vec<String> {
     let mut tables: Vec<String> = mapping
         .triples_maps
@@ -4500,8 +4505,10 @@ mod tests {
     /// A filtered map (an `rr:sqlQuery` with a `WHERE`) keeps only some of its
     /// table's rows, so no metadata knows its count: every count it contributes
     /// to is `null`, with `count-upper-bound` the sum of the contributing maps'
-    /// table row counts. A reference into a filtered parent is bounded too (a
-    /// child row whose parent the filter drops yields no triple). Unfiltered
+    /// table row counts. A reference into a filtered parent is bounded by the
+    /// child's rows when the parent's subject columns are among its join
+    /// columns (one parent subject per child key), and not bounded at all when
+    /// they are not (two kept parent rows can share a child key). Unfiltered
     /// counts keep their value and carry no bound.
     #[test]
     fn test_virtual_ledger_info_filtered_map_counts_are_bounds() {
@@ -4523,7 +4530,14 @@ mod tests {
                 rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] ;
                 rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [
                     rr:parentTriplesMap <#Current> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] ;
+                rr:predicateObjectMap [ rr:predicate ex:customerVersion ; rr:objectMap [
+                    rr:parentTriplesMap <#CurrentVersion> ;
                     rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] .
+            <#CurrentVersion> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/version/{customer_id}/{valid_from}" ;
+                                rr:class ex:CustomerVersion ] .
         "#;
         let mapping = fluree_db_r2rml::R2rmlLoader::from_turtle(ttl)
             .unwrap()
@@ -4600,6 +4614,18 @@ mod tests {
         let props = &stats["properties"];
         assert_eq!(props["http://ex.org/customer"]["count"], JsonValue::Null);
         assert_eq!(props["http://ex.org/customer"]["count-upper-bound"], 7);
+        // The version subject is keyed by (customer_id, valid_from) and joined
+        // on customer_id alone: two kept versions of one customer give one
+        // order two references, so the order count bounds nothing.
+        let version = &props["http://ex.org/customerVersion"];
+        assert_eq!(version["count"], JsonValue::Null, "{version}");
+        assert!(version.get("count-upper-bound").is_none(), "{version}");
+        let version_ref = &order["properties"]["http://ex.org/customerVersion"];
+        assert_eq!(
+            version_ref["types"]["@id"],
+            JsonValue::Null,
+            "{version_ref}"
+        );
         assert_eq!(props["http://ex.org/name"]["count"], JsonValue::Null);
         assert_eq!(props["http://ex.org/name"]["count-upper-bound"], 13);
         assert_eq!(props["http://ex.org/total"]["count"], 7);

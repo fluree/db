@@ -89,6 +89,10 @@ pub struct PlanningContext {
     /// it remains useful through DISTINCT and FILTER. Blocking query modifiers
     /// must clear it because they need the complete input.
     pub row_goal: Option<usize>,
+    /// The row order this query's graph-source table scans owe it. Deterministic
+    /// unless the query root has shown that no LIMIT or OFFSET anywhere in the
+    /// query can observe scan order (see `build_operator_tree`).
+    pub scan_order: crate::r2rml::ScanOrder,
 }
 
 impl PlanningContext {
@@ -101,6 +105,7 @@ impl PlanningContext {
             multi_default_graph: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
     }
 
@@ -113,6 +118,7 @@ impl PlanningContext {
             multi_default_graph: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
     }
 
@@ -148,6 +154,11 @@ impl PlanningContext {
 
     pub(crate) const fn with_row_goal(mut self, goal: Option<usize>) -> Self {
         self.row_goal = goal;
+        self
+    }
+
+    pub(crate) const fn with_scan_order(mut self, order: crate::r2rml::ScanOrder) -> Self {
+        self.scan_order = order;
         self
     }
 

@@ -1813,7 +1813,7 @@ impl EndpointGraphs {
 
     fn with_lookup<R>(&self, f: impl FnOnce(Option<fluree_db_api::GraphLookup<'_>>) -> R) -> R {
         match self {
-            Self::Ledger(_, names) => f(Some(&|iri: &str| names.graph_id_for_iri(iri))),
+            Self::Ledger(_, names) => f(Some(&|iri: &str| names.assigned_graph_id(iri))),
             Self::Empty => f(Some(&|_: &str| None)),
             Self::Unknown => f(None),
         }
@@ -1896,6 +1896,9 @@ fn route_query(
                     Err(TargetError::CrossLedger { also_iri, .. }) => {
                         local || !also_iri || !registry_known
                     }
+                    // Another branch's system graph: the connection path reads
+                    // the branch the IRI names.
+                    Err(TargetError::OtherLedgersSystemGraph { .. }) => true,
                 }
             };
             let Some(ast) = fluree_db_api::parse_sparql(content).ast else {

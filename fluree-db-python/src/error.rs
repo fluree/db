@@ -64,11 +64,14 @@ pub(crate) fn api_error(e: ApiError) -> PyErr {
 }
 
 /// A failed import as its Python exception. A value the ledger refuses is
-/// raised as a transaction refusing it would be; anything else is a
-/// `FlureeError`.
+/// raised as a transaction refusing it would be, an import that cannot run
+/// as asked as an `InvalidRequestError`, and an engine error by its status;
+/// anything else is a `FlureeError`.
 pub(crate) fn import_error(e: ImportError) -> PyErr {
     match e {
         ImportError::Invalid(e) => api_error(ApiError::Transact(e)),
+        ImportError::Refused(message) => invalid_request(message),
+        ImportError::Api(e) => api_error(e),
         e => fluree_error(e.to_string()),
     }
 }

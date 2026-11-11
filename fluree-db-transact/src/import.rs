@@ -63,7 +63,15 @@ mod inner {
         let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
             Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
                 GraphPosition::Default => return Ok(None),
-                GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => iri.into_owned(),
+                // Another ledger's config graph is refused below, as any is.
+                GraphPosition::OtherLedgersSystemGraph(iri)
+                    if fluree_db_core::graph_registry::names_txn_meta_graph(&iri) =>
+                {
+                    return Err(crate::stage::other_ledgers_system_graph(&id, &iri));
+                }
+                GraphPosition::Registered { iri, .. }
+                | GraphPosition::New(iri)
+                | GraphPosition::OtherLedgersSystemGraph(iri) => iri.into_owned(),
                 GraphPosition::NotAGraph => {
                     return Err(TransactError::Parse(format!(
                         "<{iri}> names no graph an import can write: an address of this \
@@ -78,6 +86,16 @@ mod inner {
         Ok(Some(graph))
     }
 
+    /// The named graph a bulk import into one graph of `ledger_id` writes,
+    /// for the graph name `iri` it was handed: read through the ledger's
+    /// graph-position table as a TriG block's graph is (`L#<g>` names the
+    /// graph `<g>`). `None` when the name is the ledger's default graph;
+    /// `urn:default`, a name that is no graph, and the system graphs are
+    /// refused.
+    pub fn target_graph_iri(iri: &str, ledger_id: &str) -> Result<Option<String>> {
+        import_graph_position(iri, ledger_id, &|_: &str| None)
+    }
+
     /// Refuse a named graph a bulk import may not write, by its literal IRI:
     /// the ledger's two system graphs, mirroring the staged-write guard's
     /// shape. Bulk import bypasses staging, so that guard never sees its
@@ -88,7 +106,8 @@ mod inner {
                 graph_iri: iri.to_string(),
             });
         }
-        if iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id) {
+        // Any ledger's config graph IRI is this ledger's config graph.
+        if fluree_db_core::graph_registry::names_config_graph(iri) {
             return Err(TransactError::ConfigGraphImportUnsupported {
                 graph_iri: iri.to_string(),
             });
@@ -349,6 +368,33 @@ mod inner {
         }
     }
 
+    impl ImportState {
+        /// Import state that continues an existing ledger's commit chain:
+        /// the first chunk commits at `t + 1` on top of `parent`, under the
+        /// ledger's namespace codes and named graphs (IRI → g_id).
+        pub fn continuing(
+            t: i64,
+            parent: CommitId,
+            ns_registry: NamespaceRegistry,
+            graph_ids: HashMap<String, u16>,
+        ) -> Self {
+            let next_gid = graph_ids
+                .values()
+                .map(|&g_id| g_id + 1)
+                .max()
+                .unwrap_or(0)
+                .max(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID);
+            Self {
+                t,
+                parent: Some(parent),
+                ns_registry,
+                graph_ids,
+                next_gid,
+                ..Self::new()
+            }
+        }
+    }
+
     impl Default for ImportState {
         fn default() -> Self {
             Self::new()
@@ -495,6 +541,7 @@ mod inner {
                 txn_meta: Vec::new(),
                 graph_delta: HashMap::new(),
                 ns_split_mode,
+                graph_drops: Vec::new(),
             };
 
             (writer, op_count, spool_result, envelope)
@@ -659,6 +706,7 @@ mod inner {
                 txn_meta: Vec::new(),
                 graph_delta: HashMap::new(),
                 ns_split_mode,
+                graph_drops: Vec::new(),
             };
 
             (writer, op_count, spool_result, envelope)
@@ -1044,6 +1092,7 @@ mod inner {
             txn_meta,
             graph_delta,
             ns_split_mode,
+            graph_drops: Vec::new(),
         };
 
         // 7. Finalize blob
@@ -1273,22 +1322,26 @@ mod inner {
             .map_err(|e| TransactError::Parse(e.to_string()))?;
         drop(_parse_span);
 
-        let (writer, prefix_map, spool_ctx) = sink
-            .into_parts()
+        // Named graphs come only from a spool config's target graph: Turtle
+        // has no syntax for one.
+        let output = sink
+            .into_output()
             .map_err(crate::import_sink::encode_failure)?;
-        let op_count = writer.op_count();
+        let op_count = output.writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
-        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
 
         Ok(ParsedChunk {
-            writer,
+            writer: output.writer,
             op_count,
             new_codes,
-            prefix_map,
+            prefix_map: output.prefix_map,
             spool_result,
             txn_meta: Vec::new(),
-            named_graphs: Vec::new(),
+            named_graphs: output.named_graphs,
         })
     }
 
@@ -1349,16 +1402,19 @@ mod inner {
         .map_err(|e| TransactError::Parse(e.to_string()))?;
         drop(_parse_span);
 
-        let (writer, _prefix_map, spool_ctx) = sink
-            .into_parts()
+        // Named graphs come only from a spool config's target graph.
+        let output = sink
+            .into_output()
             .map_err(crate::import_sink::encode_failure)?;
-        let op_count = writer.op_count();
+        let op_count = output.writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
-        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
 
         Ok(ParsedChunk {
-            writer,
+            writer: output.writer,
             op_count,
             new_codes,
             // Prelude prefixes are applied at session start; chunks should not
@@ -1366,7 +1422,7 @@ mod inner {
             prefix_map: HashMap::new(),
             spool_result,
             txn_meta: Vec::new(),
-            named_graphs: Vec::new(),
+            named_graphs: output.named_graphs,
         })
     }
 
@@ -1685,6 +1741,7 @@ mod inner {
                 txn_meta: parsed.txn_meta,
                 graph_delta,
                 ns_split_mode,
+                graph_drops: Vec::new(),
             };
 
             let result = parsed.writer.finish(&envelope)?;
@@ -1722,6 +1779,6 @@ mod inner {
 
 pub use inner::{
     finalize_parsed_chunk, import_commit_with_prelude, import_trig_commit, parse_chunk,
-    parse_chunk_with_prelude, parse_jsonld_chunk, ImportCommitResult, ImportState, JsonLdChunk,
-    ParsedChunk,
+    parse_chunk_with_prelude, parse_jsonld_chunk, target_graph_iri, ImportCommitResult,
+    ImportState, JsonLdChunk, ParsedChunk,
 };

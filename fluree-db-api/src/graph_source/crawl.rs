@@ -351,7 +351,12 @@ pub(crate) async fn expand_wildcard_crawl(
     // applies this ONLY to the injected true-wildcard scan (`?s ?p ?o`), never to a
     // predicate-filtered ref used as a subject filter, so a `Predicates` crawl or a
     // ref-binding WHERE keeps the scan + dangling-FK semantics and its subject set.
-    let execution = execution.with_trust_fk_refs(true);
+    // The crawl pages subjects itself, after the query (a subject OFFSET with no
+    // LIMIT reaches the flat query as no slice at all), so its scans must emit
+    // a fixed order for the pages to partition the subjects.
+    let execution = execution
+        .with_trust_fk_refs(true)
+        .with_deterministic_scans(true);
 
     let result = fluree
         .query_view_with_r2rml_tracker(
@@ -490,14 +495,15 @@ pub(crate) async fn expand_wildcard_crawl(
     // Assemble per-subject JSON-LD documents, honoring the crawl's subject
     // OFFSET then LIMIT. With an ORDER BY, first-seen order IS the solution
     // order (the flat rows arrive sorted, subject last as the tie-break), so a
-    // page holds the subjects the ORDER BY puts there. Without one, paging is
-    // BEST-EFFORT: subject order follows the scan's first-seen order, which is
-    // deterministic for a stable table but is not enforced across
-    // separately-executed requests (per-file reads run concurrently, and a table
-    // can compact/append between pages), so a page boundary can skip or repeat a
-    // subject when the underlying scan order shifts. Fine for shallow browse
-    // paging; a real pagination surface wants keyset/cursor paging instead of
-    // OFFSET.
+    // page holds the subjects the ORDER BY puts there. Without one, subject
+    // order is the scan's first-seen order: the TriplesMaps in mapping order,
+    // each table's files in a fixed order (smallest first), so
+    // separately-executed requests over one snapshot see the same order and
+    // their pages partition the subjects. A
+    // table that appends or compacts between pages changes the snapshot, and
+    // with it the order, so a page boundary can then skip or repeat a subject.
+    // Paging that must hold across table changes wants keyset/cursor paging
+    // instead of OFFSET.
     let normalize = format_config.normalize_arrays;
     let take = limit.unwrap_or(usize::MAX);
     let mut docs: Vec<JsonValue> = Vec::new();

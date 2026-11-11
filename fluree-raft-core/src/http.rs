@@ -1,5 +1,7 @@
 //! HTTP request-forwarding helpers.
 
+use http::uri::{PathAndQuery, Uri};
+
 /// Hop-by-hop headers: the RFC 2616 §13.5.1 set — the spec that
 /// coined the vocabulary and fixed this list; its "Trailers" entry
 /// misspelled the `Trailer` field, hence both spellings here — plus
@@ -32,9 +34,40 @@ pub fn is_hop_by_hop(name: &str) -> bool {
         .any(|header| header.eq_ignore_ascii_case(name))
 }
 
+/// The URL a forwarder sends a request to on `base_url`: the path and
+/// query the client sent. A nested router strips its prefix from the
+/// request's `uri` (`/v1/fluree/create` becomes `/create`) and keeps the
+/// full one as axum's `OriginalUri`, which `original` is when the request
+/// carries it.
+pub fn outbound_url(base_url: &str, original: Option<&Uri>, uri: &Uri) -> String {
+    let path_and_query = original
+        .and_then(Uri::path_and_query)
+        .or_else(|| uri.path_and_query())
+        .map_or("/", PathAndQuery::as_str);
+    format!("{}{path_and_query}", base_url.trim_end_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_url_keeps_the_path_the_client_sent() {
+        let original: Uri = "/v1/fluree/insert?ledger=a".parse().unwrap();
+        let stripped: Uri = "/insert?ledger=a".parse().unwrap();
+        for base in ["http://tx:8090", "http://tx:8090/"] {
+            assert_eq!(
+                outbound_url(base, Some(&original), &stripped),
+                "http://tx:8090/v1/fluree/insert?ledger=a",
+                "{base}"
+            );
+            assert_eq!(
+                outbound_url(base, None, &stripped),
+                "http://tx:8090/insert?ledger=a",
+                "{base}"
+            );
+        }
+    }
 
     #[test]
     fn classifies_hop_by_hop_case_insensitively() {

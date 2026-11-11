@@ -171,7 +171,7 @@ A few operational knobs are environment-only (no CLI flag):
 | `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
 | `FLUREE_REASONING_MAX_MEMORY_MB` | derived from the fact budget | Server-wide default materialization budget (max megabytes of derived facts). Unset, it is derived from the effective fact budget so the fact cap binds first; set it to bound memory directly. Overridden per ledger by `f:reasoningMaxMemoryMb` and per query by `"reasoningBudget"`. |
 | `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
-| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `DROP`, `COPY`, `MOVE`). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
+| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `COPY`, `MOVE`; `DROP` reads nothing and is not limited). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
 | `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
 | `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
 | `FLUREE_STORAGE_ALLOW_UNLOCKED` | off | Open a file storage directory on a filesystem that cannot lock it (some network and FUSE mounts). Unset, such a directory fails to open; set, nothing stops a second process from opening it too. See [One process per directory](storage.md#one-process-per-directory). |
@@ -1164,30 +1164,43 @@ See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federati
 
 ## Memory Allocator (mimalloc)
 
-`fluree-db-server` and `fluree-db-cli` expose an opt-in `mimalloc` Cargo feature
-that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimalloc).
-It is **off by default** — enable it in your release build:
+The `fluree` binary (`fluree-db-cli`), `fluree-db-server` and the Python package
+use [mimalloc](https://github.com/microsoft/mimalloc) as their global allocator.
+It is the `mimalloc` Cargo feature, on by default.
+
+**Why it is the default:**
+
+- Under sustained writes with frequent index builds, the system allocator
+  (glibc) keeps most of the memory the process frees, so resident memory climbs
+  until the host runs out. On a 64 GB host serving a 236M-flake ledger, RSS
+  reached 42–63 GB with glibc, of which a `malloc_trim` could return about 30 GB;
+  with mimalloc it stayed between 16 and 32 GB.
+- Allocation-heavy, multicore query paths run faster, most notably
+  R2RML/Iceberg graph-source scans, which materialize many RDF terms in
+  parallel: TPC-H Q1 over a 6M-row Iceberg table took ~62s with the system
+  allocator and ~31s with mimalloc.
+
+**Building without it:** turn off default features and list the ones you
+want, for example
 
 ```bash
-cargo build --release -p fluree-db-cli --features mimalloc
+cargo build --release -p fluree-db-cli --no-default-features \
+  --features server,iceberg,sql,delta,shacl,aws,graphql
 ```
 
-**When it helps:** allocation-heavy, multicore query paths — most notably
-R2RML/Iceberg graph-source scans, which materialize many RDF terms in parallel.
-On those workloads the system allocator's lock contention caps the parallel
-speedup; mimalloc roughly doubles the realized gain (e.g. TPC-H Q1 over a 6M-row
-Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
+**Embedding Fluree in your own binary:** a library cannot choose the
+allocator for the program that links it, so an application built on
+`fluree-db-api` (or `fluree-db-server` as a library) uses whatever allocator
+it declares. To get the same behavior, declare mimalloc in the application's
+binary:
 
-**Tradeoffs (operational, not semantic):**
+```rust
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
 
-- Changes the allocator for *every* allocation in the process (HTTP, query,
-  import, caches, AWS/Iceberg clients, tracing buffers).
-- Usually better multicore throughput and lower fragmentation, but may retain
-  more RSS due to per-thread heaps — relevant for large scans that already peak
-  high. Track RSS, p95 query latency, and concurrent-query behavior during a
-  soak before making it the default.
-- New native dependency in the binary; verify it builds for your target
-  (e.g. musl/cross builds) and keep a system-allocator fallback build.
+The Python package's extension module declares it for its own allocations
+only; Python's objects stay with Python's allocator.
 
 Pair it with bounded query parallelism so a single large scan cannot monopolize
 cores and allocator pressure under concurrent load.
@@ -1225,7 +1238,7 @@ environment-only.
 | `FLUREE_ARROW_DIRECT_DECODE` | on | Toggles building a column directly from an Arrow array, skipping the two-hop per-cell intermediate. Set to `0`/`false`/`off` to restore the byte-identical two-hop decode. |
 | `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` | Target table rows materialized into RDF-term bindings per parallel window. Bounds resident memory during a scan (materialization explodes the compact columnar form into fat binding rows). Also caps the size of an inner scan eligible for the inner-scan cache above, and how many input rows a correlated scan holds per pass over its table (`FLUREE_R2RML_CHILD_WINDOW`). |
 | `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |
-| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory (MB), across all Iceberg tables, for the data-file lists of snapshots kept between queries. A snapshot's file list is read from its manifests once; every later scan of that snapshot, with or without a filter, selects its files from the kept list instead of reading the manifests again. A list is weighed by its size (a few KB per file, mostly column statistics). A list larger than the whole budget is not kept in memory; it is still kept in the on-disk catalog cache, so its scans read the list from disk. `0` keeps none in memory. |
+| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory (MB), across all Iceberg tables, for the data-file lists of snapshots kept between queries. A snapshot's file list is read from its manifests once; every later scan of that snapshot, with or without a filter, selects its files from the kept list instead of reading the manifests again. A list is weighed by its size (a few KB per file, mostly column statistics). A list larger than the whole budget is held in one oversize slot beside the budgeted lists: the latest such list stays warm, and a second one replaces it. Every list is also kept in the on-disk catalog cache. `0` keeps none in memory. |
 | `FLUREE_DELTA_SCAN_CONCURRENCY` | `min(cores, files, 32)` | Number of data files of a Delta table read concurrently within one scan. Raise it for high-latency remote object stores. |
 | `FLUREE_DELTA_LOG_CACHE_MB` | `256` | Memory (MB), across all Delta tables, for the data-file lists remembered between queries so a query reads only the commits added since the last one instead of replaying the table's log. A table whose list does not fit is planned from its log on every query. `0` remembers nothing. |
 | `FLUREE_DELTA_FOOTER_CACHE_MB` | `128` | Memory (MB), across all Delta tables, for the Parquet footers and page indexes of data files kept between queries. Data files are immutable, so a kept footer is never stale. `0` keeps none: every query re-reads the footer of every file it opens. |
