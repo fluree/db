@@ -140,6 +140,11 @@ impl SpatialHook {
     pub fn retain(&mut self, keep: impl FnMut(&SpatialEntry) -> bool) {
         self.entries.retain(keep);
     }
+
+    /// Keep only the collected entries `keep` accepts, letting it edit them.
+    pub fn retain_mut(&mut self, keep: impl FnMut(&mut SpatialEntry) -> bool) {
+        self.entries.retain_mut(keep);
+    }
 }
 
 impl Default for SpatialHook {
