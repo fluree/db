@@ -4465,3 +4465,94 @@ async fn unordered_pages_partition_a_multi_file_answer() {
         "materialize read: commit order"
     );
 }
+
+/// A GROUP BY with no ORDER BY, paged with LIMIT/OFFSET, returns the same
+/// groups on the same pages in every execution, on SPARQL and JSON-LD: the
+/// sliced scan reads the files in a fixed order and the groups come out of the
+/// fold in a fixed order. `score` takes 100 values over `people_paged`'s 3,000
+/// rows; ten pages of ten partition one 1,000-row page, and two fresh
+/// instances agree page for page.
+#[tokio::test]
+async fn unordered_grouped_pages_are_the_same_on_every_execution() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
+    let location = format!("file://{}", table_dir.display());
+
+    let mut runs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for _ in 0..2 {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct("grouped", &location, &mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+        let fluree = &fluree;
+        let sparql = |limit: usize, offset: usize| async move {
+            let rows = fluree
+                .query_from()
+                .sparql(&format!(
+                    "SELECT ?sc (COUNT(?s) AS ?n) FROM <grouped:main> \
+                     WHERE {{ ?s <http://example.org/score> ?sc }} \
+                     GROUP BY ?sc LIMIT {limit} OFFSET {offset}"
+                ))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("SPARQL page {offset}: {e}"));
+            rows["results"]["bindings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("bindings: {rows}"))
+                .iter()
+                .map(|b| format!("{}={}", b["sc"]["value"], b["n"]["value"]))
+                .collect::<Vec<String>>()
+        };
+        let jsonld = |limit: usize, offset: usize| async move {
+            let rows = fluree
+                .query_from()
+                .jsonld(&serde_json::json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "from": "grouped:main",
+                    "select": ["?sc", "(count ?s)"],
+                    "where": {"@id": "?s", "ex:score": "?sc"},
+                    "groupBy": ["?sc"],
+                    "limit": limit,
+                    "offset": offset,
+                }))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("JSON-LD page {offset}: {e}"));
+            rows.as_array()
+                .unwrap_or_else(|| panic!("rows: {rows}"))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        };
+        let whole = sparql(1000, 0).await;
+        assert_eq!(whole.len(), 100, "SPARQL: one row per score: {whole:?}");
+        let mut paged = Vec::new();
+        for k in 0..10 {
+            paged.extend(sparql(10, k * 10).await);
+        }
+        assert_eq!(paged, whole, "SPARQL: the pages partition the groups");
+        let whole_jsonld = jsonld(1000, 0).await;
+        assert_eq!(whole_jsonld.len(), 100, "JSON-LD: one row per score");
+        let mut paged = Vec::new();
+        for k in 0..10 {
+            paged.extend(jsonld(10, k * 10).await);
+        }
+        assert_eq!(
+            paged, whole_jsonld,
+            "JSON-LD: the pages partition the groups"
+        );
+        runs.push((whole, whole_jsonld));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "two fresh instances page the groups alike"
+    );
+}

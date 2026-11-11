@@ -1922,8 +1922,11 @@ impl Operator for FusedR2rmlAggregateOperator {
         let vfold = self.vector_fold;
         let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
         let mut group_accs: Vec<Vec<Acc>> = Vec::new();
-        let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
-            std::collections::HashMap::new();
+        // Fx, not std's per-instance random hasher: the groups are emitted in
+        // this map's iteration order, which a LIMIT/OFFSET over a GROUP BY with no
+        // ORDER BY pages through, so it must not vary between executions.
+        let mut groups: rustc_hash::FxHashMap<Vec<GKey>, Vec<Acc>> =
+            rustc_hash::FxHashMap::default();
         let mut overflowed = false;
         'scan: while let Some(batch) = stream.next().await {
             // Checkpoint per fused-aggregate scan batch (deadline + memory budget): a
@@ -9517,5 +9520,76 @@ mod tests {
             "two semi-join branches on the SAME dim table enforce independently: buyer=Enterprise \
              drops D4 (SMB buyer), seller=SMB drops D5 (Enterprise seller)"
         );
+    }
+
+    /// A GROUP BY with no ORDER BY emits its groups in the fold map's
+    /// iteration order, which a LIMIT/OFFSET pages through: it must be the same
+    /// on every execution over the same rows, on both fold paths. Fresh
+    /// operators fold the same 200 rows into 50 groups; every run emits the
+    /// groups in one order. (A per-instance random hasher gives a different
+    /// order per run.)
+    #[tokio::test]
+    async fn grouped_output_order_is_the_same_on_every_execution() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::PredicateMap;
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![TriplesMap::new("#T", "t")
+            .with_subject_template("http://ex/t/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/grp"),
+                object_map: ObjectMap::column("G"),
+            })]));
+        let groups: Vec<String> = (0..200).map(|i| format!("g{:02}", (i * 7) % 50)).collect();
+        let mut b = std::collections::HashMap::new();
+        b.insert(
+            "t".to_string(),
+            vec![mk_batch(vec![
+                icol("ID", 1, (0..200).map(Some).collect()),
+                scol("G", 2, groups.iter().map(String::as_str).collect()),
+            ])],
+        );
+        let (s, g, cnt) = (VarId(0), VarId(1), VarId(20));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        for vector_fold in [false, true] {
+            let mut runs: Vec<Vec<String>> = Vec::new();
+            for _ in 0..4 {
+                let mut pat = R2rmlPattern::new("gs", s, Some(g));
+                pat.triples_map_iri = Some("#T".to_string());
+                pat.predicate_filter = Some("http://ex/grp".to_string());
+                let plan = FusedAggregatePlan {
+                    graph_iri: Arc::from("gs"),
+                    inner_patterns: vec![Pattern::R2rml(pat)],
+                    filter: None,
+                    agg_binds: vec![],
+                    group_by: vec![g],
+                    aggregates: vec![(cnt, AggregateFn::CountAll)],
+                };
+                let provider = CrtProvider {
+                    mapping: Arc::clone(&mapping),
+                    batches: b.clone(),
+                };
+                let ctx = ExecutionContext::new(&snapshot, &vars)
+                    .with_r2rml_providers(&provider, &provider);
+                let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+                // Set the field, never the process env (see the bounding test).
+                op.vector_fold = vector_fold;
+                op.open(&ctx).await.expect("open");
+                assert!(!op.use_fallback, "vector_fold={vector_fold}: the fold ran");
+                let mut order = Vec::new();
+                while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+                    for binding in batch.column(g).expect("group column") {
+                        order.push(format!("{binding:?}"));
+                    }
+                }
+                assert_eq!(order.len(), 50, "vector_fold={vector_fold}: 50 groups");
+                runs.push(order);
+            }
+            assert!(
+                runs.windows(2).all(|w| w[0] == w[1]),
+                "vector_fold={vector_fold}: group order differs between runs"
+            );
+        }
     }
 }
