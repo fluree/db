@@ -369,7 +369,6 @@ async fn a_class_and_property_policy_decides_a_column_typed_map() {
 /// R3: a class the map derives through a reference to another map's
 /// subjects is a class of the row's subject.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn a_class_derived_through_a_reference_is_the_subjects() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();

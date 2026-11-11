@@ -1816,8 +1816,21 @@ impl R2rmlScanOperator {
             // scan that would have dropped it) — an over-match. Non-scalar
             // constraints keep the shortcut off and take the sound parent-scan
             // path.
-            let ref_template_shortcut =
-                Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
+            // A view policy deciding by the classes a row derives reads them
+            // from its `rdf:type` object maps, a reference's included, so those
+            // maps' parents are resolved whatever the pattern reads; and a
+            // reference's class is its parent's subject, never one rendered
+            // from the child's key (a dangling key mints no class).
+            let row_classes = self
+                .policy_gate
+                .as_ref()
+                .is_some_and(|gate| gate.needs_row_classes(triples_map));
+            let is_derived_type = |pom: &PredicateObjectMap| {
+                pom.predicate_map.as_constant() == Some(fluree_vocab::rdf::TYPE)
+                    && !matches!(pom.object_map, ObjectMap::Constant { .. })
+            };
+            let ref_template_shortcut = !row_classes
+                && Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
             // Scoped so `star_preds` (which borrows `self`) is released before the
             // parent-lookup loop mutates `self.parent_lookup_cache` (PR-4).
             let filtered_poms: Vec<_> = {
@@ -1826,7 +1839,9 @@ impl R2rmlScanOperator {
                     .predicate_object_maps
                     .iter()
                     .filter(|pom| {
-                        if self.pattern.predicate_var.is_none() && self.has_star_members() {
+                        if row_classes && is_derived_type(pom) {
+                            true
+                        } else if self.pattern.predicate_var.is_none() && self.has_star_members() {
                             pom.predicate_map
                                 .as_constant()
                                 .is_some_and(|p| star_preds.contains(&p))
@@ -1923,6 +1938,12 @@ impl R2rmlScanOperator {
                     let parent_tm = match mapping.get(&rom.parent_triples_map) {
                         Some(tm) => tm,
                         None => {
+                            if row_classes && is_derived_type(pom) {
+                                return Err(unresolved_class_error(
+                                    &self.pattern.graph_source_id,
+                                    &triples_map.iri,
+                                ));
+                            }
                             tracing::warn!(
                                 parent = %rom.parent_triples_map,
                                 "Parent TriplesMap not found for RefObjectMap, skipping"
@@ -1948,6 +1969,12 @@ impl R2rmlScanOperator {
                     let Some(source) =
                         ParentSource::new(parent_tm, parent_join_cols, child_join_cols)
                     else {
+                        if row_classes && is_derived_type(pom) {
+                            return Err(unresolved_class_error(
+                                &self.pattern.graph_source_id,
+                                &triples_map.iri,
+                            ));
+                        }
                         tracing::warn!(
                             parent = %rom.parent_triples_map,
                             "Parent TriplesMap has no logical table, skipping"
@@ -2529,6 +2556,17 @@ impl R2rmlScanOperator {
         }
         Ok(false)
     }
+}
+
+/// The refusal for a map whose rows take a class from a reference the scan
+/// cannot resolve, while a view policy decides by class: reading the rows as
+/// classless would decide them on fewer classes than their subjects hold.
+fn unresolved_class_error(graph_source_id: &str, triples_map: &str) -> QueryError {
+    QueryError::Policy(format!(
+        "Graph source '{graph_source_id}': triples map <{triples_map}> takes its rdf:type \
+         from a reference whose parent cannot be read, so a class-targeted view policy \
+         cannot be decided on its rows"
+    ))
 }
 
 /// Whether the correlated inner-scan cache is enabled. Read once from
