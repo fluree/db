@@ -123,9 +123,15 @@ pub(crate) struct Schedule {
     /// Discovery problems that need an operator (missing commit time, an
     /// ambiguous instruction), newest last, capped.
     pub(crate) problems: Vec<String>,
+    /// Drawn afresh from [`REVISIONS`] by every change to the entries, so a
+    /// pass tells whether they changed without reading them.
+    revision: u64,
 }
 
 const MAX_PROBLEMS: usize = 32;
+
+/// Entry revisions, process-wide: no two changes, to any schedule, share one.
+static REVISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Schedule {
     /// An empty schedule whose discovery starts after commit `watermark_t`.
@@ -148,7 +154,17 @@ impl Schedule {
         self.entries.contains_key(key)
     }
 
+    /// The revision of the entries: it differs after any change to them.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = REVISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn insert(&mut self, key: FactKey, entry: Entry) {
+        self.touch();
         if let Some(old) = self.entries.remove(&key) {
             self.by_due.remove(&(old.due_ms, key.clone()));
         }
@@ -159,6 +175,7 @@ impl Schedule {
     pub(crate) fn remove(&mut self, key: &FactKey) -> Option<Entry> {
         let entry = self.entries.remove(key)?;
         self.by_due.remove(&(entry.due_ms, key.clone()));
+        self.touch();
         Some(entry)
     }
 
@@ -414,5 +431,38 @@ mod tests {
         assert_eq!(s.overdue(60), 1);
         s.remove(&k);
         assert_eq!(s.next_due_ms(), None);
+    }
+
+    /// A pass tells a changed schedule by its revision: every change to the
+    /// entries moves it, reading them does not, and two schedules never
+    /// share one.
+    #[test]
+    fn every_change_to_the_entries_moves_the_revision() {
+        let mut s = Schedule::default();
+        let k = key(FlakeValue::Long(1), "long");
+        let mut seen = vec![s.revision()];
+        s.insert(k.clone(), entry(10));
+        seen.push(s.revision());
+        let _ = (s.get(&k), s.due(20, 10), s.next_due_ms());
+        assert_eq!(
+            s.revision(),
+            *seen.last().unwrap(),
+            "a read changes nothing"
+        );
+        s.postpone(&k, 30);
+        seen.push(s.revision());
+        assert!(s.remove(&k).is_some());
+        seen.push(s.revision());
+        assert!(s.remove(&k).is_none());
+        assert_eq!(
+            s.revision(),
+            *seen.last().unwrap(),
+            "removing nothing changes nothing"
+        );
+        let mut other = Schedule::default();
+        other.insert(k, entry(10));
+        seen.push(other.revision());
+        let distinct: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(distinct.len(), seen.len(), "{seen:?}");
     }
 }

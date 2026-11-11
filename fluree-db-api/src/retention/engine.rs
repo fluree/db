@@ -1175,23 +1175,15 @@ impl Fluree {
 }
 
 /// A cheap summary that changes whenever the schedule does.
+/// What tells whether a pass changed `schedule`, read without its entries.
 fn schedule_fingerprint(schedule: &Schedule) -> (i64, usize, Option<i64>, usize, usize, u64) {
-    let mut h: u64 = 0;
-    for (k, e) in schedule.entries() {
-        use std::hash::{Hash, Hasher};
-        let mut s = std::collections::hash_map::DefaultHasher::new();
-        k.hash(&mut s);
-        e.due_ms.hash(&mut s);
-        e.generation_t.hash(&mut s);
-        h ^= s.finish();
-    }
     (
         schedule.watermark_t,
         schedule.len(),
         schedule.next_due_ms(),
         schedule.retire.len(),
         schedule.problems.len(),
-        h,
+        schedule.revision(),
     )
 }
 
