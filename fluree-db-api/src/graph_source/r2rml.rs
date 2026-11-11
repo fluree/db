@@ -4979,7 +4979,7 @@ impl FlureeR2rmlProvider<'_> {
 /// included, so a filtered map keeps the cached file list (the filter is fixed
 /// per map; re-planning from manifests on every query would cost a manifest
 /// read for no change in the answer).
-fn narrow_to_row_filter(
+pub(crate) fn narrow_to_row_filter(
     tasks: Vec<FileScanTask>,
     filter: &fluree_db_iceberg::scan::ExactRowFilter,
     schema: &fluree_db_iceberg::metadata::Schema,
