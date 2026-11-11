@@ -4670,12 +4670,16 @@ pub struct DocReadArgs {
     pub include: String,
 
     /// `jsonld` prints the reading as the reader wrote it, a Fluree DB
-    /// transaction (`fluree insert -f` takes it); `trig` the same as TriG,
-    /// the run in `<#txn-meta>`; `turtle` its statements without the run
+    /// transaction (`fluree insert -f` takes it). A document read in
+    /// several calls is a transaction per call, so as `jsonld` it needs
+    /// `-o`, and each call goes to a file of its own. `trig` is the same as
+    /// TriG, the run in `<#txn-meta>`; `turtle` its statements without the
+    /// run
     #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
     pub format: DocReadFormat,
 
-    /// Write to this file instead of stdout
+    /// Write to this file instead of stdout. A JSON-LD reading of several
+    /// calls goes to a file per call named after it: `FILE-1.jsonld`, …
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 

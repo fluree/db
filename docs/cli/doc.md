@@ -201,7 +201,7 @@ The output is the engine's own JSON-LD, insertable as it is: `fluree insert docs
 
 ## fluree doc read
 
-Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading as the reader wrote it: a Fluree DB transaction holding the run, the facts in the ontology's terms, the claims behind them and the mentions, each mention anchored to offsets in the parser's text. It is what `ingest` commits for the file (there, in the document's reading graph), and `fluree insert -f` takes it as it is. No ledger is written or needed. The reader is the `[doc.reader]` of the project when there is one, and of the global config otherwise (a project's config is read alone, not merged with the global one); `FLUREE_DOC_READER_*` overrides any of its fields one by one, so setting only `FLUREE_DOC_READER_URL` still sends the configured key and models. Files as ontology and catalog need no project, a ledger does.
+Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading as the reader wrote it: a Fluree DB transaction holding the run, the facts in the ontology's terms, the claims behind them and the mentions, each mention anchored to offsets in the parser's text. It is what `ingest` commits for the file (there, in the document's reading graph), and `fluree insert -f` takes it as it is. A document too long for one call is read in several, each a transaction of its own; as JSON-LD those go to a file per call (`-o`), each of which `fluree insert -f` takes. No ledger is written or needed. The reader is the `[doc.reader]` of the project when there is one, and of the global config otherwise (a project's config is read alone, not merged with the global one); `FLUREE_DOC_READER_*` overrides any of its fields one by one, so setting only `FLUREE_DOC_READER_URL` still sends the configured key and models. Files as ontology and catalog need no project, a ledger does.
 
 The offsets index the text the parser made of the file, which is what `fluree doc parse --format text` prints, not the file's own bytes: a Markdown file's markup, or a PDF's layout, is not counted. The reading doesn't repeat the text; its run's `xt:textSha256` names the text it read.
 
@@ -220,13 +220,13 @@ fluree doc read <FILE> --ontology <FILE|LEDGER> [OPTIONS]
 | `--model <ID>` | The extraction model, one a `[doc.reader]` lists in `models`. Default: `doc.model`. |
 | `--cache <ontology\|catalog\|off>` | What the reader may keep for the next request that shares it; `off` keeps nothing, overriding `doc.reader.cache`. Config: `doc.reader.cache`. |
 | `--include <PARTS>` | What the reading holds besides the facts: `claims`, `mentions`, `claims,mentions` (default) or `none`. |
-| `--format <FORMAT>` | `jsonld` (default): the reading as the reader wrote it, a Fluree DB transaction in JSON-LD. `trig`: the same transaction as TriG, the run in `<#txn-meta>` and each claim behind a fact reifying it (`~ claim`). `turtle`: its statements without the run, since Turtle has no graphs. |
-| `-o, --output <FILE>` | Write to this file instead of stdout. It is opened before the read, so a path that can't be written fails before anything is sent. |
+| `--format <FORMAT>` | `jsonld` (default): the reading as the reader wrote it, a Fluree DB transaction in JSON-LD. A document read in several calls is a transaction per call, and needs `-o`: without it the read is refused before anything is sent. `trig`: the same transaction as TriG, the run in `<#txn-meta>` and each claim behind a fact reifying it (`~ claim`). `turtle`: its statements without the run, since Turtle has no graphs. |
+| `-o, --output <FILE>` | Write to this file instead of stdout. It is opened before the read, so a path that can't be written fails before anything is sent. A JSON-LD reading of several calls goes to a file per call named after it, `FILE-1.jsonld`, `FILE-2.jsonld`, …, in place of `FILE`. |
 | `--base-iri <IRI>`, `--doc-iri <IRI>` | The document IRI, as for `parse`. |
 | `--no-escalate`, `--max-crops <N>` | Vision-model escalation during the parse, as for `parse`. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 
-The reading goes to stdout. Stderr says what was read with which model (and the vision model, when one reads what the parser can't), then the facts, claims, mentions, new entities and linked catalog records, the calls made (and how many the cache answered), what the reader billed, a line per call with its run, the release that read it and the reader's ID for the call (`X-Fluree-Request-ID`, the one to quote when reporting a problem), and what the reader set aside or adapted in the ontology. A file with no text is not sent: the reading is empty and no call is made. A document read in several calls prints a transaction per call (a JSON array of them, or one after another in TriG), each its own run.
+The reading goes to stdout. Stderr says what was read with which model (and the vision model, when one reads what the parser can't), then the facts, claims, mentions, new entities and linked catalog records, the calls made (and how many the cache answered), what the reader billed, a line per call with its run, the release that read it and the reader's ID for the call (`X-Fluree-Request-ID`, the one to quote when reporting a problem), and what the reader set aside or adapted in the ontology. A file with no text is not sent: the reading is empty and no call is made. A document read in several calls is a transaction per call, each its own run: in JSON-LD a file per call, since `fluree insert -f` takes one transaction a file and the run is that commit's metadata; in TriG one after another.
 
 ### Examples
 
@@ -235,6 +235,9 @@ fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small > invoi
 fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
 fluree doc read call.vtt --ontology onto.ttl --format trig -o call.trig
 fluree doc read memo.md --ontology onto.ttl --include none -o memo.jsonld && fluree insert memos -f memo.jsonld
+# A document read in two calls: report-1.jsonld and report-2.jsonld, each its own transaction
+fluree doc read report.pdf --ontology onto.ttl -o report.jsonld
+for f in report-*.jsonld; do fluree insert reports -f "$f"; done
 ```
 
 ## Configuration

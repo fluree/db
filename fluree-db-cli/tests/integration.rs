@@ -7902,3 +7902,65 @@ fn doc_ingest_recovers_from_a_reading_a_failed_run_left_behind() {
     assert_eq!(reading_claims(&tmp, "memo-2.md", None), 2);
     assert_eq!(sparql_rows(&tmp, "memos", stamped), 1);
 }
+
+/// A document read in two calls is a transaction per call: as JSON-LD on
+/// stdout it is refused before anything is sent, naming `-o` and `--format
+/// trig`; with `-o` each call goes to a file of its own, which `fluree
+/// insert -f` takes with its run as the commit's metadata.
+#[test]
+fn doc_read_writes_a_reading_of_several_calls_to_a_file_per_call() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    write_two_call_memo(&tmp, "docs/memo.md");
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true), stub_reading(0.8, true)]);
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is read in 2 calls"))
+        .stderr(predicate::str::contains("-o FILE.jsonld"))
+        .stderr(predicate::str::contains("--format trig"));
+    assert!(seen.lock().unwrap().is_empty(), "refused before sending");
+
+    let target = tmp.path().join("memo.jsonld");
+    read()
+        .arg("-o")
+        .arg(&target)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("call 2 of 2"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(!target.exists(), "the per-call files take its place");
+    fluree_cmd(&tmp)
+        .args(["create", "memos"])
+        .assert()
+        .success();
+    for n in [1, 2] {
+        let call = tmp.path().join(format!("memo-{n}.jsonld"));
+        let tx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&call).unwrap()).unwrap();
+        assert!(tx.is_object(), "one transaction a file");
+        fluree_cmd(&tmp)
+            .args(["insert", "memos", "-f"])
+            .arg(&call)
+            .assert()
+            .success();
+    }
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            "SELECT ?run FROM NAMED <memos:main#txn-meta> WHERE { GRAPH <memos:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }"
+        ),
+        2
+    );
+}

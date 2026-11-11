@@ -31,7 +31,7 @@ The reader is the `[doc.reader]` of the project when there is one, and of the gl
 | `--no-escalate`, `--max-crops <N>` | Vision-model escalation during the parse, as for `parse`. |
 | `--no-cache` | Neither read nor write the parse and reading caches: the document is read afresh. |
 
-Only the reading goes to stdout, so it can be piped or inserted as it is: the run becomes the commit's metadata. Stderr says which model read the file, the facts, claims, mentions, new entities and linked records, the calls made (and how many the cache answered), what the reader billed, and for each call its run, the release that read it and the reader's ID for the call. A file with no text is not sent. A document too long for one call is read in several, each its own run and its own transaction: `jsonld` prints them as a JSON array, `trig` one after another.
+Only the reading goes to stdout, so it can be piped or inserted as it is: the run becomes the commit's metadata. Stderr says which model read the file, the facts, claims, mentions, new entities and linked records, the calls made (and how many the cache answered), what the reader billed, and for each call its run, the release that read it and the reader's ID for the call. A file with no text is not sent. A document too long for one call is read in several, each its own run and its own transaction: as `jsonld` they need `-o FILE.jsonld` and go to a file per call (`FILE-1.jsonld`, `FILE-2.jsonld`, …, each of which `fluree insert -f` takes), and without `-o` the read is refused before anything is sent; `trig` prints them one after another.
 
 ## Offsets
 

@@ -1696,6 +1696,7 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     };
 
     let (p, iri) = (path.clone(), doc_iri.clone());
+    let (format, to_file) = (args.format, output.is_some());
     let result = tokio::task::spawn_blocking(move || -> CliResult<_> {
         let (meta, parsed) =
             fluree_db_doc::parse_file(&p, &file_name, &iri, cache.as_ref(), vlm.as_ref())?;
@@ -1717,6 +1718,21 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         if doc.parsed.text.trim().is_empty() {
             eprintln!("{} no text to read: nothing was sent", "!".yellow());
         }
+        // A document read in several calls is a transaction per call, and
+        // `fluree insert -f` takes one transaction a file: as JSON-LD that
+        // is a file per call, named after `-o`. With no file to name them
+        // after, it is refused here, before anything is sent.
+        if format == DocReadFormat::Jsonld && !to_file {
+            let (calls, _) = doc_reader::plan_document(&setup, &doc, None)?;
+            if calls > 1 {
+                return Err(CliError::Usage(format!(
+                    "{file_name} is read in {calls} calls, each a transaction of its own (its \
+                     own run), and `fluree insert -f` takes one: pass `-o FILE.jsonld` to write \
+                     one file per call (FILE-1.jsonld, …), or `--format trig` to print them \
+                     together; `fluree doc ingest` commits each as it is"
+                )));
+            }
+        }
         doc_reader::read_document(&setup, &doc, None)
     })
     .await
@@ -1733,19 +1749,26 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     };
 
     // The reading as the reader wrote it: one transaction per call, which
-    // `fluree insert` takes as it is.
-    let mut out = match args.format {
-        DocReadFormat::Jsonld => match read.readings.as_slice() {
-            [one] => serde_json::to_string_pretty(&one.transaction)?,
-            many => serde_json::to_string_pretty(&Value::Array(
-                many.iter().map(|r| r.transaction.clone()).collect(),
-            ))?,
-        },
-        DocReadFormat::Turtle => fluree_db_doc::reader::reading::turtle(&read.readings)?,
-        DocReadFormat::Trig => fluree_db_doc::reader::reading::trig(&read.readings)?,
+    // `fluree insert -f` takes as it is, one a file.
+    let jsonld = |v: &Value| serde_json::to_string_pretty(v);
+    let mut texts: Vec<String> = match (args.format, read.readings.as_slice()) {
+        (DocReadFormat::Jsonld, [one]) => vec![jsonld(&one.transaction)?],
+        // A file per call (refused above without `-o`).
+        (DocReadFormat::Jsonld, many) if many.len() > 1 && output.is_some() => many
+            .iter()
+            .map(|r| jsonld(&r.transaction))
+            .collect::<Result<_, _>>()?,
+        // No call (a file with no text): no transaction.
+        (DocReadFormat::Jsonld, many) => vec![jsonld(&Value::Array(
+            many.iter().map(|r| r.transaction.clone()).collect(),
+        ))?],
+        (DocReadFormat::Turtle, _) => vec![fluree_db_doc::reader::reading::turtle(&read.readings)?],
+        (DocReadFormat::Trig, _) => vec![fluree_db_doc::reader::reading::trig(&read.readings)?],
     };
-    if !out.ends_with('\n') {
-        out.push('\n');
+    for text in &mut texts {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
     }
 
     let usage = read.usage.note();
@@ -1785,16 +1808,33 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         eprintln!("  {} ontology {note}", "·".dimmed());
     }
     match output {
+        // A file per call, named after the target, which goes.
+        Some((target, file)) if texts.len() > 1 => {
+            drop(file);
+            let _ = std::fs::remove_file(&target);
+            for (n, text) in texts.iter().enumerate() {
+                let path = per_call_path(&target, n + 1);
+                std::fs::write(&path, text)
+                    .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+                eprintln!(
+                    "  {} call {} of {}: {}",
+                    "·".dimmed(),
+                    n + 1,
+                    texts.len(),
+                    path.display()
+                );
+            }
+        }
         Some((target, mut file)) => {
             use std::io::Write;
-            file.write_all(out.as_bytes())
+            file.write_all(texts.concat().as_bytes())
                 .map_err(|e| CliError::Input(format!("{}: {e}", target.display())))?;
         }
         None => {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             match stdout
-                .write_all(out.as_bytes())
+                .write_all(texts.concat().as_bytes())
                 .and_then(|()| stdout.flush())
             {
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
@@ -1803,6 +1843,19 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         }
     }
     Ok(())
+}
+
+/// Where `doc read -o FILE` writes a reading's `n`th call when it was read
+/// in several: `reading.jsonld` becomes `reading-2.jsonld`.
+fn per_call_path(target: &Path, n: usize) -> PathBuf {
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(match target.extension() {
+        Some(ext) => format!("{stem}-{n}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{n}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
