@@ -1318,47 +1318,69 @@ impl RawTerm {
 
 /// Append row `row` of `column` to `out` so that two rows' bytes are equal
 /// exactly when their values are (an integer is one value whether the file
-/// stores it in 32 or 64 bits). `false` for a type with no such encoding.
+/// stores it in 32 or 64 bits). A NULL is its own value, tagged apart from
+/// every non-null one: a key that folded it into the type's default would make
+/// a NULL and a `0` (or `""`, `false`) one solution wherever a caller has not
+/// already dropped NULL rows. `false` for a type with no such encoding.
 fn put_raw_value(column: &Column, row: usize, out: &mut Vec<u8>) -> bool {
+    const NULL: u8 = 0;
     match column {
-        Column::Int32(v) => {
-            out.push(1);
-            out.extend_from_slice(&i64::from(v[row].unwrap_or_default()).to_le_bytes());
-        }
-        Column::Int64(v) => {
-            out.push(1);
-            out.extend_from_slice(&v[row].unwrap_or_default().to_le_bytes());
-        }
-        Column::String(v) => {
-            let s = v[row].as_deref().unwrap_or_default().as_bytes();
-            out.push(2);
-            // The length as a LEB128 varint, so a string's bytes cannot run
-            // into the next value's.
-            let mut n = s.len();
-            loop {
-                let byte = (n & 0x7f) as u8;
-                n >>= 7;
-                if n == 0 {
-                    out.push(byte);
-                    break;
-                }
-                out.push(byte | 0x80);
+        Column::Int32(v) => match v[row] {
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&i64::from(n).to_le_bytes());
             }
-            out.extend_from_slice(s);
-        }
-        Column::Date(v) => {
-            out.push(3);
-            out.extend_from_slice(&v[row].unwrap_or_default().to_le_bytes());
-        }
-        Column::Boolean(v) => {
-            out.push(4);
-            out.push(u8::from(v[row].unwrap_or_default()));
-        }
-        Column::Decimal { values, scale, .. } => {
-            out.push(5);
-            out.extend_from_slice(&scale.to_le_bytes());
-            out.extend_from_slice(&values[row].unwrap_or_default().to_le_bytes());
-        }
+            None => out.push(NULL),
+        },
+        Column::Int64(v) => match v[row] {
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
+        Column::String(v) => match v[row].as_deref() {
+            Some(s) => {
+                let s = s.as_bytes();
+                out.push(2);
+                // The length as a LEB128 varint, so a string's bytes cannot run
+                // into the next value's.
+                let mut n = s.len();
+                loop {
+                    let byte = (n & 0x7f) as u8;
+                    n >>= 7;
+                    if n == 0 {
+                        out.push(byte);
+                        break;
+                    }
+                    out.push(byte | 0x80);
+                }
+                out.extend_from_slice(s);
+            }
+            None => out.push(NULL),
+        },
+        Column::Date(v) => match v[row] {
+            Some(d) => {
+                out.push(3);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
+        Column::Boolean(v) => match v[row] {
+            Some(b) => {
+                out.push(4);
+                out.push(u8::from(b));
+            }
+            None => out.push(NULL),
+        },
+        Column::Decimal { values, scale, .. } => match values[row] {
+            Some(n) => {
+                out.push(5);
+                out.extend_from_slice(&scale.to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
         _ => return false,
     }
     true
@@ -2894,7 +2916,15 @@ impl FusedR2rmlAggregateOperator {
         // non-empty, the vectorized fast path is gated off and the per-row path
         // (which enforces it) runs — the win is still skipping RDF
         // materialization, not skipping null checks.
-        let mut validity_cols: Vec<String> = tm.subject_map.template_columns.clone();
+        // The template's columns are read from the template itself, as for
+        // `count_non_null_cols` below: `template_columns` is only as complete
+        // as whatever built the map.
+        let mut validity_cols: Vec<String> = tm
+            .subject_map
+            .template
+            .as_deref()
+            .map(extract_template_columns)
+            .unwrap_or_default();
         if let Some(c) = &tm.subject_map.column {
             validity_cols.push(c.clone());
         }
@@ -4017,7 +4047,12 @@ impl FusedR2rmlAggregateOperator {
         // covered by the FK cols).
         let fact_fk_cols = hops[0].0.clone();
         let first_join_var = join_vars[0];
-        let mut validity_cols: Vec<String> = fact_tm.subject_map.template_columns.clone();
+        let mut validity_cols: Vec<String> = fact_tm
+            .subject_map
+            .template
+            .as_deref()
+            .map(extract_template_columns)
+            .unwrap_or_default();
         if let Some(c) = &fact_tm.subject_map.column {
             validity_cols.push(c.clone());
         }
@@ -4672,6 +4707,33 @@ mod tests {
         }
         assert_ne!(x, y);
         assert!(!put_raw_value(&floats, 0, &mut Vec::new()));
+    }
+
+    /// A NULL keys apart from every value, the type's default included, and
+    /// alike with another NULL of any type.
+    #[test]
+    fn a_raw_key_tags_null_apart_from_the_default() {
+        let key = |column: Column, row: usize| {
+            let mut out = Vec::new();
+            assert!(put_raw_value(&column, row, &mut out));
+            out
+        };
+        for (null, default) in [
+            (Column::Int32(vec![None]), Column::Int32(vec![Some(0)])),
+            (Column::Int64(vec![None]), Column::Int64(vec![Some(0)])),
+            (
+                Column::String(vec![None]),
+                Column::String(vec![Some(String::new())]),
+            ),
+            (Column::Date(vec![None]), Column::Date(vec![Some(0)])),
+            (
+                Column::Boolean(vec![None]),
+                Column::Boolean(vec![Some(false)]),
+            ),
+        ] {
+            assert_ne!(key(null.clone(), 0), key(default, 0), "{null:?}");
+            assert_eq!(key(null, 0), [0u8]);
+        }
     }
 
     #[test]
@@ -6662,6 +6724,61 @@ mod tests {
             "an ungrouped aggregate over a RefObjectMap object var must DECLINE (no \
              resolver drops the present-but-dangling FK); pre-fix it admitted and \
              over-counted 4 vs the generic 3"
+        );
+    }
+
+    /// A fold's row-validity columns hold the subject template's columns,
+    /// read from the template itself: a map whose `template_columns` were never
+    /// filled (any construction but the loader's, a field set directly) still
+    /// drops a row whose key column is NULL, which mints no subject.
+    #[tokio::test]
+    async fn validity_columns_come_from_the_subject_template() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        let (s_var, v_var, cnt) = (VarId(0), VarId(1), VarId(20));
+        let mut tm = TriplesMap::new("#T", "t").with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/v"),
+            object_map: ObjectMap::column("V"),
+        });
+        tm.subject_map.template = Some("http://ex/t/{ID}".to_string());
+        assert!(tm.subject_map.template_columns.is_empty());
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let mut fact = R2rmlPattern::new("gs", s_var, Some(v_var));
+        fact.triples_map_iri = Some("#T".to_string());
+        fact.predicate_filter = Some("http://ex/v".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![],
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "t".to_string(),
+            vec![batch_of(vec![
+                i64_col("ID", 1, vec![Some(1), None]),
+                i64_col("V", 2, vec![Some(5), Some(6)]),
+            ])],
+        );
+        let provider = CrtProvider { mapping, batches };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let resolved = op
+            .resolve_at_open(&ctx)
+            .await
+            .expect("resolve")
+            .expect("a COUNT over one column fuses");
+        assert!(
+            resolved.validity_cols.iter().any(|c| c == "ID"),
+            "the subject's key column must be a validity column: {:?}",
+            resolved.validity_cols
         );
     }
 

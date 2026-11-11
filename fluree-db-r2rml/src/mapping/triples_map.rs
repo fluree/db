@@ -69,9 +69,12 @@ impl TriplesMap {
         self
     }
 
-    /// Set the subject map template
+    /// Set the subject map template, and the columns it reads
+    /// ([`SubjectMap::template_columns`]), as the loader does.
     pub fn with_subject_template(mut self, template: impl Into<String>) -> Self {
-        self.subject_map.template = Some(template.into());
+        let template = template.into();
+        self.subject_map.template_columns = extract_template_columns(&template);
+        self.subject_map.template = Some(template);
         self
     }
 
@@ -677,6 +680,12 @@ mod tests {
             Some("http://example.org/{namespace}/{id}".to_string())
         );
         assert_eq!(sm.template_columns, vec!["namespace", "id"]);
+    }
+
+    #[test]
+    fn the_builder_records_a_subject_templates_columns() {
+        let tm = TriplesMap::new("#T", "t").with_subject_template("http://ex/t/{a}/{b}");
+        assert_eq!(tm.subject_map.template_columns, vec!["a", "b"]);
     }
 
     #[test]

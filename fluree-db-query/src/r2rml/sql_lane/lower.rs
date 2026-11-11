@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
 use fluree_db_r2rml::mapping::{
-    CompiledR2rmlMapping, ConstantValue, ObjectMap, PredicateMap, TermType, TriplesMap,
+    extract_template_columns, CompiledR2rmlMapping, ConstantValue, ObjectMap, PredicateMap,
+    TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{reverse_subject_template, template_is_injective};
 use fluree_db_r2rml::{RdfTerm, TableKeys};
@@ -2207,7 +2208,7 @@ impl<'a> Lowerer<'a> {
             TermSource::Subject { alias } => self.term_tm(alias).is_some_and(|tm| {
                 let sm = &tm.subject_map;
                 sm.template.as_deref().is_none_or(|t| {
-                    template_renders_apart(t, sm.term_type, sm.template_columns.len())
+                    template_renders_apart(t, sm.term_type, extract_template_columns(t).len())
                 })
             }),
             TermSource::Object { tm_iri, pom, .. } => self
@@ -4018,10 +4019,9 @@ fn subjects_disjoint(a: &TriplesMap, b: &TriplesMap) -> bool {
 fn joins_on_subject<'c>(parent: &TriplesMap, cols: impl IntoIterator<Item = &'c str>) -> bool {
     let sm = &parent.subject_map;
     let injective = sm.column.is_some()
-        || sm
-            .template
-            .as_deref()
-            .is_some_and(|t| template_renders_apart(t, sm.term_type, sm.template_columns.len()));
+        || sm.template.as_deref().is_some_and(|t| {
+            template_renders_apart(t, sm.term_type, extract_template_columns(t).len())
+        });
     let subject = parent.subject_columns();
     injective && cols.into_iter().all(|c| subject.contains(&c))
 }
