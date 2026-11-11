@@ -155,6 +155,20 @@ impl R2rmlPolicyGate {
                 view.by_class.entry(c).or_default().push(idx);
             }
         }
+        // A class-targeted restriction applies to a subject holding one of its
+        // classes. The property index may skip that check for a property
+        // only instances of the restriction's classes are known to use; the
+        // mapping's stats credit a property to static classes only, so a map
+        // that derives its class from a row, or declares none, would have its
+        // rows decided as if classed. Every class-targeted entry checks.
+        let class_policies: Vec<bool> = view.restrictions.iter().map(|r| r.class_policy).collect();
+        for entries in view.by_property.values_mut() {
+            for entry in entries {
+                if class_policies[entry.idx] {
+                    entry.class_check_needed = true;
+                }
+            }
+        }
         let per_subject = !view.by_subject.is_empty();
         let has_class_policies = view.restrictions.iter().any(|r| r.class_policy);
         // Every class any restriction is selected by, whatever it targets: a

@@ -417,7 +417,6 @@ async fn a_class_derived_through_a_reference_is_the_subjects() {
 /// R4: a predicate one classed map and one column-typed map both mint is
 /// decided on each subject's own classes, not credited to the classed map's.
 #[tokio::test]
-#[ignore = "fixed by the class-policy decisions change"]
 async fn a_shared_predicate_is_decided_on_each_subjects_classes() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();
