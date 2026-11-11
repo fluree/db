@@ -206,7 +206,7 @@ impl Fluree {
         not_before: Option<i64>,
         listing: &mut Option<Listing>,
     ) -> Result<Option<ReconcileReport>> {
-        if !self.collects_garbage() {
+        if !self.collects_garbage().await {
             return Ok(None);
         }
         let Some(binding) = self.publisher()?.get_binding(name).await? else {
@@ -369,7 +369,7 @@ impl Fluree {
     /// than `every` ago; one that cannot be reconciled yet is passed over.
     pub async fn reconcile_due(&self, every: Duration, budget: Duration) -> Result<ReconcilePass> {
         let mut pass = ReconcilePass::default();
-        if !self.collects_garbage() {
+        if !self.collects_garbage().await {
             return Ok(pass);
         }
         let started = Instant::now();

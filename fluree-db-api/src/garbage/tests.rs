@@ -464,6 +464,10 @@ pub(crate) mod cluster {
         pub(crate) term: std::sync::atomic::AtomicU64,
         /// How long a lease lasts: a second if unset.
         pub(crate) lease_ms: Mutex<Option<u64>>,
+        /// Collection is not enabled yet.
+        pub(crate) off: std::sync::atomic::AtomicBool,
+        /// How many times it was asked to enable collection.
+        pub(crate) enables: std::sync::atomic::AtomicUsize,
     }
 
     impl Cluster {
@@ -524,7 +528,14 @@ pub(crate) mod cluster {
         }
 
         async fn enable(&self) -> Result<bool> {
+            self.enables
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.off.store(false, std::sync::atomic::Ordering::Relaxed);
             Ok(true)
+        }
+
+        async fn enabled(&self) -> bool {
+            !self.off.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         async fn requests_recorded_by(&self, _ledger: &str, _ms: i64) -> bool {
@@ -582,6 +593,42 @@ pub(crate) mod cluster {
             .map(|r| r.blob.id)
             .collect();
         assert_eq!(recorded, [id]);
+    }
+
+    /// A cluster collects only once something enables collection, as its
+    /// first erasure request does: before, a pass condemns and enables
+    /// nothing, and a member deletes what it releases itself.
+    #[tokio::test]
+    async fn a_cluster_collects_nothing_until_collection_is_enabled() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        fluree.create_ledger("idle").await.unwrap();
+        let namespace = fluree.storage_namespace("idle:main").await.unwrap();
+        let id = fluree
+            .content_store(&namespace)
+            .put(ContentKind::Txn, b"{\"orphan\":true}")
+            .await
+            .unwrap();
+        let cluster = Arc::new(Cluster::default());
+        cluster.off.store(true, Ordering::Relaxed);
+        fluree.set_collector(cluster.clone());
+        assert!(!fluree.collected_by_cluster().await);
+        assert!(!fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(&id))
+            .await
+            .unwrap());
+        assert!(fluree.reconcile_garbage("idle").await.unwrap().is_none());
+        let report = pass(&fluree, &cluster).await;
+        assert_eq!(report.condemned, 0, "{report:?}");
+        assert_eq!(cluster.enables.load(Ordering::Relaxed), 0);
+        assert!(!cluster.enabled().await);
+
+        assert!(cluster.enable().await.unwrap());
+        assert!(fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(&id))
+            .await
+            .unwrap());
     }
 
     pub(crate) async fn pass(

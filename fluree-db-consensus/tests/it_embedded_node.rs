@@ -2323,6 +2323,12 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
     node.shutdown().await;
 }
 
+/// Enable the cluster's collection, as its first erasure request does.
+async fn enable_collection(integration: &RaftIntegration) {
+    use fluree_db_api::collect::Collector;
+    assert!(integration.nameservice().enable().await.unwrap());
+}
+
 /// The leader collects blobs nothing references through an intent: the
 /// pass that finds them condemns them, the next deletes them and closes the
 /// intent, and writes carry on. The seed's envelope, released when it
@@ -2332,6 +2338,7 @@ async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
     use fluree_db_core::{content_address, ContentKind, ContentStore as _};
 
     let (integration, fluree, node, _dirs) = stand_up(33, |config| config).await;
+    enable_collection(&integration).await;
     fluree.create_ledger("swept").await.expect("create ledger");
     seed(&node, "swept:main").await;
     let namespace = fluree.storage_namespace("swept:main").await.unwrap();
@@ -2375,11 +2382,14 @@ async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
     node.shutdown().await;
 }
 
-/// The cluster collects only once every member checks its writes: a
-/// member a release behind could not decode collection's commands. Until a
-/// learner answers that it checks, the leader condemns nothing.
+/// The cluster collects only once something enables collection (an
+/// erasure request), and only once every member checks its writes: a member
+/// a release behind could not decode collection's commands. A garbage pass
+/// enables nothing, and until a learner answers that it checks, enabling is
+/// refused and the leader condemns nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn collection_waits_until_every_member_checks_its_writes() {
+    use fluree_db_api::collect::Collector;
     use fluree_db_consensus::raft::nameservice::COLLECT_READY_PATH;
     use fluree_db_core::{ContentKind, ContentStore as _};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2393,7 +2403,8 @@ async fn collection_waits_until_every_member_checks_its_writes() {
         .put(ContentKind::Txn, b"{\"stray\":true}")
         .await
         .unwrap();
-    fluree.reconcile_garbage("gated").await.unwrap().unwrap();
+    // Nothing is recorded as garbage before the cluster collects.
+    assert!(fluree.reconcile_garbage("gated").await.unwrap().is_none());
 
     // A learner that does not check its writes until told to.
     let checks = Arc::new(AtomicBool::new(false));
@@ -2430,6 +2441,8 @@ async fn collection_waits_until_every_member_checks_its_writes() {
         .await
         .expect("learner added");
 
+    let ns = integration.nameservice();
+    assert!(!ns.enable().await.unwrap());
     let waiting = fluree
         .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
         .await
@@ -2455,11 +2468,8 @@ async fn collection_waits_until_every_member_checks_its_writes() {
             .await
             .expect("learner added");
     };
-    let (raced, ()) = tokio::join!(
-        fluree.collect_garbage_settled(Duration::ZERO, Duration::ZERO),
-        joins
-    );
-    assert_eq!(raced.unwrap().condemned, 0);
+    let (raced, ()) = tokio::join!(ns.enable(), joins);
+    assert!(!raced.unwrap());
     assert!(!integration.shared_state.read().await.collect.enabled);
     integration
         .raft
@@ -2470,6 +2480,16 @@ async fn collection_waits_until_every_member_checks_its_writes() {
         .await
         .expect("learner removed");
 
+    // Every member checks now, but a garbage pass alone does not enable.
+    let idle = fluree
+        .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(idle.condemned, 0, "{idle:?}");
+    assert!(!integration.shared_state.read().await.collect.enabled);
+
+    assert!(ns.enable().await.unwrap());
+    fluree.reconcile_garbage("gated").await.unwrap().unwrap();
     let enabled = fluree
         .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
         .await
@@ -2552,6 +2572,7 @@ async fn an_identical_request_keeps_the_envelope_the_first_released() {
     use fluree_db_core::{content_address, ContentId, ContentKind};
 
     let (integration, fluree, node, _dirs) = stand_up(34, |config| config).await;
+    enable_collection(&integration).await;
     fluree.create_ledger("twice").await.expect("create ledger");
     seed(&node, "twice:main").await;
     fluree
@@ -2595,17 +2616,22 @@ async fn an_identical_request_keeps_the_envelope_the_first_released() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let key = IdempotencyCacheKey::new("twice:main", IdempotencyKey::new("second").unwrap());
+    // As a writer presents it while the cluster collects: having seen no
+    // intent.
     integration
         .raft
-        .client_write(Command::EnqueueCommand(QueueSubmission {
-            ledger_id: "twice".into(),
-            branch: "main".into(),
-            idempotency: Some(key.clone()),
-            request_cid,
-            body_cid,
-            body_kind: BodyKind::Merge,
-            applied_at_millis: 0,
-        }))
+        .client_write(Command::Seen {
+            seen: 0,
+            command: Box::new(Command::EnqueueCommand(QueueSubmission {
+                ledger_id: "twice".into(),
+                branch: "main".into(),
+                idempotency: Some(key.clone()),
+                request_cid,
+                body_cid,
+                body_kind: BodyKind::Merge,
+                applied_at_millis: 0,
+            })),
+        })
         .await
         .unwrap();
     eventually("the second's outcome", async || {

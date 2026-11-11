@@ -3348,7 +3348,7 @@ impl<'a> ImportBuilder<'a> {
         // replicated write queue: a cluster member has no way to order it
         // with the cluster's writes, its erasures or its collection.
         #[cfg(feature = "native")]
-        if self.fluree.collected_by_cluster() {
+        if self.fluree.in_cluster() {
             return Err(ImportError::Refused(String::from(
                 "bulk import is not supported on a Raft cluster member: it moves the \
                  ledger's heads outside the replicated write queue; restore a .flpack instead",

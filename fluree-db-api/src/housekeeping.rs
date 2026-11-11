@@ -179,7 +179,7 @@ impl LifecycleHousekeeping {
     #[cfg(feature = "native")]
     async fn collect_if_due(&self, fluree: &Arc<Fluree>) {
         use std::sync::atomic::Ordering;
-        if !fluree.collects_garbage() {
+        if !fluree.collects_garbage().await {
             return;
         }
         {

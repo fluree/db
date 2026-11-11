@@ -83,8 +83,13 @@ pub trait Collector: Send + Sync + std::fmt::Debug {
 
     /// Whether the cluster collects, enabling it once every member checks
     /// its writes: before, a member a release behind may be unable to read
-    /// collection's commands.
+    /// collection's commands. Only an erasure request enables it, so a
+    /// cluster that never erases never collects, and keeps taking the
+    /// ref-based pushes collection refuses.
     async fn enable(&self) -> Result<bool>;
+
+    /// Whether the cluster collects, without enabling it.
+    async fn enabled(&self) -> bool;
 
     /// Whether ledger `ledger` keeps an idempotency record made at or before
     /// `ms`, which names its request's envelope.

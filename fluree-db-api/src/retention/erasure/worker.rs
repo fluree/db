@@ -312,7 +312,7 @@ impl Fluree {
             return;
         };
         // On a cluster a job is purged once every member installed it.
-        let clustered = self.collected_by_cluster();
+        let clustered = self.in_cluster();
         let now = now_ms();
         let mut due = std::collections::BTreeSet::new();
         for branch in ledgers {

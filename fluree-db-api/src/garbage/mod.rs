@@ -136,9 +136,9 @@ impl Fluree {
     }
 
     /// Whether this instance collects garbage: it holds its root's lock, or
-    /// it is a cluster member, whose leader collects.
-    pub(crate) fn collects_garbage(&self) -> bool {
-        self.blob_pins().is_some() || self.collector().is_some()
+    /// it is a member of a cluster that collects, whose leader collects.
+    pub(crate) async fn collects_garbage(&self) -> bool {
+        self.blob_pins().is_some() || self.collected_by_cluster().await
     }
 
     /// The pins that waited for a collector to finish with their blob;
@@ -166,10 +166,20 @@ impl Fluree {
             .ok_or_else(|| ApiError::internal("garbage collection needs managed storage"))
     }
 
-    /// Whether a cluster collects this member's garbage: then nothing but
-    /// the leader's collection deletes a commit or transaction blob.
-    pub fn collected_by_cluster(&self) -> bool {
+    /// Whether this instance is a member of a cluster.
+    pub(crate) fn in_cluster(&self) -> bool {
         self.collector().is_some()
+    }
+
+    /// Whether a cluster collects this member's garbage, as it does once its
+    /// first erasure request enables collection: then nothing but the
+    /// leader's collection deletes a commit or transaction blob. Before,
+    /// a member deletes what it releases itself.
+    pub async fn collected_by_cluster(&self) -> bool {
+        match self.collector() {
+            Some(collector) => collector.enabled().await,
+            None => false,
+        }
     }
 
     /// Leave `ids`, stored under `namespace` and named by nothing, to the
@@ -180,7 +190,7 @@ impl Fluree {
         namespace: &StorageNamespace,
         ids: &[ContentId],
     ) -> Result<bool> {
-        if !self.collected_by_cluster() {
+        if !self.collected_by_cluster().await {
             return Ok(false);
         }
         let blobs: Vec<Blob> = ids
@@ -198,7 +208,8 @@ impl Fluree {
         let storage = self.garbage_storage()?;
         // Recorded wherever the storage is collected: by whichever instance
         // holds its root, not only this one, or through the cluster.
-        if (storage.blob_pins().is_none() && self.collector().is_none()) || blobs.is_empty() {
+        if (storage.blob_pins().is_none() && !self.collected_by_cluster().await) || blobs.is_empty()
+        {
             return Ok(());
         }
         let method = storage.storage_method().to_string();

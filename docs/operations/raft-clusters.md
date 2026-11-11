@@ -254,8 +254,9 @@ The Raft log and snapshot encodings (postcard for `Command`, `Response`, and `Na
 
 Skipping versions is not supported. The safe path is N → N+1; for larger jumps, do them sequentially.
 
-Garbage collection and permanent erasure begin once every member runs a release that supports them;
-after that, a member of an earlier release cannot rejoin. See
+Permanent erasure is accepted once every member runs a release that supports it, and the first
+erasure request turns on garbage collection; after that, a member of an earlier release cannot
+rejoin. See
 [Garbage collection and permanent erasure](#garbage-collection-and-permanent-erasure).
 
 v4.3 binds every ledger to its name (see [Upgrading from 4.2 and earlier](upgrading-from-4.2.md)). A cluster moving from an earlier release does this once, on the first leader elected after the upgrade, through commands an older node cannot read — one more reason to finish the upgrade before a newly upgraded node leads.
@@ -271,10 +272,12 @@ writes against what is condemned: a write that stores a condemned file again kee
 began before its member knew of the condemnation is refused and staged again. Deletes stay within the
 leader's lease, so a leader deposed mid-pass deletes nothing once another may be writing.
 
-The cluster begins collecting, and accepting [permanent erasures](../transactions/permanent-erasure.md#on-a-cluster),
-only once every member, voter or learner, runs a release that checks its writes: a member of an
-earlier release cannot read the commands involved. From then on, do not add or restart a member on an
-earlier release.
+The cluster accepts [permanent erasures](../transactions/permanent-erasure.md#on-a-cluster) only
+once every member, voter or learner, runs a release that checks its writes: a member of an earlier
+release cannot read the commands involved. The first erasure request it accepts turns collection on,
+for good. From then on, do not add or restart a member on an earlier release. A cluster that never
+erases never collects: each member deletes what it releases itself, as before, and ref-based pushes
+keep working.
 
 Install the prover on every member (`fluree prover install`). The leader takes erasure requests only
 with one, and hands each proof to another member: first one that neither leads nor stages the

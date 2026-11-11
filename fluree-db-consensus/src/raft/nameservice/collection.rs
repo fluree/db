@@ -162,6 +162,10 @@ impl Collector for RaftNameService {
         Ok(named)
     }
 
+    async fn enabled(&self) -> bool {
+        self.state.read().await.collect.enabled
+    }
+
     async fn enable(&self) -> Result<bool> {
         if self.state.read().await.collect.enabled {
             return Ok(true);

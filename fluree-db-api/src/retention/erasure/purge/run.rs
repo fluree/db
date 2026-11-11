@@ -109,7 +109,7 @@ impl Fluree {
         let runtime = self.erasure_runtime()?;
         // On a cluster the leader purges the shared storage, for jobs every
         // member has installed: none reads or writes back what they erase.
-        let clustered = self.collected_by_cluster();
+        let clustered = self.in_cluster();
         // The holders stay those the pass planned for: a branch made from
         // one would copy an index not yet erased, and a restore would
         // rebuild into folders the release deletes.
@@ -509,7 +509,7 @@ impl Fluree {
     /// whose registration holds each.
     pub(super) async fn purge_jobs(&self, name: &LedgerName) -> Result<Vec<(String, ErasureJob)>> {
         let ns = self.publisher()?;
-        let clustered = self.collected_by_cluster();
+        let clustered = self.in_cluster();
         let mut jobs = Vec::new();
         for record in self.nameservice().branch_records(name.as_str()).await? {
             if record.retracted {

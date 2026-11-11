@@ -86,7 +86,7 @@ impl Fluree {
         let Some(first) = collector.lease().await else {
             return Ok(report);
         };
-        if !collector.enable().await? {
+        if !collector.enabled().await {
             return Ok(report);
         }
         // Its deletes are this term's: led again later, what it found may

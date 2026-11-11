@@ -63,7 +63,7 @@ impl Fluree {
         let ns = self.publisher()?;
         // On a cluster, only what every member has installed: a member that
         // has not still reads the originals, and may write them back.
-        let clustered = self.collected_by_cluster();
+        let clustered = self.in_cluster();
         let mut plan = PurgePlan::default();
         let mut erased = BTreeSet::new();
         let mut rebuild = BTreeSet::new();

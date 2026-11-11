@@ -198,7 +198,10 @@ earlier releases.
 ## On a cluster
 
 A Raft cluster accepts a request on its leader once every member, voter or learner, runs this
-release; until then it refuses with `501`. What differs from a single node:
+release; until then it refuses with `501`. The first request it accepts turns on the cluster's
+[garbage collection](../operations/raft-clusters.md#garbage-collection-and-permanent-erasure), which
+the purge needs. That is permanent, and from then on the cluster refuses ref-based commit-head pushes.
+What differs from a single node:
 
 - **Proving.** The leader accepts requests only with a prover of its own, so install it on every
   member. It has each step proved by another member with a prover, voter or learner: first one that

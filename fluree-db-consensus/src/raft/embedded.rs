@@ -407,7 +407,7 @@ fn spawn_release_task(
 /// the release late, or again when it replays its log. Reconciliation
 /// finds it once nothing names it.
 pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
-    if fluree.collected_by_cluster() {
+    if fluree.collected_by_cluster().await {
         return;
     }
     const ATTEMPTS: u32 = 3;
