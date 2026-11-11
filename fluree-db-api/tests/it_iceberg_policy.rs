@@ -19,6 +19,9 @@
 #[path = "support/fake_sql.rs"]
 mod fake_sql;
 
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
 use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
 use serde_json::{json, Value};
 
@@ -1113,11 +1116,36 @@ async fn graph_scoped_builder_enforces_governed_source() {
 /// denied and `k = 1` the bound rides at erin's 99.9, the alice file prunes
 /// away, and the query answers dave (64) instead of alice (91.5).
 ///
+/// The scan prunes by a column's bounds only where they sort as its terms do
+/// (a `double` bound does not sort as the plain literals an un-annotated
+/// column maps to) and only over a map whose rows cannot repeat a triple, so
+/// `topk-people` declares the score's datatype and the table's key: it is
+/// the source the top-k would prune.
+///
 /// Selects only `?s`: the fixture's scores differ from the native twin's, but
 /// the rank order is identical, so the top-k subject set must match.
 #[tokio::test]
 async fn topk_limit_is_declined_under_view_policy() {
+    const TOPK_GS: &str = "topk-people:main";
     let fluree = setup().await;
+    let topk_mapping = PEOPLE_R2RML
+        .replace(
+            r#"rr:tableName "silver.people" ]"#,
+            r#"rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#,
+        )
+        .replace(
+            r#"rr:objectMap [ rr:column "score" ]"#,
+            r#"rr:objectMap [ rr:column "score" ; rr:datatype <http://www.w3.org/2001/XMLSchema#double> ]"#,
+        );
+    assert_eq!(topk_mapping.matches("db#key").count(), 1);
+    assert_eq!(topk_mapping.matches("XMLSchema#double").count(), 1);
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("topk-people", table_location(), topk_mapping)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
     let policies = vec![deny(
         "ex:hide-top",
         on_subject("http://example.org/person/5"),
@@ -1152,7 +1180,7 @@ async fn topk_limit_is_declined_under_view_policy() {
     // k = 1 is the shape that prunes: the denied row alone fills the heap.
     for k in [1usize, 2, 3] {
         let native = run_topk(NATIVE, policies.clone(), k).await;
-        for source in virtual_sources(GS) {
+        for source in virtual_sources(GS).into_iter().chain([TOPK_GS]) {
             let virt = run_topk(source, policies.clone(), k).await;
             assert_eq!(
                 virt, native,
@@ -1161,13 +1189,24 @@ async fn topk_limit_is_declined_under_view_policy() {
         }
     }
 
-    // Control: with no policy the scan-side top-k still runs and still answers
-    // with the true top scorer, so the guard above cannot pass vacuously by
-    // having disabled the pushdown outright.
+    // Control: with no policy the scan-side top-k still runs over
+    // `topk-people`, pruning the alice file, and still answers with the true
+    // top scorer, so the guard above cannot pass vacuously by having disabled
+    // the pushdown outright.
+    let (store, _guard) = span_capture::init_test_tracing();
+    let before = store.find_events("scan-side top-k prune").len();
     assert_eq!(
-        run_topk(GS, Vec::new(), 1).await,
+        run_topk(TOPK_GS, Vec::new(), 1).await,
         "[[\"http://example.org/person/5\"]]",
         "unpoliced top-1 must still be the highest scorer"
+    );
+    let prunes = &store.find_events("scan-side top-k prune")[before..];
+    assert!(
+        prunes
+            .iter()
+            .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
+        "unpoliced, the top-k must prune the alice file: {:?}",
+        prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
     );
 }
 

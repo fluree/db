@@ -417,21 +417,27 @@ async fn filtered_map_answers_match_the_native_oracle() {
         );
     }
 
-    // The scan-side top-k ran for the top balance and stopped early: the file
-    // holding the current rows' best balance is read first, and the other file
-    // cannot beat it. Its answer (customer/4, 100.00) is above; unfiltered, a
-    // non-current row's 500.00 would win.
-    let before = store.find_events("scan-side top-k prune").len();
-    let top = sparql_rows(&fluree, FILTERED, &cases()[4]).await;
-    assert_eq!(top, ["customer/4"]);
-    let prunes = &store.find_events("scan-side top-k prune")[before..];
-    assert!(
-        prunes
-            .iter()
-            .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
-        "the top-k must read one file and prune the other: {:?}",
-        prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
-    );
+    // Over the keyed map the scan-side top-k ran for the top balance and
+    // stopped early: the file holding the current rows' best balance is read
+    // first, and the other file cannot beat it. Its answer (customer/4,
+    // 100.00) is above; unfiltered, a non-current row's 500.00 would win.
+    // With no key, two current rows could mint one customer's balance, which
+    // the scan emits once, so the rows it has seen are not k triples: it
+    // declines the top-k and reads both files, to the same answer.
+    for (from, keyed) in [("filtered-keyed:main", true), (FILTERED, false)] {
+        let before = store.find_events("scan-side top-k prune").len();
+        let top = sparql_rows(&fluree, from, &cases()[4]).await;
+        assert_eq!(top, ["customer/4"], "{from}");
+        let prunes = &store.find_events("scan-side top-k prune")[before..];
+        assert_eq!(
+            prunes
+                .iter()
+                .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
+            keyed,
+            "{from}: the top-k must read one file and prune the other only when keyed: {:?}",
+            prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// The `{"?s": ["*"]}` browse crawl renders a reference from the child's own

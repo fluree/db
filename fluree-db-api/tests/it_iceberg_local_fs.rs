@@ -1590,7 +1590,8 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
     let location = table_location();
     allow_fixture_roots();
     let fluree = FlureeBuilder::memory().build_memory();
-    let config = R2rmlCreateConfig::new_direct("topk-people", &location, PEOPLE_R2RML)
+    let mapping = keyed_by_id(PEOPLE_R2RML, "silver.people");
+    let config = R2rmlCreateConfig::new_direct("topk-people", &location, &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -3296,6 +3297,19 @@ const WINDOW_PEOPLE_R2RML: &str = r#"
         ] .
 "#;
 
+/// `mapping` with `id` declared the key of `table`'s logical table. A
+/// scan-side top-k counts rows, so it runs only over a map whose rows cannot
+/// repeat a triple; the top-k tests below declare the key their fixtures hold
+/// so the decline they pin is theirs, not the missing key's.
+fn keyed_by_id(mapping: &str, table: &str) -> String {
+    let keyed = mapping.replace(
+        &format!(r#"rr:tableName "{table}" ]"#),
+        &format!(r#"rr:tableName "{table}" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#),
+    );
+    assert_ne!(keyed, mapping, "the key was spliced in");
+    keyed
+}
+
 /// The ids (in answer order) of the first column named `id` in a SPARQL or
 /// JSON-LD result.
 fn answer_ids(result: &serde_json::Value) -> Vec<i64> {
@@ -3362,7 +3376,8 @@ async fn order_by_limit_over_a_scan_its_input_binds_answers_the_bound_rows() {
         "file://{}/tests/fixtures/iceberg/silver",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("topk-cell", &root, PERSON_CELL_TOPK_R2RML)
+    let mapping = keyed_by_id(PERSON_CELL_TOPK_R2RML, "silver.people_window");
+    let config = R2rmlCreateConfig::new_direct("topk-cell", &root, &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -3439,7 +3454,8 @@ async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
         "file://{}/tests/fixtures/iceberg/silver/people_window",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_PEOPLE_R2RML)
+    let mapping = keyed_by_id(WINDOW_PEOPLE_R2RML, "silver.people_window");
+    let config = R2rmlCreateConfig::new_direct("topk-window", &location, &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)

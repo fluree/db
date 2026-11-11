@@ -43,6 +43,10 @@
   referencing object map whose parent key matches several parent subjects
   (R2RML fan-out); a parent map minting one subject per `code` gives the
   history shape (a repeated key, one subject).
+- `sets.order_lines`: order lines in two files, the first holding order 42's
+  amount twice (one triple, two rows) above every amount in the second, so a
+  scan-side top-k that counted rows rather than triples would stop before
+  the second file.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -445,6 +449,35 @@ parents_dup.append(parents_dup_batch(parents_dup_rows[:4]))
 parents_dup.append(parents_dup_batch(parents_dup_rows[4:]))
 parents_dup = catalog.load_table("sets.parents_dup")
 print("parents_dup table_location:", parents_dup.location())
+
+# ---------------------------------------------------------------------------
+# sets.order_lines: a repeated triple above the rest of the top k.
+# ---------------------------------------------------------------------------
+# `line_id` is unique; `order_id` is not. The first file holds two lines of
+# order 42 with the same amount: mapped per order they mint ONE triple, so
+# the top two amounts per order are 100 (order 42) and 50 (order 43), the
+# second in the other file, whose upper bound (50) sits below the first
+# file's two rows. Mapped per line, every row is its own triple. The
+# `sets` namespace exists by now (created above).
+order_lines_schema = pa.schema([
+    pa.field("line_id", pa.int64()),
+    pa.field("order_id", pa.int64()),
+    pa.field("amount", pa.int64()),
+])
+order_lines = catalog.create_table("sets.order_lines", schema=order_lines_schema)
+
+def order_lines_batch(rows):
+    col = lambda i: [r[i] for r in rows]
+    return pa.table({
+        "line_id": pa.array(col(0), pa.int64()),
+        "order_id": pa.array(col(1), pa.int64()),
+        "amount": pa.array(col(2), pa.int64()),
+    }, schema=order_lines_schema)
+
+order_lines.append(order_lines_batch([(1, 42, 100), (2, 42, 100)]))
+order_lines.append(order_lines_batch([(3, 43, 50), (4, 44, 40)]))
+order_lines = catalog.load_table("sets.order_lines")
+print("sets.order_lines table_location:", order_lines.location())
 
 # ---------------------------------------------------------------------------
 # silver.customers_history + silver.orders: a filtered logical table and a

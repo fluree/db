@@ -340,9 +340,9 @@ struct Case {
     routes: Vec<(&'static str, Routing)>,
     /// The generic pipeline's answer, where pinning it is the point.
     expect: Option<Vec<String>>,
-    /// The data files the scan reads, on either surface and with fast paths
-    /// on or off, where whether a pushdown pruned is the point.
-    files_read: Option<usize>,
+    /// The data files the scan reads, on either surface, with fast paths on
+    /// and off, where whether a pushdown pruned is the point.
+    files_read: Option<(usize, usize)>,
 }
 
 impl Case {
@@ -375,7 +375,15 @@ impl Case {
     }
 
     fn files_read(mut self, n: usize) -> Self {
-        self.files_read = Some(n);
+        self.files_read = Some((n, n));
+        self
+    }
+
+    /// A scan-side top-k's files read: `n` with fast paths on, and both with
+    /// them off, where nothing relies on the map's key, so the scan removes
+    /// repeated triples and its rows are not the triples the bound counts.
+    fn top_k_files_read(mut self, n: usize) -> Self {
+        self.files_read = Some((n, 2));
         self
     }
 }
@@ -531,8 +539,8 @@ async fn check(fluree: &Fluree, cases: &[Case], from: &str) -> Vec<String> {
                     _ => {}
                 }
             }
-            if let Some(n) = c.files_read {
-                for (lane, r) in [("fast", &fast), ("generic", &generic)] {
+            if let Some((on, off)) = c.files_read {
+                for (lane, r, n) in [("fast", &fast, on), ("generic", &generic, off)] {
                     if r.files != n {
                         problems.push(format!("{surface} {lane}: read {} files, not {n}", r.files));
                     }
@@ -859,7 +867,8 @@ fn iceberg_cases() -> Vec<Case> {
         c.expect = Some(rows.iter().map(ToString::to_string).collect());
     }
 
-    // The scan's file-level pushdowns, which run with fast paths off as well.
+    // The scan's file-level pushdowns, which run with fast paths off as well
+    // (a top-k only where the map's key is relied on).
     // The second data file holds only two- and three-digit integers, so a
     // prune by the column's numeric bounds loses rows the string comparison
     // keeps; a string column, and an equality with an integer's own rendering,
@@ -872,7 +881,7 @@ fn iceberg_cases() -> Vec<Case> {
     cases.push(
         order_case(src, "label", true, 1)
             .expect(&["v=\u{e9}"])
-            .files_read(1),
+            .top_k_files_read(1),
     );
     cases.push(
         filter_case(src, "i32", "<", "\"5\"")
@@ -936,7 +945,7 @@ fn iceberg_cases() -> Vec<Case> {
     cases.push(
         order_case(src, "i64N", true, 1)
             .expect(&["v=9007199254740993"])
-            .files_read(1),
+            .top_k_files_read(1),
     );
     // Equality with a cell's own rendering prunes by the cell's value, for
     // every type with an exact round trip. NaN equals nothing by value and -0

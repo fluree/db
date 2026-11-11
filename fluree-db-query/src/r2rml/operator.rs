@@ -586,6 +586,19 @@ enum JoinPlan {
     },
 }
 
+/// What one map's rows yield in a scan pass, decided before its scan opens
+/// ([`R2rmlScanOperator::dedupe_plan`]).
+#[derive(Debug, Clone, Copy)]
+struct MapSolutions {
+    /// No two of the map's rows yield the same solution of the pattern and no
+    /// row yields one twice: the map's rows are its solutions.
+    rows_distinct: bool,
+    /// The map's solutions go through the pass's [`ScanProgress::seen`] set:
+    /// its rows are not its solutions, or another map in the pass can yield
+    /// one of them.
+    dedupe: bool,
+}
+
 /// One TriplesMap's streaming scan state: the live batch stream from the table
 /// scan, the parent lookups for its RefObjectMap joins, and the precomputed join
 /// plan against the buffered child. Batches are pulled in bounded windows and
@@ -644,6 +657,13 @@ impl ScanProgress {
         }
     }
 }
+
+/// Routing stamp for a scan-side top-k directive: `proceed` when a map's scan
+/// takes it, `fallback:gate_declined` when it is declined (a row the scan
+/// emits may not be output, or several rows can yield one solution), and
+/// `fallback:kill_switch` with fast paths disabled, where every map
+/// deduplicates.
+pub(crate) const TOPK_SITE: &str = "r2rml_scan_topk";
 
 /// Whether PR-3 star TriplesMap-set pruning is enabled. Read once from
 /// `FLUREE_R2RML_STAR_TM_PRUNE` (family falsy spellings,
@@ -1081,10 +1101,43 @@ impl R2rmlScanOperator {
     /// gate `build_scan_filters` uses. The scan-side prune uses only this primary
     /// column; the `SortOperator` above still applies the exact compound order +
     /// LIMIT, so a `None` here is only a missed optimization, never wrong.
+    ///
+    /// `rows_distinct` says whether the map's rows are its solutions
+    /// ([`MapSolutions::rows_distinct`]). The heap counts rows, so where
+    /// several rows yield one solution the k-th bound counts that solution
+    /// more than once and rides above the true k-th solution, skipping files
+    /// that hold the rest of the top k. A map that only overlaps another stays
+    /// sound: the k rows its bound rests on are k distinct solutions of the
+    /// answer, whichever map emits them.
+    ///
+    /// Stamps [`TOPK_SITE`] whenever a directive is resolved: `proceed` when
+    /// the scan takes it.
     fn resolve_topk_directive(
         &self,
         triples_map: &TriplesMap,
         scan_filters: &[crate::r2rml::ScanFilter],
+        rows_distinct: bool,
+    ) -> Option<crate::r2rml::ScanTopK> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        self.topk?;
+        let topk = self.topk_for_map(triples_map, scan_filters, rows_distinct);
+        let outcome = if topk.is_some() {
+            FastPathOutcome::Proceed
+        } else if crate::execute::operator_tree::fast_paths_disabled() {
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
+        } else {
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+        };
+        stamp_fast_path(TOPK_SITE, outcome);
+        topk
+    }
+
+    /// [`Self::resolve_topk_directive`] without the stamp.
+    fn topk_for_map(
+        &self,
+        triples_map: &TriplesMap,
+        scan_filters: &[crate::r2rml::ScanFilter],
+        rows_distinct: bool,
     ) -> Option<crate::r2rml::ScanTopK> {
         let (sort_var, k, ascending) = self.topk?;
         // SOUNDNESS (heap feed): decline when a row the scan emits may still be
@@ -1092,6 +1145,15 @@ impl R2rmlScanOperator {
         // are not in the result. (A join with a child that binds a produced
         // variable drops rows too; `set_topk` records no directive for that.)
         if topk_feed_may_drop_rows(&self.pattern, scan_filters) {
+            return None;
+        }
+        // SOUNDNESS (heap count): decline when several rows can yield one
+        // solution, which deduplication then emits once.
+        if !rows_distinct {
+            tracing::debug!(
+                triples_map = %triples_map.iri,
+                "r2rml topk declined: the map's rows can repeat a solution"
+            );
             return None;
         }
         // The view-policy gate is a residual filter too: it drops rows AFTER the
@@ -1508,18 +1570,14 @@ impl R2rmlScanOperator {
         // to their template keys.
         let child_subjects = self.child_subject_iris(&child_schema, &child_batch, ctx);
 
-        let mut tms: Vec<TmStream> = Vec::with_capacity(triples_maps.len());
+        // The maps this pass reads, each with the subject keys the child
+        // window narrows its scan to.
+        let mut scanned: Vec<(&TriplesMap, SubjectKeys)> = Vec::with_capacity(triples_maps.len());
         let mut seen: HashSet<String> = HashSet::new();
-
         for triples_map in &triples_maps {
-            // Cancellation checkpoint before each TriplesMap's table scan: a
-            // multi-TriplesMap pattern issues one `scan_table` (catalog loadTable
-            // + plan) per map here without returning to `next_batch`.
-            ctx.check_cancelled()?;
             if !seen.insert(triples_map.iri.clone()) {
                 continue;
             }
-
             let subject_keys = child_subjects
                 .as_deref()
                 .map_or(SubjectKeys::Unknown, |iris| {
@@ -1532,6 +1590,22 @@ impl R2rmlScanOperator {
                 );
                 continue;
             }
+            scanned.push((triples_map, subject_keys));
+        }
+
+        // Which maps' solutions are deduplicated is decided before any scan
+        // opens: a scan-side top-k is sound only over a map whose rows are its
+        // solutions (see `resolve_topk_directive`).
+        let maps: Vec<&TriplesMap> = scanned.iter().map(|(tm, _)| *tm).collect();
+        let (solutions, strip) = self.dedupe_plan(ctx, table_provider, &maps).await?;
+        let seen = strip.map(SeenSolutions::new);
+
+        let mut tms: Vec<TmStream> = Vec::with_capacity(scanned.len());
+        for ((triples_map, subject_keys), solutions) in scanned.into_iter().zip(solutions) {
+            // Cancellation checkpoint before each TriplesMap's table scan: a
+            // multi-TriplesMap pattern issues one `scan_table` (catalog loadTable
+            // + plan) per map here without returning to `next_batch`.
+            ctx.check_cancelled()?;
 
             let table_name = triples_map.table_name().ok_or_else(|| {
                 QueryError::InvalidQuery("TriplesMap has no logical table".to_string())
@@ -1667,7 +1741,8 @@ impl R2rmlScanOperator {
             // load-bearing invariant is one-directional: NO path that could return
             // a pruned subset (`self.topk.is_some()`) is ever cacheable, so a
             // pruned result can never poison the `(table, projection)` cache.
-            let main_scan_topk = self.resolve_topk_directive(triples_map, &scan_filters);
+            let main_scan_topk =
+                self.resolve_topk_directive(triples_map, &scan_filters, solutions.rows_distinct);
             let cacheable = scan_cache_enabled()
                 && scan_filters.is_empty()
                 && self.row_budget.is_none()
@@ -1909,14 +1984,9 @@ impl R2rmlScanOperator {
                 fan_out: 1,
                 ref_shortcuts,
                 join,
-                dedupe: true,
+                dedupe: solutions.dedupe,
             });
         }
-
-        let seen = self
-            .dedupe_plan(ctx, table_provider, &mapping, &mut tms)
-            .await?
-            .map(SeenSolutions::new);
 
         // Under a LIMIT, cap the materialize window at the remaining budget so a
         // `LIMIT n` does not explode a full 512K-row window into bindings before
@@ -1942,9 +2012,9 @@ impl R2rmlScanOperator {
         }))
     }
 
-    /// Decide which of a pass's maps must have their solutions checked against
-    /// the pass's set of emitted solutions, setting each [`TmStream::dedupe`];
-    /// returns whether any must.
+    /// Decide, for each of a pass's maps, whether its solutions must be checked
+    /// against the pass's set of emitted solutions, and whether its rows are
+    /// its solutions ([`MapSolutions`]).
     ///
     /// The graph holds each triple once, while a table can hold rows minting
     /// the same one. A map's own rows never repeat a solution of this pattern
@@ -1960,35 +2030,28 @@ impl R2rmlScanOperator {
     /// With fast paths disabled every map is checked: the differential oracle
     /// then never relies on a key.
     ///
-    /// Returns, when some map is checked, the prefix every subject a checked
-    /// map mints starts with (the longest common constant prefix of their
-    /// subject templates), which the set leaves out of what it remembers.
+    /// Also returns, when some map is checked, the prefix every subject a
+    /// checked map mints starts with (the longest common constant prefix of
+    /// their subject templates), which the set leaves out of what it remembers.
     async fn dedupe_plan(
         &mut self,
         ctx: &ExecutionContext<'_>,
         provider: &dyn super::R2rmlTableProvider,
-        mapping: &CompiledR2rmlMapping,
-        tms: &mut [TmStream],
-    ) -> Result<Option<String>> {
+        maps: &[&TriplesMap],
+    ) -> Result<(Vec<MapSolutions>, Option<String>)> {
         use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         let fast_paths = !crate::execute::operator_tree::fast_paths_disabled();
-        let maps: Vec<&TriplesMap> = tms
-            .iter()
-            .map(|s| {
-                mapping.get(&s.tm_iri).ok_or_else(|| {
-                    QueryError::Internal(format!(
-                        "TriplesMap '{}' missing from mapping mid-scan",
-                        s.tm_iri
-                    ))
-                })
-            })
-            .collect::<Result<_>>()?;
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or_else(|| QueryError::Internal("R2RML mapping not loaded".to_string()))?
+            .clone();
         let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
         };
-        let mut any = false;
+        let mut plan: Vec<MapSolutions> = Vec::with_capacity(maps.len());
         for (i, tm) in maps.iter().enumerate() {
             // Fetched for every map, whatever the pattern or the switch: the
             // source checks the mapping's declared keys against the table
@@ -1998,7 +2061,7 @@ impl R2rmlScanOperator {
                 .key_evidence
                 .subject_unique_fetching(
                     provider,
-                    mapping,
+                    &mapping,
                     &self.pattern.graph_source_id,
                     as_of_t,
                     tm,
@@ -2008,11 +2071,14 @@ impl R2rmlScanOperator {
                 .iter()
                 .enumerate()
                 .any(|(j, other)| j != i && !tm.subjects_provably_disjoint(other));
-            let proven = fast_paths && unique && !overlaps && emits_distinct_for(&self.pattern, tm);
-            tms[i].dedupe = !proven;
-            any |= !proven;
+            let rows_distinct = fast_paths && unique && emits_distinct_for(&self.pattern, tm);
+            plan.push(MapSolutions {
+                rows_distinct,
+                dedupe: !rows_distinct || overlaps,
+            });
         }
-        if !self.proven_stamped && !tms.is_empty() {
+        let any = plan.iter().any(|m| m.dedupe);
+        if !self.proven_stamped && !plan.is_empty() {
             self.proven_stamped = true;
             let outcome = if !fast_paths {
                 FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
@@ -2024,11 +2090,11 @@ impl R2rmlScanOperator {
             stamp_fast_path(PROVEN_DISTINCT_SITE, outcome);
         }
         if !any {
-            return Ok(None);
+            return Ok((plan, None));
         }
         let mut strip: Option<&str> = None;
-        for (tm, stream) in maps.iter().zip(tms.iter()) {
-            if !stream.dedupe {
+        for (tm, m) in maps.iter().zip(plan.iter()) {
+            if !m.dedupe {
                 continue;
             }
             let sm = &tm.subject_map;
@@ -2051,7 +2117,8 @@ impl R2rmlScanOperator {
                 }
             });
         }
-        Ok(Some(strip.unwrap_or("").to_string()))
+        let strip = strip.unwrap_or("").to_string();
+        Ok((plan, Some(strip)))
     }
 
     /// Read `source`'s parent whole into a [`CompleteParentLookup`], and keep
@@ -5038,23 +5105,33 @@ mod tests {
             R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))).with_predicate("http://ex/id");
 
         // Whether `scan_table` saw a top-k for `ORDER BY DESC(?id) LIMIT 2` over
-        // `pattern`, under a child of `child_schema` passing `child_batch`.
-        let scan_saw_topk =
-            |pattern: R2rmlPattern, child: BoxedOperator, child_batch: Batch| -> bool {
-                let provider = TopkRecorder::default();
-                {
-                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
-                    ctx.r2rml_table_provider = Some(&provider);
-                    let mut op = R2rmlScanOperator::new(child, pattern);
-                    op.mapping = Some(Arc::clone(&mapping));
-                    op.set_topk(&[crate::sort::SortSpec::desc(VarId(1))], 2);
-                    futures::executor::block_on(op.build_progress(&ctx, child_batch))
-                        .expect("build_progress");
+        // `pattern`, under a child of `child_schema` passing `child_batch`,
+        // where the table is keyed by the subject's column (`keyed`) or not.
+        let scan_saw_topk_keyed = |pattern: R2rmlPattern,
+                                   child: BoxedOperator,
+                                   child_batch: Batch,
+                                   keyed: bool|
+         -> bool {
+            let provider = TopkRecorder::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                let mut op = R2rmlScanOperator::new(child, pattern);
+                op.mapping = Some(Arc::clone(&mapping));
+                if keyed {
+                    op.key_evidence = TableKeyEvidence::assume_keyed_by_subjects(&mapping);
                 }
-                let seen = provider.topk.lock().unwrap();
-                assert_eq!(seen.len(), 1, "one scan of the one table");
-                seen[0]
-            };
+                op.set_topk(&[crate::sort::SortSpec::desc(VarId(1))], 2);
+                futures::executor::block_on(op.build_progress(&ctx, child_batch))
+                    .expect("build_progress");
+            }
+            let seen = provider.topk.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one scan of the one table");
+            seen[0]
+        };
+        let scan_saw_topk = |pattern: R2rmlPattern, child: BoxedOperator, child_batch: Batch| {
+            scan_saw_topk_keyed(pattern, child, child_batch, true)
+        };
 
         assert!(
             scan_saw_topk(
@@ -5063,6 +5140,16 @@ mod tests {
                 Batch::single_empty()
             ),
             "under the seed every emitted row is output: the top-k is pushed"
+        );
+        assert!(
+            !scan_saw_topk_keyed(
+                base.clone(),
+                Box::<EmptyOperator>::default(),
+                Batch::single_empty(),
+                false
+            ),
+            "with no key, rows of one subject can repeat a solution the scan \
+             emits once: no top-k"
         );
 
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());

@@ -16,6 +16,8 @@
 //!   class as the history table, plus customer 6;
 //! - `orders`: references the history table on `customer_id`; order 101 is an
 //!   exact duplicate row, 104's customer dangles, 105's is NULL.
+//! - `order_lines`: in two files, the first holding order 42's amount twice,
+//!   above every amount in the second.
 //!
 //! Three mappings over them:
 //! - `sets-hist`: the history table and the orders, no key declared;
@@ -55,6 +57,9 @@ const FOLD_DEDUPE: &str = "fused_r2rml_aggregate_dedupe";
 /// The scan's routing stamp: `proceed` when every map it reads is proven to
 /// mint each triple once, so it skips deduplication.
 const PROVEN: &str = "r2rml_scan_proven_distinct";
+/// The scan's routing stamp for an `ORDER BY … LIMIT` it reads best-first,
+/// skipping files that cannot hold the top k: `proceed` when it does.
+const TOPK: &str = "r2rml_scan_topk";
 
 /// `sets.customers_history`: `(customer_id, name, city)`, as the fixture
 /// writer writes it (valid_from and is_current are not mapped here).
@@ -106,6 +111,10 @@ const AMOUNTS: [(i64, &str); 8] = [
     (106, "2.00"),
 ];
 
+/// `sets.order_lines`: `(line_id, order_id, amount)`, the first two rows in
+/// one file and the rest in another.
+const LINES: [(i64, i64, i64); 4] = [(1, 42, 100), (2, 42, 100), (3, 43, 50), (4, 44, 40)];
+
 const HISTORY_MAP: &str = r#"
     <http://example.org/mapping#History>
         a rr:TriplesMap ;
@@ -143,6 +152,31 @@ const AMOUNT_MAP: &str = r#"
         rr:predicateObjectMap [
             rr:predicate ex:amount ;
             rr:objectMap [ rr:column "amount" ; rr:datatype xsd:decimal ]
+        ] .
+"#;
+
+/// Each order's line amount, no key declared: order 42's two lines mint one
+/// triple.
+const ORDER_LINE_MAP: &str = r#"
+    <http://example.org/mapping#OrderLine>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.order_lines" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:amount ;
+            rr:objectMap [ rr:column "amount" ; rr:datatype xsd:integer ]
+        ] .
+"#;
+
+/// Each line's amount, keyed by `line_id`: every row is its own triple.
+const LINE_MAP: &str = r#"
+    <http://example.org/mapping#Line>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.order_lines" ; f:key ( "line_id" ) ] ;
+        rr:subjectMap [ rr:template "http://example.org/line/{line_id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:amount ;
+            rr:objectMap [ rr:column "amount" ; rr:datatype xsd:integer ]
         ] .
 "#;
 
@@ -232,6 +266,18 @@ const AMOUNTS_SRC: Source = Source {
     native: "sets-amount-native:main",
     maps: &[AMOUNT_MAP],
 };
+/// The order lines per order, no key declared.
+const LINES_PER_ORDER: Source = Source {
+    alias: "sets-order-lines",
+    native: "sets-order-lines-native:main",
+    maps: &[ORDER_LINE_MAP],
+};
+/// The order lines per line, keyed.
+const LINES_KEYED: Source = Source {
+    alias: "sets-lines",
+    native: "sets-lines-native:main",
+    maps: &[LINE_MAP],
+};
 /// The current table alone, no key declared: its Iceberg identifier field
 /// is the key.
 const IDENT: Source = Source {
@@ -300,6 +346,20 @@ impl Source {
                 add(order(oid), "amount", format!("decimal:{amount}"));
             }
         }
+        if has(ORDER_LINE_MAP) {
+            for (_, oid, amount) in LINES {
+                add(order(oid), "amount", format!("integer:{amount}"));
+            }
+        }
+        if has(LINE_MAP) {
+            for (lid, _, amount) in LINES {
+                add(
+                    ex(&format!("line/{lid}")),
+                    "amount",
+                    format!("integer:{amount}"),
+                );
+            }
+        }
         if has(KEYED_MAPS) {
             for (id, name) in CURRENT {
                 add(customer(id), "@type", iri(ex("Customer")));
@@ -327,13 +387,19 @@ impl Source {
                             |o| match o.strip_prefix('<').and_then(|o| o.strip_suffix('>')) {
                                 Some(i) if p == "@type" => json!(i),
                                 Some(i) => json!({ "@id": i }),
-                                None => match o.strip_prefix("decimal:") {
-                                    Some(d) => json!({
-                                        "@value": d,
-                                        "@type": "http://www.w3.org/2001/XMLSchema#decimal"
-                                    }),
-                                    None => json!(o),
-                                },
+                                None => {
+                                    match (o.strip_prefix("decimal:"), o.strip_prefix("integer:")) {
+                                        (Some(d), _) => json!({
+                                            "@value": d,
+                                            "@type": "http://www.w3.org/2001/XMLSchema#decimal"
+                                        }),
+                                        (_, Some(n)) => json!({
+                                            "@value": n.parse::<i64>().expect("an integer"),
+                                            "@type": "http://www.w3.org/2001/XMLSchema#integer"
+                                        }),
+                                        _ => json!(o),
+                                    }
+                                }
                             },
                         )
                         .collect();
@@ -914,6 +980,52 @@ fn amount_cases() -> Vec<Case> {
     ]
 }
 
+/// `ORDER BY DESC(?a) LIMIT k [OFFSET n]` over the order lines' amounts. The
+/// first file holds the two largest amounts; the scan-side top-k reads it
+/// first, and its bound tells it whether the second file can hold any of the
+/// top k. Per order, the first file's two rows are one triple, so the second
+/// file holds the second-largest; per line, they are two.
+fn top_k_cases(keyed: bool) -> Vec<Case> {
+    let amount = ex("amount");
+    let order_by = |name, vars: &'static [&'static str], limit: usize, offset: usize| {
+        let projection = vars.iter().map(|v| format!("?{v}")).collect::<Vec<_>>();
+        let mut jsonld = json!({
+            "select": projection,
+            "where": { "@id": "?s", amount.clone(): "?a" },
+            "orderBy": "(desc ?a)",
+            "limit": limit,
+        });
+        if offset > 0 {
+            jsonld["offset"] = json!(offset);
+        }
+        let offset_clause = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        case(
+            name,
+            &format!(
+                "SELECT {} FROM <{{from}}> WHERE {{ ?s ex:amount ?a }} \
+                 ORDER BY DESC(?a) LIMIT {limit}{offset_clause}",
+                projection.join(" ")
+            ),
+            jsonld,
+            vars,
+        )
+        .rows(limit)
+        // The scan reads its top k from the first file; deduplicating, it
+        // must read both.
+        .stamp(TOPK, keyed)
+        .stamp(PROVEN, keyed)
+    };
+    vec![
+        order_by("ORDER BY DESC LIMIT 2", &["s", "a"], 2, 0),
+        order_by("ORDER BY DESC LIMIT 1 OFFSET 1", &["a"], 1, 1),
+        order_by("ORDER BY DESC LIMIT 3", &["s", "a"], 3, 0),
+    ]
+}
+
 /// Maps whose declared key makes each subject one row's: every existing fast
 /// path still serves them.
 fn keyed_cases() -> Vec<Case> {
@@ -1022,6 +1134,35 @@ async fn keyed_maps_keep_their_fast_paths() {
     let mut failures = check(&fluree, &keyed_cases(), &KEYED).await;
     failures.extend(check(&fluree, &identifier_cases(), &IDENT).await);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A scan-side top-k reads a map's files best-first and stops once no unread
+/// file can beat the k-th value it has seen. Over a map whose rows can repeat
+/// a triple, the rows it has seen are not k triples, so it declines; over a
+/// keyed map it still reads only the first file.
+#[tokio::test]
+async fn a_top_k_counts_triples_not_rows() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree, &[&LINES_PER_ORDER, &LINES_KEYED]).await;
+    let mut failures = check(&fluree, &top_k_cases(false), &LINES_PER_ORDER).await;
+    failures.extend(check(&fluree, &top_k_cases(true), &LINES_KEYED).await);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // The keyed top-k reads the first file and skips the second.
+    let (store, _guard) = span_capture::init_test_tracing();
+    let before = store.find_events("scan-side top-k prune").len();
+    let c = &top_k_cases(true)[0];
+    let got = run(&fluree, &store, c, &LINES_KEYED.from(), false, true).await;
+    assert_eq!(got.rows.len(), 2, "{:?}", got.rows);
+    let prunes = &store.find_events("scan-side top-k prune")[before..];
+    assert!(
+        prunes
+            .iter()
+            .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
+        "the keyed top-k must read one file and prune the other: {prunes:?}"
+    );
 }
 
 /// A declared key naming a column the table lacks refuses every query over
