@@ -10,6 +10,8 @@
   RETAINED. This is the shape of a healthy source that got ahead of its
   materialize job: the watermark still resolves, so the window is read
   incrementally, and it is too large to commit in one pass.
+- `silver.people_paged`: the same five 600-row appends again, read only by
+  the paging test, whose expected order is its data files' sizes.
 - `silver.amounts`: one snapshot of decimal columns for FILTER pushdown —
   `ratio` is `decimal(38,9)` (BigQuery's `NUMERIC`), with values on either
   side of 0.05 and 1.05 one grid step apart; `price` is `decimal(5,2)`, the
@@ -139,6 +141,21 @@ print("window snapshots:", [
     (s.snapshot_id, s.sequence_number, s.parent_snapshot_id, s.summary.get("added-records"))
     for s in sorted(window.snapshots(), key=lambda s: s.sequence_number)
 ])
+
+# ---------------------------------------------------------------------------
+# silver.people_paged: the same commits again, for the paging test alone.
+# ---------------------------------------------------------------------------
+paged = catalog.create_table("silver.people_paged", schema=schema)
+for c in range(COMMITS):
+    lo = c * ROWS_PER_COMMIT + 1
+    ids = list(range(lo, lo + ROWS_PER_COMMIT))
+    paged.append(pa.table({
+        "id": pa.array(ids, pa.int64()),
+        "name": pa.array([f"person-{i:04d}" for i in ids]),
+        "score": pa.array([float(i % 100) for i in ids], pa.float64()),
+        "active": pa.array([i % 2 == 0 for i in ids]),
+    }))
+print("paged table_location:", catalog.load_table("silver.people_paged").location())
 
 # ---------------------------------------------------------------------------
 # silver.amounts: decimal columns for FILTER pushdown.

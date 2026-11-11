@@ -372,3 +372,79 @@ mod sql_query_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "turtle"))]
+mod document_order_tests {
+    use super::R2rmlLoader;
+
+    /// Sixteen maps of one class, written in an order that is neither sorted
+    /// nor any hash order a run is likely to produce (16! orders).
+    const NAMES: [&str; 16] = [
+        "Pear",
+        "Fig",
+        "Apple",
+        "Quince",
+        "Lime",
+        "Date",
+        "Kiwi",
+        "Banana",
+        "Mango",
+        "Cherry",
+        "Olive",
+        "Grape",
+        "Nectarine",
+        "Elder",
+        "Jujube",
+        "Hazel",
+    ];
+
+    fn mapping() -> String {
+        let mut m = String::from(
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n",
+        );
+        for name in NAMES {
+            m.push_str(&format!(
+                "<http://example.org/m#{name}> a rr:TriplesMap ;\n\
+                 rr:logicalTable [ rr:tableName \"fruit.{name}\" ] ;\n\
+                 rr:subjectMap [ rr:template \"http://example.org/{name}/{{id}}\" ; rr:class ex:Fruit ] ;\n\
+                 rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"name\" ] ] .\n"
+            ));
+        }
+        m
+    }
+
+    fn expected() -> Vec<String> {
+        NAMES
+            .iter()
+            .map(|n| format!("http://example.org/m#{n}"))
+            .collect()
+    }
+
+    /// A pattern several maps answer scans them in `triples_maps` order, so that
+    /// order must be the document's, the same in every process, and survive the
+    /// serialized form a compiled mapping is cached in.
+    #[test]
+    fn triples_maps_iterate_in_document_order() {
+        let compiled = R2rmlLoader::from_turtle(&mapping())
+            .unwrap()
+            .compile()
+            .unwrap();
+        let order: Vec<String> = compiled.triples_maps.keys().cloned().collect();
+        assert_eq!(order, expected(), "maps in document order");
+        let by_class: Vec<String> = compiled
+            .find_maps_for_class("http://example.org/Fruit")
+            .into_iter()
+            .map(|tm| tm.iri.clone())
+            .collect();
+        assert_eq!(by_class, expected(), "class lookup in document order");
+
+        let json = serde_json::to_string(&compiled).unwrap();
+        let back: crate::mapping::CompiledR2rmlMapping = serde_json::from_str(&json).unwrap();
+        let order: Vec<String> = back
+            .triples_maps
+            .values()
+            .map(|tm| tm.iri.clone())
+            .collect();
+        assert_eq!(order, expected(), "order survives a serde round trip");
+    }
+}

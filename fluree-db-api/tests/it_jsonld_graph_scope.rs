@@ -643,7 +643,7 @@ async fn annotation_under_a_graph_named_through_the_address_anchors_to_that_grap
         let g_id = ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(G)
+            .assigned_graph_id(G)
             .unwrap_or_else(|| panic!("{what}: <{G}> is registered"));
         let annotations =
             support::decode_annotations_for_subject(&ledger, g_id, "http://example.org/alice")
@@ -1125,7 +1125,7 @@ async fn where_default_is_not_a_graph_registered_as_urn_default() {
         fluree_db_core::GraphRegistry::seed_from_entries(&entries).expect("registry");
     let legacy = snapshot
         .graph_registry
-        .graph_id_for_iri(fluree_db_core::DEFAULT_GRAPH_IRI)
+        .assigned_graph_id(fluree_db_core::DEFAULT_GRAPH_IRI)
         .expect("a graph registered as urn:default");
     assert!(legacy >= fluree_db_core::FIRST_USER_GRAPH_ID);
 

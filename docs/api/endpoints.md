@@ -417,7 +417,9 @@ JSON object:
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit. A merge records the merge even when its conflict strategy resolved every flake away.
+- A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
+- A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
@@ -453,6 +455,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
 - `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
@@ -473,7 +476,7 @@ The fields of `POST /push/*ledger`, plus:
 
 - `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
 
-The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit, and none may drop graphs, which a merge cannot bring in. A push that carries any other commit is refused with `422`.
 
 A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
 
@@ -893,12 +896,27 @@ POST /import-upload
   "source_kind": "source",       // default "flpack"
   "filename": "dump.cypher",     // extension drives format detection
   "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
-  "base_iri": "https://kb.example/" } // CSV/Cypher only; format default if omitted
+  "base_iri": "https://kb.example/", // CSV/Cypher only; format default if omitted
+  "skolem_namespace": "urn:kb" } // blank-node salt; needs "source-upload-skolem"
 ```
+
+The file is imported under its own name, so its blank nodes get the ids a direct import of that file would mint. Servers that honor `"skolem_namespace"` (the salt `--skolem-namespace` sets, in place of the ledger id) advertise `"source-upload-skolem"` in `import.modes`.
 
 Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
 
 This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
+A source upload can also fill a **new named graph of an existing ledger**, as [`fluree graph import`](../cli/graph.md#fluree-graph-import) does. Servers that support it add `"source-upload-graph"` to `import.modes`; mint with `"graph"` naming the new graph and `"ledger"` the existing ledger:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",
+  "filename": "products.ttl",
+  "graph": "http://example.org/graph/products" }
+```
+
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh.
 
 ## Storage Proxy Endpoints
 
@@ -1828,7 +1846,7 @@ POST /validate/{ledger...}
 }
 ```
 
-- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `graph` — IRI of the named data graph to validate (default: the default graph). It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graphs the ledger config lists for it, whichever shapes are used.
 - `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
 - `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
 - `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
@@ -1871,6 +1889,7 @@ POST /validate/{ledger...}
 - `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
 - `401 Unauthorized` — authentication required and missing
 - `404 Not Found` — ledger or named graph not found (or not authorized)
+- `500 Internal Server Error` — the ledger config could not be read (`err:storage/ReadFailure`); validation does not run without it
 
 **Examples:**
 
@@ -2399,10 +2418,9 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
 
 ### POST /drop-graph
 
-Drop a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted under that graph IRI. The drop
-runs as a normal commit at `t = current_t + 1` — history at earlier `t`
-values is preserved. Admin-protected.
+Drop a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`. The drop is one commit at `t = current_t + 1` that
+retracts nothing. Admin-protected.
 
 **URL:**
 ```
@@ -2429,7 +2447,7 @@ POST /drop-graph
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -2439,24 +2457,25 @@ POST /drop-graph
 |-------|------|-------------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
 | `graph_iri` | string | Graph IRI that was dropped (echoed) |
-| `retracted` | integer | Number of flakes retracted by the drop commit; `0` for a no-op |
-| `committed` | boolean | `true` when a new commit was produced; `false` for a no-op drop on an empty graph |
-| `t` | integer | Current commit `t` for the branch after the drop |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | boolean | `true`: the drop commits |
+| `t` | integer | Commit `t` of the drop |
 
 **Behavior:**
 
-- **Transactional and history-preserving.** A query `as-of` an earlier `t` still sees the graph populated.
+- **Takes the history.** Nothing the graph held is queryable afterwards, at the head or as of an earlier `t`: a query naming the graph as of a `t` before the drop gets a 404. The commits keep the facts, so a branch created at a `t` before the drop reads them.
+- **The graph no longer exists.** `/info` leaves it out of `named-graphs`, and writing to the same IRI starts it afresh.
+- **Any size.** The drop reads none of the graph's facts, so its cost does not depend on the graph's size; `FLUREE_MAX_GRAPH_SCAN_FLAKES` does not apply.
 - **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
-- **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
-- **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+- **Refuses missing graphs.** Returns 404 when `graph` does not exist in the ledger, a dropped graph included — the call never registers a graph.
 
 **Status codes:**
 
-- `200 OK` - Drop succeeded (commit produced or no-op)
+- `200 OK` - Drop succeeded
 - `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
 - `401`/`403` - Admin token required and absent/invalid
-- `404 Not Found` - Ledger or graph IRI not found
+- `404 Not Found` - Ledger or graph not found
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -3067,8 +3086,8 @@ The source's own fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
-| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle (required). A request without it is a 400 and registers nothing. |
 | `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
@@ -3191,20 +3210,34 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
   "table_identifier": "sales.orders",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "connection_tested": true,
+  "connection_check": {"outcome": "verified"},
   "mapping_source": "r2rml-inline",
   "triples_map_count": 3,
+  "table_count": 1,
+  "table_names": ["sales.orders"],
   "mapping_validated": true
 }
 ```
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields, or an `r2rml` that does not parse or compile
+- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`)
 - `401/403` — admin auth required
 - `403 Forbidden` (`err:auth/HostIdentityRefused`) — a host identity the operator's policy refuses
 - `500 Internal Server Error` — the graph source could not be published
 
-A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
+
+`connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
+
+| `outcome` | Meaning | Other fields |
+|---|---|---|
+| `verified` | Every mapped table loaded | |
+| `table_failed` | `table` did not load: the catalog answered that it has no such table, refused it, or answered with another error status; in `direct` mode, its metadata could not be read. `error` is the reason | `table`, `error` |
+| `catalog_unreachable` | The catalog did not answer for `table`: a refused connection, a timeout, a DNS or TLS failure, or a failure that carries no answer from the catalog. Catalog modes only | `table`, `error` |
+| `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
+| `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
+| `no_tables` | The mapping could not be read, so it named no table to load | |
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
@@ -3558,7 +3591,7 @@ So that one body can be sent to each route in turn, each Delta route ignores the
 
 An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
 
-**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
 See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
 

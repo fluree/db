@@ -795,6 +795,9 @@ pub struct ContextConfig<'a, 'b> {
     /// set only by the graph-source browse-crawl path. See
     /// [`ExecutionContext::trust_fk_refs`].
     pub trust_fk_refs: bool,
+    /// Every graph-source scan emits a fixed row order; set by a caller that
+    /// slices the answer itself. See [`ExecutionContext::deterministic_scans`].
+    pub deterministic_scans: bool,
     /// See [`ExecutionContext::path_pair_limit`].
     pub path_pair_limit: Option<usize>,
     /// Binary columnar index store for `BinaryScanOperator`.
@@ -992,6 +995,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     if config.trust_fk_refs {
         ctx = ctx.with_trust_fk_refs(true);
+    }
+    if config.deterministic_scans {
+        ctx = ctx.with_deterministic_scans(true);
     }
     if let Some(limit) = config.path_pair_limit {
         ctx = ctx.with_path_pair_limit(limit);

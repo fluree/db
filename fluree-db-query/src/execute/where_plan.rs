@@ -3338,10 +3338,10 @@ pub fn build_where_operators_seeded_with_needed(
             Pattern::R2rml(r2rml_pattern) => {
                 // R2RML scan against an Iceberg graph source
                 let child = require_child(operator, "R2RML pattern")?;
-                operator = Some(Box::new(crate::r2rml::R2rmlScanOperator::new(
-                    child,
-                    r2rml_pattern.clone(),
-                )));
+                operator = Some(Box::new(
+                    crate::r2rml::R2rmlScanOperator::new(child, r2rml_pattern.clone())
+                        .with_scan_order(planning.scan_order),
+                ));
                 i += 1;
             }
 

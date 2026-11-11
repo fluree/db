@@ -222,18 +222,22 @@ where
                 tracing::debug_span!("commit_chain_walk", commits = tracing::field::Empty)
                     .entered();
             let walk_started = std::time::Instant::now();
-            let (commit_cids, ledger_split_mode) = {
+            let (commit_cids, ledger_split_mode, lifecycles) = {
                 // stop_at_t=0 collects all commits (t starts at 1).
-                let (dag, split_mode) = fluree_db_core::collect_first_parent_cids_with_split_mode(
-                    &content_store,
-                    &head_commit_id,
-                    0,
-                )
-                .await?;
+                let (dag, split_mode, lifecycles) =
+                    fluree_db_core::collect_first_parent_cids_with_split_mode(
+                        &content_store,
+                        &head_commit_id,
+                        0,
+                    )
+                    .await?;
 
                 // Sorted by t descending; reverse for chronological (genesis-first).
                 let cids: Vec<ContentId> = dag.into_iter().rev().map(|(_, cid)| cid).collect();
-                (cids, split_mode)
+                // Graph lifecycles, likewise oldest first.
+                let lifecycles: Vec<fluree_db_core::CommitGraphLifecycle> =
+                    lifecycles.into_iter().rev().collect();
+                (cids, split_mode, lifecycles)
             };
             _span_a.record("commits", commit_cids.len());
             tracing::info!(
@@ -304,6 +308,12 @@ where
 
             // Enable schema hierarchy extraction during resolution.
             shared.schema_hook = Some(crate::stats::SchemaExtractor::new());
+
+            // What a graph held before its latest drop is not indexed: the
+            // commits keep it, the index does not (see `Commit::graph_drops`).
+            let graph_floors =
+                crate::run_index::build::incremental_resolve::graph_floors(&lifecycles, &shared);
+            shared.set_graph_floors(graph_floors.clone());
 
             let chunk_max_flakes: u64 = 5_000_000; // ~5M flakes per chunk
             let mut chunk = RebuildChunk::new();
@@ -1182,6 +1192,16 @@ where
                 sketch_ref,
                 attachment_events: config.attachment_events.clone(),
                 prev_index: prev_index.clone(),
+                graph_floors,
+                graph_drops: {
+                    let mut drops = std::collections::BTreeMap::new();
+                    crate::run_index::build::incremental_resolve::apply_lifecycles(
+                        &mut drops,
+                        &lifecycles,
+                        &shared,
+                    );
+                    drops.into_iter().collect()
+                },
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

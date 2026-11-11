@@ -313,6 +313,12 @@ pub struct ExecutionContext<'a> {
     /// present-but-dangling FK differs (templated vs omitted). Read only for the
     /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
     pub trust_fk_refs: bool,
+    /// When true, every graph-source table scan emits a fixed row order, even
+    /// where the planner found no LIMIT or OFFSET in the query (see
+    /// [`crate::r2rml::ScanOrder`]). For a caller that slices the answer itself,
+    /// outside the query: the graph-source browse crawl pages subjects after the
+    /// query returns. Default `false`.
+    pub deterministic_scans: bool,
     /// Most pairs a property path may compute before returning its first
     /// row — one whose endpoints are both free or both constant; past it the
     /// path fails with [`QueryError::ResourceLimit`]. `None` (the default)
@@ -528,6 +534,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -591,6 +598,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -658,6 +666,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -714,6 +723,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -769,6 +779,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -826,6 +837,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -1019,6 +1031,12 @@ impl<'a> ExecutionContext<'a> {
     /// `QueryExecutionOptions::trust_fk_refs` on the graph-source crawl path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// See [`ExecutionContext::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
         self
     }
 
@@ -1484,15 +1502,47 @@ impl<'a> ExecutionContext<'a> {
     /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
     /// names no graph, or it names a reserved system graph or the default graph
     /// (the ledger's own address, even if a registered graph shares the text).
+    ///
+    /// A graph dropped as of `to_t` names no graph here either, as one that
+    /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
         match self.single_db_graph_position(iri)? {
             fluree_db_core::GraphPosition::Registered { g_id, .. }
-                if g_id >= FIRST_USER_GRAPH_ID =>
+                if g_id >= FIRST_USER_GRAPH_ID
+                    && self
+                        .active_snapshot
+                        .graph_registry
+                        .visible_at(g_id, self.to_t) =>
             {
                 Some(g_id)
             }
             _ => None,
         }
+    }
+
+    /// Refuse a `GRAPH <iri>` naming a user graph that a commit after `to_t`
+    /// dropped: the query asks what the graph held then, which the drop took,
+    /// and reading that as an empty graph would answer something else.
+    pub fn refuse_dropped_graph(&self, iri: &str) -> crate::error::Result<()> {
+        if !self.active_snapshot.graph_registry.has_drops() {
+            return Ok(());
+        }
+        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
+            self.single_db_graph_position(iri)
+        {
+            if let Some(floor) = self
+                .active_snapshot
+                .graph_registry
+                .drop_after(g_id, self.to_t)
+            {
+                return Err(crate::error::QueryError::GraphDropped {
+                    graph: iri.to_string(),
+                    floor,
+                    t: self.to_t,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
@@ -1517,7 +1567,7 @@ impl<'a> ExecutionContext<'a> {
         let registry = &self.active_snapshot.graph_registry;
         let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
         registry
-            .iter_entries()
+            .iter_visible_entries(self.to_t)
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
             .filter_map(|(g, iri)| {
                 target
@@ -1564,6 +1614,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1630,6 +1681,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1692,6 +1744,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
