@@ -21,8 +21,9 @@ use fluree_db_core::flake::Flake;
 use fluree_db_core::graph_registry::DEFAULT_GRAPH_ID;
 use fluree_db_core::overlay::OverlayProvider;
 use fluree_db_core::{GraphId, Sid};
+use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::same_as::FrozenSameAs;
 
@@ -45,6 +46,24 @@ pub struct DerivedFactsOverlay {
     /// same base-overlay epoch under different rule configs / ontologies —
     /// caches keyed on overlay identity must incorporate this id.
     instance_id: u64,
+    /// Derived state a reader keeps for as long as this materialization
+    /// lives, such as a query engine's translated view of it. Shared by
+    /// clones, so every query reading this materialization sees one copy.
+    attachment: Attachment,
+}
+
+/// See [`DerivedFactsOverlay::attachment`].
+#[derive(Clone, Default)]
+struct Attachment(Arc<OnceLock<Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "Attachment(set)"
+        } else {
+            "Attachment(empty)"
+        })
+    }
 }
 
 /// The derived facts of one graph.
@@ -155,6 +174,7 @@ impl DerivedFactsOverlay {
             same_as,
             epoch,
             instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+            attachment: Attachment::default(),
         }
     }
 
@@ -192,12 +212,33 @@ impl DerivedFactsOverlay {
             same_as,
             epoch,
             instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+            attachment: Attachment::default(),
         }
     }
 
     /// Process-unique identity of this materialization (stable across clones).
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// The reader state attached to this materialization, created by `init`
+    /// on first use. It lives exactly as long as the materialization: when a
+    /// cache evicts it and the last query reading it ends, the state goes too.
+    /// `None` when a reader attached state of another type.
+    pub fn attachment<T: Any + Send + Sync>(&self, init: impl FnOnce() -> T) -> Option<Arc<T>> {
+        let state = self.attachment.0.get_or_init(|| Arc::new(init()));
+        Arc::clone(state).downcast::<T>().ok()
+    }
+
+    /// Estimated memory this materialization holds: its facts (as
+    /// [`approx_flake_bytes`](crate::approx_flake_bytes) counts them toward
+    /// the reasoning memory budget) plus the three position permutations.
+    pub fn approx_bytes(&self) -> usize {
+        self.graphs
+            .iter()
+            .flat_map(|g| g.spot.iter())
+            .map(|flake| crate::approx_flake_bytes(flake) + 3 * std::mem::size_of::<u32>())
+            .sum()
     }
 
     /// Get the sameAs equivalence structure

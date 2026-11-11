@@ -1,11 +1,10 @@
-//! Reasoning lanes whose routing depends on what an earlier query left in
-//! the cross-query ops cache.
+//! Reasoning lanes whose routing depends on what an earlier query left on
+//! the reasoning materialization: the overlay ops a lane translated.
 //!
-//! That cache is keyed by the materialization's content version, and the
-//! materialization lives in the process-wide reasoning cache (16 entries).
-//! Among many concurrent reasoning tests, a sibling can evict it between two
-//! queries; the rebuild gets a new version and the earlier query's entry is
-//! never found. Its own binary keeps the materializations alive here fewer
+//! Those translations live on the materialization, which lives in the
+//! process-wide reasoning cache (16 entries). Among many concurrent reasoning
+//! tests, a sibling can evict it between two queries; the rebuild starts with
+//! no translations. Its own binary keeps the materializations alive here fewer
 //! than the cache holds.
 
 #![cfg(feature = "native")]

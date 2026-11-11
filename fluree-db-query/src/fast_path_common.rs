@@ -2113,10 +2113,24 @@ pub(crate) fn predicate_overlay_extent(
     g_id: GraphId,
     pred_sid: &Sid,
 ) -> Option<usize> {
+    predicate_overlay_extent_in(ctx, g_id, RunSortOrder::Psot, pred_sid)
+}
+
+/// [`predicate_overlay_extent`] in a predicate-leading `order`; `None` for
+/// any other order.
+fn predicate_overlay_extent_in(
+    ctx: &ExecutionContext<'_>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Option<usize> {
+    if !matches!(order, RunSortOrder::Psot | RunSortOrder::Post) {
+        return None;
+    }
     let (first, rhs) = predicate_walk_bounds(pred_sid);
     ctx.overlay().overlay_range_flake_count(
         g_id,
-        crate::binary_scan::sort_order_to_index_type(RunSortOrder::Psot),
+        crate::binary_scan::sort_order_to_index_type(order),
         Some(&first),
         Some(&rhs),
         false,
@@ -2338,7 +2352,7 @@ pub(crate) fn cached_object_probe_ops(
 }
 
 /// Whether the ops for `(g_id, order, pred_sid)` are already translated,
-/// in this execution or (for an eager caller) a previous one.
+/// in this execution or, under reasoning, on the materialization.
 pub(crate) fn overlay_ops_cached(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -2354,9 +2368,7 @@ pub(crate) fn overlay_ops_cached(
                 .expect("overlay ops cache poisoned")
                 .contains_key(&(g_id, order, pred_sid.clone()))
     });
-    in_execution
-        || pred_ops_key(ctx, store, g_id, order, pred_sid)
-            .is_some_and(|key| global_pred_ops_cache().contains(&key))
+    in_execution || crate::reasoning_ops::cached(ctx, store, g_id, order, pred_sid)
 }
 
 fn cached_ops_entry(
@@ -2394,148 +2406,21 @@ fn cached_ops_entry(
     // A concurrent miss on the same key duplicates the walk (acceptable —
     // last write wins with an identical value) but never holds the lock
     // across the walk.
-    let computed = ops_cross_query(ctx, store, g_id, order, pred_sid, compute)?;
+    let computed = crate::reasoning_ops::get_or_translate(
+        ctx,
+        store,
+        g_id,
+        order,
+        pred_sid,
+        || predicate_overlay_extent_in(ctx, g_id, order, pred_sid),
+        compute,
+    )?;
     bound
         .map
         .lock()
         .expect("overlay ops cache poisoned")
         .insert(key, computed.clone());
     Ok(computed)
-}
-
-/// Cross-query layer under [`cached_ops_entry`], for reasoning queries only: a
-/// reasoning materialization's derived extents cost a dictionary translation
-/// per fact and are read by query after query, so they are translated once.
-/// Novelty extents are bounded by indexing and stay per-execution, and so do
-/// other eager callers: a datalog fixpoint pass (rule bodies run with
-/// reasoning off) builds an overlay no later query reads, and a dataset
-/// member's overlay is plain novelty.
-fn ops_cross_query(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    order: RunSortOrder,
-    pred_sid: &Sid,
-    compute: impl FnOnce() -> Result<Option<SharedOverlayOps>>,
-) -> Result<Option<SharedOverlayOps>> {
-    let Some(key) = pred_ops_key(ctx, store, g_id, order, pred_sid) else {
-        return compute();
-    };
-    if let Some(hit) = global_pred_ops_cache().get(&key) {
-        return Ok(hit);
-    }
-    let computed = compute()?;
-    global_pred_ops_cache().insert(key, computed.clone());
-    Ok(computed)
-}
-
-/// The cross-query key, or `None` when the caller isn't an eager reasoning
-/// query or its overlay cannot vouch for its content (see
-/// `GlobalTranslationKey`).
-fn pred_ops_key(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    order: RunSortOrder,
-    pred_sid: &Sid,
-) -> Option<PredOpsKey> {
-    if !(ctx.eager_materialization && ctx.reasoning_active) {
-        return None;
-    }
-    let content_version = ctx.overlay().content_version()?;
-    Some((
-        crate::binary_scan::GlobalTranslationKey {
-            ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
-            snapshot_t: ctx.active_snapshot.t,
-            content_version,
-            store_id: store.store_id(),
-            to_t: ctx.to_t,
-            g_id,
-            index: crate::binary_scan::sort_order_to_index_type(order),
-        },
-        pred_sid.clone(),
-    ))
-}
-
-type PredOpsKey = (crate::binary_scan::GlobalTranslationKey, Sid);
-
-/// Budget of the cross-query per-predicate cache, in ops (~40 B each), so
-/// up to ~160 MiB per process. It sits beside the scan's
-/// `global_translation_cache` (4 whole-overlay translations under the same
-/// `GlobalTranslationKey`), which can hold the same derived extent again:
-/// the scan translates a whole graph's overlay, a lane one predicate's.
-const PRED_OPS_CACHE_MAX_OPS: usize = 1 << 22;
-
-/// What one entry's key, LRU node and allocations cost against
-/// [`PRED_OPS_CACHE_MAX_OPS`], in op-sized units, so that many small entries
-/// are bounded as well as a few large ones.
-const PRED_OPS_ENTRY_COST: usize = 8;
-
-/// LRU of per-predicate resolved ops, bounded by what it retains: one
-/// derived `rdf:type` extent can hold millions, and every commit mints new
-/// keys. Empty results aren't retained; computing one is a walk that finds
-/// nothing. A failed translation (`None`) is: it walks the whole extent and
-/// fails the same way for the same key.
-struct PredOpsCache {
-    inner: std::sync::Mutex<PredOpsLru>,
-}
-
-struct PredOpsLru {
-    entries: lru::LruCache<PredOpsKey, Option<SharedOverlayOps>>,
-    retained: usize,
-}
-
-fn pred_ops_entry_cost(ops: &Option<SharedOverlayOps>) -> usize {
-    ops.as_ref().map_or(0, |ops| ops.len()) + PRED_OPS_ENTRY_COST
-}
-
-impl PredOpsCache {
-    fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(PredOpsLru {
-                entries: lru::LruCache::unbounded(),
-                retained: 0,
-            }),
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, PredOpsLru> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// `Some(None)` is a cached translation failure.
-    fn get(&self, key: &PredOpsKey) -> Option<Option<SharedOverlayOps>> {
-        self.lock().entries.get(key).cloned()
-    }
-
-    fn contains(&self, key: &PredOpsKey) -> bool {
-        self.lock().entries.contains(key)
-    }
-
-    fn insert(&self, key: PredOpsKey, ops: Option<SharedOverlayOps>) {
-        let cost = pred_ops_entry_cost(&ops);
-        if ops.as_ref().is_some_and(|ops| ops.is_empty()) || cost > PRED_OPS_CACHE_MAX_OPS {
-            return;
-        }
-        let mut lru = self.lock();
-        lru.retained += cost;
-        if let Some(replaced) = lru.entries.put(key, ops) {
-            lru.retained -= pred_ops_entry_cost(&replaced);
-        }
-        while lru.retained > PRED_OPS_CACHE_MAX_OPS {
-            let Some((_, evicted)) = lru.entries.pop_lru() else {
-                break;
-            };
-            lru.retained -= pred_ops_entry_cost(&evicted);
-        }
-    }
-}
-
-fn global_pred_ops_cache() -> &'static PredOpsCache {
-    static CACHE: std::sync::LazyLock<PredOpsCache> = std::sync::LazyLock::new(PredOpsCache::new);
-    &CACHE
 }
 
 /// Fate of a base row checked against a predicate's overlay ops.
@@ -4787,82 +4672,6 @@ mod tests {
         assert!(refused.is_err(), "a failed merge check fails the lookup");
     }
 
-    fn pred_ops_test_key(content_version: u64) -> PredOpsKey {
-        (
-            crate::binary_scan::GlobalTranslationKey {
-                ledger_id: "cache/test:main".into(),
-                snapshot_t: 1,
-                content_version,
-                store_id: 1,
-                to_t: 1,
-                g_id: 0,
-                index: IndexType::Psot,
-            },
-            Sid::new(1, "p"),
-        )
-    }
-
-    fn pred_ops_of(n: usize) -> SharedOverlayOps {
-        (0..n as u64)
-            .map(|s_id| fluree_db_binary_index::read::types::OverlayOp {
-                s_id,
-                p_id: 0,
-                o_type: OType::IRI_REF.as_u16(),
-                o_key: 0,
-                o_i: 0,
-                t: 1,
-                op: true,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn pred_ops_cache_bounds_small_entries_and_skips_empty_ones() {
-        let cache = PredOpsCache::new();
-        let keys = 4 * PRED_OPS_CACHE_MAX_OPS / PRED_OPS_ENTRY_COST;
-        for version in 0..keys as u64 {
-            cache.insert(pred_ops_test_key(version), Some(pred_ops_of(0)));
-        }
-        assert_eq!(
-            cache.lock().entries.len(),
-            0,
-            "empty results aren't retained"
-        );
-
-        let one = pred_ops_of(1);
-        for version in 0..keys as u64 {
-            cache.insert(pred_ops_test_key(version), Some(Arc::clone(&one)));
-        }
-        let lru = cache.lock();
-        let per_entry = 1 + PRED_OPS_ENTRY_COST;
-        assert_eq!(lru.entries.len(), PRED_OPS_CACHE_MAX_OPS / per_entry);
-        assert_eq!(lru.retained, lru.entries.len() * per_entry);
-    }
-
-    #[test]
-    fn pred_ops_cache_evicts_least_recent_to_its_budget() {
-        let cache = PredOpsCache::new();
-        let half = pred_ops_of(PRED_OPS_CACHE_MAX_OPS / 2 - PRED_OPS_ENTRY_COST);
-        cache.insert(pred_ops_test_key(1), Some(Arc::clone(&half)));
-        cache.insert(pred_ops_test_key(2), Some(Arc::clone(&half)));
-        assert!(cache.get(&pred_ops_test_key(1)).is_some());
-        cache.insert(pred_ops_test_key(3), Some(Arc::clone(&half)));
-        assert!(cache.contains(&pred_ops_test_key(1)), "recently read");
-        assert!(
-            !cache.contains(&pred_ops_test_key(2)),
-            "least recent evicted"
-        );
-        assert!(cache.contains(&pred_ops_test_key(3)));
-        assert!(cache.lock().retained <= PRED_OPS_CACHE_MAX_OPS);
-
-        let oversized = pred_ops_of(PRED_OPS_CACHE_MAX_OPS);
-        cache.insert(pred_ops_test_key(4), Some(oversized));
-        assert!(
-            !cache.contains(&pred_ops_test_key(4)),
-            "larger than the budget"
-        );
-    }
-
     /// Eager callers with an overlay are owed decoded bindings, so only a
     /// lane that decodes them is admitted; on an overlay-free graph every
     /// lane is `Clean`.
@@ -4909,74 +4718,102 @@ mod tests {
         }
     }
 
-    /// Only a reasoning query's translated ops outlive its execution. Other
-    /// eager callers (a datalog fixpoint pass runs its rule bodies with
-    /// reasoning off; a dataset member's overlay is plain novelty) keep them
-    /// per-execution, as non-eager callers do.
+    /// Translated ops outlive an execution only on a reasoning
+    /// materialization, for the contexts reading its overlay, and only
+    /// within its reasoning memory budget.
     #[test]
-    fn only_reasoning_queries_keep_ops_across_queries() {
+    fn only_a_materialization_keeps_ops_across_queries() {
+        use crate::reasoning_ops::ReasoningOpsHandle;
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
         use fluree_db_novelty::Novelty;
+        use fluree_db_reasoner::DerivedFactsOverlay;
 
         let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let pred = Sid::new(100, "p");
-        let mut novelty = Novelty::new(0);
-        let flake = Flake {
-            g: None,
-            s: Sid::new(100, "s"),
-            p: pred.clone(),
-            o: FlakeValue::Ref(Sid::new(100, "o")),
-            dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
-            t: 1,
-            op: true,
-            m: None,
+        let novelty_with = |object: &str| {
+            let mut novelty = Novelty::new(0);
+            let flake = Flake {
+                g: None,
+                s: Sid::new(100, "s"),
+                p: pred.clone(),
+                o: FlakeValue::Ref(Sid::new(100, object)),
+                dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+                t: 1,
+                op: true,
+                m: None,
+            };
+            novelty
+                .apply_commit(vec![flake], 1, &Default::default())
+                .unwrap();
+            novelty
         };
-        novelty
-            .apply_commit(vec![flake], 1, &Default::default())
-            .unwrap();
-        // A store of its own: its id keeps this test's keys apart from every
-        // other test's in the process-wide cache.
+        let overlay = novelty_with("o");
+        let other_overlay = novelty_with("o2");
         let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
-        let ctx = |eager: bool, reasoning: bool| {
-            let ctx = ExecutionContext::with_time_and_overlay(&snapshot, &vars, 1, None, &novelty)
-                .with_binary_store(Arc::clone(&store), 0)
-                .with_reasoning_active(reasoning);
-            if eager {
-                ctx.with_eager_materialization()
-            } else {
-                ctx
+        fn ctx<'a>(
+            snapshot: &'a LedgerSnapshot,
+            vars: &'a VarRegistry,
+            store: &Arc<BinaryIndexStore>,
+            overlay: &'a Novelty,
+            ops: Option<&ReasoningOpsHandle>,
+        ) -> ExecutionContext<'a> {
+            let ctx = ExecutionContext::with_time_and_overlay(snapshot, vars, 1, None, overlay)
+                .with_binary_store(Arc::clone(store), 0)
+                .with_eager_materialization()
+                .with_reasoning_active(true);
+            match ops {
+                Some(ops) => ctx.with_reasoning_ops(ops.clone()),
+                None => ctx,
             }
-        };
-        let kept_by_a_later_query = |eager: bool, reasoning: bool| {
-            let first = ctx(eager, reasoning);
+        }
+        let ctx = |overlay, ops| ctx(&snapshot, &vars, &store, overlay, ops);
+        let kept_by_a_later_query = |first: ExecutionContext<'_>, later: ExecutionContext<'_>| {
             let ops = cached_overlay_ops(&first, &store, 0, RunSortOrder::Psot, &pred).unwrap();
-            assert!(
-                ops.is_none_or(|ops| !ops.is_empty()),
-                "an empty result is never kept"
-            );
-            assert!(
-                overlay_ops_cached(&first, &store, 0, RunSortOrder::Psot, &pred),
-                "cached for the execution that computed them"
-            );
-            overlay_ops_cached(&ctx(eager, reasoning), &store, 0, RunSortOrder::Psot, &pred)
+            // An empty store can't translate the fact; a failed translation
+            // is kept like any other, and an empty one never is.
+            assert!(ops.is_none_or(|ops| !ops.is_empty()), "never empty");
+            overlay_ops_cached(&later, &store, 0, RunSortOrder::Psot, &pred)
+        };
+        let attach = |limit| {
+            ReasoningOpsHandle::attach(
+                &DerivedFactsOverlay::empty(),
+                limit,
+                fluree_db_core::OverlayProvider::content_version(&overlay),
+            )
+            .unwrap()
         };
 
-        assert!(!kept_by_a_later_query(false, false), "a plain query");
         assert!(
-            !kept_by_a_later_query(true, false),
-            "an eager non-reasoning caller"
+            !kept_by_a_later_query(ctx(&overlay, None), ctx(&overlay, None)),
+            "a reasoning query without a materialization keeps nothing"
         );
-        assert!(kept_by_a_later_query(true, true), "a reasoning query");
-    }
-
-    #[test]
-    fn pred_ops_cache_keeps_a_failed_translation() {
-        let cache = PredOpsCache::new();
-        cache.insert(pred_ops_test_key(1), None);
-        assert!(matches!(cache.get(&pred_ops_test_key(1)), Some(None)));
-        let lru = cache.lock();
-        assert_eq!(lru.retained, PRED_OPS_ENTRY_COST);
+        let ops = attach(usize::MAX);
+        assert!(
+            kept_by_a_later_query(ctx(&overlay, Some(&ops)), ctx(&overlay, Some(&ops))),
+            "queries reading one materialization share its translations"
+        );
+        let fresh = attach(usize::MAX);
+        assert!(
+            !kept_by_a_later_query(
+                ctx(&other_overlay, Some(&fresh)),
+                ctx(&other_overlay, Some(&fresh))
+            ),
+            "a context reading another overlay leaves the materialization alone"
+        );
+        let tight = attach(1);
+        let tight_ctx = ctx(&overlay, Some(&tight));
+        cached_overlay_ops(&tight_ctx, &store, 0, RunSortOrder::Psot, &pred).unwrap();
+        assert!(
+            !overlay_ops_cached(
+                &ctx(&overlay, Some(&tight)),
+                &store,
+                0,
+                RunSortOrder::Psot,
+                &pred
+            ),
+            "a translation past the reasoning memory budget isn't kept"
+        );
     }
 }
