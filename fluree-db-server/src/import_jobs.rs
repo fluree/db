@@ -77,12 +77,22 @@ pub enum ImportSourceKind {
     Source,
 }
 
-/// Conversion options carried from `fluree create --remote --from` for
-/// CSV/Cypher source uploads. Other source formats ignore these fields.
+/// Options a source upload carries into the bulk-import pipeline.
 #[derive(Clone, Debug, Default)]
 pub struct SourceImportOptions {
+    /// CSV/Cypher conversion, from `fluree create --remote --from`. Other
+    /// source formats ignore these.
     pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
     pub base_iri: Option<String>,
+    /// A new named graph of the existing ledger to import into, rather than
+    /// a new ledger.
+    pub graph: Option<String>,
+    /// Salt for blank-node ids instead of the ledger id.
+    pub skolem_namespace: Option<String>,
+    /// The uploaded file's own name. A single-file import keys its
+    /// blank-node ids on its file name, so the staged upload is imported
+    /// under it, as a direct import of that file would be.
+    pub file_name: Option<String>,
 }
 
 /// One negotiated-upload import job.

@@ -1982,7 +1982,7 @@ async fn test_update_from_named_alias_usable_in_templates() {
                 ledger
                     .snapshot
                     .graph_registry
-                    .graph_id_for_iri("http://example.org/g2")
+                    .assigned_graph_id("http://example.org/g2")
                     .is_some(),
                 "expected g2 IRI to be registered in graph_registry"
             );
@@ -2866,7 +2866,7 @@ INSERT DATA {
         let g2_id = ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(g2)
+            .assigned_graph_id(g2)
             .expect("dest graph registered after transfer");
         let dest_keys =
             support::decode_annotations_for_subject(&ledger, g2_id, "http://example.org/alice")
@@ -3506,6 +3506,21 @@ async fn test_jsonld_update_from_an_unknown_graph_reads_an_empty_default_graph()
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// Whether selecting the named graph registered under exactly `graph` is
+/// refused because the graph was dropped (a dropped graph no longer exists).
+async fn graph_is_dropped(fluree: &fluree_db_api::Fluree, ledger_id: &str, graph: &str) -> bool {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": {"@id": ledger_id, "graph": graph},
+        "select": ["?o"],
+        "where": [{"@id": "?s", "ex:v": "?o"}]
+    });
+    match fluree.query_from().jsonld(&query).execute_formatted().await {
+        Ok(_) => false,
+        Err(e) => e.to_string().contains("was dropped"),
+    }
+}
+
 /// The `ex:v` values in one graph of `ledger_id`, sorted: its default graph,
 /// or the named graph registered under exactly `graph`. The dataset `from`
 /// selects a named graph by registry lookup, so it reaches a graph registered
@@ -4016,10 +4031,9 @@ async fn test_a_graph_registered_under_the_address_migrates_to_the_default_graph
             ["default only", "legacy only", "same"],
             "[{address}] the default graph holds the legacy graph's data"
         );
-        assert_eq!(
-            ex_v_values(&fluree, &branch, Some(&address)).await,
-            Vec::<String>::new(),
-            "[{address}] the legacy graph is empty"
+        assert!(
+            graph_is_dropped(&fluree, &branch, &address).await,
+            "[{address}] the legacy graph is gone"
         );
     }
 }
@@ -4492,7 +4506,12 @@ async fn test_graph_management_reads_a_graph_named_through_the_address() {
         assert_eq!(values(Some(copy)).await, ["legacy"], "{keyword}: COPY");
         update(format!("MOVE GRAPH <{branch}#{legacy}> TO <{moved}>")).await;
         assert_eq!(values(Some(moved)).await, ["legacy"], "{keyword}: MOVE");
-        assert!(values(Some(&legacy)).await.is_empty(), "{keyword}: MOVE");
+        let dropped = |graph: &str| {
+            let graph = graph.to_string();
+            let fluree = &fluree;
+            async move { graph_is_dropped(fluree, branch, &graph).await }
+        };
+        assert!(dropped(&legacy).await, "{keyword}: MOVE drops its source");
         // Back in, naming the legacy graph as the destination.
         update(format!("MOVE GRAPH <{moved}> TO <{branch}#{legacy}>")).await;
         assert_eq!(
@@ -4502,12 +4521,12 @@ async fn test_graph_management_reads_a_graph_named_through_the_address() {
         );
 
         update(format!("DROP GRAPH <{branch}#{legacy}>")).await;
-        assert!(values(Some(&legacy)).await.is_empty(), "{keyword}: DROP");
+        assert!(dropped(&legacy).await, "{keyword}: DROP");
         update(format!("DROP GRAPH <{branch}#{copy}>")).await;
-        assert!(values(Some(copy)).await.is_empty(), "{keyword}: DROP");
+        assert!(dropped(copy).await, "{keyword}: DROP");
         // The address alone: the graph registered under it, not the default graph.
         update(format!("DROP GRAPH <{branch}>")).await;
-        assert!(values(Some(branch)).await.is_empty(), "{keyword}: DROP");
+        assert!(dropped(branch).await, "{keyword}: DROP");
         assert_eq!(values(None).await, ["default", "legacy"], "{keyword}");
     }
 }
