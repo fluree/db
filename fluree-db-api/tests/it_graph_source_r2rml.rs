@@ -6382,75 +6382,113 @@ async fn a_scan_is_deterministic_unless_no_slice_can_observe_its_order() {
 }
 
 /// The fused aggregate folds its table through a scan of its own, which owes
-/// the query the same order as the generic one: `Any` for a COUNT with no
-/// slice, deterministic when a LIMIT sits over it.
+/// the query the same order as the generic one: `Any` for an aggregate with no
+/// slice, deterministic when a LIMIT sits over it. Two shapes, because the
+/// fused operator is built at two sites: a plain COUNT reaches it as the
+/// SQL-lane detector's fallback; a SUM over a top-level BIND, which that
+/// detector declines (its block must be the whole WHERE), reaches the fused
+/// operator directly.
 #[tokio::test]
 async fn a_fused_aggregate_scan_follows_the_query_slice() {
-    for (limit, want) in [(None, ScanOrder::Any), (Some(1), ScanOrder::Deterministic)] {
-        let fluree = FlureeBuilder::memory().build_memory();
-        let mut ledger = genesis_ledger(&fluree, "fa:main");
-        Arc::make_mut(&mut ledger.snapshot)
-            .insert_namespace_code(9_999, "http://example.org/".to_string())
-            .unwrap();
-        let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:integer"))
-            .unwrap()
-            .compile()
-            .unwrap();
-        let batch = id_val_batch(
-            vec![Some(1), Some(2), Some(3)],
-            Column::Int64(vec![Some(10), Some(20), Some(30)]),
-            FieldType::Int64,
-        );
-        let provider = MockR2rmlProvider::new(mapping, vec![batch]);
-        let mut vars = VarRegistry::new();
-        let s = vars.get_or_insert("?s");
-        let o = vars.get_or_insert("?o");
-        let out = vars.get_or_insert("?agg");
-        let pred = ledger
-            .snapshot
-            .encode_iri("http://example.org/val")
-            .expect("example.org namespace registered");
-        let mut parsed = Query::new(ParsedContext::default());
-        parsed.patterns = vec![Pattern::Graph {
-            name: GraphName::Iri("fa-gs:main".into()),
-            patterns: vec![Pattern::Triple(TriplePattern::new(
-                Ref::Var(s),
-                Ref::Sid(pred),
-                Term::Var(o),
-            ))],
-        }];
-        parsed.output = QueryOutput::select_all(vec![out]);
-        parsed.grouping = Grouping::assemble(
-            vec![],
-            vec![AggregateSpec {
-                function: AggregateFn::Count(o),
-                output_var: out,
-            }],
-            vec![],
-            None,
-        )
-        .expect("valid grouping");
-        parsed.limit = limit;
-        let executable = ExecutableQuery::simple(parsed);
-        let tracker = Tracker::disabled();
-        let result = execute(
-            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
-            &vars,
-            &executable,
-            r2rml_test_config(&tracker, &provider),
-        )
-        .await
-        .expect("query should execute");
-        let count = result
-            .iter()
-            .find_map(|b| (!b.is_empty()).then(|| format!("{:?}", b.get(0, out))))
-            .expect("one row");
-        assert!(count.contains('3'), "limit {limit:?}: COUNT is 3: {count}");
-        let orders = provider.orders.lock().unwrap().clone();
-        assert_eq!(
-            orders,
-            vec![Some(want)],
-            "limit {limit:?}: the one scan's order"
-        );
+    for with_bind in [false, true] {
+        for (limit, want) in [(None, ScanOrder::Any), (Some(1), ScanOrder::Deterministic)] {
+            let label = format!("bind={with_bind} limit={limit:?}");
+            let fluree = FlureeBuilder::memory().build_memory();
+            let mut ledger = genesis_ledger(&fluree, "fa:main");
+            Arc::make_mut(&mut ledger.snapshot)
+                .insert_namespace_code(9_999, "http://example.org/".to_string())
+                .unwrap();
+            let (datatype, batch) = if with_bind {
+                (
+                    "xsd:decimal",
+                    id_val_batch(
+                        vec![Some(1), Some(2), Some(3)],
+                        Column::Decimal {
+                            values: vec![Some(1000), Some(2000), Some(3000)],
+                            precision: 10,
+                            scale: 2,
+                        },
+                        FieldType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
+                    ),
+                )
+            } else {
+                (
+                    "xsd:integer",
+                    id_val_batch(
+                        vec![Some(1), Some(2), Some(3)],
+                        Column::Int64(vec![Some(10), Some(20), Some(30)]),
+                        FieldType::Int64,
+                    ),
+                )
+            };
+            let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+                .unwrap()
+                .compile()
+                .unwrap();
+            let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+            let mut vars = VarRegistry::new();
+            let s = vars.get_or_insert("?s");
+            let o = vars.get_or_insert("?o");
+            let e = vars.get_or_insert("?e");
+            let out = vars.get_or_insert("?agg");
+            let pred = ledger
+                .snapshot
+                .encode_iri("http://example.org/val")
+                .expect("example.org namespace registered");
+            let mut parsed = Query::new(ParsedContext::default());
+            parsed.patterns = vec![Pattern::Graph {
+                name: GraphName::Iri("fa-gs:main".into()),
+                patterns: vec![Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(pred),
+                    Term::Var(o),
+                ))],
+            }];
+            let function = if with_bind {
+                parsed.patterns.push(Pattern::Bind {
+                    var: e,
+                    expr: Expression::Call {
+                        func: Function::Mul,
+                        args: vec![Expression::Var(o), Expression::Const(FlakeValue::Long(2))],
+                    },
+                });
+                AggregateFn::Sum(e, InputSemantics::List)
+            } else {
+                AggregateFn::Count(o)
+            };
+            parsed.output = QueryOutput::select_all(vec![out]);
+            parsed.grouping = Grouping::assemble(
+                vec![],
+                vec![AggregateSpec {
+                    function,
+                    output_var: out,
+                }],
+                vec![],
+                None,
+            )
+            .expect("valid grouping");
+            parsed.limit = limit;
+            let executable = ExecutableQuery::simple(parsed);
+            let tracker = Tracker::disabled();
+            let result = execute(
+                GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+                &vars,
+                &executable,
+                r2rml_test_config(&tracker, &provider),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+            let value = result
+                .iter()
+                .find_map(|b| (!b.is_empty()).then(|| format!("{:?}", b.get(0, out))))
+                .expect("one row");
+            let expected = if with_bind { "120" } else { "3" };
+            assert!(value.contains(expected), "{label}: {value}");
+            let orders = provider.orders.lock().unwrap().clone();
+            assert_eq!(orders, vec![Some(want)], "{label}: the one scan's order");
+        }
     }
 }

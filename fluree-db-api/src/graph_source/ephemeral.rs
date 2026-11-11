@@ -672,4 +672,36 @@ mod tests {
             "both Person subjects bind their name column"
         );
     }
+
+    /// A provisional-mapping query owes its scan the same order a persisted
+    /// one does: any order with no slice, a fixed one under a LIMIT.
+    #[tokio::test]
+    async fn provisional_scan_order_follows_the_query_slice() {
+        let (_ledger, view) = genesis_view();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let q = "SELECT ?s ?name WHERE { \
+                 ?s a <http://example.org/Person> . \
+                 ?s <http://example.org/name> ?name }";
+        for (suffix, want) in [("", ScanOrder::Any), (" LIMIT 5", ScanOrder::Deterministic)] {
+            let provider = people_provider();
+            let query = format!("{q}{suffix}");
+            let result = fluree
+                .query_view_with_r2rml_options(
+                    &view,
+                    QueryInput::Sparql(&query),
+                    &provider,
+                    &provider,
+                    QueryExecutionOptions::new(),
+                )
+                .await
+                .expect("provisional query succeeds");
+            assert_eq!(row_count(&result), 2, "{query}");
+            let orders = provider.orders.lock().unwrap().clone();
+            assert!(!orders.is_empty(), "{query}: the table was scanned");
+            assert!(
+                orders.iter().all(|o| *o == Some(want)),
+                "{query}: {orders:?}"
+            );
+        }
+    }
 }
