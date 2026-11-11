@@ -19,7 +19,7 @@ use tracing::Instrument;
 
 /// The `iceberg.scan_plan` span every full plan runs in, whether it read the
 /// manifests or selected from a kept file list. Its counters are recorded
-/// once the plan is known ([`record_plan`]).
+/// once the plan is known ([`finish_plan`]).
 fn scan_plan_span() -> tracing::Span {
     tracing::debug_span!(
         "iceberg.scan_plan",
@@ -29,10 +29,19 @@ fn scan_plan_span() -> tracing::Span {
     )
 }
 
-fn record_plan(span: &tracing::Span, plan: &ScanPlan) {
+/// Report a finished plan: its counters on the `iceberg.scan_plan` span and
+/// the "Scan planning complete" log line. Every planning arm (manifests read,
+/// list kept, list reused) ends here, so they all report alike.
+fn finish_plan(span: &tracing::Span, plan: &ScanPlan) {
     span.record("files_selected", plan.files_selected);
     span.record("files_pruned", plan.files_pruned);
     span.record("estimated_row_count", plan.estimated_row_count);
+    tracing::info!(
+        files_selected = plan.files_selected,
+        files_pruned = plan.files_pruned,
+        estimated_row_count = plan.estimated_row_count,
+        "Scan planning complete"
+    );
 }
 
 /// A snapshot's live data files, read from its manifests, in plan order.
@@ -100,8 +109,7 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         }
         .instrument(span.clone())
         .await?;
-        record_plan(&span, &plan);
-        log_plan(&plan);
+        finish_plan(&span, &plan);
         Ok(plan)
     }
 
@@ -135,8 +143,7 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         }
         .instrument(span.clone())
         .await?;
-        record_plan(&span, &plan);
-        log_plan(&plan);
+        finish_plan(&span, &plan);
         Ok((plan, files))
     }
 
@@ -180,7 +187,7 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
                 Some(kept.record_count),
             ))
         })?;
-        record_plan(&span, &plan);
+        finish_plan(&span, &plan);
         Ok(plan)
     }
 
@@ -409,15 +416,6 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             to_sequence_number: to_seq,
         })
     }
-}
-
-fn log_plan(plan: &ScanPlan) {
-    tracing::info!(
-        files_selected = plan.files_selected,
-        files_pruned = plan.files_pruned,
-        estimated_row_count = plan.estimated_row_count,
-        "Scan planning complete"
-    );
 }
 
 /// The production COUNT/scan path routes through `SendScanPlanner` (r2rml
@@ -1137,6 +1135,63 @@ mod plan_from_files_tests {
             .unwrap();
             assert_eq!(paths(&plan), ALL, "concurrency {concurrency}");
         }
+    }
+
+    /// Every planning arm logs its plan alike: reading the manifests, keeping
+    /// the list on a miss, and planning from the kept list on a hit each emit
+    /// one "Scan planning complete" line with the same counters.
+    #[tokio::test]
+    async fn every_planning_arm_logs_its_plan() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Captured {
+            fn take_plan_lines(&self) -> Vec<String> {
+                let bytes = std::mem::take(&mut *self.0.lock().unwrap());
+                String::from_utf8(bytes)
+                    .unwrap()
+                    .lines()
+                    .filter(|l| l.contains("Scan planning complete"))
+                    .map(|l| l[l.find("Scan planning complete").unwrap()..].to_string())
+                    .collect()
+            }
+        }
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let captured = captured.clone();
+                move || captured.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (md, storage) = table();
+        let snap = md.current_snapshot().unwrap();
+        let planner = SendScanPlanner::new(&storage, &md, ScanConfig::new());
+        planner.plan_scan_for_snapshot(snap).await.unwrap();
+        let fresh = captured.take_plan_lines();
+        let (_, kept) = planner
+            .plan_scan_for_snapshot_retaining_files(snap)
+            .await
+            .unwrap();
+        let miss = captured.take_plan_lines();
+        planner
+            .plan_from_files(snap, kept_files(&kept, false))
+            .unwrap();
+        let hit = captured.take_plan_lines();
+        assert_eq!(fresh.len(), 1, "fresh: {fresh:?}");
+        assert_eq!(miss, fresh, "miss logs as a fresh plan does");
+        assert_eq!(hit, fresh, "hit logs as a fresh plan does");
     }
 
     /// A kept list flagged as delete-bearing (kept while the merge-on-read
