@@ -83,6 +83,7 @@ pub async fn generation_reach(
     store: &dyn ContentStore,
     generation: &IndexGeneration,
 ) -> Result<HashSet<ContentId>> {
+    require_reclaim_guard(&generation.manifest)?;
     let root_bytes = store.get(&generation.manifest.root).await.map_err(|e| {
         IndexerError::StorageRead(format!(
             "reasoning-index root {}: {e}",
@@ -152,6 +153,7 @@ pub async fn shared_refs_of_indexes(
         };
         let store = backend.content_store(&branch.reasoning_index(index_id.as_str()));
         for generation in index_generations(store.as_ref(), &pointer.manifest).await? {
+            require_reclaim_guard(&generation.manifest)?;
             refs.extend(root_dict_refs(store.as_ref(), &generation.manifest.root).await?);
         }
     }
@@ -308,6 +310,11 @@ pub async fn release_generations(
     plan: &GenerationReleasePlan,
     referenced_elsewhere: Option<&HashSet<ContentId>>,
 ) -> Result<GenerationReleaseResult> {
+    // Do this before the partial-release recovery below, which intentionally
+    // tolerates missing files but must never swallow a live repair guard.
+    for generation in plan.retained.iter().chain(&plan.released) {
+        require_reclaim_guard(&generation.manifest)?;
+    }
     let mut result = GenerationReleaseResult {
         generations: plan.released.len(),
         ..Default::default()
@@ -360,6 +367,19 @@ pub async fn release_generations(
     Ok(result)
 }
 
+fn require_reclaim_guard(manifest: &ReasoningManifest) -> Result<()> {
+    let now = fluree_db_core::clock::SystemTime::now()
+        .duration_since(fluree_db_core::clock::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    if now < manifest.reclaim_not_before_ms {
+        return Err(IndexerError::StorageRead(format!(
+            "reasoning index {} is protected after repair until {}",
+            manifest.index_id, manifest.reclaim_not_before_ms,
+        )));
+    }
+    Ok(())
+}
+
 /// The namespaces of every index a branch document names, for listings that
 /// must cover them (drop, sweep).
 pub fn index_namespaces(
@@ -394,6 +414,7 @@ mod tests {
                 generation: n,
                 prev_manifest: None,
                 published_at_ms,
+                reclaim_not_before_ms: 0,
                 kind: GenerationKind::Logical,
                 revision: 1,
                 semantics: SemanticKey {

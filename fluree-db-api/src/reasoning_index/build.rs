@@ -35,7 +35,7 @@ use fluree_db_core::{
 };
 use fluree_db_nameservice::{NsRecord, ReasoningIndexesCasResult};
 use fluree_db_query::execute::{
-    compute_derived_facts, compute_derived_facts_incremental, QueryRequest,
+    compute_derived_facts_incremental, compute_derived_facts_uncached, QueryRequest,
 };
 use fluree_db_query::schema_bundle::SchemaBundleOverlay;
 use serde_json::Value as JsonValue;
@@ -62,11 +62,6 @@ fn grown_bytes(doc: &ReasoningIndexes) -> usize {
     serde_json::to_vec(doc).map_or(usize::MAX, |json| json.len())
         + doc.indexes.len() * ENTRY_GROWTH_BYTES
 }
-
-/// The materialization budget a worker runs under unless the program sets
-/// one: generous, since a capped result is never published.
-const WORKER_MAX_FACTS: u64 = 100_000_000;
-const WORKER_MAX_SECONDS: u64 = 3_600;
 
 /// What a refresh of one index did.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -204,6 +199,24 @@ impl Fluree {
     ) -> Result<ReasoningIndexId> {
         let id = canonical_id(ledger_id)?;
         let canonical = program::canonical_program(program)?;
+        // Parse before persisting: malformed budgets, modes or rules must not
+        // leave a registration that can never be refreshed. Use the ledger's
+        // namespaces and default context, just as refresh does.
+        let db = self.db(&id).await?;
+        let (_, parsed) = parse_jsonld_query(
+            &program::settling_query(&canonical),
+            &db.snapshot,
+            db.default_context.as_ref(),
+            None,
+        )?;
+        let mut rules = fluree_db_query::datalog_rules::DatalogRuleSet::new();
+        for (i, rule) in parsed.reasoning.modes.rules.iter().enumerate() {
+            rules.add_rule(fluree_db_query::datalog_rules::parse_query_time_rule(
+                rule,
+                &db.snapshot,
+                i,
+            )?)?;
+        }
         let key = program::registration_key(&canonical);
         let max_bytes = self.publisher()?.max_reasoning_indexes_bytes();
         self.update_reasoning_indexes(&id, |actual| {
@@ -368,11 +381,24 @@ impl Fluree {
         &self,
         ledger_id: &str,
     ) -> Result<Vec<(ReasoningIndexId, RefreshOutcome)>> {
+        self.refresh_indexes(ledger_id, false).await
+    }
+
+    pub(super) async fn refresh_indexes(
+        &self,
+        ledger_id: &str,
+        automatic: bool,
+    ) -> Result<Vec<(ReasoningIndexId, RefreshOutcome)>> {
         let doc = self.reasoning_indexes(ledger_id).await?;
         let mut out = Vec::new();
         for (index_id, entry) in &doc.indexes {
             if matches!(entry.registration.state, RegistrationState::Active) {
-                let outcome = self.refresh_reasoning_index(ledger_id, index_id).await?;
+                let outcome = self
+                    .refresh_reasoning_index_with_retry(ledger_id, index_id, automatic)
+                    .await
+                    .unwrap_or_else(|e| RefreshOutcome::Failed {
+                        reason: e.to_string(),
+                    });
                 out.push((index_id.clone(), outcome));
             }
         }
@@ -386,11 +412,50 @@ impl Fluree {
         ledger_id: &str,
         index_id: &ReasoningIndexId,
     ) -> Result<RefreshOutcome> {
+        self.refresh_reasoning_index_with_retry(ledger_id, index_id, false)
+            .await
+    }
+
+    async fn refresh_reasoning_index_with_retry(
+        &self,
+        ledger_id: &str,
+        index_id: &ReasoningIndexId,
+        automatic: bool,
+    ) -> Result<RefreshOutcome> {
         let id = canonical_id(ledger_id)?;
+        if automatic {
+            if let Some(retry_at) = self.reasoning_index_state.retry_after(&id, index_id) {
+                return Ok(RefreshOutcome::Deferred {
+                    reason: format!("retry backoff until {retry_at} (Unix milliseconds); explicit refresh retries now"),
+                });
+            }
+        }
         let Some(_flight) = self.reasoning_index_state.begin(&id, index_id) else {
             return Ok(RefreshOutcome::InFlight);
         };
-        self.refresh_index_exclusive(&id, index_id).await
+        if !automatic {
+            self.reasoning_index_state.clear_failure(&id, index_id);
+        }
+        let outcome = self.refresh_index_exclusive(&id, index_id).await;
+        match &outcome {
+            Ok(RefreshOutcome::Failed { reason }) => {
+                self.reasoning_index_state
+                    .record_failure(&id, index_id, reason.clone());
+            }
+            Err(error) => {
+                self.reasoning_index_state
+                    .record_failure(&id, index_id, error.to_string());
+            }
+            Ok(RefreshOutcome::Published { .. } | RefreshOutcome::Current { .. }) => {
+                self.reasoning_index_state.clear_failure(&id, index_id);
+                self.reasoning_index_state
+                    .repairs
+                    .lock()
+                    .remove(&(id, index_id.clone()));
+            }
+            _ => {}
+        }
+        outcome
     }
 
     async fn refresh_index_exclusive(
@@ -423,6 +488,11 @@ impl Fluree {
             });
         }
         let revision = entry.registration.revision;
+        if basis.epoch < entry.floor {
+            return Ok(RefreshOutcome::Discarded {
+                reason: "the branch basis is below the reasoning index erasure floor".into(),
+            });
+        }
 
         // Settle the program as a query would, against the reasoned graph.
         // Before the currency check: what the program settles to can change
@@ -446,7 +516,7 @@ impl Fluree {
             db.default_context.as_ref(),
             None,
         )?;
-        let mut executable = self.build_executable_for_view(&db, &parsed, None).await?;
+        let executable = self.build_executable_for_view(&db, &parsed, None).await?;
         phases.mark("settle");
         if !program::materializes(&executable.reasoning) {
             return Ok(RefreshOutcome::Failed {
@@ -455,6 +525,14 @@ impl Fluree {
         }
         let engine = self.reasoning_index_state.engine_semantics();
         let settled = program::settled_key(&executable.reasoning, db.graph_id, engine);
+        let index_cs = self.backend().content_store(
+            &record
+                .storage_namespace()
+                .reasoning_index(index_id.as_str()),
+        );
+        // Validate the head before the currency and retention shortcuts.
+        // Otherwise a dangling pointer remains "Current" forever.
+        let mut repair = None;
         if let Some(published) = &entry.head {
             // Not even retention: an older collector would act on files a
             // newer engine wrote.
@@ -464,9 +542,20 @@ impl Fluree {
                     engine,
                 });
             }
+            if self
+                .reasoning_index_state
+                .needs_repair(ledger_id, index_id, &published.manifest)
+                || load_previous(index_cs.as_ref(), &published.manifest)
+                    .await
+                    .is_err()
+            {
+                repair = Some(published.manifest.clone());
+                tracing::warn!(ledger = ledger_id, index = %index_id, "published generation unreadable; rebuilding");
+            }
             if published.revision == revision
                 && published.basis == basis
                 && published.settled == settled
+                && repair.is_none()
             {
                 // Retention runs whether or not anything is published: an
                 // idle branch's superseded generations still expire.
@@ -488,19 +577,26 @@ impl Fluree {
 
         // Publication waits rather than let the index collector shorten the
         // protection of generations queries may still be reading.
-        if let Some(published) = &entry.head {
+        if let Some(published) = entry.head.as_ref().filter(|_| repair.is_none()) {
             let retention = self.reasoning_index_state.retention();
             let index_cs = self.backend().content_store(
                 &record
                     .storage_namespace()
                     .reasoning_index(index_id.as_str()),
             );
-            let generations = fluree_db_indexer::gc::reasoning_indexes::index_generations(
+            let generations = match fluree_db_indexer::gc::reasoning_indexes::index_generations(
                 index_cs.as_ref(),
                 &published.manifest,
             )
             .await
-            .map_err(|e| ApiError::internal(format!("read index chain: {e}")))?;
+            {
+                Ok(generations) => generations,
+                Err(error) => {
+                    tracing::warn!(ledger = ledger_id, index = %index_id, %error, "retained generation chain unreadable; rebuilding");
+                    repair = Some(published.manifest.clone());
+                    Vec::new()
+                }
+            };
             let plan = fluree_db_indexer::gc::reasoning_indexes::plan_generation_release(
                 generations,
                 now_ms(),
@@ -511,13 +607,6 @@ impl Fluree {
                 self.collect_quietly(ledger_id, &record, index_id).await;
                 return Ok(RefreshOutcome::Throttled { in_guard });
             }
-        }
-
-        let modes = &mut executable.reasoning.modes;
-        if program_json.get("reasoningBudget").is_none() {
-            modes.max_facts = Some(WORKER_MAX_FACTS);
-            modes.max_seconds = Some(WORKER_MAX_SECONDS);
-            modes.max_memory_mb = None;
         }
 
         // The previous generation, when this one can build on it.
@@ -536,7 +625,7 @@ impl Fluree {
             vec![BranchedContentStore::leaf(Arc::clone(&branch_store))],
         ));
         let previous = match &entry.head {
-            Some(p) if p.revision == revision && p.settled == settled => {
+            Some(p) if p.revision == revision && p.settled == settled && repair.is_none() => {
                 match load_previous(index_cs.as_ref(), &p.manifest).await {
                     Ok(prev) => {
                         let line = Line::walk(
@@ -891,6 +980,7 @@ impl Fluree {
             generation: 0,
             prev_manifest: None,
             published_at_ms: 0,
+            reclaim_not_before_ms: 0,
             kind,
             revision,
             semantics: entry.registration.semantics.clone(),
@@ -916,6 +1006,7 @@ impl Fluree {
                 branch_store.as_ref(),
                 &candidate,
                 manifest,
+                repair.as_ref(),
             )
             .await?
         {
@@ -1044,7 +1135,7 @@ impl Fluree {
             .as_ref()
             .map_or(db_ref.overlay, |o| o as &dyn OverlayProvider);
         let base = fluree_db_core::GraphDbRef::new(db_ref.snapshot, db_ref.g_id, overlay, db_ref.t);
-        let outcome = compute_derived_facts(
+        let outcome = compute_derived_facts_uncached(
             base,
             &reasoning.modes,
             reasoning.rules_source_g_id,
@@ -1120,9 +1211,27 @@ impl Fluree {
             overlay,
             closed_ref.t,
         );
+        // Definitions come from assertions, as in a full run. The closed
+        // predecessor can itself contain derived schema statements; treating
+        // those as new rule definitions changes the program on refresh.
+        let asserted_ref = db.as_graph_db_ref();
+        let asserted_schema = reasoning
+            .schema_bundle
+            .as_ref()
+            .filter(|bundle| !bundle.is_empty())
+            .map(|bundle| SchemaBundleOverlay::new(asserted_ref.overlay, bundle.clone()));
+        let asserted = fluree_db_core::GraphDbRef::new(
+            asserted_ref.snapshot,
+            asserted_ref.g_id,
+            asserted_schema
+                .as_ref()
+                .map_or(asserted_ref.overlay, |o| o as &dyn OverlayProvider),
+            asserted_ref.t,
+        );
         let loaded_ms = started.elapsed().as_millis() as u64;
         let outcome = match compute_derived_facts_incremental(
             base,
+            asserted,
             modes,
             &inserted,
             self.reasoning_index_state.maintenance(),
@@ -1159,6 +1268,7 @@ impl Fluree {
         branch_store: &dyn ContentStore,
         candidate: &Candidate,
         mut manifest: ReasoningManifest,
+        repair: Option<&ContentId>,
     ) -> Result<std::result::Result<u64, Discard>> {
         for _ in 0..CAS_ATTEMPTS {
             let record = self.branch_record(ledger_id).await?;
@@ -1181,12 +1291,27 @@ impl Fluree {
             };
             manifest.generation = admitted.generation;
             manifest.prev_manifest = admitted.prev_manifest;
+            // A broken chain cannot be retained as this generation's parent.
+            // Only detach the exact head diagnosed above, never a newer one
+            // that won a concurrent publication. Files are left for GC.
+            if repair.is_some() && manifest.prev_manifest.as_ref() == repair {
+                manifest.prev_manifest = None;
+                manifest.reclaim_not_before_ms = now_ms()
+                    .saturating_add(self.reasoning_index_state.retention().min_age_ms.max(0));
+            }
             manifest.published_at_ms = now_ms();
             let bytes = manifest.encode();
             let manifest_id = index_cs
                 .put(ContentKind::ReasoningManifest, &bytes)
                 .await
                 .map_err(|e| ApiError::internal(format!("write manifest: {e}")))?;
+            // The pointer must never become durable before its manifest and
+            // reachable artifacts. A CAS retry writes a new manifest, so sync
+            // belongs here, inside the retry loop.
+            index_cs
+                .sync()
+                .await
+                .map_err(|e| ApiError::internal(format!("sync reasoning generation: {e}")))?;
             let mut next = actual.clone();
             next.v = actual.v + 1;
             next.indexes
@@ -3294,5 +3419,272 @@ mod tests {
             resp.reasoning.and_then(|r| r.index).is_some(),
             "the published generation is readable after the sweep"
         );
+    }
+    #[tokio::test]
+    async fn an_invalid_legacy_registration_does_not_block_healthy_indexes() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/legacy-invalid:main";
+        let (invalid, _) = students(&fluree, id).await;
+        fluree
+            .update_reasoning_indexes(id, |doc| {
+                let mut next = doc.clone();
+                next.indexes.get_mut(&invalid).unwrap().registration.program["reasoningBudget"] =
+                    json!({"maxFacts": "bad"});
+                Ok((Some(next), ()))
+            })
+            .await
+            .unwrap();
+        let healthy = fluree
+            .register_reasoning_index(id, &json!({"reasoning": ["owl2rl", "datalog"]}))
+            .await
+            .unwrap();
+        let outcomes = fluree.refresh_reasoning_indexes(id).await.unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|(i, o)| i == &invalid && matches!(o, RefreshOutcome::Failed { .. })));
+        assert!(outcomes
+            .iter()
+            .any(|(i, o)| i == &healthy && matches!(o, RefreshOutcome::Published { .. })));
+        assert!(fluree.reasoning_index_failures(id).contains_key(&invalid));
+        let outcomes = fluree.refresh_indexes(id, true).await.unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|(i, o)| i == &invalid && matches!(o, RefreshOutcome::Deferred { .. })));
+        assert!(outcomes
+            .iter()
+            .any(|(i, o)| i == &healthy && matches!(o, RefreshOutcome::Current { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_missing_published_manifest_is_rebuilt_at_the_same_commit() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/repair-head:main";
+        let (index, _) = students(&fluree, id).await;
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+        let (manifest, _) = head_manifest(&fluree, id, &index).await;
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.index_store(&record, &index).await.unwrap();
+        store.release(&manifest).await.unwrap();
+        assert_eq!(alice_classes(&fluree, id).await.1, None);
+        assert!(fluree.reasoning_index_failures(id).contains_key(&index));
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Published {
+                generation: 2,
+                kind: GenerationKind::Rebuild,
+                ..
+            }
+        ));
+        assert_eq!(alice_classes(&fluree, id).await.1, Some(2));
+        assert!(fluree.reasoning_index_failures(id).is_empty());
+        assert!(head_manifest(&fluree, id, &index)
+            .await
+            .1
+            .prev_manifest
+            .is_none());
+        let (manifest_id, repaired) = head_manifest(&fluree, id, &index).await;
+        assert!(repaired.reclaim_not_before_ms > super::now_ms());
+        let doc = fluree.reasoning_indexes(id).await.unwrap();
+        assert!(
+            fluree_db_indexer::gc::reasoning_indexes::shared_refs_of_indexes(
+                fluree.backend(),
+                &record.storage_namespace(),
+                &doc,
+            )
+            .await
+            .is_err(),
+            "shared dictionaries must stay protected"
+        );
+        let mut generation = fluree_db_indexer::gc::reasoning_indexes::IndexGeneration {
+            manifest_id,
+            manifest: repaired,
+        };
+        assert!(
+            fluree_db_indexer::gc::reasoning_indexes::generation_reach(store.as_ref(), &generation)
+                .await
+                .is_err(),
+            "a sweep must not reclaim detached generations inside the guard"
+        );
+        generation.manifest.reclaim_not_before_ms = 0;
+        assert!(fluree_db_indexer::gc::reasoning_indexes::generation_reach(
+            store.as_ref(),
+            &generation
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn erasure_floor_rejects_exact_and_retained_generations() {
+        use fluree_db_core::reasoning_index::ErasureEpoch;
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/serve-floor:main";
+        let (index, ledger) = students(&fluree, id).await;
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+        fluree
+            .update_reasoning_indexes(id, |doc| {
+                let mut next = doc.clone();
+                next.indexes.get_mut(&index).unwrap().floor = ErasureEpoch(1);
+                Ok((Some(next), ()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice_classes(&fluree, id).await.1, None);
+        // Simulate a later, eligible epoch without changing the old manifest.
+        let (old_id, mut manifest) = head_manifest(&fluree, id, &index).await;
+        let ledger = insert_student(&fluree, ledger, "http://example.org/bob").await;
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.index_store(&record, &index).await.unwrap();
+        manifest.prev_manifest = Some(old_id);
+        manifest.basis.epoch = ErasureEpoch(1);
+        manifest.basis.commit = record.commit_head_id.clone().unwrap();
+        manifest.basis.t = ledger.t();
+        manifest.generation += 1;
+        let new_id = store
+            .put(ContentKind::ReasoningManifest, &manifest.encode())
+            .await
+            .unwrap();
+        fluree
+            .update_reasoning_indexes(id, |doc| {
+                let mut next = doc.clone();
+                next.indexes.get_mut(&index).unwrap().head = Some(manifest.pointer(new_id.clone()));
+                Ok((Some(next), ()))
+            })
+            .await
+            .unwrap();
+        // Query the earlier commit: only the retained, below-floor generation
+        // is old enough. It must fall back despite the eligible new head.
+        let response = fluree.graph_at(id, crate::TimeSpec::AtT(manifest.basis.t - 1)).query()
+            .jsonld(&json!({"select": "?s", "where": {"@id": "?s", "@type": "http://example.org/Person"},
+                "reasoning": "owl2rl", "reasoningFreshness": "asOf"}))
+            .track_all().execute_tracked().await.unwrap();
+        assert!(response.reasoning.unwrap().index.is_none());
+    }
+
+    struct SyncProbe {
+        inner: Arc<dyn ContentStore>,
+        fluree: Fluree,
+        ledger: String,
+        fail: std::sync::atomic::AtomicBool,
+        conflict: std::sync::atomic::AtomicBool,
+        events: parking_lot::Mutex<Vec<&'static str>>,
+    }
+
+    impl std::fmt::Debug for SyncProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SyncProbe").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for SyncProbe {
+        async fn has(&self, id: &fluree_db_core::ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(
+            &self,
+            id: &fluree_db_core::ContentId,
+        ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
+            self.inner.get(id).await
+        }
+        async fn put(
+            &self,
+            kind: ContentKind,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<fluree_db_core::ContentId> {
+            self.events.lock().push("put");
+            self.inner.put(kind, bytes).await
+        }
+        async fn put_with_id(
+            &self,
+            id: &fluree_db_core::ContentId,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+        async fn release(&self, id: &fluree_db_core::ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+        async fn sync(&self) -> fluree_db_core::Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.events.lock().push("sync");
+            if self.fail.load(SeqCst) {
+                return Err(fluree_db_core::Error::io("injected sync failure"));
+            }
+            if self.conflict.swap(false, SeqCst) {
+                self.fluree
+                    .update_reasoning_indexes(&self.ledger, |doc| Ok((Some(doc.clone()), ())))
+                    .await
+                    .map_err(|e| fluree_db_core::Error::io(e.to_string()))?;
+            }
+            self.inner.sync().await
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_flushes_each_manifest_and_refuses_a_failed_sync() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/durable-publication:main";
+        let (index, _) = students(&fluree, id).await;
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+        let (original, manifest) = head_manifest(&fluree, id, &index).await;
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let branch_store = fluree_db_nameservice::branched_content_store_for_record(
+            fluree.backend(),
+            fluree.nameservice(),
+            &record,
+        )
+        .await
+        .unwrap();
+        let probe = SyncProbe {
+            inner: fluree
+                .backend()
+                .content_store(&record.storage_namespace().reasoning_index(index.as_str())),
+            fluree: fluree.clone(),
+            ledger: id.into(),
+            fail: AtomicBool::new(true),
+            conflict: AtomicBool::new(false),
+            events: Default::default(),
+        };
+        let candidate = super::Candidate {
+            index_id: index.clone(),
+            kind: GenerationKind::Rebuild,
+            revision: manifest.revision,
+            basis: manifest.basis.clone(),
+            engine: manifest.engine,
+        };
+        assert!(fluree
+            .publish_generation(
+                id,
+                &probe,
+                branch_store.as_ref(),
+                &candidate,
+                manifest.clone(),
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(head_manifest(&fluree, id, &index).await.0, original);
+        assert_eq!(*probe.events.lock(), vec!["put", "sync"]);
+        probe.events.lock().clear();
+        probe.fail.store(false, SeqCst);
+        probe.conflict.store(true, SeqCst);
+        assert_eq!(
+            fluree
+                .publish_generation(
+                    id,
+                    &probe,
+                    branch_store.as_ref(),
+                    &candidate,
+                    manifest,
+                    None
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        assert_eq!(*probe.events.lock(), vec!["put", "sync", "put", "sync"]);
     }
 }

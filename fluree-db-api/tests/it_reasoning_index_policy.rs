@@ -1036,24 +1036,35 @@ async fn an_unmatched_program_falls_back() {
     assert!(index.is_none());
 }
 
-/// A graph crawl in a reasoning query under a view policy is refused before
-/// an index is consulted.
+/// Hydration uses the same derived class memberships as row filtering.
 #[tokio::test]
-async fn a_crawl_is_refused_with_an_index_too() {
+async fn a_crawl_obeys_derived_class_denials_with_and_without_an_index() {
     let twins = twins("crawl", &["datalog"]).await;
     let crawl = json!({
         "@context": ctx(),
         "select": {"ex:alice": ["*"]},
         "reasoning": "datalog"
     });
-    let error = twins
-        .run(
-            &twins.served,
-            &crawl,
-            &deny_class("HighEarner"),
-            Entry::View,
-        )
+    let policy = deny_class("HighEarner");
+    let (expected, index) = twins
+        .run(&twins.query_time, &crawl, &policy, Entry::View)
         .await
-        .expect_err("refused");
-    assert!(error.contains("graph crawl"), "{error}");
+        .unwrap();
+    assert!(index.is_none());
+    assert!(!serde_json::to_string(&expected).unwrap().contains("salary"));
+    let (actual, index) = twins
+        .run(&twins.served, &crawl, &policy, Entry::View)
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert!(index.is_some());
+    // The untracked formatter must retain the policy and the generation too.
+    let view = twins.view(&twins.served, &policy).await;
+    let untracked = view
+        .query(&twins.fluree)
+        .jsonld(&crawl)
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(normalize_rows(&untracked), expected);
 }

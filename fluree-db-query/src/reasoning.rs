@@ -5,7 +5,7 @@
 
 use fluree_db_core::overlay::compose_content_version;
 use fluree_db_core::{Flake, GraphId, IndexType, OverlayProvider};
-use fluree_db_reasoner::{DerivedFactsOverlay, ReasoningCache};
+use fluree_db_reasoner::ReasoningCache;
 use std::sync::Arc;
 
 /// Overlay that combines a base overlay with derived facts from OWL2-RL reasoning.
@@ -178,8 +178,8 @@ pub fn global_reasoning_cache() -> &'static ReasoningCache {
 
 /// Re-export reasoning types for convenience
 pub use fluree_db_reasoner::{
-    reason_owl2rl, DerivedFactsBuilder, FrozenSameAs, MaintenanceBounds, ReasoningBudget,
-    ReasoningDiagnostics,
+    reason_owl2rl, DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, MaintenanceBounds,
+    ReasoningBudget, ReasoningDiagnostics,
 };
 
 #[cfg(test)]

@@ -707,6 +707,7 @@ mod tests {
             binary_graph: None,
             from_graph_source: false,
             reasoned_overlay: None,
+            read_view: None,
             advisories: Vec::new(),
         }
     }
@@ -841,6 +842,7 @@ mod tests {
             binary_graph: None,
             from_graph_source: false,
             reasoned_overlay: None,
+            read_view: None,
             advisories: Vec::new(),
         }
     }

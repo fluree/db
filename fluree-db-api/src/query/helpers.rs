@@ -481,6 +481,7 @@ pub(crate) fn build_query_result(
         // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
         from_graph_source: false,
         reasoned_overlay: None,
+        read_view: None,
         advisories: Vec::new(),
     }
 }

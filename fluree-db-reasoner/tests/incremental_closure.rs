@@ -101,7 +101,7 @@ async fn gained(state: Vec<Flake>, inserted: &[Flake]) -> Option<HashSet<Flake>>
     let snapshot = snapshot();
     let overlay = SortedOverlay::new(state);
     let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
-    run_fixpoint_incremental(db, inserted, &ReasoningOptions::default())
+    run_fixpoint_incremental(db, db, inserted, &ReasoningOptions::default())
         .await
         .unwrap()
         .map(|(flakes, _)| flakes.into_iter().collect())
@@ -358,7 +358,7 @@ async fn pending_reads_count_against_the_working_bound() {
     let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
     let mut opts = ReasoningOptions::default();
     opts.maintenance.working_bytes = 1;
-    let result = run_fixpoint_incremental(db, &inserted, &opts)
+    let result = run_fixpoint_incremental(db, db, &inserted, &opts)
         .await
         .unwrap();
     assert!(result.is_none(), "outgrown: computed in full");
@@ -375,7 +375,7 @@ async fn the_working_bound_is_checked_between_reads() {
     let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
     let mut opts = ReasoningOptions::default();
     opts.maintenance.working_bytes = 8 * 1024;
-    let result = run_fixpoint_incremental(db, &inserted, &opts)
+    let result = run_fixpoint_incremental(db, db, &inserted, &opts)
         .await
         .unwrap();
     assert!(result.is_none(), "outgrown: computed in full");
@@ -398,7 +398,7 @@ async fn a_run_past_its_deadline_is_capped() {
     let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
     let mut opts = ReasoningOptions::default();
     opts.budget.max_duration = std::time::Duration::from_millis(100);
-    let (_, diagnostics) = run_fixpoint_incremental(db, &inserted, &opts)
+    let (_, diagnostics) = run_fixpoint_incremental(db, db, &inserted, &opts)
         .await
         .unwrap()
         .expect("a budget caps the run");

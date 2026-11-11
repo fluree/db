@@ -1036,17 +1036,25 @@ impl PolicyContext {
     /// Filter `subjects` down to those this context has not resolved in
     /// `state`, taking the cache lock once rather than per subject.
     pub fn retain_uncached(&self, state: &ClassState, subjects: &[Sid]) -> Vec<Sid> {
+        self.retain_uncached_iter(state, subjects.iter())
+    }
+
+    /// Inspect borrowed subjects under one cache lock, cloning only misses.
+    pub fn retain_uncached_iter<'a>(
+        &self,
+        state: &ClassState,
+        subjects: impl Iterator<Item = &'a Sid>,
+    ) -> Vec<Sid> {
         match self.class_cache.read() {
             Ok(cache) => match cache.get(state) {
                 Some(resolved) => subjects
-                    .iter()
                     .filter(|s| !resolved.contains_key(*s))
                     .cloned()
                     .collect(),
-                None => subjects.to_vec(),
+                None => subjects.cloned().collect(),
             },
             // Poisoned: resolve everything, same as a miss.
-            Err(_) => subjects.to_vec(),
+            Err(_) => subjects.cloned().collect(),
         }
     }
 

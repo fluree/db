@@ -849,7 +849,7 @@ async fn with_reasoning_index_refs(
     }
 }
 
-/// Collect the whole prev-index chain, newest root first./// Collect the whole prev-index chain, newest root first.
+/// Collect the whole prev-index chain, newest root first.
 ///
 /// See [`PrevIndexChainWalk::next_entry`] for how the walk ends, and prefer
 /// the walk itself where each root can be consumed and dropped.

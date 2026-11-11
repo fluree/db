@@ -137,7 +137,9 @@ pub struct SemanticKey {
 /// 2: a restriction or chain over mutually inverse properties no longer fails
 /// the OWL 2 RL pass.
 /// 3: every member of an `owl:sameAs` set holds every member's facts.
-pub const ENGINE_SEMANTICS: u32 = 3;
+/// 4: incremental rule definitions come from assertions, not derived schema;
+/// hydrated results retain the reasoned execution state.
+pub const ENGINE_SEMANTICS: u32 = 4;
 
 /// The content id a canonical program encoding is known by.
 pub fn program_id(canonical: &[u8]) -> ContentId {
@@ -279,6 +281,11 @@ pub struct ReasoningManifest {
     /// When the compare-and-swap that published it was attempted. A
     /// generation is superseded at its successor's `published_at_ms`.
     pub published_at_ms: i64,
+    /// A repaired chain may have lost references still held by readers.
+    /// Defer reclamation of this index and shared dictionaries until this
+    /// persisted deadline, including after a restart. Zero for ordinary builds.
+    #[serde(default)]
+    pub reclaim_not_before_ms: i64,
     pub kind: GenerationKind,
     pub revision: u64,
     pub semantics: SemanticKey,
@@ -770,6 +777,7 @@ mod tests {
             generation: 2,
             prev_manifest: Some(cid("m1")),
             published_at_ms: 99,
+            reclaim_not_before_ms: 0,
             kind: GenerationKind::Logical,
             revision: 1,
             semantics: key(),

@@ -67,6 +67,12 @@ async fn register_refresh_list_and_retire_an_index() {
     .await;
     assert!(status.is_success(), "{status}");
 
+    let (status, _) = post(
+        &app, "/v1/fluree/reasoning-indexes/register",
+        json!({"ledger": ledger, "program": {"reasoning": "owl2rl", "reasoningBudget": {"maxFacts": "bad"}}}),
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     let (status, registered) = post(
         &app,
         "/v1/fluree/reasoning-indexes/register",
@@ -95,6 +101,33 @@ async fn register_refresh_list_and_retire_an_index() {
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["indexes"][&index_id]["head"]["generation"], json!(1));
+    assert_eq!(listed["maintenanceFailures"], json!({}));
+    let (_, capped) = post(&app, "/v1/fluree/reasoning-indexes/register",
+        json!({"ledger": ledger, "program": {"reasoning": "owl2rl", "reasoningBudget": {"maxFacts": 0}}})).await;
+    let capped_id = capped["indexId"].as_str().unwrap();
+    let (status, refreshed) = post(
+        &app,
+        "/v1/fluree/reasoning-indexes/refresh",
+        json!({"ledger": ledger}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(refreshed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["outcome"] == "failed"));
+    let (_, listed) = post(
+        &app,
+        "/v1/fluree/reasoning-indexes/list",
+        json!({"ledger": ledger}),
+    )
+    .await;
+    assert!(listed["maintenanceFailures"][capped_id]["reason"].is_string());
+    assert_eq!(
+        listed["maintenanceFailures"][capped_id]["attempts"],
+        json!(1)
+    );
 
     let (status, _) = post(
         &app,

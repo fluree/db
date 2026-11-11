@@ -599,8 +599,8 @@ async fn one_view_judges_classes_by_each_query_s_reasoning() {
 
 /// A class deny under reasoning reaches an aggregate's fast path, a join and
 /// SPARQL alike: `ex:alice`, a `HighEarner` only by rule, is hidden; `ex:bob`
-/// is not. A graph crawl is refused instead
-/// (`a_graph_crawl_in_a_reasoning_query_is_refused_under_a_view_policy`).
+/// is not. A graph crawl uses the same derived memberships
+/// (`a_graph_crawl_uses_reasoned_classes_under_a_view_policy`).
 #[tokio::test]
 async fn a_derived_class_deny_reaches_every_row_shape() {
     use fluree_db_api::{GovernanceOptions, GraphDb};
@@ -661,11 +661,10 @@ async fn a_derived_class_deny_reaches_every_row_shape() {
 /// A graph crawl renders stored facts at formatting time and judges class
 /// policies on stored classes, where `ex:alice` is no `HighEarner`: in a
 /// reasoning query a deny on the class would leave her crawled salary
-/// visible. Under any view policy the crawl is refused, in every crawl form
-/// and whether reasoning comes from the query or the ledger's defaults. A
-/// root crawl, and a plain one judged on stored classes, still run.
+/// visible. Every single-graph crawl form must instead use the reasoned
+/// read state and hide that salary, including nested hydration.
 #[tokio::test]
-async fn a_graph_crawl_in_a_reasoning_query_is_refused_under_a_view_policy() {
+async fn a_graph_crawl_uses_reasoned_classes_under_a_view_policy() {
     for storage in STORAGE {
         let ledger_id = format!("reasoning-policy/crawl-{storage:?}:main");
         let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
@@ -702,15 +701,14 @@ async fn a_graph_crawl_in_a_reasoning_query_is_refused_under_a_view_policy() {
         for form in &forms {
             let root = run(form.clone()).await.expect("root crawl");
             assert!(root.contains("250000"), "{storage:?}: root: {root}");
-            for restricted in [
-                class_restricted(form, HIGH_EARNER),
-                restricted(form, UNRELATED),
-            ] {
-                match run(restricted).await {
-                    Err((400, error)) if error.contains("graph crawl") => {}
-                    other => panic!("{storage:?}: {form}: {other:?}"),
-                }
-            }
+            let denied = run(class_restricted(form, HIGH_EARNER))
+                .await
+                .expect("reasoned crawl");
+            assert!(!denied.contains("250000"), "{storage:?}: {denied}");
+            let unrelated = run(restricted(form, UNRELATED))
+                .await
+                .expect("unrelated deny");
+            assert!(unrelated.contains("250000"), "{storage:?}: {unrelated}");
         }
 
         let plain = crawl(json!({"ex:alice": ["*"]}), json!(null), "none");
@@ -722,9 +720,9 @@ async fn a_graph_crawl_in_a_reasoning_query_is_refused_under_a_view_policy() {
 }
 
 /// Ledger reasoning defaults make a crawl that names no reasoning a
-/// reasoning query, so it is refused under a view policy too.
+/// reasoning query, so hydration must use derived class memberships too.
 #[tokio::test]
-async fn a_graph_crawl_under_reasoning_defaults_is_refused_under_a_view_policy() {
+async fn a_graph_crawl_under_reasoning_defaults_uses_reasoned_classes() {
     let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
     let ledger_id = "reasoning-policy/crawl-defaults:main";
     let ledger = genesis_ledger(&fluree, ledger_id).await;
@@ -764,10 +762,15 @@ async fn a_graph_crawl_under_reasoning_defaults_is_refused_under_a_view_policy()
         root.result
     );
     crawl["opts"] = denying_class(HIGH_EARNER);
-    match fluree.query_connection_tracked(&crawl).await {
-        Err(e) if e.status == 400 && e.error.contains("graph crawl") => {}
-        other => panic!("{:?}", other.map(|r| r.result)),
-    }
+    let denied = fluree
+        .query_connection_tracked(&crawl)
+        .await
+        .expect("reasoned crawl");
+    assert!(
+        !denied.result.to_string().contains("250000"),
+        "{:?}",
+        denied.result
+    );
 }
 
 /// A dataset can hold one ledger under several policies. A restricted
@@ -844,4 +847,64 @@ async fn a_restricted_member_of_an_indexed_dataset_keeps_its_class_deny() {
         run(dataset, salaries("urn:restricted")).await,
         normalize_rows(&json!([["ex:bob", 90000]]))
     );
+}
+
+/// A single source can expand into several runtime graphs through either
+/// request options or ledger defaults. It still needs the multi-graph gate.
+#[tokio::test]
+async fn a_union_crawl_under_policy_remains_unsupported() {
+    use fluree_db_api::{DataSetDb, FlureeBuilder, GovernanceOptions, GraphDb};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "reasoning-policy/union-crawl:main";
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    let ledger = fluree
+        .insert(ledger, &family_with_rules())
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix ex: <http://example.org/> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            GRAPH ex:people {{ ex:bob ex:name "Bob" . }}
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:cfg:main> a f:LedgerConfig ; f:queryDefaults <urn:cfg:query> .
+                <urn:cfg:query> f:unionDefaultGraph true .
+            }}
+            "#
+        ))
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let view = fluree
+        .wrap_policy(
+            GraphDb::from_ledger_state(&ledger),
+            &GovernanceOptions {
+                policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+                default_allow: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for explicit in [false, true] {
+        let mut query = json!({
+            "@context": context(),
+            "select": {"ex:alice": ["*"]},
+            "reasoning": "datalog"
+        });
+        if explicit {
+            query["opts"] = json!({"unionDefaultGraph": true});
+        }
+        let error = fluree.query(&view, &query).await.unwrap_err();
+        assert!(error.to_string().contains("multi-graph crawl"), "{error}");
+        let error = fluree
+            .query_dataset(&DataSetDb::single(view.clone()), &query)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multi-graph crawl"), "{error}");
+    }
 }

@@ -526,7 +526,8 @@ impl Fluree {
                 &options,
                 &mut sink,
             )
-            .await;
+            .await
+            .map(|_| ());
 
         let terminal = match exec {
             Ok(()) => {

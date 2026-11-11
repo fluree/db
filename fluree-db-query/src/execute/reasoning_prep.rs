@@ -153,6 +153,45 @@ pub async fn compute_derived_facts(
     binary_store: Option<&Arc<BinaryIndexStore>>,
     request: QueryRequest<'_>,
 ) -> crate::error::Result<DerivedFactsOutcome> {
+    compute_derived_facts_with_cache(
+        base_db,
+        reasoning,
+        rules_source_g_id,
+        binary_store,
+        request,
+        Some(global_reasoning_cache()),
+    )
+    .await
+}
+
+/// Compute maintenance output without reading or retaining OWL or Datalog
+/// closures in the process-wide query cache. Budget precedence matches queries.
+pub async fn compute_derived_facts_uncached(
+    base_db: GraphDbRef<'_>,
+    reasoning: &ReasoningModes,
+    rules_source_g_id: Option<GraphId>,
+    binary_store: Option<&Arc<BinaryIndexStore>>,
+    request: QueryRequest<'_>,
+) -> crate::error::Result<DerivedFactsOutcome> {
+    compute_derived_facts_with_cache(
+        base_db,
+        reasoning,
+        rules_source_g_id,
+        binary_store,
+        request,
+        None,
+    )
+    .await
+}
+
+async fn compute_derived_facts_with_cache(
+    base_db: GraphDbRef<'_>,
+    reasoning: &ReasoningModes,
+    rules_source_g_id: Option<GraphId>,
+    binary_store: Option<&Arc<BinaryIndexStore>>,
+    request: QueryRequest<'_>,
+    cache: Option<&fluree_db_reasoner::ReasoningCache>,
+) -> crate::error::Result<DerivedFactsOutcome> {
     use crate::datalog_rules::{load_rule_set, run_fixpoint, RuleExecutionEnv};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -160,7 +199,6 @@ pub async fn compute_derived_facts(
     // One budget for both reasoning mechanisms — datalog reuses it rather than
     // standing up a second cap.
     let budget = reasoning_budget(reasoning);
-    let cache = global_reasoning_cache();
     let GraphDbRef {
         snapshot,
         g_id,
@@ -194,7 +232,7 @@ pub async fn compute_derived_facts(
                 rule_config_hash: h.finish(),
             }
         });
-        if let Some(cached) = key.as_ref().and_then(|k| cache.get(k)) {
+        if let Some(cached) = key.as_ref().and_then(|k| cache.and_then(|c| c.get(k))) {
             tracing::debug!("derived facts served from the reasoning cache");
             return Ok(DerivedFactsOutcome {
                 overlay: (!cached.overlay.is_empty()).then(|| cached.overlay.clone()),
@@ -228,7 +266,11 @@ pub async fn compute_derived_facts(
             tracker: request.tracker.cloned().unwrap_or_default(),
             ..Default::default()
         };
-        match reason_owl2rl(base_db, &reasoning_opts, cache).await {
+        let owl = match cache {
+            Some(cache) => reason_owl2rl(base_db, &reasoning_opts, cache).await,
+            None => fluree_db_reasoner::reason_owl2rl_uncached(base_db, &reasoning_opts).await,
+        };
+        match owl {
             Ok(result) => {
                 if result.diagnostics.capped {
                     // A capped materialization is an INCOMPLETE closure:
@@ -438,7 +480,10 @@ pub async fn compute_derived_facts(
     let capped_by_clock = diagnostics
         .as_ref()
         .is_some_and(|d| d.capped_reason.as_deref() == Some("time"));
-    if let Some(key) = datalog_key.filter(|_| owl_failed.is_none() && !capped_by_clock) {
+    if let Some((cache, key)) = cache
+        .zip(datalog_key)
+        .filter(|_| owl_failed.is_none() && !capped_by_clock)
+    {
         cache.insert(
             key,
             Arc::new(ReasoningResult {
@@ -456,7 +501,8 @@ pub async fn compute_derived_facts(
 
 /// What the OWL 2 RL closure of `base_db` gains when `base_db` holds a
 /// closed state (a previous closure's asserted and derived facts) plus
-/// `inserted`, the facts asserted since: the incremental counterpart of
+/// `inserted`, the facts asserted since. Rule definitions come from `asserted`,
+/// the assertion-only view at the same commit: the incremental counterpart of
 /// [`compute_derived_facts`] for a program that is OWL 2 RL alone.
 ///
 /// `None` when the program cannot be maintained this way: other modes or
@@ -464,6 +510,7 @@ pub async fn compute_derived_facts(
 /// in full instead.
 pub async fn compute_derived_facts_incremental(
     base_db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
     reasoning: &ReasoningModes,
     inserted: &[fluree_db_core::Flake],
     maintenance: fluree_db_reasoner::MaintenanceBounds,
@@ -479,7 +526,7 @@ pub async fn compute_derived_facts_incremental(
         maintenance,
         ..Default::default()
     };
-    match fluree_db_reasoner::reason_owl2rl_incremental(base_db, inserted, &opts).await {
+    match fluree_db_reasoner::reason_owl2rl_incremental(base_db, asserted, inserted, &opts).await {
         Ok(None) => Ok(None),
         Ok(Some(result)) => Ok(Some(DerivedFactsOutcome {
             overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
@@ -579,4 +626,112 @@ pub async fn explain_derived_facts(
         facts,
         not_replayed,
     })
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+    use fluree_db_reasoner::{ReasoningCacheKey, ReasoningDiagnostics};
+    use std::hash::{Hash, Hasher};
+
+    #[tokio::test]
+    async fn maintenance_bypasses_and_does_not_replace_owl_or_datalog_cache_entries() {
+        for datalog in [false, true] {
+            let mut snapshot =
+                LedgerSnapshot::genesis(&format!("uncached-maintenance-{datalog}:main"));
+            for (code, iri) in [
+                (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+                (4, "http://www.w3.org/2000/01/rdf-schema#"),
+                (100, "http://example.org/"),
+            ] {
+                snapshot
+                    .insert_namespace_code(code, iri.to_string())
+                    .unwrap();
+            }
+            let fact =
+                |s, p, o| Flake::new(s, p, FlakeValue::Ref(o), Sid::new(1, "id"), 1, true, None);
+            let mut builder = DerivedFactsBuilder::new();
+            builder.push(fact(
+                Sid::new(100, "Student"),
+                Sid::new(4, "subClassOf"),
+                Sid::new(100, "Person"),
+            ));
+            builder.push(fact(
+                Sid::new(100, "alice"),
+                Sid::new(3, "type"),
+                Sid::new(100, "Student"),
+            ));
+            let overlay = builder.build(FrozenSameAs::empty(), 1);
+            let db = GraphDbRef::new(&snapshot, 0, &overlay, 1);
+            let mut modes = ReasoningModes {
+                owl2rl: !datalog,
+                datalog,
+                ..Default::default()
+            };
+            if datalog {
+                modes.rules.push(serde_json::json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "where": {"@id": "?s", "@type": "ex:Student"},
+                    "insert": {"@id": "?s", "@type": "ex:Person"}
+                }));
+            }
+            let budget = reasoning_budget(&modes);
+            let rule_config_hash = if datalog {
+                let rules = crate::datalog_rules::load_rule_set(db, &modes.rules, None)
+                    .await
+                    .unwrap();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                "datalog-v3".hash(&mut h);
+                budget.config_hash().hash(&mut h);
+                modes.evaluation_time.hash(&mut h);
+                modes.owl2rl.hash(&mut h);
+                db.g_id.hash(&mut h);
+                Option::<GraphId>::None.hash(&mut h);
+                rules.content_hash().hash(&mut h);
+                h.finish()
+            } else {
+                ReasoningOptions {
+                    budget,
+                    ..Default::default()
+                }
+                .config_hash()
+            };
+            let key = ReasoningCacheKey {
+                ledger_id: snapshot.ledger_id.as_str().into(),
+                db_epoch: snapshot.t as u64,
+                to_t: db.t,
+                overlay_version: overlay.content_version().unwrap(),
+                ontology_epoch: snapshot.schema_epoch().unwrap_or(0),
+                rule_config_hash,
+            };
+            // Seed an intentionally empty cached result. Maintenance must
+            // compute the real Person fact and leave this query entry alone.
+            let sentinel = Arc::new(ReasoningResult::new(
+                DerivedFactsOverlay::empty(),
+                ReasoningDiagnostics::default(),
+            ));
+            global_reasoning_cache().insert(key.clone(), sentinel.clone());
+            let outcome = compute_derived_facts_uncached(
+                db,
+                &modes,
+                None,
+                None,
+                QueryRequest {
+                    tracker: None,
+                    cancellation: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                outcome.overlay.is_some_and(|o| !o.is_empty()),
+                "datalog={datalog}"
+            );
+            assert!(
+                Arc::ptr_eq(&global_reasoning_cache().peek(&key).unwrap(), &sentinel),
+                "datalog={datalog}"
+            );
+        }
+    }
 }

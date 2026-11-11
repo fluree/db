@@ -132,13 +132,18 @@ pub async fn populate_class_cache_in(
     // operator populates per batch and hydration re-asks per subject fetch, so
     // without this every subject pays the index lookup (a leaflet decode) at
     // least twice.
-    let uncached = policy_ctx.retain_uncached(state, subjects);
+    let mut uncached = policy_ctx.retain_uncached(state, subjects);
     if uncached.is_empty() {
         return Ok(());
     }
-    let class_map = lookup_subject_classes(&uncached, db).await?;
+    uncached.sort();
+    uncached.dedup();
+    let mut class_map = lookup_subject_classes(&uncached, db).await?;
 
-    for (subject, classes) in class_map {
+    // A completed lookup with no classes is also a cache hit. Otherwise
+    // untyped subjects pay for the same read at every policy check.
+    for subject in uncached {
+        let classes = class_map.remove(&subject).unwrap_or_default();
         policy_ctx.cache_subject_classes(state, subject, classes);
     }
 

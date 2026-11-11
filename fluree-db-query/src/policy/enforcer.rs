@@ -6,7 +6,6 @@ use super::QueryPolicyExecutor;
 use crate::error::Result;
 use fluree_db_core::{
     Flake, FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker,
-    TripleTermValue,
 };
 use fluree_db_policy::{is_schema_flake, is_schema_predicate, ClassState, PolicyContext};
 use std::sync::Arc;
@@ -298,16 +297,18 @@ impl QueryPolicyEnforcer {
         if !self.policy.wrapper().has_class_policies() {
             return Ok(());
         }
-        let mut subjects: Vec<Sid> = Vec::new();
-        for flake in flakes {
-            subjects.push(flake.s.clone());
-            let mut object = &flake.o;
-            while let FlakeValue::TripleTerm(term) = object {
-                let TripleTermValue { s, o, .. } = &**term;
-                subjects.push(s.clone());
-                object = o;
-            }
-        }
+        let subjects = flakes.iter().flat_map(|flake| {
+            let terms = std::iter::successors(Some(&flake.o), |object| match object {
+                FlakeValue::TripleTerm(term) => Some(&term.o),
+                _ => None,
+            })
+            .filter_map(|object| match object {
+                FlakeValue::TripleTerm(term) => Some(&term.s),
+                _ => None,
+            });
+            std::iter::once(&flake.s).chain(terms)
+        });
+        let mut subjects = self.policy.retain_uncached_iter(state, subjects);
         if subjects.is_empty() {
             return Ok(());
         }

@@ -262,6 +262,20 @@ pub async fn reason_owl2rl(
         return Ok(cached);
     }
 
+    let result = reason_owl2rl_uncached(db, opts).await?;
+    if let Some(key) = key {
+        cache.insert(key, result.clone());
+    }
+    Ok(result)
+}
+
+/// Compute a closure without reading or retaining a cross-query cache entry.
+/// Background maintenance uses this so large closures are released after writing.
+pub async fn reason_owl2rl_uncached(
+    db: GraphDbRef<'_>,
+    opts: &ReasoningOptions,
+) -> Result<Arc<ReasoningResult>> {
+    opts.validate()?;
     // Run fixpoint reasoning
     let (derived_flakes, same_as, diagnostics) = fixpoint::run_fixpoint(db, opts).await?;
 
@@ -274,27 +288,24 @@ pub async fn reason_owl2rl(
 
     let result = Arc::new(ReasoningResult::new(derived_overlay, diagnostics));
 
-    // Store in cache
-    if let Some(key) = key {
-        cache.insert(key, result.clone());
-    }
-
     Ok(result)
 }
 
 /// OWL 2 RL closure maintenance under insertions: what the closure of `db`
-/// gains when `db` holds a closed state plus `inserted`. `None` when the
+/// gains when `db` holds a closed state plus `inserted`. `asserted` supplies
+/// definitions from assertion-only data at the same commit. `None` when the
 /// program cannot be maintained this way (see
 /// [`fixpoint::run_fixpoint_incremental`]). Never cached: the result describes
 /// a change, not a state.
 pub async fn reason_owl2rl_incremental(
     db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
     inserted: &[fluree_db_core::Flake],
     opts: &ReasoningOptions,
 ) -> Result<Option<Arc<ReasoningResult>>> {
     opts.validate()?;
     let Some((derived_flakes, diagnostics)) =
-        fixpoint::run_fixpoint_incremental(db, inserted, opts).await?
+        fixpoint::run_fixpoint_incremental(db, asserted, inserted, opts).await?
     else {
         return Ok(None);
     };

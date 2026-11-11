@@ -438,7 +438,8 @@ impl FlureeServer {
         // Reasoning indexes are built where writes publish: here when this
         // server owns its ledgers, on the leader under Raft (spawned with
         // the leader's tasks), never on a peer.
-        let reasoning_indexes_task = (consensus == Consensus::Standalone
+        let reasoning_indexes_task = (self.state.config.reasoning_index_auto_refresh
+            && consensus == Consensus::Standalone
             && self.state.config.server_role != ServerRole::Peer)
             .then(|| {
                 tokio::spawn(
@@ -846,6 +847,7 @@ impl FlureeServerBuilder {
                 );
                 let backend = state_inner.fluree.backend().clone();
                 let bm25_auto_sync = state_inner.config.bm25_auto_sync;
+                let reasoning_index_auto_refresh = state_inner.config.reasoning_index_auto_refresh;
                 let bm25_fluree = Arc::clone(&state_inner.fluree);
                 // The leader-scope worker is the one that sweeps under raft
                 // (the node-scope worker every node builds through
@@ -909,9 +911,12 @@ impl FlureeServerBuilder {
                         tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
                     }
                     // Reasoning indexes publish through the nameservice too.
-                    tasks.push(tokio::spawn(
-                        fluree_db_api::ReasoningIndexWorker::new(Arc::clone(&bm25_fluree)).run(),
-                    ));
+                    if reasoning_index_auto_refresh {
+                        tasks.push(tokio::spawn(
+                            fluree_db_api::ReasoningIndexWorker::new(Arc::clone(&bm25_fluree))
+                                .run(),
+                        ));
+                    }
                     // A key rotation in progress continues on the new leader
                     // and is handed off when leadership is lost: the guard's
                     // drop, run by the abort, releases the record so the next

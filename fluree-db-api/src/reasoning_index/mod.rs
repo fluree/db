@@ -27,13 +27,15 @@ mod build;
 pub(crate) mod derived;
 pub(crate) mod program;
 pub(crate) mod serve;
+mod status;
+pub use status::ReasoningIndexFailure;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use build::{RefreshOutcome, ENTRY_GROWTH_BYTES, MAX_ACTIVE_INDEXES};
 #[cfg(not(target_arch = "wasm32"))]
-pub use worker::{ReasoningIndexWorker, DEFAULT_CATCHUP_INTERVAL};
+pub use worker::{ReasoningIndexWorker, DEFAULT_CATCHUP_INTERVAL, DEFAULT_RECONCILIATION_INTERVAL};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,6 +55,18 @@ pub(crate) struct LoadedGeneration {
 
 /// How many loaded generations an instance keeps.
 const LOADED_GENERATIONS: usize = 16;
+
+struct LoadedGenerations(
+    lru::LruCache<(String, ReasoningIndexId, ContentId), Arc<LoadedGeneration>>,
+);
+
+impl Default for LoadedGenerations {
+    fn default() -> Self {
+        Self(lru::LruCache::new(
+            std::num::NonZeroUsize::new(LOADED_GENERATIONS).unwrap(),
+        ))
+    }
+}
 
 /// How long superseded generations are kept, and how many an index may
 /// accumulate inside that window before publication waits.
@@ -81,7 +95,10 @@ impl Default for GenerationRetention {
 #[derive(Default)]
 pub(crate) struct ReasoningIndexState {
     flights: Mutex<HashSet<(String, ReasoningIndexId)>>,
-    loaded: Mutex<HashMap<(String, ReasoningIndexId), Arc<LoadedGeneration>>>,
+    loaded: Mutex<LoadedGenerations>,
+    failures: Mutex<HashMap<(String, ReasoningIndexId), status::Failure>>,
+    repairs: Mutex<HashMap<(String, ReasoningIndexId), ContentId>>,
+    serve_warnings: Mutex<HashMap<String, fluree_db_core::clock::Instant>>,
     retention: Mutex<GenerationRetention>,
     /// Ledgers that registered an index in this process since the worker last
     /// looked, and the signal that wakes it.
@@ -184,7 +201,7 @@ impl std::fmt::Debug for ReasoningIndexState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReasoningIndexState")
             .field("flights", &self.flights.lock().len())
-            .field("loaded", &self.loaded.lock().len())
+            .field("loaded", &self.loaded.lock().0.len())
             .finish()
     }
 }
@@ -311,9 +328,20 @@ impl ReasoningIndexState {
     }
 
     pub(crate) fn forget_index(&self, ledger_id: &str, index_id: &ReasoningIndexId) {
-        self.loaded
+        self.clear_failure(ledger_id, index_id);
+        self.repairs
             .lock()
             .remove(&(ledger_id.to_string(), index_id.clone()));
+        let mut loaded = self.loaded.lock();
+        let keys: Vec<_> = loaded
+            .0
+            .iter()
+            .filter(|((ledger, index, _), _)| ledger == ledger_id && index == index_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            loaded.0.pop(&key);
+        }
     }
 
     fn loaded(
@@ -324,8 +352,8 @@ impl ReasoningIndexState {
     ) -> Option<Arc<LoadedGeneration>> {
         self.loaded
             .lock()
-            .get(&(ledger_id.to_string(), index_id.clone()))
-            .filter(|g| &g.manifest_id == manifest_id)
+            .0
+            .get(&(ledger_id.to_string(), index_id.clone(), manifest_id.clone()))
             .cloned()
     }
 
@@ -336,11 +364,13 @@ impl ReasoningIndexState {
         generation: Arc<LoadedGeneration>,
     ) {
         let mut loaded = self.loaded.lock();
-        if loaded.len() >= LOADED_GENERATIONS {
-            if let Some(key) = loaded.keys().next().cloned() {
-                loaded.remove(&key);
-            }
-        }
-        loaded.insert((ledger_id.to_string(), index_id.clone()), generation);
+        loaded.0.put(
+            (
+                ledger_id.to_string(),
+                index_id.clone(),
+                generation.manifest_id.clone(),
+            ),
+            generation,
+        );
     }
 }

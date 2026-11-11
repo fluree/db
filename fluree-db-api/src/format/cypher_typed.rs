@@ -131,6 +131,7 @@ pub(crate) async fn typed_table(
 
     // A reasoning query's nodes render from the state its rows were read
     // and judged in. The batched lane reads the index alone, so it is off.
+    let view = result.read_view.as_ref().unwrap_or(view);
     let reasoned;
     let (view, gv) = match &result.reasoned_overlay {
         Some(overlay) => {

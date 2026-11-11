@@ -472,7 +472,7 @@ impl Fluree {
         // execution completes, so it cannot be re-run transparently and is
         // excluded on residency-mode peers.
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-        let (batches, plan_ms, exec_ms, served) = {
+        let (batches, plan_ms, exec_ms, read_view) = {
             let _ = &tracker;
             let residency_cs = residency_content_store(db);
             let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
@@ -514,7 +514,7 @@ impl Fluree {
             }
         };
         #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
-        let (batches, plan_ms, exec_ms, served) = self
+        let (batches, plan_ms, exec_ms, read_view) = self
             .plan_and_execute_round(db, &vars, &parsed, &tracker, &options)
             .await?;
 
@@ -526,7 +526,7 @@ impl Fluree {
         );
 
         // 5. Build result
-        let db = served.as_ref().unwrap_or(db);
+        let db = &read_view;
         Ok(build_query_result(
             vars,
             parsed,
@@ -534,7 +534,8 @@ impl Fluree {
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        ))
+        )
+        .with_read_view(db, None))
     }
 
     /// Execute a Cypher (openCypher 9 subset) query against a GraphDb.
@@ -735,9 +736,13 @@ impl Fluree {
         tracker: &Tracker,
     ) -> Result<QueryResult> {
         let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(tracker))
+            .await?;
+        let db = served.as_ref().unwrap_or(db);
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
@@ -766,7 +771,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
-        result.reasoned_overlay = reasoned_overlay;
+        result = result.with_read_view(db, reasoned_overlay);
         Ok(result)
     }
 
@@ -882,8 +887,8 @@ impl Fluree {
         let db = served.as_ref().unwrap_or(db);
 
         // 4. Execute
-        let batches = self
-            .execute_view_internal_with_r2rml(
+        let (batches, read) = self
+            .execute_view_read(
                 db,
                 &vars,
                 &executable,
@@ -905,6 +910,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
+        result = result.with_read_view(db, read);
         mark_graph_source_result(&mut result, db);
         Ok(result)
     }
@@ -1126,7 +1132,7 @@ impl Fluree {
         let db = served.as_ref().unwrap_or(db);
 
         // Execute with tracking
-        let batches =
+        let (batches, read) =
             Box::pin(self.execute_view_tracked(db, &vars, &executable, &tracker, &options))
                 .await
                 .map_err(|e| {
@@ -1142,7 +1148,8 @@ impl Fluree {
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        );
+        )
+        .with_read_view(db, read);
 
         // CONSTRUCT/DESCRIBE graph results must be formatted as JSON-LD.
         if query_result.output.construct_template().is_some()
@@ -1279,7 +1286,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
         let db = served.as_ref().unwrap_or(db);
 
-        let batches = self
+        let (batches, read) = self
             .execute_view_tracked_with_r2rml(db, &vars, &executable, &tracker, r2rml, &options)
             .await
             .map_err(|e| {
@@ -1295,6 +1302,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
+        query_result = query_result.with_read_view(db, read);
         mark_graph_source_result(&mut query_result, db);
 
         if query_result.output.construct_template().is_some()
@@ -1564,7 +1572,7 @@ impl Fluree {
         parsed: &fluree_db_query::ir::Query,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> Result<(Vec<crate::Batch>, f64, f64, Option<GraphDb>)> {
+    ) -> Result<(Vec<crate::Batch>, f64, f64, GraphDb)> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let mut executable = self
             .build_executable_for_view(db, parsed, options.server_identity.as_ref())
@@ -1575,20 +1583,27 @@ impl Fluree {
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
-        let batches = self
-            .execute_view_internal(
-                served.as_ref().unwrap_or(db),
+        let db = served.as_ref().unwrap_or(db);
+        let noop = crate::NoOpR2rmlProvider::new();
+        let (batches, read) = self
+            .execute_view_read(
+                db,
                 vars,
                 &executable,
                 tracker,
+                crate::R2rmlProviders {
+                    provider: &noop,
+                    table_provider: &noop,
+                },
                 options,
             )
             .await?;
+        let read_view = read.map_or_else(|| db.clone(), |overlay| db.reasoned(overlay));
         Ok((
             batches,
             plan_ms,
             exec_start.elapsed().as_secs_f64() * 1000.0,
-            served,
+            read_view,
         ))
     }
 
@@ -1694,6 +1709,22 @@ impl Fluree {
                 .await?,
         );
 
+        // A union is a multi-graph dataset even when the caller supplied one
+        // view. Hydration cannot yet retain each member's reasoned read state.
+        if !db.is_root()
+            && executable.query.union_default_graph == Some(true)
+            && executable.reasoning.modes.has_any_enabled()
+            && executable.query.output.has_hydration()
+        {
+            return Err(ApiError::Query(
+                fluree_db_query::QueryError::UnsupportedFeature(
+                    "a multi-graph crawl in a reasoning query under a view policy; \
+                     use a single-graph view, select variables, or query without reasoning"
+                        .to_string(),
+                ),
+            ));
+        }
+
         Ok(executable)
     }
 
@@ -1789,23 +1820,6 @@ impl Fluree {
         if strip_query_rules && !executable.reasoning.modes.rules.is_empty() {
             tracing::debug!("stripping query-time datalog rules under non-root view policy");
             executable.reasoning.modes.rules.clear();
-        }
-
-        // A graph crawl renders stored facts at formatting time and judges
-        // class policies on stored classes, so under reasoning it would miss
-        // derived facts and let a deny on a derived class through. Refused
-        // before the query is served or reasoned.
-        if strip_query_rules
-            && executable.reasoning.modes.has_any_enabled()
-            && executable.query.output.has_hydration()
-        {
-            return Err(ApiError::Query(
-                fluree_db_query::QueryError::UnsupportedFeature(
-                    "a graph crawl in a reasoning query under a view policy; select \
-                     variables instead, or query without reasoning"
-                        .to_string(),
-                ),
-            ));
         }
 
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
@@ -2174,7 +2188,13 @@ impl Fluree {
         executable: &ExecutableQuery,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+    ) -> std::result::Result<
+        (
+            Vec<crate::Batch>,
+            Option<std::sync::Arc<dyn fluree_db_core::OverlayProvider>>,
+        ),
+        fluree_db_query::QueryError,
+    > {
         let noop = crate::NoOpR2rmlProvider::new();
         self.execute_view_tracked_with_r2rml(
             db,
@@ -2198,7 +2218,13 @@ impl Fluree {
         tracker: &Tracker,
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
-    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+    ) -> std::result::Result<
+        (
+            Vec<crate::Batch>,
+            Option<std::sync::Arc<dyn fluree_db_core::OverlayProvider>>,
+        ),
+        fluree_db_query::QueryError,
+    > {
         // Record whether policy governs this request, before executing: the
         // state comes from the prepared view, so it is reported even when
         // execution returns no rows or fails part-way.
@@ -2237,7 +2263,14 @@ impl Fluree {
         );
         config.dataset = union.as_ref();
 
-        execute_prepared(db_ref, vars, prepared, config).await
+        let read = prepared.derived_overlay.clone().map(|derived| {
+            std::sync::Arc::new(fluree_db_query::ReasoningOverlay::shared(
+                std::sync::Arc::clone(&db.overlay),
+                derived,
+            )) as std::sync::Arc<dyn fluree_db_core::OverlayProvider>
+        });
+        let batches = execute_prepared(db_ref, vars, prepared, config).await?;
+        Ok((batches, read))
     }
 }
 

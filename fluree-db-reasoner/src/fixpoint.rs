@@ -49,14 +49,16 @@ pub async fn run_fixpoint(
     db: GraphDbRef<'_>,
     opts: &ReasoningOptions,
 ) -> Result<(Vec<Flake>, FrozenSameAs, ReasoningDiagnostics)> {
-    Ok(run(db, opts, None)
+    Ok(run(db, db, opts, None)
         .await?
         .expect("a full run always completes or caps"))
 }
 
 /// Maintain a closure under insertions: `db` holds a closed state (a
 /// previous closure's asserted and derived facts) plus `inserted`, the facts
-/// asserted since. Returns only what the closure gains.
+/// asserted since. `asserted` is the assertion-only view at the same commit,
+/// including any external schema, from which rule definitions are read.
+/// Returns only what the closure gains.
 ///
 /// Every rule fires from a delta fact in each of its premise positions and
 /// joins the rest against everything known, so seeding the delta with just
@@ -71,11 +73,12 @@ pub async fn run_fixpoint(
 /// compute the closure in full.
 pub async fn run_fixpoint_incremental(
     db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
     inserted: &[Flake],
     opts: &ReasoningOptions,
 ) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
     let start = Instant::now();
-    let out = run(db, opts, Some(inserted)).await?;
+    let out = run(db, asserted, opts, Some(inserted)).await?;
     tracing::debug!(
         returned_ms = start.elapsed().as_millis() as u64,
         "OWL 2 RL incremental fixpoint returned"
@@ -99,6 +102,7 @@ fn uses_identity_rules(ontology: &OntologyRL, restrictions: &RestrictionIndex) -
 
 async fn run(
     db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
     opts: &ReasoningOptions,
     inserted: Option<&[Flake]>,
 ) -> Result<Option<(Vec<Flake>, FrozenSameAs, ReasoningDiagnostics)>> {
@@ -107,15 +111,15 @@ async fn run(
     let mut diagnostics = ReasoningDiagnostics::default();
 
     // Extract OWL2-RL ontology (symmetric, transitive, inverse properties)
-    let ontology = OntologyRL::from_db_with_overlay(db).await?;
+    let ontology = OntologyRL::from_db_with_overlay(asserted).await?;
 
     // Extract OWL restrictions (hasValue, someValuesFrom, etc.)
-    let restrictions = extract_restrictions(db).await?;
+    let restrictions = extract_restrictions(asserted).await?;
 
     // Load sameAs assertions BEFORE checking if we have work to do
     // sameAs can exist even without symmetric/transitive/inverse declarations
     let mut same_as_tracker = SameAsTracker::new();
-    let same_as_pairs = load_same_as_assertions(db).await?;
+    let same_as_pairs = load_same_as_assertions(asserted).await?;
     let has_same_as = !same_as_pairs.is_empty();
     if inserted.is_some() && (has_same_as || uses_identity_rules(&ontology, &restrictions)) {
         return Ok(None);

@@ -2,7 +2,7 @@
 
 Query-time reasoning materializes a program's derived facts when a query asks
 for them, and again after every commit. **Materialized reasoning** persists
-that work: you register a reasoning program on a branch, a background worker
+that work: you register a reasoning program on a branch, an optional background worker
 keeps a **reasoning index** for it up to date, and reasoning queries that
 match the program are answered from that index as ordinary queries. Nothing is
 re-derived when the server restarts, and a reasoning budget never caps the
@@ -57,12 +57,39 @@ let index_id = fluree
     .await?;
 ```
 
-The server's background worker builds the index's first generation, and a new
-one after each commit. Every minute it also checks each index against what its
+Enable automatic maintenance with `--reasoning-index-auto-refresh`,
+`FLUREE_REASONING_INDEX_AUTO_REFRESH=true`, or
+`server.indexing.reasoning_index_auto_refresh = true` in the server configuration.
+It is off by default; explicit refresh works in either mode. The worker runs
+on standalone write servers or the Raft leader, never on peers. Rust embedders
+can run `ReasoningIndexWorker::new(fluree).run()` themselves.
+
+The background worker builds the index's first generation, and a new
+one after each commit. Every minute it also checks known indexes against what their
 program settles to now: a schema or rules source in another ledger can change
 without the branch moving, and the index is then rebuilt at the same commit.
 Until it is, queries no longer match it and reason at query time. A refresh
 that finds a storage sweep of the ledger running defers to the next one.
+Local registrations wake the worker immediately. A full discovery scan runs
+at startup and every 15 minutes to find registrations made by other processes.
+Ledgers share a FIFO queue, and commits for a queued ledger coalesce.
+
+Failed refreshes retry with exponential backoff from 5 seconds to 5 minutes,
+subject to the worker's one-minute retry tick. A new commit does not reset
+backoff, so a busy failing ledger cannot monopolize maintenance. Explicit
+refresh bypasses backoff, including after changing a budget or configuration.
+A failure in one registration does not prevent other indexes from refreshing.
+The list endpoint includes `maintenanceFailures` with each locally observed
+failure's reason, attempt count, failure time and retry time (Unix milliseconds).
+These diagnostics are process-local, clear after a successful refresh, and do
+not survive a restart. Rust callers can read `reasoning_index_failures`.
+
+Maintenance uses the same resolved reasoning budgets as queries: built-in
+limits, environment defaults, then the ledger/program settings permitted by
+override control. Without overrides, the defaults are one million facts,
+30 seconds, and a memory ceiling derived from the fact limit. Maintenance does
+not retain OWL or Datalog closures in the query cache. Loaded generations use
+a 16-entry LRU; embedders can adjust it with `set_reasoning_index_cache_capacity`.
 
 A new generation of an OWL 2 RL program is computed from its predecessor
 when the commits since only inserted data: only what those facts add to the
@@ -127,7 +154,7 @@ Tracked queries report the index and generation that answered in the
 "reasoning": {"index": {"indexId": "01JC...", "generation": 4, "basisT": 12, "basisCommit": "bafy..."}}
 ```
 
-JSON-LD, SPARQL and streaming queries are served from indexes, and so are
+JSON-LD, SPARQL, Cypher and streaming queries are served from indexes, and so are
 dataset queries whose graphs all belong to the one ledger. A dataset that
 reaches other ledgers reasons at query time.
 
@@ -147,8 +174,10 @@ read an older generation, which would also take its policy's class lookups and
 conditions back to that commit. A dataset is restricted when any of its graphs
 carries a policy. Query-supplied `rules` are stripped from a restricted request
 before an index is chosen, as they are at query time, so only stored and
-configured rules can match. A graph crawl in a reasoning query is refused under
-a policy, served or not.
+configured rules can match. Single-graph crawls retain the same snapshot,
+derived facts and policy as execution, both at query time and when served.
+Restricted reasoning crawls over datasets with multiple graphs, including
+`unionDefaultGraph`, remain unsupported; use a single-graph view or select variables.
 
 ## Freshness
 
@@ -188,3 +217,52 @@ each reasons at query time over indexes the other version computed, and only
 the newer version refreshes them. A refresh by the older one does nothing and
 reports `newerEngine`. After a downgrade, an index the newer version published
 stays unrefreshed: retire it and register its program again.
+
+## Storage and durability
+
+Each reasoning index stores a merged index of the entire asserted branch plus
+its closure, as well as a separate derived-only set used to maintain later
+generations. It is not just a compact cache of inferred triples. Storage cost
+depends on closure size, index layout, shared dictionaries and generation
+retention; it can be several times the asserted branch size. Each of the up to
+eight active programs can incur this cost and maintenance work after commits.
+
+A generation's manifest and artifacts are synced before its head is published,
+including publication retries. An unreadable generation falls back to
+query-time reasoning, emits a rate-limited warning, and requests maintenance.
+A refresh validates the current manifest/root before declaring it current.
+Repair rebuilds at the same commit and can detach a broken manifest chain;
+a persisted retention deadline defers both sweeping and shared-dictionary
+reclamation after detaching the chain, including across restarts. This protects
+files that readers may still hold before they become eligible for collection.
+
+Serving checks the registration's erasure floor for both current and retained
+`asOf` generations. This is a serving fence, not permanent deletion. Before
+combining reasoning indexes with retention, targeted removal or permanent
+erasure from PR #2280, that implementation must include `@reasoning` artifacts
+and retained generations in its purge protocol, or gate the combination in both
+directions. This branch does not implement that cross-PR purge integration.
+
+Engine semantics version 4 rebuilds generations from earlier engines, including
+ones whose incremental closure could have treated derived schema as new rules.
+
+## Rust API migration
+
+This feature changes the nameservice interfaces: custom implementations must
+implement reasoning-index reads and fenced compare-and-swap publication.
+No-op implementations cannot provide persistence or fencing guarantees.
+
+`run_stream_query` no longer takes its former `LedgerState` argument.
+`QueryResult`, `ReasoningTally`, and `ReasoningManifest` have new public fields; code constructing
+these structs directly must initialize them. `QueryResult::read_view` retains
+the snapshot, overlay and policy used for single-graph hydration. Prefer
+`format_async_for_view` when formatting API query results.
+
+The incremental reasoner entry points take both the closed state and the
+assertion-only view at the same commit. Pass external schema in the assertion
+view as well; derived schema in the closed state must not become new rules.
+
+When integrating PR #2271, preserve the reasoning pair-probe lane's eager
+materialization admission checks and clear `batched_pair_objects` whenever a
+batch is rerouted to per-row execution. Test both eager and fallback paths
+against the per-row oracle before enabling the combined optimization.

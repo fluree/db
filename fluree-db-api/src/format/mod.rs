@@ -333,6 +333,10 @@ pub fn format_results(
     snapshot: &LedgerSnapshot,
     config: &FormatterConfig,
 ) -> Result<JsonValue> {
+    let snapshot = result
+        .read_view
+        .as_ref()
+        .map_or(snapshot, |v| v.snapshot.as_ref());
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(
         config.format,
@@ -549,6 +553,15 @@ pub async fn format_results_async(
     policy: Option<&fluree_db_policy::PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
+    let db = result
+        .read_view
+        .as_ref()
+        .map_or(db, crate::view::GraphDb::as_graph_db_ref);
+    let policy = result
+        .read_view
+        .as_ref()
+        .and_then(|v| v.policy())
+        .or(policy);
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(config.format, OutputFormat::Tsv | OutputFormat::Csv) {
         return Err(FormatError::InvalidBinding(format!(
@@ -822,6 +835,7 @@ mod tests {
             binary_graph: None,
             from_graph_source: false,
             reasoned_overlay: None,
+            read_view: None,
             advisories: Vec::new(),
         }
     }
@@ -990,6 +1004,7 @@ mod tests {
             binary_graph: None,
             from_graph_source: false,
             reasoned_overlay: None,
+            read_view: None,
             advisories: Vec::new(),
         }
     }

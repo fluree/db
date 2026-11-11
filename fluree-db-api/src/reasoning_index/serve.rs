@@ -24,7 +24,9 @@
 
 use std::sync::Arc;
 
-use fluree_db_core::reasoning_index::{ReasoningIndexId, ReasoningManifest, RegistrationState};
+use fluree_db_core::reasoning_index::{
+    ReasoningIndexEntry, ReasoningIndexId, ReasoningManifest, RegistrationState,
+};
 use fluree_db_core::{BranchedContentStore, ContentId, ContentStore, ReasoningIndexTally};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::ir::{ReasoningConfig, ReasoningFreshness};
@@ -98,7 +100,8 @@ impl Fluree {
         match self.try_servable(db, reasoning, as_of).await {
             Ok(served) => served,
             Err(e) => {
-                tracing::debug!(ledger = %db.ledger_id, error = %e, "reasoning index not served");
+                self.reasoning_index_state
+                    .warn_serving(db.ledger_id.as_ref(), &e);
                 None
             }
         }
@@ -159,6 +162,7 @@ impl Fluree {
             };
             if !matches!(entry.registration.state, RegistrationState::Active)
                 || published.revision != entry.registration.revision
+                || published.basis.epoch < entry.floor
             {
                 continue;
             }
@@ -176,27 +180,49 @@ impl Fluree {
                 }
                 continue;
             }
-            if let Some((manifest_id, basis_t)) = self
-                .as_of_generation(
-                    &record,
-                    &view_commit,
-                    index_id,
-                    &published.manifest,
-                    &settled,
-                    db,
-                )
-                .await?
-            {
+            let historical = self
+                .as_of_generation(&record, &view_commit, index_id, entry, &settled, db)
+                .await;
+            let historical = match historical {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.reasoning_index_state.warn_serving(ledger_id, &error);
+                    self.reasoning_index_state.request_repair(
+                        ledger_id,
+                        index_id,
+                        &published.manifest,
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            };
+            if let Some((manifest_id, basis_t)) = historical {
                 candidates.push((basis_t, index_id, entry, manifest_id));
             }
         }
         candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
         for (_, index_id, entry, manifest_id) in candidates {
-            let generation = self
+            let generation = match self
                 .loaded_generation(&record, index_id, &manifest_id)
-                .await?;
+                .await
+            {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.reasoning_index_state.warn_serving(ledger_id, &error);
+                    if let Some(head) = &entry.head {
+                        self.reasoning_index_state.request_repair(
+                            ledger_id,
+                            index_id,
+                            &head.manifest,
+                            error.to_string(),
+                        );
+                    }
+                    continue;
+                }
+            };
             if generation.manifest.settled != settled
                 || generation.manifest.revision != entry.registration.revision
+                || generation.manifest.basis.epoch < entry.floor
             {
                 continue;
             }
@@ -224,15 +250,20 @@ impl Fluree {
         record: &NsRecord,
         view_commit: &ContentId,
         index_id: &ReasoningIndexId,
-        newest: &ContentId,
+        entry: &ReasoningIndexEntry,
         settled: &ContentId,
         db: &GraphDb,
     ) -> Result<Option<(ContentId, i64)>> {
+        let Some(head) = &entry.head else {
+            return Ok(None);
+        };
         let store = self.index_store(record, index_id).await?;
-        let generations =
-            fluree_db_indexer::gc::reasoning_indexes::index_generations(store.as_ref(), newest)
-                .await
-                .map_err(|e| ApiError::internal(format!("read index chain: {e}")))?;
+        let generations = fluree_db_indexer::gc::reasoning_indexes::index_generations(
+            store.as_ref(),
+            &head.manifest,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("read index chain: {e}")))?;
         let Some(oldest_t) = generations.iter().map(|g| g.manifest.basis.t).min() else {
             return Ok(None);
         };
@@ -247,6 +278,7 @@ impl Fluree {
             .into_iter()
             .find(|g| {
                 g.manifest.basis.t <= db.t
+                    && g.manifest.basis.epoch >= entry.floor
                     && &g.manifest.settled == settled
                     && line.on_line(&g.manifest.basis)
                     && db
@@ -266,7 +298,7 @@ impl Fluree {
         _record: &NsRecord,
         _view_commit: &ContentId,
         _index_id: &ReasoningIndexId,
-        _newest: &ContentId,
+        _entry: &ReasoningIndexEntry,
         _settled: &ContentId,
         _db: &GraphDb,
     ) -> Result<Option<(ContentId, i64)>> {

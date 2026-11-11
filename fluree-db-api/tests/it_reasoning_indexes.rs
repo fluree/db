@@ -2533,3 +2533,243 @@ async fn a_fact_derived_into_two_graphs_leaves_both_when_its_support_does() {
         );
     }
 }
+
+#[tokio::test]
+async fn hydration_keeps_the_execution_snapshot_and_derived_facts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/hydration-state:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+            {"@id": "ex:alice", "@type": "ex:Student", "ex:name": "Alice"}
+        ]}),
+    )
+    .await;
+    let query = json!({"@context": ctx(), "select": {"?p": ["*"]},
+        "where": {"@id": "?p", "@type": "ex:Person"}, "reasoning": "owl2rl"});
+    let original = fluree.db(id).await.unwrap();
+    let mut before = fluree
+        .query(&original, &query)
+        .await
+        .unwrap()
+        .format_async_for_view(&original, &fluree_db_api::format::FormatterConfig::jsonld())
+        .await
+        .unwrap();
+    assert!(before.to_string().contains("Alice"), "{before}");
+    assert!(before.to_string().contains("ex:Person"), "{before}");
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    // Deliberately format using the original, unindexed view.
+    let mut after = fluree
+        .query(&original, &query)
+        .await
+        .unwrap()
+        .format_async_for_view(&original, &fluree_db_api::format::FormatterConfig::jsonld())
+        .await
+        .unwrap();
+    // rdf:type values are an RDF set; binary and novelty scans can emit
+    // them in different orders.
+    let sort_types = |v: &mut JsonValue| {
+        v[0]["@type"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by_key(ToString::to_string);
+    };
+    sort_types(&mut before);
+    sort_types(&mut after);
+    assert_eq!(after, before);
+    let mut tracked = fluree
+        .graph(id)
+        .query()
+        .jsonld(&query)
+        .track_all()
+        .execute_tracked()
+        .await
+        .unwrap();
+    sort_types(&mut tracked.result);
+    assert_eq!(tracked.result, before);
+    assert!(tracked.reasoning.unwrap().index.is_some());
+}
+
+#[tokio::test]
+async fn incremental_definitions_exclude_schema_derived_by_the_previous_generation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/derived-schema:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:p", "rdfs:subPropertyOf": {"@id": "rdfs:subClassOf"}},
+            {"@id": "ex:A", "ex:p": {"@id": "ex:B"}}
+        ]}),
+    )
+    .await;
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:bob", "@type": "ex:A"}),
+        )
+        .await
+        .unwrap();
+    let query = json!({"@context": ctx(), "select": "?s", "where": {"@id": "?s", "@type": "ex:B"}, "reasoning": "owl2rl"});
+    let (expected, served) = rows(&fluree, id, &query).await;
+    assert!(expected.is_empty());
+    assert!(served.is_none());
+    let refreshed = fluree.refresh_reasoning_index(id, &index).await.unwrap();
+    assert!(matches!(refreshed, RefreshOutcome::Published { stats, .. }
+        if stats.closure == fluree_db_core::reasoning_index::ClosureMode::Incremental));
+    let (actual, served) = rows(&fluree, id, &query).await;
+    assert_eq!(actual, expected);
+    assert!(served.is_some());
+}
+
+#[tokio::test]
+async fn malformed_programs_are_rejected_before_registration() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/malformed-program:main";
+    fluree.create_ledger(id).await.unwrap();
+    for program in [
+        json!({"reasoning": "owl2rl", "reasoningBudget": {"maxFacts": "bad"}}),
+        json!({"reasoning": "unsupported-reasoning-mode"}),
+        json!({"reasoning": "owl2rl", "reasoningTime": "not-a-time"}),
+        json!({"reasoning": "datalog", "rules": [{"where": {"@id": "?s"}}]}),
+    ] {
+        assert!(
+            fluree.register_reasoning_index(id, &program).await.is_err(),
+            "{program}"
+        );
+    }
+    assert!(fluree
+        .reasoning_indexes(id)
+        .await
+        .unwrap()
+        .indexes
+        .is_empty());
+}
+
+#[tokio::test]
+async fn retracting_same_as_removes_propagated_facts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/retract-equality:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "owl:sameAs": {"@id": "ex:alias"}, "ex:name": "Alice"}
+        ]}),
+    )
+    .await;
+    let query = json!({"@context": ctx(), "select": "?name", "where": {"@id": "ex:alias", "ex:name": "?name"}, "reasoning": "owl2rl"});
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    assert_eq!(rows(&fluree, id, &query).await.0, vec![json!("Alice")]);
+    retract(
+        &fluree,
+        ledger,
+        json!({"@id": "ex:alice", "owl:sameAs": {"@id": "ex:alias"}}),
+    )
+    .await;
+    let expected = rows(&fluree, id, &query).await.0;
+    assert!(expected.is_empty());
+    let refreshed = fluree.refresh_reasoning_index(id, &index).await.unwrap();
+    assert!(matches!(refreshed, RefreshOutcome::Published { stats, .. }
+        if stats.closure == fluree_db_core::reasoning_index::ClosureMode::Full));
+    assert_eq!(rows(&fluree, id, &query).await.0, expected);
+}
+
+#[tokio::test]
+async fn a_refresh_honors_the_ledgers_budget_when_the_program_omits_one() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/configured-budget:main";
+    let ledger = ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+            {"@id": "ex:a", "@type": "ex:Student"},
+            {"@id": "ex:b", "@type": "ex:Student"},
+            {"@id": "ex:c", "@type": "ex:Student"}
+        ]}),
+    )
+    .await;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        GRAPH <urn:fluree:{id}#config> {{
+            <urn:config:main> a f:LedgerConfig ; f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningMaxFacts 1 .
+        }}
+    "
+        ))
+        .execute()
+        .await
+        .unwrap();
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+        RefreshOutcome::Failed { .. }
+    ));
+    assert!(fluree.reasoning_indexes(id).await.unwrap().indexes[&index]
+        .head
+        .is_none());
+    assert!(fluree.reasoning_index_failures(id).contains_key(&index));
+}
+
+#[tokio::test]
+async fn cypher_reads_a_matching_reasoning_generation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/cypher:main";
+    ledger_with(
+        &fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+            {"@id": "ex:alice", "@type": "ex:Student"}
+        ]}),
+    )
+    .await;
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    let db =
+        fluree.db(id).await.unwrap().with_reasoning(
+            fluree_db_query::ir::ReasoningModes::from_json(&json!("owl2rl")).unwrap(),
+        );
+    assert!(db.snapshot.index_root_id().is_none());
+    let result = fluree
+        .query_cypher(&db, "MATCH (n:`http://example.org/Person`) RETURN count(n)")
+        .await
+        .unwrap();
+    assert!(result
+        .read_view
+        .as_ref()
+        .unwrap()
+        .snapshot
+        .index_root_id()
+        .is_some());
+    let json = result
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .unwrap();
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(1));
+}

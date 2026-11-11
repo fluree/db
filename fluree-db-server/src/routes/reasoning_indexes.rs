@@ -54,6 +54,17 @@ pub struct RefreshResponse {
     pub results: Vec<RefreshResult>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListResponse {
+    #[serde(flatten)]
+    document: ReasoningIndexes,
+    maintenance_failures: std::collections::BTreeMap<
+        ReasoningIndexId,
+        fluree_db_api::reasoning_index::ReasoningIndexFailure,
+    >,
+}
+
 async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T> {
     let bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
         .await
@@ -103,7 +114,10 @@ pub async fn list(State(state): State<Arc<AppState>>, request: Request) -> Respo
             .reasoning_indexes(&req.ledger)
             .await
             .map_err(ServerError::Api)?;
-        Ok::<_, ServerError>(Json(doc))
+        Ok::<_, ServerError>(Json(ListResponse {
+            document: doc,
+            maintenance_failures: state.fluree.reasoning_index_failures(&req.ledger),
+        }))
     }
     .await
     .into_response()
