@@ -180,10 +180,15 @@ fn comparison_op(op: RowCmpOp) -> ComparisonOp {
 }
 
 /// `value` as a literal of `field`'s type that compares with it exactly, or
-/// why there is none. Only same-kind comparisons are accepted, so the row
-/// filter's answer is the one any SQL engine would give: an integer or decimal
-/// against an integer or decimal column, a string against a string column, a
-/// boolean against a boolean column.
+/// why there is none. Only same-kind comparisons are accepted: an integer or
+/// decimal against an integer or decimal column, a string against a string
+/// column, a boolean against a boolean column.
+///
+/// A float or double column compares as IEEE numbers, the way a SPARQL
+/// `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`.
+/// SQL engines that treat NaN as equal to itself and above every number
+/// (PostgreSQL, Spark) answer differently there; the filter agrees with the
+/// query language over the triples instead.
 fn typed_literal(field: &SchemaField, value: &SqlLiteral) -> Result<LiteralValue, String> {
     let ty = field.type_string().unwrap_or("a nested type");
     let column = &field.name;

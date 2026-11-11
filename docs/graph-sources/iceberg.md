@@ -560,6 +560,7 @@ FROM <table>
 
 - The table resolves the way an `rr:tableName` does (`namespace.table`).
 - Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive; quote a column whose name is a keyword.
+- A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
 - The select list does not shape the rows (the term maps choose the columns read), but a column it names must exist.
 - Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
 
