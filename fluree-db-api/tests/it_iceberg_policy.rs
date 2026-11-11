@@ -1549,3 +1549,54 @@ async fn a_governed_source_in_a_dataset_keeps_its_own_policy() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// A governed graph source named by `GRAPH` inside a query over one ledger
+/// keeps its own view policy.
+#[tokio::test]
+async fn a_governed_source_named_by_graph_keeps_its_own_policy() {
+    let fluree = setup().await;
+    let mut wrong = Vec::new();
+    for source in graph_governed_sources(&fluree).await {
+        let q = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "select": ["?s", "?n"],
+            "where": [["graph", source, { "@id": "?s", "ex:name": "?n" }]],
+        });
+        let got = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_formatted()
+            .await
+            .map_err(|e| e.to_string());
+        wrong.extend(
+            graph_scope_disagreements(
+                &fluree,
+                source,
+                vec![("JSON-LD from + graph".to_string(), got, None)],
+            )
+            .await,
+        );
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A query over one ledger naming an ungoverned graph source in a graph
+/// pattern answers as the source queried directly does, as before.
+#[tokio::test]
+async fn an_ungoverned_source_named_by_graph_answers_as_before() {
+    let fluree = setup().await;
+    let q = json!({
+        "@context": context(),
+        "from": NATIVE,
+        "select": ["?s", "?n"],
+        "where": [["graph", GS, { "@id": "?s", "ex:name": "?n" }]],
+    });
+    let got = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("ungoverned graph scope");
+    assert_eq!(result_len(&got), 5, "{got}");
+}
