@@ -113,7 +113,11 @@ macro_rules! view_context_config {
             tracker: Some($tracker),
             cancellation: $options.cancellation.clone(),
             policy_enforcer: __db.policy_enforcer().cloned(),
-            policy_source: __db.graph_source_id.clone(),
+            policy_source: Some(
+                __db.graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| ::std::sync::Arc::clone(&__db.ledger_id)),
+            ),
             r2rml: $r2rml,
             bm25_provider: Some(&__index_provider),
             binary_store: __db.binary_store.clone(),

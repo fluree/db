@@ -121,7 +121,11 @@ impl R2rmlPolicyGate {
                     &ctx.active_graph,
                     crate::dataset::ActiveGraph::Named(iri) if iri.as_ref() == graph_source_id
                 );
-                if in_graph_scope && ctx.policy_source.as_deref() != Some(graph_source_id) {
+                let other_policy = ctx
+                    .policy_source
+                    .as_deref()
+                    .is_some_and(|source| source != graph_source_id);
+                if in_graph_scope && other_policy {
                     return Err(QueryError::Policy(format!(
                         "Graph source '{graph_source_id}' is reached through a GRAPH scope of a \
                          query over another graph, whose view policy is not the source's own; \

@@ -260,9 +260,10 @@ pub struct ExecutionContext<'a> {
     /// When present, scan operators should use this for per-leaf batch filtering
     /// via `filter_flakes`. This provides full f:query support without deadlocks.
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
-    /// The graph source `policy_enforcer` was built for, when this query's
-    /// primary is a graph source. A graph-source scan outside a dataset reads
-    /// this context's policy only as that source's own.
+    /// The graph whose view policy `policy_enforcer` is: the query's primary
+    /// (a ledger or a graph source) when the caller resolves policy per
+    /// graph, `None` when it does not. A graph-source scan outside a dataset
+    /// reads this context's policy only when it is that source's own.
     pub policy_source: Option<Arc<str>>,
     /// Optional BM25 index provider for `Pattern::IndexSearch` (legacy, returns raw index)
     pub bm25_provider: Option<&'a dyn Bm25IndexProvider>,

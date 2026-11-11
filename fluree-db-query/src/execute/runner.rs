@@ -752,8 +752,8 @@ pub struct ContextConfig<'a, 'b> {
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
     /// Access the raw PolicyContext via `enforcer.policy()` if needed.
     pub policy_enforcer: Option<Arc<crate::policy::QueryPolicyEnforcer>>,
-    /// The graph source `policy_enforcer` was built for, when the query's
-    /// primary is one (see [`ExecutionContext::policy_source`]).
+    /// The graph whose view policy `policy_enforcer` is (see
+    /// [`ExecutionContext::policy_source`]).
     pub policy_source: Option<Arc<str>>,
     pub dataset: Option<&'a DataSet<'a>>,
     pub r2rml: Option<(
