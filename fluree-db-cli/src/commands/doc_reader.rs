@@ -12,7 +12,8 @@ use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_doc::reader::{Credential, Read, ReaderClient, Session, CACHE_MODES};
-use fluree_db_doc::{DocCache, PreparedDocument, ReaderEndpoint};
+use fluree_db_doc::{DocCache, DocError, PreparedDocument, ReaderEndpoint};
+use std::sync::{Arc, Mutex};
 
 /// What every document of a run is read with, and what the run reports
 /// about its catalog.
@@ -21,11 +22,17 @@ pub struct ReaderSetup {
     pub catalog_counts: Vec<(String, usize)>,
     /// The credential is the account sign-in, renewed per document.
     account: bool,
+    /// Why renewing a refused sign-in failed, kept whole for the error.
+    renewal_failed: Arc<Mutex<Option<CliError>>>,
 }
 
 /// The reader's URL and credential: the slot's own (`url`, `api_key` in
 /// `auth_header`), or with `account = true` this machine's `fluree login`,
 /// whose API is the default URL.
+///
+/// The sign-in's token goes only to the account's own API: a `url` on
+/// another scheme, host or port is refused, since `[doc.reader]` may come
+/// from a project's `.fluree/config.toml` that a cloned repository carries.
 pub async fn resolve(endpoint: &ReaderEndpoint) -> CliResult<(String, Option<Credential>)> {
     if !endpoint.account {
         return Ok((endpoint.url.clone(), Credential::from_endpoint(endpoint)));
@@ -33,10 +40,32 @@ pub async fn resolve(endpoint: &ReaderEndpoint) -> CliResult<(String, Option<Cre
     let session = account_session(false).await?;
     let url = if endpoint.url.trim().is_empty() {
         format!("{}/grounding", session.api_base_url.trim_end_matches('/'))
+    } else if same_origin(&endpoint.url, &session.api_base_url) {
+        endpoint.url.trim().to_string()
     } else {
-        endpoint.url.clone()
+        return Err(CliError::Config(format!(
+            "[doc.reader] url {} is not on the signed-in account's API ({}), and with \
+             `account = true` the sign-in's token is sent only there\n  hint: remove `url` \
+             to use the account's reader, or give this reader its own `api_key` instead of `account`",
+            endpoint.url.trim(),
+            session.api_base_url
+        )));
     };
     Ok((url, Some(Credential::Bearer(session.access_token))))
+}
+
+/// Whether `a` and `b` share scheme, host and port.
+fn same_origin(a: &str, b: &str) -> bool {
+    let origin = |u: &str| {
+        reqwest::Url::parse(u.trim()).ok().map(|u| {
+            (
+                u.scheme().to_string(),
+                u.host_str().map(str::to_string),
+                u.port_or_known_default(),
+            )
+        })
+    };
+    matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// The sign-in's token; with `force`, renewed even if it has time left.
@@ -95,12 +124,32 @@ pub async fn setup(
     let sources: Vec<Source> = catalog.iter().map(|s| Source::parse(s)).collect();
     let loaded = doc_sources::load_catalog(&sources, dirs).await?;
     let (url, credential) = resolve(endpoint).await?;
-    let client = ReaderClient::with_credential(&url, credential);
+    let renewal_failed = Arc::new(Mutex::new(None));
+    let mut client = ReaderClient::with_credential(&url, credential);
+    if endpoint.account {
+        // The account refused its token (most often `config_stale`: its
+        // configuration changed after the token was issued): the client
+        // renews it once and resends the refused call alone. It runs on the
+        // reading's blocking thread, so it can wait on the runtime.
+        let runtime = tokio::runtime::Handle::current();
+        let failed = renewal_failed.clone();
+        client = client.with_renewal(Box::new(move || {
+            match runtime.block_on(account_session(true)) {
+                Ok(session) => Ok(Credential::Bearer(session.access_token)),
+                Err(e) => {
+                    let message = format!("renewing the sign-in: {e}");
+                    *failed.lock().expect("renewal lock") = Some(e);
+                    Err(DocError::Config(message))
+                }
+            }
+        }));
+    }
     let session = Session::new(client, model, cache, ontology, loaded.graph, doc_cache)?;
     Ok(ReaderSetup {
         session,
         catalog_counts: loaded.counts,
         account: endpoint.account,
+        renewal_failed,
     })
 }
 
@@ -112,26 +161,17 @@ pub fn read_document(
     requests_to: Option<&std::path::Path>,
 ) -> CliResult<Read> {
     let on_wait = |wait: &str| eprintln!("    {} {wait}", "…".dimmed());
-    let first = setup.session.read(doc, requests_to, &on_wait);
-    // The account's token was refused (most often `config_stale`: its
-    // configuration changed after the token was issued): renew it once and
-    // read again. Calls already answered come from the cache, if there is one.
-    let result = match first {
-        Err(fluree_db_doc::DocError::Endpoint { status: 401, .. }) if setup.account => {
-            let session = tokio::runtime::Handle::current().block_on(account_session(true))?;
-            setup
-                .session
-                .client
-                .set_credential(Some(Credential::Bearer(session.access_token)));
-            setup.session.read(doc, requests_to, &on_wait)
+    // A refused sign-in is renewed by the client, per call (see `setup`).
+    setup.session.read(doc, requests_to, &on_wait).map_err(|e| {
+        if let Some(failed) = setup.renewal_failed.lock().expect("renewal lock").take() {
+            return failed;
         }
-        other => other,
-    };
-    result.map_err(|e| match e.to_string() {
-        m if setup.account && m.contains(": 401 ") => CliError::Config(format!(
-            "{m}\n  hint: the sign-in was refused; run `fluree login` again"
-        )),
-        _ => CliError::from(e),
+        match e {
+            DocError::Endpoint { status: 401, .. } if setup.account => CliError::Config(format!(
+                "{e}\n  hint: the sign-in was refused; run `fluree login` again"
+            )),
+            e => CliError::from(e),
+        }
     })
 }
 

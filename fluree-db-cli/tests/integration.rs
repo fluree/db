@@ -7701,3 +7701,319 @@ fn doc_read_through_the_account_renews_a_stale_token_once() {
         .unwrap()
         .contains(&fresh));
 }
+
+/// A JWT that expires in `secs` (inside the sign-in's refresh margin when
+/// under a minute), told apart by `tag`.
+fn jwt_expiring_in(secs: i64, tag: &str) -> String {
+    use base64::Engine;
+    let enc = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    format!(
+        "{}.{}.{tag}",
+        enc(serde_json::json!({"alg": "none"})),
+        enc(serde_json::json!({"exp": now + secs, "sub": "acct"}))
+    )
+}
+
+/// `account.toml` for a sign-in whose API is `api_base` and whose token
+/// exchange is `exchange_url`.
+fn write_account(home: &std::path::Path, api_base: &str, exchange_url: &str, token: &str) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{api_base}\"\napi_base_url = \"{api_base}/v1\"\nexchange_url = \"{exchange_url}\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn request_paths(seen: &StubLog) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|(head, _)| head.split_whitespace().nth(1).unwrap_or("").to_string())
+        .collect()
+}
+
+fn config_stale() -> serde_json::Value {
+    serde_json::json!({ "__status": 401, "body": { "error": { "message": "Configuration updated, please refresh token", "status": 401, "error": "config_stale" } } })
+}
+
+/// A 401 partway through a document of several calls renews the sign-in
+/// and resends the refused call alone: the call already answered is not
+/// sent (or billed) again, and the run reports the two calls it made.
+#[test]
+fn doc_ingest_through_the_account_resends_only_the_refused_call() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Two calls' worth of text.
+    let mut memo = std::fs::read_to_string(tmp.path().join("docs/memo.md")).unwrap();
+    while memo.len() < 70_000 {
+        memo.push_str(
+            "\nThe board reviewed the quarterly staffing plan in detail and agreed on it.\n",
+        );
+    }
+    std::fs::write(tmp.path().join("docs/memo.md"), memo).unwrap();
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (url, seen) = spawn_stub_reader(vec![
+        stub_reading(0.9, true),
+        config_stale(),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        stub_reading(0.9, true),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reading: 2 call(s), 2,064 tokens"));
+    assert_eq!(
+        request_paths(&seen),
+        vec![
+            "/v1/grounding",
+            "/v1/grounding",
+            "/v1/oauth/exchange",
+            "/v1/grounding"
+        ]
+    );
+    let seen = seen.lock().unwrap();
+    assert!(seen[3]
+        .0
+        .contains(&format!("authorization: bearer {}", fresh.to_lowercase())));
+}
+
+/// A sign-in refused again after its renewal is an error that says to sign
+/// in again; it is renewed only once.
+#[test]
+fn doc_read_through_the_account_refused_twice_says_to_sign_in_again() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (url, seen) = spawn_stub_reader(vec![
+        config_stale(),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        config_stale(),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("401"))
+        .stderr(predicate::str::contains(
+            "hint: the sign-in was refused; run `fluree login` again",
+        ));
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange", "/v1/grounding"]
+    );
+}
+
+/// A reader with its own key that answers 401 is sent one request: no
+/// sign-in is renewed, though this machine is signed in, and the hint
+/// about signing in is not given.
+#[test]
+fn doc_read_with_its_own_key_is_not_renewed_on_a_401() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![config_stale()]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_API_KEY", "k-123")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("401"))
+        .stderr(predicate::str::contains("fluree login").not());
+    assert_eq!(request_paths(&seen), vec!["/extract"]);
+}
+
+/// A 502 whose message mentions a 401 upstream is not a refused sign-in.
+#[test]
+fn doc_read_through_the_account_gives_the_sign_in_hint_only_for_a_401() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![serde_json::json!({
+        "__status": 502,
+        "body": { "error": "upstream_error", "message": "401 Unauthorized from model host" }
+    })]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("502"))
+        .stderr(predicate::str::contains("fluree login").not());
+    assert_eq!(request_paths(&seen), vec!["/v1/grounding"]);
+}
+
+/// An ingest renews a token about to expire before each document, so a run
+/// longer than the token keeps going: each document's call carries the
+/// token renewed just before it.
+#[test]
+fn doc_ingest_through_the_account_renews_the_token_before_each_document() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::copy(
+        tmp.path().join("docs/memo.md"),
+        tmp.path().join("docs/memo-2.md"),
+    )
+    .unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    // Every token the exchange hands out is inside the refresh margin, so
+    // each renewal exchanges again.
+    let tokens: Vec<String> = (0..4)
+        .map(|i| jwt_expiring_in(30, &format!("t{i}")))
+        .collect();
+    let (exchange, exchanged) = spawn_stub_reader(
+        tokens
+            .iter()
+            .map(|t| serde_json::json!({ "access_token": t, "token_type": "Bearer", "expires_in": 30 }))
+            .collect(),
+    );
+    let home = tmp.path().join("home");
+    write_account(&home, &base, &exchange, &jwt_expiring_in(30, "t-old"));
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .success();
+    let bearer = |head: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix("authorization: bearer "))
+            .unwrap_or("")
+            .to_string()
+    };
+    let sent: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(h, _)| bearer(h))
+        .collect();
+    assert_eq!(sent.len(), 2, "one call per document");
+    assert_ne!(sent[0], sent[1], "the second document has a renewed token");
+    let issued: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+    let n = exchanged.lock().unwrap().len();
+    assert!(n >= 3, "an exchange at setup and before each document: {n}");
+    for token in &sent {
+        assert!(issued[..n].contains(token), "{token} was not exchanged");
+    }
+}
+
+/// With `account = true` the sign-in's token goes only to the account's
+/// own API: a project config's `url` on another host is refused before
+/// anything is sent; one on the account's API, any path, is used.
+#[test]
+fn doc_read_through_the_account_refuses_a_url_off_the_accounts_api() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (account_url, account_seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = account_url.trim_end_matches("/extract").to_string();
+    let (foreign, foreign_seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    let config = tmp.path().join(".fluree/config.toml");
+    let project = std::fs::read_to_string(&config).unwrap();
+    let read = |url: &str| {
+        std::fs::write(
+            &config,
+            format!("{project}\n[doc.reader]\naccount = true\nurl = \"{url}\"\nmodels = [\"stub-reader\"]\n"),
+        )
+        .unwrap();
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read(&foreign)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "is not on the signed-in account's API",
+        ));
+    assert!(foreign_seen.lock().unwrap().is_empty());
+    assert!(account_seen.lock().unwrap().is_empty());
+
+    read(&format!("{base}/v1/reader")).assert().success();
+    assert_eq!(request_paths(&account_seen), vec!["/v1/reader"]);
+}
