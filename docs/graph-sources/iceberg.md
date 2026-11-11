@@ -1307,6 +1307,12 @@ with `400` `err:db/InvalidQuery`, governed source or not: name the source in
 `from-named` (SPARQL: `FROM NAMED <iri>`) and use `GRAPH <iri>` or
 `VALUES ?g { <iri> }`.
 
+Not supported: **`f:query`** policies. A virtual source has no graph to run the
+policy query against, so a targeted `f:query` evaluates as "no rows" and
+denies its targets — it never falls open. Relationship gates that join the
+requesting identity to the row (`fluree model access … --connected`) fall in
+this category. Write verbs do not apply; the source is read-only.
+
 ### Class policies over subjects several rows mint
 
 A row shows its own map's classes and the classes it derives. A subject can
@@ -1340,12 +1346,6 @@ only when the deriving template could mint it.
 A declared key (or an Iceberg table's identifier fields) is trusted here, as
 it is for [set semantics](r2rml.md#declaring-a-tables-keys-fkey): a table that
 breaks it is decided as if each subject were one row's.
-
-Not supported: **`f:query`** policies. A virtual source has no graph to run the
-policy query against, so a targeted `f:query` evaluates as "no rows" and
-denies its targets — it never falls open. Relationship gates that join the
-requesting identity to the row (`fluree model access … --connected`) fall in
-this category. Write verbs do not apply; the source is read-only.
 
 ### Where policies live: the model ledger
 
