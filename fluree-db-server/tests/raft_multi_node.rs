@@ -2326,11 +2326,12 @@ async fn every_replica_acknowledges_a_removal() {
     }
 }
 
-/// A replica that cannot reach a quorum cannot confirm its journal is
-/// current: it stops serving the enabled ledger's history (current reads
-/// continue), and a removal names the replicas that did not apply it.
+/// A removal names the replicas that did not apply it. A replica cut off
+/// from the quorum serves history from the journal it has learned, waiting
+/// on no leader: the removals it applied stay refused, and the rest of the
+/// ledger's history is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unconfirmed_replica_stops_serving_history() {
+async fn a_replica_without_a_quorum_serves_history_from_its_journal() {
     init_test_tracing();
     let mut cluster =
         TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
@@ -2367,10 +2368,10 @@ async fn an_unconfirmed_replica_stops_serving_history() {
         "{receipt}"
     );
 
-    // Without a quorum the last follower has no leader to confirm against.
     cluster.shutdown_node(leader).await;
+    let (status, body) = cluster.names_as_of(last, ledger, "b", 3).await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
     let (status, body) = cluster.names_as_of(last, ledger, "c", 3).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.to_string().contains("ReplicaNotCurrent"), "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(cluster.query_names(last, ledger).await, vec!["C"]);
 }
