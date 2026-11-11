@@ -524,7 +524,13 @@ async fn a_cached_branch_behind_its_head_is_caught_up() {
 #[tokio::test]
 async fn a_cached_branch_whose_history_was_rewritten_is_loaded_again() {
     let dir = tempfile::tempdir().unwrap();
-    let fluree = file_fluree(&dir).await;
+    // No background builds: one of the line the rebase replaces, published
+    // after it, would leave reconciliation nothing it may decide from.
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build_async()
+        .await
+        .expect("build");
     fluree.create_ledger("garbage").await.unwrap();
     transact_cached(&fluree, "garbage:main", &insert("alice")).await;
     fluree
@@ -536,7 +542,12 @@ async fn a_cached_branch_whose_history_was_rewritten_is_loaded_again() {
     }
     transact_cached(&fluree, "garbage:main", &insert("dave")).await;
     // An unlocked writer records nothing: reconciliation finds the line.
-    let other = unseen_writer(&dir).await;
+    let other = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_storage_lock()
+        .without_indexing()
+        .build_async()
+        .await
+        .expect("build");
     let report = other
         .rebase_branch("garbage", "dev", ConflictStrategy::default())
         .await
@@ -549,4 +560,66 @@ async fn a_cached_branch_whose_history_was_rewritten_is_loaded_again() {
         .unwrap()
         .expect("settled");
     assert_eq!(report.recorded, 4, "{report:?}");
+}
+
+/// An index of a branch's line built before a rebase and published after it
+/// holds the commits the rebase replaced and misses the new line's. Until a
+/// build replaces it, reconciliation decides nothing from it, so collection
+/// deletes nothing the branch holds; once rebuilt, it goes on.
+#[tokio::test]
+async fn an_index_of_a_replaced_line_decides_no_garbage() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build_async()
+        .await
+        .expect("build");
+    fluree.create_ledger("garbage").await.unwrap();
+    transact_cached(&fluree, "garbage:main", &insert("alice")).await;
+    fluree
+        .create_branch("garbage", "dev", None, None)
+        .await
+        .unwrap();
+    for name in ["bob", "carol"] {
+        transact_cached(&fluree, "garbage:dev", &insert(name)).await;
+    }
+    transact_cached(&fluree, "garbage:main", &insert("dave")).await;
+    let before = fluree
+        .nameservice()
+        .lookup("garbage:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.branched_content_store("garbage:dev").await.unwrap(),
+        "garbage:dev",
+        &before,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let report = fluree
+        .rebase_branch("garbage", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 2);
+    crate::support::publish_built_index(&fluree, "garbage:dev", stale.index_t, &stale.root_id)
+        .await;
+    fluree.disconnect_ledger("garbage:dev").await;
+
+    assert!(fluree.reconcile_garbage("garbage").await.unwrap().is_none());
+    fluree.collect_garbage(Duration::ZERO).await.unwrap();
+    let verified = fluree.verify_ledger("garbage:dev", None).await.unwrap();
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+
+    crate::support::build_and_publish_index(&fluree, "garbage:dev").await;
+    fluree.disconnect_ledger("garbage:dev").await;
+    fluree
+        .reconcile_garbage("garbage")
+        .await
+        .unwrap()
+        .expect("settled once rebuilt");
+    fluree.collect_garbage(Duration::ZERO).await.unwrap();
+    let verified = fluree.verify_ledger("garbage:dev", None).await.unwrap();
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
 }

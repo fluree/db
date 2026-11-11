@@ -91,6 +91,12 @@ impl Fluree {
                 tracing::warn!(ledger = %record.ledger_id, "txn-meta lacks the head commit; garbage left alone");
                 return Ok(None);
             }
+            // Until a build replaces it, an index of a line a rebase
+            // replaced holds that line's commits and misses the head's.
+            if !indexes_line(&state, store.as_ref(), &loaded).await? {
+                tracing::warn!(ledger = %record.ledger_id, "the index is of another line; garbage left alone");
+                return Ok(None);
+            }
             let mut branch = Branch {
                 folders: folders(record, &records),
                 record: record.clone(),
@@ -609,6 +615,30 @@ fn current(state: &LedgerState) -> RangeOptions {
     RangeOptions::default()
         .with_to_t(state.t())
         .with_flake_limit(1)
+}
+
+/// Whether `state`'s index is of the line through `head`: it holds the
+/// commit that line has at the index's `t`.
+async fn indexes_line(
+    state: &LedgerState,
+    store: &dyn fluree_db_core::ContentStore,
+    head: &ContentId,
+) -> Result<bool> {
+    if state.index_t() <= 0 {
+        return Ok(true);
+    }
+    let above = fluree_db_core::collect_first_parent_cids(store, head, state.index_t()).await?;
+    let base = match above.last() {
+        Some((_, oldest)) => {
+            let envelope = fluree_db_core::load_commit_envelope_by_id(store, oldest).await?;
+            match envelope.parents.into_iter().next() {
+                Some(parent) => parent,
+                None => return Ok(true),
+            }
+        }
+        None => head.clone(),
+    };
+    has_commit(state, &base).await
 }
 
 async fn has_commit(state: &LedgerState, id: &ContentId) -> Result<bool> {
