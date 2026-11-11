@@ -752,6 +752,9 @@ pub struct ContextConfig<'a, 'b> {
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
     /// Access the raw PolicyContext via `enforcer.policy()` if needed.
     pub policy_enforcer: Option<Arc<crate::policy::QueryPolicyEnforcer>>,
+    /// The graph source `policy_enforcer` was built for, when the query's
+    /// primary is one (see [`ExecutionContext::policy_source`]).
+    pub policy_source: Option<Arc<str>>,
     pub dataset: Option<&'a DataSet<'a>>,
     pub r2rml: Option<(
         &'b dyn crate::r2rml::R2rmlProvider,
@@ -968,6 +971,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);
     }
+    ctx.policy_source = config.policy_source;
     if let Some(dataset) = patched_dataset.as_ref().or(config.dataset) {
         ctx = ctx.with_dataset(dataset);
     }

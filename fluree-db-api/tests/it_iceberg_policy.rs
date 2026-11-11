@@ -1581,6 +1581,38 @@ async fn a_governed_source_named_by_graph_keeps_its_own_policy() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A graph variable bound to a graph source's IRI reaches the source through
+/// a graph scope no `from-named` declared, under the policy of the ledger the
+/// query reads: it is refused, naming the source and `from-named`, for a
+/// governed source and, since the scope cannot tell, an ungoverned one alike.
+/// Named in `from-named`, the same query answers under the source's own
+/// policy.
+#[tokio::test]
+async fn a_graph_variable_bound_to_a_graph_source_is_refused_outside_the_dataset() {
+    let fluree = setup().await;
+    let mut sources = graph_governed_sources(&fluree).await;
+    sources.push(GS);
+    let mut wrong = Vec::new();
+    for source in sources {
+        let q = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "select": ["?s", "?n"],
+            "where": [
+                // The source's name as a string, which a graph scope reads as
+                // the graph's name.
+                ["values", ["?g", [source]]],
+                ["graph", "?g", { "@id": "?s", "ex:name": "?n" }]
+            ],
+        });
+        match fluree.query_from().jsonld(&q).execute_formatted().await {
+            Err(e) if e.to_string().contains(source) && e.to_string().contains("from-named") => {}
+            other => wrong.push(format!("{source}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A query over one ledger naming an ungoverned graph source in a graph
 /// pattern answers as the source queried directly does, as before.
 #[tokio::test]
