@@ -100,9 +100,15 @@ async fn account_session(force: bool) -> CliResult<crate::account::AccountSessio
 /// Renew an account credential before a document is read, so a run longer
 /// than the hourly token keeps going. A no-op for a slot's own key, and
 /// cheap otherwise: the token is refreshed only when it is about to expire.
-pub async fn renew(setup: &ReaderSetup) -> CliResult<()> {
+///
+/// A renewal that fails is [`ReadFailure::Run`], as one refused mid-call
+/// is: the token is about to expire, so every later document would need
+/// the same renewal first.
+pub async fn renew(setup: &ReaderSetup) -> Result<(), ReadFailure> {
     if setup.account {
-        let session = account_session(false).await?;
+        let session = account_session(false)
+            .await
+            .map_err(|e| ReadFailure::Run(e.context("renewing the sign-in")))?;
         setup
             .session
             .client
@@ -167,25 +173,53 @@ pub async fn setup(
     })
 }
 
+/// Why a document's read failed, and so whether a run of several goes on.
+/// `doc ingest` keeps one rule for every failure: one of this document
+/// marks it ✗ and the next document is read; one that every remaining
+/// document is sure to meet too ends the run with a single message, rather
+/// than a ✗ (and a refused call) for each.
+pub enum ReadFailure {
+    /// This document's own: a refused or bad answer, a reading that won't
+    /// parse.
+    Document(CliError),
+    /// One the next document would meet too (see [`read_document`]).
+    Run(CliError),
+}
+
+impl From<ReadFailure> for CliError {
+    fn from(failure: ReadFailure) -> Self {
+        match failure {
+            ReadFailure::Document(e) | ReadFailure::Run(e) => e,
+        }
+    }
+}
+
 /// Read one parsed document, saying each wait for capacity on stderr.
 /// Blocking, so run it on a blocking thread.
+///
+/// A sign-in that was refused and could not be renewed ends the run
+/// ([`ReadFailure::Run`]): its stored token still looks valid, so every
+/// later document would send a refused call and a failing renewal of its
+/// own.
 pub fn read_document(
     setup: &ReaderSetup,
     doc: &PreparedDocument,
     requests_to: Option<&std::path::Path>,
-) -> CliResult<Read> {
+) -> Result<Read, ReadFailure> {
     let on_wait = |wait: &str| eprintln!("    {} {wait}", "…".dimmed());
     // A refused sign-in is renewed by the client, per call (see `setup`).
     setup.session.read(doc, requests_to, &on_wait).map_err(|e| {
         if let Some(failed) = setup.renewal_failed.lock().expect("renewal lock").take() {
-            return failed;
+            return ReadFailure::Run(
+                failed.context("the reader refused the sign-in, and renewing it failed"),
+            );
         }
-        match e {
+        ReadFailure::Document(match e {
             DocError::Endpoint { status: 401, .. } if setup.account => CliError::Config(format!(
                 "{e}\n  hint: the sign-in was refused; run `fluree login` again"
             )),
             e => CliError::from(e),
-        }
+        })
     })
 }
 

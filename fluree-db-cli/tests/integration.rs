@@ -8088,6 +8088,114 @@ fn doc_read_through_the_account_renews_a_refused_token_or_says_the_sign_in_is_go
     );
 }
 
+/// Two documents to ingest: `docs/memo.md` and a copy of it.
+fn two_memos(tmp: &TempDir) {
+    std::fs::copy(
+        tmp.path().join("docs/memo.md"),
+        tmp.path().join("docs/memo-2.md"),
+    )
+    .unwrap();
+}
+
+fn ingest_through_the_account(tmp: &TempDir, home: &std::path::Path) -> Command {
+    let mut cmd = fluree_cmd(tmp);
+    cmd.env("FLUREE_HOME", home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader", "--no-cache"]);
+    cmd
+}
+
+/// A sign-in that is refused and can't be renewed ends an ingest at that
+/// document, with one error: the stored token still looks valid, so each
+/// later document would only send another refused call and a failing
+/// renewal. The documents after it are not read.
+#[test]
+fn doc_ingest_through_the_account_stops_when_the_sign_in_is_gone() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    two_memos(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![
+        config_stale(),
+        serde_json::json!({ "__status": 400, "body": { "error": "invalid_grant", "error_description": "refresh token revoked" } }),
+        stub_reading(0.9, true),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    let out = ingest_through_the_account(&tmp, &home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "leaving 1 document(s) unread that would fail the same way",
+        ))
+        .stderr(predicate::str::contains(
+            "the reader refused the sign-in, and renewing it failed",
+        ))
+        .stderr(predicate::str::contains("your sign-in is no longer valid"))
+        .stderr(predicate::str::contains(format!(
+            "hint: fluree login --url {base}"
+        )))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches('✗').count(), 1, "{stdout}");
+    assert!(stdout.contains("0 ingested"), "{stdout}");
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange"]
+    );
+}
+
+/// A renewal that fails before a document is read ends the run the same
+/// way: the token is about to expire, so every later document would need
+/// the same renewal first. What was read before it is kept.
+#[test]
+fn doc_ingest_through_the_account_stops_when_renewing_before_a_document_fails() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    two_memos(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    // The setup's exchange and the first document's succeed, each with a
+    // token inside the refresh margin; the second document's is refused.
+    let (exchange, exchanged) = spawn_stub_reader(vec![
+        serde_json::json!({ "access_token": jwt_expiring_in(30, "t0"), "token_type": "Bearer", "expires_in": 30 }),
+        serde_json::json!({ "access_token": jwt_expiring_in(30, "t1"), "token_type": "Bearer", "expires_in": 30 }),
+        serde_json::json!({ "__status": 400, "body": { "error": "invalid_grant", "error_description": "refresh token revoked" } }),
+    ]);
+    let home = tmp.path().join("home");
+    write_account(&home, &base, &exchange, &jwt_expiring_in(30, "t-old"));
+    let out = ingest_through_the_account(&tmp, &home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("renewing the sign-in"))
+        .stderr(predicate::str::contains("your sign-in is no longer valid"))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 ingested"), "{stdout}");
+    assert_eq!(stdout.matches('✗').count(), 1, "{stdout}");
+    assert_eq!(seen.lock().unwrap().len(), 1, "one document was read");
+    assert_eq!(exchanged.lock().unwrap().len(), 3);
+}
+
 /// `account = true` beside an `api_key` is refused, whichever of the file
 /// and the environment set each: the run would otherwise use one and
 /// quietly ignore the other.
