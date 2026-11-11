@@ -11,8 +11,7 @@
   materialize job: the watermark still resolves, so the window is read
   incrementally, and it is too large to commit in one pass.
 - `silver.people_paged`: the same five 600-row appends again, read only by
-  the paging test, which slows one of its data files by name; a table of its
-  own keeps that file name out of every other test's reads.
+  the paging test, whose expected order is its data files' sizes.
 - `silver.amounts`: one snapshot of decimal columns for FILTER pushdown —
   `ratio` is `decimal(38,9)` (BigQuery's `NUMERIC`), with values on either
   side of 0.05 and 1.05 one grid step apart; `price` is `decimal(5,2)`, the

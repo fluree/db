@@ -208,10 +208,7 @@ impl EphemeralR2rmlProvider {
         let concurrency = tasks.len().clamp(1, 8);
         Ok(super::r2rml::read_files_in_order(
             tasks,
-            match order {
-                ScanOrder::Deterministic => super::r2rml::EmitOrder::SmallestFirst,
-                ScanOrder::Any => super::r2rml::EmitOrder::Completion,
-            },
+            super::r2rml::EmitOrder::for_query(order),
             concurrency,
             move |task| {
                 let storage = Arc::clone(&storage);
@@ -357,7 +354,7 @@ mod tests {
     use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
     use fluree_db_query::error::Result as QResult;
     use fluree_db_query::r2rml::{
-        ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
+        ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanOrder,
     };
     use fluree_db_r2rml::mapping::{
         CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
@@ -379,6 +376,8 @@ mod tests {
     struct StubEphemeralProvider {
         mapping: Arc<CompiledR2rmlMapping>,
         tables: HashMap<String, Vec<ColumnBatch>>,
+        /// The row order each scan asked for; `None` for a plain `scan_table`.
+        orders: std::sync::Mutex<Vec<Option<ScanOrder>>>,
     }
 
     #[async_trait]
@@ -406,6 +405,22 @@ mod tests {
             _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
             _as_of_t: Option<i64>,
         ) -> QResult<ColumnBatchStream> {
+            self.orders.lock().unwrap().push(None);
+            let batches = self.tables.get(table).cloned().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(batches).map(Ok)))
+        }
+
+        async fn scan_table_ordered(
+            &self,
+            _gs: &str,
+            table: &str,
+            _projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
+            _as_of_t: Option<i64>,
+            order: ScanOrder,
+        ) -> QResult<ColumnBatchStream> {
+            self.orders.lock().unwrap().push(Some(order));
             let batches = self.tables.get(table).cloned().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(batches).map(Ok)))
         }
@@ -495,6 +510,7 @@ mod tests {
         StubEphemeralProvider {
             mapping: Arc::new(mapping),
             tables,
+            orders: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -587,6 +603,7 @@ mod tests {
         let provider = StubEphemeralProvider {
             mapping: Arc::new(mapping),
             tables,
+            orders: std::sync::Mutex::new(Vec::new()),
         };
         let (_ledger, view) = genesis_view_unregistered();
         let fluree = FlureeBuilder::memory().build_memory();

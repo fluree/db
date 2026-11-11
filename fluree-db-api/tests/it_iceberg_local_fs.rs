@@ -19,8 +19,7 @@
 //!   healthy source that got ahead of its job, so the window resolves and is
 //!   read incrementally, and is too large to commit in one pass.
 //! - `people_paged` — the same five appends again, read only by the paging
-//!   test, which slows one of its data files by name; a table of its own keeps
-//!   that file name out of every other test's reads.
+//!   test: five data files whose sizes are not in commit order.
 //! - `amounts` — decimal columns for FILTER pushdown: `ratio` is `decimal(38,9)`
 //!   (BigQuery's `NUMERIC`) with values one grid step either side of 0.05 and
 //!   1.05; `price` is `decimal(5,2)`, too narrow to hold a literal like 1000.
@@ -4223,23 +4222,17 @@ async fn a_materialize_read_before_a_rename_keeps_the_renamed_column() {
     assert_eq!(names_of(&batches), early, "pinned stream");
 }
 
-/// An unsliced answer holds every person once, and (streamed in completion
-/// order) the slowed first file's 600 persons last.
-fn assert_unsliced_in_completion_order(rows: &[i64], fixed_order: &[i64], surface: &str) {
+/// An unsliced answer holds every person exactly once. Its order is open (the
+/// scan streams files as their reads finish), so nothing is asserted about it;
+/// that the unsliced lane streams in completion order is pinned by the routing
+/// test in `it_graph_source_r2rml` and the reader's unit tests.
+fn assert_every_person_once(rows: &[i64], surface: &str) {
     let mut sorted = rows.to_vec();
     sorted.sort_unstable();
     assert_eq!(
         sorted,
         (1..=3000).collect::<Vec<i64>>(),
         "{surface}: unsliced, every person once"
-    );
-    let mut slowed = fixed_order[..600].to_vec();
-    slowed.sort_unstable();
-    let mut tail = rows[rows.len() - 600..].to_vec();
-    tail.sort_unstable();
-    assert_eq!(
-        tail, slowed,
-        "{surface}: unsliced, the slowed file's rows come last (completion order)"
     );
 }
 
@@ -4259,16 +4252,14 @@ fn person_number(iri: &str) -> i64 {
 ///
 /// `people_paged` is five 600-row commits, one data file each, ids ascending
 /// in commit order, so the deterministic order is each commit's persons in
-/// order, the commits taken by data-file size. The first file in that order is
-/// read 200 ms late (the debug-build hook `FLUREE_DEBUG_ICEBERG_SLOW_READ`), so
-/// every other read finishes before it: emitted in completion order, its rows
-/// would come last.
+/// order, the commits taken by data-file size (read here from the table's own
+/// files, and checked to differ from commit order).
 ///
-/// A query with no slice cannot observe its order, so it streams files as
-/// their reads finish, and the slowed file's rows do come last there. A crawl
-/// pages subjects itself (an OFFSET with no LIMIT reaches its flat query as no
-/// slice), so it asks for the deterministic order explicitly. The materialize
-/// read keeps commit order, persons 1..=3000.
+/// A query with no slice cannot observe its order, so it may stream files as
+/// their reads finish: it is checked for its rows only. A crawl pages subjects
+/// itself (an OFFSET with no LIMIT reaches its flat query as no slice), so it
+/// asks for the deterministic order explicitly. The materialize read keeps
+/// commit order, persons 1..=3000.
 #[tokio::test]
 async fn unordered_pages_partition_a_multi_file_answer() {
     allow_fixture_roots();
@@ -4344,20 +4335,6 @@ async fn unordered_pages_partition_a_multi_file_answer() {
             lo..lo + 600
         })
         .collect();
-    let first_file = commit_files[by_size[0]].0.clone();
-    // The hook matches the path the manifest records (the table's original
-    // location, which the staged copy is remapped from), so it names the file
-    // by its name. No other test reads `people_paged`, so no other test's read
-    // matches; the hook reads the variable on every read, and the guard clears
-    // it when this test ends, pass or fail.
-    struct SlowRead;
-    impl Drop for SlowRead {
-        fn drop(&mut self) {
-            std::env::remove_var("FLUREE_DEBUG_ICEBERG_SLOW_READ");
-        }
-    }
-    std::env::set_var("FLUREE_DEBUG_ICEBERG_SLOW_READ", &first_file);
-    let _slow_read = SlowRead;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
@@ -4405,8 +4382,7 @@ async fn unordered_pages_partition_a_multi_file_answer() {
         "SPARQL: the pages partition the answer"
     );
     assert_eq!(pages().await, everyone, "SPARQL: a second run agrees");
-    let unsliced = sparql(None).await;
-    assert_unsliced_in_completion_order(&unsliced, &everyone, "SPARQL");
+    assert_every_person_once(&sparql(None).await, "SPARQL");
 
     // JSON-LD.
     let jsonld = |page: Option<usize>| async move {
@@ -4440,8 +4416,7 @@ async fn unordered_pages_partition_a_multi_file_answer() {
         paged.extend(jsonld(Some(k)).await);
     }
     assert_eq!(paged, everyone, "JSON-LD: the pages partition the answer");
-    let unsliced = jsonld(None).await;
-    assert_unsliced_in_completion_order(&unsliced, &everyone, "JSON-LD");
+    assert_every_person_once(&jsonld(None).await, "JSON-LD");
 
     // A crawl with an OFFSET and no LIMIT: the subjects after the first 2,900
     // in the deterministic order.

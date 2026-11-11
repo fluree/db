@@ -4702,10 +4702,7 @@ impl FlureeR2rmlProvider<'_> {
 
         Ok(read_files_in_order(
             tasks,
-            match order {
-                ScanOrder::Deterministic => EmitOrder::SmallestFirst,
-                ScanOrder::Any => EmitOrder::Completion,
-            },
+            EmitOrder::for_query(order),
             concurrency,
             move |task| {
                 let storage = Arc::clone(&storage);
@@ -4781,6 +4778,16 @@ pub(crate) enum EmitOrder {
     Completion,
 }
 
+impl EmitOrder {
+    /// The order a query scan emits in for the `ScanOrder` the query owes it.
+    pub(crate) fn for_query(order: ScanOrder) -> Self {
+        match order {
+            ScanOrder::Deterministic => Self::SmallestFirst,
+            ScanOrder::Any => Self::Completion,
+        }
+    }
+}
+
 /// Read a scan's data files with up to `concurrency` reads in flight, and emit
 /// each file's batches in `order`.
 ///
@@ -4806,21 +4813,20 @@ where
         // Stable: equal sizes keep the listed order.
         EmitOrder::SmallestFirst => tasks.sort_by_key(|t| t.data_file.file_size_in_bytes),
     }
+    // Each file's read is built here, when the window admits the file (so its
+    // span is parented under the consumer's), and spawned on its first poll;
+    // both combinators below poll every admitted file, so the reads behind the
+    // earliest one run meanwhile. This is the shape the scan had before it
+    // took an order. (Spawning eagerly as the stream is pulled raised peak RSS
+    // under glibc malloc on a decode-bound COUNT.) The mutex only makes the
+    // pending read `Sync`, as the stream must be; it is never contended.
     let reads = futures::stream::iter(tasks).map(move |task| {
-        #[cfg(debug_assertions)]
-        let delay = debug_slow_read(&task.data_file.file_path);
-        let read = read(task);
-        // Spawned when the window admits the file, not when the consumer
-        // reaches it, so the reads behind the earliest one run meanwhile.
-        let worker = tokio::spawn(async move {
-            #[cfg(debug_assertions)]
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
-            read.await
-        });
+        let read = std::sync::Mutex::new(read(task));
         async move {
-            worker
+            let read = read
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tokio::spawn(read)
                 .await
                 .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
         }
@@ -4840,20 +4846,6 @@ where
             Err(e) => futures::stream::iter(vec![Err(e)]),
         }),
     )
-}
-
-/// Test hook (debug builds only): a data file whose path contains the value of
-/// `FLUREE_DEBUG_ICEBERG_SLOW_READ` is read 200 ms late, so a test can make
-/// reads finish out of emit order on purpose. The match is against the path
-/// the manifest records (a relocated table's original location, not where it
-/// is read from), so name a data file of a table no other test reads. The
-/// variable is read on every call, so clearing it takes effect at once; unset
-/// or empty, nothing is delayed.
-#[cfg(debug_assertions)]
-fn debug_slow_read(path: &str) -> Option<std::time::Duration> {
-    let marker = std::env::var("FLUREE_DEBUG_ICEBERG_SLOW_READ").ok()?;
-    (!marker.is_empty() && path.contains(marker.as_str()))
-        .then(|| std::time::Duration::from_millis(200))
 }
 
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
@@ -7957,6 +7949,43 @@ mod emit_order_tests {
         let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
         let order: Vec<i64> = batches.iter().map(file_of).collect();
         assert_eq!(order, vec![1, 3, 2, 0]);
+    }
+
+    /// Completion order: the first listed file's read waits until file 3's is
+    /// done, so it is emitted last; the others come as they finish.
+    #[tokio::test]
+    async fn completion_emits_each_file_as_its_read_finishes() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::Completion, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order.len(), 4, "{order:?}");
+        assert_eq!(order[3], 0, "the held-back file comes last: {order:?}");
+    }
+
+    /// A query owes its scan a `ScanOrder`; both providers emit by it.
+    #[test]
+    fn a_query_scan_emits_by_its_scan_order() {
+        assert_eq!(
+            EmitOrder::for_query(ScanOrder::Deterministic),
+            EmitOrder::SmallestFirst
+        );
+        assert_eq!(EmitOrder::for_query(ScanOrder::Any), EmitOrder::Completion);
     }
 
     /// A read error is emitted at its file's place in the emit order, after
