@@ -227,7 +227,20 @@ minting customers from the same template).
 An Iceberg table's identifier fields (`identifier-field-ids` in its schema)
 count as a key without being declared, for tables of format version 1 to 3;
 format version 4 replaces them with table constraints, and Fluree does not
-read those yet. Delta and SQL sources report no key, so declare one there.
+read those yet. Delta sources report no key, so declare one there. A SQL
+source's keys come from its registration probe (see
+[SQL → Repeated rows and subject keys](sql.md#repeated-rows-and-subject-keys))
+or a declaration.
+
+**Keys are trusted, not verified.** Fluree does not check a key against the
+data, whichever way it was learned: an `f:key`, an Iceberg table's
+identifier fields, or a SQL source's registration probe. Iceberg does not
+enforce identifier fields either; an append can write a row that repeats
+one. Over a table that breaks its key, queries return the repeated
+solutions the key ruled out, as bag answers, and a count read from table
+metadata (a fused `COUNT`, `/info`'s per-class counts) is presented as exact
+when it is not. A check of each Iceberg snapshot's keys against its data is
+planned; until then, declare a key only where the table's writer keeps it.
 
 `f:key` is checked when the mapping loads. Refused with
 `Failed to compile R2RML mapping: …`: an `f:key` that is not a list, an empty

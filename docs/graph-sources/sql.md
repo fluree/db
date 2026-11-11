@@ -477,7 +477,11 @@ Keys come from two places:
   endpoint unreachable at registration verifies nothing, so every table
   answers with set semantics until a `check` succeeds. Because the probe
   checks one composite per table, a map whose subject uses only some of its
-  columns is not proven unique by it.
+  columns is not proven unique by it. The probe sees the table as it was
+  when it ran, and queries do not repeat it: a row written since that
+  repeats a key is not noticed, and queries over the table return the
+  repeated solutions the key ruled out (and counts as if it held) until the
+  next `fluree sql check` flags the table.
 - **A declared key.** `f:key` on the logical table (see [Declaring a
   table's keys](r2rml.md#declaring-a-tables-keys-fkey)) declares a key the
   data is trusted to hold. The lane checks that its columns exist and can
