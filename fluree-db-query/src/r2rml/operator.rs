@@ -3622,6 +3622,15 @@ fn row_output_bound(
             .map(objects)
             .sum()
     };
+    // A projected `?type` (`type_var`) is bound only to the map's declared
+    // classes (`rr:class`): `materialize_row` emits one row per class of
+    // `classes()` and never reads an `rdf:type` object map for it. The classes
+    // an `rdf:type` column, template or reference derives
+    // ([`derived_row_classes`], which fans out over parent subjects) label the
+    // rows already produced for the view-policy gate, one list per row, and
+    // add none; where such a map is read as a predicate (`rdf:type` as the
+    // filter, or a wildcard), it is a predicate-object map counted by
+    // `objects` above, a reference by its parent subjects.
     let classes = triples_map.classes().len();
     if pattern.predicate_var.is_none()
         && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
