@@ -1484,15 +1484,47 @@ impl<'a> ExecutionContext<'a> {
     /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
     /// names no graph, or it names a reserved system graph or the default graph
     /// (the ledger's own address, even if a registered graph shares the text).
+    ///
+    /// A graph dropped as of `to_t` names no graph here either, as one that
+    /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
         match self.single_db_graph_position(iri)? {
             fluree_db_core::GraphPosition::Registered { g_id, .. }
-                if g_id >= FIRST_USER_GRAPH_ID =>
+                if g_id >= FIRST_USER_GRAPH_ID
+                    && self
+                        .active_snapshot
+                        .graph_registry
+                        .visible_at(g_id, self.to_t) =>
             {
                 Some(g_id)
             }
             _ => None,
         }
+    }
+
+    /// Refuse a `GRAPH <iri>` naming a user graph that a commit after `to_t`
+    /// dropped: the query asks what the graph held then, which the drop took,
+    /// and reading that as an empty graph would answer something else.
+    pub fn refuse_dropped_graph(&self, iri: &str) -> crate::error::Result<()> {
+        if !self.active_snapshot.graph_registry.has_drops() {
+            return Ok(());
+        }
+        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
+            self.single_db_graph_position(iri)
+        {
+            if let Some(floor) = self
+                .active_snapshot
+                .graph_registry
+                .drop_after(g_id, self.to_t)
+            {
+                return Err(crate::error::QueryError::GraphDropped {
+                    graph: iri.to_string(),
+                    floor,
+                    t: self.to_t,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
@@ -1517,7 +1549,7 @@ impl<'a> ExecutionContext<'a> {
         let registry = &self.active_snapshot.graph_registry;
         let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
         registry
-            .iter_entries()
+            .iter_visible_entries(self.to_t)
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
             .filter_map(|(g, iri)| {
                 target

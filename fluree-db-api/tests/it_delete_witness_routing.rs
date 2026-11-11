@@ -301,7 +301,7 @@ async fn v_values(ledger: &LedgerState, graph: Option<&str>, subject: &str) -> V
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph registered"),
     };
     let s = ledger
