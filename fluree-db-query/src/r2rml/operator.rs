@@ -127,6 +127,9 @@ struct PartialParentIndex {
     probes: usize,
     /// Data files those reads were planned to read (when the provider says).
     files_probed: u64,
+    /// Bytes charged to the query's memory budget for `lookup` and
+    /// `resolved`, released when the index is given up for a whole read.
+    charged: usize,
     source: ParentSource,
 }
 
@@ -170,15 +173,35 @@ impl PartialParentIndex {
             resolved: HashSet::new(),
             probes: 0,
             files_probed: 0,
+            charged: 0,
             source,
         }
+    }
+
+    /// Charge `bytes` this index retains to the query's memory budget.
+    fn charge(&mut self, ctx: &ExecutionContext<'_>, bytes: usize) -> Result<()> {
+        if scan_mem_accounting_enabled() {
+            ctx.record_alloc(bytes);
+            self.charged = self.charged.saturating_add(bytes);
+            ctx.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Drop what the probes built, and release its charge: the index is
+    /// replaced by a whole read, which is charged on its own.
+    fn forget(&mut self, ctx: &ExecutionContext<'_>) {
+        self.lookup = ParentLookup::new();
+        self.resolved = HashSet::new();
+        ctx.release(std::mem::take(&mut self.charged));
     }
 
     /// The join keys `window`'s rows hold that are not resolved yet, read
     /// through each of `child_joins` (the referencing table's join columns of
     /// every RefObjectMap that reads the window through this parent, each
     /// aligned with the parent's join columns), or `None` once there are more
-    /// than `cap`.
+    /// than `cap`. The set lives for one window and holds at most `cap` + 1
+    /// keys, so it is not charged to the query's memory budget.
     fn missing_keys(
         &self,
         window: &[ColumnBatch],
@@ -275,10 +298,7 @@ impl PartialParentIndex {
             let batch = batch?;
             // Charged like a full build's batch: a provider that applies no
             // filter returns the whole parent here.
-            if scan_mem_accounting_enabled() {
-                ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
-                ctx.checkpoint()?;
-            }
+            self.charge(ctx, batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES))?;
             fold_parent_batch(
                 &mut self.lookup,
                 parent_tm,
@@ -287,6 +307,9 @@ impl PartialParentIndex {
                 Some(&keys),
             );
         }
+        // Each resolved key is held too, present or not (at most the push
+        // cap per probe).
+        self.charge(ctx, keys.len().saturating_mul(PARENT_ENTRY_EST_BYTES))?;
         self.resolved.extend(keys);
         Ok(())
     }
@@ -2045,6 +2068,10 @@ impl R2rmlScanOperator {
                         "R2RML parent: reading the parent whole"
                     );
                     let source = partial.source.clone();
+                    // The whole read replaces what the probes built: free that
+                    // first, and its charge, so the parent is never held (or
+                    // charged) twice.
+                    partial.forget(ctx);
                     let complete = self
                         .build_complete_parent(ctx, provider, parent_tm, &source, lookup_key)
                         .await?;
@@ -5392,6 +5419,42 @@ mod tests {
             }
         }
 
+        /// When the probes stop paying off and the parent is read whole,
+        /// what they built is dropped and its charge released: the query is
+        /// left charged for the whole read alone, as without key pushdown,
+        /// never for the probes on top of it. Here (no file counts) one
+        /// window probes two keys, one of them present, and the next reads
+        /// the parent whole.
+        #[test]
+        fn a_whole_read_after_probes_is_charged_alone() {
+            let tables = || Tables::new(vec![3, 90, 91, 92, 2, 5], (1..=7).collect());
+            let pattern = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/customer")
+            };
+            let (whole, whole_charged) =
+                run_pattern_charged(&tables(), mapping(), pattern(), None, Some(2), false);
+            let probed_tables = tables();
+            let (probed, probed_charged) =
+                run_pattern_charged(&probed_tables, mapping(), pattern(), None, Some(2), true);
+            assert_eq!(probed, whole);
+            let keys: Vec<Vec<String>> = customer_scans(&probed_tables)
+                .iter()
+                .map(|(_, f)| filtered_keys(f))
+                .collect();
+            assert_eq!(
+                keys,
+                [vec!["3".to_string(), "90".to_string()], vec![]],
+                "a probe, then the parent read whole"
+            );
+            assert_eq!(
+                whole_charged,
+                14 * PARENT_ENTRY_EST_BYTES,
+                "the whole read's 14 rows"
+            );
+            assert_eq!(probed_charged, whole_charged);
+        }
+
         fn customer_ref(column: &str) -> ObjectMap {
             ObjectMap::RefObjectMap(RefObjectMap::new("#Customer", column, "ID"))
         }
@@ -5453,9 +5516,23 @@ mod tests {
             budget: Option<usize>,
             key_pushdown: bool,
         ) -> Vec<Vec<String>> {
+            run_pattern_charged(tables, mapping, pattern, child_rows, budget, key_pushdown).0
+        }
+
+        /// [`run_pattern`], and the bytes still charged to the query's
+        /// memory budget once the scan is done.
+        fn run_pattern_charged(
+            tables: &Tables,
+            mapping: Arc<CompiledR2rmlMapping>,
+            pattern: R2rmlPattern,
+            child_rows: Option<usize>,
+            budget: Option<usize>,
+            key_pushdown: bool,
+        ) -> (Vec<Vec<String>>, usize) {
             let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
             let vars = VarRegistry::new();
-            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            let mut ctx = ExecutionContext::new(&snapshot, &vars)
+                .with_cancellation(fluree_db_core::QueryCancellation::new());
             ctx.r2rml_table_provider = Some(tables);
             let child: BoxedOperator = match child_rows {
                 None => Box::new(EmptyOperator::new()),
@@ -5497,7 +5574,8 @@ mod tests {
             if let Some(budget) = budget {
                 rows.truncate(budget);
             }
-            rows
+            let charged = ctx.mem_used();
+            (rows, charged)
         }
 
         /// Each customer in its own data file, so a keyed read always skips
