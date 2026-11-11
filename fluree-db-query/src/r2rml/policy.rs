@@ -1018,7 +1018,7 @@ impl R2rmlPolicyGate {
             _ => self.any_subject.clone(),
         };
         let pred_sid = encode(snapshot, pred);
-        // The object only matters for the schema-flake bypass (an rdf:type
+        // The object only matters for the schema-flake exception (an rdf:type
         // whose object is itself a schema class); `f:query` never runs here.
         let object = if pred == rdf::TYPE {
             FlakeValue::Ref(
