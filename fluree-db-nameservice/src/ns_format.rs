@@ -177,6 +177,18 @@ impl NsFileV2 {
     }
 }
 
+/// The index-only file holding `snapshot`'s index, which a reset writes
+/// over any newer one.
+pub(crate) fn snapshot_index_file(snapshot: &crate::NsRecordSnapshot) -> NsIndexFileV2 {
+    NsIndexFileV2 {
+        context: ns_context(),
+        index: IndexRef {
+            cid: snapshot.index_head_id.as_ref().map(ToString::to_string),
+            t: snapshot.index_t,
+        },
+    }
+}
+
 /// Head pointers from a main ns@v2 file plus its optional index-only file,
 /// using the read-time merge rule shared by `load_record`: the separate
 /// index file wins when its `t` is equal or higher.

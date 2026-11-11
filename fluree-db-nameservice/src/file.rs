@@ -24,8 +24,8 @@
 //! - A database with transactions
 
 use crate::ns_format::{
-    merge_heads, ns_context, parse_record, BranchPointRef, IndexRef, LedgerRef, NsFileV2,
-    NsIndexFileV2, NS_VERSION,
+    merge_heads, ns_context, parse_record, snapshot_index_file, BranchPointRef, IndexRef,
+    LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
@@ -740,6 +740,7 @@ impl crate::BranchLifecycle for FileNameService {
     async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
+        let index = snapshot_index_file(&snapshot);
 
         let outcome = self
             .storage
@@ -757,6 +758,18 @@ impl crate::BranchLifecycle for FileNameService {
         if matches!(outcome, CasOutcome::Aborted(())) {
             return Err(NameServiceError::not_found(ledger_id));
         }
+
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        let index_address = Self::index_address(&ledger_name, &branch);
+        self.storage
+            .compare_and_swap(&index_address, move |bytes| {
+                if bytes.is_none() {
+                    return Ok(CasAction::Abort(()));
+                }
+                Ok(CasAction::Write(serialize_json(&index)?))
+            })
+            .await?;
 
         Ok(())
     }

@@ -963,3 +963,51 @@ async fn rebase_replays_commit_that_creates_named_graph() {
         .unwrap();
     assert_eq!(rows, json!(["Dave"]));
 }
+
+/// A branch with its own commits, `bob` and `carol` after the fork at
+/// `alice`, and a source that moved on to `dave`.
+async fn diverged(fluree: &fluree_db_api::Fluree) {
+    let name = |n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{n}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree.insert(main, &name("alice")).await.unwrap().ledger;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    for n in ["bob", "carol"] {
+        let dev = fluree.ledger("rb:dev").await.unwrap();
+        fluree.insert(dev, &name(n)).await.unwrap();
+    }
+    fluree.insert(main, &name("dave")).await.unwrap();
+}
+
+fn file_fluree(dir: &tempfile::TempDir) -> fluree_db_api::Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap()
+}
+
+const EVERY_NAME: [&str; 4] = ["alice", "bob", "carol", "dave"];
+
+/// A rebase that replays the branch's commits takes the branch's index of
+/// the line it replaced away, even where the source's index is older or
+/// absent: a fresh load of the branch reads its new line, not that index
+/// with the new line's later commits on top.
+#[tokio::test]
+async fn a_rebase_takes_away_the_index_of_the_line_it_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    support::rebuild_and_publish_index(&fluree, "rb:dev").await;
+
+    let report = fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 2);
+    drop(fluree);
+
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+}
