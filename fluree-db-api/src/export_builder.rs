@@ -290,7 +290,7 @@ impl<'a> ExportBuilder<'a> {
                     crate::retention::suppression::HistoricalRead {
                         to_t,
                         from_t: None,
-                        reads: crate::retention::suppression::Reads::Everything,
+                        reads: || crate::retention::suppression::Reads::Everything,
                     },
                 )
                 .await?;

@@ -148,26 +148,51 @@ pub(crate) fn search_sources(query: &Query) -> Vec<String> {
 }
 
 /// A historical read of one ledger.
-pub(crate) struct HistoricalRead {
+pub(crate) struct HistoricalRead<R> {
     /// As-of point (the end of a history range).
     pub(crate) to_t: i64,
     /// The start of a history range; `None` for a point-in-time read.
     pub(crate) from_t: Option<i64>,
-    pub(crate) reads: Reads,
+    /// What it reads, worked out only for a ledger with a removal.
+    pub(crate) reads: R,
 }
 
 /// A journal with the removals that apply to its branch looked up by what
 /// a read names.
 pub(crate) struct Suppression {
-    pub(crate) journal: Journal,
+    pub(crate) journal: Arc<Journal>,
     /// The journal's identity as its record names it.
     identity: String,
-    revision: Option<(Option<fluree_db_nameservice::Fence>, u128, i64, i64)>,
+    /// The branch as it stood when this was worked out; see [`Key`].
+    key: Key,
     processed_until: i64,
+    /// Whether the branch holds each removal's commit, worked out at
+    /// `head_t`.
+    applies: Arc<Vec<bool>>,
+    head_t: i64,
     /// The removals whose commit the branch holds, by predicate, as indexes
     /// into the journal's removals. One whose commit the branch does not
     /// hold (merged from another copy of the lineage) is left out.
-    removed: HashMap<String, RemovedOf>,
+    removed: Arc<HashMap<String, RemovedOf>>,
+}
+
+/// What a cached [`Suppression`] was worked out from: the branch's
+/// incarnation, its configuration revision (`None` when not known, which
+/// is read again every time) and its history (see
+/// [`Seen::Live::history`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Key {
+    fence: Option<fluree_db_nameservice::Fence>,
+    instance: u128,
+    config_version: Option<i64>,
+    history: u64,
+}
+
+impl Key {
+    /// The same branch and history, whatever its configuration revision.
+    fn same_history(&self, other: &Key) -> bool {
+        (self.fence, self.instance, self.history) == (other.fence, other.instance, other.history)
+    }
 }
 
 /// The removals of one predicate that apply to a branch.
@@ -179,26 +204,44 @@ struct RemovedOf {
     any_subject: Vec<usize>,
 }
 
+fn removed_by_predicate(journal: &Journal, applies: &[bool]) -> HashMap<String, RemovedOf> {
+    let mut removed: HashMap<String, RemovedOf> = HashMap::new();
+    for (i, removal) in journal.removals.iter().enumerate() {
+        if !applies.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        let of = removed.entry(removal.predicate.clone()).or_default();
+        match &removal.subject {
+            Some(subject) => of.by_subject.entry(subject.clone()).or_default().push(i),
+            None => of.any_subject.push(i),
+        }
+    }
+    removed
+}
+
 impl Suppression {
+    #[cfg(test)]
     fn new(journal: Journal, identity: String, applies: &[bool]) -> Self {
-        let mut removed: HashMap<String, RemovedOf> = HashMap::new();
-        for (i, removal) in journal.removals.iter().enumerate() {
-            if !applies.get(i).copied().unwrap_or(true) {
-                continue;
-            }
-            let of = removed.entry(removal.predicate.clone()).or_default();
-            match &removal.subject {
-                Some(subject) => of.by_subject.entry(subject.clone()).or_default().push(i),
-                None => of.any_subject.push(i),
-            }
-        }
         Suppression {
-            journal,
+            removed: Arc::new(removed_by_predicate(&journal, applies)),
+            journal: Arc::new(journal),
             identity,
-            revision: None,
+            key: Key {
+                fence: None,
+                instance: 0,
+                config_version: None,
+                history: 0,
+            },
             processed_until: 0,
-            removed,
+            applies: Arc::new(applies.to_vec()),
+            head_t: 0,
         }
+    }
+
+    /// A removal whose commit the branch did not hold when this was worked
+    /// out: commits added since may bring it.
+    fn awaits_commits(&self) -> bool {
+        self.applies.iter().any(|a| !a)
     }
 
     /// The predicate of a removal that a read of `reads`, as of `to` (or
@@ -243,9 +286,11 @@ impl Suppression {
 pub(crate) enum Freshness {
     /// At the head: current state.
     Current,
-    /// Behind it. `journal` is whether the ledger's journal holds anything,
-    /// where known.
-    Behind { journal: Option<bool> },
+    /// Behind it. `journal` is what the ledger's journal holds, where
+    /// known.
+    Behind {
+        journal: Option<super::watch::Holds>,
+    },
 }
 
 /// Suppressions held between reads, by branch. One is reused only for a
@@ -277,7 +322,10 @@ impl Fluree {
         };
         let seen = match watch.check(&db.ledger_id, db.fence) {
             Check::FenceDropped => return Err(gone()),
-            Check::Known(seen) => seen,
+            Check::Known(seen) => {
+                self.revalidate_if_due(&db.ledger_id);
+                seen
+            }
             Check::Unknown => {
                 let Ok(id) = fluree_db_core::LedgerId::parse(&db.ledger_id) else {
                     return Ok(Freshness::Current);
@@ -314,85 +362,231 @@ impl Fluree {
         }
     }
 
+    /// Learn `ledger_id` again in the background when what is kept of it is
+    /// due (see [`super::watch::BranchWatch::revalidation_due`]). The read
+    /// that asked serves what is kept.
+    fn revalidate_if_due(&self, ledger_id: &str) {
+        let watch = &self.retention.watch;
+        if !watch.revalidation_due(ledger_id) {
+            return;
+        }
+        let watch = Arc::clone(watch);
+        let ns = self.nameservice_mode.clone();
+        let ledger_id = ledger_id.to_string();
+        crate::wasm_compat::spawn_detached(async move {
+            let token = watch.token();
+            let found = async {
+                use fluree_db_nameservice::NameServiceLookup;
+                let record = ns.lookup(&ledger_id).await.ok()?;
+                // A record that names no revision tells nothing of a
+                // change to the journal: read it.
+                let holds = match &record {
+                    Some(r) if r.config_version.is_none() => {
+                        Some(match registry::read_stored(&ns, &ledger_id).await.ok()?.1 {
+                            Some(stored) => registry::journal_holds(&stored),
+                            None => super::watch::Holds::Nothing,
+                        })
+                    }
+                    _ => None,
+                };
+                Some((record, holds))
+            }
+            .await;
+            watch.revalidated(
+                &ledger_id,
+                found.as_ref().map(|(r, h)| (r.as_ref(), *h)),
+                token,
+            );
+        });
+    }
+
     /// The branch's suppression, using this node's replicated journal.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) async fn suppression_for(
         &self,
         ledger_id: &str,
     ) -> Result<Option<Arc<Suppression>>> {
+        self.suppression_holding(ledger_id, false).await
+    }
+
+    /// The branch's suppression when its journal holds a removal: what a
+    /// read is refused for.
+    pub(crate) async fn removals_for(&self, ledger_id: &str) -> Result<Option<Arc<Suppression>>> {
+        self.suppression_holding(ledger_id, true).await
+    }
+
+    async fn suppression_holding(
+        &self,
+        ledger_id: &str,
+        removals: bool,
+    ) -> Result<Option<Arc<Suppression>>> {
+        use super::watch::Holds;
         self.ensure_read_ready(ledger_id).await?;
         let ns = &self.nameservice_mode;
         let watch = &self.retention.watch;
-        if matches!(watch.check(ledger_id, None), Check::Unknown) {
+        let mut check = watch.check(ledger_id, None);
+        if matches!(check, Check::Unknown) {
             let token = watch.token();
             let record = self.nameservice().lookup(ledger_id).await?;
             watch.learn(ledger_id, record.as_ref(), token);
+            check = watch.check(ledger_id, None);
+        } else {
+            self.revalidate_if_due(ledger_id);
         }
         let token = watch.token();
-        let revision = match watch.check(ledger_id, None) {
+        let (key, head_t) = match check {
             Check::Known(Seen::Live {
-                journal: Some(false),
+                journal: Some(holds),
                 ..
-            }) => return Ok(None),
+            }) if holds == Holds::Nothing || (removals && !holds.removals()) => return Ok(None),
             Check::Known(Seen::Live {
                 fence,
                 instance,
                 head_t,
-                config_version: Some(v),
+                config_version,
+                history,
                 ..
-            }) => Some((fence, instance, head_t, v)),
-            _ => None,
+            }) => (
+                Key {
+                    fence,
+                    instance,
+                    config_version,
+                    history,
+                },
+                head_t,
+            ),
+            // Dropped, or never created: whatever its record holds.
+            _ => (
+                Key {
+                    fence: None,
+                    instance: 0,
+                    config_version: None,
+                    history: 0,
+                },
+                i64::MAX,
+            ),
         };
         let cache = &self.retention.suppressions;
-        if let Some(revision) = revision {
-            if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
-                if cached.revision == Some(revision) {
-                    return Ok(Some(Arc::clone(cached)));
-                }
+        let cached = cache.by_ledger.lock().get(ledger_id).cloned();
+        if let Some(cached) = &cached {
+            if key.config_version.is_some() && cached.key == key {
+                return self
+                    .with_commits_since(ledger_id, cached, head_t)
+                    .await
+                    .map(Some);
             }
         }
         let (config, stored) = registry::read_stored(ns, ledger_id).await?;
-        if let Some((_, _, _, expected)) = revision {
+        if let Some(expected) = key.config_version {
             if config.as_ref().map_or(0, |c| c.v) < expected {
                 return Err(ApiError::ReplicaNotCurrent(format!(
                     "{ledger_id}'s journal is older than configuration revision {expected}, which this node has already learned; retry"
                 )));
             }
         }
-        let stored = stored.filter(|s| !registry::journal_empty(s));
-        self.retention
-            .watch
-            .learn_journal(ledger_id, stored.is_some(), token);
-        let Some(stored) = stored else {
+        let holds = stored
+            .as_ref()
+            .map_or(Holds::Nothing, registry::journal_holds);
+        watch.learn_journal(ledger_id, holds, token);
+        let Some(stored) = stored.filter(|_| holds != Holds::Nothing) else {
             return Ok(None);
         };
+        // Revision of the record this suppression is good for.
+        let key = Key {
+            config_version: key.config_version.filter(|_| {
+                config
+                    .as_ref()
+                    .is_some_and(|c| Some(c.v) == key.config_version)
+            }),
+            ..key
+        };
         let identity = registry::journal_identity(&stored);
-        if revision.is_none() {
-            if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
-                if cached.identity == identity
-                    && cached.processed_until == registry::shell(&stored)?.watermark_t + 1
-                {
-                    return Ok(Some(Arc::clone(cached)));
-                }
+        let processed_until = registry::shell(&stored)?.watermark_t + 1;
+        let suppression = match cached
+            .filter(|c| c.identity == identity && c.key.same_history(&key))
+        {
+            // A configuration change that left the journal as it was (a
+            // retention pass's bookkeeping): what was worked out stands.
+            Some(cached) => {
+                let reused = Arc::new(Suppression {
+                    journal: Arc::clone(&cached.journal),
+                    identity,
+                    key,
+                    processed_until,
+                    applies: Arc::clone(&cached.applies),
+                    head_t: cached.head_t,
+                    removed: Arc::clone(&cached.removed),
+                });
+                self.with_commits_since(ledger_id, &reused, head_t).await?
             }
-        }
-        let journal = registry::resolve_journal(&stored, self.registry_objects()).await?;
-        let applies = self.removals_applying(ledger_id, &journal).await;
-        let mut suppression = Suppression::new(journal, identity, &applies);
-        suppression.revision = revision.filter(|r| config.as_ref().is_some_and(|c| c.v == r.3));
-        suppression.processed_until = registry::shell(&stored)?.watermark_t + 1;
-        let suppression = Arc::new(suppression);
+            None => {
+                let journal = registry::resolve_journal(&stored, self.registry_objects()).await?;
+                let applies = self.removals_applying(ledger_id, &journal, None).await;
+                Arc::new(Suppression {
+                    removed: Arc::new(removed_by_predicate(&journal, &applies)),
+                    journal: Arc::new(journal),
+                    identity,
+                    key,
+                    processed_until,
+                    applies: Arc::new(applies),
+                    head_t,
+                })
+            }
+        };
         cache
             .by_ledger
             .lock()
             .insert(ledger_id.to_string(), Arc::clone(&suppression));
+        if removals && suppression.journal.removals.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(suppression))
+    }
+
+    /// `cached`, as of a head at `head_t`: commits added since it was
+    /// worked out may hold the commit of a removal it found not to apply,
+    /// so those, and only those, are looked at again.
+    async fn with_commits_since(
+        &self,
+        ledger_id: &str,
+        cached: &Arc<Suppression>,
+        head_t: i64,
+    ) -> Result<Arc<Suppression>> {
+        if head_t <= cached.head_t || !cached.awaits_commits() {
+            return Ok(Arc::clone(cached));
+        }
+        let applies = self
+            .removals_applying(ledger_id, &cached.journal, Some(&cached.applies))
+            .await;
+        let suppression = Arc::new(Suppression {
+            removed: Arc::new(removed_by_predicate(&cached.journal, &applies)),
+            journal: Arc::clone(&cached.journal),
+            identity: cached.identity.clone(),
+            key: cached.key,
+            processed_until: cached.processed_until,
+            applies: Arc::new(applies),
+            head_t,
+        });
+        self.retention
+            .suppressions
+            .by_ledger
+            .lock()
+            .insert(ledger_id.to_string(), Arc::clone(&suppression));
+        Ok(suppression)
     }
 
     /// Whether each removal of `journal` applies to `ledger_id`: whether the
     /// branch holds its commit. Reads only storage and the nameservice,
     /// never the cached ledger, so a query issued inside a transaction can
     /// ask. Whatever cannot be told applies.
-    async fn removals_applying(&self, ledger_id: &str, journal: &Journal) -> Vec<bool> {
+    /// `known` holds what was found before: a removal found to apply still
+    /// does, and is not looked at again.
+    async fn removals_applying(
+        &self,
+        ledger_id: &str,
+        journal: &Journal,
+        known: Option<&[bool]>,
+    ) -> Vec<bool> {
         let all = || vec![true; journal.removals.len()];
         let Ok(Some(record)) = self.nameservice().lookup(ledger_id).await else {
             return all();
@@ -405,7 +599,11 @@ impl Fluree {
         };
         let mut held: HashMap<&str, bool> = HashMap::new();
         let mut out = Vec::with_capacity(journal.removals.len());
-        for removal in &journal.removals {
+        for (i, removal) in journal.removals.iter().enumerate() {
+            if known.and_then(|k| k.get(i)).copied() == Some(true) {
+                out.push(true);
+                continue;
+            }
             let applies = match held.get(removal.commit.as_str()) {
                 Some(applies) => *applies,
                 None => {
@@ -522,20 +720,35 @@ impl Fluree {
         query: &Query,
         historical: bool,
     ) -> Result<()> {
+        let watch = &self.retention.watch;
         for id in search_sources(query) {
+            // Ledgers known to hold no removal refuse nothing: neither the
+            // graph source nor its configuration is read.
+            if let Some(dependencies) = watch.source_dependencies(&id) {
+                if dependencies
+                    .iter()
+                    .all(|ledger_id| self.holds_no_removal(ledger_id))
+                {
+                    continue;
+                }
+            }
+            let token = watch.token();
             let Some(record) = self.nameservice().lookup_graph_source(&id).await? else {
                 continue;
             };
+            let dependencies: Vec<String> = record
+                .dependencies
+                .iter()
+                .filter_map(|d| fluree_db_core::LedgerId::parse(d).ok())
+                .map(|d| d.to_string())
+                .collect();
+            watch.learn_source(&id, dependencies.clone(), token);
             let indexed = crate::graph_source::helpers::indexed_properties(&record);
-            for ledger_id in &record.dependencies {
-                let Ok(ledger_id) = fluree_db_core::LedgerId::parse(ledger_id) else {
-                    continue;
-                };
-                let ledger_id = ledger_id.to_string();
+            for ledger_id in dependencies {
                 // A current search is a current-state read: like one of a
                 // ledger, it is checked against the journal this replica
                 // holds, without waiting on the cluster.
-                let Some(suppression) = self.suppression_for(&ledger_id).await? else {
+                let Some(suppression) = self.removals_for(&ledger_id).await? else {
                     continue;
                 };
                 let journal = &suppression.journal;
@@ -569,29 +782,48 @@ impl Fluree {
         Ok(())
     }
 
+    /// Whether this instance knows `ledger_id` (canonically spelled) to
+    /// hold no removal, without reading anything.
+    fn holds_no_removal(&self, ledger_id: &str) -> bool {
+        let known = matches!(
+            self.retention.watch.check(ledger_id, None),
+            Check::Known(Seen::Live {
+                journal: Some(holds),
+                ..
+            }) if !holds.removals()
+        );
+        if known {
+            self.revalidate_if_due(ledger_id);
+        }
+        known
+    }
+
     /// Refuse `read` of `ledger_id` when it needs suppressed history.
     pub(crate) async fn refuse_suppressed_history(
         &self,
         ledger_id: &str,
-        read: HistoricalRead,
+        read: HistoricalRead<impl FnOnce() -> Reads>,
     ) -> Result<()> {
-        let Some(suppression) = self.suppression_for(ledger_id).await? else {
+        let Some(suppression) = self.removals_for(ledger_id).await? else {
             return Ok(());
         };
-        let head_t = match self.nameservice().lookup(ledger_id).await? {
-            Some(record) => record.commit_t,
-            None => {
-                return Err(ApiError::NotFound(format!(
-                    "{ledger_id}: the ledger this read needs has been dropped"
-                )))
-            }
+        let head_t = match self.retention.watch.check(ledger_id, None) {
+            Check::Known(Seen::Live { head_t, .. }) => head_t,
+            _ => match self.nameservice().lookup(ledger_id).await? {
+                Some(record) => record.commit_t,
+                None => {
+                    return Err(ApiError::NotFound(format!(
+                        "{ledger_id}: the ledger this read needs has been dropped"
+                    )))
+                }
+            },
         };
         if read.from_t.is_none() && read.to_t >= head_t {
             return Ok(());
         }
         let (from, to) = (read.from_t.unwrap_or(read.to_t), read.to_t);
         let point = read.from_t.is_none();
-        if let Some(predicate) = suppression.removal_needed(&read.reads, from, to, point) {
+        if let Some(predicate) = suppression.removal_needed(&(read.reads)(), from, to, point) {
             return Err(ApiError::HistoryUnavailable(format!(
                 "a removed occurrence of <{predicate}> on {ledger_id} falls in the requested range"
             )));

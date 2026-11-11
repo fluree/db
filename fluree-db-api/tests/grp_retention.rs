@@ -18,3 +18,6 @@ mod it_retention_registration;
 
 #[path = "it_retention_branch_lifetimes.rs"]
 mod it_retention_branch_lifetimes;
+
+#[path = "it_retention_query_costs.rs"]
+mod it_retention_query_costs;

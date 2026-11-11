@@ -1981,8 +1981,13 @@ impl Fluree {
         let Some(runtime) = self.retention.erasure.get() else {
             return Ok(0);
         };
+        // Nothing pending: branch creation and restores are not held up.
+        if runtime.index.pending().await?.is_empty() {
+            return Ok(0);
+        }
         let _admission = runtime.admission.write().await;
         let mut completed = 0;
+        // Listed again under the lock: another sweep may have finished them.
         for (id, bytes) in runtime.index.pending().await? {
             let resumed = async {
                 let activation: Activation = serde_json::from_slice(&bytes)

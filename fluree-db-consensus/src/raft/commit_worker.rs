@@ -229,12 +229,7 @@ impl Worker {
     /// Whether an erasure activation being prepared holds the branch's
     /// head, so that a stage now would only be refused.
     async fn held(&self) -> bool {
-        let state = self.shared_state.read().await;
-        state
-            .erasure
-            .holds
-            .get(&self.ref_key)
-            .is_some_and(|&until| crate::raft::current_millis() < until)
+        held_in(&*self.shared_state.read().await, &self.ref_key)
     }
 
     async fn wait_out_hold(&self) {
@@ -1421,7 +1416,7 @@ impl Worker {
         let mut last_committed: Option<u64> = None;
         let mut idle_since: Option<tokio::time::Instant> = None;
         loop {
-            let Some(entry) = self.snapshot_front().await else {
+            let Some((entry, held)) = self.snapshot_front().await else {
                 let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
                 if since.elapsed() >= IDLE_EXIT {
                     return;
@@ -1445,7 +1440,7 @@ impl Worker {
                     continue;
                 }
             }
-            if self.held().await {
+            if held {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -1523,13 +1518,25 @@ impl Worker {
         }
     }
 
-    async fn snapshot_front(&self) -> Option<QueueEntry> {
+    /// The front of the branch's queue, and whether an erasure activation
+    /// being prepared holds the branch (see [`Self::held`]), in one read.
+    async fn snapshot_front(&self) -> Option<(QueueEntry, bool)> {
         let state = self.shared_state.read().await;
-        state
+        let entry = state
             .queues
             .get(&self.ref_key)
-            .and_then(|queue| queue.front().cloned())
+            .and_then(|queue| queue.front().cloned())?;
+        Some((entry, held_in(&state, &self.ref_key)))
     }
+}
+
+/// Whether an erasure activation being prepared holds `key`'s head.
+fn held_in(state: &crate::raft::state_machine::NameServiceState, key: &RefKey) -> bool {
+    state
+        .erasure
+        .holds
+        .get(key)
+        .is_some_and(|&until| crate::raft::current_millis() < until)
 }
 
 /// Signal `abort` on every handle, then `await` each one. Returns

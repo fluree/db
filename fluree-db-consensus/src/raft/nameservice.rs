@@ -172,7 +172,7 @@ impl RaftNameService {
         ledger_id: &str,
         timeout: std::time::Duration,
     ) -> std::result::Result<(), String> {
-        let Some(node) = &self.erasure else {
+        let Some(node) = self.erasure.as_ref().filter(|n| !n.installed_everything()) else {
             return Ok(());
         };
         let key = ref_key_of(ledger_id).map_err(|e| e.to_string())?;

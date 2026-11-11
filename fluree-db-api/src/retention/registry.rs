@@ -459,13 +459,25 @@ pub(crate) fn journal_identity(stored: &serde_json::Value) -> String {
 
 /// Whether `stored`'s journal suppresses nothing, without reading its chunks.
 pub(crate) fn journal_empty(stored: &serde_json::Value) -> bool {
-    let empty = |key: &str| {
+    journal_holds(stored) == super::watch::Holds::Nothing
+}
+
+/// What `stored`'s journal holds, without reading its chunks.
+pub(crate) fn journal_holds(stored: &serde_json::Value) -> super::watch::Holds {
+    use super::watch::Holds;
+    let some = |key: &str| {
         stored
             .pointer(&format!("/journal/{key}"))
             .and_then(|v| v.as_array())
-            .is_none_or(Vec::is_empty)
+            .is_some_and(|a| !a.is_empty())
     };
-    empty("historyRules") && empty("removals") && empty("removalChunks")
+    if some("removals") || some("removalChunks") {
+        Holds::Removals
+    } else if some("historyRules") {
+        Holds::Rules
+    } else {
+        Holds::Nothing
+    }
 }
 
 /// The journal `stored` holds, its removals read from their chunks.
@@ -812,16 +824,26 @@ pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
     objects: Option<Objects<'_>>,
     ledger_id: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let Some(registration) = read(ns, objects, ledger_id).await?.1 else {
-        return Ok(None);
+    Ok(archived_at(ns, objects, ledger_id).await?.1)
+}
+
+/// [`archived`], with the config value it was read from.
+pub(crate) async fn archived_at<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
+    ns: &N,
+    objects: Option<Objects<'_>>,
+    ledger_id: &str,
+) -> Result<(Option<ConfigValue>, Option<serde_json::Value>)> {
+    let (config, registration) = read(ns, objects, ledger_id).await?;
+    let Some(registration) = registration else {
+        return Ok((config, None));
     };
     let archived = ArchivedRetention {
         active_since_t: registration.active_since_t,
         journal: registration.journal,
     };
-    serde_json::to_value(archived)
-        .map(Some)
-        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))
+    let section = serde_json::to_value(archived)
+        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))?;
+    Ok((config, Some(section)))
 }
 
 /// Register a restored ledger: its archive's retention section (if any),

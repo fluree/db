@@ -185,6 +185,7 @@ pub struct NameServiceObserver {
     staged_receipts: Option<Arc<StagedReceiptMap>>,
     release_tx: Option<UnboundedSender<(String, ContentId)>>,
     ledger_manager: Arc<OnceLock<Arc<LedgerManager>>>,
+    erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
 }
 
 impl NameServiceObserver {
@@ -220,6 +221,19 @@ impl NameServiceObserver {
     pub fn with_release_sender(mut self, tx: UnboundedSender<(String, ContentId)>) -> Self {
         self.release_tx = Some(tx);
         self
+    }
+
+    /// Tell `node` how many erasure activations each apply leaves applied,
+    /// so a read can find them all installed without the state lock.
+    pub fn with_erasure_node(mut self, node: Arc<crate::raft::erasure::ErasureNode>) -> Self {
+        self.erasure = Some(node);
+        self
+    }
+
+    fn note_applied(&self, state: &NameServiceState) {
+        if let Some(node) = &self.erasure {
+            node.note_applied(state.erasure.next_activation);
+        }
     }
 
     /// Clone out the late-binding ledger-cache cell.
@@ -290,6 +304,7 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
         _log_index: u64,
         out: &mut Vec<Effect>,
     ) {
+        self.note_applied(state);
         // A wrapped write is the write it wraps, once the state machine has
         // admitted it.
         let command = command.admitted();
@@ -317,6 +332,7 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
         load: SnapshotLoad,
         out: &mut Vec<Effect>,
     ) {
+        self.note_applied(state);
         // A snapshot advances heads in bulk without per-entry applies,
         // so the per-apply watermark report never fires for them.
         out.extend(state.refs.iter().filter_map(|(key, entry)| {
@@ -794,6 +810,31 @@ mod tests {
 
     fn cid(seed: u8) -> ContentId {
         ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    /// Every apply and snapshot load tells the erasure node how many
+    /// activations are applied, so its reads can skip the state lock.
+    #[test]
+    fn applies_and_snapshot_loads_report_applied_activations() {
+        let node = Arc::new(crate::raft::erasure::ErasureNode::new(1, 7));
+        let observer = NameServiceObserver::new().with_erasure_node(Arc::clone(&node));
+        let mut state = NameServiceState::default();
+        state.erasure.next_activation = 2;
+        let mut out = Vec::new();
+        observer.on_snapshot_loaded(&state, SnapshotLoad::BootRestore, &mut out);
+        assert!(!node.installed_everything());
+        node.mark_installed(2);
+        assert!(node.installed_everything());
+        state.erasure.next_activation = 3;
+        let mut response = Response::NoOp;
+        observer.on_command(
+            &state,
+            &RaftCommand::ReleaseContent { id: cid(1) },
+            &mut response,
+            1,
+            &mut out,
+        );
+        assert!(!node.installed_everything());
     }
 
     /// `drain_releases` must forward a keyless entry's envelope

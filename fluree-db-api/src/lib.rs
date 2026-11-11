@@ -3029,6 +3029,7 @@ impl FlureeBuilder {
         // The storage root's lock keeps every other process out.
         if locked {
             fluree.retention.watch.set_sole_writer();
+            erasure.index.set_sole_writer();
         }
         let _ = fluree.retention.erasure.set(erasure);
         fluree.root.pins = pins;
@@ -3115,6 +3116,16 @@ impl FlureeBuilder {
             );
         }
         let event_bus = self.resolve_event_bus();
+        // A nameservice given without the bus it reports to reports to the
+        // one built here, which the ledger cache and retention follow.
+        let nameservice = match nameservice {
+            NameServiceMode::ReadWrite(ns) if self.event_bus.is_none() => {
+                NameServiceMode::ReadWrite(Arc::new(
+                    fluree_db_nameservice::NotifyingNameService::new(ns, Arc::clone(&event_bus)),
+                ))
+            }
+            given => given,
+        };
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
             self.ledger_cache_config,
@@ -3886,6 +3897,9 @@ impl FlureeBuilder {
             let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
             let ledger_manager_cell = Self::new_ledger_manager_cell();
+            // The root's lock keeps every other process out, and its own
+            // nameservice reports every write this instance makes.
+            let sole_writer = nameservice.is_none() && Self::excludes_others(&root_lock);
 
             let (ns_mode, indexing_mode) = match nameservice {
                 Some(ns) => (ns, tx::IndexingMode::Disabled),
@@ -3918,6 +3932,10 @@ impl FlureeBuilder {
                 #[cfg(feature = "iceberg")]
                 self.identity,
             );
+            if sole_writer {
+                fluree.retention.watch.set_sole_writer();
+                erasure.index.set_sole_writer();
+            }
             let _ = fluree.retention.erasure.set(erasure);
             fluree.root.pins = pins;
             Ok(fluree.holding(root_lock))
@@ -4137,6 +4155,20 @@ impl Fluree {
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config, &backend);
         let config_content_hash = config.content_hash;
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let retention = Arc::<retention::RetentionRuntime>::default();
+        // Writes made through this instance reach its bus, so what it keeps
+        // of a branch follows them. A writer it does not see (another
+        // process on the same storage) is learned in the background.
+        let nameservice = match nameservice {
+            NameServiceMode::ReadWrite(ns) => {
+                retention.watch.track(&event_bus);
+                NameServiceMode::ReadWrite(Arc::new(
+                    fluree_db_nameservice::NotifyingNameService::new(ns, Arc::clone(&event_bus)),
+                ))
+            }
+            read_only => read_only,
+        };
         Self {
             config,
             backend: with_artifact_cache(backend, None),
@@ -4146,7 +4178,7 @@ impl Fluree {
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
-            event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
+            event_bus,
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
@@ -4154,7 +4186,7 @@ impl Fluree {
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             #[cfg(not(target_arch = "wasm32"))]
             leader_indexer: Arc::default(),
-            retention: Arc::default(),
+            retention,
             content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
             root: RootHold::default(),

@@ -29,6 +29,12 @@ use super::writer::{RetentionBatch, RetentionWriter, SubmitOutcome};
 use super::RetentionLimits;
 use crate::{Fluree, Result};
 
+/// A record revision: the branch's fence and its configuration version.
+pub(crate) type Revision = (Option<fluree_db_nameservice::Fence>, i64);
+
+/// What was read of each branch, by the record revision it was read at.
+pub(crate) type ByRevision<T> = std::collections::HashMap<String, (Revision, T)>;
+
 /// The retention state one `Fluree` instance keeps in memory.
 #[derive(Default)]
 pub(crate) struct RetentionRuntime {
@@ -46,6 +52,13 @@ pub(crate) struct RetentionRuntime {
     pub(crate) suppressions: super::suppression::SuppressionCache,
     /// Each branch's instance, head and journal, as this instance knows them.
     pub(crate) watch: Arc<super::watch::BranchWatch>,
+    /// What the last registration rescan read of each branch, by the
+    /// record revision it read it at: its activation boundary, if
+    /// registered.
+    pub(crate) rescanned: parking_lot::Mutex<ByRevision<Option<i64>>>,
+    /// Each branch's archive section, by the record revision it was read
+    /// at: a peer fetches it with every record.
+    pub(crate) archives: parking_lot::Mutex<ByRevision<Option<serde_json::Value>>>,
     /// Set on a cluster node.
     pub(crate) replicas: std::sync::OnceLock<Arc<dyn super::replicas::ReplicaSync>>,
     /// Registration chunks read.
@@ -368,12 +381,40 @@ impl Fluree {
         let ns = self.publisher()?;
         let records = self.nameservice().all_records().await?;
         let mut registered: HashMap<String, i64> = HashMap::new();
+        let mut seen = self.retention.rescanned.lock().clone();
         for record in records.iter().filter(|r| !r.retracted) {
             let id = record.ledger_id.to_string();
-            if let Some(r) = registry::read(ns, self.registry_objects(), &id).await?.1 {
-                registered.insert(id, r.active_since_t);
+            // A record naming no configuration has no registration; one
+            // naming the revision read last time has what it had then.
+            let active_since = match record.config_version {
+                Some(0) => None,
+                Some(v) => match seen.get(&id) {
+                    Some(&((fence, read_at), since)) if fence == record.fence && read_at == v => {
+                        since
+                    }
+                    _ => {
+                        let (config, stored) = registry::read_stored(ns, &id).await?;
+                        let since = match stored {
+                            Some(stored) => Some(registry::shell(&stored)?.active_since_t),
+                            None => None,
+                        };
+                        if config.is_some_and(|c| c.v == v) {
+                            seen.insert(id.clone(), ((record.fence, v), since));
+                        }
+                        since
+                    }
+                },
+                None => registry::read_stored(ns, &id)
+                    .await?
+                    .1
+                    .map(|stored| registry::shell(&stored).map(|r| r.active_since_t))
+                    .transpose()?,
+            };
+            if let Some(since) = active_since {
+                registered.insert(id, since);
             }
         }
+        *self.retention.rescanned.lock() = seen;
         for record in records.iter().filter(|r| !r.retracted) {
             let id = record.ledger_id.to_string();
             if registered.contains_key(&id) {

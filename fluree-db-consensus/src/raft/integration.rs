@@ -276,7 +276,8 @@ impl RaftIntegration {
             .with_event_bus(Arc::clone(&event_bus))
             .with_waiter_map(Arc::clone(&waiter_map))
             .with_staged_receipts(Arc::clone(&staged_receipts))
-            .with_release_sender(release_tx);
+            .with_release_sender(release_tx)
+            .with_erasure_node(Arc::clone(&erasure));
         // Taken before the observer is handed off; server assembly
         // fills it once `Fluree` exists.
         let ledger_manager = observer.ledger_manager_cell();

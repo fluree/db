@@ -134,7 +134,7 @@ The journal travels through the normal nameservice replication channel. Configur
 
 Every read still checks local erasure installation. A node that has applied an erasure but has not installed it refuses affected reads with retryable `503` `err:db/ReplicaNotCurrent`. Installing an erasure changes what the node serves; physical deletion is the separate purge phase. Write-side erasure proving and startup/rejoin coordination still catch up with the cluster.
 
-Records carry the version of their runtime configuration. An explicit version zero means no configuration or journal; an absent version in older records is unknown and requires a read. Event-driven caches avoid repeated configuration reads when the revision stays unchanged. Backends without a complete local change stream continue to revalidate.
+Records carry the version of their runtime configuration. An explicit version zero means no configuration or journal; an absent version in older records is unknown and requires a read. A query of a ledger without a removal reads nothing for retention, and a ledger's journal is read once per configuration revision, not once per commit. A process that shares its storage with other writers (S3, or a file root opened without its lock) sees none of their changes as events: it serves the journal it has learned and looks the ledger up again in the background at most once a second while it is queried, so a removal made through another process reaches its reads within about a second.
 
 A removal returns after every replica has applied it, or after 10 seconds. The receipt's `unacknowledgedReplicas` lists any replica that had not:
 

@@ -10,7 +10,8 @@
 //! Another instance on the same storage (a query peer) publishes nothing
 //! and is told nothing: it lists the map objects again on a commit read once
 //! its last listing is [`REFRESH`] old, and a publication is reported only
-//! after that.
+//! after that. An instance holding the storage root's lock has no such
+//! neighbor: it lists them once, and again only when told to.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,6 +132,10 @@ pub(crate) struct ErasureIndex {
     verifier: Arc<Verifier>,
     /// When the last complete listing of the map objects started.
     listed_at: parking_lot::RwLock<Option<Instant>>,
+    /// No other process writes this storage: every erasure it holds is
+    /// published or installed through this index, so a listing stands until
+    /// [`Self::expire`].
+    sole_writer: AtomicBool,
     /// The map objects read, as of that listing; held while listing.
     read: tokio::sync::Mutex<HashSet<String>>,
     /// Some commit is erased.
@@ -253,6 +258,7 @@ impl ErasureIndex {
             storage,
             verifier,
             listed_at: parking_lot::RwLock::new(None),
+            sole_writer: AtomicBool::new(false),
             read: tokio::sync::Mutex::new(HashSet::new()),
             any: AtomicBool::new(false),
             txns: parking_lot::RwLock::new(HashSet::new()),
@@ -395,11 +401,18 @@ impl ErasureIndex {
         Ok(held)
     }
 
+    /// This instance holds its storage root's lock: see
+    /// [`Self::sole_writer`](field@Self::sole_writer).
+    pub(crate) fn set_sole_writer(&self) {
+        self.sole_writer.store(true, Ordering::Release);
+    }
+
     /// Whether the last listing of the map objects still stands.
     fn fresh(&self) -> bool {
+        let sole_writer = self.sole_writer.load(Ordering::Acquire);
         self.listed_at
             .read()
-            .is_some_and(|at| at.elapsed() < REFRESH)
+            .is_some_and(|at| sole_writer || at.elapsed() < REFRESH)
     }
 
     /// Read the map objects not read yet, unless the last listing still

@@ -131,10 +131,7 @@ impl Fluree {
     /// `f:noHistory` alone does not count: it hides nothing.
     pub async fn history_suppressed(&self, ledger_id: &str) -> Result<bool> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
-        Ok(self
-            .suppression_for(&ledger_id)
-            .await?
-            .is_some_and(|s| !s.journal.removals.is_empty()))
+        Ok(self.removals_for(&ledger_id).await?.is_some())
     }
 
     /// The branches whose suppressed history a raw read through `ledger_id`
@@ -158,14 +155,14 @@ impl Fluree {
                 .collect()
         } else {
             let mut reached = vec![id.clone()];
-            let mut record = self.nameservice().lookup(id.as_str()).await?;
-            while let Some(source) = record.and_then(|r| r.source_branch) {
-                let source = id.with_branch(&source)?;
-                if reached.contains(&source) {
+            let mut source = self.source_branch_of(&id).await?;
+            while let Some(branch) = source {
+                let branch = id.with_branch(&branch)?;
+                if reached.contains(&branch) {
                     break;
                 }
-                record = self.nameservice().lookup(source.as_str()).await?;
-                reached.push(source);
+                source = self.source_branch_of(&branch).await?;
+                reached.push(branch);
             }
             reached
         };
@@ -176,6 +173,47 @@ impl Fluree {
             }
         }
         Ok(suppressing)
+    }
+
+    /// The branch `id` was made from, as this instance last learned it.
+    async fn source_branch_of(&self, id: &fluree_db_core::LedgerId) -> Result<Option<String>> {
+        let watch = &self.retention.watch;
+        if let Some(source) = watch.source_branch(id.as_str()) {
+            return Ok(source);
+        }
+        let token = watch.token();
+        let record = self.nameservice().lookup(id.as_str()).await?;
+        watch.learn(id.as_str(), record.as_ref(), token);
+        Ok(record.and_then(|r| r.source_branch))
+    }
+
+    /// [`Self::retention_archive_section`] for the branch `record`
+    /// describes, reused while it names the same configuration revision.
+    pub async fn retention_archive_section_of(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+    ) -> Result<Option<serde_json::Value>> {
+        let ledger_id = record.ledger_id.to_string();
+        let key = match record.config_version {
+            Some(0) => return Ok(None),
+            Some(v) => Some((record.fence, v)),
+            None => None,
+        };
+        let archives = &self.retention.archives;
+        if let Some(key) = key {
+            if let Some((cached, section)) = archives.lock().get(&ledger_id) {
+                if *cached == key {
+                    return Ok(section.clone());
+                }
+            }
+        }
+        let (config, section) =
+            registry::archived_at(&self.nameservice_mode, self.registry_objects(), &ledger_id)
+                .await?;
+        if let Some(key) = key.filter(|(_, v)| config.as_ref().is_some_and(|c| c.v == *v)) {
+            archives.lock().insert(ledger_id, (key, section.clone()));
+        }
+        Ok(section)
     }
 
     /// What a ledger archive carries of `ledger_id`'s retention (its

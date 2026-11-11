@@ -1612,18 +1612,20 @@ impl Fluree {
             .await?;
         if !earlier_point {
             match freshness {
-                // Behind, with nothing suppressed.
-                Freshness::Current
-                | Freshness::Behind {
-                    journal: Some(false),
-                } => return Ok(()),
+                Freshness::Current => return Ok(()),
+                // Behind, with no removal to refuse a read for.
+                Freshness::Behind {
+                    journal: Some(holds),
+                } if !holds.removals() => return Ok(()),
                 Freshness::Behind { .. } => {}
             }
         }
-        let reads = if executable.reasoning.modes.has_any_enabled() {
-            crate::retention::suppression::Reads::Everything
-        } else {
-            crate::retention::suppression::reads_of(parsed, encoded_with)
+        let reads = || {
+            if executable.reasoning.modes.has_any_enabled() {
+                crate::retention::suppression::Reads::Everything
+            } else {
+                crate::retention::suppression::reads_of(parsed, encoded_with)
+            }
         };
         let (from_t, to_t) = match history_range {
             Some((from, to)) => (Some(from), to),

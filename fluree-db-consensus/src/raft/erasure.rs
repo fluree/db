@@ -55,9 +55,16 @@ pub struct ErasureNode {
     incarnation: Incarnation,
     /// Every activation numbered below this is installed.
     installed: watch::Sender<u64>,
+    /// The number the next applied activation takes, as the applied state
+    /// last stood: set under the state's write lock by every apply and
+    /// snapshot load. [`UNKNOWN`] until the first.
+    applied: std::sync::atomic::AtomicU64,
     /// The log index of the last purge whose copies this run cleaned.
     cleaned: std::sync::atomic::AtomicU64,
 }
+
+/// No applied state has been reported yet.
+const UNKNOWN: u64 = u64::MAX;
 
 impl ErasureNode {
     /// The node's state for this run. The storage incarnation lives in
@@ -92,8 +99,24 @@ impl ErasureNode {
                 storage,
             },
             installed: watch::Sender::new(0),
+            applied: std::sync::atomic::AtomicU64::new(UNKNOWN),
             cleaned: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The applied state now numbers its next activation `next`. Called
+    /// under the state's write lock, so a reader that finds every applied
+    /// activation installed without taking the lock is as current as one
+    /// that took it.
+    pub(crate) fn note_applied(&self, next: u64) {
+        self.applied
+            .store(next, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this node has installed every activation applied here.
+    pub(crate) fn installed_everything(&self) -> bool {
+        let applied = self.applied.load(std::sync::atomic::Ordering::Acquire);
+        applied != UNKNOWN && self.installed_through() >= applied
     }
 
     pub fn incarnation(&self) -> Incarnation {
@@ -116,13 +139,18 @@ impl ErasureNode {
     }
 
     /// Wait up to `timeout` until this node has installed every activation
-    /// applied here that reaches `key`.
+    /// applied here that reaches `key`. Takes no lock while nothing applied
+    /// here waits to be installed, as on every read but those racing an
+    /// erasure.
     pub async fn wait_installed(
         &self,
         state: &SharedState,
         key: &RefKey,
         timeout: Duration,
     ) -> bool {
+        if self.installed_everything() {
+            return true;
+        }
         let mut rx = self.installed.subscribe();
         let wait = async {
             loop {
@@ -343,6 +371,37 @@ mod tests {
             cleanable(&state, 4, 0),
             (Some(50), vec!["c:main".to_string()])
         );
+    }
+
+    /// A read waits on no apply while every activation applied here is
+    /// installed, and takes the lock once one is pending or before any
+    /// apply has reported how many there are.
+    #[tokio::test]
+    async fn a_read_takes_no_state_lock_while_nothing_waits_to_be_installed() {
+        use crate::raft::state_machine::NameServiceState;
+        use tokio::sync::RwLock;
+        let inner = Arc::new(RwLock::new(NameServiceState::default()));
+        let state = SharedState::view_of(Arc::clone(&inner));
+        let node = ErasureNode::new(1, 7);
+        let key = RefKey::new("a", "main");
+        let short = Duration::from_millis(50);
+
+        // A long apply holds the write lock throughout.
+        let applying = inner.write().await;
+        // Nothing reported yet: the read must look, so it waits.
+        assert!(!node.wait_installed(&state, &key, short).await);
+        node.note_applied(0);
+        assert!(node.wait_installed(&state, &key, short).await);
+        node.note_applied(2);
+        node.mark_installed(2);
+        assert!(node.wait_installed(&state, &key, short).await);
+        // An activation applied and not installed: the read looks.
+        node.note_applied(3);
+        assert!(!node.wait_installed(&state, &key, short).await);
+        drop(applying);
+        // With the lock free, the activation reaching another ledger is
+        // not this one's to wait for.
+        assert!(node.wait_installed(&state, &key, short).await);
     }
 
     /// A node keeps its storage incarnation across runs on the same

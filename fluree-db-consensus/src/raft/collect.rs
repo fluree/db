@@ -35,6 +35,10 @@ pub async fn run_loader(
 /// loaded yet, before a write begins: one that began before an intent's
 /// load is refused once the intent deletes.
 pub async fn catch_up(fluree: &Fluree, condemned: &Condemned, state: &SharedState) {
+    // A member whose writes are not checked has nothing to load first.
+    if condemned.intents_loaded().is_none() {
+        return;
+    }
     if condemned.loaded() < state.read().await.collect.next_intent {
         load_pass(fluree, condemned, state).await;
     }

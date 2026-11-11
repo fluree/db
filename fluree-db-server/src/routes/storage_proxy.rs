@@ -592,7 +592,7 @@ pub async fn get_ns_record(
         serving,
         retention: state
             .fluree
-            .retention_archive_section(&ledger_id)
+            .retention_archive_section_of(&ns_record)
             .await
             .map_err(ServerError::Api)?,
     };
