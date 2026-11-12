@@ -48,6 +48,8 @@ async fn imported(lexical: &str) -> (tempfile::TempDir, Fluree, LedgerState) {
 
 /// How each output should render the literal.
 struct Expected<'a> {
+    /// Surfaces whose output must be these bytes exactly.
+    exact: &'a [(&'a str, &'a str)],
     /// The stored text.
     text: &'a str,
     /// JSON-LD and agent JSON: the document itself, or the typed literal.
@@ -68,11 +70,20 @@ async fn read_surfaces(lexical: &str, expected: &Expected<'_>) -> Vec<String> {
     let s = format!("{EX}s");
     let text = expected.text;
     let mut differing = Vec::new();
-    let mut check =
-        |surface: &str, got: Result<String, String>, want: &dyn Fn(&str) -> bool| match got {
-            Ok(got) if want(&got) => {}
-            other => differing.push(format!("{surface}: {other:?}")),
-        };
+    let mut exact_checked = 0;
+    let mut check = |surface: &str, got: Result<String, String>, want: &dyn Fn(&str) -> bool| {
+        let exact = expected
+            .exact
+            .iter()
+            .find(|(s, _)| *s == surface)
+            .map(|(_, e)| *e);
+        exact_checked += usize::from(exact.is_some());
+        match (got, exact) {
+            (Ok(got), Some(exact)) if got == exact => {}
+            (Ok(got), None) if want(&got) => {}
+            (other, _) => differing.push(format!("{surface}: {other:?}")),
+        }
+    };
     let json_eq = |want: Value| {
         move |got: &str| serde_json::from_str::<Value>(got).ok() == Some(want.clone())
     };
@@ -239,14 +250,23 @@ async fn read_surfaces(lexical: &str, expected: &Expected<'_>) -> Vec<String> {
             }),
         }
     }
+    if exact_checked != expected.exact.len() {
+        differing.push(format!(
+            "{exact_checked} of {} recorded outputs matched a surface",
+            expected.exact.len()
+        ));
+    }
     differing
 }
 
-/// A valid JSON literal an import stored reads back exactly as it always has.
+/// A valid JSON literal an import stored reads back exactly as it always has,
+/// byte for byte on every surface.
 #[tokio::test]
 async fn an_imported_json_literal_reads_back_as_before() {
+    assert_eq!(VALID_OUTPUTS.len(), 25, "one recorded output per surface");
     let document = json!({"a": [true], "b": 1});
     let expected = Expected {
+        exact: VALID_OUTPUTS,
         text: r#"{"a":[true],"b":1}"#,
         bare: document.clone(),
         typed: json!({"@value": document, "@type": "@json"}),
@@ -263,6 +283,7 @@ async fn an_imported_json_literal_reads_back_as_before() {
 async fn an_imported_invalid_json_literal_reads_back_as_typed_text() {
     let typed_literal = json!({"@value": "not json", "@type": RDF_JSON});
     let expected = Expected {
+        exact: &[],
         text: "not json",
         bare: typed_literal.clone(),
         typed: typed_literal.clone(),
@@ -271,3 +292,125 @@ async fn an_imported_invalid_json_literal_reads_back_as_typed_text() {
     let differing = read_surfaces("not json", &expected).await;
     assert!(differing.is_empty(), "{differing:#?}");
 }
+
+/// Every surface's output for a valid JSON literal before invalid ones read
+/// back as typed text, byte for byte: that change must not touch it.
+const VALID_OUTPUTS: &[(&str, &str)] = &[
+    ("select JSON-LD", r#"[[{"a":[true],"b":1}]]"#),
+    (
+        "select typed JSON",
+        r#"[{"?o":{"@value":{"a":[true],"b":1},"@type":"@json"}}]"#,
+    ),
+    (
+        "select SPARQL JSON",
+        r#"{"head":{"vars":["o"]},"results":{"bindings":[{"o":{"type":"literal","value":"{\"a\":[true],\"b\":1}","datatype":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}}]}}"#,
+    ),
+    (
+        "select agent JSON",
+        r#"{"schema":{"?o":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"},"rows":[{"?o":{"a":[true],"b":1}}],"rowCount":1,"t":1,"hasMore":false}"#,
+    ),
+    ("select JSON-LD, streamed", r#"[[{"a":[true],"b":1}]]"#),
+    (
+        "select typed JSON, streamed",
+        r#"[{"?o":{"@value":{"a":[true],"b":1},"@type":"@json"}}]"#,
+    ),
+    (
+        "select SPARQL JSON, streamed",
+        r#"{"head":{"vars":["o"]},"results":{"bindings":[{"o":{"type":"literal","value":"{\"a\":[true],\"b\":1}","datatype":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}}]}}"#,
+    ),
+    (
+        "select SPARQL XML",
+        r#"<?xml version="1.0" encoding="UTF-8"?><sparql xmlns="http://www.w3.org/2005/sparql-results#"><head><variable name="o"/></head><results><result><binding name="o"><literal datatype="http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON">{"a":[true],"b":1}</literal></binding></result></results></sparql>"#,
+    ),
+    (
+        "select CSV",
+        r#"o
+"{""a"":[true],""b"":1}"
+"#,
+    ),
+    (
+        "select TSV",
+        r#"o
+{"a":[true],"b":1}
+"#,
+    ),
+    (
+        "select agent JSON, streamed",
+        r#"{"schema":{"?o":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"},"rows":[{"?o":{"a":[true],"b":1}}],"rowCount":1,"t":1,"hasMore":false}"#,
+    ),
+    (
+        "crawl JSON-LD",
+        r#"[{"@id":"http://example.org/ns/s","http://example.org/ns/doc":{"a":[true],"b":1},"http://example.org/ns/name":"s"}]"#,
+    ),
+    (
+        "crawl JSON-LD, streamed",
+        r#"[{"@id":"http://example.org/ns/s","http://example.org/ns/doc":{"a":[true],"b":1},"http://example.org/ns/name":"s"}]"#,
+    ),
+    (
+        "crawl typed JSON",
+        r#"[{"@id":"http://example.org/ns/s","http://example.org/ns/doc":{"@value":{"a":[true],"b":1},"@type":"@json"},"http://example.org/ns/name":{"@value":"s","@type":"http://www.w3.org/2001/XMLSchema#string"}}]"#,
+    ),
+    (
+        "crawl typed JSON, streamed",
+        r#"[{"@id":"http://example.org/ns/s","http://example.org/ns/doc":{"@value":{"a":[true],"b":1},"@type":"@json"},"http://example.org/ns/name":{"@value":"s","@type":"http://www.w3.org/2001/XMLSchema#string"}}]"#,
+    ),
+    (
+        "crawl of @value and @type JSON-LD",
+        r#"[{"http://example.org/ns/doc":{"@value":{"a":[true],"b":1},"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}}]"#,
+    ),
+    (
+        "crawl of @value and @type JSON-LD, streamed",
+        r#"[{"http://example.org/ns/doc":{"@value":{"a":[true],"b":1},"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}}]"#,
+    ),
+    (
+        "crawl of @value and @type typed JSON",
+        r#"[{"http://example.org/ns/doc":{"@value":{"a":[true],"b":1},"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}}]"#,
+    ),
+    (
+        "crawl of @value and @type typed JSON, streamed",
+        r#"[{"http://example.org/ns/doc":{"@value":{"a":[true],"b":1},"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}}]"#,
+    ),
+    (
+        "CONSTRUCT JSON-LD",
+        r#"{"@context":{},"@graph":[{"@id":"http://example.org/ns/s","http://example.org/ns/doc":[{"@value":"{\"a\":[true],\"b\":1}","@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}],"http://example.org/ns/name":["s"]}]}"#,
+    ),
+    (
+        "CONSTRUCT Turtle",
+        r#"<http://example.org/ns/s> <http://example.org/ns/doc> "{\"a\":[true],\"b\":1}"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> ;
+    <http://example.org/ns/name> "s" .
+"#,
+    ),
+    (
+        "CONSTRUCT N-Triples",
+        r#"<http://example.org/ns/s> <http://example.org/ns/doc> "{\"a\":[true],\"b\":1}"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> .
+<http://example.org/ns/s> <http://example.org/ns/name> "s" .
+"#,
+    ),
+    (
+        "export Turtle",
+        r#"@prefix ex: <http://example.org/ns/> .
+
+ex:s
+    ex:doc "{\"a\":[true],\"b\":1}"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> ;
+    ex:name "s" .
+"#,
+    ),
+    (
+        "export NTriples",
+        r#"<http://example.org/ns/s> <http://example.org/ns/doc> "{\"a\":[true],\"b\":1}"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> .
+<http://example.org/ns/s> <http://example.org/ns/name> "s" .
+"#,
+    ),
+    (
+        "export JsonLd",
+        r#"{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "@graph": [
+    {"@id": "ex:s", "ex:doc": {"@value":{"a":[true],"b":1},"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}, "ex:name": "s"}
+  ]
+}
+"#,
+    ),
+];
