@@ -230,13 +230,18 @@ fn leafwise(root: &IndexRoot, event: &RunRecordV2) -> bool {
             .graph_arenas
             .iter()
             .any(|ga| ga.g_id == event.g_id && ga.fulltext.iter().any(|f| f.p_id == event.p_id));
+    let spatial = root
+        .graph_arenas
+        .iter()
+        .any(|ga| ga.g_id == event.g_id && ga.spatial.iter().any(|s| s.p_id == event.p_id));
     match o_type.decode_kind() {
         DecodeKind::NumBigArena
         | DecodeKind::VectorArena
         | DecodeKind::SpatialArena
         | DecodeKind::TripleTermDict => false,
-        // A triple term may name the string, and a full-text arena indexes it.
-        _ if o_type.is_string_keyed() => root.term_dict.is_none() && !full_text,
+        // A triple term may name the string, a full-text arena indexes it,
+        // and a spatial arena keeps a geometry's text.
+        _ if o_type.is_string_keyed() => root.term_dict.is_none() && !full_text && !spatial,
         _ => true,
     }
 }

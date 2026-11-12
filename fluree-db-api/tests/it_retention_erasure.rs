@@ -3456,6 +3456,72 @@ async fn a_value_outside_the_leaves_is_purged_by_a_rebuild() {
         .is_empty());
 }
 
+/// A geometry's text is kept in its graph's spatial arena as well as the
+/// string dictionary, which leaf by leaf erasure does not rewrite: the
+/// holder's index is rebuilt, and no index file keeps the text.
+#[tokio::test]
+async fn an_erased_geometry_is_purged_by_a_rebuild() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-geometry").await;
+    let track = "LINESTRING(-71.0601 42.3554, -71.0589 42.3601, -71.0573 42.3622)";
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice", "ex:track": {
+            "@value": track,
+            "@type": "http://www.opengis.net/ont/geosparql#wktLiteral"
+        }}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let in_spatial_index = |dir: &std::path::Path| {
+        files_holding(dir, "LINESTRING")
+            .into_iter()
+            .filter(|f| f.to_string_lossy().contains("/index/spatial/"))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !in_spatial_index(dir.path()).is_empty(),
+        "fixture: the spatial arena holds the geometry"
+    );
+    publish_erasure(
+        &fluree,
+        &id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/track".into(),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        (report.purged, report.leafwise, report.rebuilt),
+        (1, 0, 1),
+        "{report:?}"
+    );
+    assert_eq!(
+        in_spatial_index(dir.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        files_holding(dir.path(), "42.3601"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
+    );
+}
+
 /// A rebase begun after an erasure is accepted would write the occurrence
 /// again in commits the erasure does not name: it is refused, and the
 /// erasure publishes against the branch's own line.
