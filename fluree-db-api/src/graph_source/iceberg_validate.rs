@@ -581,6 +581,10 @@ pub(crate) enum KeyRemedy {
     DeclareOrIdentifierFields,
     /// `f:key`: the source reports no key of its own (Delta), or only the one
     /// its registration probe verified (SQL).
+    #[cfg_attr(
+        not(any(feature = "delta", feature = "sql")),
+        allow(dead_code, reason = "only Delta and SQL sources report it")
+    )]
     Declare,
 }
 
@@ -741,6 +745,13 @@ pub(crate) fn preview_table_keys(
 
 /// Each logical table's keys from the mapping's `f:key` alone: what a
 /// source that reports no key of its own (Delta) queries under.
+#[cfg_attr(
+    not(feature = "delta"),
+    allow(
+        dead_code,
+        reason = "only Delta sources query under declared keys alone"
+    )
+)]
 pub(crate) fn declared_table_keys(compiled: &CompiledR2rmlMapping) -> HashMap<String, TableKeys> {
     compiled
         .triples_maps
