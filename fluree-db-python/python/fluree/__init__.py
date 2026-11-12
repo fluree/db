@@ -20,6 +20,7 @@ JSON-LD or Turtle and query it with SPARQL or JSON-LD::
 
 from importlib.metadata import version as _version
 
+from fluree._canon import canonicalize
 from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, Transaction, connect
 from fluree._graph import Node, Path, Relationship
 from fluree._records import (
@@ -129,6 +130,7 @@ __all__ = [
     "ValidationResult",
     "Vector",
     "VerifyReport",
+    "canonicalize",
     "connect",
     "ntriples",
     "parse",

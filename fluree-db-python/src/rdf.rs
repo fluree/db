@@ -242,3 +242,44 @@ pub(crate) fn term_ntriples(term: &Bound<'_, PyAny>) -> PyResult<String> {
 fn rdf_error(error: RdfError) -> PyErr {
     invalid_request(error.to_string())
 }
+
+/// The canonical N-Quads (RDFC-1.0) of `quads`, each a `fluree.Quad`, hashed
+/// with `hash`: `"sha256"` or `"sha384"`.
+#[pyfunction]
+#[pyo3(signature = (quads, hash = "sha256", max_deep_calls = None))]
+pub(crate) fn canonicalize_rdf<'py>(
+    py: Python<'py>,
+    quads: &Bound<'py, PyAny>,
+    hash: &str,
+    max_deep_calls: Option<usize>,
+) -> PyResult<String> {
+    let hash = match hash.to_ascii_lowercase().as_str() {
+        "sha256" | "sha-256" => rdf::HashAlgorithm::Sha256,
+        "sha384" | "sha-384" => rdf::HashAlgorithm::Sha384,
+        other => {
+            return Err(invalid_request(format!(
+                "hash is \"sha256\" or \"sha384\", not {other:?}"
+            )))
+        }
+    };
+    let mut nodes = Nodes::default();
+    let mut dataset = Dataset::new();
+    for quad in quads.try_iter()? {
+        let quad = quad?;
+        let graph = quad.getattr(intern!(py, "graph"))?;
+        let graph = (!graph.is_none()).then(|| nodes.term(graph)).transpose()?;
+        dataset.add_quad(
+            nodes.term(quad.getattr(intern!(py, "subject"))?)?,
+            nodes.term(quad.getattr(intern!(py, "predicate"))?)?,
+            nodes.object(quad.getattr(intern!(py, "object"))?)?,
+            graph.as_ref(),
+        );
+    }
+    let options = rdf::CanonicalizeOptions {
+        hash,
+        max_deep_calls,
+    };
+    py.detach(|| rdf::canonicalize(&dataset, &options))
+        .map(|canonical| canonical.nquads)
+        .map_err(rdf_error)
+}

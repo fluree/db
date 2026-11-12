@@ -159,3 +159,36 @@ object is a triple term into a reification.
   as a bare `5`, which reads as `xsd:integer`. From Python,
   `literals="lexical"` keeps the datatype.
 - **No framing:** output is compacted only with the prefixes you pass.
+
+## Canonicalization
+
+`rdf::canonicalize` (in Python, `fluree.canonicalize(quads)`) applies
+[RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0).
+It labels a dataset's blank nodes `_:c14n0`, `_:c14n1`, … from its
+statements alone, drops duplicate statements, and writes canonical N-Quads
+with the lines in code point order. Two datasets that hold the same
+statements give the same text, whatever their blank node labels and
+statement order, so the text can be compared, hashed or signed.
+
+- **Hash:** SHA-256 by default; SHA-384 on request.
+- **Poison graphs:** some datasets have blank nodes that no statement tells
+  apart, and canonicalizing them can take time exponential in their size.
+  Such a dataset is refused once it needs more deep comparisons (calls to the
+  algorithm's Hash N-Degree Quads step) than its limit: by default 16 per
+  blank node, at least 1,024. `CanonicalizeOptions::max_deep_calls` (in
+  Python, `max_deep_calls=`) sets the limit; lower it for input from an
+  untrusted source.
+- **Literals:** a literal is written with the spelling and datatype it has in
+  the dataset. In Python, parse with `literals="lexical"` to keep them: by
+  default a literal becomes its Python value, and `"01"^^xsd:long` and
+  `"1"^^xsd:integer` then canonicalize alike.
+- **RDF 1.2:** RDFC-1.0 defines RDF 1.1 datasets. A triple term is written
+  `<<( s p o )>>`, as N-Quads 1.2 writes it, and its blank nodes are labeled
+  with the quad's.
+- **When it runs:** only when called. Reading, writing and transactions never
+  canonicalize.
+
+The implementation passes the W3C RDFC-1.0 test suite, its SHA-384,
+identifier-map and poison-graph tests included: all 86 tests of the suite
+run in CI.
+

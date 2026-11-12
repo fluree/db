@@ -453,6 +453,23 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
 the Fluree documentation shows how each syntax writes named graphs,
 annotations, reified triples and triple terms.
 
+`fluree.canonicalize(quads)` returns the quads' canonical N-Quads (RDF
+Dataset Canonicalization, RDFC-1.0): blank nodes labeled from the statements
+alone and lines in a fixed order, so two sets of quads holding the same
+statements give the same text, whatever their blank node labels and order:
+
+```python
+def canonical(doc):
+    return fluree.canonicalize(fluree.parse(doc, "trig", literals="lexical"))
+
+same = canonical(a) == canonical(b)
+```
+
+Parse with `literals="lexical"` when the text will be hashed or signed: by
+default a literal becomes its Python value, which writes `"01"^^xsd:long` and
+`"1"^^xsd:integer` alike. `max_deep_calls=` lowers the work a dataset from an
+untrusted source may take before it is refused.
+
 ## rdflib
 
 [rdflib](https://rdflib.readthedocs.io) reads formats Fluree does not, such as
