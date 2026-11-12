@@ -4259,6 +4259,7 @@ dependencies = [
  "fluree-graph-ir",
  "fluree-graph-turtle",
  "fluree-vocab",
+ "hashbrown 0.16.1",
  "pretty_assertions",
  "serde",
  "serde_json",

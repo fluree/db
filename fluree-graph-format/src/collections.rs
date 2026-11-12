@@ -3,7 +3,12 @@
 
 use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{Dataset, Graph, Term, Triple};
-use std::collections::{HashMap, HashSet};
+// The fold hashes every cell several times, and its output is looked up once
+// per triple written. hashbrown's default hasher (foldhash) is several times
+// faster than std's SipHash on short terms, and is still seeded at random,
+// so terms taken from stored data can't be chosen to collide.
+use hashbrown::{HashMap, HashSet};
+use std::collections::{HashMap as StdMap, HashSet as StdSet};
 
 /// Chains of blank nodes, each with exactly one `rdf:first` and one
 /// `rdf:rest` and nothing else, named once, and ending at `rdf:nil`. A stored
@@ -20,20 +25,21 @@ impl<'g> Collections<'g> {
     /// `shared` holds the nodes another graph of the same document names.
     pub fn of(
         graph: &'g Graph,
-        reifiers: &HashMap<&'g Triple, Vec<&'g Term>>,
-        shared: &HashSet<&'g Term>,
+        reifiers: &StdMap<&'g Triple, Vec<&'g Term>>,
+        shared: &StdSet<&'g Term>,
     ) -> Self {
         let foldable =
             |t: &Term| is_blank(t) && t.as_iri().is_none_or(|iri| !iri.starts_with("_:fdb-"));
         // A reified triple, or one a reifier names, keeps its cells as written.
-        let mut named: HashSet<&Term> = shared.clone();
+        let mut named: HashSet<&Term> = HashSet::new();
         for t in reifiers.keys() {
             named.insert(t.subject());
             named.insert(t.object());
         }
+        let kept = |t: &Term| named.contains(t) || shared.contains(t);
         let mut cells: HashMap<&Term, (Option<&Term>, Option<&Term>, usize)> = HashMap::new();
         for t in graph.triples() {
-            if !foldable(t.subject()) || named.contains(t.subject()) {
+            if !foldable(t.subject()) || kept(t.subject()) {
                 continue;
             }
             let cell = cells.entry(t.subject()).or_default();
@@ -132,12 +138,12 @@ impl<'g> Collections<'g> {
 
 /// A document scopes a blank-node label to all its graphs, so a node more
 /// than one graph names must keep its label.
-pub(crate) fn blank_nodes_in_several_graphs(dataset: &Dataset) -> HashSet<&Term> {
-    let mut shared = HashSet::new();
+pub(crate) fn blank_nodes_in_several_graphs(dataset: &Dataset) -> StdSet<&Term> {
+    let mut shared = StdSet::new();
     if dataset.named.is_empty() {
         return shared;
     }
-    let mut seen: HashMap<&Term, usize> = HashMap::new();
+    let mut seen: StdMap<&Term, usize> = StdMap::new();
     let graphs = std::iter::once(&dataset.default).chain(dataset.named.values());
     for (i, graph) in graphs.enumerate() {
         for t in graph.triples() {
@@ -186,7 +192,7 @@ mod tests {
     /// The collections of `graph`: the number of items in each, longest
     /// first, and the number of cells folded.
     fn fold(graph: &Graph) -> (Vec<usize>, usize) {
-        let collections = Collections::of(graph, &HashMap::new(), &HashSet::new());
+        let collections = Collections::of(graph, &StdMap::new(), &StdSet::new());
         let mut lens: Vec<usize> = collections.heads.values().map(Vec::len).collect();
         lens.sort_unstable_by(|a, b| b.cmp(a));
         (lens, collections.cells.len())
