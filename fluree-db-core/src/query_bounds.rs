@@ -40,6 +40,10 @@ pub struct RangeMatch {
     pub o: Option<FlakeValue>,
     /// Datatype to match
     pub dt: Option<Sid>,
+    /// Language tag of an `rdf:langString` object to match, which a range
+    /// read may narrow to (each tag is its own object type). Rows are still
+    /// kept by their tag by the caller.
+    pub lang: Option<std::sync::Arc<str>>,
     /// Transaction time to match
     pub t: Option<i64>,
 }

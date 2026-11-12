@@ -367,6 +367,7 @@ impl BinaryHistoryScanOperator {
             p: None,
             o: o_val_opt.clone(),
             dt: self.pattern.dtc.as_ref().map(|d| d.datatype().clone()),
+            lang: None,
             t: None,
         };
         let object_matches = |f: &Flake| {
@@ -385,6 +386,7 @@ impl BinaryHistoryScanOperator {
                 p: p_sid.clone(),
                 o: None,
                 dt: None,
+                lang: None,
                 t: None,
             };
 

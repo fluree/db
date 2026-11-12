@@ -2150,6 +2150,7 @@ fn build_match_val_for_snapshot(
     // reads that datatype, not every bound string as `xsd:string`.
     if let (Term::Value(FlakeValue::String(_)), Some(dtc)) = (&pattern.o, pattern.dtc.as_ref()) {
         match_val.dt = Some(datatype_in_snapshot(ctx, snapshot, dtc.datatype()));
+        match_val.lang = dtc.lang_tag().map(Arc::from);
     }
 
     Ok(match_val)
