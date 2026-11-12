@@ -497,6 +497,7 @@ pub fn rewrite_patterns_for_r2rml(
                         graph_source_id,
                         snapshot,
                         mapping,
+                        keys,
                         reasoning_active,
                         crawl_active,
                     );
