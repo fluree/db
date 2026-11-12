@@ -46,10 +46,12 @@ from fluree._sources import (
     Glue,
     GraphSource,
     S3Tables,
+    StorageIdentity,
     Unity,
     _auth,
     _common,
     _registered,
+    _storage,
 )
 from fluree.errors import ConflictError, InvalidRequestError, NotFoundError, PermissionDeniedError
 
@@ -257,6 +259,7 @@ class Connection:
         warehouse: str | None = None,
         auth: Auth | None = None,
         vended_credentials: bool | None = None,
+        storage: StorageIdentity | None = None,
         s3_region: str | None = None,
         s3_endpoint: str | None = None,
         s3_path_style: bool = False,
@@ -275,13 +278,22 @@ class Connection:
         process first reads a table). Or find them through a catalog, where
         the mapping's table names (or ``table``) name the tables: a REST
         catalog at ``catalog_uri``, with ``warehouse`` and ``auth``
-        (:class:`Bearer` or :class:`OAuth2`); an AWS Glue Data Catalog
-        (:class:`Glue`); or an AWS S3 Tables table bucket
-        (:class:`S3Tables`). A REST catalog's vended credentials are used
-        unless ``vended_credentials`` is false; otherwise, and always for
-        Glue and S3 Tables, S3 access uses the usual AWS environment and the
-        ``s3_*`` settings. ``warehouse``, ``auth`` and asking for vended
+        (:class:`Bearer`, :class:`OAuth2` or :class:`Google`); an AWS Glue
+        Data Catalog (:class:`Glue`); or an AWS S3 Tables table bucket
+        (:class:`S3Tables`). ``warehouse``, ``auth`` and asking for vended
         credentials apply to a REST catalog only, and are refused otherwise.
+
+        ``storage`` says which identity reads the table's files: ``"vended"``
+        (the REST catalog's per-table credentials, required), ``"ambient"``
+        (the usual AWS environment and the ``s3_*`` settings),
+        ``"catalog"`` (the catalog's own :class:`Google` identity reads
+        ``gs://``), or a :class:`Google` identity of the source's own. Left
+        out, a ``bq://`` warehouse (BigLake federation, which never vends)
+        reads with ``"catalog"`` and a ``bl://`` one with ``"vended"``;
+        otherwise a REST catalog's vended credentials are used unless
+        ``vended_credentials`` is false, and Glue, S3 Tables and Direct read
+        with the usual AWS environment. Give ``storage`` or
+        ``vended_credentials``, not both.
 
         ``order_by`` names the column that orders a key's rows, latest
         winning, for :meth:`GraphSource.materialize`. ``model`` names a
@@ -300,6 +312,7 @@ class Connection:
             "warehouse": warehouse,
             "auth": _auth(auth),
             "vended_credentials": vended_credentials,
+            "storage": _storage(storage),
             "s3_region": s3_region,
             "s3_endpoint": s3_endpoint,
             "s3_path_style": s3_path_style,
@@ -1146,11 +1159,31 @@ class Ledger:
         return [IRI(g["iri"]) for g in named if g["iri"] not in system]
 
     def drop_graph(self, graph: str) -> Commit:
-        """Retract everything in named graph ``graph`` (its full IRI) in one
-        commit. History keeps it, and the graph can be written to again. The
-        default graph and Fluree's own graphs cannot be dropped."""
+        """Drop named graph ``graph`` (its full IRI) in one commit, as SPARQL
+        ``DROP GRAPH`` does: the graph and its history are no longer queryable
+        — a query as of an earlier ``t`` naming it raises — though the commits
+        that wrote it keep its facts, so a branch from before the drop has
+        them. Writing to the IRI again starts the graph afresh. The default
+        graph and Fluree's own graphs cannot be dropped; SPARQL ``CLEAR
+        GRAPH`` empties a graph and keeps its history."""
         self._require_unrestricted("drop_graph")
         return Commit(**self._connection._native.drop_graph(self._id, graph))
+
+    def import_graph(self, graph: str, source: str | os.PathLike[str]) -> Commit:
+        """Bulk-load ``source`` into ``graph``, a named graph (its full IRI)
+        the ledger does not have yet, as :meth:`Connection.create` loads a new
+        ledger. Returns the import's last commit, with every fact it added as
+        ``asserts``.
+
+        ``source`` is a file or a directory of Turtle, N-Triples, or JSON-LD
+        files; TriG and N-Quads name graphs of their own and are refused.
+        IRIs and strings the ledger already holds keep their identity, so the
+        graph joins with the rest of the ledger. Commits the ledger has not
+        indexed yet are indexed first, and writes to the ledger wait while the
+        import runs. Raises :class:`InvalidRequestError` when the ledger
+        already has ``graph``."""
+        self._require_unrestricted("import_graph")
+        return Commit(**self._connection._native.import_graph(self._id, graph, Path(source)))
 
     def set_full_text(
         self, properties: Iterable[str], *, language: str = "en", reindex: bool = True

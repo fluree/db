@@ -97,11 +97,24 @@ impl Fluree {
         ledger_id: &str,
         target_t: i64,
     ) -> Result<HistoricalLedgerView> {
-        let view = HistoricalLedgerView::load_at(
+        self.ledger_view_at_from_head(ledger_id, target_t, None)
+            .await
+    }
+
+    /// [`Self::ledger_view_at`], taking the drops after the index from
+    /// `head`, a state in hand, when it is at the ledger's head commit.
+    pub(crate) async fn ledger_view_at_from_head(
+        &self,
+        ledger_id: &str,
+        target_t: i64,
+        head: Option<fluree_db_ledger::HeadDrops<'_>>,
+    ) -> Result<HistoricalLedgerView> {
+        let view = HistoricalLedgerView::load_at_from_head(
             &self.nameservice_mode,
             ledger_id,
             self.backend(),
             target_t,
+            head,
         )
         .await?;
 
@@ -431,8 +444,13 @@ impl Fluree {
 
 impl Fluree {
     /// List all non-retracted branches for a ledger.
+    ///
+    /// Fails if any branch record cannot be read, rather than return a list
+    /// that silently leaves that branch out.
     pub async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        Ok(self.nameservice().list_branches(ledger_name).await?)
+        let mut branches = self.nameservice().branch_records(ledger_name).await?;
+        branches.retain(|r| !r.retracted);
+        Ok(branches)
     }
 }
 

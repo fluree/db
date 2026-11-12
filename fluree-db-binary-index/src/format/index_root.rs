@@ -278,6 +278,19 @@ pub struct IndexRoot {
     /// (`FLAG_EXT_LIST_META_TRACKED`, `FLAG_EXT_HAS_LIST_META`) so a
     /// legacy zero byte reads as "untracked" rather than "none".
     pub has_list_meta: Option<bool>,
+
+    /// The graphs a commit at or before `index_t` dropped, ascending by g_id,
+    /// with what each latest drop left. The index holds none of a dropped
+    /// graph's facts from before its floor; this is what tells a reader that
+    /// the graph does not exist (until revived) and that its history before
+    /// the floor is gone rather than empty.
+    ///
+    /// Carried in a section after `annotation_index`, flagged by
+    /// `FLAG_EXT_GRAPH_DROPS`: a decoder predating DROP refuses the root
+    /// ("trailing bytes") instead of reading the graph as merely emptied.
+    /// Empty on every ledger that never dropped a graph, whose roots are
+    /// byte-identical to before.
+    pub graph_drops: Vec<(fluree_db_core::GraphId, fluree_db_core::GraphDrop)>,
 }
 
 /// Decode the two-bit `has_list_meta` state from the FIR6 extended-flags
@@ -604,6 +617,9 @@ impl IndexRoot {
     /// Extended-flags bit: at least one indexed row carries a list index.
     /// Only meaningful when `FLAG_EXT_LIST_META_TRACKED` is set.
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
+    /// Extended-flags bit: the `graph_drops` section follows
+    /// `annotation_index`.
+    const FLAG_EXT_GRAPH_DROPS: u8 = 1 << 3;
 
     /// Encode to the binary FIR6 wire format.
     ///
@@ -695,6 +711,9 @@ impl IndexRoot {
             }
             Some(false) => flags_ext |= Self::FLAG_EXT_LIST_META_TRACKED,
             None => {}
+        }
+        if !self.graph_drops.is_empty() {
+            flags_ext |= Self::FLAG_EXT_GRAPH_DROPS;
         }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
@@ -858,6 +877,11 @@ impl IndexRoot {
                 .expect("ciborium serialization to Vec<u8> is infallible");
             buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
             buf.extend_from_slice(&body);
+        }
+
+        // ---- Optional: graph_drops ----
+        if !self.graph_drops.is_empty() {
+            fluree_db_core::graph_registry::encode_graph_drops(&self.graph_drops, &mut buf);
         }
 
         buf
@@ -1100,15 +1124,21 @@ impl IndexRoot {
             None
         };
 
+        let graph_drops = if flags_ext & Self::FLAG_EXT_GRAPH_DROPS != 0 {
+            fluree_db_core::graph_registry::decode_graph_drops(data, &mut pos)?
+        } else {
+            Vec::new()
+        };
+
         // All optional sections consumed. `pos` should now equal the
         // input length — anything else means a future format added
-        // bytes after the annotation section, or the writer emitted
+        // bytes after the last section, or the writer emitted
         // garbage. Surfacing this here keeps decode strict and makes
         // appending a new section a deliberate change rather than a
         // silent compatibility break.
         if pos != data.len() {
             return Err(io_err(&format!(
-                "root v6: trailing bytes after annotation_index ({} unread)",
+                "root v6: trailing bytes after the last section ({} unread)",
                 data.len() - pos
             )));
         }
@@ -1157,6 +1187,7 @@ impl IndexRoot {
             had_annotation_arena: had_annotation_arena || annotation_index.is_some(),
             annotation_index,
             has_list_meta,
+            graph_drops,
         })
     }
     /// Collect all CAS content-artifact CIDs referenced **directly** by this root.
@@ -1458,6 +1489,7 @@ mod tests {
             annotation_index: None,
             had_annotation_arena: false,
             has_list_meta: None,
+            graph_drops: Vec::new(),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }
@@ -1483,6 +1515,45 @@ mod tests {
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
         assert!(decoded.annotation_index.is_none());
+    }
+
+    #[test]
+    fn fir6_round_trip_graph_drops() {
+        use fluree_db_core::GraphDrop;
+
+        let plain = minimal_root_v6().encode();
+        assert_eq!(plain[6] & IndexRoot::FLAG_EXT_GRAPH_DROPS, 0);
+
+        let mut root = minimal_root_v6();
+        root.graph_drops = vec![
+            (
+                0,
+                GraphDrop {
+                    floor: 7,
+                    revived: Some(7),
+                },
+            ),
+            (
+                4,
+                GraphDrop {
+                    floor: 9,
+                    revived: None,
+                },
+            ),
+        ];
+        let bytes = root.encode();
+        assert_ne!(bytes[6] & IndexRoot::FLAG_EXT_GRAPH_DROPS, 0);
+        // The section comes last, so a decoder predating it refuses the root
+        // on its trailing-bytes check rather than skipping the drops.
+        assert_eq!(&bytes[..plain.len()][8..], &plain[8..]);
+
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        assert_eq!(decoded.graph_drops, root.graph_drops);
+
+        let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        assert!(!snap.graph_registry.visible_at(0, 6));
+        assert!(snap.graph_registry.visible_at(0, 7));
+        assert!(snap.graph_registry.is_dropped(4));
     }
 
     #[test]

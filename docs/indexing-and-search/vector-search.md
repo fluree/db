@@ -421,7 +421,7 @@ Vector indexes are implemented using embedded [usearch](https://github.com/unum-
 
 ### Creating Vector Indexes
 
-> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the same storage path your Fluree server reads, then run queries normally via `POST /v1/fluree/query`.
+> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the storage your Fluree server reads, then run queries normally via `POST /v1/fluree/query`. On file storage, a directory is used by one process at a time and the server locks it ([One process per directory](../operations/storage.md#one-process-per-directory)), so stop the server while the Rust program creates the index, then start it again.
 
 #### Rust API
 
@@ -550,6 +550,8 @@ println!("Upserted: {}, Removed: {}", sync_result.upserted, sync_result.removed)
 ```
 
 Sync is incremental only when the indexing query's dependencies can be tracked completely; the shape rules are the same as for [BM25 syncing](bm25.md#syncing). Outside that shape every sync re-embeds the whole corpus, and the decline is logged at `warn` with the reason. Within it, a window that touches none of the tracked properties (the embedding property is always one of them) advances the watermark without re-embedding anything.
+
+A sync whose window holds a `DROP` of a graph the indexing query reads re-embeds in full, for the reason and by the rules given under [BM25 syncing](bm25.md#syncing). A vector index keeps only its latest snapshot, so there is no earlier one to retire.
 
 #### Full Resync
 

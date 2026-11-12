@@ -89,6 +89,20 @@ impl VarRegistry {
         id
     }
 
+    /// A new variable named `{prefix}{n}`, for an `n` no registered name
+    /// has. Taken after every name a query writes is registered, it aliases
+    /// none of them.
+    pub fn fresh(&mut self, prefix: &str) -> VarId {
+        let mut n = self.id_to_name.len();
+        loop {
+            let name = format!("{prefix}{n}");
+            if !self.name_to_id.contains_key(name.as_str()) {
+                return self.get_or_insert(&name);
+            }
+            n += 1;
+        }
+    }
+
     /// Get the VarId for a name, if it exists
     pub fn get(&self, name: &str) -> Option<VarId> {
         self.name_to_id.get(name).copied()

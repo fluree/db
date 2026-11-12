@@ -74,7 +74,10 @@ Content-Type: application/json
 Optional fields: `branch`, `r2rml_type`, `s3_endpoint`, `s3_path_style`,
 `azure_tenant_id`, `azure_client_id`, `azure_client_secret_env` /
 `azure_client_secret`, the [Unity Catalog](#unity-catalog) fields, `model`,
-`default_allow`. The response reports the stored mapping, the mapped
+`default_allow`, and the [latest-by-key](#materialization) fields
+`delete_column`, `delete_values` (a `null` entry matches a NULL value) and
+`order_by`. `fluree delta map` does not set the latest-by-key fields; send them
+to `/delta/map` directly. The response reports the stored mapping, the mapped
 table names, `table_versions` (the current Delta version of each table that
 opened with every column its maps reference) and `table_warnings` (a table that
 could not be read, or a mapped column it lacks; the source is registered
@@ -122,8 +125,9 @@ principal per source, give its tenant id, client id and secret:
 ```
 
 `azure_client_secret_env` names an environment variable of the reading
-process, so the secret is never stored; `azure_client_secret` is a literal
-that is stored with the graph source. An embedding application can instead
+process, so the secret is never stored; a server accepts only names listed in
+[`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning).
+`azure_client_secret` is a literal that is stored with the graph source. An embedding application can instead
 supply a secret reference, resolved through its `SecretResolver`. Tokens are
 requested for the storage audience and refreshed automatically.
 
@@ -178,7 +182,10 @@ needs no storage credentials of its own.
   default to the workspace's own endpoint and `all-apis`. A secret is given as
   a literal, stored with the source, or as the name of an environment variable
   of the reading process; a server accepts only names listed in
-  [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](iceberg.md#stored-configuration-format-nameservice).
+  [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning).
+  The catalog and storage fields may also be given structured, as the stored
+  config spells them (`unity`, `io`); see
+  [`delta/map`](../api/endpoints.md#post-api_base_urldeltamap).
 - **Credentials.** Unity issues them per table, scoped to that table's path,
   for an hour. Each table's are kept until a few minutes before they expire
   and then requested again; concurrent queries share one request. The table's
@@ -485,7 +492,8 @@ A pass applies at most `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` changed rows (by
 default derived from the novelty ceiling; see
 [Configuration](../operations/configuration.md)). It stops at a commit boundary,
 records the last version it applied, and the next pass continues from there. A
-read pinned to a version, and a first whole read, are not bounded.
+read pinned to a version is not bounded, and neither is a whole read: the first
+pass, one with `"force_full": true`, or the fallback below.
 
 When the change feed cannot serve a window, the pass reads the latest version
 whole instead and logs why at `warn`: the feed was off for part of the window,

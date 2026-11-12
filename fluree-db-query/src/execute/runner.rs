@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
-use super::reasoning_prep::{compute_derived_facts, schema_hierarchy_with_overlay};
+use super::reasoning_prep::compute_derived_facts;
 use super::rewrite_glue::rewrite_query_patterns;
 
 /// Remove exact duplicate triple patterns inside conjunctive blocks.
@@ -137,6 +137,8 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// The reasoning memory budget `derived_overlay` was materialized under.
+    pub reasoning_memory_limit: usize,
     /// Whether any reasoning/entailment mode was enabled for this query.
     ///
     /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
@@ -335,8 +337,12 @@ pub async fn prepare_execution_with_config(
             }
 
             // Step 1: Compute schema hierarchy from overlay
-            let hierarchy =
-                schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await?;
+            let hierarchy = fluree_db_core::compute_schema_hierarchy_with_overlay(
+                db.snapshot,
+                effective_overlay,
+                db.t,
+            )
+            .await?;
 
             tracing::debug!(
                 rdfs = reasoning.rdfs,
@@ -544,10 +550,33 @@ pub async fn prepare_execution_with_config(
             build_operator_tree(&rewritten_query, stats_view, &planning)?
         };
 
+        // A CONSTRUCT writes the list entries its template restates
+        // (`crate::list_entries`), for a ledger that may hold list members
+        // and a template triple whose predicate may hold them.
+        let operator = match &rewritten_query.output {
+            crate::ir::QueryOutput::Construct(template)
+                if template.writes_list_entries()
+                    && !rewritten_query.rdf_list_view
+                    && !planning.is_history() =>
+            {
+                match crate::list_view::view_for(db.snapshot, db.overlay, binary_store)? {
+                    Some(view) => crate::list_entries::ListEntriesOperator::over(
+                        operator,
+                        template,
+                        view,
+                        &|iri| db.snapshot.encode_iri(iri),
+                    ),
+                    None => operator,
+                }
+            }
+            _ => operator,
+        };
+
         Ok(PreparedExecution {
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_memory_limit: derived_outcome.memory_limit_bytes,
             reasoning_active: reasoning.has_any_enabled(),
         })
     }
@@ -918,6 +947,15 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     // otherwise be dropped by.
     if prepared.reasoning_active {
         ctx = ctx.with_reasoning_active(true);
+    }
+    if let Some(derived) = prepared.derived_overlay.as_ref() {
+        if let Some(ops) = crate::reasoning_ops::ReasoningOpsHandle::attach(
+            derived,
+            prepared.reasoning_memory_limit,
+            ctx.overlay().content_version(),
+        ) {
+            ctx = ctx.with_reasoning_ops(ops);
+        }
     }
 
     if let Some(tracker) = config.tracker {

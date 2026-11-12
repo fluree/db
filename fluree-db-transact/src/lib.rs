@@ -78,7 +78,8 @@ pub use flake_sink::FlakeSink;
 pub use generate::FlakeGenerator;
 pub use ir::{
     AddressName, GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues,
-    TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
+    RelationshipDelete, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    WriteGraphs,
 };
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,
@@ -98,11 +99,12 @@ pub use parse::{
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{
-    generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions,
-    DELETE_WITNESSED_SITE,
+    drop_needs_unrestricted_identity, generate_txn_id, stage, stage_flakes, stage_with_graph_delta,
+    StageOptions, DELETE_WITNESSED_SITE,
 };
 pub use staged_dicts::{
-    attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
+    attach_binary_provider, attach_staged_dicts, detach_binary_provider, graphs_to_hide,
+    hide_dropped_graphs, staged_dicts, store_without_dropped_graphs, StagedDicts,
 };
 pub use template_sink::{RdfTextParts, TemplateSink};
 

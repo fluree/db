@@ -349,3 +349,112 @@ async fn geof_distance_via_sparql() {
         "Expected ~343.5km via SPARQL, got {distance} meters"
     );
 }
+
+/// A full rebuild indexes complex geometries, as an incremental build does, and
+/// the incremental build after it adds to that index. The rebuild built none,
+/// so a reindex dropped the ledger's spatial index, and the next incremental
+/// build indexed only its own window. The incremental build also re-added each
+/// prior geometry once per covering cell, multiplying the index on every build.
+#[tokio::test]
+async fn a_rebuild_keeps_the_spatial_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    fluree.create_ledger("geo/rebuild").await.unwrap();
+    let id = "geo/rebuild:main";
+
+    insert_area(&fluree, id, "ex:park", "POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))").await;
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let park = indexed_subject_id(&fluree, id, "http://example.org/park").await;
+    let after_rebuild = spatial_cell_subjects(&fluree, id).await;
+    assert!(!after_rebuild.is_empty());
+    assert!(
+        after_rebuild.iter().all(|&s| s == park),
+        "{after_rebuild:?}"
+    );
+
+    insert_area(&fluree, id, "ex:lake", "POLYGON((5 5, 5 6, 6 6, 6 5, 5 5))").await;
+    support::build_incrementally_and_publish_index(&fluree, id).await;
+    let lake = indexed_subject_id(&fluree, id, "http://example.org/lake").await;
+    let after_incremental = spatial_cell_subjects(&fluree, id).await;
+    let count = |s| after_incremental.iter().filter(|&&x| x == s).count();
+    assert_eq!(
+        count(park),
+        after_rebuild.len(),
+        "park's cells carry over once"
+    );
+    assert!(count(lake) > 0);
+    assert_eq!(count(park) + count(lake), after_incremental.len());
+}
+
+async fn insert_area(fluree: &fluree_db_api::Fluree, id: &str, subject: &str, wkt: &str) {
+    fluree
+        .graph(id)
+        .transact()
+        .insert(&json!({
+            "@context": geo_context(),
+            "@id": subject,
+            "ex:area": {"@value": wkt, "@type": "geo:wktLiteral"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+}
+
+/// `iri`'s subject id in the published index.
+async fn indexed_subject_id(fluree: &fluree_db_api::Fluree, id: &str, iri: &str) -> u64 {
+    fluree.disconnect_ledger(id).await;
+    fluree
+        .db(id)
+        .await
+        .unwrap()
+        .binary_store()
+        .unwrap()
+        .find_subject_id(iri)
+        .unwrap()
+        .unwrap()
+}
+
+/// The subject of each cell entry in the published root's one spatial index.
+async fn spatial_cell_subjects(fluree: &fluree_db_api::Fluree, id: &str) -> Vec<u64> {
+    use fluree_db_core::ContentStore;
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree.content_store(id);
+    let bytes = store
+        .get(record.index_head_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
+    let spatial: Vec<_> = root.graph_arenas.iter().flat_map(|g| &g.spatial).collect();
+    assert_eq!(spatial.len(), 1, "one spatial index");
+    let spatial = spatial[0];
+
+    let spatial_root: fluree_db_spatial::SpatialIndexRoot =
+        serde_json::from_slice(&store.get(&spatial.root_cid).await.unwrap()).unwrap();
+    let mut blobs = std::collections::HashMap::new();
+    for cid in [&spatial.manifest, &spatial.arena]
+        .into_iter()
+        .chain(&spatial.leaflets)
+    {
+        blobs.insert(cid.digest_hex(), store.get(cid).await.unwrap());
+    }
+    let snapshot =
+        fluree_db_spatial::SpatialIndexSnapshot::load_from_cas(spatial_root, move |hash| {
+            blobs.get(hash).cloned().ok_or_else(|| {
+                fluree_db_spatial::error::SpatialError::ChunkNotFound(hash.to_string())
+            })
+        })
+        .unwrap();
+    snapshot
+        .cell_index()
+        .scan_range(0, u64::MAX)
+        .unwrap()
+        .iter()
+        .map(|e| e.subject_id)
+        .collect()
+}

@@ -42,6 +42,30 @@ use fluree_vocab::{rdf_names, xsd_names};
 use futures::StreamExt;
 use std::sync::Arc;
 
+/// The drops a state at a ledger's head knows, from a registry already in
+/// hand: what a view as of a `t` at or below the index takes from the commits
+/// after it, which a view loaded without them reads one by one. Serves a view
+/// only of a record whose head commit is `commit_id`.
+#[derive(Clone, Copy)]
+pub struct HeadDrops<'a> {
+    pub commit_id: &'a ContentId,
+    pub registry: &'a fluree_db_core::GraphRegistry,
+}
+
+impl<'a> HeadDrops<'a> {
+    /// The drops of the state whose head commit is `commit_id` and whose
+    /// registry is `registry`, if it has a head commit.
+    pub fn of(
+        commit_id: Option<&'a ContentId>,
+        registry: &'a fluree_db_core::GraphRegistry,
+    ) -> Option<Self> {
+        commit_id.map(|commit_id| Self {
+            commit_id,
+            registry,
+        })
+    }
+}
+
 /// Read-only ledger view for time-bounded historical queries
 ///
 /// This struct provides a consistent view of a ledger at a specific point in time.
@@ -91,6 +115,19 @@ impl HistoricalLedgerView {
         backend: &StorageBackend,
         target_t: i64,
     ) -> Result<Self> {
+        Self::load_at_from_head(ns, alias, backend, target_t, None).await
+    }
+
+    /// [`Self::load_at`], taking the drops after the index from `head` when it
+    /// is at the record's head commit, rather than reading the commits after
+    /// the index.
+    pub async fn load_at_from_head(
+        ns: &dyn NameServiceLookup,
+        alias: &str,
+        backend: &StorageBackend,
+        target_t: i64,
+        head: Option<HeadDrops<'_>>,
+    ) -> Result<Self> {
         let record = ns
             .lookup(alias)
             .await?
@@ -105,11 +142,11 @@ impl HistoricalLedgerView {
         // back through the branch ancestry DAG.
         if record.source_branch.is_some() {
             let store = LedgerState::build_branched_store(ns, &record, backend).await?;
-            return Self::load_at_with_store(store, record, target_t).await;
+            return Self::load_at_with_store(store, record, target_t, head).await;
         }
 
         let store = backend.content_store(&record.ledger_id);
-        Self::load_at_with_store(store, record, target_t).await
+        Self::load_at_with_store(store, record, target_t, head).await
     }
 
     /// Load a historical view using a given content store.
@@ -119,6 +156,7 @@ impl HistoricalLedgerView {
         store: C,
         record: fluree_db_nameservice::NsRecord,
         target_t: i64,
+        head: Option<HeadDrops<'_>>,
     ) -> Result<Self> {
         // The binary index covers `base_t..=index_t` via FIR6 Region 3 history.
         // Use the indexed snapshot whenever it covers `target_t`:
@@ -129,10 +167,14 @@ impl HistoricalLedgerView {
         //
         // `base_t` must be read from the index root itself (it isn't in the
         // nameservice record), so we load the root first and then decide.
+        // The drops the head knows, whatever `target_t`: a graph dropped after
+        // `target_t` is no more visible as of it than at the head. The index
+        // root carries those at or before its `index_t`; a genesis fallback
+        // replays every commit, and meets every drop that way.
         let (mut snapshot, index_t) = match record.index_head_id.as_ref() {
             Some(index_cid) => {
                 let root_bytes = store.get(index_cid).await?;
-                let loaded = LedgerSnapshot::from_root_bytes(&root_bytes)?;
+                let loaded = LedgerSnapshot::from_root(index_cid, &root_bytes)?;
                 if target_t < loaded.base_t {
                     tracing::debug!(
                         target_t,
@@ -154,6 +196,19 @@ impl HistoricalLedgerView {
         // commits up to target_t (index_t=0), producing a correct time-travel snapshot
         // without relying on index history coverage.
         let overlay = if let Some(head_cid) = &record.commit_head_id {
+            if target_t <= index_t && record.commit_t > index_t {
+                // No replay, but the commits after the index may drop graphs.
+                // A state at the record's head knows those drops; without
+                // one, each commit after the index is read for them.
+                match head.filter(|head| head.commit_id == head_cid) {
+                    Some(head) => crate::carry_graph_drops(head.registry, &mut snapshot),
+                    None => {
+                        let lifecycles =
+                            crate::window_lifecycles(&store, head_cid, index_t).await?;
+                        crate::apply_commit_lifecycles(&mut snapshot, &lifecycles);
+                    }
+                }
+            }
             if target_t > index_t {
                 tracing::trace!(target_t, index_t, "HistoricalLedgerView: loading novelty");
                 let novelty = Self::load_novelty_range(
@@ -236,6 +291,10 @@ impl HistoricalLedgerView {
         let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
+        // Every walked commit's graph lifecycle, those after `target_t`
+        // included: a drop after it takes what the graph held as of it.
+        let mut lifecycle: Vec<fluree_db_core::CommitGraphLifecycle> = Vec::new();
+
         let mut commit_count = 0;
         while let Some(result) = stream.next().await {
             let commit = result?;
@@ -246,6 +305,14 @@ impl HistoricalLedgerView {
                 flakes = commit.flakes.len(),
                 "load_novelty_range: processing commit"
             );
+
+            if !commit.graph_drops.is_empty() || !commit.graph_delta.is_empty() {
+                lifecycle.push(fluree_db_core::CommitGraphLifecycle {
+                    t: commit.t,
+                    drops: commit.graph_drops.clone(),
+                    written: commit.graph_delta.values().cloned().collect(),
+                });
+            }
 
             // Skip commits beyond target_t
             if commit.t > target_t {
@@ -292,6 +359,9 @@ impl HistoricalLedgerView {
 
         // Apply accumulated deltas to snapshot (ns codes + graph IRIs)
         snapshot.apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)?;
+        // A later commit's revival names a graph registered by then; one
+        // registered after `target_t` is not in this registry, so it stays out.
+        let floors = crate::apply_commit_lifecycles(snapshot, &lifecycle);
 
         // Resolve the txn-meta graph Sid now that namespace_codes are complete.
         // This produces the same Sid that build_reverse_graph() will map to g_id=1.
@@ -319,6 +389,7 @@ impl HistoricalLedgerView {
         // Replay oldest→newest (walk was HEAD→oldest)
         commit_batches.reverse();
         for (mut flakes, deferred_txn_meta, commit_t) in commit_batches {
+            crate::take_dropped_flakes(&mut flakes, commit_t, &floors, &reverse_graph);
             // Materialize deferred txn-meta flakes with the correct graph Sid
             if let Some(dtm) = deferred_txn_meta {
                 if let Some(ref txn_graph) = txn_meta_graph_sid {

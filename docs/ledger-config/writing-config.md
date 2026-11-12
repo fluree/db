@@ -12,6 +12,10 @@ urn:fluree:{ledger_id}#config
 
 For a ledger named `mydb:main`, the config graph is `urn:fluree:mydb:main#config`.
 
+Each branch has its own config graph, named by its own config graph IRI or the `config` keyword. A query or write that names the config graph IRI of another ledger, or of another branch, is refused (400) with a message naming this branch's own (the `txn-meta` graph follows the same rule); to read another branch's config, query that branch, or name its IRI in a connection query. History is the exception: a branch, or a copy restored under another name, replays commits that wrote its source's config graph under the source's IRI, and that config applies to it.
+
+An index built by an earlier version can hold another ledger's config graph as an ordinary graph: a branch created before its source's first index build, or a copy under another name, then indexed. Such a ledger reads that graph as an ordinary graph, as it did before, so its source's config does not apply to it, and its incremental index builds keep it so. `fluree reindex <ledger>` rebuilds the index from its commits, after which the source's config applies, configured full-text properties included.
+
 ## Writing via TriG
 
 TriG is the most natural format for writing to named graphs. Wrap your config triples in a `GRAPH` block targeting the config graph IRI:
@@ -95,7 +99,7 @@ Give the config node an `@graph` naming the config graph:
 }
 ```
 
-A node's `@graph` scopes the node and everything nested in it, so the `f:shaclDefaults` group above lands in the config graph with its parent. (Before this release the nested group's fields landed in the default graph, where the config reader never looks; see [Repairing a config split across graphs](#repairing-a-config-split-across-graphs).)
+A node's `@graph` scopes the node and everything nested in it, so the `f:shaclDefaults` group above lands in the config graph with its parent. (In Fluree 4.2.3 and earlier the nested group's fields landed in the default graph, where the config reader never looks; see [Repairing a config split across graphs](#repairing-a-config-split-across-graphs).)
 
 `"@graph": "config"` names the ledger's own config graph without spelling out its IRI:
 
@@ -234,15 +238,16 @@ Writing the same value again is not refused. The checks read only the transactio
 
 Merges (fast-forwards included), rebases and reverts re-check the integrity of the target's config groups: a result that would leave a setting group's fields outside the config graph, or a single-valued setting with two values, is refused as a conflict with the target's state (HTTP 409), naming the group. A branch that carries a split config from before these checks is refused until the config is repaired ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)).
 
-A branch's config graph (`urn:fluree:mydb:dev#config`) configures that branch only. A merge or rebase that would carry what a branch wrote there into another branch is refused (HTTP 409), since on the target it would be an ordinary graph rather than config: make the change on the target itself. The same holds for a branch's `#txn-meta` graph. Merging from a branch the target was created from (its parent, directly or not) is not affected, because that branch's config graph was already an ordinary graph on the target when it forked. In the other direction, the target's own config graph (`urn:fluree:mydb:main#config`) is an ordinary graph on its branches: a merge that would change it (or the target's `#txn-meta` graph) with what a branch wrote there is refused the same way. A branch's config is changed on that branch.
+A branch starts with the config of the branch it was created from; later config changes there reach it only through a merge. Config written on a branch configures that branch only: a merge that would carry it into another branch is refused (HTTP 409); make the change on the target itself. Merging from a branch the target was created from (its parent, directly or not) carries that branch's config changes since the fork into the target, as the fork carried the earlier ones. A setting both branches changed since the fork is a conflict like any
+other, which the merge's (or a rebase's) strategy resolves. A merge never changes the target's `#txn-meta` graph, and no branch operation writes another branch's `#txn-meta` graph unless the target was created from that branch.
 
 A transaction that writes only the config graph is never validated against SHACL shapes or uniqueness constraints, and never needs a shapes, schema or constraints source to be available: you can always turn SHACL or uniqueness off, or point a source somewhere else, even when the source it names is gone. Policy is the exception. A config write is still subject to the ledger's policy, including a policy source in another ledger, because policy decides who may change the config.
 
 ## Repairing a config split across graphs
 
-Before this release, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. The same holds for fields written on the config subject itself without the config graph (a `f:shaclDefaults` link, say), and for a per-graph override whose `f:targetGraph` and groups were written there. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
+In Fluree 4.2.3 and earlier, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. The same holds for fields written on the config subject itself without the config graph (a `f:shaclDefaults` link, say), and for a per-graph override whose `f:targetGraph` and groups were written there. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
 
-This SPARQL moves the stranded fields into the config graph in one transaction, restoring exactly what was written. It starts from the config subject and from every node a config edge in the config graph points at, and follows config edges (and the RDF lists `f:reasoningModes` may hold) through the default graph. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
+This SPARQL moves the stranded fields into the config graph in one transaction, restoring the settings that were written. It starts from the config subject and from every node a config edge in the config graph points at, and follows config edges (and an `f:reasoningModes` list stored as `rdf:first`/`rdf:rest` triples) through the default graph. A compact `f:reasoningModes` list moves as plain values, which the config reader accepts. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
 
 ```sparql
 PREFIX f: <https://ns.flur.ee/db#>
@@ -257,13 +262,13 @@ WHERE {
     GRAPH <urn:fluree:mydb:main#config> { ?parent ?edge ?root }
     VALUES ?edge { f:policyDefaults f:shaclDefaults f:reasoningDefaults f:datalogDefaults
                    f:transactDefaults f:fullTextDefaults f:servingDefaults f:queryDefaults
-                   f:graphOverrides f:overrideControl f:shapesSource f:policySource
+                   f:graphOverrides f:overrideControl f:shapesSource f:additionalDataSource f:policySource
                    f:schemaSource f:rulesSource f:constraintsSource f:graphSource
                    f:trustPolicy f:rollbackGuard f:ontologyImportMap f:graphRef f:property }
   }
   ?root (f:policyDefaults|f:shaclDefaults|f:reasoningDefaults|f:datalogDefaults|
          f:transactDefaults|f:fullTextDefaults|f:servingDefaults|f:queryDefaults|
-         f:graphOverrides|f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
+         f:graphOverrides|f:overrideControl|f:shapesSource|f:additionalDataSource|f:policySource|f:schemaSource|
          f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|
          f:ontologyImportMap|f:graphRef|f:property|f:reasoningModes|rdf:rest)* ?n .
   ?n ?p ?o .
@@ -284,7 +289,7 @@ WHERE {
   VALUES ?root { <urn:fluree:mydb:main:config:ledger> }
   ?root (f:policyDefaults|f:shaclDefaults|f:reasoningDefaults|f:datalogDefaults|
          f:transactDefaults|f:fullTextDefaults|f:servingDefaults|f:queryDefaults|
-         f:graphOverrides|f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
+         f:graphOverrides|f:overrideControl|f:shapesSource|f:additionalDataSource|f:policySource|f:schemaSource|
          f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|
          f:ontologyImportMap|f:graphRef|f:property|f:reasoningModes|rdf:rest)* ?n .
   ?n ?p ?o .

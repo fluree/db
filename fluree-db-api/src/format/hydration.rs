@@ -56,7 +56,7 @@ use fluree_db_query::ir::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
 };
 use fluree_db_query::QueryPolicyEnforcer;
-use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
+use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD, RDF};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -885,6 +885,7 @@ impl<'a> DatasetCtx<'a> {
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(view.db.snapshot, arena_reader.is_some());
         HydrationFormatter {
             db: view.db,
             compactor: &view.compactor,
@@ -893,9 +894,11 @@ impl<'a> DatasetCtx<'a> {
             policy: view.policy.as_ref(),
             tracker: self.tracker,
             arena_reader,
+            arena_dropped_graphs,
             novelty,
             dataset: Some(self),
             active_idx: idx,
+            holds_cells: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1130,6 +1133,10 @@ struct HydrationFormatter<'a> {
             dyn fluree_db_core::storage::ContentStore,
         >,
     >,
+    /// The graphs a drop took after the index, as edges name them: the
+    /// arena predates those drops, so an edge of theirs is read from novelty
+    /// alone. Empty without an arena reader or a drop since the index.
+    arena_dropped_graphs: Vec<Option<Sid>>,
     /// Cached downcast of `db.overlay` to the concrete
     /// `fluree_db_novelty::Novelty` type. Computed once on `new()`
     /// and reused across every annotation-hydration call site —
@@ -1156,6 +1163,20 @@ struct HydrationFormatter<'a> {
     /// identifies the view within a hydration's shared cache, so one ledger's
     /// rendering is never served for another's (issue #1259).
     active_idx: usize,
+    /// Whether `db` holds an `rdf:first` triple, so a blank-node value may
+    /// head a list stored as its triples; read when the crawl first meets a
+    /// blank-node value ([`Self::holds_cells`]).
+    holds_cells: std::sync::OnceLock<bool>,
+}
+
+/// [`HydrationFormatter::arena_dropped_graphs`] for `snapshot`, when an
+/// arena reader is in use.
+fn arena_dropped_graphs(snapshot: &LedgerSnapshot, has_arena: bool) -> Vec<Option<Sid>> {
+    if has_arena {
+        snapshot.edge_graphs_dropped_since_index()
+    } else {
+        Vec::new()
+    }
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -1191,6 +1212,7 @@ impl<'a> HydrationFormatter<'a> {
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(db.snapshot, arena_reader.is_some());
         Self {
             db,
             compactor,
@@ -1199,9 +1221,11 @@ impl<'a> HydrationFormatter<'a> {
             policy,
             tracker,
             arena_reader,
+            arena_dropped_graphs,
             novelty,
             dataset: None,
             active_idx: 0,
+            holds_cells: std::sync::OnceLock::new(),
         }
     }
 
@@ -2158,6 +2182,16 @@ impl<'a> HydrationFormatter<'a> {
             let Some(novelty) = self.novelty else {
                 return Ok(None);
             };
+            if self.arena_dropped_graphs.contains(&edge_key.g) {
+                // The arena predates the drop of this edge's graph, which
+                // took all it holds of the edge.
+                let live: Vec<Sid> = novelty
+                    .attachments
+                    .current_annotations_for_at(edge_key, self.db.t)
+                    .collect();
+                tracing::Span::current().record("live_count", live.len());
+                return Ok(Some(live));
+            }
             let novelty_events = novelty.attachments.collect_forward_events(edge_key);
             let live = reader
                 .current_annotations_merged(edge_key, &novelty_events, self.db.t)
@@ -2609,7 +2643,7 @@ impl<'a> HydrationFormatter<'a> {
             let FlakeValue::Ref(head) = &flake.o else {
                 continue;
             };
-            if head.namespace_code != BLANK_NODE {
+            if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
                 continue;
             }
             let members = fluree_db_core::rdf_list::chain_members(self.db, head)
@@ -2632,6 +2666,30 @@ impl<'a> HydrationFormatter<'a> {
             out.push((k, members));
         }
         Ok(out)
+    }
+
+    /// Whether `db` holds any `rdf:first` triple, read once per response:
+    /// without one, no blank node heads a list stored as its triples.
+    async fn holds_cells(&self) -> Result<bool> {
+        if let Some(&held) = self.holds_cells.get() {
+            return Ok(held);
+        }
+        let first = self
+            .db
+            .range_with_opts(
+                IndexType::Psot,
+                RangeTest::Eq,
+                RangeMatch {
+                    p: Some(Sid::new(RDF, fluree_vocab::predicates::RDF_FIRST)),
+                    ..Default::default()
+                },
+                RangeOptions::default().with_flake_limit(1),
+            )
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+        let held = !first.is_empty();
+        let _ = self.holds_cells.set(held);
+        Ok(held)
     }
 
     /// Fetch one `(subject, predicate)` pair via the SPOT index.

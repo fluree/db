@@ -421,7 +421,7 @@ impl Transaction {
             let mut attempt = 0;
             loop {
                 tracing::Span::current().record("attempts", attempt + 1);
-                let guard = handle.lock_for_write().await;
+                let mut guard = handle.lock_for_write().await;
                 let unchanged = guard.state().t() == base_t
                     && guard.state().head_commit_id.as_ref() == base_head.as_ref();
                 if read && !unchanged {
@@ -444,7 +444,7 @@ impl Transaction {
                         }
                         None => {
                             handle.note_write_path(WritePath::Restaged);
-                            let state = guard.clone_state();
+                            let state = guard.clone_state_for_staging();
                             // The policy the ledger has now: a commit since the
                             // transaction began may have changed it.
                             context.policy =
@@ -608,15 +608,20 @@ async fn stage_cypher(
                             Some(&request),
                         )
                         .await?;
-                    if let Some(result) = outcome.return_result {
+                    if let Some(answered) = outcome.returned {
                         let view = fluree
                             .resolve_and_attach_config(GraphDb::from_ledger_state(
-                                &outcome.final_state,
+                                &answered.final_state,
                             ))
                             .await?;
-                        let table = result.to_cypher_typed_table(&view).await.map_err(|e| {
-                            ApiError::internal(format!("Cypher RETURN formatting: {e}"))
-                        })?;
+                        let table =
+                            answered
+                                .result
+                                .to_cypher_typed_table(&view)
+                                .await
+                                .map_err(|e| {
+                                    ApiError::internal(format!("Cypher RETURN formatting: {e}"))
+                                })?;
                         *pending_ref = Some(PendingReturn::Rows(table));
                     }
                     return Ok(outcome.stage_result);

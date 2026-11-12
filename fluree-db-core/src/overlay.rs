@@ -202,6 +202,21 @@ pub trait OverlayProvider: Send + Sync {
         None
     }
 
+    /// Upper bound on the flakes [`Self::for_each_overlay_flake`] visits for
+    /// the same range, unfiltered by `to_t`, when the implementation can
+    /// answer without walking them. `None` (the default) means unknown; as
+    /// with [`Self::overlay_flake_count`], callers must never walk to count.
+    fn overlay_range_flake_count(
+        &self,
+        _g_id: GraphId,
+        _index: IndexType,
+        _first: Option<&Flake>,
+        _rhs: Option<&Flake>,
+        _leftmost: bool,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Segment metadata for `g_id`, in segment (commit) order.
     ///
     /// Enables a per-segment translation cache (only newly-appended segments
