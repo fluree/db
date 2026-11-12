@@ -302,3 +302,149 @@ async fn union_dedups_on_fact_identity() {
 
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Two ledgers code their namespaces independently, so the datatype of a
+/// constant object is a different `Sid` in each. A union across ledgers
+/// re-codes its rows into the query's codes; the fact a member's scan
+/// matched must be re-coded too, or one fact both ledgers hold comes back
+/// once per ledger.
+#[tokio::test]
+async fn cross_ledger_union_keys_a_fact_on_the_querys_datatype_codes() {
+    const A: &str = "it/union-xl-a:main";
+    const B: &str = "it/union-xl-b:main";
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let seed = |ledger: &'static str, turtle: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            let handle = fluree.ledger_cached(ledger).await.expect("cache");
+            fluree
+                .stage(&handle)
+                .upsert_turtle(turtle)
+                .execute()
+                .await
+                .expect("seed");
+        }
+    };
+    fluree.create_ledger(A).await.expect("create A");
+    fluree.create_ledger(B).await.expect("create B");
+    // A registers another namespace first, so `ex:` takes a later code there.
+    seed(
+        A,
+        "<http://other.example/x> <http://other.example/q> \"z\" .",
+    )
+    .await;
+    seed(
+        A,
+        r#"@prefix ex: <http://example.org/> .
+           ex:s ex:p "v"^^ex:dt ."#,
+    )
+    .await;
+    seed(
+        B,
+        r#"@prefix ex: <http://example.org/> .
+           ex:s ex:p "v"^^ex:dt .
+           ex:t ex:p "v"^^ex:dt ."#,
+    )
+    .await;
+
+    let mut failures = Vec::new();
+    for state in ["novelty", "indexed"] {
+        if state == "indexed" {
+            for ledger in [A, B] {
+                fluree
+                    .reindex(ledger, ReindexOptions::default())
+                    .await
+                    .expect("index");
+                fluree.disconnect_ledger(ledger).await;
+            }
+        }
+        let code = |ledger: &'static str| {
+            let fluree = fluree.clone();
+            async move {
+                let db = fluree.db(ledger).await.expect("db");
+                db.snapshot
+                    .encode_iri_strict("http://example.org/dt")
+                    .expect("registered")
+                    .namespace_code
+            }
+        };
+        assert_ne!(
+            code(A).await,
+            code(B).await,
+            "the fixture must give `ex:` a different code in each ledger"
+        );
+
+        let sparql = |body: &str| {
+            format!("PREFIX ex: <http://example.org/>\n{body}")
+                .replace("{ds}", &format!("FROM <{A}> FROM <{B}>"))
+        };
+        for (body, expected) in [
+            (
+                r#"SELECT ?s {ds} WHERE { ?s ex:p "v"^^ex:dt }"#,
+                vec!["s=s", "s=t"],
+            ),
+            (
+                "SELECT ?s ?o {ds} WHERE { ?s ex:p ?o }",
+                vec!["o=v^^dt;s=s", "o=v^^dt;s=t"],
+            ),
+            (
+                r#"SELECT (COUNT(*) AS ?n) {ds} WHERE { ex:s ex:p "v"^^ex:dt }"#,
+                vec!["n=1^^integer"],
+            ),
+        ] {
+            let query = sparql(body);
+            let json = fluree
+                .query_from()
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let mut rows: Vec<String> = json["results"]["bindings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{query}: {json}"))
+                .iter()
+                .map(|b| {
+                    let mut cols: Vec<String> = b
+                        .as_object()
+                        .expect("binding object")
+                        .iter()
+                        .map(|(var, v)| {
+                            let tail =
+                                |s: &str| s.rsplit(['/', '#']).next().unwrap_or(s).to_string();
+                            let value = tail(v["value"].as_str().unwrap_or_default());
+                            match v["datatype"].as_str() {
+                                Some(dt) => format!("{var}={value}^^{}", tail(dt)),
+                                None => format!("{var}={value}"),
+                            }
+                        })
+                        .collect();
+                    cols.sort();
+                    cols.join(";")
+                })
+                .collect();
+            rows.sort();
+            if rows != expected {
+                failures.push(format!("{state}: {body}: {rows:?}, expected {expected:?}"));
+            }
+        }
+
+        let jsonld = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": [A, B],
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:p": {"@value": "v", "@type": "ex:dt"}}
+        });
+        let json = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .expect("jsonld");
+        let mut rows: Vec<JsonValue> = json.as_array().cloned().unwrap_or_default();
+        rows.sort_by_key(ToString::to_string);
+        if rows != vec![json!(["ex:s"]), json!(["ex:t"])] {
+            failures.push(format!("{state}: JSON-LD constant object: {json}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

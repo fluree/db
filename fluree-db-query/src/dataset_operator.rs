@@ -532,6 +532,25 @@ pub(crate) fn stamp_provenance(
     Batch::new(schema, stamped_columns).map_err(|e| QueryError::Internal(e.to_string()))
 }
 
+/// Re-code the object each fact matched as [`stamp_provenance`] re-codes a
+/// batch's bindings. A union keys a row on the fact it matched too
+/// ([`BatchDeduper::retain_new`]), and a constant literal's datatype is
+/// coded in its member's ledger, so a fact two ledgers hold would otherwise
+/// be two facts.
+fn stamp_row_facts(
+    mut facts: Vec<RowFact>,
+    ledger_id: &Arc<str>,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<RowFact>> {
+    let mut recoded: Option<(Sid, Sid)> = None;
+    for fact in &mut facts {
+        if let Some(object) = fact.object.take() {
+            fact.object = Some(stamp_binding(object, ledger_id, ctx, &mut recoded)?);
+        }
+    }
+    Ok(facts)
+}
+
 /// Stamp `batch` in the ledger a cross-ledger SERVICE body executes against,
 /// when the context arms per-scan provenance (`scan_provenance_ledger`); a
 /// pass-through everywhere else. For binding producers that are not wrapped
@@ -888,11 +907,16 @@ impl Operator for DatasetOperator {
                         Some(_) => self.members[self.current_member].operator.take_row_facts(),
                         None => None,
                     };
-                    let result = if self.needs_provenance {
+                    let (result, facts) = if self.needs_provenance {
                         let ledger_id = &self.members[self.current_member].ledger_id;
-                        stamp_provenance(batch, ledger_id, ctx)?
+                        (
+                            stamp_provenance(batch, ledger_id, ctx)?,
+                            facts
+                                .map(|facts| stamp_row_facts(facts, ledger_id, ctx))
+                                .transpose()?,
+                        )
                     } else {
-                        batch
+                        (batch, facts)
                     };
                     // Set-merge the default union (SPARQL §13.2): drop triples an
                     // earlier member already emitted. Deduplicating *after*
