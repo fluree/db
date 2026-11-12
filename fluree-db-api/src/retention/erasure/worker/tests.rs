@@ -806,6 +806,60 @@ impl crate::retention::replicas::ReplicaSync for BranchedMeanwhile {
     }
 }
 
+/// Cluster collection is for good, so a request this member refuses leaves
+/// it off: with no prover installed, or naming nothing. The first request
+/// whose removal takes effect turns it on.
+#[tokio::test]
+async fn only_an_accepted_request_turns_cluster_collection_on() {
+    use crate::garbage::tests::cluster::Cluster;
+    use std::sync::atomic::Ordering;
+
+    let off = || {
+        let cluster = Arc::new(Cluster::default());
+        cluster.off.store(true, Ordering::Relaxed);
+        cluster
+    };
+    let doc = json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"});
+    let id = "t/enable:main";
+
+    let dir = tempfile::tempdir().unwrap();
+    let no_prover = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    no_prover.create_ledger("t/enable").await.unwrap();
+    insert(&no_prover, id, doc.clone()).await;
+    let cluster = off();
+    no_prover.set_collector(cluster.clone());
+    let refused = no_prover
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.status_code(), 501, "{refused}");
+    assert_eq!(cluster.enables.load(Ordering::Relaxed), 0);
+    assert!(!no_prover.collected_by_cluster().await);
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/enable").await.unwrap();
+    insert(&fluree, id, doc).await;
+    let cluster = off();
+    fluree.set_collector(cluster.clone());
+    fluree
+        .erase_occurrences(id, email("alice", "never@written"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(cluster.enables.load(Ordering::Relaxed), 0);
+    assert!(!fluree.collected_by_cluster().await);
+
+    fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    assert_eq!(cluster.enables.load(Ordering::Relaxed), 1);
+    assert!(fluree.collected_by_cluster().await);
+}
+
 /// On a cluster, a branch another member makes while a request is accepted,
 /// which neither the listing nor its copied journal covers, is removed from
 /// too: it would otherwise keep the erased value as current state.
@@ -845,7 +899,7 @@ async fn acceptance_removes_from_a_branch_another_member_made_meanwhile() {
     }));
 
     let receipt = fluree
-        .accept_erasure(&Direct(&fluree), id, email("alice", "a@secret"), None)
+        .erase_occurrences_with(&Direct(&fluree), id, email("alice", "a@secret"), None)
         .await
         .unwrap();
     let late = "t/meanwhile:late";

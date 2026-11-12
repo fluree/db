@@ -104,28 +104,6 @@ impl Fluree {
         request: ErasureRequest,
         requester: Option<String>,
     ) -> Result<ErasureReceipt> {
-        // A cluster erases once every member runs a release that reads
-        // erasure's commands and checks its writes against collection, which
-        // purges what it publishes.
-        if let Some(collector) = self.collector() {
-            if !collector.enable().await? {
-                return Err(unsupported(
-                    "every member of the cluster must run this release before it accepts \
-                     erasures",
-                ));
-            }
-        }
-        self.accept_erasure(writer, ledger_id, request, requester)
-            .await
-    }
-
-    pub(crate) async fn accept_erasure(
-        &self,
-        writer: &dyn RetentionWriter,
-        ledger_id: &str,
-        request: ErasureRequest,
-        requester: Option<String>,
-    ) -> Result<ErasureReceipt> {
         let runtime = self.erasure_runtime()?;
         if runtime.config.is_none() {
             return Err(unsupported(
@@ -156,6 +134,18 @@ impl Fluree {
         // keep it readable, on any ledger holding its commits.
         self.refuse_spelled(&ledger_id, &branches, &removal_request)
             .await?;
+        // A cluster erases once every member runs a release that reads
+        // erasure's commands and checks its writes against collection, which
+        // purges what it publishes. Collection is for good, so only a
+        // request about to remove something turns it on.
+        if let Some(collector) = self.collector() {
+            if !collector.enable().await? {
+                return Err(unsupported(
+                    "every member of the cluster must run this release before it accepts \
+                     erasures",
+                ));
+            }
+        }
         let mut removed = Accepted::default();
         self.remove_on(
             writer,
