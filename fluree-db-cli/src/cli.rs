@@ -2780,7 +2780,8 @@ pub enum OntologyAction {
     /// model reached over HTTP, `fluree doc ingest`'s [doc.reader]) locally,
     /// and reports what a request carrying this ontology (and catalog) would
     /// fail for, what the reader reads another way, what it never sees, and
-    /// advice. Nothing is sent anywhere. Exits 1 when a request would be
+    /// advice, including whether it finds the events of each event class
+    /// (xt:EventClass) and their kinds. Nothing is sent anywhere. Exits 1 when a request would be
     /// refused. The language-model extractor of `fluree doc ingest` reads more
     /// of an ontology (domains, ranges, every parent class).
     ///
@@ -3584,6 +3585,7 @@ pub enum IcebergAction {
     ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table --r2rml mappings/table.ttl
     ///   fluree iceberg map my-gs --mode glue --region us-east-1 --r2rml mappings/sales.ttl
     ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --r2rml mappings/sales.ttl
+    ///   fluree iceberg map my-gs --remote origin --stored-mapping <MAPPING-ID>
     #[command(verbatim_doc_comment)]
     Map(Box<IcebergMapArgs>),
 
@@ -4059,7 +4061,16 @@ pub struct SqlMapArgs {
 }
 
 /// Arguments for mapping an Iceberg table as a graph source.
+///
+/// A graph source needs a mapping: exactly one of `--r2rml` and
+/// `--stored-mapping`, which clap names together when neither is given.
 #[derive(Debug, Clone, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("mapping")
+        .required(true)
+        .multiple(false)
+        .args(["r2rml", "stored_mapping"])
+))]
 pub struct IcebergMapArgs {
     /// Graph source name (e.g., "my-iceberg-gs")
     pub name: String,
@@ -4115,15 +4126,40 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table_bucket_arn: Option<String>,
 
-    /// R2RML mapping file (Turtle format, required). Defines how Iceberg table
-    /// rows are mapped to RDF triples; table references come from the mapping's
-    /// rr:tableName entries.
+    /// R2RML mapping file (Turtle format). Defines how Iceberg table rows are
+    /// mapped to RDF triples; table references come from the mapping's
+    /// rr:tableName entries. Required unless --stored-mapping names a mapping
+    /// the remote stores
     #[arg(long)]
-    pub r2rml: PathBuf,
+    pub r2rml: Option<PathBuf>,
 
     /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
     #[arg(long)]
     pub r2rml_type: Option<String>,
+
+    /// A catalog connection the remote stores, by its id there (--remote
+    /// only). Replaces every connection and credential option; nothing
+    /// secret is sent. Needs a mapping: --r2rml or --stored-mapping
+    #[arg(
+        long,
+        value_name = "ID",
+        value_parser = stored_id,
+        conflicts_with_all = INLINE_CONNECTION_ARGS
+    )]
+    pub stored_catalog: Option<String>,
+
+    /// An R2RML mapping the remote stores, by its id there (--remote only).
+    /// Replaces --r2rml, and implies the mapping's catalog connection, so no
+    /// connection option is given; --table defaults to the mapping's first
+    /// table. --stored-catalog may name the same connection
+    #[arg(
+        long,
+        value_name = "ID",
+        value_parser = stored_id,
+        conflicts_with_all = INLINE_CONNECTION_ARGS,
+        conflicts_with_all = ["r2rml", "r2rml_type"]
+    )]
+    pub stored_mapping: Option<String>,
 
     /// Branch name (defaults to "main")
     #[arg(long)]
@@ -4169,6 +4205,39 @@ pub struct IcebergMapArgs {
     /// Use path-style S3 URLs
     #[arg(long)]
     pub s3_path_style: bool,
+}
+
+/// Every `iceberg map` option that describes the catalog connection inline,
+/// by clap id (a flattened group by its struct's name). A stored reference
+/// names a connection the remote already holds, so none of these can stand
+/// beside `--stored-catalog` or `--stored-mapping`. An explicit `--mode`
+/// counts; its default does not, since clap checks conflicts against given
+/// values only.
+pub(crate) const INLINE_CONNECTION_ARGS: [&str; 14] = [
+    "mode",
+    "catalog_uri",
+    "table_location",
+    "region",
+    "catalog_id",
+    "table_bucket_arn",
+    "warehouse",
+    "no_vended_credentials",
+    "s3_region",
+    "s3_endpoint",
+    "s3_path_style",
+    "CatalogAuthArgs",
+    "GoogleAuthArgs",
+    "StorageIdentityArgs",
+];
+
+/// The id of a catalog connection or mapping a remote stores: any non-blank
+/// string, sent as given.
+fn stored_id(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("a stored id cannot be empty".to_string())
+    } else {
+        Ok(value.trim().to_string())
+    }
 }
 
 /// How a catalog or SQL endpoint is authenticated: a bearer token, or OAuth2

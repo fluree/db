@@ -131,6 +131,7 @@
 pub mod cache;
 pub mod compile;
 pub mod constraints;
+mod data_view;
 pub mod error;
 pub mod path;
 pub mod report_text;

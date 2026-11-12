@@ -756,13 +756,24 @@ impl BinaryIndexStore {
     /// The derived store gets its own id: a cache keyed by store id may hold
     /// what this store read of the removed graphs.
     pub fn without_graphs(&self, g_ids: &[GraphId]) -> Self {
+        // Short u16 slices scan cheaply, so keep those allocation-free.
+        // Large drops must not scan the list for every indexed graph
+        // (quadratic for DROP ALL); amortize the set over a large store too.
+        const LINEAR_DROP_LIMIT: usize = 512;
+        let dropped: Option<std::collections::HashSet<GraphId>> = (g_ids.len() > LINEAR_DROP_LIMIT
+            && self.graph_indexes.len() > LINEAR_DROP_LIMIT)
+            .then(|| g_ids.iter().copied().collect());
         Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts: Arc::clone(&self.dicts),
             graph_indexes: self
                 .graph_indexes
                 .iter()
-                .filter(|(g_id, _)| !g_ids.contains(g_id))
+                .filter(|(g_id, _)| {
+                    !dropped
+                        .as_ref()
+                        .map_or_else(|| g_ids.contains(g_id), |ids| ids.contains(*g_id))
+                })
                 .map(|(g_id, gi)| (*g_id, Arc::clone(gi)))
                 .collect(),
             o_type_table: self.o_type_table.clone(),
@@ -4375,6 +4386,40 @@ pub(crate) mod tests {
         store.cas = Some(cs);
         store.max_t = 1;
         store
+    }
+
+    #[test]
+    fn masking_graphs_keeps_shared_indexes_and_handles_unordered_duplicate_ids() {
+        let cache = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache.clone());
+        for g_id in 0..2048 {
+            store.graph_indexes.insert(
+                g_id,
+                Arc::new(GraphIndex {
+                    orders: HashMap::new(),
+                    order_cids: HashMap::new(),
+                    numbig: HashMap::new(),
+                    vectors: HashMap::new(),
+                    spatial: HashMap::new(),
+                    fulltext: HashMap::new(),
+                }),
+            );
+        }
+        let mut many: Vec<GraphId> = (0..2048).step_by(2).rev().collect();
+        many.extend([2, 2, u16::MAX]);
+        for dropped in [Vec::new(), vec![6, 2, 6, u16::MAX], many] {
+            let masked = store.without_graphs(&dropped);
+            assert_ne!(masked.store_id, store.store_id);
+            assert!(Arc::ptr_eq(&masked.dicts, &store.dicts));
+            for g_id in 0..2048 {
+                assert!(store.has_graph_index(g_id));
+                assert_eq!(masked.has_graph_index(g_id), !dropped.contains(&g_id));
+                if let Some(kept) = masked.graph_indexes.get(&g_id) {
+                    assert!(Arc::ptr_eq(kept, &store.graph_indexes[&g_id]));
+                }
+            }
+        }
+        std::fs::remove_dir_all(cache).unwrap();
     }
 
     fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, t: u32) -> RunRecordV2 {
