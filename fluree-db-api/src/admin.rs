@@ -1081,7 +1081,11 @@ impl crate::Fluree {
                 ..r
             })
             .collect();
-        let live: Vec<_> = records.iter().filter(|r| !r.frozen).cloned().collect();
+        let live: Vec<_> = records
+            .iter()
+            .filter(|r| !r.frozen && addressable(r))
+            .cloned()
+            .collect();
         // Branches whose indexes a purge released, rebuilt first: nothing
         // can load them before.
         let released = crate::retention::erasure::purge::release::released_branches(&entry);
@@ -1114,7 +1118,7 @@ impl crate::Fluree {
         records: &[fluree_db_nameservice::NsRecord],
     ) -> Result<()> {
         let ns = self.publisher()?;
-        for record in records.iter().filter(|r| !r.frozen) {
+        for record in records.iter().filter(|r| !r.frozen && addressable(r)) {
             let id = record.ledger_id.to_string();
             if crate::retention::registry::read(ns, self.registry_objects(), &id)
                 .await?
@@ -3448,4 +3452,11 @@ impl crate::Fluree {
         );
         Ok(execute_sweep(&storage, &plan).await)
     }
+}
+
+/// Whether a request can name `record`'s branch. A record kept from before
+/// the id grammar is listed, dropped and restored with its ledger, and
+/// serves nothing: retention, which works by id, has nothing to hold for it.
+fn addressable(record: &fluree_db_nameservice::NsRecord) -> bool {
+    fluree_db_core::LedgerId::parse(record.ledger_id.as_str()).is_ok()
 }

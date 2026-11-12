@@ -1022,7 +1022,9 @@ async fn configs_to_copy<S: LifecycleStore + ?Sized>(
             .raw_record(&id)
             .await?
             .is_some_and(|r| r.fence == Some(b.fence));
-        if !held {
+        // A record kept from before the id grammar: no request can name its
+        // branch, so nothing gave it a config.
+        if !held || LedgerId::parse(id.as_ref()).is_err() {
             continue;
         }
         if let Some(config) = store
