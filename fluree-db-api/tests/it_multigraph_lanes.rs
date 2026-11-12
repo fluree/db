@@ -711,8 +711,13 @@ async fn union_counts_answer_to_the_memory_budget() {
         if !outcomes.iter().any(|(s, o)| s == site && o == "proceed") {
             failures.push(format!("{site} did not proceed: {outcomes:?}"));
         }
-        // Under a budget its own state outgrows, the budget ends the query.
-        match run(query, Some(BUDGET)).await.0 {
+        // Under a budget its own state outgrows, the budget ends the query,
+        // in the lane: it is no failed read to decline to the general plan on.
+        let (result, outcomes) = run(query, Some(BUDGET)).await;
+        if let Some((_, outcome)) = outcomes.iter().find(|(s, o)| s == site && o != "proceed") {
+            failures.push(format!("{site} declined under the budget: {outcome}"));
+        }
+        match result {
             Err(ApiError::Query(QueryError::MemoryBudgetExceeded { used_bytes, .. })) => {
                 if site == GROUPED_COUNT_UNION && used_bytes >= N * GROUP_BYTES {
                     failures.push(format!(
