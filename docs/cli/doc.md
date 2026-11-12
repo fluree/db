@@ -319,11 +319,19 @@ The answer is asked for as JSON-LD (`Accept: application/ld+json`).
   }
   ```
 - **What is billed.** Each document line reports the tokens the reader billed (`X-Fluree-Serialized-Tokens`), prompt-cache reads and writes, and fuel when the endpoint meters it; the run's last lines total them, and say what the reader set aside or adapted in the ontology.
-- **Resends.** A request is resent only when the reader answers 503 with `Retry-After` (no capacity yet, such as a model still starting), after the wait it names (in seconds or as an HTTP date), up to four attempts and five minutes of waiting, each wait shown as it starts. Nothing else is resent, because any other failure may follow a read that ran, and a resend would run it again: a 504 (the reader's gateway stopped waiting, and the read may still run) says so in its message. Every error quotes the reader's ID for the call (`X-Fluree-Request-ID`) when it sent one.
+- **Resends.** A request is resent only when the reader answers 503 or 429 with `Retry-After` (no capacity yet, such as a model still starting, or over a rate limit), after the full wait it names (in seconds or as an HTTP date), up to four attempts and five minutes of waiting, each wait shown as it starts. A wait that would pass five minutes fails at once, with the wait the reader asked for in the error; one that passes five minutes on its own (an account over a quota) also stops `doc ingest` at that document, since the reader refuses every call until it is over, and what was read before it is kept. fluree.ai's reader bills only a call it answers, so neither refusal is billed; a reader of another kind should send `Retry-After` with them only when the same holds. Nothing else is resent, because any other failure may follow a read that ran, and a resend would run it again: a 504 (the reader's gateway stopped waiting, and the read may still run) says so in its message. The one exception is an account reader's refused sign-in (below): that call alone is resent once, with a renewed token. Every error quotes the reader's ID for the call (`X-Fluree-Request-ID`) when it sent one.
 - **Runs.** Each document line is followed by a line per call: its run's IRI, the release that read it (`X-Fluree-Release`) and the reader's ID for the call, or that the reading cache answered.
 - **Caching.** Answers are kept in the reading cache by endpoint, model, `--cache`, the control headers and request body, so a rerun that sends the same request (`--force` with nothing changed) is not read again; `--no-cache` reads afresh.
 
-Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE}` and `FLUREE_DOC_MODEL` override the file.
+A reader the signed-in account serves needs no key: with `account = true` the credential is this machine's [`fluree login`](login.md), renewed before each document. If the account refuses it on a call (a `401`, such as `config_stale` after the account's configuration changed), the token is renewed once and that call alone is resent; calls already answered are not sent again. A renewal that fails (a revoked sign-in) stops `doc ingest` at that document, since every document after it would fail the same way; what was read before it is kept. `url` defaults to the account's own reader at `<api base>/grounding`, and a `url` on another scheme, host or port is refused, so a project's config can't send the sign-in's token anywhere but the account's API. A reader takes `account` or `api_key`, not both:
+
+```toml
+[doc.reader]
+account = true
+models = ["reader-small"]
+```
+
+Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE,ACCOUNT}` and `FLUREE_DOC_MODEL` override the file. `FLUREE_DOC_READER_ACCOUNT` takes `1`, `true` or `yes`, or `0`, `false` or `no`; any other value is an error.
 
 ### Using a Fluree AI account
 

@@ -22,8 +22,8 @@ the parser's text (what ``fluree doc parse --format text`` prints)::
 ``"mentions"``, both (the default) or ``"none"``.
 
 The read is the ``fluree`` CLI's own, so a document is cut into calls, sent,
-resent when the reader has no capacity yet, and kept the same way. Waits for
-capacity (a model still starting can take minutes) are logged as warnings
+resent when the reader has no capacity yet or rate-limits it, and kept the
+same way. Waits (a model still starting can take minutes) are logged as warnings
 on the ``fluree.engine`` logger. Python does no vision escalation: scanned
 pages and images are read with the parser's deterministic tier only, and
 :attr:`Reading.notes` says what it couldn't read.

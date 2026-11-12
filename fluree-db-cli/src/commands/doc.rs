@@ -55,7 +55,7 @@ fn cache_root(dirs: &FlureeDir) -> PathBuf {
 /// first, then the global one, so a login done once from the home directory
 /// serves every project.
 async fn resolve_config(dirs: &FlureeDir) -> CliResult<DocConfig> {
-    let config = crate::config::read_doc_config(dirs.config_dir())?.with_env();
+    let config = crate::config::read_doc_config(dirs.config_dir())?.with_env()?;
     let Some(remote_name) = config.remote.clone() else {
         return Ok(config);
     };
@@ -779,8 +779,11 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     let mut dimensions: Option<usize> = None;
     let parser_revision = fluree_db_doc::parse::DOC_PARSE_REV.to_string();
     let chunking = format!("{}/{}", args.min_chars, args.max_chars);
+    // A failure every remaining document would meet too: the run stops at
+    // it, and says so once, after what it did is indexed and totalled.
+    let mut stopped: Option<CliError> = None;
 
-    for (path, relative) in &inputs {
+    for (n, (path, relative)) in inputs.iter().enumerate() {
         let label = relative.as_str();
 
         // Skip what the ledger already holds from these same inputs, unless told otherwise.
@@ -888,18 +891,28 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                         }
                     }
                 } else {
-                    let (doc, read) = tokio::task::spawn_blocking(move || {
-                        let read = doc_reader::read_document(&reader, &doc, out_dir.as_deref());
-                        (doc, read)
-                    })
-                    .await
-                    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
+                    // A signed-in account's token, renewed before the call.
+                    let read = match doc_reader::renew(&reader).await {
+                        Ok(()) => tokio::task::spawn_blocking(move || {
+                            doc_reader::read_document(&reader, &doc, out_dir.as_deref())
+                                .map(|read| (doc, read))
+                        })
+                        .await
+                        .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?,
+                        Err(failure) => Err(failure),
+                    };
                     match read {
-                        Ok(read) => (doc, Some(read_extracted(read))),
-                        Err(e) => {
+                        Ok((doc, read)) => (doc, Some(read_extracted(read))),
+                        Err(doc_reader::ReadFailure::Document(e)) => {
                             println!("  {} {label}  reading: {e}", "✗".red());
                             totals.failed += 1;
                             continue;
+                        }
+                        Err(doc_reader::ReadFailure::Run(e)) => {
+                            println!("  {} {label}  reading: the run stops here", "✗".red());
+                            totals.failed += 1;
+                            stopped = Some(run_stopped(e, label, inputs.len() - n - 1));
+                            break;
                         }
                     }
                 }
@@ -1304,10 +1317,26 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             totals.unescalated
         );
     }
+    if let Some(e) = stopped {
+        return Err(e);
+    }
     if totals.failed > 0 {
         return Err(CliError::ExitCode(1));
     }
     Ok(())
+}
+
+/// The error a run ends with when a document's failure is one every
+/// remaining document would meet too: what failed, where the run stopped,
+/// and what it left unread. What was read before it is kept.
+fn run_stopped(e: CliError, label: &str, left: usize) -> CliError {
+    let context = match left {
+        0 => label.to_string(),
+        n => format!(
+            "the run stopped at {label}, leaving {n} document(s) unread that would fail the same way"
+        ),
+    };
+    e.context(context)
 }
 
 fn announce(
@@ -1536,7 +1565,7 @@ pub async fn run_parse(args: DocParseArgs, dirs: Option<&FlureeDir>) -> CliResul
     }
     let config = match dirs {
         Some(dirs) => resolve_config(dirs).await?,
-        None => DocConfig::default().with_env(),
+        None => DocConfig::default().with_env()?,
     };
     let cache = dirs
         .filter(|_| !args.no_cache)
@@ -1628,7 +1657,7 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     }
     let config = match dirs {
         Some(dirs) => resolve_config(dirs).await?,
-        None => DocConfig::default().with_env(),
+        None => DocConfig::default().with_env()?,
     };
     let Some(model) = args.model.clone().or_else(|| config.model.clone()) else {
         return Err(CliError::Usage(
@@ -1733,7 +1762,7 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
                 )));
             }
         }
-        doc_reader::read_document(&setup, &doc, None)
+        Ok(doc_reader::read_document(&setup, &doc, None)?)
     })
     .await
     .map_err(|e| CliError::Input(format!("reading task failed: {e}")));
@@ -1875,7 +1904,7 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     // slot, or an account that would fill one. The account is only asked
     // for its token when a vector lane actually runs, so a text search
     // never waits on it.
-    let local = crate::config::read_doc_config(dirs.config_dir())?.with_env();
+    let local = crate::config::read_doc_config(dirs.config_dir())?.with_env()?;
     let can_embed = local.embedding.is_some() || local.remote.is_some();
 
     // Everything available, unless told otherwise: both indexes fused when

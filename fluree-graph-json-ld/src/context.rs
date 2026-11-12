@@ -40,6 +40,12 @@ pub struct ContextEntry {
     pub is_type_definition: bool,
     /// Whether this entry was derived (copied from compact IRI to full IRI)
     pub derived: bool,
+    /// Defined as `null`, or with `"@id": null`: the term maps to no IRI, so
+    /// a property using it is dropped rather than expanded against `@vocab`.
+    pub null_mapping: bool,
+    /// A property-valued `@index`, unsupported: an index map under this
+    /// term is refused.
+    pub index: Option<String>,
 }
 
 impl ContextEntry {
@@ -65,6 +71,8 @@ impl ContextEntry {
 
         if let Some(ref id) = self.id {
             obj.insert("@id".to_string(), JsonValue::String(id.clone()));
+        } else if self.null_mapping {
+            obj.insert("@id".to_string(), JsonValue::Null);
         }
         if let Some(ref rev) = self.reverse {
             obj.insert("@reverse".to_string(), JsonValue::String(rev.clone()));
@@ -103,6 +111,9 @@ impl ContextEntry {
                     ),
                 );
             }
+        }
+        if let Some(ref index) = self.index {
+            obj.insert("@index".to_string(), JsonValue::String(index.clone()));
         }
         if let Some(ref lang) = self.language {
             match lang {
@@ -536,6 +547,11 @@ fn parse_context_entry(
     depth: usize,
 ) -> Result<ContextEntry> {
     match value {
+        JsonValue::Null => Ok(ContextEntry {
+            null_mapping: true,
+            ..Default::default()
+        }),
+
         JsonValue::String(s) => {
             // Resolve potentially nested references
             let mut visited = Vec::new();
@@ -554,8 +570,8 @@ fn parse_context_entry(
 
             for (k, v) in map {
                 match k.as_str() {
-                    "@id" => {
-                        if let JsonValue::String(s) = v {
+                    "@id" => match v {
+                        JsonValue::String(s) => {
                             entry.id = Some(resolve_compact_iri(
                                 s,
                                 original_context,
@@ -563,7 +579,9 @@ fn parse_context_entry(
                                 default_vocab,
                             ));
                         }
-                    }
+                        JsonValue::Null => entry.null_mapping = true,
+                        _ => {}
+                    },
                     "@type" => {
                         entry.type_ =
                             parse_type_value(v, original_context, base_context, default_vocab)?;
@@ -580,6 +598,9 @@ fn parse_context_entry(
                     }
                     "@container" => {
                         entry.container = Some(parse_container(v)?);
+                    }
+                    "@index" => {
+                        entry.index = v.as_str().map(str::to_string);
                     }
                     "@context" => {
                         let nested = ParsedContext::parse_guarded(
@@ -601,7 +622,7 @@ fn parse_context_entry(
             }
 
             // If no @id but @type exists, infer @id from key
-            if entry.id.is_none() && entry.reverse.is_none() {
+            if entry.id.is_none() && entry.reverse.is_none() && !entry.null_mapping {
                 entry.id = Some(resolve_compact_iri(
                     key,
                     original_context,
