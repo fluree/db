@@ -4060,6 +4060,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -4087,6 +4088,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -4106,6 +4108,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -4123,6 +4126,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -4372,6 +4376,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
