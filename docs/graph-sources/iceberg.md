@@ -1254,6 +1254,17 @@ native twin of the same data):
   constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
   aggregates, and `GRAPH` blocks in a dataset query.
 
+A source read through a graph scope is filtered by its own policy (the
+request's and the source's model), whatever governs the graph the query
+reads by default. A graph scope reads a source only as a named graph of the
+query's dataset: name it in `from-named` (SPARQL: `FROM NAMED <iri>`) and use
+`GRAPH <iri>`, `VALUES ?g { <iri> }`, or an unbound `GRAPH ?g` ranging over
+the named graphs. A query over one ledger that reaches a source through a
+graph scope without naming it in the dataset does not read it, governed
+source or not: JSON-LD answers `400` `err:db/InvalidQuery` with that remedy,
+and a SPARQL query with `FROM` and no `FROM NAMED` answers no rows, as for
+any graph outside its dataset.
+
 Not supported: **`f:query`** policies. A virtual source has no graph to run the
 policy query against, so a targeted `f:query` evaluates as "no rows" and
 denies its targets — it never falls open. Relationship gates that join the

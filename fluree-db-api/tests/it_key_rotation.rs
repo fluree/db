@@ -220,6 +220,54 @@ async fn rotation_dry_run_scoped_run_full_run_and_verify() {
     assert_eq!(count_things(&fluree, "rot-b").await, 25);
 }
 
+/// `completed` means done: a client acting on the first terminal status it
+/// reads (the CLI's remote `--wait` does) finds nothing left to pause and can
+/// start the next rotation.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_completed_status_means_the_sweep_is_done() {
+    let data = tempfile::TempDir::new().expect("tempdir");
+    {
+        let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+        seed(&fluree, "rot-d", 10).await;
+    }
+    let fluree = client(data.path(), &[(1, KEY1), (2, KEY2)], 2).await;
+    fluree.start_key_rotation(opts(1)).await.expect("start");
+
+    // Poll without sleeping so the read lands as close to the sweep's final
+    // checkpoint as it can.
+    let status = tokio::time::timeout(SWEEP_DEADLINE, async {
+        loop {
+            let status = fluree.key_rotation_status().await.expect("status");
+            if status
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.state != KeyRotationState::Running)
+            {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sweep finished within the deadline");
+    assert!(!status.active_here, "a completed sweep is not active");
+    // Not active here, so this progress was read back from the record.
+    assert_eq!(
+        status.progress.expect("progress").state,
+        KeyRotationState::Completed
+    );
+
+    assert!(
+        fluree.pause_key_rotation().is_err(),
+        "nothing left to pause"
+    );
+    fluree
+        .start_key_rotation(opts(1))
+        .await
+        .expect("the next rotation starts");
+    assert_eq!(wait_done(&fluree).await.state, KeyRotationState::Completed);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_running_record_is_refused_while_fresh_and_taken_over_when_stale() {
     let data = tempfile::TempDir::new().expect("tempdir");

@@ -79,6 +79,18 @@ pub enum DocError {
     /// allowed. Raised before any call is made, so nothing has been spent.
     #[error("{crops} crop(s) routed to the vision model, past the cap of {cap}")]
     CropCap { crops: usize, cap: usize },
+    /// An endpoint refused a call (a 429 or 503 with `Retry-After`) and
+    /// asked for a wait longer than a call waits in all
+    /// ([`reader::client::MAX_WAIT`]). Every call to it is refused until
+    /// then, not this one alone, so a caller with more to send stops.
+    #[error("model endpoint: {model}: {status} {message}")]
+    Unavailable {
+        model: String,
+        status: u16,
+        /// The wait the endpoint asked for.
+        wait: std::time::Duration,
+        message: String,
+    },
 }
 
 impl From<std::io::Error> for DocError {
