@@ -46,6 +46,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:entityCount` | integer | Distinct entities mentioned, known and new. |
 | `doc:relationCount` | integer | Relations written, every verdict included. |
 | `doc:readerPredicate` | IRI | A predicate a reader wrote outside the pipeline's own; a re-ingest retracts these from the nodes the reader minted, and nothing else there. |
+| `doc:readingGraph` | IRI | The named graph an HTTP reader's reading of the document is committed in (`<document>/reading`), which a re-ingest clears before it commits the new reading. The reading itself is in the extraction vocabulary, `xt:` (`https://ns.flur.ee/extract#`). |
 
 ## Mention properties
 

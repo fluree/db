@@ -4,7 +4,7 @@
 //! WHERE patterns → GROUP BY → Aggregates → HAVING → ORDER BY → PROJECT → DISTINCT → OFFSET → LIMIT
 
 use crate::aggregate::AggregateOperator;
-use crate::binary_scan::EmitMask;
+use crate::binary_scan::{lang_tag_equality, EmitMask};
 use crate::count_rows::CountRowsOperator;
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
@@ -1196,33 +1196,8 @@ fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String
         }
     }
 
-    let is_lang_o = |e: &crate::ir::Expression| match e {
-        crate::ir::Expression::Call { func, args } => {
-            matches!(func, crate::ir::Function::Lang { .. })
-                && args.len() == 1
-                && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
-        }
-        _ => false,
-    };
-    let crate::ir::Expression::Call { func, args } = filter else {
-        return None;
-    };
-    if *func != crate::ir::Function::Eq || args.len() != 2 {
-        return None;
-    }
-
-    if is_lang_o(&args[0]) {
-        if let crate::ir::Expression::Const(crate::ir::FlakeValue::String(tag)) = &args[1] {
-            return Some((pred, tag.clone(), out_var));
-        }
-    }
-    if is_lang_o(&args[1]) {
-        if let crate::ir::Expression::Const(crate::ir::FlakeValue::String(tag)) = &args[0] {
-            return Some((pred, tag.clone(), out_var));
-        }
-    }
-
-    None
+    let tag = lang_tag_equality(filter, o_var)?;
+    Some((pred, tag.to_string(), out_var))
 }
 
 fn detect_predicate_count_distinct_object(query: &Query) -> Option<(Ref, VarId)> {
@@ -1337,34 +1312,6 @@ fn detect_count_rows_with_encoded_filters(
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == s_var);
     let is_o =
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == o_var);
-    let is_lang_call = |e: &crate::ir::Expression| match e {
-        crate::ir::Expression::Call { func, args } => {
-            matches!(func, crate::ir::Function::Lang { .. })
-                && args.len() == 1
-                && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
-        }
-        _ => false,
-    };
-    let is_lang_eq_const = |expr: &crate::ir::Expression| match expr {
-        crate::ir::Expression::Call { func, args } => {
-            if *func != crate::ir::Function::Eq || args.len() != 2 {
-                return false;
-            }
-            let has_lang = is_lang_call(&args[0]) || is_lang_call(&args[1]);
-            let has_const = matches!(
-                (&args[0], &args[1]),
-                (
-                    crate::ir::Expression::Const(crate::ir::FlakeValue::String(_)),
-                    _
-                ) | (
-                    _,
-                    crate::ir::Expression::Const(crate::ir::FlakeValue::String(_))
-                )
-            );
-            has_lang && has_const
-        }
-        _ => false,
-    };
     for expr in &filters {
         match expr {
             crate::ir::Expression::Call { func, args }
@@ -1380,7 +1327,7 @@ fn detect_count_rows_with_encoded_filters(
                 {
                     continue;
                 }
-                if is_lang_eq_const(expr) {
+                if lang_tag_equality(expr, o_var).is_some() {
                     continue;
                 }
                 return None;
@@ -2346,12 +2293,14 @@ pub fn build_operator_tree(
             .is_none_or(|rows| rows >= goal as f64)
     });
     // A graph-source scan may emit rows in any order (as its file reads finish)
-    // only when no LIMIT or OFFSET anywhere in the query can observe the order:
-    // a page cut from an unordered answer must hold the same rows on every
-    // execution. Decided once, here at the root, and fail closed: a slice at any
+    // only when nothing in the query takes a prefix of an answer: a page cut
+    // from an unordered answer must hold the same rows on every execution.
+    // Decided once, here at the root, and fail closed: a prefix taken at any
     // depth, or any path that plans without passing through here, keeps every
-    // scan deterministic.
-    let scan_order = if query_has_slice(query) {
+    // scan deterministic. A prefix taken by the caller after the query (the
+    // browse crawl's subject pages, a byte-budgeted response a client resumes
+    // with OFFSET) sets `ExecutionContext::deterministic_scans` instead.
+    let scan_order = if query_takes_prefix(query) {
         crate::r2rml::ScanOrder::Deterministic
     } else {
         crate::r2rml::ScanOrder::Any
@@ -2373,6 +2322,14 @@ pub fn build_operator_tree(
         return build_operator_tree_folds(&simplified, stats, planning);
     }
     build_operator_tree_folds(query, stats, planning)
+}
+
+/// Whether `query` answers with a prefix of some unordered answer, so the
+/// order its scans emit rows in decides which rows it answers: a LIMIT or
+/// OFFSET anywhere ([`query_has_slice`]), or a `selectOne`, which keeps the
+/// first row when the result is formatted.
+pub(crate) fn query_takes_prefix(query: &Query) -> bool {
+    query_has_slice(query) || query.output.is_select_one()
 }
 
 /// Whether a LIMIT or OFFSET appears anywhere in `query`: on the query itself,

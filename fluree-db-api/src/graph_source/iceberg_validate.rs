@@ -25,6 +25,15 @@
 //!   have `null_fraction == 0` per stats, else [`DiagCode::NoSafeSubjectKey`] (a
 //!   nullable key silently drops rows). **Uniqueness is deliberately NOT checked**
 //!   — NDV requires column profiling and is deferred to PR-5.
+//! * **`rr:sqlQuery` row filters** — an `rr:sqlQuery` map is checked against its
+//!   query's `FROM` table, and the query by the check registration refuses it
+//!   with and a read refuses its rows with
+//!   ([`check_query_map`](super::row_filter::check_query_map)): the restricted
+//!   subset, a select list holding every column the map reads, and each column
+//!   named exactly and each literal typed against its live column. Its refusal
+//!   is an error carrying registration's message, [`DiagCode::ColumnNotFound`]
+//!   for a column the table lacks and [`DiagCode::CompileError`] otherwise, so
+//!   the dry-run never calls clean a mapping registration refuses.
 //!
 //! # Testability
 //!
@@ -38,6 +47,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use fluree_db_iceberg::metadata::Schema;
 use fluree_db_iceberg::FieldType;
 use fluree_db_r2rml::emit::{DiagCode, Diagnostic, Severity};
 use fluree_db_r2rml::loader::R2rmlLoader;
@@ -46,9 +56,12 @@ use fluree_db_r2rml::mapping::{
     TriplesMap,
 };
 
+use super::row_filter::{check_query_map, query_maps};
+
 use super::config::IcebergConnectionConfig;
 use super::iceberg_catalog::{
-    preview_iceberg_table_in, ColumnInfo, StatsTier, TableIdentifier, TableSchema,
+    preview_iceberg_table_and_read_schema_in, table_schema_from_metadata, ColumnInfo, StatsTier,
+    TableIdentifier, TableSchema,
 };
 use crate::Result;
 
@@ -223,9 +236,13 @@ fn check_column<'a>(
 ///
 /// This function performs **no I/O** — it is the whole diagnostic surface and is
 /// driven directly by unit tests with synthesized schemas.
+///
+/// `read_schemas` maps a table to the schema an unpinned read of it reads, the
+/// one a row filter is checked against (absent for a table that did not load).
 fn cross_check_mapping(
     compiled: &CompiledR2rmlMapping,
     schemas: &HashMap<String, TableSchema>,
+    read_schemas: &HashMap<String, Schema>,
     load_errors: &HashMap<String, String>,
 ) -> Vec<Diagnostic> {
     let live = schemas
@@ -235,13 +252,46 @@ fn cross_check_mapping(
             (name.clone(), columns)
         })
         .collect();
-    cross_check_live(
+    let mut diagnostics = cross_check_live(
         compiled,
         &live,
         load_errors,
         ICEBERG_WORDING,
         QueryTables::FromTable,
-    )
+    );
+    diagnostics.extend(query_map_diagnostics(compiled, read_schemas));
+    diagnostics
+}
+
+/// Each `rr:sqlQuery` map's refusal by [`check_query_map`], as an error: the
+/// check registration refuses the mapping with and a read refuses its rows
+/// with, over the schema an unpinned read of the query's `FROM` table reads
+/// (only the checks that need no schema when the table did not load; its
+/// `TableNotFound` is already reported). The message is the one registration
+/// gives.
+fn query_map_diagnostics(
+    compiled: &CompiledR2rmlMapping,
+    read_schemas: &HashMap<String, Schema>,
+) -> Vec<Diagnostic> {
+    query_maps(compiled)
+        .into_iter()
+        .filter_map(|tm| {
+            let table = source_table(tm, QueryTables::FromTable);
+            let schema = table.as_deref().and_then(|t| read_schemas.get(t));
+            let refusal = check_query_map(compiled, tm, schema).err()?;
+            let code = match refusal.missing_column {
+                Some(_) => DiagCode::ColumnNotFound,
+                None => DiagCode::CompileError,
+            };
+            Some(Diagnostic {
+                severity: Severity::Error,
+                code,
+                table,
+                column: refusal.missing_column,
+                message: refusal.message,
+            })
+        })
+        .collect()
 }
 
 /// [`cross_check_mapping`] over any table format's columns.
@@ -259,31 +309,11 @@ pub(crate) fn cross_check_live(
     tms.sort_by(|a, b| a.iri.cmp(&b.iri));
 
     for tm in tms {
-        // An `rr:sqlQuery` in the restricted subset is checked against its FROM
-        // table, with the columns it names; one outside the subset is refused
-        // at registration, so it is an error here.
-        let query = match (queries, tm.sql_query()) {
-            (QueryTables::FromTable, Some(sql)) => match RestrictedSelect::parse(sql) {
-                Ok(select) => Some(select),
-                Err(e) => {
-                    diagnostics.push(Diagnostic {
-                        severity: Severity::Error,
-                        code: DiagCode::CompileError,
-                        table: None,
-                        column: None,
-                        message: format!(
-                            "TriplesMap <{}>: {}",
-                            tm.iri,
-                            super::row_filter::unsupported_query_message(sql, &e)
-                        ),
-                    });
-                    continue;
-                }
-            },
-            _ => None,
-        };
+        // An `rr:sqlQuery` map's term maps are checked against its FROM table
+        // here; the query itself is checked by `query_map_diagnostics`, and
+        // one outside the subset names no table.
         let Some(table) = source_table(tm, queries) else {
-            continue; // logical table is always a table name today; skip defensively.
+            continue;
         };
         let table = table.as_str();
 
@@ -314,9 +344,6 @@ pub(crate) fn cross_check_live(
         let mut referenced: BTreeSet<&str> = tm.referenced_columns().into_iter().collect();
         if let Some(col) = &tm.subject_map.column {
             referenced.insert(col.as_str());
-        }
-        if let Some(select) = &query {
-            referenced.extend(select.named_columns());
         }
         let mut resolved: HashMap<&str, Option<&LiveColumn>> = HashMap::new();
         for &name in &referenced {
@@ -804,19 +831,13 @@ impl crate::Fluree {
             Err(response) => return Ok(response),
         };
 
-        // Distinct logical tables referenced by the mapping (sorted, deterministic).
-        // An `rr:sqlQuery` map's table is its query's FROM table.
-        let mut table_names_set: BTreeSet<String> = BTreeSet::new();
-        for tm in compiled.triples_maps.values() {
-            if let Some(t) = source_table(tm, QueryTables::FromTable) {
-                table_names_set.insert(t);
-            }
-        }
+        let table_names_set = validated_tables(&compiled);
 
         // Resolve each table to its live schema via the preview (Tier-B stats, so
         // subject-key null_fraction is available). Preview failures are recorded and
         // become TableNotFound diagnostics in the pure cross-check below.
         let mut schemas: HashMap<String, TableSchema> = HashMap::new();
+        let mut read_schemas: HashMap<String, Schema> = HashMap::new();
         let mut load_errors: HashMap<String, String> = HashMap::new();
         for name in &table_names_set {
             let table_id = table_identifier_from_name(name);
@@ -826,7 +847,7 @@ impl crate::Fluree {
                 "validate_r2rml: previewing table current snapshot for cross-check"
             );
             // Under this instance's identity context, as every catalog read is.
-            let preview = preview_iceberg_table_in(
+            let preview = preview_iceberg_table_and_read_schema_in(
                 conn.clone(),
                 table_id,
                 StatsTier::Stats,
@@ -834,8 +855,9 @@ impl crate::Fluree {
                 None,
             );
             match preview.await {
-                Ok(preview) => {
+                Ok((preview, read_schema)) => {
                     schemas.insert(name.clone(), preview.schema);
+                    read_schemas.extend(read_schema.map(|schema| (name.clone(), schema)));
                 }
                 Err(e) => {
                     tracing::debug!(table = %name, error = %e, "validate_r2rml: preview failed");
@@ -844,20 +866,96 @@ impl crate::Fluree {
             }
         }
 
-        let mut diagnostics = cross_check_mapping(&compiled, &schemas, &load_errors);
-        diagnostics.extend(keyless_map_diagnostics(
+        Ok(validated(
             &compiled,
-            &preview_table_keys(&compiled, &schemas),
-            QueryTables::FromTable,
-            KeyRemedy::DeclareOrIdentifierFields,
-        ));
+            table_names_set,
+            &schemas,
+            &read_schemas,
+            &load_errors,
+        ))
+    }
 
-        Ok(ValidateR2rmlResponse {
-            compiled_ok: true,
-            triples_map_count: compiled.len(),
-            table_names: table_names_set.into_iter().collect(),
-            diagnostics,
-        })
+    /// [`Self::validate_r2rml`] over local table directories (by table name)
+    /// instead of a catalog, so a test can validate a mapping against the
+    /// same table it registers and reads. Reads only under
+    /// `FLUREE_ICEBERG_LOCAL_ROOTS`.
+    #[doc(hidden)]
+    pub async fn validate_r2rml_over_local_tables_for_test(
+        &self,
+        tables: HashMap<String, String>,
+        turtle: String,
+    ) -> Result<ValidateR2rmlResponse> {
+        let compiled = match compile_for_validate(&turtle) {
+            Ok(compiled) => compiled,
+            Err(response) => return Ok(response),
+        };
+        let table_names_set = validated_tables(&compiled);
+        let mut schemas: HashMap<String, TableSchema> = HashMap::new();
+        let mut read_schemas: HashMap<String, Schema> = HashMap::new();
+        let mut load_errors: HashMap<String, String> = HashMap::new();
+        for name in &table_names_set {
+            let loaded = match super::ephemeral::load_local(&tables, name).await {
+                Ok((_, metadata)) => {
+                    table_schema_from_metadata(&table_identifier_from_name(name), &metadata)
+                        .map(|schema| (schema, metadata))
+                }
+                Err(e) => Err(crate::ApiError::config(e.to_string())),
+            };
+            match loaded {
+                Ok((schema, metadata)) => {
+                    schemas.insert(name.clone(), schema);
+                    read_schemas.extend(
+                        super::r2rml::unpinned_read_schema(&metadata)
+                            .map(|schema| (name.clone(), schema.into_owned())),
+                    );
+                }
+                Err(e) => {
+                    load_errors.insert(name.clone(), e.to_string());
+                }
+            }
+        }
+        Ok(validated(
+            &compiled,
+            table_names_set,
+            &schemas,
+            &read_schemas,
+            &load_errors,
+        ))
+    }
+}
+
+/// The distinct tables a mapping reads (sorted): an `rr:sqlQuery` map's table
+/// is its query's FROM table.
+fn validated_tables(compiled: &CompiledR2rmlMapping) -> BTreeSet<String> {
+    compiled
+        .triples_maps
+        .values()
+        .filter_map(|tm| source_table(tm, QueryTables::FromTable))
+        .collect()
+}
+
+/// The dry-run's response for a compiled mapping, given the tables it reads
+/// and the schemas of those that loaded: the cross-check's diagnostics, and an
+/// advisory for each map whose subjects no known key proves unique.
+fn validated(
+    compiled: &CompiledR2rmlMapping,
+    table_names: BTreeSet<String>,
+    schemas: &HashMap<String, TableSchema>,
+    read_schemas: &HashMap<String, Schema>,
+    load_errors: &HashMap<String, String>,
+) -> ValidateR2rmlResponse {
+    let mut diagnostics = cross_check_mapping(compiled, schemas, read_schemas, load_errors);
+    diagnostics.extend(keyless_map_diagnostics(
+        compiled,
+        &preview_table_keys(compiled, schemas),
+        QueryTables::FromTable,
+        KeyRemedy::DeclareOrIdentifierFields,
+    ));
+    ValidateR2rmlResponse {
+        compiled_ok: true,
+        triples_map_count: compiled.len(),
+        table_names: table_names.into_iter().collect(),
+        diagnostics,
     }
 }
 
@@ -866,6 +964,37 @@ mod tests {
     use super::*;
 
     use fluree_db_iceberg::FieldType;
+
+    /// [`super::cross_check_mapping`] with each table's read schema made from
+    /// its synthesized preview columns, as a loaded table's would be.
+    fn cross_check_mapping(
+        compiled: &CompiledR2rmlMapping,
+        schemas: &HashMap<String, TableSchema>,
+        load_errors: &HashMap<String, String>,
+    ) -> Vec<Diagnostic> {
+        let read_schemas = schemas
+            .iter()
+            .map(|(name, table)| (name.clone(), read_schema(table)))
+            .collect();
+        super::cross_check_mapping(compiled, schemas, &read_schemas, load_errors)
+    }
+
+    fn read_schema(table: &TableSchema) -> Schema {
+        let fields: Vec<_> = table
+            .columns
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.field_id, "name": c.name, "required": c.required,
+                    "type": c.iceberg_type,
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "type": "struct", "schema-id": 0, "fields": fields
+        }))
+        .expect("schema")
+    }
     use fluree_db_r2rml::mapping::{
         GraphMap, JoinCondition, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
         SubjectMap, TriplesMap,
@@ -888,7 +1017,7 @@ mod tests {
         ColumnInfo {
             field_id: 0,
             name: name.to_string(),
-            iceberg_type: "n/a".to_string(),
+            iceberg_type: super::super::iceberg_catalog::field_type_to_iceberg_string(ft),
             field_type: Some(ft),
             xsd_type: None,
             required,
@@ -1010,6 +1139,91 @@ mod tests {
             diags.iter().any(|d| d.code == DiagCode::CompileError
                 && d.severity == Severity::Error
                 && d.message.contains("OR is not supported")),
+            "{diags:?}"
+        );
+    }
+
+    /// The dry-run calls no `rr:sqlQuery` map clean that registration refuses
+    /// or a read fails on: a select list leaving out a column the map reads, a
+    /// literal that does not type against its column, a miscased column in
+    /// the query (a read matches it exactly). Each is an error carrying the
+    /// message registration gives (`check_query_map`).
+    #[test]
+    fn a_query_map_registration_refuses_is_an_error() {
+        let mut tm = dim_store_map();
+        let table_schema = schema(
+            "DW.DIM_STORE",
+            vec![
+                col("STORE_KEY", FieldType::Int64, true, Some(0.0)),
+                col("NAME", FieldType::String, false, Some(0.1)),
+                col("OPENED", FieldType::Date, false, None),
+                col("FLOORS", FieldType::Int32, false, None),
+                col("SCORE", FieldType::Float64, false, None),
+            ],
+        );
+        let schemas = HashMap::from([("DW.DIM_STORE".to_string(), table_schema.clone())]);
+        let cases = [
+            (
+                "SELECT STORE_KEY FROM DW.DIM_STORE",
+                DiagCode::CompileError,
+                None,
+                "selects STORE_KEY, but the map reads NAME",
+            ),
+            (
+                "SELECT * FROM DW.DIM_STORE WHERE OPENED > '2024-01-01'",
+                DiagCode::CompileError,
+                None,
+                "column 'OPENED' is date",
+            ),
+            (
+                "SELECT * FROM DW.DIM_STORE WHERE FLOORS > 0.5",
+                DiagCode::CompileError,
+                None,
+                "compare it with an integer, not 0.5",
+            ),
+            (
+                "SELECT * FROM DW.DIM_STORE WHERE SCORE > 0.5",
+                DiagCode::CompileError,
+                None,
+                "no exact binary value",
+            ),
+            (
+                "SELECT * FROM DW.DIM_STORE WHERE floors = 1",
+                DiagCode::ColumnNotFound,
+                Some("floors"),
+                "did you mean \"FLOORS\"",
+            ),
+        ];
+        for (sql, code, column, needle) in cases {
+            tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(sql);
+            let compiled = CompiledR2rmlMapping::new(vec![tm.clone()]);
+            let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+            let refusal =
+                check_query_map(&compiled, &tm, Some(&read_schema(&table_schema))).expect_err(sql);
+            let found = diags
+                .iter()
+                .find(|d| d.severity == Severity::Error && d.message == refusal.message)
+                .unwrap_or_else(|| panic!("{sql}: no error carries {refusal:?}: {diags:?}"));
+            assert!(found.message.contains(needle), "{sql}: {found:?}");
+            assert!(found.message.contains("<#DimStore>"), "{sql}: {found:?}");
+            assert_eq!(found.code, code, "{sql}");
+            assert_eq!(found.column.as_deref(), column, "{sql}");
+            assert_eq!(found.table.as_deref(), Some("DW.DIM_STORE"), "{sql}");
+        }
+
+        // A table that did not load still gets the checks that need no schema.
+        tm.logical_table =
+            fluree_db_r2rml::mapping::LogicalTable::sql_query("SELECT STORE_KEY FROM DW.DIM_STORE");
+        let diags = cross_check_mapping(
+            &CompiledR2rmlMapping::new(vec![tm]),
+            &HashMap::new(),
+            &no_errors(),
+        );
+        assert!(has_code(&diags, DiagCode::TableNotFound), "{diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("but the map reads NAME")),
             "{diags:?}"
         );
     }

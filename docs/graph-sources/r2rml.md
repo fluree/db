@@ -479,19 +479,28 @@ An R2RML graph source is *virtual* — every query re-reads the underlying table
 2. **Performance:** Complex joins across Fluree + Iceberg may be slow
 3. **Schema Changes:** Requires mapping updates when referenced columns change
 4. **No index-walking query patterns (fail-closed):** Property-path quantifiers
-   (`p+`, `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
-   `shortestPath`, and subqueries cannot be evaluated over a mapped source — it
-   has no native index for them to walk. A query using one is **refused** with
-   HTTP 400 `err:db/InvalidQuery` naming the pattern, rather than returning the
-   empty result it would otherwise produce as a success. Fixed-length patterns
+   (`p+`, `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`) and
+   `shortestPath` cannot be evaluated over a mapped source — it has no native
+   index for them to walk. A query using one is **refused** with HTTP 400
+   `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   result it would otherwise produce as a success. Fixed-length patterns
    (`p`, `p/p`, …) and unquantified `a|b` / `^p` lower to table scans and run
-   normally. Over a SQL source, a sub-`SELECT` the
+   normally. See [Graph Sources Overview → Query Patterns a Graph Source Cannot
+   Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate) for
+   the bounded workaround, or materialize a native twin (below) for unbounded
+   traversal.
+
+   Sub-selects run: their bodies lower to table scans like the rest of the
+   scope. Over a SQL source, a sub-`SELECT` the
    [pushdown lane](sql.md#the-pushdown-lane-one-statement-per-block) admits
-   runs as a derived table of the block's statement; one it does not take is
-   refused the same way. See [Graph Sources Overview → Query Patterns a Graph
-   Source Cannot Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)
-   for the bounded workaround, or materialize a native twin (below) for
-   unbounded traversal.
+   runs as a derived table of the block's statement, and one it does not take
+   runs on the per-scan lane. A sliced JSON-LD sub-select correlated with the
+   outer rows reads its tables once per outer row, and a sub-select outside
+   every `GRAPH` block whose body reads the default view is refused; see
+   [Sub-selects over a Graph Source](overview.md#sub-selects-over-a-graph-source).
+   An `EXISTS` in the `WHERE` clause scans the tables too, while one in the
+   query's own `HAVING` or `ORDER BY` is refused; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source).
 5. **One object map per predicate on a projected scan:** when a query names a
    predicate, the scan reads the first `rr:predicateObjectMap` of the triples
    map that carries it. A second predicate-object map for the same predicate

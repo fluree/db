@@ -414,10 +414,11 @@ async fn setup() -> (MockServer, Fluree) {
     (server, fluree)
 }
 
-/// Cases the per-scan lane cannot run (a graph source has no native index
-/// for the engine's subquery operator), checked against the native twin
-/// of the shop fixture instead.
-const LANE_ONLY_CASES: &[&str] = &[
+/// Sub-select cases, checked against the native twin of the shop fixture as
+/// well as against the per-scan lane: both lanes evaluate a sub-select by
+/// lowering its body through the R2RML rewrite, so a defect in that shared
+/// plan would be invisible to the lane comparison alone.
+const SUB_SELECT_CASES: &[&str] = &[
     "a sub-select projects an OPTIONAL variable as nullable",
     "a grouped sub-select joins its counts to the outer rows",
     "a grouped sub-select sums in the database and finalizes in the engine",
@@ -427,7 +428,7 @@ const LANE_ONLY_CASES: &[&str] = &[
 ];
 
 /// The shop fixture as a native ledger (`shop-native:main`): the oracle for
-/// shapes the per-scan lane cannot answer.
+/// the sub-select shapes, whose plan the two graph-source lanes share.
 async fn seed_native_twin(fluree: &Fluree) {
     let ledger = fluree
         .create_ledger("shop-native:main")
@@ -1681,7 +1682,7 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
 
     for (i, c) in cases.iter().enumerate() {
         let sparql = format!("{PREFIX}{}", c.sparql);
-        if LANE_ONLY_CASES.contains(&c.name) {
+        if SUB_SELECT_CASES.contains(&c.name) {
             let native = native_rows(&fluree, &sparql).await;
             if native != by_value(&lane_rows[i]) {
                 failures.push(format!(
@@ -1689,7 +1690,6 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
                     c.name, lane_rows[i]
                 ));
             }
-            continue;
         }
         set_fast_paths_disabled(true);
         let rows = rows_of(&query(&fluree, &sparql).await);
@@ -2186,14 +2186,28 @@ async fn class_policy_on_a_derived_type_pushes_a_predicate() {
     assert!(!sent[0].contains("kind"), "{}", sent[0]);
 }
 
-/// A sub-select the lane cannot take has no other lane: a graph source has
-/// no native index for the engine's subquery operator, so the query refuses
-/// as it did before the lane took any sub-select at all. Never a silent
-/// empty answer.
+/// A sub-select the lane cannot take falls back to the per-scan lane, which
+/// evaluates it by lowering its body through the R2RML rewrite. Its rows
+/// match the native twin; never a refusal, never a silent empty answer from
+/// the source's (empty) native index. Each shape is stamped `MustNotFire`, so
+/// a change that moves one into the lane shows here, paired with a canary the
+/// lane takes so the absence is not a capture that saw nothing.
 #[tokio::test]
-async fn sub_selects_the_lane_cannot_take_still_refuse() {
+async fn sub_selects_the_lane_cannot_take_are_answered_by_the_scan_lane() {
     let _lock = KILL_SWITCH.lock().await;
     let (_server, fluree) = setup().await;
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+
+    let canary = format!(
+        "{PREFIX}SELECT ?n ?k FROM <shop-sql:main> WHERE {{ ?c ex:name ?n {{ SELECT ?c (COUNT(?o) AS ?k) WHERE {{ ?o ex:customer ?c }} GROUP BY ?c }} }}"
+    );
+    let before = store.find_events("fast-path outcome").len();
+    query(&fluree, &canary).await;
+    assert!(
+        proceeded_sites(&store, before).iter().any(|s| s == SITE),
+        "canary: the lane takes a grouped sub-select, so the capture sees `{SITE}`"
+    );
     let shapes = [
         (
             "a HAVING over an AVG",
@@ -2217,18 +2231,21 @@ async fn sub_selects_the_lane_cannot_take_still_refuse() {
         ),
     ];
     for (what, sparql) in shapes {
-        let err = fluree
+        let sparql = format!("{PREFIX}{sparql}");
+        let before = store.find_events("fast-path outcome").len();
+        let result = fluree
             .query_from()
-            .sparql(&format!("{PREFIX}{sparql}"))
+            .sparql(&sparql)
             .execute_tracked()
             .await
-            .err()
-            .map(|e| e.error.to_string())
-            .unwrap_or_else(|| panic!("{what}: expected a refusal"));
+            .unwrap_or_else(|e| panic!("{what}: {}", e.error));
         assert!(
-            err.contains("cannot be evaluated over a virtual dataset") && err.contains("subquery"),
-            "{what}: {err}"
+            !proceeded_sites(&store, before).iter().any(|s| s == SITE),
+            "{what}: `{SITE}` proceeded on a shape the lane does not take"
         );
+        let rows = by_value(&rows_of(&result.result));
+        assert!(!rows.is_empty(), "{what}: no rows");
+        assert_eq!(rows, native_rows(&fluree, &sparql).await, "{what}");
     }
 }
 
@@ -3521,12 +3538,10 @@ async fn live_differential(backend: &LiveBackend) {
             .replace("shop-vp:main", "shop-vp-live:main")
             .replace("shop-typed:main", "shop-typed-live:main")
             .replace("shop-memo:main", "shop-memo-live:main");
+        // A sub-select a dialect declines falls back to the per-scan lane,
+        // which lowers its body like any other shape, so its rows are checked
+        // like the rest.
         let declines = backend.declines.contains(&c.name);
-        // A sub-select the lane declines has no other lane here: the query
-        // refuses (pinned in `sub_selects_the_lane_cannot_take_still_refuse`).
-        if declines && LANE_ONLY_CASES.contains(&c.name) {
-            continue;
-        }
         let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         match (&c.routing, c.sql.is_empty()) {
             (Routing::MustFire, false) if declines && !sent.is_empty() => {
@@ -3557,7 +3572,7 @@ async fn live_differential(backend: &LiveBackend) {
                 c.name, c.rows
             ));
         }
-        if LANE_ONLY_CASES.contains(&c.name) {
+        if SUB_SELECT_CASES.contains(&c.name) {
             let native = native_rows(&fluree, &sparql).await;
             if native != by_value(&lane_rows) {
                 failures.push(format!(
@@ -3565,7 +3580,6 @@ async fn live_differential(backend: &LiveBackend) {
                     c.name
                 ));
             }
-            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {

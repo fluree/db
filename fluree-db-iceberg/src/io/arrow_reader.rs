@@ -594,8 +594,8 @@ enum Check {
     /// in-engine FILTER decides. Never the answer for an exact filter, which
     /// refuses instead.
     KeepAll,
-    /// Every non-null cell satisfies the test (an inequality with a value the
-    /// column cannot hold); a null cell, compared, is unknown.
+    /// Every non-null cell satisfies the comparison (an inequality with a
+    /// value the column cannot hold); a null cell, compared, is unknown.
     NotNull,
     /// No cell can satisfy the test (an equality with a value the column
     /// cannot hold).
@@ -674,7 +674,7 @@ fn prepare_membership(members: &[LiteralValue], target: &DataType) -> Check {
         match prepare_check(ComparisonOp::Eq, member, target) {
             Check::Compare(_, literal) => literals.push(literal),
             Check::DropAll => {}
-            Check::KeepAll | Check::Member(_) | Check::NotNull => return Check::KeepAll,
+            Check::KeepAll | Check::NotNull | Check::Member(_) => return Check::KeepAll,
         }
     }
     if literals.is_empty() {
