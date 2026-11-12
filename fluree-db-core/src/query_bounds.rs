@@ -387,6 +387,18 @@ impl ObjectBounds {
         Some(otypes)
     }
 
+    /// Whether `lexical`, as a string bound under
+    /// [`Self::temporal_string_ordering`], reaches rows of some temporal type:
+    /// whether a scan ordering it against one reads it as that type. Two such
+    /// bounds on one side can order differently as text and as temporals, so
+    /// which one is tighter depends on the row, and a merge must keep both.
+    pub fn string_orders_temporals(lexical: &FlakeValue) -> bool {
+        matches!(lexical, FlakeValue::String(_))
+            && TEMPORAL_SAMPLES
+                .iter()
+                .any(|(_, sample)| temporal::cmp_with_lexical(sample, lexical).is_some())
+    }
+
     /// Returns true if no bounds are set
     pub fn is_empty(&self) -> bool {
         self.lower.is_none() && self.upper.is_none()

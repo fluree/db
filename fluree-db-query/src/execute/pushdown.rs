@@ -144,13 +144,22 @@ pub fn count_filter_vars(expr: &Expression) -> usize {
 /// When values are equal, takes the exclusive bound (more restrictive).
 ///
 /// Returns `None` when two bounds on one side cannot be ordered against each
-/// other (a number and a string, a date and a time): the tighter one is then
-/// unknowable, and keeping either would drop the other's filter.
+/// other (a number and a string, a date and a time, or two strings a temporal
+/// row reads as temporals): the tighter one is then unknowable, and keeping
+/// either would drop the other's filter.
 pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> Option<ObjectBounds> {
+    // Both sets of bounds hold, so an `=` in either rules out comparing a
+    // string with a temporal.
+    let temporal_string_ordering = a.temporal_string_ordering && b.temporal_string_ordering;
     let orderable = |x: Option<&(FlakeValue, bool)>, y: Option<&(FlakeValue, bool)>| match (x, y) {
         (Some((x, _)), Some((y, _))) => {
             (x.is_numeric() && y.is_numeric())
-                || std::mem::discriminant(x) == std::mem::discriminant(y)
+                || (std::mem::discriminant(x) == std::mem::discriminant(y)
+                    // Two strings order by text, but a temporal row orders
+                    // them by their temporal reading, which can disagree.
+                    && !(temporal_string_ordering
+                        && (ObjectBounds::string_orders_temporals(x)
+                            || ObjectBounds::string_orders_temporals(y))))
         }
         _ => true,
     };
@@ -162,9 +171,7 @@ pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> Option<ObjectB
     Some(ObjectBounds {
         lower: merge_lower_bound(a.lower.as_ref(), b.lower.as_ref()),
         upper: merge_upper_bound(a.upper.as_ref(), b.upper.as_ref()),
-        // Both sets of bounds hold, so an `=` in either rules out comparing
-        // a string with a temporal.
-        temporal_string_ordering: a.temporal_string_ordering && b.temporal_string_ordering,
+        temporal_string_ordering,
     })
 }
 

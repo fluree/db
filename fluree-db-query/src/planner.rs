@@ -563,6 +563,9 @@ impl RangeConstraint {
         if self.var != other.var {
             return true;
         }
+        // The merged bounds order a string against a temporal unless an `=`
+        // contributed to either.
+        let temporal_strings = !(self.from_equality || other.from_equality);
 
         // Merge lower bounds: take the higher (tighter) one
         let mut lower = self.lower.clone();
@@ -570,7 +573,8 @@ impl RangeConstraint {
             match &self.lower {
                 None => lower = other.lower.clone(),
                 Some((self_val, self_incl)) => {
-                    let Some(ord) = compare_range_values(other_val, self_val) else {
+                    let Some(ord) = compare_range_values(other_val, self_val, temporal_strings)
+                    else {
                         return false;
                     };
                     if ord == Ordering::Greater
@@ -588,7 +592,8 @@ impl RangeConstraint {
             match &self.upper {
                 None => upper = other.upper.clone(),
                 Some((self_val, self_incl)) => {
-                    let Some(ord) = compare_range_values(other_val, self_val) else {
+                    let Some(ord) = compare_range_values(other_val, self_val, temporal_strings)
+                    else {
                         return false;
                     };
                     if ord == Ordering::Less
@@ -617,7 +622,7 @@ impl RangeConstraint {
     pub fn is_unsatisfiable(&self) -> bool {
         match (&self.lower, &self.upper) {
             (Some((lower_val, lower_incl)), Some((upper_val, upper_incl))) => {
-                match compare_range_values(lower_val, upper_val) {
+                match compare_range_values(lower_val, upper_val, !self.from_equality) {
                     Some(std::cmp::Ordering::Greater) => true, // lower > upper
                     Some(std::cmp::Ordering::Equal) => {
                         // lower == upper: only satisfiable if both inclusive
@@ -643,10 +648,25 @@ impl RangeConstraint {
 /// Temporal values order by instant when they are the same temporal type.
 /// Returns `None` for pairs that have no order (numeric vs string, date vs
 /// time, ...) — never a fabricated `Equal`, which would let `merge` keep an
-/// arbitrary bound and silently drop the other.
-fn compare_range_values(a: &RangeValue, b: &RangeValue) -> Option<std::cmp::Ordering> {
+/// arbitrary bound and silently drop the other. With `temporal_strings`
+/// (the bounds order a string against a temporal,
+/// [`ObjectBounds::temporal_string_ordering`]), two strings either of which
+/// reads as a temporal have no order either: as text and as temporals they
+/// can order differently.
+fn compare_range_values(
+    a: &RangeValue,
+    b: &RangeValue,
+    temporal_strings: bool,
+) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (RangeValue::String(a), RangeValue::String(b)) => Some(a.cmp(b)),
+        (RangeValue::String(x), RangeValue::String(y)) => {
+            let reads_as_temporal =
+                |s: &String| ObjectBounds::string_orders_temporals(&FlakeValue::String(s.clone()));
+            if temporal_strings && (reads_as_temporal(x) || reads_as_temporal(y)) {
+                return None;
+            }
+            Some(x.cmp(y))
+        }
         (RangeValue::String(_), _) | (_, RangeValue::String(_)) => None,
         (RangeValue::Temporal(a), RangeValue::Temporal(b)) => a.temporal_cmp(b),
         (RangeValue::Temporal(_), _) | (_, RangeValue::Temporal(_)) => None,

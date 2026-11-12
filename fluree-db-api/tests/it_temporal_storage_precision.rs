@@ -688,6 +688,123 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     );
 }
 
+/// Two plain-string bounds on one side of a `dateTime` object order one way
+/// as text and the other as instants (`"…00.5Z"` sorts before `"…00Z"`), so
+/// which is tighter depends on the row, and the plan keeps both: the pushed
+/// bounds answer what the evaluated filters do. Two FILTERs merge in the
+/// pushdown, one `&&` FILTER in the planner, and a pair of bounds the planner
+/// would find contradictory as text is not. Over novelty and over the index,
+/// in SPARQL and JSON-LD.
+#[tokio::test]
+async fn two_string_bounds_on_a_temporal_keep_both_filters() {
+    const LEDGER: &str = "it/temporal-string-bounds:main";
+    const LATE: &str = "2026-01-01T10:00:00.5Z";
+    const EARLY: &str = "2026-01-01T10:00:00Z";
+    // The stored instant, 10:00:00.2, lies between EARLY and LATE.
+    let sparql: Vec<(String, bool)> = [
+        (
+            format!(r#"FILTER(?at > "{LATE}") FILTER(?at > "{EARLY}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at > "{EARLY}") FILTER(?at > "{LATE}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at < "{EARLY}") FILTER(?at < "{LATE}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at > "{LATE}" && ?at > "{EARLY}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at < "{LATE}" && ?at < "{EARLY}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at > "{EARLY}" && ?at < "{LATE}")"#),
+            true,
+        ),
+        (
+            format!(r#"FILTER(?at > "{EARLY}") FILTER(?at < "{LATE}")"#),
+            true,
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let jsonld: Vec<(Vec<String>, bool)> = vec![
+        (
+            vec![
+                format!(r#"(> ?at "{LATE}")"#),
+                format!(r#"(> ?at "{EARLY}")"#),
+            ],
+            false,
+        ),
+        (
+            vec![
+                format!(r#"(> ?at "{EARLY}")"#),
+                format!(r#"(< ?at "{LATE}")"#),
+            ],
+            true,
+        ),
+    ];
+
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    fluree.create_ledger(LEDGER).await.expect("create");
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update(&format!(
+            "{PFX}INSERT DATA {{ ex:e ex:at \"2026-01-01T10:00:00.2Z\"^^xsd:dateTime }}"
+        ))
+        .commit()
+        .await
+        .expect("insert");
+    let mut wrong = Vec::new();
+    for state in ["novelty", "indexed"] {
+        if state == "indexed" {
+            fluree
+                .reindex(LEDGER, fluree_db_api::ReindexOptions::default())
+                .await
+                .expect("index");
+            fluree.disconnect_ledger(LEDGER).await;
+        }
+        let db = fluree.db(LEDGER).await.expect("db");
+        for (filters, want) in &sparql {
+            let q = format!("{PFX}ASK {{ ex:e ex:at ?at {filters} }}");
+            let json = fluree
+                .query(&db, &q)
+                .await
+                .expect("ask")
+                .to_sparql_json(&db.snapshot)
+                .expect("json");
+            if json["boolean"].as_bool() != Some(*want) {
+                wrong.push(format!("{state}: {filters}"));
+            }
+        }
+        for (filters, want) in &jsonld {
+            let mut where_ = vec![json!({"@id": "ex:e", "ex:at": "?at"})];
+            for f in filters {
+                where_.push(json!(["filter", f]));
+            }
+            let q = json!({"@context": ctx(), "select": "?at", "where": where_});
+            let rows = fluree
+                .query(&db, &q)
+                .await
+                .expect("query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            let found = rows.as_array().is_some_and(|rows| !rows.is_empty());
+            if found != *want {
+                wrong.push(format!("{state}: JSON-LD {filters:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "answered wrongly: {wrong:#?}");
+}
+
 /// A Cypher `datetime()` or `time()` constant past the microsecond is held to
 /// it too, so a stored value is exactly one of `<`, `=` and `>` it, a
 /// component map's `nanosecond` included, before a reload and after.
