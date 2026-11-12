@@ -256,14 +256,18 @@ struct Origin {
 /// For each of `wanted` (a fact a merge brought in, with the reifier of
 /// the instruction it carries), the commit on the line from `from` that
 /// began its current occurrence or last renewed it with an instruction,
-/// read back along that line's first parents. A fact that commit took from
-/// a merge of its own is followed onto that merge's line. A fact the line
-/// never asserted is left out. Commit-level: a lifetime is close, not exact.
-fn merged_origins(
-    store: &dyn ContentStore,
+/// read back along that line's first parents, down to where it joins the
+/// line the merge was made on (the one `ctx` reads, as of `before_t`): what
+/// that line already held began there. A fact that commit took from a merge
+/// of its own is followed onto that merge's line. A fact the line never
+/// asserted is left out. Commit-level: a lifetime is close, not exact.
+fn merged_origins<'a>(
+    store: &'a dyn ContentStore,
+    ctx: &'a Ctx<'a>,
+    before_t: i64,
     from: ContentId,
     wanted: HashMap<FactKey, Option<Sid>>,
-) -> futures::future::BoxFuture<'_, Result<HashMap<FactKey, Origin>>> {
+) -> futures::future::BoxFuture<'a, Result<HashMap<FactKey, Origin>>> {
     Box::pin(async move {
         // A fact's origin, and the line it came from when that commit merged it.
         type Found = (Origin, Option<ContentId>);
@@ -276,6 +280,9 @@ fn merged_origins(
         let mut found: HashMap<FactKey, Found> = HashMap::new();
         let mut next = Some(from);
         while let Some(cid) = next.filter(|_| !open.is_empty()) {
+            if ctx.held(&cid, before_t).await? {
+                break;
+            }
             let commit = load_commit_by_id(store, &cid).await?;
             let here: Found = (
                 Origin {
@@ -336,7 +343,7 @@ fn merged_origins(
         let mut origins: HashMap<FactKey, Origin> =
             found.into_iter().map(|(k, (o, _))| (k, o)).collect();
         for (line, keys) in lines {
-            origins.extend(merged_origins(store, line, keys).await?);
+            origins.extend(merged_origins(store, ctx, before_t, line, keys).await?);
         }
         Ok(origins)
     })
@@ -378,6 +385,15 @@ impl Ctx<'_> {
             },
         )
         .await?)
+    }
+
+    /// Whether the branch's own line held commit `id` as of `to_t`.
+    async fn held(&self, id: &ContentId, to_t: i64) -> Result<bool> {
+        let subject = RangeMatch::subject(fluree_db_core::commit_subject::commit_sid(id));
+        Ok(!self
+            .range(TXN_META_GRAPH_ID, subject, to_t)
+            .await?
+            .is_empty())
     }
 
     /// The stored flakes stating `key` as of `to_t`.
@@ -564,9 +580,16 @@ async fn discover_commit(
         if instruction.is_some() {
             asserted.insert(key.clone());
         }
-        // Reasserting a current value is not a new occurrence: only an
-        // explicit instruction renews it.
         if merged_from.is_some() {
+            // A lifetime reaches a merged value through an instruction or
+            // its origin's transaction default, which only a marked merge's
+            // line holds, or through a property rule. Any other value is
+            // left as it is, its origin unread.
+            if !marked && property_lifetime(ctx, policy, &key).is_none() {
+                continue;
+            }
+            // Reasserting a current value is not a new occurrence: only an
+            // explicit instruction renews it.
             let existed =
                 schedule.contains(&key) || !ctx.current(g_id, &key, t - 1).await?.is_empty();
             if !existed || instruction.is_some() {
@@ -638,7 +661,7 @@ async fn discover_commit(
             )
         })
         .collect();
-    let origins = merged_origins(store, from, wanted).await?;
+    let origins = merged_origins(store, ctx, t - 1, from, wanted).await?;
     for Merged {
         key,
         slot,

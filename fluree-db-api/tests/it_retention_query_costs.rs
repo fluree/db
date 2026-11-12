@@ -3,7 +3,8 @@
 //! commit. An instance sharing its storage with another serves what it
 //! learned and learns again in the background, or first once that is
 //! stale, so a removal made elsewhere reaches its reads within about two
-//! seconds, even one that commits nothing.
+//! seconds, even one that commits nothing. A retention pass over a merge
+//! reads the merged line only where a lifetime can reach.
 
 use async_trait::async_trait;
 use fluree_db_api::{ApiError, Fluree, FlureeBuilder, NameServiceMode};
@@ -336,4 +337,102 @@ async fn a_removal_made_elsewhere_reaches_the_first_read_after_a_quiet_spell() {
         Err(ApiError::HistoryUnavailable(_))
     ));
     assert!(here.history_suppressed(&gated).await.unwrap());
+}
+
+/// A ledger that gives a value a lifetime, with `history` plain commits
+/// after it, read through storage that counts its reads.
+async fn ttl_ledger_with_history(name: &str, history: usize) -> (Fluree, ReadCounting, String) {
+    let data = ReadCounting::new();
+    let fluree = FlureeBuilder::memory().build_with(
+        data.clone(),
+        NameServiceMode::ReadWrite(Arc::new(StorageNameService::new(ReadCounting::new(), "ns"))),
+    );
+    fluree.create_ledger(name).await.expect("create");
+    let main = format!("{name}:main");
+    upsert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 3600}}),
+    )
+    .await;
+    for i in 0..history {
+        upsert(&fluree, &main, plain(&format!("ex:h{i}"))).await;
+    }
+    (fluree, data, main)
+}
+
+fn plain(id: &str) -> JsonValue {
+    json!({"@context": ctx(), "@id": id, "ex:note": id})
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// A merge that brings in values no lifetime can reach reads none of the
+/// merged line: a pass over it costs the same whatever history lies below.
+#[tokio::test]
+async fn a_merge_of_plain_values_reads_none_of_the_merged_line() {
+    const HISTORY: usize = 40;
+    let name = "it/costs-merge-plain";
+    let (fluree, data, main) = ttl_ledger_with_history(name, HISTORY).await;
+    let dev = format!("{name}:dev");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    upsert(&fluree, &dev, plain("ex:dev")).await;
+    upsert(&fluree, &main, plain("ex:main")).await;
+    let before = fluree
+        .run_retention_at(&main, now_ms())
+        .await
+        .expect("pass");
+    assert_eq!(before.pending, 1, "{before:?}");
+    fluree
+        .merge_branch(name, "dev", Some("main"), Default::default())
+        .await
+        .expect("merge");
+
+    data.take();
+    let report = fluree
+        .run_retention_at(&main, now_ms())
+        .await
+        .expect("pass");
+    let reads = data.take();
+    assert_eq!(report.discovered_commits, 1, "{report:?}");
+    assert_eq!(report.pending, 1, "{report:?}");
+    assert!(reads < HISTORY / 2, "{reads} storage reads for one merge");
+}
+
+/// A merge that brings in a lifetime reads the merged line only down to
+/// where it left this one, not the history they share.
+#[tokio::test]
+async fn a_merged_lifetime_is_traced_no_further_than_the_branch_point() {
+    const HISTORY: usize = 40;
+    let name = "it/costs-merge-ttl";
+    let (fluree, data, main) = ttl_ledger_with_history(name, HISTORY).await;
+    let dev = format!("{name}:dev");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    upsert(
+        &fluree,
+        &dev,
+        json!({"@context": ctx(), "@id": "ex:d", "ex:v": {"@value": "y", "@ttl": 7200}}),
+    )
+    .await;
+    upsert(&fluree, &dev, plain("ex:dev")).await;
+    upsert(&fluree, &main, plain("ex:main")).await;
+    fluree
+        .run_retention_at(&main, now_ms())
+        .await
+        .expect("pass");
+    fluree
+        .merge_branch(name, "dev", Some("main"), Default::default())
+        .await
+        .expect("merge");
+
+    data.take();
+    let report = fluree
+        .run_retention_at(&main, now_ms())
+        .await
+        .expect("pass");
+    let reads = data.take();
+    assert_eq!(report.pending, 2, "{report:?}");
+    assert!(reads < HISTORY / 2, "{reads} storage reads for one merge");
 }
