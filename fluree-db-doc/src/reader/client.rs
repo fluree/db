@@ -3,14 +3,43 @@
 //! Blocking, like [`crate::LlmClient`] and for the same reason: readings run
 //! inside a `spawn_blocking` task, and ureq carries no runtime to drop there.
 //!
-//! **Resends.** A read is resent only when the answer is a 503 that carries
-//! `Retry-After`: the endpoint saying it had no capacity (a model still
-//! starting, a full queue) and when to come back. Nothing else is resent —
-//! not a timeout, not a dropped connection, not a 503 without the header —
-//! because any of those may follow a read that ran, and a read is billed.
-//! Attempts and total waiting are capped, and every wait is reported through
-//! the caller's `on_wait`, so a model starting from cold shows as waiting
-//! rather than as a hang.
+//! **Controls.** What a call asks for travels in headers, never in the body
+//! as well (a reader refuses a request that sends both): the answer's shape
+//! (`X-Fluree-Output: fluree-transaction`, a Fluree DB transaction), what
+//! comes with the facts (`X-Fluree-Include`), and, for a long text, the
+//! windows it is read in (`X-Fluree-Window`). See [`Controls`].
+//!
+//! **Resends.** A read is resent only when the answer is a 503 or a 429 that
+//! carries `Retry-After`: the endpoint saying it had no capacity (a model
+//! still starting, a full queue) or that the caller is over a rate limit,
+//! and when to come back. Nothing else is resent — not a timeout, not a
+//! dropped connection, not a 503 or 429 without the header, not a 504 (the
+//! gateway stopped waiting, and the read may still have run) — because any
+//! of those may follow a read that ran, and a resend would run it again.
+//!
+//! That a refusal with `Retry-After` was not billed is the reader's promise,
+//! not HTTP's: RFC 9110 and RFC 6585 define 503 and 429 by their cause and
+//! say nothing about work done. fluree.ai's reader keeps it: it bills only a
+//! call it answers, so neither its own rate limit's 429 nor a 503 or 429 it
+//! passes on from a model is billed. A reader of another kind should send
+//! `Retry-After` with them only when the same holds.
+//!
+//! A resend waits the time the endpoint names, never less. Waiting is capped
+//! at [`MAX_WAIT`] across a call's resends, and attempts at [`ATTEMPTS`]: a
+//! wait that would pass the cap fails at once, naming the wait asked for.
+//! One that passes it on its own is [`DocError::Unavailable`], since every
+//! call is refused until it is over, and a caller with more to read stops.
+//! Every wait is reported through the caller's `on_wait`, so a model
+//! starting from cold shows as waiting rather than as a hang.
+//!
+//! **A refused credential.** A client given a [`Renewal`] (an account
+//! sign-in whose token can be renewed) answers a 401 by renewing once and
+//! resending that call, and only that call: a request whose credential was
+//! refused was not read for, or billed to, that credential. A second 401 is
+//! the caller's error.
+//!
+//! Every answer, an error's included, carries the endpoint's ID for the call
+//! (`X-Fluree-Request-ID`), which an error's message quotes.
 
 use crate::config::ReaderEndpoint;
 use crate::{DocError, Result};
@@ -23,8 +52,10 @@ const TIMEOUT: Duration = Duration::from_secs(330);
 pub const ATTEMPTS: u32 = 4;
 /// Waiting across all resends of one request.
 pub const MAX_WAIT: Duration = Duration::from_secs(300);
-/// The longest single `Retry-After` honoured.
-const MAX_RETRY_AFTER: u64 = 60;
+
+/// Renews a refused credential: run once when a call is answered 401, and
+/// that call resent with the credential it returns.
+pub type Renewal = Box<dyn Fn() -> Result<Credential> + Send + Sync>;
 
 /// Where the credential goes.
 #[derive(Clone)]
@@ -114,15 +145,107 @@ impl Usage {
     }
 }
 
+/// What a call asks for besides the reading of its body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Controls {
+    pub include: Include,
+    /// Character ranges of the request's text, each read as one window
+    /// (`X-Fluree-Window`); empty reads the text as one.
+    pub windows: Vec<(usize, usize)>,
+}
+
+impl Controls {
+    /// The headers a call sends for these controls.
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![
+            ("X-Fluree-Output", "fluree-transaction".to_string()),
+            ("X-Fluree-Include", self.include.header().to_string()),
+        ];
+        if !self.windows.is_empty() {
+            let windows: Vec<String> = self
+                .windows
+                .iter()
+                .map(|(b, e)| format!("{b}-{e}"))
+                .collect();
+            out.push(("X-Fluree-Window", windows.join(",")));
+        }
+        out
+    }
+}
+
+/// What comes back with the facts, which always do: the claims behind them,
+/// the mentions (each occurrence in the text, and the record it links to),
+/// both, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Include {
+    pub claims: bool,
+    pub mentions: bool,
+}
+
+impl Default for Include {
+    /// Claims and mentions: a reading anchored to the text.
+    fn default() -> Self {
+        Self {
+            claims: true,
+            mentions: true,
+        }
+    }
+}
+
+impl Include {
+    /// `claims`, `mentions`, `claims,mentions` (either order) or `none`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let invalid = || {
+            DocError::Config(format!(
+                "include {value:?}: expected claims, mentions, claims,mentions or none"
+            ))
+        };
+        let parts: Vec<String> = value
+            .split(',')
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut include = Self {
+            claims: false,
+            mentions: false,
+        };
+        for part in &parts {
+            match part.as_str() {
+                "claims" => include.claims = true,
+                "mentions" => include.mentions = true,
+                "none" if parts.len() == 1 => {}
+                _ => return Err(invalid()),
+            }
+        }
+        if parts.is_empty() {
+            return Err(invalid());
+        }
+        Ok(include)
+    }
+
+    /// The `X-Fluree-Include` value.
+    pub fn header(&self) -> &'static str {
+        match (self.claims, self.mentions) {
+            (true, true) => "claims,mentions",
+            (true, false) => "claims",
+            (false, true) => "mentions",
+            (false, false) => "none",
+        }
+    }
+}
+
 /// One answered read.
 #[derive(Debug, Clone)]
 pub struct Answer {
-    /// The reading, as JSON-LD.
+    /// The reading: a Fluree DB transaction, as JSON-LD.
     pub body: String,
     pub usage: Usage,
-    /// The model and release that served, as the endpoint names them.
-    pub model: Option<String>,
+    /// The release that served (`X-Fluree-Release`), the run's IRI
+    /// (`X-Fluree-Run`) and the endpoint's ID for the call
+    /// (`X-Fluree-Request-ID`), as the answer names them.
     pub release: Option<String>,
+    pub run: Option<String>,
+    pub request_id: Option<String>,
     /// What the endpoint set aside or adapted in the ontology, as it reports
     /// it (`X-Fluree-Ontology-Not-Shown`, `-Adapted`).
     pub ontology_notes: Vec<String>,
@@ -133,7 +256,13 @@ pub struct Answer {
 pub struct ReaderClient {
     agent: ureq::Agent,
     url: String,
-    credential: Option<Credential>,
+    /// Replaceable, for a credential that is renewed during a run (an
+    /// account sign-in's hourly token).
+    credential: std::sync::RwLock<Option<Credential>>,
+    /// How a refused credential is renewed, when it can be.
+    renewal: Option<Renewal>,
+    /// How a wait is spent: the thread sleeps, except in tests.
+    sleep: fn(Duration),
 }
 
 impl std::fmt::Debug for ReaderClient {
@@ -164,25 +293,48 @@ impl ReaderClient {
         Self {
             agent,
             url: url.to_string(),
-            credential,
+            credential: std::sync::RwLock::new(credential),
+            renewal: None,
+            sleep: std::thread::sleep,
         }
+    }
+
+    /// Renew the credential with `renewal` when a call is refused (401),
+    /// and resend that call once with the renewed one.
+    pub fn with_renewal(mut self, renewal: Renewal) -> Self {
+        self.renewal = Some(renewal);
+        self
+    }
+
+    /// Spend waits with `sleep` instead of sleeping.
+    #[cfg(test)]
+    fn with_sleep(mut self, sleep: fn(Duration)) -> Self {
+        self.sleep = sleep;
+        self
     }
 
     pub fn url(&self) -> &str {
         &self.url
     }
 
-    /// Read one request dataset (TriG) with `model`. `on_wait` hears about
-    /// each wait for capacity before it starts.
+    /// Replace the credential the next calls send.
+    pub fn set_credential(&self, credential: Option<Credential>) {
+        *self.credential.write().expect("credential lock") = credential;
+    }
+
+    /// Read one request dataset (TriG) with `model`, asking for `controls`.
+    /// `on_wait` hears about each wait for capacity before it starts.
     pub fn read(
         &self,
         body: &str,
         model: &str,
         cache: Option<&str>,
+        controls: &Controls,
         on_wait: &dyn Fn(&str),
     ) -> Result<Answer> {
         let mut waited = Duration::ZERO;
         let mut attempt = 1;
+        let mut renewed = false;
         loop {
             let mut req = self
                 .agent
@@ -193,7 +345,11 @@ impl ReaderClient {
             if let Some(c) = cache {
                 req = req.header("X-Fluree-Cache", c);
             }
-            req = match &self.credential {
+            for (name, value) in controls.headers() {
+                req = req.header(name, value.as_str());
+            }
+            let credential = self.credential.read().expect("credential lock").clone();
+            req = match &credential {
                 Some(Credential::Bearer(t)) => req.header("Authorization", &format!("Bearer {t}")),
                 Some(Credential::Header { name, value }) => {
                     req.header(name.as_str(), value.as_str())
@@ -207,75 +363,107 @@ impl ReaderClient {
             let headers = response.headers().clone();
             let text = response
                 .body_mut()
-                // An answer echoes the structure graph beside the reading;
-                // ureq's 10 MiB default is too tight for a large document.
+                // A long document's mentions alone can pass ureq's 10 MiB
+                // default.
                 .with_config()
                 .limit(64 * 1024 * 1024)
                 .read_to_string()
                 .map_err(|e| DocError::Model(format!("{}: reading the answer: {e}", self.url)))?;
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            let request_id = header("x-fluree-request-id");
             if (200..300).contains(&status) {
-                let header = |name: &str| {
-                    headers
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                };
                 let ontology_notes = [
                     ("x-fluree-ontology-not-shown", "not shown to the model"),
                     ("x-fluree-ontology-adapted", "adapted"),
                 ]
                 .into_iter()
-                .filter_map(|(h, what)| {
-                    header(h)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| format!("{what}: {v}"))
-                })
+                .filter_map(|(h, what)| header(h).map(|v| format!("{what}: {v}")))
                 .collect();
                 return Ok(Answer {
                     body: text,
                     usage: Usage::from_headers(&headers),
-                    model: header("x-fluree-model"),
                     release: header("x-fluree-release"),
+                    run: header("x-fluree-run"),
+                    request_id,
                     ontology_notes,
                     resends: attempt - 1,
                 });
             }
-            let message = error_message(&text);
-            let retry_after = (status == 503)
+            if status == 401 && !renewed {
+                if let Some(renew) = &self.renewal {
+                    self.set_credential(Some(renew()?));
+                    renewed = true;
+                    continue;
+                }
+            }
+            let mut message = error_message(&text);
+            if status == 504 {
+                message.push_str(
+                    "; the reader may still have run it, so it is not resent (a resend would be a second run)",
+                );
+            }
+            if let Some(id) = &request_id {
+                message.push_str(&format!(" (request {id})"));
+            }
+            let retry_after = (status == 503 || status == 429)
                 .then(|| headers.get("retry-after"))
                 .flatten()
                 .and_then(|v| v.to_str().ok())
                 .and_then(retry_after_secs);
-            match retry_after {
-                Some(secs) if attempt < ATTEMPTS => {
-                    let wait = Duration::from_secs(secs.clamp(1, MAX_RETRY_AFTER));
-                    if waited + wait > MAX_WAIT {
-                        return Err(DocError::Endpoint {
-                            model: model.to_string(),
-                            status,
-                            message: format!(
-                                "no capacity after {}s of waiting: {message}",
-                                waited.as_secs()
-                            ),
-                        });
-                    }
-                    on_wait(&format!(
-                        "{model}: {message}; trying again in {}s (attempt {} of {ATTEMPTS})",
-                        wait.as_secs(),
-                        attempt + 1
-                    ));
-                    std::thread::sleep(wait);
-                    waited += wait;
-                    attempt += 1;
-                }
-                _ => {
-                    return Err(DocError::Endpoint {
-                        model: model.to_string(),
-                        status,
-                        message,
-                    });
-                }
+            let refused = |message: String| DocError::Endpoint {
+                model: model.to_string(),
+                status,
+                message,
+            };
+            let Some(secs) = retry_after else {
+                return Err(refused(message));
+            };
+            // The wait the endpoint names, never cut short: a resend before
+            // it is sure to be refused again.
+            let wait = Duration::from_secs(secs.max(1));
+            let past_the_cap = || {
+                format!(
+                    "{message}; the reader asks to wait {}s, and a call waits at most {}s in all \
+                     ({}s so far), so it is not resent",
+                    wait.as_secs(),
+                    MAX_WAIT.as_secs(),
+                    waited.as_secs()
+                )
+            };
+            // A wait past the cap on its own holds for every call until it
+            // is over (an account over a quota), not for this one alone.
+            if wait > MAX_WAIT {
+                return Err(DocError::Unavailable {
+                    model: model.to_string(),
+                    status,
+                    wait,
+                    message: past_the_cap(),
+                });
             }
+            if attempt >= ATTEMPTS {
+                return Err(refused(format!(
+                    "still refused after {ATTEMPTS} attempts and {}s of waiting: {message}",
+                    waited.as_secs()
+                )));
+            }
+            if waited + wait > MAX_WAIT {
+                return Err(refused(past_the_cap()));
+            }
+            on_wait(&format!(
+                "{model}: {message}; trying again in {}s (attempt {} of {ATTEMPTS})",
+                wait.as_secs(),
+                attempt + 1
+            ));
+            (self.sleep)(wait);
+            waited += wait;
+            attempt += 1;
         }
     }
 }
@@ -325,11 +513,48 @@ fn error_message(body: &str) -> String {
         }
     }
     let trimmed = body.trim();
+    if let Some(page) = html_page(trimmed) {
+        return page;
+    }
     if trimmed.chars().count() > 300 {
         format!("{}…", trimmed.chars().take(300).collect::<String>())
     } else {
         trimmed.to_string()
     }
+}
+
+/// An HTML page in place of the reader's answer comes from something in
+/// front of it (a CDN, a web firewall, a load balancer) that answered
+/// instead: said as such, with the page's title and the request ID such
+/// pages print, never as the page's markup.
+fn html_page(body: &str) -> Option<String> {
+    let head: String = body
+        .chars()
+        .take(512)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if !(head.starts_with("<!doctype html") || head.starts_with("<html")) {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    let between = |open: &str, close: &str| {
+        let start = lower.find(open)? + open.len();
+        let end = start + lower[start..].find(close)?;
+        let text = body[start..end].split_whitespace().collect::<Vec<_>>();
+        Some(text.join(" ")).filter(|t| !t.is_empty())
+    };
+    let title = between("<title>", "</title>");
+    let id = between("request id:", "<")
+        .or_else(|| between("request id:", "\n"))
+        .map(|id| id.chars().take(128).collect::<String>());
+    let mut message = String::from("answered by a proxy in front of the reader, not the reader");
+    match (title, id) {
+        (Some(t), Some(id)) => message.push_str(&format!(" (\"{t}\", its request ID {id})")),
+        (Some(t), None) => message.push_str(&format!(" (\"{t}\")")),
+        (None, Some(id)) => message.push_str(&format!(" (its request ID {id})")),
+        (None, None) => {}
+    }
+    Some(message)
 }
 
 #[cfg(test)]
@@ -400,6 +625,7 @@ mod tests {
             auth_header: Some("X-Api-Key".into()),
             models: vec!["m".into()],
             cache: None,
+            account: false,
         }
     }
 
@@ -411,15 +637,24 @@ mod tests {
                 "X-Fluree-Serialized-Tokens: 1000, 32",
                 "X-Fluree-Cache-Read-Tokens: 0,900",
                 "X-Fluree-Fuel-Consumed: 3.4",
-                "X-Fluree-Model: m",
+                "X-Fluree-Release: example-reader-1.0",
+                "X-Fluree-Run: urn:fluree:run:01EXAMPLE",
+                "X-Fluree-Request-ID: req-1",
                 "X-Fluree-Ontology-Not-Shown: rdfs:domain=2",
             ],
             "[]",
         )]);
         let client = ReaderClient::new(&endpoint(&url));
+        let controls = Controls {
+            include: Include::parse("mentions, claims").unwrap(),
+            windows: vec![(0, 1200), (1100, 2400)],
+        };
         let answer = client
-            .read("<urn:g> {}", "m", Some("catalog"), &|_| {})
+            .read("<urn:g> {}", "m", Some("catalog"), &controls, &|_| {})
             .unwrap();
+        assert_eq!(answer.release.as_deref(), Some("example-reader-1.0"));
+        assert_eq!(answer.run.as_deref(), Some("urn:fluree:run:01EXAMPLE"));
+        assert_eq!(answer.request_id.as_deref(), Some("req-1"));
         assert_eq!(answer.usage.input_tokens, 1032);
         assert_eq!(answer.usage.windows, 2);
         assert_eq!(answer.usage.cache_read_tokens, 900);
@@ -433,7 +668,52 @@ mod tests {
         assert!(head.contains("x-fluree-model: m"));
         assert!(head.contains("x-fluree-cache: catalog"));
         assert!(head.contains("content-type: application/trig"));
+        assert!(head.contains("accept: application/ld+json"));
+        assert!(head.contains("x-fluree-output: fluree-transaction"));
+        assert!(head.contains("x-fluree-include: claims,mentions"));
+        assert!(head.contains("x-fluree-window: 0-1200,1100-2400"));
         assert!(!head.contains("authorization"));
+    }
+
+    #[test]
+    fn include_reads_each_part_or_none() {
+        let header = |v: &str| Include::parse(v).map(|i| i.header());
+        assert_eq!(header("claims").unwrap(), "claims");
+        assert_eq!(header("MENTIONS").unwrap(), "mentions");
+        assert_eq!(header("mentions,claims").unwrap(), "claims,mentions");
+        assert_eq!(header("none").unwrap(), "none");
+        for bad in ["", "none,claims", "facts"] {
+            assert!(header(bad).is_err(), "{bad:?}");
+        }
+        // No windows, no window header.
+        let headers = Controls::default().headers();
+        assert!(headers.iter().all(|(h, _)| *h != "X-Fluree-Window"));
+    }
+
+    /// A 504 may follow a read that ran: not resent, and the message says
+    /// so with the endpoint's ID for the call.
+    #[test]
+    fn a_504_is_not_resent_and_names_the_request() {
+        let (url, seen) = stub(vec![http(
+            "504 Gateway Timeout",
+            &["X-Fluree-Request-ID: req-504"],
+            r#"{"error":"no answer within the job timeout"}"#,
+        )]);
+        let err = ReaderClient::new(&endpoint(&url))
+            .read("x", "m", None, &Controls::default(), &|_| {
+                panic!("no wait expected")
+            })
+            .unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let text = err.to_string();
+        assert!(text.contains("504"), "{text}");
+        assert!(
+            text.contains("may still have run it, so it is not resent"),
+            "{text}"
+        );
+        // What is billed is the service's to say; a 504 makes no claim.
+        assert!(!text.contains("billed"), "{text}");
+        assert!(text.contains("(request req-504)"), "{text}");
     }
 
     #[test]
@@ -448,7 +728,7 @@ mod tests {
         ]);
         let waits = Mutex::new(Vec::new());
         let answer = ReaderClient::new(&endpoint(&url))
-            .read("x", "m", None, &|w| {
+            .read("x", "m", None, &Controls::default(), &|w| {
                 waits.lock().unwrap().push(w.to_string());
             })
             .unwrap();
@@ -462,25 +742,126 @@ mod tests {
         );
     }
 
-    /// Only a 503 with `Retry-After` is resent: without it the read may have
-    /// run, and the resend rule covers no other status.
     #[test]
-    fn a_503_without_retry_after_and_any_other_error_are_not_resent() {
+    fn a_429_with_retry_after_is_resent() {
+        let (url, seen) = stub(vec![
+            http(
+                "429 Too Many Requests",
+                &["Retry-After: 1"],
+                r#"{"error":{"message":"Too many","status":429,"error":"rate_limited"}}"#,
+            ),
+            http("200 OK", &["X-Fluree-Serialized-Tokens: 5"], "[]"),
+        ]);
+        let waits = Mutex::new(Vec::new());
+        let answer = ReaderClient::new(&endpoint(&url))
+            .read("x", "m", None, &Controls::default(), &|w| {
+                waits.lock().unwrap().push(w.to_string());
+            })
+            .unwrap();
+        assert_eq!(answer.resends, 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(waits.into_inner().unwrap()[0].contains("attempt 2 of 4"));
+    }
+
+    /// Only a 503 or 429 with `Retry-After` is resent: without it the read
+    /// may have run, and the resend rule covers no other status.
+    #[test]
+    fn a_503_or_429_without_retry_after_and_any_other_error_are_not_resent() {
         for response in [
             http(
                 "503 Service Unavailable",
                 &[],
                 r#"{"error":"Extraction service unavailable"}"#,
             ),
+            http("429 Too Many Requests", &[], "slow down"),
             http("504 Gateway Timeout", &["Retry-After: 1"], "timed out"),
-            http("429 Too Many Requests", &["Retry-After: 1"], "slow down"),
+            http("502 Bad Gateway", &["Retry-After: 1"], "upstream"),
         ] {
             let (url, seen) = stub(vec![response]);
             let err = ReaderClient::new(&endpoint(&url))
-                .read("x", "m", None, &|_| panic!("no wait expected"))
+                .read("x", "m", None, &Controls::default(), &|_| {
+                    panic!("no wait expected")
+                })
                 .unwrap_err();
             assert_eq!(seen.lock().unwrap().len(), 1, "{err}");
         }
+    }
+
+    /// A wait longer than a call may wait in all fails at once, saying the
+    /// wait asked for; it is never resent early. It is told apart
+    /// ([`DocError::Unavailable`], with the wait), since every call meets
+    /// it until the wait is over.
+    #[test]
+    fn a_wait_past_the_cap_is_not_resent() {
+        for (status, code) in [
+            ("429 Too Many Requests", 429),
+            ("503 Service Unavailable", 503),
+        ] {
+            let (url, seen) = stub(vec![http(status, &["Retry-After: 301"], "slow down")]);
+            let err = ReaderClient::new(&endpoint(&url))
+                .with_sleep(|_| panic!("no wait expected"))
+                .read("x", "m", None, &Controls::default(), &|_| {
+                    panic!("no wait expected")
+                })
+                .unwrap_err();
+            assert_eq!(seen.lock().unwrap().len(), 1, "{err}");
+            let text = err.to_string();
+            assert!(text.contains("asks to wait 301s"), "{text}");
+            assert!(text.contains("at most 300s in all (0s so far)"), "{text}");
+            match err {
+                DocError::Unavailable { status, wait, .. } => {
+                    assert_eq!((status, wait), (code, Duration::from_secs(301)));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A 429 asking for two minutes is resent after two minutes, not after
+    /// one: the wait is the endpoint's, uncut.
+    #[test]
+    fn a_long_retry_after_is_waited_in_full() {
+        let (url, seen) = stub(vec![
+            http("429 Too Many Requests", &["Retry-After: 120"], "slow down"),
+            http("200 OK", &[], "[]"),
+        ]);
+        let waits = Mutex::new(Vec::new());
+        let answer = ReaderClient::new(&endpoint(&url))
+            .with_sleep(|_| {})
+            .read("x", "m", None, &Controls::default(), &|w| {
+                waits.lock().unwrap().push(w.to_string());
+            })
+            .unwrap();
+        assert_eq!(answer.resends, 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let waits = waits.into_inner().unwrap();
+        assert!(waits[0].contains("trying again in 120s"), "{waits:?}");
+    }
+
+    /// Waits add up against [`MAX_WAIT`]: two of two minutes are spent, and
+    /// the third, which would pass five minutes, fails at once.
+    #[test]
+    fn waiting_stops_at_the_total_cap() {
+        let busy = || http("503 Service Unavailable", &["Retry-After: 120"], "busy");
+        let (url, seen) = stub(vec![busy(), busy(), busy()]);
+        let waits = Mutex::new(0);
+        let err = ReaderClient::new(&endpoint(&url))
+            .with_sleep(|_| {})
+            .read("x", "m", None, &Controls::default(), &|_| {
+                *waits.lock().unwrap() += 1;
+            })
+            .unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(*waits.lock().unwrap(), 2);
+        let text = err.to_string();
+        assert!(text.contains("asks to wait 120s"), "{text}");
+        assert!(text.contains("(240s so far)"), "{text}");
+        // This call's waits ran out, but the next call's start afresh: the
+        // endpoint isn't refusing every call.
+        assert!(
+            matches!(err, DocError::Endpoint { status: 503, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -488,10 +869,16 @@ mod tests {
         let busy = || http("503 Service Unavailable", &["Retry-After: 1"], "busy");
         let (url, seen) = stub(vec![busy(), busy(), busy(), busy()]);
         let err = ReaderClient::new(&endpoint(&url))
-            .read("x", "m", None, &|_| {})
+            .with_sleep(|_| {})
+            .read("x", "m", None, &Controls::default(), &|_| {})
             .unwrap_err();
         assert_eq!(seen.lock().unwrap().len(), ATTEMPTS as usize);
         assert!(err.to_string().contains("503"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("still refused after 4 attempts and 3s of waiting"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -532,6 +919,28 @@ mod tests {
     }
 
     #[test]
+    fn an_html_page_says_who_answered_not_its_markup() {
+        // What a CDN's web firewall answers when it refuses a request.
+        let page = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">\n\
+            <HTML><HEAD><META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=iso-8859-1\">\n\
+            <TITLE>ERROR: The request could not be satisfied</TITLE>\n</HEAD><BODY>\n<H1>403 ERROR</H1>\n\
+            <H2>The request could not be satisfied.</H2>\n<HR noshade size=\"1px\">\nRequest blocked.\n\
+            <BR clear=\"all\">\n<HR noshade size=\"1px\">\n<PRE>\nGenerated by cloudfront (CloudFront)\n\
+            Request ID: AbC123xyz==\n</PRE>\n<ADDRESS>\n</ADDRESS>\n</BODY></HTML>";
+        assert_eq!(
+            error_message(page),
+            "answered by a proxy in front of the reader, not the reader \
+             (\"ERROR: The request could not be satisfied\", its request ID AbC123xyz==)"
+        );
+        assert_eq!(
+            error_message("<html><body>Bad Gateway</body></html>"),
+            "answered by a proxy in front of the reader, not the reader"
+        );
+        // Text that merely mentions HTML is the reader's own.
+        assert_eq!(error_message("expected <html>"), "expected <html>");
+    }
+
+    #[test]
     fn retry_after_takes_seconds_or_an_http_date() {
         assert_eq!(retry_after_secs(" 15 "), Some(15));
         let soon = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(30));
@@ -544,10 +953,57 @@ mod tests {
     #[test]
     fn an_error_status_is_kept_typed() {
         let (url, _) = stub(vec![http("401 Unauthorized", &[], r#"{"error":"no"}"#)]);
-        match ReaderClient::new(&endpoint(&url)).read("x", "m", None, &|_| {}) {
+        match ReaderClient::new(&endpoint(&url)).read("x", "m", None, &Controls::default(), &|_| {})
+        {
             Err(DocError::Endpoint { status: 401, .. }) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A client that can renew its credential renews it once on a 401 and
+    /// resends that call alone; a second 401 is the caller's.
+    #[test]
+    fn a_refused_credential_is_renewed_once_and_the_call_resent() {
+        let refused = || http("401 Unauthorized", &[], r#"{"error":"config_stale"}"#);
+        let client = |url: &str, renewals: &Arc<Mutex<u32>>| {
+            let count = renewals.clone();
+            ReaderClient::with_credential(url, Some(Credential::Bearer("old".into()))).with_renewal(
+                Box::new(move || {
+                    *count.lock().unwrap() += 1;
+                    Ok(Credential::Bearer("new".into()))
+                }),
+            )
+        };
+
+        let (url, seen) = stub(vec![
+            refused(),
+            http("200 OK", &["X-Fluree-Serialized-Tokens: 5"], "[]"),
+        ]);
+        let renewals = Arc::new(Mutex::new(0));
+        let answer = client(&url, &renewals)
+            .read("x", "m", None, &Controls::default(), &|_| {
+                panic!("no wait expected")
+            })
+            .unwrap();
+        assert_eq!(*renewals.lock().unwrap(), 1);
+        assert_eq!(answer.resends, 0, "a renewal is not a wait for capacity");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer old"));
+        assert!(seen[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer new"));
+
+        let (url, seen) = stub(vec![refused(), refused()]);
+        let renewals = Arc::new(Mutex::new(0));
+        match client(&url, &renewals).read("x", "m", None, &Controls::default(), &|_| {}) {
+            Err(DocError::Endpoint { status: 401, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*renewals.lock().unwrap(), 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -556,7 +1012,7 @@ mod tests {
         let mut ep = endpoint(&url);
         ep.auth_header = None;
         ReaderClient::new(&ep)
-            .read("x", "m", None, &|_| {})
+            .read("x", "m", None, &Controls::default(), &|_| {})
             .unwrap();
         assert!(seen.lock().unwrap()[0]
             .to_ascii_lowercase()
