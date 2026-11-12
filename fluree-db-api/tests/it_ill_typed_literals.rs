@@ -14,6 +14,7 @@ use crate::support::{
     self, ledger_with_stored_ill_typed_literals, query_jsonld_formatted, query_sparql_formatted,
 };
 use fluree_db_api::{FlureeBuilder, GraphPayload};
+use fluree_db_core::FlakeValue;
 use fluree_db_transact::GraphSel;
 use serde_json::{json, Value};
 
@@ -407,3 +408,165 @@ async fn a_stored_ill_typed_literal_keeps_its_datatype() {
     }
 }
 
+/// Each object stored for `subject predicate`, as (the value, its datatype
+/// IRI), read from the ledger as stored: novelty or index.
+async fn stored_values(
+    ledger: &fluree_db_api::LedgerState,
+    subject: &str,
+    predicate: &str,
+) -> Vec<(fluree_db_core::FlakeValue, String)> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+    let snapshot = &ledger.snapshot;
+    let (Some(s), Some(p)) = (snapshot.encode_iri(subject), snapshot.encode_iri(predicate)) else {
+        return Vec::new();
+    };
+    let flakes = ledger
+        .as_graph_db_ref(0)
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s),
+                p: Some(p),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range");
+    flakes
+        .into_iter()
+        .filter(|f| f.op)
+        .map(|f| {
+            let dt = snapshot.decode_sid(&f.dt).unwrap_or_default();
+            (f.o, dt)
+        })
+        .collect()
+}
+
+/// A transaction and an import parse a typed literal with one parser. Each
+/// valid form below is stored as the same value, of the kind named, whichever
+/// of the two wrote it, the transaction into novelty and the import into the
+/// index. A form a transaction refuses is the one an import keeps as text
+/// (an `rdf:JSON` one as written).
+#[tokio::test]
+async fn a_transaction_and_an_import_store_one_value_per_literal() {
+    const RDF_JSON: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
+    const WKT: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+    const VECTOR: &str = "https://ns.flur.ee/db#embeddingVector";
+    let xsd = |local: &str| format!("{XSD}{local}");
+    // (datatype IRI, lexical form, the kind of value both store).
+    let valid: Vec<(String, &str, &str)> = vec![
+        (xsd("boolean"), "1", "Boolean"),
+        (xsd("decimal"), "1.5", "Decimal"),
+        (xsd("double"), "INF", "Double"),
+        (xsd("float"), "-1.5E2", "Double"),
+        (xsd("integer"), "123456789012345678901234567890", "BigInt"),
+        (xsd("byte"), "12", "Long"),
+        (xsd("dateTime"), "2026-10-28T12:00:00Z", "DateTime"),
+        (xsd("gYear"), "2024", "GYear"),
+        (xsd("duration"), "P1Y2M3DT4H", "Duration"),
+        (xsd("dayTimeDuration"), "PT36H", "DayTimeDuration"),
+        (WKT.to_string(), "POINT(1 2)", "GeoPoint"),
+        (RDF_JSON.to_string(), r#"{"b": 1, "a": [true]}"#, "Json"),
+        (VECTOR.to_string(), "[0.5, 1.5]", "Vector"),
+        (xsd("anyURI"), "http://example.org/x", "String"),
+        (format!("{EX}custom"), "anything at all", "String"),
+    ];
+    // (datatype IRI, a lexical form a transaction refuses, its error, what
+    // import keeps).
+    let text = |s: &str| FlakeValue::String(s.to_string());
+    let refused: Vec<(String, &str, &str, FlakeValue)> = vec![
+        (
+            xsd("byte"),
+            "300",
+            "Value 300 is out of range for byte",
+            text("300"),
+        ),
+        (xsd("boolean"), "yes", "Cannot parse 'yes' as", text("yes")),
+        (xsd("duration"), "P1Q", "Cannot parse 'P1Q' as", text("P1Q")),
+        (
+            RDF_JSON.to_string(),
+            "not json",
+            "Cannot parse 'not json' as",
+            FlakeValue::Json("not json".into()),
+        ),
+    ];
+    let triple =
+        |i: usize, dt: &str, lexical: &str| format!("<{EX}s> <{EX}p{i}> '{lexical}'^^<{dt}> .\n");
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+
+    // By transaction: the valid forms in one, each refused form on its own.
+    let txn_id = "it/parity-transaction:main";
+    let ledger = fluree.create_ledger(txn_id).await.unwrap();
+    let doc: String = valid
+        .iter()
+        .enumerate()
+        .map(|(i, (dt, lexical, _))| triple(i, dt, lexical))
+        .collect();
+    fluree
+        .insert_turtle(ledger, &doc)
+        .await
+        .expect("valid forms");
+    for (i, (dt, lexical, error, _)) in refused.iter().enumerate() {
+        let ledger = fluree.ledger(txn_id).await.unwrap();
+        let err = fluree
+            .insert_turtle(ledger, &triple(valid.len() + i, dt, lexical))
+            .await
+            .map(|_| ())
+            .expect_err(&format!("a transaction refuses '{lexical}'^^<{dt}>"));
+        assert!(err.to_string().contains(error), "{dt}: {err}");
+    }
+
+    // By import: every form in one file.
+    let data_dir = tempfile::tempdir().unwrap();
+    let doc: String = valid
+        .iter()
+        .map(|(dt, lexical, _)| (dt, lexical))
+        .chain(refused.iter().map(|(dt, lexical, _, _)| (dt, lexical)))
+        .enumerate()
+        .map(|(i, (dt, lexical))| triple(i, dt, lexical))
+        .collect();
+    std::fs::write(data_dir.path().join("data.ttl"), doc).unwrap();
+    let import_id = "it/parity-import:main";
+    fluree
+        .create(import_id)
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    let by_txn = fluree.ledger(txn_id).await.unwrap();
+    let by_import = fluree.ledger(import_id).await.unwrap();
+    let subject = format!("{EX}s");
+    let mut differing = Vec::new();
+    for (i, (dt, lexical, kind)) in valid.iter().enumerate() {
+        let predicate = format!("{EX}p{i}");
+        let txn = stored_values(&by_txn, &subject, &predicate).await;
+        let import = stored_values(&by_import, &subject, &predicate).await;
+        let as_kind = txn.len() == 1 && format!("{:?}", txn[0].0).starts_with(&format!("{kind}("));
+        if txn != import || !as_kind || txn[0].1 != *dt {
+            differing.push(format!(
+                "'{lexical}'^^<{dt}> as {kind}: transaction {txn:?}, import {import:?}"
+            ));
+        }
+    }
+    for (i, (dt, lexical, _, kept)) in refused.iter().enumerate() {
+        let predicate = format!("{EX}p{}", valid.len() + i);
+        let txn = stored_values(&by_txn, &subject, &predicate).await;
+        let import = stored_values(&by_import, &subject, &predicate).await;
+        if !txn.is_empty() || import != vec![(kept.clone(), dt.clone())] {
+            differing.push(format!(
+                "'{lexical}'^^<{dt}>: transaction {txn:?}, import {import:?}, expected {kept:?}"
+            ));
+        }
+    }
+    assert!(differing.is_empty(), "{differing:#?}");
+}

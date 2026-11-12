@@ -11,14 +11,13 @@ use crate::generate::{
     DT_LANG_STRING, DT_STRING, DT_TIME, DT_WKT_LITERAL, DT_YEAR_MONTH_DURATION,
 };
 use crate::namespace::NsAllocator;
-use fluree_db_core::geo::try_extract_point;
 use fluree_db_core::temporal::{
     Date, DateTime, DayTimeDuration, Duration, GDay, GMonth, GMonthDay, GYear, GYearMonth, Time,
     YearMonthDuration,
 };
-use fluree_db_core::{FlakeValue, GeoPointBits, Sid};
+use fluree_db_core::{FlakeValue, Sid};
 use fluree_graph_ir::LiteralValue;
-use fluree_vocab::{fluree, geo, rdf, xsd};
+use fluree_vocab::{geo, rdf, xsd};
 
 /// Fast-path: return cached Sid for the most common datatype IRIs.
 /// Avoids trie lookup + Sid::new() allocation for high-frequency types.
@@ -106,108 +105,23 @@ pub(crate) fn convert_string_literal(
     Ok((fv, dt_sid))
 }
 
-/// The lenient parse of a typed lexical form: a well-known datatype's
-/// native value, or, for a lexical form that does not parse, the text
-/// itself.
+/// The lenient parse of a typed lexical form, bulk import's: the value the
+/// strict parse ([`typed_lexical`]) gives, or, for a lexical form it refuses,
+/// the text itself under the declared datatype.
+///
+/// One parser, so the two cannot drift: a literal a transaction stores is
+/// stored as the same value by an import, and only what a transaction
+/// refuses is kept as text. An `rdf:JSON` lexical form that is not JSON is
+/// kept as written. One that is not a vector is kept as text, which the
+/// value/datatype pairing guard on the write path then refuses.
 fn lenient_value(value: &str, dt_iri: &str) -> FlakeValue {
-    match dt_iri {
-        xsd::STRING | xsd::NORMALIZED_STRING | xsd::TOKEN | xsd::LANGUAGE | xsd::ANY_URI => {
+    fluree_db_core::coerce::coerce_string_value(value, dt_iri).unwrap_or_else(|_| {
+        if dt_iri == rdf::JSON {
+            FlakeValue::Json(value.to_string())
+        } else {
             FlakeValue::String(value.to_string())
         }
-        xsd::INTEGER
-        | xsd::LONG
-        | xsd::INT
-        | xsd::SHORT
-        | xsd::BYTE
-        | xsd::UNSIGNED_LONG
-        | xsd::UNSIGNED_INT
-        | xsd::UNSIGNED_SHORT
-        | xsd::UNSIGNED_BYTE
-        | xsd::NON_NEGATIVE_INTEGER
-        | xsd::POSITIVE_INTEGER
-        | xsd::NON_POSITIVE_INTEGER
-        | xsd::NEGATIVE_INTEGER => parse_integer(value),
-        xsd::DOUBLE | xsd::FLOAT => fluree_graph_ir::parse_xsd_double(value)
-            .map(FlakeValue::Double)
-            .unwrap_or_else(|| FlakeValue::String(value.to_string())),
-        xsd::DECIMAL => value
-            .parse::<bigdecimal::BigDecimal>()
-            .map(|d| FlakeValue::Decimal(Box::new(d)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::BOOLEAN => match value {
-            "true" | "1" => FlakeValue::Boolean(true),
-            "false" | "0" => FlakeValue::Boolean(false),
-            _ => FlakeValue::String(value.to_string()),
-        },
-        xsd::DATE_TIME => DateTime::parse(value)
-            .map(|dt| FlakeValue::DateTime(Box::new(dt)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::DATE => Date::parse(value)
-            .map(|d| FlakeValue::Date(Box::new(d)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::TIME => Time::parse(value)
-            .map(|t| FlakeValue::Time(Box::new(t)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::G_YEAR => GYear::parse(value)
-            .map(|v| FlakeValue::GYear(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::G_YEAR_MONTH => GYearMonth::parse(value)
-            .map(|v| FlakeValue::GYearMonth(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::G_MONTH => GMonth::parse(value)
-            .map(|v| FlakeValue::GMonth(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::G_DAY => GDay::parse(value)
-            .map(|v| FlakeValue::GDay(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::G_MONTH_DAY => GMonthDay::parse(value)
-            .map(|v| FlakeValue::GMonthDay(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::DURATION => Duration::parse(value)
-            .map(|v| FlakeValue::Duration(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::DAY_TIME_DURATION => DayTimeDuration::parse(value)
-            .map(|v| FlakeValue::DayTimeDuration(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        xsd::YEAR_MONTH_DURATION => YearMonthDuration::parse(value)
-            .map(|v| FlakeValue::YearMonthDuration(Box::new(v)))
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        // Canonicalizing gives one term per value (#1781). This converter is
-        // the lenient one, so a lexical that is not valid JSON is kept as
-        // written rather than failing the write.
-        rdf::JSON => FlakeValue::Json(
-            fluree_graph_ir::canonicalize_json(value).unwrap_or_else(|_| value.to_string()),
-        ),
-        fluree::EMBEDDING_VECTOR => {
-            // Delegate to core's shared lexical parser so JSON-LD bulk import,
-            // Turtle, and SPARQL `"[..]"^^f:embeddingVector` all share f32
-            // quantization. On parse failure, fall through to a string literal
-            // — the late `validate_value_dt_pair` guard at the write path
-            // (FlakeGenerator / ImportSink / FlakeSink) rejects the corrupt
-            // (String, embeddingVector) pair as a hard transaction error.
-            fluree_db_core::coerce::coerce_string_value(value, fluree::EMBEDDING_VECTOR)
-                .unwrap_or_else(|_| FlakeValue::String(value.to_string()))
-        }
-        rdf::LANG_STRING => {
-            // Language goes in FlakeMeta, value is a plain string
-            FlakeValue::String(value.to_string())
-        }
-        geo::WKT_LITERAL => {
-            // Detect POINT and store as GeoPoint, others as string
-            if let Some((lat, lng)) = try_extract_point(value) {
-                GeoPointBits::new(lat, lng)
-                    .map(FlakeValue::GeoPoint)
-                    .unwrap_or_else(|| FlakeValue::String(value.to_string()))
-            } else {
-                // Non-point WKT: store as string for sidecar spatial index
-                FlakeValue::String(value.to_string())
-            }
-        }
-        _ => {
-            // Unknown datatype — store as string, preserve the dt Sid
-            FlakeValue::String(value.to_string())
-        }
-    }
+    })
 }
 
 /// Parse a typed XSD-style lexical form into the matching

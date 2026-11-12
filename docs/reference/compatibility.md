@@ -605,6 +605,10 @@ Every release since 4.0.0 indexed the `rdf:JSON` and `xsd:duration` values of a 
 
 A ledger built or extended by an import in an earlier release, with `rdf:JSON` or `xsd:duration` values, still holds the wrong entries in its index. The ledger's commits hold the values as written, so [`fluree reindex`](../cli/reindex.md), which rebuilds the index from the commits, repairs it; a re-import is not needed. Reindex even if the ledger has been written to since the import. A value an update copied out of such a ledger before the repair (an `INSERT … WHERE` that bound it) was written with the wrong text, and a reindex does not change it.
 
+#### Bulk import keeps an out-of-range bounded integer as text
+
+A bulk import stored an out-of-range value of a bounded integer type, such as `"300"^^xsd:byte`, as the number 300 under `xsd:byte`. It now keeps it as text under its datatype, as it keeps every other literal that is not a value of its datatype (see [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)), so it no longer compares equal to a number. A transaction refuses it ("Value 300 is out of range for byte").
+
 ## Supported Data Formats
 
 ### JSON-LD
