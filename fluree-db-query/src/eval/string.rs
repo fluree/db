@@ -704,12 +704,13 @@ pub fn eval_str_dt<R: RowAccess>(
                 other => other.as_str().map(Arc::from),
             };
             // Any IRI is a datatype (§17.4.2.9), one in a namespace the ledger
-            // has never seen included. Anything else is a type error: the value
-            // is unbound, and a transaction's strict WHERE refuses it, since
-            // the literal could not be stored.
-            let Some(dt_iri) = dt_iri.filter(|iri| {
-                fluree_db_core::graph_registry::validate_absolute_graph_iri(iri).is_ok()
-            }) else {
+            // has never seen included, and so is a name with no scheme, which
+            // every write path stores as one. Anything else is a type error:
+            // the value is unbound, and a transaction's strict WHERE refuses
+            // it, since the literal could not be stored.
+            let Some(dt_iri) =
+                dt_iri.filter(|iri| fluree_db_core::graph_registry::is_iri_reference(iri))
+            else {
                 if ctx.is_some_and(|c| c.strict_bind_errors) {
                     return Err(QueryError::InvalidExpression(format!(
                         "STRDT's datatype must be an IRI, not {dt_val:?}"

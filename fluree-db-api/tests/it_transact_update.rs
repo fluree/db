@@ -1559,9 +1559,10 @@ async fn update_where_bind_str_dt_with_an_unseen_datatype_iri() {
 }
 
 /// `str-dt` takes any IRI as its datatype, and nothing else: a datatype that
-/// is not an IRI is a type error, which leaves the value unbound in a query
-/// and fails an update, on both surfaces. It used to build a literal whose
-/// datatype was the string, and an update stored it.
+/// cannot be an IRI (a number, a string with spaces) is a type error, which
+/// leaves the value unbound in a query and fails an update, on both surfaces.
+/// It used to build a literal whose datatype was the string, and an update
+/// stored it.
 #[tokio::test]
 async fn str_dt_refuses_a_datatype_that_is_not_an_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
