@@ -4267,8 +4267,11 @@ fn person_number(iri: &str) -> i64 {
 /// A query with no slice cannot observe its order, so it may stream files as
 /// their reads finish: it is checked for its rows only. A crawl pages subjects
 /// itself (an OFFSET with no LIMIT reaches its flat query as no slice), so it
-/// asks for the deterministic order explicitly. The materialize read keeps
-/// commit order, persons 1..=3000.
+/// asks for the deterministic order explicitly. So do the two other prefixes
+/// of an answer: a JSON-LD `selectOne` (the first row, taken when the result
+/// is formatted) and a byte-budgeted AgentJson response (a page its client
+/// continues with OFFSET). The materialize read keeps commit order, persons
+/// 1..=3000.
 #[tokio::test]
 async fn unordered_pages_partition_a_multi_file_answer() {
     allow_fixture_roots();
@@ -4451,6 +4454,55 @@ async fn unordered_pages_partition_a_multi_file_answer() {
         crawled,
         everyone[2900..],
         "crawl: OFFSET in the fixed order"
+    );
+
+    // A `selectOne` keeps the first row of the answer when it is formatted:
+    // the first person in the fixed order, every time.
+    for run in 0..2 {
+        let one = fluree
+            .query_from()
+            .jsonld(&serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": "paged:main",
+                "selectOne": ["?s"],
+                "where": {"@id": "?s", "ex:name": "?n"},
+            }))
+            .execute_formatted()
+            .await
+            .expect("selectOne");
+        let s = one.as_array().map_or(&one, |row| &row[0]);
+        assert_eq!(
+            person_number(s.as_str().unwrap_or_else(|| panic!("an IRI: {one}"))),
+            everyone[0],
+            "selectOne (run {run}): the first row in the fixed order"
+        );
+    }
+
+    // A byte-budgeted AgentJson response is a page its client continues with
+    // OFFSET (`hasMore`, `resume`): its rows are a prefix of the fixed order,
+    // though the query itself has no slice.
+    let agent_page = fluree
+        .query_from()
+        .sparql("SELECT ?s FROM <paged:main> WHERE { ?s <http://example.org/name> ?n }")
+        .format(fluree_db_api::FormatterConfig::agent_json().with_max_bytes(4_000))
+        .execute_formatted()
+        .await
+        .expect("AgentJson page");
+    assert_eq!(
+        agent_page["hasMore"], true,
+        "a truncated page: {agent_page}"
+    );
+    let page_rows: Vec<i64> = agent_page["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows: {agent_page}"))
+        .iter()
+        .map(|row| person_number(row["?s"].as_str().expect("an IRI")))
+        .collect();
+    assert!(!page_rows.is_empty(), "{agent_page}");
+    assert_eq!(
+        page_rows,
+        everyone[..page_rows.len()],
+        "AgentJson: the page is a prefix of the fixed order"
     );
 
     // The materialize read streams the same files the same way.

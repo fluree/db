@@ -6267,10 +6267,11 @@ async fn materialize_on_current_thread_runtime_fails_loud() {
 }
 
 /// The row order each query shape asks of its graph-source table scan: only a
-/// query with no LIMIT or OFFSET anywhere may take `ScanOrder::Any` (rows as
-/// file reads finish); any slice, including one under a FILTER (which a row
-/// budget does not pass) or inside a sub-SELECT, keeps the scan deterministic so
-/// a client's pages partition the answer. An `ORDER BY … LIMIT` still takes
+/// query that takes no prefix of an answer (no LIMIT or OFFSET anywhere, no
+/// `selectOne`) may take `ScanOrder::Any` (rows as file reads finish); any
+/// slice, including one under a FILTER (which a row budget does not pass) or
+/// inside a sub-SELECT, keeps the scan deterministic so a client's pages
+/// partition the answer. An `ORDER BY … LIMIT` still takes
 /// the scan-side top-k.
 #[tokio::test]
 async fn a_scan_is_deterministic_unless_no_slice_can_observe_its_order() {
@@ -6311,6 +6312,11 @@ async fn a_scan_is_deterministic_unless_no_slice_can_observe_its_order() {
     let mut q = query(vec![graph(store_keys())]);
     q.offset = Some(1);
     cases.push(("OFFSET", q, ScanOrder::Deterministic, false));
+    // `selectOne` keeps the first row when the result is formatted: a prefix
+    // of the answer, as a LIMIT 1 is.
+    let mut q = query(vec![graph(store_keys())]);
+    q.output = QueryOutput::select_one(vec![s, k]);
+    cases.push(("selectOne", q, ScanOrder::Deterministic, false));
     let mut with_filter = store_keys();
     with_filter.push(Pattern::Filter(positive()));
     let mut q = query(vec![graph(with_filter)]);

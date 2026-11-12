@@ -2346,12 +2346,14 @@ pub fn build_operator_tree(
             .is_none_or(|rows| rows >= goal as f64)
     });
     // A graph-source scan may emit rows in any order (as its file reads finish)
-    // only when no LIMIT or OFFSET anywhere in the query can observe the order:
-    // a page cut from an unordered answer must hold the same rows on every
-    // execution. Decided once, here at the root, and fail closed: a slice at any
+    // only when nothing in the query takes a prefix of an answer: a page cut
+    // from an unordered answer must hold the same rows on every execution.
+    // Decided once, here at the root, and fail closed: a prefix taken at any
     // depth, or any path that plans without passing through here, keeps every
-    // scan deterministic.
-    let scan_order = if query_has_slice(query) {
+    // scan deterministic. A prefix taken by the caller after the query (the
+    // browse crawl's subject pages, a byte-budgeted response a client resumes
+    // with OFFSET) sets `ExecutionContext::deterministic_scans` instead.
+    let scan_order = if query_takes_prefix(query) {
         crate::r2rml::ScanOrder::Deterministic
     } else {
         crate::r2rml::ScanOrder::Any
@@ -2373,6 +2375,14 @@ pub fn build_operator_tree(
         return build_operator_tree_folds(&simplified, stats, planning);
     }
     build_operator_tree_folds(query, stats, planning)
+}
+
+/// Whether `query` answers with a prefix of some unordered answer, so the
+/// order its scans emit rows in decides which rows it answers: a LIMIT or
+/// OFFSET anywhere ([`query_has_slice`]), or a `selectOne`, which keeps the
+/// first row when the result is formatted.
+pub(crate) fn query_takes_prefix(query: &Query) -> bool {
+    query_has_slice(query) || query.output.is_select_one()
 }
 
 /// Whether a LIMIT or OFFSET appears anywhere in `query`: on the query itself,
