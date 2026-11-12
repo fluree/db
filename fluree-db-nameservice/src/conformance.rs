@@ -1791,6 +1791,78 @@ pub async fn a_rerun_migration_keeps_a_stopped_branch_drop_dropped<
     assert!(store.raw_record("mydb:dev").await.unwrap().is_none());
 }
 
+/// A branch an earlier release let begin with `/` is no ledger address, so
+/// no request names it, but it is a branch of its ledger all the same: the
+/// migration lists and fences it, a drop of the ledger takes it with the
+/// rest, a restore brings it back, and a hard drop leaves no record of it.
+pub async fn a_ledger_drop_takes_a_legacy_branch_with_it<S: crate::NameServicePublisher>(
+    store: &S,
+) {
+    let legacy = LedgerId::from_persisted_parts("mydb", "/old").unwrap();
+    for record in [
+        legacy_record("mydb:main", None, false),
+        NsRecord {
+            source_branch: Some("main".to_string()),
+            ..NsRecord::new(legacy.clone())
+        },
+    ] {
+        assert!(store.insert_record(&record).await.unwrap().is_none());
+    }
+
+    let report = lifecycle::migrate_legacy(store).await.unwrap();
+    assert_eq!(report.bound, vec!["mydb".to_string()]);
+    assert!(report.quarantined.is_empty());
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    let fence = binding.fence_of("/old").expect("the binding lists it");
+    let listed = store
+        .raw_record(&legacy)
+        .await
+        .unwrap()
+        .expect("its record");
+    assert_eq!(listed.fence, Some(fence));
+    assert!(
+        matches!(
+            store.lookup("mydb:/old").await,
+            Err(NameServiceError::InvalidId(_))
+        ),
+        "a request cannot name the branch"
+    );
+
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .expect("dropped");
+    assert_eq!(dropped.entry.branches.len(), 2);
+    assert!(dropped.entry.branches.iter().all(|r| r.frozen));
+    assert!(store.get_binding("mydb").await.unwrap().is_none());
+    assert!(store.raw_record("mydb:main").await.unwrap().is_none());
+    assert!(store.raw_record(&legacy).await.unwrap().is_none());
+
+    let restored = lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    assert_eq!(restored.len(), 2);
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    let restored_fence = binding.fence_of("/old").expect("listed again");
+    assert_ne!(restored_fence, fence);
+    let record = store.raw_record(&legacy).await.unwrap().expect("restored");
+    assert_eq!(record.fence, Some(restored_fence));
+    assert!(!record.frozen);
+
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), true)
+        .await
+        .unwrap()
+        .expect("dropped");
+    assert!(dropped.hard);
+    assert_eq!(dropped.entry.branches.len(), 2);
+    lifecycle::finish_purge(store, &dropped.instance)
+        .await
+        .unwrap();
+    assert!(store.get_binding("mydb").await.unwrap().is_none());
+    assert!(store.raw_record("mydb:main").await.unwrap().is_none());
+    assert!(store.raw_record(&legacy).await.unwrap().is_none());
+}
+
 pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store: &S) {
     for record in [
         legacy_record("mydb:main", None, false),
@@ -2260,6 +2332,7 @@ where
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
+    a_ledger_drop_takes_a_legacy_branch_with_it(&make().await).await;
 }
 
 /// The writes a purge makes, which the backends it runs on support (file,
@@ -2331,6 +2404,7 @@ macro_rules! lifecycle_conformance_tests {
             an_unmirrored_branch_with_children_is_kept,
             a_rerun_migration_binds_late_legacy_records,
             a_rerun_migration_keeps_a_stopped_branch_drop_dropped,
+            a_ledger_drop_takes_a_legacy_branch_with_it,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

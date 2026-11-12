@@ -4,7 +4,7 @@
 //! WHERE patterns → GROUP BY → Aggregates → HAVING → ORDER BY → PROJECT → DISTINCT → OFFSET → LIMIT
 
 use crate::aggregate::AggregateOperator;
-use crate::binary_scan::EmitMask;
+use crate::binary_scan::{lang_tag_equality, EmitMask};
 use crate::count_rows::CountRowsOperator;
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
@@ -1202,33 +1202,8 @@ fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String
         }
     }
 
-    let is_lang_o = |e: &crate::ir::Expression| match e {
-        crate::ir::Expression::Call { func, args } => {
-            matches!(func, crate::ir::Function::Lang { .. })
-                && args.len() == 1
-                && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
-        }
-        _ => false,
-    };
-    let crate::ir::Expression::Call { func, args } = filter else {
-        return None;
-    };
-    if *func != crate::ir::Function::Eq || args.len() != 2 {
-        return None;
-    }
-
-    if is_lang_o(&args[0]) {
-        if let crate::ir::Expression::Const(crate::ir::FlakeValue::String(tag)) = &args[1] {
-            return Some((pred, tag.clone(), out_var));
-        }
-    }
-    if is_lang_o(&args[1]) {
-        if let crate::ir::Expression::Const(crate::ir::FlakeValue::String(tag)) = &args[0] {
-            return Some((pred, tag.clone(), out_var));
-        }
-    }
-
-    None
+    let tag = lang_tag_equality(filter, o_var)?;
+    Some((pred, tag.to_string(), out_var))
 }
 
 fn detect_predicate_count_distinct_object(query: &Query) -> Option<(Ref, VarId)> {
@@ -1343,34 +1318,6 @@ fn detect_count_rows_with_encoded_filters(
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == s_var);
     let is_o =
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == o_var);
-    let is_lang_call = |e: &crate::ir::Expression| match e {
-        crate::ir::Expression::Call { func, args } => {
-            matches!(func, crate::ir::Function::Lang { .. })
-                && args.len() == 1
-                && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
-        }
-        _ => false,
-    };
-    let is_lang_eq_const = |expr: &crate::ir::Expression| match expr {
-        crate::ir::Expression::Call { func, args } => {
-            if *func != crate::ir::Function::Eq || args.len() != 2 {
-                return false;
-            }
-            let has_lang = is_lang_call(&args[0]) || is_lang_call(&args[1]);
-            let has_const = matches!(
-                (&args[0], &args[1]),
-                (
-                    crate::ir::Expression::Const(crate::ir::FlakeValue::String(_)),
-                    _
-                ) | (
-                    _,
-                    crate::ir::Expression::Const(crate::ir::FlakeValue::String(_))
-                )
-            );
-            has_lang && has_const
-        }
-        _ => false,
-    };
     for expr in &filters {
         match expr {
             crate::ir::Expression::Call { func, args }
@@ -1386,7 +1333,7 @@ fn detect_count_rows_with_encoded_filters(
                 {
                     continue;
                 }
-                if is_lang_eq_const(expr) {
+                if lang_tag_equality(expr, o_var).is_some() {
                     continue;
                 }
                 return None;

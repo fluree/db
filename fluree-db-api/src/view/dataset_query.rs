@@ -857,6 +857,12 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
             bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,
@@ -1041,6 +1047,12 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
             bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,

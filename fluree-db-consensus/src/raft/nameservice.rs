@@ -63,7 +63,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{ContentId, InstanceId, LedgerId};
 use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{
@@ -2246,8 +2246,12 @@ fn fence_outcome_from_response(response: SmResponse) -> Result<FenceOutcome> {
     }
 }
 
+/// The key of a stored record, read under the stored-record grammar: the
+/// record store's operations act on ids a binding or a listing holds, and so
+/// must reach a branch an earlier release wrote under a name no request can
+/// address.
 fn ref_key_of(ledger_id: &str) -> Result<RefKey> {
-    let (name, branch) = split_ledger_id(ledger_id)?;
+    let (name, branch) = split_persisted_ledger_id(ledger_id)?;
     Ok(RefKey::new(name, branch))
 }
 
@@ -2327,7 +2331,7 @@ impl LedgerRegistry for RaftNameService {
 #[async_trait]
 impl BranchRecordStore for RaftNameService {
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let state = self.state.read().await;
         Ok(record_from_state(
             &state,

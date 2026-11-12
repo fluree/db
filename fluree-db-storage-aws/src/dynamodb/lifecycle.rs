@@ -704,7 +704,7 @@ impl BranchRecordStore for DynamoDbNameService {
     }
 
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let pk = Self::normalize(ledger_id)?;
+        let pk = Self::normalize_persisted(ledger_id)?;
         let items = self.query_metadata_items(&pk).await?;
         Ok(Self::items_to_ns_record(&pk, &items))
     }
@@ -717,7 +717,7 @@ impl BranchRecordStore for DynamoDbNameService {
     /// from, a graph source's or one whose id no longer parses, holds the
     /// key: the insert is refused rather than clearing it.
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
-        let pk = Self::normalize(&record.ledger_id)?;
+        let pk = Self::normalize_persisted(&record.ledger_id)?;
         for _ in 0..3 {
             if let Some(existing) = self.raw_record(&pk).await? {
                 return Ok(Some(existing));
@@ -793,7 +793,7 @@ impl BranchRecordStore for DynamoDbNameService {
     /// An item the record never had (an index never published) is written
     /// fenced, since a fenced publish never creates one.
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let pk = Self::normalize(ledger_id)?;
+        let pk = Self::normalize_persisted(ledger_id)?;
         match self.meta_fence(&pk).await? {
             None => return Ok(FenceOutcome::Missing),
             Some(Some(f)) if f == fence => return Ok(FenceOutcome::Applied),
@@ -829,7 +829,7 @@ impl BranchRecordStore for DynamoDbNameService {
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let pk = Self::normalize(ledger_id)?;
+        let pk = Self::normalize_persisted(ledger_id)?;
         match self.meta_fence(&pk).await? {
             None => return Ok(FenceOutcome::Missing),
             Some(f) if f != Some(fence) => return Ok(FenceOutcome::Mismatch),
@@ -887,7 +887,7 @@ impl BranchRecordStore for DynamoDbNameService {
     /// commit index carries no fence and goes once the record's fence is
     /// confirmed.
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let pk = Self::normalize(ledger_id)?;
+        let pk = Self::normalize_persisted(ledger_id)?;
         match self.meta_fence(&pk).await? {
             None => return Ok(FenceOutcome::Missing),
             Some(f) if f != Some(fence) => return Ok(FenceOutcome::Mismatch),

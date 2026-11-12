@@ -551,7 +551,7 @@ Graph and dataset references now resolve through one table ([The ledger's own ad
 
 Earlier data:
 
-- A branch whose name begins with `/`, which v4.0.0 through v4.2.1 could create, can no longer be addressed. Its data is intact; export it (`fluree export L:/branch`) with the release you run before upgrading.
+- A branch whose name begins with `/`, which v4.0.0 through v4.2.1 could create, can no longer be addressed. Its data is intact; export it (`fluree export L:/branch`) with the release you run before upgrading. The branch stays part of its ledger: dropping the ledger drops it with the rest, and restoring the ledger brings it back.
 - A graph an earlier version registered under the ledger's address (for instance by a TriG block `GRAPH <mydb:main> { … }`) keeps its data and is reached as `<mydb:main#mydb:main>`: the address, `#`, and the IRI it is registered under. One registered under the address with a keyword is reached the same way, as `<mydb:main#mydb:main#config>`. `GRAPH ?g` lists it under that name, in queries and updates alike, so a `?g` binding reads it back. The graph-management verbs (`CLEAR`, `DROP`, `ADD`, `COPY`, `MOVE`) read `mydb:main#<g>` as the graph `<g>` too, so `DROP GRAPH <mydb:main#mydb:main#config>` acts on such a graph. The address alone keeps naming the graph registered under it, never the default graph, so they also reach that graph by the address itself. To move its data into the default graph:
 
   ```sparql

@@ -912,7 +912,7 @@ pub fn count_rows_encoded_filters_operator(
                 };
                 // Compile the FILTERs to encoded pre-filters. If any can't be pushed
                 // down (needs value decoding), defer to the serial scan-count fallback.
-                let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                let (encoded, pruned, _) = compile_encoded_pre_filters_and_prune_inline_ops(
                     &inline_ops,
                     &pattern,
                     store,
@@ -942,7 +942,7 @@ pub fn count_rows_encoded_filters_operator(
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                     return Ok(None);
                 };
-                let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                let (encoded, pruned, _) = compile_encoded_pre_filters_and_prune_inline_ops(
                     &inline_ops,
                     &pattern,
                     store,

@@ -120,6 +120,13 @@ impl DynamoDbNameService {
         Ok(LedgerId::parse(ledger_id)?.to_string())
     }
 
+    /// [`Self::normalize`] under the stored-record grammar, for the
+    /// operations that remove a record an earlier release wrote under a name
+    /// no request can address.
+    fn normalize_persisted(ledger_id: &str) -> std::result::Result<String, NameServiceError> {
+        Ok(LedgerId::parse_persisted(ledger_id)?.to_string())
+    }
+
     /// Current epoch time in milliseconds.
     fn now_epoch_ms() -> u64 {
         SystemTime::now()

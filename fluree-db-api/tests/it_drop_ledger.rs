@@ -907,6 +907,229 @@ async fn files_of_child(fluree: &fluree_db_api::Fluree) -> Vec<String> {
         .expect("list")
 }
 
+/// Every file under `dir`, with its bytes.
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read");
+                out.insert(path, bytes);
+            }
+        }
+    }
+    out
+}
+
+/// The files under `dir` that are gone or hold other bytes than in `before`.
+fn changed_since(
+    before: &std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let now = tree(dir);
+    before
+        .iter()
+        .filter(|(path, bytes)| now.get(*path) != Some(*bytes))
+        .map(|(path, _)| path.clone())
+        .chain(now.keys().filter(|p| !before.contains_key(*p)).cloned())
+        .collect()
+}
+
+/// Give `ledger`, one from before name bindings, a branch `/old`: a name an
+/// earlier release allowed and `create_branch` now refuses. A placeholder
+/// branch's files are moved under the path the legacy id names, and its
+/// record and its listing in the ledger's binding rewritten to match, as the
+/// upgrade leaves such a branch. Returns the store reopened.
+async fn leave_a_legacy_branch(
+    fluree: fluree_db_api::Fluree,
+    root: &std::path::Path,
+    ledger: &str,
+) -> fluree_db_api::Fluree {
+    fluree
+        .create_branch(ledger, "placeholder", None, None)
+        .await
+        .expect("create placeholder");
+    let placeholder_id = format!("{ledger}:placeholder");
+    let placeholder = fluree.ledger(&placeholder_id).await.expect("load");
+    fluree
+        .insert(
+            placeholder,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:on-the-branch", "ex:val": 1}]
+            }),
+        )
+        .await
+        .expect("insert placeholder");
+    drop(fluree);
+
+    std::fs::rename(
+        root.join(ledger).join("placeholder"),
+        root.join(ledger).join("old"),
+    )
+    .expect("move the branch's files");
+    let records = root.join("ns@v3").join(ledger);
+    for entry in std::fs::read_dir(&records).expect("records").flatten() {
+        let file = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if path.is_dir() || !(file.starts_with("placeholder.") || file == "@binding.json") {
+            continue;
+        }
+        let rewritten = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace("placeholder", "/old");
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::write(records.join(file.replace("placeholder", "old")), rewritten)
+            .expect("write the branch's record");
+    }
+    FlureeBuilder::file(root.to_string_lossy().to_string())
+        .build()
+        .expect("reopen")
+}
+
+/// A branch an earlier release let begin with `/` is listed under its id,
+/// though no request can name it. Dropping its ledger drops it with the rest:
+/// a soft drop keeps every file and a restore brings the branch back, and a
+/// hard drop leaves neither a record nor a file.
+#[tokio::test]
+async fn a_ledger_drop_takes_a_legacy_branch_with_it() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    fluree_db_nameservice::testing::create_at_name_root(fluree.publisher().unwrap(), "slashed")
+        .await
+        .expect("a ledger from before name bindings");
+    let main = fluree.ledger("slashed").await.expect("load");
+    fluree
+        .insert(
+            main,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:a", "ex:val": "a string for the dicts"}]
+            }),
+        )
+        .await
+        .expect("insert main");
+    fluree
+        .reindex("slashed", fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex writes dict blobs");
+    let fluree = leave_a_legacy_branch(fluree, tmp.path(), "slashed").await;
+
+    let records = || async {
+        fluree
+            .nameservice()
+            .all_records()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|r| (r.ledger_id.to_string(), r.retracted))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let listed = records().await;
+    assert!(
+        listed.len() == 2 && listed.get("slashed:/old") == Some(&false),
+        "listed under its id: {listed:?}"
+    );
+    assert!(
+        fluree.db("slashed:/old").await.is_err(),
+        "a request cannot name the branch"
+    );
+
+    let files = tmp.path().join("slashed");
+    let files_before = tree(&files);
+    assert!(
+        files_before
+            .keys()
+            .any(|f| f.to_string_lossy().contains("/slashed/old/commit/"))
+            && files_before
+                .keys()
+                .any(|f| f.to_string_lossy().contains("/@shared/dicts/")),
+        "fixture: the branch has commits and the ledger shared dictionaries"
+    );
+
+    let soft = fluree
+        .drop_ledger("slashed", DropMode::Soft)
+        .await
+        .expect("soft drop");
+    assert_eq!(soft.status, DropStatus::Dropped);
+    assert_eq!(soft.branch_reports.len(), 2, "{:?}", soft.branch_reports);
+    assert!(
+        records().await.is_empty(),
+        "a soft drop frees every branch's record"
+    );
+    assert_eq!(
+        changed_since(&files_before, &files),
+        Vec::<std::path::PathBuf>::new(),
+        "a soft drop keeps every file"
+    );
+
+    let instance = soft.instance.expect("instance").to_string();
+    fluree
+        .restore_dropped(&instance)
+        .await
+        .expect("restore brings the legacy branch back");
+    let listed = records().await;
+    assert!(
+        listed.len() == 2 && listed.get("slashed:/old") == Some(&false),
+        "restored under its id: {listed:?}"
+    );
+
+    let hard = fluree
+        .drop_ledger("slashed", DropMode::Hard)
+        .await
+        .expect("hard drop");
+    assert_eq!(hard.status, DropStatus::Dropped);
+    assert_eq!(hard.warnings, Vec::<String>::new());
+    assert!(records().await.is_empty(), "a hard drop leaves no record");
+    assert_eq!(
+        tree(&files).keys().collect::<Vec<_>>(),
+        Vec::<&std::path::PathBuf>::new(),
+        "a hard drop leaves no file"
+    );
+}
+
+/// A nested ledger's legacy branch `/old` has the path prefix
+/// `{name}//old`, which file storage lists as `{name}/old`. Neither a sweep
+/// nor a hard drop of the ledger it nests under may take its files for the
+/// outer ledger's own.
+#[tokio::test]
+async fn a_nested_ledgers_legacy_branch_survives_a_sweep_and_a_drop_of_the_outer_ledger() {
+    let (tmp, fluree, _, _) = nested_legacy_ledgers(false).await;
+    let child = "a/main/index/child";
+    let fluree = leave_a_legacy_branch(fluree, tmp.path(), child).await;
+
+    let child_files = tmp.path().join(child);
+    let before = tree(&child_files);
+    assert!(
+        before
+            .keys()
+            .any(|f| f.to_string_lossy().contains("/child/old/commit/")),
+        "fixture: the legacy branch has commits"
+    );
+
+    fluree.sweep_index_storage("a").await.expect("sweep a");
+    assert_eq!(
+        changed_since(&before, &child_files),
+        Vec::<std::path::PathBuf>::new(),
+        "sweeping `a` reclaimed the nested ledger's files"
+    );
+
+    fluree
+        .drop_ledger("a", DropMode::Hard)
+        .await
+        .expect("drop a");
+    assert_eq!(
+        changed_since(&before, &child_files),
+        Vec::<std::path::PathBuf>::new(),
+        "dropping `a` deleted the nested ledger's files"
+    );
+}
+
 /// A hard drop of `a` keeps a nested legacy ledger's files, its branches'
 /// and its `@shared/` dictionaries, whether that ledger is live or
 /// soft-dropped and waiting in the registry.

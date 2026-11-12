@@ -629,7 +629,7 @@ where
             // A branch drop freezes the branch first, and one with children
             // deletes nothing until its last child goes, so the drop is
             // announced here. A ledger drop announces as it deletes.
-            let id = LedgerId::parse(ledger_id)?;
+            let id = LedgerId::parse_persisted(ledger_id)?;
             if let Some(binding) = self
                 .listing_binding(&id, Some(fence))
                 .await
@@ -657,7 +657,7 @@ where
         ledger_id: &str,
         fence: crate::Fence,
     ) -> Result<crate::FenceOutcome> {
-        let id = LedgerId::parse(ledger_id)?;
+        let id = LedgerId::parse_persisted(ledger_id)?;
         // A drop deletes records while its binding still lists them, which
         // names the ledger they belonged to.
         let instance = self
