@@ -427,6 +427,131 @@ async fn a_removal_records_who_asked() {
     assert!(archived.to_string().contains("z6MkAdmin"));
 }
 
+/// A removal cannot be undone, so a request body with a field it does not
+/// know, or a null object, is refused: either would widen the request to
+/// every object of the subject and predicate.
+#[test]
+fn a_request_with_an_unknown_field_is_refused() {
+    use fluree_db_api::retention::erasure::ErasureRequest;
+    use fluree_db_api::retention::RemovalRequest;
+    let selector = |object: (&str, JsonValue)| json!({"matching": [{"subject": "ex:s", "predicate": "ex:p", object.0: object.1}]});
+    for body in [
+        selector(("objekt", json!("a@old"))),
+        selector(("value", json!("a@old"))),
+        selector(("object", JsonValue::Null)),
+        json!({"matchng": []}),
+    ] {
+        assert!(
+            serde_json::from_value::<RemovalRequest>(body.clone()).is_err(),
+            "{body}"
+        );
+        assert!(
+            serde_json::from_value::<ErasureRequest>(body.clone()).is_err(),
+            "{body}"
+        );
+    }
+    let named = selector(("object", json!("a@old")));
+    let removal: RemovalRequest = serde_json::from_value(named.clone()).unwrap();
+    assert_eq!(removal.matching[0].object, Some(json!("a@old")));
+    serde_json::from_value::<ErasureRequest>(named).unwrap();
+    let every: RemovalRequest =
+        serde_json::from_value(json!({"matching": [{"subject": "ex:s", "predicate": "ex:p"}]}))
+            .unwrap();
+    assert_eq!(every.matching[0].object, None);
+}
+
+/// Under the RDF list view a pattern over `rdf:first` reads list members
+/// whichever predicate owns them: a removed member is refused there too.
+#[tokio::test]
+async fn a_removed_list_member_is_refused_under_the_rdf_list_view() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-list-view").await;
+    let t1 = upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:codes": {"@list": ["secret", "b"]}}),
+    )
+    .await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:x", "ex:n": 1}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(
+            &id,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/codes".into(),
+                    graph: None,
+                    object: Some(json!("secret")),
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+    let past = fluree.db_at_t(&id, t1).await.unwrap();
+    let cells = json!({
+        "@context": {"rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+        "select": "?m",
+        "where": {"@id": "?c", "rdf:first": "?m"},
+        "opts": {"rdfLists": true}
+    });
+    assert!(matches!(
+        fluree.query(&past, &cells).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+    // At the head the view reads what is left.
+    let now = fluree.db(&id).await.unwrap();
+    let members = fluree.query(&now, &cells).await.expect("current");
+    assert_eq!(members.to_jsonld(&now.snapshot).unwrap(), json!(["b"]));
+}
+
+/// The search-enabled connection query refuses removed history as the
+/// plain one does.
+#[tokio::test]
+async fn a_search_enabled_connection_query_refuses_removed_history() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-bm25-entry").await;
+    let t1 = upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@new"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    let query = |from: String| {
+        json!({
+            "@context": ctx(), "from": from, "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        })
+    };
+    assert!(matches!(
+        fluree
+            .query_connection_with_bm25(&query(format!("{id}@t:{t1}")))
+            .await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+    let current = fluree
+        .query_connection_with_bm25(&query(id.clone()))
+        .await
+        .expect("current");
+    let now = fluree.db(&id).await.unwrap();
+    assert_eq!(current.to_jsonld(&now.snapshot).unwrap(), json!(["a@new"]));
+}
+
 #[tokio::test]
 async fn removing_one_occurrence_preserves_the_others() {
     let fluree = FlureeBuilder::memory().build_memory();

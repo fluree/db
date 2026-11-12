@@ -37,7 +37,9 @@ pub(crate) enum Reads {
 /// What `query` reads, in IRIs: every pattern it evaluates, those in its
 /// solution modifiers included.
 pub(crate) fn reads_of(query: &Query, snapshot: &LedgerSnapshot) -> Reads {
-    if query.output.has_hydration() {
+    // Under the RDF list view a pattern over `rdf:first` reads the members
+    // of every list, whichever predicate owns it.
+    if query.output.has_hydration() || query.rdf_list_view {
         return Reads::Everything;
     }
     let mut facts = Vec::new();

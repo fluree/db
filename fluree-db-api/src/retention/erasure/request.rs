@@ -25,7 +25,7 @@ use crate::{ApiError, Fluree, Result};
 /// A permanent-erasure request: occurrences named by commit and slot, or
 /// facts whose every occurrence is erased.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErasureRequest {
     #[serde(default)]
     pub occurrences: Vec<OccurrenceRef>,

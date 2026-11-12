@@ -38,9 +38,11 @@ pub struct OccurrenceRef {
     pub slot: u32,
 }
 
-/// Facts whose every occurrence a request removes.
+/// Facts whose every occurrence a request removes. A removal cannot be
+/// undone, so a field this does not know is refused: a misspelled `object`
+/// would otherwise select every object.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FactSelector {
     /// Subject IRI.
     pub subject: String,
@@ -53,14 +55,29 @@ pub struct FactSelector {
     /// `xsd:string`), number or boolean; or a value object,
     /// `{"@value": ..., "@type": "<datatype IRI>"}` or
     /// `{"@value": "...", "@language": "<tag>"}`. Absent selects every
-    /// object.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// object; a `null` is refused, not read as absent.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "named_object"
+    )]
     pub object: Option<serde_json::Value>,
+}
+
+fn named_object<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Err(serde::de::Error::custom(
+            "`object` is null; leave it out to select every object",
+        )),
+        object => Ok(Some(object)),
+    }
 }
 
 /// A removal request.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemovalRequest {
     #[serde(default)]
     pub occurrences: Vec<OccurrenceRef>,
