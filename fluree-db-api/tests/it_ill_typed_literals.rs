@@ -19,16 +19,41 @@ use serde_json::{json, Value};
 
 const EX: &str = "http://example.org/ns/";
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
-const PREFIXES: &str =
-    "PREFIX ex: <http://example.org/ns/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+const PREFIXES: &str = "PREFIX ex: <http://example.org/ns/> \
+     PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
-/// (datatype local name, an ill-typed lexical form, a valid one).
-const CASES: [(&str, &str, &str); 2] = [
-    ("integer", "landed", "42"),
-    ("dateTime", "landed", "2026-10-28T12:00:00Z"),
+/// (datatype IRI, its name under `PREFIXES`, an ill-typed lexical form, a
+/// valid one).
+const CASES: [(&str, &str, &str, &str); 3] = [
+    (
+        "http://www.w3.org/2001/XMLSchema#integer",
+        "xsd:integer",
+        "landed",
+        "42",
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#dateTime",
+        "xsd:dateTime",
+        "landed",
+        "2026-10-28T12:00:00Z",
+    ),
+    // A string `@value` under `@json` is a serialized document, so the
+    // JSON-LD insert parses it as `INSERT DATA` parses `"…"^^rdf:JSON`.
+    (
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON",
+        "rdf:JSON",
+        "not json",
+        "[1,2]",
+    ),
 ];
 
-/// Each write of `"lexical"^^xsd:<dt>` to `ex:<subject> ex:p`, as
+/// The local name of the datatype IRI `dt`, for ledger ids.
+fn local(dt: &str) -> &str {
+    dt.rsplit(['#', '/']).next().unwrap_or(dt)
+}
+
+/// Each write of `"lexical"^^<dt>` to `ex:<subject> ex:p`, as
 /// (path, the write's outcome as `Ok(())` or the error text).
 async fn write_on_every_path(
     fluree: &support::MemoryFluree,
@@ -52,7 +77,7 @@ async fn write_on_every_path(
     out.push((
         "SPARQL INSERT DATA".to_string(),
         sparql(format!(
-            r#"{PREFIXES} INSERT DATA {{ ex:{subject}-data ex:p "{lexical}"^^xsd:{dt} }}"#
+            r#"{PREFIXES} INSERT DATA {{ ex:{subject}-data ex:p "{lexical}"^^<{dt}> }}"#
         ))
         .await,
     ));
@@ -60,7 +85,7 @@ async fn write_on_every_path(
         "SPARQL update, STRDT".to_string(),
         sparql(format!(
             r#"{PREFIXES} INSERT {{ ex:{subject}-strdt ex:p ?v }}
-               WHERE {{ ex:seed ex:k ?k BIND(STRDT("{lexical}", xsd:{dt}) AS ?v) }}"#
+               WHERE {{ ex:seed ex:k ?k BIND(STRDT("{lexical}", <{dt}>) AS ?v) }}"#
         ))
         .await,
     ));
@@ -69,7 +94,7 @@ async fn write_on_every_path(
         "SPARQL update, STRDT of CONCAT".to_string(),
         sparql(format!(
             r#"{PREFIXES} INSERT {{ ex:{subject}-concat ex:p ?v }}
-               WHERE {{ ex:seed ex:k ?k BIND(STRDT(CONCAT("{head}", "{tail}"), xsd:{dt}) AS ?v) }}"#
+               WHERE {{ ex:seed ex:k ?k BIND(STRDT(CONCAT("{head}", "{tail}"), <{dt}>) AS ?v) }}"#
         ))
         .await,
     ));
@@ -80,7 +105,7 @@ async fn write_on_every_path(
             .insert(
                 ledger,
                 &json!({"@context": ctx, "@id": format!("ex:{subject}-insert"),
-                        "ex:p": {"@value": lexical, "@type": format!("xsd:{dt}")}}),
+                        "ex:p": {"@value": lexical, "@type": dt}}),
             )
             .await
             .map(|_| ())
@@ -94,7 +119,7 @@ async fn write_on_every_path(
                 ledger,
                 &json!({"@context": ctx,
                         "where": [{"@id": "ex:seed", "ex:k": "?k"},
-                                  ["bind", "?v", format!("(str-dt \"{lexical}\" \"{XSD}{dt}\")")]],
+                                  ["bind", "?v", format!("(str-dt \"{lexical}\" \"{dt}\")")]],
                         "insert": {"@id": format!("ex:{subject}-strdt-jsonld"), "ex:p": "?v"}}),
             )
             .await
@@ -107,7 +132,7 @@ async fn write_on_every_path(
         fluree
             .insert_turtle(
                 ledger,
-                &format!("<{EX}{subject}-ttl> <{EX}p> \"{lexical}\"^^<{XSD}{dt}> ."),
+                &format!("<{EX}{subject}-ttl> <{EX}p> \"{lexical}\"^^<{dt}> ."),
             )
             .await
             .map(|_| ())
@@ -119,7 +144,7 @@ async fn write_on_every_path(
             .graph(id)
             .transact()
             .upsert_turtle(&format!(
-                "<{EX}{subject}-upsert> <{EX}p> \"{lexical}\"^^<{XSD}{dt}> ."
+                "<{EX}{subject}-upsert> <{EX}p> \"{lexical}\"^^<{dt}> ."
             ))
             .commit()
             .await
@@ -133,14 +158,14 @@ async fn write_on_every_path(
             .insert_turtle(
                 ledger,
                 &format!(
-                    "GRAPH <{EX}g-trig> {{ <{EX}{subject}-trig> <{EX}p> \"{lexical}\"^^<{XSD}{dt}> . }}"
+                    "GRAPH <{EX}g-trig> {{ <{EX}{subject}-trig> <{EX}p> \"{lexical}\"^^<{dt}> . }}"
                 ),
             )
             .await
             .map(|_| ())
             .map_err(|e| e.to_string()),
     ));
-    let triple = format!("<{EX}{subject}-graph> <{EX}p> \"{lexical}\"^^<{XSD}{dt}> .");
+    let triple = format!("<{EX}{subject}-graph> <{EX}p> \"{lexical}\"^^<{dt}> .");
     out.push((
         "graph insert".to_string(),
         fluree
@@ -187,21 +212,21 @@ async fn seeded(fluree: &support::MemoryFluree, id: &str) {
 #[tokio::test]
 async fn every_transaction_refuses_an_ill_typed_literal() {
     let fluree = FlureeBuilder::memory().build_memory();
-    for (dt, bad, _) in CASES {
-        let id = format!("it/ill-typed-refused-{dt}:main");
+    for (dt, name, bad, _) in CASES {
+        let id = format!("it/ill-typed-refused-{}:main", local(dt));
         seeded(&fluree, &id).await;
         let t = fluree.ledger(&id).await.unwrap().t();
         for (path, outcome) in write_on_every_path(&fluree, &id, "s", dt, bad).await {
-            let err = outcome.expect_err(&format!("{dt}: {path} refuses \"{bad}\""));
+            let err = outcome.expect_err(&format!("{name}: {path} refuses \"{bad}\""));
             assert!(
                 err.contains(&format!("Cannot parse '{bad}' as")),
-                "{dt}: {path}: {err}"
+                "{name}: {path}: {err}"
             );
         }
         assert_eq!(
             fluree.ledger(&id).await.unwrap().t(),
             t,
-            "{dt}: nothing committed"
+            "{name}: nothing committed"
         );
     }
 }
@@ -212,14 +237,14 @@ async fn every_transaction_refuses_an_ill_typed_literal() {
 /// deliberate.
 #[tokio::test]
 async fn bulk_import_keeps_an_ill_typed_literal() {
-    for (dt, bad, good) in CASES {
+    for (dt, name, bad, good) in CASES {
         let data_dir = tempfile::tempdir().unwrap();
         let db_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             data_dir.path().join("data.ttl"),
             format!(
-                "<{EX}imp> <{EX}ok> \"{good}\"^^<{XSD}{dt}> .\n\
-                 <{EX}imp> <{EX}p> \"{bad}\"^^<{XSD}{dt}> .\n"
+                "<{EX}imp> <{EX}ok> \"{good}\"^^<{dt}> .\n\
+                 <{EX}imp> <{EX}p> \"{bad}\"^^<{dt}> .\n"
             ),
         )
         .unwrap();
@@ -235,7 +260,7 @@ async fn bulk_import_keeps_an_ill_typed_literal() {
             .cleanup(false)
             .execute()
             .await
-            .unwrap_or_else(|e| panic!("{dt}: import: {e}"));
+            .unwrap_or_else(|e| panic!("{name}: import: {e}"));
         let ledger = fluree.ledger(id).await.unwrap();
         let rows = query_sparql_formatted(
             &fluree,
@@ -246,16 +271,12 @@ async fn bulk_import_keeps_an_ill_typed_literal() {
         )
         .await
         .unwrap();
-        assert_eq!(
-            rows,
-            json!([[bad, format!("xsd:{dt}")]]),
-            "{dt}: kept as text"
-        );
+        assert_eq!(rows, json!([[bad, name]]), "{name}: kept as text");
         let valid = query_sparql_formatted(
             &fluree,
             &ledger,
             &format!(
-                r#"{PREFIXES} SELECT (sameTerm(?v, "{good}"^^xsd:{dt}) AS ?same) WHERE {{ ex:imp ex:ok ?v }}"#
+                r#"{PREFIXES} SELECT (sameTerm(?v, "{good}"^^<{dt}>) AS ?same) WHERE {{ ex:imp ex:ok ?v }}"#
             ),
         )
         .await
@@ -263,7 +284,7 @@ async fn bulk_import_keeps_an_ill_typed_literal() {
         assert_eq!(
             valid,
             json!([[true]]),
-            "{dt}: the valid literal, as its value"
+            "{name}: the valid literal, as its value"
         );
     }
 }
@@ -273,13 +294,13 @@ async fn bulk_import_keeps_an_ill_typed_literal() {
 #[tokio::test]
 async fn a_valid_typed_literal_is_one_term_on_every_write_path() {
     let fluree = FlureeBuilder::memory().build_memory();
-    for (dt, _, good) in CASES {
-        let id = format!("it/ill-typed-valid-{dt}:main");
+    for (dt, name, _, good) in CASES {
+        let id = format!("it/ill-typed-valid-{}:main", local(dt));
         seeded(&fluree, &id).await;
         let outcomes = write_on_every_path(&fluree, &id, "s", dt, good).await;
         let paths = outcomes.len();
         for (path, outcome) in outcomes {
-            outcome.unwrap_or_else(|e| panic!("{dt}: {path}: {e}"));
+            outcome.unwrap_or_else(|e| panic!("{name}: {path}: {e}"));
         }
         let ledger = fluree.ledger(&id).await.unwrap();
         let rows = query_sparql_formatted(
@@ -288,12 +309,12 @@ async fn a_valid_typed_literal_is_one_term_on_every_write_path() {
             &format!(
                 r#"{PREFIXES} SELECT (COUNT(?s) AS ?n) (COUNT(DISTINCT ?v) AS ?terms)
                    WHERE {{ {{ ?s ex:p ?v }} UNION {{ GRAPH ?g {{ ?s ex:p ?v }} }}
-                           FILTER(sameTerm(?v, "{good}"^^xsd:{dt})) }}"#
+                           FILTER(sameTerm(?v, "{good}"^^<{dt}>)) }}"#
             ),
         )
         .await
         .unwrap();
-        assert_eq!(rows, json!([[paths, 1]]), "{dt}: every path, one term");
+        assert_eq!(rows, json!([[paths, 1]]), "{name}: every path, one term");
     }
 }
 
@@ -303,7 +324,9 @@ async fn a_valid_typed_literal_is_one_term_on_every_write_path() {
 #[tokio::test]
 async fn a_stored_ill_typed_literal_keeps_its_datatype() {
     let fluree = FlureeBuilder::memory().build_memory();
-    for (dt, bad, _) in CASES {
+    // The helper stores text under an `xsd:` datatype.
+    for (dt, _, bad, _) in CASES.into_iter().filter(|c| c.0.starts_with(XSD)) {
+        let dt = local(dt);
         let id = format!("it/ill-typed-stored-{dt}:main");
         let ledger = ledger_with_stored_ill_typed_literals(
             &fluree,
@@ -383,3 +406,4 @@ async fn a_stored_ill_typed_literal_keeps_its_datatype() {
         assert_eq!(left, json!([]), "{dt}: deleted");
     }
 }
+

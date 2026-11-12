@@ -568,7 +568,8 @@ async fn scan_encoded_literals_keep_one_key_across_join_lanes() {
         &[
             json_lit(json!({"a": 1, "b": [true, "x"]})),
             json_lit(json!([1, 2])),
-            json_lit(json!("s")),
+            // A string `@value` is a serialized document: the JSON string "s".
+            json_lit(json!("\"s\"")),
         ],
     )
     .await;

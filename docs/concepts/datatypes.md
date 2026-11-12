@@ -263,7 +263,7 @@ Two consequences are worth knowing:
 - **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
 - **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
 
-`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
 
 Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
 
