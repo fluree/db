@@ -197,7 +197,7 @@ class Transaction:
 
 def sparql_form(sparql: str) -> str | None: ...
 def parse_rdf(
-    text: str, format: str, base: str | None = None
+    text: str, format: str, base: str | None = None, blank_prefix: str | None = None
 ) -> tuple[
     list[tuple[IRI | BlankNode, IRI, IRI | BlankNode | Term, IRI | BlankNode | None]],
     list[tuple[str, str]],

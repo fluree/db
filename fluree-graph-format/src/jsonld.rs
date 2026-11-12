@@ -43,6 +43,17 @@ pub struct JsonLdFormatConfig {
     /// When false (default), single values are scalars, multiple values are arrays.
     pub multicardinal_arrays: bool,
 
+    /// Write a number or boolean as a bare JSON value only where a JSON-LD
+    /// processor reads the same literal back, and as a value object with its
+    /// `@type` otherwise.
+    ///
+    /// JSON-LD reads a bare number by its value: one with no fractional part
+    /// (below 10^21) is an `xsd:integer`. So an `xsd:double` holding `1.0` is
+    /// written `{"@value": 1.0, "@type": "xsd:double"}`, and a number or
+    /// boolean under another datatype keeps that datatype. When false
+    /// (default), each is the bare value.
+    pub exact_native_values: bool,
+
     /// Optional IRI compaction function for vocab positions (predicates and @type values)
     ///
     /// If None, IRIs are output in expanded form.
@@ -61,6 +72,7 @@ impl std::fmt::Debug for JsonLdFormatConfig {
             .field("blank_node_policy", &self.blank_node_policy)
             .field("type_handling", &self.type_handling)
             .field("multicardinal_arrays", &self.multicardinal_arrays)
+            .field("exact_native_values", &self.exact_native_values)
             .field(
                 "compactor_vocab",
                 &self.compactor_vocab.as_ref().map(|_| "<fn>"),
@@ -97,6 +109,13 @@ impl JsonLdFormatConfig {
     /// Enable multicardinal arrays (all values as arrays)
     pub fn with_multicardinal_arrays(mut self, enabled: bool) -> Self {
         self.multicardinal_arrays = enabled;
+        self
+    }
+
+    /// Keep every number's and boolean's datatype (see
+    /// [`Self::exact_native_values`]).
+    pub fn with_exact_native_values(mut self, enabled: bool) -> Self {
+        self.exact_native_values = enabled;
         self
     }
 
@@ -635,7 +654,13 @@ fn term_to_object(
             value,
             datatype,
             language,
-        } => format_literal(value, datatype, language.as_deref()),
+        } => {
+            let exact = config.exact_native_values && language.is_none();
+            match exact.then(|| exact_native_value(value, datatype)).flatten() {
+                Some(typed) => typed,
+                None => format_literal(value, datatype, language.as_deref()),
+            }
+        }
         // A JSON-LD-star embedded node, as query results write a term.
         Term::TripleTerm(t) => {
             let mut node = Map::new();
@@ -650,6 +675,35 @@ fn term_to_object(
             }
             json!({ "@id": node })
         }
+    }
+}
+
+/// The value object for a number or boolean that JSON-LD would not read back
+/// as this literal from the bare value (see
+/// [`JsonLdFormatConfig::exact_native_values`]); `None` where the bare value
+/// reads back as it is.
+///
+/// JSON-LD 1.1 API § 8.2.2 reads a bare number as an `xsd:double` when it has
+/// a fractional part or is at least 10^21 and as an `xsd:integer` otherwise,
+/// and a number under `xsd:double` as a double whatever its value.
+fn exact_native_value(value: &LiteralValue, datatype: &Datatype) -> Option<JsonValue> {
+    let iri = datatype.as_iri();
+    let typed = |value: JsonValue| Some(json!({"@value": value, "@type": iri}));
+    match value {
+        LiteralValue::Boolean(b) if iri != dt_iri::XSD_BOOLEAN => typed(json!(b)),
+        LiteralValue::Integer(i) if iri != dt_iri::XSD_INTEGER => typed(json!(i)),
+        LiteralValue::Double(d) if d.is_finite() => {
+            let reads_as_double = d.fract() != 0.0 || d.abs() >= 1e21;
+            match (iri == dt_iri::XSD_DOUBLE, reads_as_double) {
+                (true, true) => None,
+                (true, false) => typed(json!(d)),
+                (false, true) => typed(json!(d)),
+                // A whole number under another datatype reads back in its
+                // integer form, so the lexical form is written.
+                (false, false) => typed(json!(value.lexical())),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -804,6 +858,68 @@ mod tests {
 
         graph.sort();
         graph
+    }
+
+    /// A number or boolean is bare by default, whatever its datatype. With
+    /// exact native values it is bare only where JSON-LD reads the same
+    /// literal back: a whole double, and a value under another datatype,
+    /// carry their `@type`.
+    #[test]
+    fn exact_native_values_keep_each_datatype() {
+        let custom = Datatype::from_iri("http://example.org/dt");
+        let typed = |value, datatype: &Datatype| Term::Literal {
+            value,
+            datatype: datatype.clone(),
+            language: None,
+        };
+        let terms = [
+            Term::integer(3),
+            Term::double(2.5),
+            Term::double(1.0),
+            Term::double(1e21),
+            Term::boolean(true),
+            typed(LiteralValue::Integer(5), &custom),
+            typed(LiteralValue::Double(5.5), &custom),
+            typed(LiteralValue::Double(6.0), &custom),
+            typed(LiteralValue::Boolean(false), &custom),
+        ];
+        let write = |exact| -> Vec<JsonValue> {
+            let config = JsonLdFormatConfig::default().with_exact_native_values(exact);
+            let mut renamer = BlankNodeRenamer::new(BlankNodePolicy::PreserveLabeled);
+            terms
+                .iter()
+                .map(|term| term_to_object(term, &config, &mut renamer))
+                .collect()
+        };
+        assert_eq!(
+            write(false),
+            [
+                json!(3),
+                json!(2.5),
+                json!(1.0),
+                json!(1e21),
+                json!(true),
+                json!(5),
+                json!(5.5),
+                json!(6.0),
+                json!(false),
+            ]
+        );
+        let (double, dt) = (dt_iri::XSD_DOUBLE, "http://example.org/dt");
+        assert_eq!(
+            write(true),
+            [
+                json!(3),
+                json!(2.5),
+                json!({"@value": 1.0, "@type": double}),
+                json!(1e21),
+                json!(true),
+                json!({"@value": 5, "@type": dt}),
+                json!({"@value": 5.5, "@type": dt}),
+                json!({"@value": "6.0E0", "@type": dt}),
+                json!({"@value": false, "@type": dt}),
+            ]
+        );
     }
 
     #[test]

@@ -147,7 +147,7 @@ fn parse_values_cell(cell: &JsonValue, ctx: &JsonLdParseCtx) -> Result<Unresolve
             dtc: None,
         }),
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = fluree_graph_ir::json_integer(n) {
                 Ok(UnresolvedValue::Literal {
                     value: LiteralValue::Long(i),
                     dtc: None,
@@ -277,7 +277,7 @@ fn parse_literal_value(value_val: &JsonValue, dt_iri: Option<&str>) -> Result<Li
         JsonValue::String(s) => Ok(LiteralValue::String(Arc::from(s.as_str()))),
         JsonValue::Bool(b) => Ok(LiteralValue::Boolean(*b)),
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = fluree_graph_ir::json_integer(n) {
                 Ok(LiteralValue::Long(i))
             } else if let Some(f) = n.as_f64() {
                 Ok(LiteralValue::Double(f))

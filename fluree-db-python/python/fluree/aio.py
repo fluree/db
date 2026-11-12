@@ -139,12 +139,13 @@ async def parse(
     *,
     base: str | None = None,
     literals: Literal["value", "lexical"] = "value",
+    blank_prefix: str | None = None,
 ) -> list[Quad]:
     """The quads of an RDF document; see :func:`fluree.parse`. The file is
     read and the document parsed on a worker thread, which releases the GIL
     while it parses but holds it while it builds the quads, so a large
     document still slows the event loop."""
-    return await _call(fluree.parse, data, format, base=base, literals=literals)
+    return await _call(fluree.parse, data, format, base=base, literals=literals, blank_prefix=blank_prefix)
 
 
 async def serialize(

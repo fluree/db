@@ -254,7 +254,7 @@ fn json_to_single_txn_meta_value(
         Value::Bool(b) => Ok(TxnMetaValue::Boolean(*b)),
 
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = fluree_graph_ir::json_integer(n) {
                 Ok(TxnMetaValue::Long(i))
             } else if let Some(f) = n.as_f64() {
                 if !f.is_finite() {
@@ -363,7 +363,7 @@ fn parse_value_object(
         Value::String(s) => Ok(TxnMetaValue::String(s.clone())),
         Value::Bool(b) => Ok(TxnMetaValue::Boolean(*b)),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = fluree_graph_ir::json_integer(n) {
                 Ok(TxnMetaValue::Long(i))
             } else if let Some(f) = n.as_f64() {
                 if !f.is_finite() {

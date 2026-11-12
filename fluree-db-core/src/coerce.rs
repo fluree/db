@@ -654,14 +654,20 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
         return Ok(FlakeValue::Double(f));
     }
 
-    // Default: preserve as Long or Double
-    if let Some(i) = n.as_i64() {
-        Ok(FlakeValue::Long(i))
-    } else if let Some(f) = n.as_f64() {
-        Ok(FlakeValue::Double(f))
-    } else {
-        Err(CoercionError::new(format!("Unsupported number: {n}")))
-    }
+    json_number_value(n).ok_or_else(|| CoercionError::new(format!("Unsupported number: {n}")))
+}
+
+/// A JSON number with no datatype given, as the value JSON-LD makes of it
+/// (see [`fluree_graph_ir::JsonNumber`]): an integer unless it has a
+/// fractional part or is 10^21 or more, so `1.0` is the integer `1`. An
+/// integer outside i64 is a `BigInt`.
+pub fn json_number_value(n: &serde_json::Number) -> Option<FlakeValue> {
+    use fluree_graph_ir::JsonNumber;
+    Some(match JsonNumber::read(n)? {
+        JsonNumber::Integer(i) => FlakeValue::Long(i),
+        JsonNumber::BigInteger(digits) => FlakeValue::BigInt(Box::new(digits.parse().ok()?)),
+        JsonNumber::Double(f) => FlakeValue::Double(f),
+    })
 }
 
 /// Coerce a boolean to the target datatype

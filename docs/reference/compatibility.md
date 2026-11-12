@@ -80,7 +80,9 @@ Fluree supports JSON-LD 1.1:
 - Arrays
 - @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
 
-**Bulk import and transactions read some JSON-LD differently.** [Bulk import](../cli/create.md) and [`rdf::parse`](rdf-documents.md) keep an integer too large for 64 bits exact as `xsd:integer` and read a blank-node `@type` (`"@type": "_:t"`) as a blank node; a JSON-LD transaction (insert, upsert) stores such an integer as `xsd:double` and reads `_:t` as an IRI. Bulk import refuses a node with its own `@graph`, whether it names a graph or selects one; load named graphs as TriG or N-Quads.
+**Bulk import and transactions read some JSON-LD differently.** [Bulk import](../cli/create.md) and [`rdf::parse`](rdf-documents.md) read a blank-node `@type` (`"@type": "_:t"`) as a blank node; a JSON-LD transaction (insert, upsert) reads `_:t` as an IRI. Bulk import refuses a node with its own `@graph`, whether it names a graph or selects one; load named graphs as TriG or N-Quads.
+
+**Numbers are typed by value (JSON-LD 1.1 API § 8.2.2).** A number is an `xsd:double` when it has a fractional part or is 10^21 or more, and an `xsd:integer` otherwise, so `1.0` and `1e3` are the integers `1` and `1000`. A transaction, a bulk import, a query's `values` and patterns, and [`rdf::parse`](rdf-documents.md) all read a number that way. For the double `1.0`, give the value its type: `{"@value": 1.0, "@type": "xsd:double"}`, or a term whose `@type` is `xsd:double`. See [the change in 5.0](#a-json-ld-number-is-typed-by-its-value-breaking).
 
 Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
 
@@ -397,6 +399,14 @@ A relative `@base` or `@vocab` resolves against the base already in effect. A re
 Query results change the same way. An `@id` under a base ending in `#` is written `#alice`, where it was `alice`. Under any other base, an id whose remainder starts with `/`, has a `:` in its first segment or holds a `.` or `..` segment is written as the full IRI, since the shortened form would resolve to something else.
 
 A type's scoped context applies to the typed node's own properties, and no longer to the node objects nested in it: JSON-LD 1.1's default. Mark it `"@propagate": true` to keep it in force for them. A property's scoped context now applies to each node object in an array value, as it did to a single one.
+
+#### A JSON-LD number is typed by its value (breaking)
+
+A JSON-LD number with no `@type` now takes the datatype JSON-LD 1.1 gives it, which goes by the number's value: `xsd:double` with a fractional part (or from 10^21), `xsd:integer` otherwise. Earlier releases went by its spelling, so `1.0` and `1e3` were stored as `xsd:double`; they are now the integers `1` and `1000`, in a transaction, a bulk import and a query's `values` alike. The same document then stores the same data whichever client sends it: a JavaScript client never could send `1.0`, since its JSON writer drops the `.0`. An integer too large for 64 bits is kept exact as an `xsd:integer` rather than rounded into a double.
+
+**Check clients whose JSON writer keeps the `.0`** (Python, Java, Rust). A property they wrote as doubles now takes an integer for each whole value unless the value is typed: `{"@value": 1.0, "@type": "xsd:double"}`, or a context term with `"@type": "xsd:double"`. Data already written stays as it is, so a delete that names a stored double as a bare `1.0` no longer removes it; name it with its type, or bind it in `where`. A query result writes a stored `xsd:double` as a bare number, so a whole one sent back untyped is an integer. Comparisons, a bare number in a query pattern and aggregates go by value, and are unchanged. A number in a filter expression is read as before.
+
+A number of 16 or 17 significant digits now reads as the nearest double. About one in ten used to read as its neighbour (`0.9452706955539223` as `0.9452706955539224`). A value stored by an earlier release keeps the double it was given.
 
 #### Python RDF terms compare as RDF terms (breaking)
 

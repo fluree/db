@@ -196,10 +196,7 @@ fn explain_target(
                 JsonValue::Null => None,
                 JsonValue::String(s) if s.starts_with('?') => None,
                 JsonValue::String(s) => Some(FlakeValue::String(s.clone())),
-                JsonValue::Number(n) => n
-                    .as_i64()
-                    .map(FlakeValue::Long)
-                    .or_else(|| n.as_f64().map(FlakeValue::Double)),
+                JsonValue::Number(n) => fluree_db_core::coerce::json_number_value(n),
                 JsonValue::Bool(b) => Some(FlakeValue::Boolean(*b)),
                 JsonValue::Array(_) => {
                     return Err(ApiError::invalid_query(

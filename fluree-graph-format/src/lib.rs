@@ -41,6 +41,6 @@ pub use jsonld::{
 pub use policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 pub use prefix::PrefixMap;
 pub use rdf_text::{
-    format_nquads, format_nquads_ordered, format_nt_term, format_ntriples, format_trig,
-    format_trig_ordered, format_turtle, InvalidLangTag,
+    format_nquads, format_nquads_ordered, format_nquads_statements, format_nt_term,
+    format_ntriples, format_trig, format_trig_ordered, format_turtle, InvalidLangTag,
 };
