@@ -44,7 +44,7 @@ use crate::{
     RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{
     CasAction, CasOutcome, ContentId, FileStorage, InstanceId, LedgerId, StorageCas,
 };
@@ -344,6 +344,18 @@ impl FileNameService {
 
     fn record_keys(ledger_id: &str) -> Result<(String, String)> {
         let (name, branch) = split_ledger_id(ledger_id)?;
+        Ok((
+            Self::ns_address(&name, &branch),
+            Self::index_address(&name, &branch),
+        ))
+    }
+
+    /// [`Self::record_keys`] under the stored-record grammar, for the record
+    /// store's own operations. They act on ids a binding or a listing holds,
+    /// and so must reach a branch an earlier release wrote under a name no
+    /// request can address.
+    fn persisted_record_keys(ledger_id: &str) -> Result<(String, String)> {
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         Ok((
             Self::ns_address(&name, &branch),
             Self::index_address(&name, &branch),
@@ -899,7 +911,7 @@ impl BranchRecordStore for FileNameService {
     }
 
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let (main, index) = Self::record_keys(ledger_id)?;
+        let (main, index) = Self::persisted_record_keys(ledger_id)?;
         ns_cas::raw_record(
             &self.storage,
             RecordKeys {
@@ -911,7 +923,7 @@ impl BranchRecordStore for FileNameService {
     }
 
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
-        let (main, index) = Self::record_keys(&record.ledger_id)?;
+        let (main, index) = Self::persisted_record_keys(&record.ledger_id)?;
         ns_cas::insert_record(
             &self.storage,
             RecordKeys {
@@ -924,7 +936,7 @@ impl BranchRecordStore for FileNameService {
     }
 
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (main, index) = Self::record_keys(ledger_id)?;
+        let (main, index) = Self::persisted_record_keys(ledger_id)?;
         ns_cas::adopt_record(
             &self.storage,
             RecordKeys {
@@ -937,7 +949,7 @@ impl BranchRecordStore for FileNameService {
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (main, index) = Self::record_keys(ledger_id)?;
+        let (main, index) = Self::persisted_record_keys(ledger_id)?;
         ns_cas::freeze_record(
             &self.storage,
             RecordKeys {
@@ -950,7 +962,7 @@ impl BranchRecordStore for FileNameService {
     }
 
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (main, _) = Self::record_keys(ledger_id)?;
+        let (main, _) = Self::persisted_record_keys(ledger_id)?;
         ns_cas::delete_record(&self.storage, &main, fence).await
     }
 }
@@ -2410,12 +2422,13 @@ mod tests {
         assert!(ns.branch_records("../beside").await.is_err());
     }
 
-    /// A branch whose name begins with `/` is no ledger address: publishing,
-    /// looking up and dropping it are refused, and nothing is written for it.
-    /// A record an older version wrote for one stays under the ledger's
-    /// directory, untouched.
+    /// A branch whose name begins with `/` is no ledger address: publishing
+    /// and looking it up are refused, and nothing is written for it. A record
+    /// an older version wrote for one stays under the ledger's directory
+    /// until it is frozen and deleted, which a whole-ledger drop does from
+    /// the listed record's own id.
     #[tokio::test]
-    async fn a_branch_beginning_with_a_slash_is_refused_and_its_record_kept() {
+    async fn a_branch_beginning_with_a_slash_is_refused_but_its_record_can_be_dropped() {
         let (temp, ns) = setup().await;
         // Rooted in this test's directory, so the name stays inside it however
         // it is read.
@@ -2450,6 +2463,22 @@ mod tests {
         let dropped = crate::lifecycle::begin_drop_branch(&ns, &name, &branch).await;
         assert!(dropped.is_err(), "{dropped:?}");
         assert_eq!(std::fs::read_to_string(&record).unwrap(), json);
+
+        let listed = ns.all_raw_records().await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].ledger_id.as_ref(), ledger_id);
+        let fence = listed[0].fence.expect("fenced");
+        assert_eq!(
+            ns.freeze_record(&ledger_id, fence).await.unwrap(),
+            FenceOutcome::Applied
+        );
+        assert!(ns.raw_record(&ledger_id).await.unwrap().unwrap().frozen);
+        assert_eq!(
+            ns.delete_record(&ledger_id, fence).await.unwrap(),
+            FenceOutcome::Applied
+        );
+        assert!(ns.raw_record(&ledger_id).await.unwrap().is_none());
+        assert!(ns.all_raw_records().await.unwrap().is_empty());
     }
 
     // ========== Graph Source Tests ==========

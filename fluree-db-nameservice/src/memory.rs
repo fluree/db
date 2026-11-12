@@ -255,7 +255,7 @@ impl LedgerRegistry for MemoryNameService {
 #[async_trait]
 impl BranchRecordStore for MemoryNameService {
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         Ok(self.records.read().get(&key).cloned())
     }
 
@@ -275,7 +275,7 @@ impl BranchRecordStore for MemoryNameService {
     }
 
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         Ok(match self.records.write().get_mut(&key) {
             None => FenceOutcome::Missing,
             Some(record) => match record.fence {
@@ -290,7 +290,7 @@ impl BranchRecordStore for MemoryNameService {
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         Ok(match self.records.write().get_mut(&key) {
             None => FenceOutcome::Missing,
             Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
@@ -302,7 +302,7 @@ impl BranchRecordStore for MemoryNameService {
     }
 
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         let mut records = self.records.write();
         match records.get(&key) {
             None => return Ok(FenceOutcome::Missing),

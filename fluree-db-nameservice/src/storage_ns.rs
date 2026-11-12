@@ -33,7 +33,7 @@ use crate::{
     RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{
     CasAction, CasOutcome, ContentId, Error as CoreError, InstanceId, LedgerId, StorageCas,
     StorageList, StorageRead, StorageWrite,
@@ -897,7 +897,7 @@ where
     }
 
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
         ns_cas::raw_record(
             &self.storage,
@@ -926,7 +926,7 @@ where
     }
 
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
         ns_cas::adopt_record(
             &self.storage,
@@ -940,7 +940,7 @@ where
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
         ns_cas::freeze_record(
             &self.storage,
@@ -954,7 +954,7 @@ where
     }
 
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         ns_cas::delete_record(&self.storage, &self.ns_key(&name, &branch), fence).await
     }
 }
