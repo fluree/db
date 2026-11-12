@@ -227,6 +227,9 @@ pub type TranslatedOverlayCache = Arc<
     >,
 >;
 
+/// The store and dictionary novelty a [`TermView`] was built from, by address.
+type TermViewKey = (Option<usize>, Option<usize>);
+
 /// Execution context providing access to database and query state.
 ///
 /// # Dataset Support
@@ -463,6 +466,13 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo for `STR()` of late-materialized subjects — see
     /// [`SubjectIriCache`].
     pub subject_iri_cache: SubjectIriCache,
+    /// [`Self::term_view`], built once for the callers that decode a value at
+    /// a time ([`Self::with_term_view`]): under a union, building it walks
+    /// the dataset and its members. Kept with the store and dictionary
+    /// novelty it was built from, which a context can drop after it is built
+    /// (the range fallback does); the builders that change its other inputs
+    /// reset it.
+    term_view_once: std::sync::OnceLock<(TermViewKey, Option<TermView>)>,
     /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
     /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
     /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
@@ -578,6 +588,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -643,6 +654,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -712,6 +724,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -770,6 +783,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -827,6 +841,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -886,6 +901,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -965,6 +981,7 @@ impl<'a> ExecutionContext<'a> {
     /// Attach an execution tracker to this context.
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         self.tracker = tracker;
+        self.term_view_once = std::sync::OnceLock::new();
         self
     }
 
@@ -1239,6 +1256,7 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_dataset(mut self, dataset: &'a DataSet<'a>) -> Self {
         self.multi_ledger = Self::compute_multi_ledger(Some(dataset), &self.active_graph);
         self.dataset = Some(dataset);
+        self.term_view_once = std::sync::OnceLock::new();
         self
     }
 
@@ -1480,6 +1498,27 @@ impl<'a> ExecutionContext<'a> {
         Some(terms)
     }
 
+    /// `f` over this scope's decoder ([`Self::term_view`]), built once per
+    /// context: for a caller that decodes one value at a time, where building
+    /// it per value would cost more than the decode under a union. `None`
+    /// where [`Self::term_view`] is.
+    pub fn with_term_view<R>(&self, f: impl FnOnce(&TermView) -> R) -> Option<R> {
+        let key = self.term_view_key();
+        let (built_for, terms) = self.term_view_once.get_or_init(|| (key, self.term_view()));
+        if *built_for == key {
+            return terms.as_ref().map(f);
+        }
+        self.term_view().as_ref().map(f)
+    }
+
+    /// The store and dictionary novelty [`Self::term_view`] reads, by address.
+    fn term_view_key(&self) -> TermViewKey {
+        (
+            self.binary_store.as_ref().map(|s| Arc::as_ptr(s) as usize),
+            self.dict_novelty.as_ref().map(|d| Arc::as_ptr(d) as usize),
+        )
+    }
+
     /// Decode an `EncodedLit` binding value using DictNovelty-aware routing.
     ///
     /// Thin wrapper around [`BinaryGraphView::decode_value_from_kind`] which
@@ -1518,8 +1557,9 @@ impl<'a> ExecutionContext<'a> {
         {
             return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
         }
-        let gv = self.term_view()?;
-        Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id))
+        self.with_term_view(|gv| {
+            gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id)
+        })
     }
 
     /// Resolve a binding-level `lang_id` to its language tag, memoized per
@@ -1580,8 +1620,7 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Returns `None` if no binary store is attached.
     pub fn resolve_subject_iri(&self, s_id: u64) -> Option<std::io::Result<String>> {
-        let gv = self.term_view()?;
-        Some(gv.resolve_subject_iri(s_id))
+        self.with_term_view(|gv| gv.resolve_subject_iri(s_id))
     }
 
     /// Get the default graphs slice without allocation (for scan hot path).
@@ -1774,6 +1813,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             subject_iri_cache: self.subject_iri_cache.clone(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1842,6 +1882,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             subject_iri_cache: self.subject_iri_cache.clone(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1922,6 +1963,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             // The R2RML parent-lookup memo, by contrast, is SAFE to share here
             // (F19): its key carries `graph_source_id` + `as_of_t`
             // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
@@ -1985,6 +2027,7 @@ impl<'a> ExecutionContext<'a> {
     /// the `range_with_overlay` fallback for reading from binary columnar indexes.
     pub fn with_binary_store(mut self, store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
         self.binary_store = Some(store);
+        self.term_view_once = std::sync::OnceLock::new();
         self.binary_g_id = g_id;
         // Store identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
@@ -1995,6 +2038,7 @@ impl<'a> ExecutionContext<'a> {
     /// Attach a dictionary novelty layer for binary scan subject/string lookups.
     pub fn with_dict_novelty(mut self, dict_novelty: Arc<DictNovelty>) -> Self {
         self.dict_novelty = Some(dict_novelty);
+        self.term_view_once = std::sync::OnceLock::new();
         // Dict-novelty identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self.translated_overlay_cache = TranslatedOverlayCache::default();
@@ -2410,5 +2454,55 @@ mod dataset_scope_tests {
             .with_default_graph(graph(0, "other:main"));
         let ctx = ExecutionContext::new(&snapshot, &vars).with_dataset(&two_ledgers);
         assert!(ctx.path_graphs().is_err());
+    }
+}
+
+#[cfg(test)]
+mod term_view_once_tests {
+    use super::*;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_core::dict_novelty::DictNovelty;
+    use fluree_db_core::LedgerSnapshot;
+
+    /// The decoder built once per context is the one a later call gets, until
+    /// the store or dictionary novelty it read changes: then a call reads the
+    /// new ones, and none at all once the store is gone.
+    #[test]
+    fn a_context_keeps_its_decoder_until_its_store_changes() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let first_novelty = Arc::new(DictNovelty::new_uninitialized());
+        let mut ctx = ExecutionContext::new(&snapshot, &vars)
+            .with_binary_store(Arc::clone(&store), 0)
+            .with_dict_novelty(Arc::clone(&first_novelty));
+        let built = |ctx: &ExecutionContext<'_>| {
+            ctx.with_term_view(|terms| std::ptr::from_ref(terms) as usize)
+        };
+        let first = built(&ctx).expect("a decoder");
+        assert_eq!(built(&ctx), Some(first), "built once");
+        assert_eq!(
+            ctx.term_view_once.get().map(|(key, _)| *key),
+            Some(ctx.term_view_key())
+        );
+
+        // A dictionary novelty set after the decoder was built.
+        ctx.dict_novelty = Some(Arc::new(DictNovelty::new_uninitialized()));
+        let key = ctx.term_view_key();
+        assert_ne!(ctx.term_view_once.get().map(|(k, _)| *k), Some(key));
+        assert!(
+            ctx.with_term_view(|terms| {
+                terms
+                    .dict_novelty()
+                    .zip(ctx.dict_novelty.as_ref())
+                    .is_some_and(|(read, set)| Arc::ptr_eq(read, set))
+            })
+            .expect("a decoder"),
+            "reads the context's dictionary novelty"
+        );
+
+        // A store dropped after it was built (the range fallback does).
+        ctx.binary_store = None;
+        assert!(built(&ctx).is_none(), "no store, no decoder");
     }
 }

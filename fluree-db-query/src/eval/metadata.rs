@@ -50,17 +50,14 @@ pub(crate) fn binding_subject_sid(
 ) -> Result<Option<Sid>> {
     match binding {
         Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
-        Binding::EncodedSid { s_id, .. } => {
-            let Some(gv) = ctx.term_view() else {
-                return Ok(None);
-            };
-            Ok(gv.resolve_subject_sid(*s_id).ok())
-        }
+        Binding::EncodedSid { s_id, .. } => Ok(ctx
+            .with_term_view(|gv| gv.resolve_subject_sid(*s_id).ok())
+            .flatten()),
         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
             if let Some(store) = ctx.binary_store.as_ref() {
                 if let Ok(Some(s_id)) = store.find_subject_id(iri) {
-                    if let Some(gv) = ctx.term_view() {
-                        return Ok(gv.resolve_subject_sid(s_id).ok());
+                    if let Some(sid) = ctx.with_term_view(|gv| gv.resolve_subject_sid(s_id).ok()) {
+                        return Ok(sid);
                     }
                 }
             }
