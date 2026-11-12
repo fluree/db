@@ -11,8 +11,8 @@ use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_psot_cursor_for_predicate, cached_overlay_ops, cursor_projection_sid_otype_okey,
-    normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan, ProbeLanePlan, ProbeOps,
-    PsotSubjectSeek, RowFate, SharedOverlayOps,
+    normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan, LaneOutput, ProbeLanePlan,
+    ProbeOps, PsotSubjectSeek, RowFate, SharedOverlayOps,
 };
 use crate::fast_path_outcome::{FastPathFallback, FastPathOutcome};
 use crate::index_scope::{overlay_carries_novelty, IndexMember, IndexScope, MemberSet, ScopeKind};
@@ -1537,7 +1537,7 @@ impl CyclicBgpOperator {
     /// every edge). With novelty present, probing stays allowed when every
     /// edge's resolved ops are mergeable (empty → `None`, non-empty →
     /// `Some(ops)` merged per probed subject); any unmergeable edge
-    /// (translation failure, novelty-only predicate, eager materialization)
+    /// (translation failure, novelty-only predicate), or eager materialization,
     /// disables probes for the cascade — full scans, which merge through the
     /// overlay cursor, are unaffected. Historical snapshots keep probes off:
     /// the seek reads latest base state with no replay.
@@ -1556,7 +1556,7 @@ impl CyclicBgpOperator {
         let mut ops_per_edge = Vec::with_capacity(n);
         for edge in self.plan.edges.iter() {
             let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-            match subject_probe_lane_plan(read.ctx, store, &pred_sid)? {
+            match subject_probe_lane_plan(read.ctx, store, &pred_sid, LaneOutput::Encoded)? {
                 ProbeLanePlan::Clean => ops_per_edge.push(None),
                 ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
                 ProbeLanePlan::Decline => {

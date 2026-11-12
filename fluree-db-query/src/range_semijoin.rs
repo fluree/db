@@ -57,8 +57,8 @@ use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
 use crate::fast_path_common::{
     classify_predicates_under_policy, leaf_entries_for_predicate, policy_lane_for_predicate,
-    subject_probe_lane_plan, try_normalize_pred_sid, PredicateFastPath, ProbeLanePlan, ProbeOps,
-    POLICY_PREDICATE_SCAN_SITE,
+    subject_probe_lane_plan, try_normalize_pred_sid, LaneOutput, PredicateFastPath, ProbeLanePlan,
+    ProbeOps, POLICY_PREDICATE_SCAN_SITE,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -843,7 +843,7 @@ impl RangeSemiJoinOperator {
             .and_then(|s| try_normalize_pred_sid(s, &self.conditions[c].predicate));
         let lane = match (&store, &pred_sid) {
             (Some(store), Some(pred_sid)) if !ctx.is_multi_ledger() => {
-                subject_probe_lane_plan(ctx, store, pred_sid)?
+                subject_probe_lane_plan(ctx, store, pred_sid, LaneOutput::Encoded)?
             }
             _ => ProbeLanePlan::Decline,
         };

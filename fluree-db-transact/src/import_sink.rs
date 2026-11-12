@@ -123,6 +123,10 @@ mod inner {
         /// second list on one property, in any chunk, is stored as a chain
         /// (see [`crate::lists`]).
         pub list_owners: crate::lists::ClaimedOwners,
+        /// The named graph a chunk writes its default-graph statements into
+        /// instead, when the import fills one graph of an existing ledger
+        /// (see [`ImportSink::set_target_graph`]).
+        pub target_graph: Option<Arc<str>>,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish`] —
@@ -198,6 +202,8 @@ mod inner {
         saw_list_meta_shared: Arc<std::sync::atomic::AtomicBool>,
         /// `SpoolConfig::list_owners`.
         list_owners: crate::lists::ClaimedOwners,
+        /// `SpoolConfig::target_graph`, applied by the sink it is attached to.
+        target_graph: Option<Arc<str>>,
     }
 
     impl SpoolContext {
@@ -230,6 +236,7 @@ mod inner {
                 saw_list_meta: false,
                 saw_list_meta_shared: Arc::clone(&config.saw_list_meta),
                 list_owners: Arc::clone(&config.list_owners),
+                target_graph: config.target_graph.clone(),
             })
         }
 
@@ -694,6 +701,9 @@ mod inner {
         /// The graph term the last quad named, and its slot: a producer names
         /// one graph for a run of statements.
         last_graph: Option<(TermId, usize)>,
+        /// The `named_graphs` slot default-graph statements go to instead
+        /// (see [`Self::set_target_graph`]).
+        target_graph: Option<usize>,
     }
 
     /// A named graph an [`ImportSink`] wrote statements to (JSON-LD `@graph`
@@ -754,6 +764,7 @@ mod inner {
                 named_graphs: Vec::new(),
                 named_graph_slots: HashMap::new(),
                 last_graph: None,
+                target_graph: None,
             })
         }
 
@@ -783,12 +794,35 @@ mod inner {
                 named_graphs: Vec::new(),
                 named_graph_slots: HashMap::new(),
                 last_graph: None,
+                target_graph: None,
             })
         }
 
-        /// Attach a spool context for writing spool records during parse.
+        /// Attach a spool context for writing spool records during parse,
+        /// and the target graph its config names, if any.
         pub fn set_spool_context(&mut self, ctx: SpoolContext) {
+            if let Some(iri) = ctx.target_graph.clone() {
+                self.set_target_graph(&iri);
+            }
             self.spool_ctx = Some(ctx);
+        }
+
+        /// Write every default-graph statement into the named graph `iri`
+        /// instead: an import that fills one graph of an existing ledger.
+        /// A statement the source puts in a named graph of its own is then
+        /// refused, since the import targets that one graph only.
+        pub fn set_target_graph(&mut self, iri: &str) {
+            let sid = self.ns.sid_for_iri(iri);
+            let slot = self.named_graphs.len();
+            self.named_graphs.push((
+                sid.clone(),
+                NamedGraphUse {
+                    iri: iri.to_string(),
+                    g_id: None,
+                },
+            ));
+            self.named_graph_slots.insert(sid, slot);
+            self.target_graph = Some(slot);
         }
 
         /// Intern a predicate IRI, returning its `(namespace_code, local_name)`.
@@ -912,6 +946,13 @@ mod inner {
         /// The `named_graphs` slot of the graph `graph` names, registered on
         /// first use.
         fn named_graph_slot(&mut self, graph: TermId) -> Result<usize, SinkError> {
+            if let Some(slot) = self.target_graph {
+                return Err(SinkError::rejected(format!(
+                    "the source names a graph of its own, but this import writes \
+                     everything into <{}>",
+                    self.named_graphs[slot].1.iri
+                )));
+            }
             if let Some((last, slot)) = self.last_graph {
                 if last == graph {
                     return Ok(slot);
@@ -956,6 +997,7 @@ mod inner {
             let Some((o, dtc)) = self.resolve_object(object) else {
                 return;
             };
+            let graph = graph.or(self.target_graph);
 
             let dt = dtc.datatype().clone();
             let lang = dtc.lang_tag().map(std::string::ToString::to_string);
@@ -1257,8 +1299,11 @@ mod inner {
                 return Ok(());
             };
 
+            let graph = self
+                .target_graph
+                .map(|slot| self.named_graphs[slot].0.clone());
             let bundle = match crate::generate::flakes::reified_triple_bundle(
-                None, s, p, o, &dtc, &ann, self.t,
+                graph, s, p, o, &dtc, &ann, self.t,
             ) {
                 Ok(bundle) => bundle,
                 Err(e) => {
@@ -1272,26 +1317,9 @@ mod inner {
                 }
             };
             for flake in bundle {
-                if let Err(e) = self.writer.push_flake(&flake) {
-                    if self.encode_error.is_none() {
-                        tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
-                        self.encode_error = Some(TransactError::CommitCodec(e));
-                    }
-                    return Ok(()); // Don't spool a flake that failed to encode
-                }
-                if let Some(ctx) = &mut self.spool_ctx {
-                    let written = ctx.write_record(FlakeRecord {
-                        s: &flake.s,
-                        p: &flake.p,
-                        o: &flake.o,
-                        dt: &flake.dt,
-                        lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
-                        list_index: None,
-                        t: self.t,
-                    });
-                    if let Err(e) = written {
-                        self.encode_error.get_or_insert(e);
-                    }
+                self.write_flake(&flake);
+                if self.encode_error.is_some() {
+                    break;
                 }
             }
             Ok(())
@@ -1326,6 +1354,7 @@ mod inner {
                 txn_meta: Vec::new(),
                 graph_delta: HashMap::new(),
                 ns_split_mode: None,
+                graph_drops: Vec::new(),
             }
         }
 
@@ -1346,6 +1375,7 @@ mod inner {
                 ns_alloc: Arc::new(SharedNamespaceAllocator::from_registry(ns)),
                 saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 list_owners: Default::default(),
+                target_graph: None,
             }
         }
 
@@ -1592,6 +1622,75 @@ mod inner {
             let spool = output.spool_ctx.expect("spool");
             let g_ids: Vec<_> = spool.records.iter().map(|r| r.g_id).collect();
             assert_eq!(g_ids, [g_id, 0]);
+        }
+
+        /// With a target graph, every default-graph statement — a list's
+        /// members and a reifier's bundle included — lands in that graph, in
+        /// the commit and the spool alike.
+        #[test]
+        fn a_target_graph_takes_every_default_graph_statement() {
+            let ns = NamespaceRegistry::new();
+            let config = SpoolConfig {
+                target_graph: Some(Arc::from("http://example.org/g")),
+                ..make_spool_config(&ns)
+            };
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-target-graph-{}.spool",
+                std::process::id()
+            ));
+            sink.set_spool_context(SpoolContext::new(&path, 0, 0, &config).unwrap());
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let o = sink.term_iri("http://example.org/b");
+            sink.emit_triple(s, p, o).unwrap();
+            let items = sink.term_iri("http://example.org/items");
+            sink.emit_list_item(s, items, o, 0).unwrap();
+            let r = sink.term_iri("http://example.org/reifier");
+            sink.emit_reified_triple(s, p, o, r).unwrap();
+
+            let output = sink.into_output().unwrap();
+            let g_id = config.graph_alloc.get_or_insert("http://example.org/g") + 1;
+            assert_eq!(
+                output.named_graphs,
+                [NamedGraphUse {
+                    iri: "http://example.org/g".to_string(),
+                    g_id: Some(g_id as GraphId),
+                }]
+            );
+            let spool = output.spool_ctx.as_ref().expect("spool");
+            assert!(spool.records.iter().all(|r| u32::from(r.g_id) == g_id));
+            let result = output.writer.finish(&make_envelope(1)).unwrap();
+            let flakes = read_commit(&result.bytes).unwrap().flakes;
+            assert_eq!(flakes.len(), spool.records.len());
+            let graphs: Vec<String> = flakes
+                .iter()
+                .map(|f| {
+                    let g = f.g.as_ref().expect("every flake is in the target graph");
+                    let code = std::iter::once(g.namespace_code).collect();
+                    let prefix = &config.ns_alloc.lookup_codes(&code)[&g.namespace_code];
+                    format!("{prefix}{}", g.name)
+                })
+                .collect();
+            assert!(
+                graphs.iter().all(|g| g == "http://example.org/g"),
+                "{graphs:?}"
+            );
+        }
+
+        /// A source that names its own graphs cannot be imported into one.
+        #[test]
+        fn a_target_graph_refuses_a_named_graph_of_the_source() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+            sink.set_target_graph("http://example.org/g");
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let g = sink.term_iri("http://example.org/other");
+            let err = sink.emit_quad(s, p, s, g).unwrap_err();
+            assert!(err.to_string().contains("http://example.org/g"), "{err}");
         }
 
         /// A caller that cannot record a named graph does not get a writer

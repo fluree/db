@@ -266,13 +266,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // writer dropping the `datatype` off string-backed literals with an "inferable"
     // type — so a typed object compared as a plain string and no bnode mapping was
     // consistent. With the datatype emitted, the isomorphism resolves.
-    // optional cluster (3): all three optional-complex-* use GRAPH ?x/?g and
-    // are gated on PR-G1 (GRAPH-variable semantics). dawg-optional-filter-005's
-    // doubly-nested `OPTIONAL { { ... FILTER } }` scope leak is fixed (PR-W1
-    // Family A).
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-4",
     // type-promotion-03/04/05/21 (double∘decimal, float-float/decimal/short
     // promotion) and the tP-29/30 "-fail" ASKs (double+decimal is double not
     // decimal; float+decimal is float not decimal) — D4 numeric promotion, PR-X2

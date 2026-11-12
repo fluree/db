@@ -81,7 +81,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
 | [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
 | [`doc`](doc.md) | Ingest a folder of documents into a searchable graph (structure, chunks, embeddings, indexes) and search it |
-| [`ontology`](ontology.md) | Ontology tools for document extraction: check what an extraction model reads of an ontology; make one from tables (CSV, workbooks, SQL DDL) or a semantic layer (Snowflake, Genie, dbt, Apache Ossie), or rewrite and slice one |
+| [`ontology`](ontology.md) | Ontology tools for document extraction: check what an extraction model reads of an ontology; make one from tables (CSV, workbooks, SQL DDL) a semantic layer (Snowflake, Genie, dbt, Apache Ossie) or a Neo4j schema, or rewrite and slice one |
 | [`catalog`](catalog.md) | Catalog tools for document extraction: SKOS records from rows (CSV, workbooks) for an extraction model to link names to |
 
 ### Remote Sync
@@ -119,8 +119,10 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 
 | Command | Description |
 |---------|-------------|
+| [`login`](login.md) | Sign this machine in to a fluree.ai account |
+| [`logout`](logout.md) | Sign this machine out of its fluree.ai account |
 | [`token`](token.md) | Create, inspect, and manage JWS tokens |
-| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token) |
+| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token), and show the account sign-in |
 
 ### Configuration
 

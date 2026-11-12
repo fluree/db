@@ -169,9 +169,9 @@ A few operational knobs are environment-only (no CLI flag):
 |----------|---------|---------|
 | `FLUREE_REASONING_MAX_FACTS` | 1,000,000 | Server-wide default OWL2-RL materialization budget (max derived facts). Overridden per ledger by `f:reasoningMaxFacts` and per query by `"reasoningBudget"`; see [Reasoning](../query/reasoning.md#materialization-budget). |
 | `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
-| `FLUREE_REASONING_MAX_MEMORY_MB` | derived from the fact budget | Server-wide default materialization budget (max megabytes of derived facts). Unset, it is derived from the effective fact budget so the fact cap binds first; set it to bound memory directly. Overridden per ledger by `f:reasoningMaxMemoryMb` and per query by `"reasoningBudget"`. |
+| `FLUREE_REASONING_MAX_MEMORY_MB` | derived from the fact budget | Server-wide default materialization budget: the most megabytes a reasoning result may hold, counting its derived facts and the join translations kept with it (see [Memory a cached result holds](../query/reasoning.md#memory-a-cached-result-holds)). Unset, it is derived from the effective fact budget so the fact cap binds first; set it to bound memory directly. Overridden per ledger by `f:reasoningMaxMemoryMb` and per query by `"reasoningBudget"`. |
 | `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
-| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `DROP`, `COPY`, `MOVE`). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
+| `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `COPY`, `MOVE`; `DROP` reads nothing and is not limited). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
 | `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
 | `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
 | `FLUREE_STORAGE_ALLOW_UNLOCKED` | off | Open a file storage directory on a filesystem that cannot lock it (some network and FUSE mounts). Unset, such a directory fails to open; set, nothing stops a second process from opening it too. See [One process per directory](storage.md#one-process-per-directory). |
@@ -1164,30 +1164,43 @@ See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federati
 
 ## Memory Allocator (mimalloc)
 
-`fluree-db-server` and `fluree-db-cli` expose an opt-in `mimalloc` Cargo feature
-that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimalloc).
-It is **off by default** — enable it in your release build:
+The `fluree` binary (`fluree-db-cli`), `fluree-db-server` and the Python package
+use [mimalloc](https://github.com/microsoft/mimalloc) as their global allocator.
+It is the `mimalloc` Cargo feature, on by default.
+
+**Why it is the default:**
+
+- Under sustained writes with frequent index builds, the system allocator
+  (glibc) keeps most of the memory the process frees, so resident memory climbs
+  until the host runs out. On a 64 GB host serving a 236M-flake ledger, RSS
+  reached 42–63 GB with glibc, of which a `malloc_trim` could return about 30 GB;
+  with mimalloc it stayed between 16 and 32 GB.
+- Allocation-heavy, multicore query paths run faster, most notably
+  R2RML/Iceberg graph-source scans, which materialize many RDF terms in
+  parallel: TPC-H Q1 over a 6M-row Iceberg table took ~62s with the system
+  allocator and ~31s with mimalloc.
+
+**Building without it:** turn off default features and list the ones you
+want, for example
 
 ```bash
-cargo build --release -p fluree-db-cli --features mimalloc
+cargo build --release -p fluree-db-cli --no-default-features \
+  --features server,iceberg,sql,delta,shacl,aws,graphql
 ```
 
-**When it helps:** allocation-heavy, multicore query paths — most notably
-R2RML/Iceberg graph-source scans, which materialize many RDF terms in parallel.
-On those workloads the system allocator's lock contention caps the parallel
-speedup; mimalloc roughly doubles the realized gain (e.g. TPC-H Q1 over a 6M-row
-Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
+**Embedding Fluree in your own binary:** a library cannot choose the
+allocator for the program that links it, so an application built on
+`fluree-db-api` (or `fluree-db-server` as a library) uses whatever allocator
+it declares. To get the same behavior, declare mimalloc in the application's
+binary:
 
-**Tradeoffs (operational, not semantic):**
+```rust
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
 
-- Changes the allocator for *every* allocation in the process (HTTP, query,
-  import, caches, AWS/Iceberg clients, tracing buffers).
-- Usually better multicore throughput and lower fragmentation, but may retain
-  more RSS due to per-thread heaps — relevant for large scans that already peak
-  high. Track RSS, p95 query latency, and concurrent-query behavior during a
-  soak before making it the default.
-- New native dependency in the binary; verify it builds for your target
-  (e.g. musl/cross builds) and keep a system-allocator fallback build.
+The Python package's extension module declares it for its own allocations
+only; Python's objects stay with Python's allocator.
 
 Pair it with bounded query parallelism so a single large scan cannot monopolize
 cores and allocator pressure under concurrent load.

@@ -1293,6 +1293,63 @@ fn create_from_file() {
         .stdout(predicate::str::contains("flakes"));
 }
 
+/// `graph import` adds a new named graph to a ledger built by transactions:
+/// the ledger's unindexed commits are indexed first, the graph reads back,
+/// and it joins with the default graph through the subject they share.
+#[test]
+fn graph_import_fills_a_new_graph_of_an_existing_ledger() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "peopledb");
+    let source = tmp.path().join("extra.ttl");
+    std::fs::write(
+        &source,
+        "@prefix ex: <http://example.org/> .\nex:widget ex:maker ex:alice ; ex:name \"Widget\" .\n",
+    )
+    .unwrap();
+    let graph = "http://example.org/graph/extra";
+
+    fluree_cmd(&tmp)
+        .args(["graph", "import", graph, "--from", source.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("before the import"))
+        .stdout(predicate::str::contains(format!(
+            "into graph <{graph}> of 'peopledb:main'"
+        )));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            &format!(
+                "SELECT ?name WHERE {{ GRAPH <{graph}> {{ ?w <http://example.org/name> ?name }} }}"
+            ),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Widget"))
+        .stdout(predicate::str::contains("Alice").not());
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            &format!(
+                "SELECT ?who WHERE {{ GRAPH <{graph}> {{ ?w <http://example.org/maker> ?m }} \
+                 ?m <http://example.org/name> ?who }}"
+            ),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // The graph must be new.
+    fluree_cmd(&tmp)
+        .args(["graph", "import", graph, "--from", source.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already has the graph"));
+}
+
 #[test]
 fn create_from_nt_file() {
     let tmp = TempDir::new().unwrap();
@@ -4053,6 +4110,39 @@ fn iceberg_map_remote_uses_remote_client() {
         .stderr(predicate::str::contains("connection failed"));
 }
 
+/// `iceberg map` needs `--r2rml`: a source's queries are answered from its
+/// mapping. Without one the command is refused before it registers anything
+/// locally or contacts a remote.
+#[test]
+fn iceberg_map_without_a_mapping_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:19999"])
+        .assert()
+        .success();
+
+    let map = ["iceberg", "map", "warehouse-orders", "--mode", "direct"];
+    let location = ["--table-location", "s3://bucket/warehouse/sales/orders"];
+    for remote in [&[][..], &["--remote", "origin"][..]] {
+        fluree_cmd(&tmp)
+            .args(map)
+            .args(location)
+            .args(remote)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--r2rml <R2RML>"))
+            .stderr(predicate::str::contains("required"))
+            .stderr(predicate::str::contains("connection failed").not());
+    }
+
+    fluree_cmd(&tmp)
+        .args(["iceberg", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No Iceberg graph sources found."));
+}
+
 #[test]
 fn iceberg_list_remote_uses_remote_client() {
     let tmp = TempDir::new().unwrap();
@@ -5706,7 +5796,7 @@ fn doc_ingest_entities_alone_scan_without_a_model_and_model_needs_an_llm() {
 }
 
 /// `--catalog` is another name for `--entities`; `--ontology` took over
-/// `--model` outright, so the old spelling is a usage error, not an alias.
+/// `--model` outright, so an ontology passed as `--model` is not read as one.
 #[test]
 fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
     let tmp = TempDir::new().unwrap();
@@ -5739,8 +5829,10 @@ fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
             "ont/model.ttl",
         ])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--model"));
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model ont/model.ttl looks like an ontology (an RDF file); did you mean `--ontology ont/model.ttl`?",
+        ));
 
     // The first run built the ledger's full-text index, `memos-text`: a
     // graph source, but an index, not a mapped table, so it is refused by
@@ -6878,4 +6970,1795 @@ fn issue_1512_sparql_from_reads_the_config_graph() {
             .stdout(predicate::str::contains("cfg-value"))
             .stdout(predicate::str::contains("in-default").not());
     }
+}
+
+/// Each request a stub saw: its lowercased head, and its body.
+type StubLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// A stub HTTP reader: records each request (head and body) and answers the
+/// n-th with `answers[n]` (the last one again past the end), billing 1,032
+/// tokens a call and naming it `req-<n + 1>`.
+fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let request = loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= split + 4 + len {
+                    let body =
+                        String::from_utf8_lossy(&buf[split + 4..split + 4 + len]).to_string();
+                    break Some((head, body));
+                }
+            };
+            let Some(request) = request else { continue };
+            let n = {
+                let mut log = log.lock().unwrap();
+                log.push(request);
+                log.len() - 1
+            };
+            let answer = &answers[n.min(answers.len() - 1)];
+            // `{"__status": 429, "__headers": ["Retry-After: 3600"], "body": …}`
+            // answers that status, with those headers, instead.
+            if let Some(status) = answer.get("__status").and_then(serde_json::Value::as_u64) {
+                let payload = answer["body"].to_string();
+                let headers: String = answer["__headers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|h| format!("{h}\r\n"))
+                    .collect();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+                continue;
+            }
+            let payload = answer.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nX-Fluree-Output: fluree-transaction\r\nX-Fluree-Serialized-Tokens: 1032\r\nX-Fluree-Ontology-Not-Shown: rdfs:domain=1\r\nX-Fluree-Release: example-reader-1.0\r\nX-Fluree-Request-ID: req-{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                n + 1,
+                payload.len(),
+                payload
+            );
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}/extract"), seen)
+}
+
+/// A reading of `memo.md` in the reader's layout: a Fluree DB transaction
+/// whose commit metadata names the run, with a mention of Acme and (with
+/// `claim`) the fact that Jane Doe, an entity the run minted, works for it,
+/// the claim behind that fact annotating it. Each `score` is its own run.
+fn stub_reading(score: f64, claim: bool) -> serde_json::Value {
+    let doc = "urn:fluree:doc:memo.md";
+    let run = format!("urn:fluree:run:01TEST{}", (score * 100.0) as u32);
+    let jane = "urn:fluree:entity:memo00-jane";
+    let mut mentions = vec![serde_json::json!({
+        "id": "run:o31-35",
+        "type": ["Occurrence", "nif:RFC5147String"],
+        "anchorOf": "Acme",
+        "beginIndex": 31,
+        "endIndex": 35,
+        "occurrenceClass": "schema:Organization",
+        "entity": "https://example.org/org/acme",
+        "linkConfidence": score,
+        "referenceContext": doc
+    })];
+    let mut graph = Vec::new();
+    if claim {
+        mentions.push(serde_json::json!({
+            "id": "run:o15-23",
+            "type": ["Occurrence", "nif:RFC5147String"],
+            "anchorOf": "Jane Doe",
+            "beginIndex": 15,
+            "endIndex": 23,
+            "occurrenceClass": "schema:Person",
+            "localEntity": jane,
+            "score": 0.99,
+            "referenceContext": doc
+        }));
+        mentions.push(serde_json::json!({ "id": jane, "type": "LocalEntity" }));
+        graph.push(serde_json::json!({
+            "id": jane,
+            "type": "schema:Person",
+            "label": "Jane Doe",
+            "schema:worksFor": {
+                "@id": "https://example.org/org/acme",
+                "@annotation": {
+                    "@id": "run:r-0",
+                    "type": "Claim",
+                    "assertionStatus": "xt:affirmed",
+                    "accepted": true,
+                    "score": score,
+                    "subjectOccurrence": "run:o15-23",
+                    "objectOccurrence": "run:o31-35",
+                    "wasGeneratedBy": run
+                }
+            }
+        }));
+    }
+    graph.insert(
+        0,
+        serde_json::json!({ "id": "xt:mentions", "@graph": mentions }),
+    );
+    serde_json::json!({
+        "@context": {
+            "id": "@id",
+            "type": "@type",
+            "nif": "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "schema": "https://schema.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#",
+            "xt": "https://ns.flur.ee/extract#",
+            "prov": "http://www.w3.org/ns/prov#",
+            "run": { "@id": format!("{run}-"), "@prefix": true },
+            "label": "rdfs:label",
+            "anchorOf": "nif:anchorOf",
+            "beginIndex": "nif:beginIndex",
+            "endIndex": "nif:endIndex",
+            "occurrenceClass": { "@id": "xt:occurrenceClass", "@type": "@id" },
+            "assertionStatus": { "@id": "xt:assertionStatus", "@type": "@id" },
+            "accepted": "xt:accepted",
+            "entity": { "@id": "xt:entity", "@type": "@id" },
+            "localEntity": { "@id": "xt:localEntity", "@type": "@id" },
+            "linkConfidence": { "@id": "xt:linkConfidence", "@type": "xsd:double" },
+            "score": { "@id": "xt:score", "@type": "xsd:double" },
+            "subjectOccurrence": { "@id": "xt:subjectOccurrence", "@type": "@id" },
+            "objectOccurrence": { "@id": "xt:objectOccurrence", "@type": "@id" },
+            "referenceContext": { "@id": "nif:referenceContext", "@type": "@id" },
+            "responseLayout": { "@id": "xt:responseLayout", "@type": "@id" },
+            "textSha256": "xt:textSha256",
+            "used": { "@id": "prov:used", "@type": "@id" },
+            "wasAssociatedWith": { "@id": "prov:wasAssociatedWith", "@type": "@id" },
+            "wasGeneratedBy": { "@id": "prov:wasGeneratedBy", "@type": "@id" },
+            "Claim": "xt:Claim",
+            "LocalEntity": "xt:LocalEntity",
+            "Occurrence": "xt:Occurrence"
+        },
+        "txn-meta": {
+            "used": { "@id": doc },
+            "wasAssociatedWith": { "@id": "https://ns.flur.ee/model/example-reader-1.0" },
+            "responseLayout": { "@id": "https://ns.flur.ee/extract/response/2" },
+            "xt:run": { "@id": run },
+            "textSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "@graph": graph
+    })
+}
+
+fn sparql_rows(tmp: &TempDir, ledger: &str, query: &str) -> usize {
+    let out = fluree_cmd(tmp)
+        .args(["query", ledger, "--format", "json", "--sparql", query])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["results"]["bindings"].as_array().map_or(0, Vec::len)
+}
+
+#[test]
+fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true), stub_reading(0.5, false)]);
+    let config = tmp.path().join(".fluree/config.toml");
+    let mut toml = std::fs::read_to_string(&config).unwrap();
+    toml.push_str(&format!(
+        "\n[doc.reader]\nurl = \"{url}\"\napi_key = \"k-123\"\nauth_header = \"X-Api-Key\"\nmodels = [\"stub-reader\"]\n"
+    ));
+    std::fs::write(&config, toml).unwrap();
+    let ingest = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--catalog",
+            "ont/entities.ttl",
+            "--model",
+            "stub-reader",
+        ]);
+        cmd.args(extra);
+        cmd
+    };
+
+    ingest(&[])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "extraction stub-reader via http://",
+        ))
+        .stderr(predicate::str::contains(
+            "catalog    ont/entities.ttl: 1 record(s)",
+        ))
+        .stdout(predicate::str::contains(
+            "2 mention(s) of 2 entities (1 new)",
+        ))
+        .stdout(predicate::str::contains("1 relation(s), 1,032 tokens"))
+        .stdout(predicate::str::contains(
+            "run urn:fluree:run:01TEST90, release example-reader-1.0, request req-1",
+        ))
+        .stdout(predicate::str::contains("reading: 1 call(s), 1,032 tokens"))
+        .stdout(predicate::str::contains(
+            "ontology not shown to the model: rdfs:domain=1",
+        ));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (head, body) = &seen[0];
+        assert!(head.contains("x-fluree-model: stub-reader"), "{head}");
+        assert!(head.contains("x-api-key: k-123"), "{head}");
+        assert!(head.contains("content-type: application/trig"), "{head}");
+        // The controls are headers, and only headers.
+        assert!(
+            head.contains("x-fluree-output: fluree-transaction"),
+            "{head}"
+        );
+        assert!(head.contains("x-fluree-include: claims,mentions"), "{head}");
+        assert!(!head.contains("x-fluree-window"), "{head}");
+        assert!(!body.contains("extract#request"), "{body}");
+        assert!(!body.contains("extract#Request"), "{body}");
+        for role in ["document", "ontology", "instances"] {
+            assert!(
+                body.contains(&format!("<https://ns.flur.ee/extract#{role}> {{")),
+                "{body}"
+            );
+        }
+        assert!(body.contains("\"Acme Corporation\""), "{body}");
+        assert!(
+            body.contains("<https://ns.flur.ee/doc#SourceDocument>"),
+            "{body}"
+        );
+    }
+    // The transaction went in as it is, in the document's reading graph:
+    // the fact, the claim annotating it, and the mentions beside them.
+    let g = "<urn:fluree:doc:memo.md/reading>";
+    let fact = format!(
+        "SELECT ?s WHERE {{ GRAPH {g} {{ ?s <https://schema.org/worksFor> <https://example.org/org/acme> }} }}"
+    );
+    let claim = format!(
+        "SELECT ?c WHERE {{ GRAPH {g} {{ ?c a <https://ns.flur.ee/extract#Claim> ; <https://ns.flur.ee/extract#score> ?v }} }}"
+    );
+    let annotation = format!(
+        "SELECT ?c WHERE {{ GRAPH {g} {{ ?c <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s <https://schema.org/worksFor> ?o )>> }} }}"
+    );
+    let link = format!(
+        "SELECT ?v WHERE {{ GRAPH {g} {{ ?m <https://ns.flur.ee/extract#entity> <https://example.org/org/acme> ; <https://ns.flur.ee/extract#linkConfidence> ?v }} }}"
+    );
+    let runs = "SELECT ?run FROM NAMED <memos:main#txn-meta> WHERE { GRAPH <memos:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }";
+    let stamped =
+        "SELECT ?g WHERE { <urn:fluree:doc:memo.md> <https://ns.flur.ee/doc#readingGraph> ?g }";
+    assert_eq!(sparql_rows(&tmp, "memos", &fact), 1);
+    // Not in the default graph, where the document's structure is.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            "SELECT ?s WHERE { ?s <https://schema.org/worksFor> ?o }"
+        ),
+        0
+    );
+    assert_eq!(sparql_rows(&tmp, "memos", &claim), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", &annotation), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", &link), 1);
+    // The run is the commit's metadata, and a fact joins to its document
+    // through its claim's run (the query the docs give).
+    assert_eq!(sparql_rows(&tmp, "memos", runs), 1);
+    let traced = "PREFIX xt: <https://ns.flur.ee/extract#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?s ?p ?o ?score ?document
+FROM NAMED <urn:fluree:doc:memo.md/reading> FROM NAMED <memos:main#txn-meta>
+WHERE {
+  GRAPH <urn:fluree:doc:memo.md/reading> {
+    ?claim rdf:reifies <<( ?s ?p ?o )>> ; xt:score ?score ; prov:wasGeneratedBy ?run .
+  }
+  GRAPH <memos:main#txn-meta> { ?commit xt:run ?run ; prov:used ?document . }
+}";
+    assert_eq!(sparql_rows(&tmp, "memos", traced), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", stamped), 1);
+
+    // The same request again is answered from the cache: nothing is sent.
+    ingest(&["--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reading from cache"))
+        .stdout(predicate::str::contains("from cache"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // A fresh read replaces the reading whole: the fact, its claim and the
+    // old link are gone, the new link is there, and the commit metadata
+    // keeps every run.
+    ingest(&["--force", "--no-cache"]).assert().success();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(sparql_rows(&tmp, "memos", &fact), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &claim), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &annotation), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", &link), 1);
+    assert!(sparql_rows(&tmp, "memos", runs) >= 2);
+
+    // An unchanged document is not read again.
+    ingest(&[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "nobody",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model nobody: no [doc.reader] lists it",
+        ));
+    // A ledger's name passed to --model, as an older script passes its
+    // ontology, is caught before it reaches any model.
+    fluree_cmd(&tmp)
+        .args(["create", "people-ontology"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "people-ontology",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model people-ontology looks like an ontology (the ledger `people-ontology`); did you mean `--ontology people-ontology`?",
+        ));
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--cache",
+            "catalog",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--cache is for a model a [doc.reader] serves",
+        ));
+}
+
+/// `doc read` needs no project: the reader comes from the environment, the
+/// reading goes to stdout as the reader wrote it, and what it was billed,
+/// with each call's run, release and request ID, to stderr.
+#[test]
+fn doc_read_prints_one_files_reading_without_a_project() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    // A global directory, with no project: it holds the reading cache.
+    std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+    let read = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", tmp.path().join("home"))
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--catalog", "ont/entities.ttl", "--model", "stub-reader"])
+            .args(extra);
+        cmd
+    };
+
+    let out = read(&[]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("read memo.md with stub-reader via http://"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "3 fact(s), 1 claim(s), 2 mention(s), 1 new entity, 1 catalog record(s) linked; 1 call(s), 1,032 tokens"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run urn:fluree:run:01TEST90, release example-reader-1.0, request req-1"),
+        "{stderr}"
+    );
+    // The transaction as the reader wrote it: its commit metadata, the
+    // fact with its claim, the mentions graph.
+    let reading: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        reading["txn-meta"]["responseLayout"]["@id"],
+        "https://ns.flur.ee/extract/response/2"
+    );
+    let graph = reading["@graph"].as_array().unwrap();
+    assert!(graph.iter().any(|n| n["id"] == "xt:mentions"));
+    assert!(graph
+        .iter()
+        .any(|n| n["schema:worksFor"]["@annotation"]["@id"] == "run:r-0"));
+    assert_eq!(
+        seen.lock().unwrap()[0]
+            .0
+            .matches("x-fluree-include: claims,mentions")
+            .count(),
+        1
+    );
+
+    // The same request again is answered from the cache.
+    read(&["--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "@prefix xt: <https://ns.flur.ee/extract#>",
+        ))
+        .stdout(predicate::str::contains("txn-meta").not())
+        .stderr(predicate::str::contains("(1 from cache)"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    read(&["--format", "trig", "--no-cache"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GRAPH <#txn-meta> {"))
+        .stdout(predicate::str::contains("fluree:commit:this"))
+        .stdout(predicate::str::contains("GRAPH xt:mentions {"))
+        // The stub writes offsets as native JSON numbers: still numbers.
+        .stdout(predicate::str::contains("beginIndex 31"))
+        .stdout(predicate::str::contains("beginIndex \"31\"").not());
+    // `--no-cache` read afresh.
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // What comes with the facts is the caller's to say.
+    read(&["--include", "none", "--no-cache"])
+        .assert()
+        .success();
+    assert!(seen.lock().unwrap()[2].0.contains("x-fluree-include: none"));
+    read(&["--include", "facts"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--include \"facts\""));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+
+    // An output path that can't be written fails before anything is sent,
+    // by name.
+    read(&["-o", "no/such/dir/out.jsonld"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no/such/dir/out.jsonld"));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+
+    // A document with no text is not sent.
+    std::fs::write(tmp.path().join("docs/empty.md"), "").unwrap();
+    let mut empty = fluree_cmd(&tmp);
+    empty
+        .env("FLUREE_HOME", tmp.path().join("home"))
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "read",
+            "docs/empty.md",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no text to read"))
+        .stderr(predicate::str::contains("0 call(s)"));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+/// A reader still answering in the earlier layout (the document graph
+/// echoed, no commit metadata) is refused by name, and nothing is kept.
+#[test]
+fn doc_read_refuses_an_answer_in_the_earlier_layout() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let doc = "urn:fluree:doc:memo.md";
+    let earlier = serde_json::json!([
+        { "@id": doc, "@graph": [{ "@id": doc, "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#isString": [{ "@value": "echo" }] }] },
+        { "@id": format!("{doc}/reading"), "@graph": [] }
+    ]);
+    let (url, seen) = spawn_stub_reader(vec![earlier]);
+    std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", tmp.path().join("home"))
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader"]);
+        cmd
+    };
+    read()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("response layout 2"))
+        .stderr(predicate::str::contains("(request req-1)"));
+    // Not cached: the next read asks again.
+    read().assert().failure();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn doc_read_names_what_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let cmd = |args: &[&str]| {
+        let mut c = fluree_cmd(&tmp);
+        c.env("FLUREE_HOME", tmp.path().join("home"))
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(args);
+        c
+    };
+    cmd(&[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("name the extraction model"));
+    cmd(&["--model", "nobody"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model nobody: no [doc.reader] lists it",
+        ));
+}
+
+/// A JWT whose `exp` is far off, so the sign-in is used without a refresh.
+fn long_lived_jwt() -> String {
+    use base64::Engine;
+    let enc = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    format!(
+        "{}.{}.sig",
+        enc(serde_json::json!({"alg": "none"})),
+        enc(serde_json::json!({"exp": 4_102_444_800_i64, "sub": "acct"}))
+    )
+}
+
+/// `account = true`: the reader is the signed-in account's own, reached at
+/// `<api base>/grounding` with the sign-in's token; not signed in, it says so.
+#[test]
+fn doc_read_through_the_signed_in_account() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .env("FLUREE_DOC_READER_ACCOUNT", "true")
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read().assert().failure().stderr(predicate::str::contains(
+        "isn't signed in: run `fluree login`",
+    ));
+    assert!(seen.lock().unwrap().is_empty());
+
+    let token = long_lived_jwt();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{base}\"\napi_base_url = \"{base}/v1\"\nexchange_url = \"{base}/v1/oauth/token\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+    read()
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!("via {base}/v1/grounding")));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let head = &seen[0].0;
+    assert!(head.starts_with("post /v1/grounding "), "{head}");
+    assert!(
+        head.contains(&format!("authorization: bearer {}", token.to_lowercase())),
+        "{head}"
+    );
+}
+
+/// A catalog scoped to a class is sent with each record's types (the
+/// reader links by class) and its labels as written, language tag kept.
+#[test]
+fn doc_ingest_reader_sends_a_scoped_catalog_with_types_and_language_tags() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::write(
+        tmp.path().join("ont/tagged.ttl"),
+        r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix schema: <https://schema.org/> .
+<https://example.org/org/acme> a schema:Organization ;
+    skos:prefLabel "Acme Corporation"@en ; skos:altLabel "Acme" .
+<https://example.org/person/jane> a schema:Person ; skos:prefLabel "Jane Doe" .
+"#,
+    )
+    .unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args([
+            "--catalog",
+            "ont/tagged.ttl#schema:Organization",
+            "--model",
+            "stub-reader",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "catalog    ont/tagged.ttl#schema:Organization: 1 record(s)",
+        ));
+    let seen = seen.lock().unwrap();
+    let body = &seen[0].1;
+    let instances = &body[body
+        .find("<https://ns.flur.ee/extract#instances> {")
+        .expect(body)..];
+    let instances = &instances[..instances.find("\n}").unwrap()];
+    assert!(
+        instances.contains("<https://example.org/org/acme> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://schema.org/Organization>"),
+        "{instances}"
+    );
+    assert!(instances.contains("\"Acme Corporation\"@en"), "{instances}");
+    assert!(!instances.contains("jane"), "{instances}");
+}
+
+/// The reader is configured with `fluree config set`, as the docs say: a
+/// `models` written as a string (what `config set` writes) is a list of one.
+#[test]
+fn doc_reader_configured_with_config_set_reads() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    for (key, value) in [
+        ("doc.reader.url", url.as_str()),
+        ("doc.reader.models", "stub-reader, other"),
+    ] {
+        fluree_cmd(&tmp)
+            .args(["config", "set", key, value])
+            .assert()
+            .success();
+    }
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "extraction stub-reader via http://",
+        ));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// A reader's facts come with its reading: `--relations off|reified` is
+/// refused for one, and `--include` says what comes with the facts.
+#[test]
+fn doc_ingest_reader_takes_include_not_relations() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let ingest = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--no-embed",
+                "--ontology",
+                "ont/model.ttl",
+                "--model",
+                "stub-reader",
+            ])
+            .args(extra);
+        cmd
+    };
+    for mode in ["off", "reified"] {
+        ingest(&["--relations", mode])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "--relations {mode}: a reader's facts always come with its reading"
+            )));
+    }
+    assert_eq!(seen.lock().unwrap().len(), 0);
+    ingest(&["--include", "claims"]).assert().success();
+    assert!(seen.lock().unwrap()[0]
+        .0
+        .lines()
+        .any(|l| l.trim() == "x-fluree-include: claims"));
+    // `--include` is a reader's.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--include", "claims"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--include is for a model a [doc.reader] serves",
+        ));
+}
+
+#[test]
+fn doc_ingest_dry_run_with_a_reader_sends_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--dry-run",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "stub-reader",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would read in 1 call(s)"))
+        .stdout(predicate::str::contains(
+            "reading: 1 call(s) planned, none sent (dry run)",
+        ));
+    // A reader call is billed: a dry run makes none.
+    assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn doc_ingest_reader_sends_nothing_for_a_document_with_no_text() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::create_dir_all(tmp.path().join("blank")).unwrap();
+    std::fs::write(tmp.path().join("blank/empty.md"), "  \n").unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "blank", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .assert()
+        .success();
+    assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+/// A sign-in token that predates the account's configuration (401
+/// `config_stale`) is renewed once and the read sent again.
+#[test]
+fn doc_read_through_the_account_renews_a_stale_token_once() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (url, seen) = spawn_stub_reader(vec![
+        serde_json::json!({ "__status": 401, "body": { "error": { "message": "Configuration updated, please refresh token", "status": 401, "error": "config_stale" } } }),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        stub_reading(0.9, true),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let token = long_lived_jwt();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{base}\"\napi_base_url = \"{base}/v1\"\nexchange_url = \"{base}/v1/oauth/exchange\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .success();
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen
+        .iter()
+        .map(|(head, _)| head.split_whitespace().nth(1).unwrap_or(""))
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["/v1/grounding", "/v1/oauth/exchange", "/v1/grounding"]
+    );
+    assert!(seen[2]
+        .0
+        .contains(&format!("authorization: bearer {}", fresh.to_lowercase())));
+    assert!(std::fs::read_to_string(home.join("account.toml"))
+        .unwrap()
+        .contains(&fresh));
+}
+
+/// A JWT that expires in `secs` (inside the sign-in's refresh margin when
+/// under a minute), told apart by `tag`.
+fn jwt_expiring_in(secs: i64, tag: &str) -> String {
+    use base64::Engine;
+    let enc = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    format!(
+        "{}.{}.{tag}",
+        enc(serde_json::json!({"alg": "none"})),
+        enc(serde_json::json!({"exp": now + secs, "sub": "acct"}))
+    )
+}
+
+/// `account.toml` for a sign-in whose API is `api_base` and whose token
+/// exchange is `exchange_url`.
+fn write_account(home: &std::path::Path, api_base: &str, exchange_url: &str, token: &str) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{api_base}\"\napi_base_url = \"{api_base}/v1\"\nexchange_url = \"{exchange_url}\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn request_paths(seen: &StubLog) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|(head, _)| head.split_whitespace().nth(1).unwrap_or("").to_string())
+        .collect()
+}
+
+fn config_stale() -> serde_json::Value {
+    serde_json::json!({ "__status": 401, "body": { "error": { "message": "Configuration updated, please refresh token", "status": 401, "error": "config_stale" } } })
+}
+
+/// A 401 partway through a document of several calls renews the sign-in
+/// and resends the refused call alone: the call already answered is not
+/// sent (or billed) again, and the run reports the two calls it made.
+#[test]
+fn doc_ingest_through_the_account_resends_only_the_refused_call() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Two calls' worth of text.
+    let mut memo = std::fs::read_to_string(tmp.path().join("docs/memo.md")).unwrap();
+    while memo.len() < 70_000 {
+        memo.push_str(
+            "\nThe board reviewed the quarterly staffing plan in detail and agreed on it.\n",
+        );
+    }
+    std::fs::write(tmp.path().join("docs/memo.md"), memo).unwrap();
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (url, seen) = spawn_stub_reader(vec![
+        stub_reading(0.9, true),
+        config_stale(),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        stub_reading(0.9, true),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reading: 2 call(s), 2,064 tokens"));
+    assert_eq!(
+        request_paths(&seen),
+        vec![
+            "/v1/grounding",
+            "/v1/grounding",
+            "/v1/oauth/exchange",
+            "/v1/grounding"
+        ]
+    );
+    let seen = seen.lock().unwrap();
+    assert!(seen[3]
+        .0
+        .contains(&format!("authorization: bearer {}", fresh.to_lowercase())));
+}
+
+/// A sign-in refused again after its renewal is an error that says to sign
+/// in again; it is renewed only once.
+#[test]
+fn doc_read_through_the_account_refused_twice_says_to_sign_in_again() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (url, seen) = spawn_stub_reader(vec![
+        config_stale(),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        config_stale(),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("401"))
+        .stderr(predicate::str::contains(
+            "hint: the sign-in was refused; run `fluree login` again",
+        ));
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange", "/v1/grounding"]
+    );
+}
+
+/// A reader with its own key that answers 401 is sent one request: no
+/// sign-in is renewed, though this machine is signed in, and the hint
+/// about signing in is not given.
+#[test]
+fn doc_read_with_its_own_key_is_not_renewed_on_a_401() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![config_stale()]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_API_KEY", "k-123")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("401"))
+        .stderr(predicate::str::contains("fluree login").not());
+    assert_eq!(request_paths(&seen), vec!["/extract"]);
+}
+
+/// A 502 whose message mentions a 401 upstream is not a refused sign-in.
+#[test]
+fn doc_read_through_the_account_gives_the_sign_in_hint_only_for_a_401() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![serde_json::json!({
+        "__status": 502,
+        "body": { "error": "upstream_error", "message": "401 Unauthorized from model host" }
+    })]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("502"))
+        .stderr(predicate::str::contains("fluree login").not());
+    assert_eq!(request_paths(&seen), vec!["/v1/grounding"]);
+}
+
+/// An ingest renews a token about to expire before each document, so a run
+/// longer than the token keeps going: each document's call carries the
+/// token renewed just before it.
+#[test]
+fn doc_ingest_through_the_account_renews_the_token_before_each_document() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::copy(
+        tmp.path().join("docs/memo.md"),
+        tmp.path().join("docs/memo-2.md"),
+    )
+    .unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    // Every token the exchange hands out is inside the refresh margin, so
+    // each renewal exchanges again.
+    let tokens: Vec<String> = (0..4)
+        .map(|i| jwt_expiring_in(30, &format!("t{i}")))
+        .collect();
+    let (exchange, exchanged) = spawn_stub_reader(
+        tokens
+            .iter()
+            .map(|t| serde_json::json!({ "access_token": t, "token_type": "Bearer", "expires_in": 30 }))
+            .collect(),
+    );
+    let home = tmp.path().join("home");
+    write_account(&home, &base, &exchange, &jwt_expiring_in(30, "t-old"));
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .success();
+    let bearer = |head: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix("authorization: bearer "))
+            .unwrap_or("")
+            .to_string()
+    };
+    let sent: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(h, _)| bearer(h))
+        .collect();
+    assert_eq!(sent.len(), 2, "one call per document");
+    assert_ne!(sent[0], sent[1], "the second document has a renewed token");
+    let issued: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+    let n = exchanged.lock().unwrap().len();
+    assert!(n >= 3, "an exchange at setup and before each document: {n}");
+    for token in &sent {
+        assert!(issued[..n].contains(token), "{token} was not exchanged");
+    }
+}
+
+/// With `account = true` the sign-in's token goes only to the account's
+/// own API: a project config's `url` on another host is refused before
+/// anything is sent; one on the account's API, any path, is used; and with
+/// no `url` at all (as the docs show it) the account's reader is.
+#[test]
+fn doc_read_through_the_account_refuses_a_url_off_the_accounts_api() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (account_url, account_seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = account_url.trim_end_matches("/extract").to_string();
+    let (foreign, foreign_seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    let config = tmp.path().join(".fluree/config.toml");
+    let project = std::fs::read_to_string(&config).unwrap();
+    let read = |url: &str| {
+        let url = if url.is_empty() {
+            String::new()
+        } else {
+            format!("url = \"{url}\"\n")
+        };
+        std::fs::write(
+            &config,
+            format!("{project}\n[doc.reader]\naccount = true\n{url}models = [\"stub-reader\"]\n"),
+        )
+        .unwrap();
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read(&foreign)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "is not on the signed-in account's API",
+        ));
+    assert!(foreign_seen.lock().unwrap().is_empty());
+    assert!(account_seen.lock().unwrap().is_empty());
+
+    read(&format!("{base}/v1/reader")).assert().success();
+    assert_eq!(request_paths(&account_seen), vec!["/v1/reader"]);
+
+    read("").assert().success();
+    assert_eq!(
+        request_paths(&account_seen),
+        vec!["/v1/reader", "/v1/grounding"]
+    );
+}
+
+/// Any 401 renews the sign-in once, `token_invalid` as well as
+/// `config_stale`, and resends only the refused call. When the renewal
+/// itself is refused (a token that was never valid, with a revoked refresh
+/// token), its own error comes through whole, with the sign-in hint.
+#[test]
+fn doc_read_through_the_account_renews_a_refused_token_or_says_the_sign_in_is_gone() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let token_invalid = serde_json::json!({ "__status": 401, "body": { "error": { "message": "Invalid token", "status": 401, "error": "token_invalid" } } });
+    let read = |answers: Vec<serde_json::Value>| {
+        let (url, seen) = spawn_stub_reader(answers);
+        let base = url.trim_end_matches("/extract").to_string();
+        let home = tmp
+            .path()
+            .join(format!("home-{}", base.rsplit(':').next().unwrap()));
+        write_account(
+            &home,
+            &base,
+            &format!("{base}/v1/oauth/exchange"),
+            &long_lived_jwt(),
+        );
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .env("FLUREE_DOC_READER_ACCOUNT", "true")
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        (cmd, base, seen)
+    };
+
+    let fresh = long_lived_jwt().replace(".sig", ".fresh");
+    let (mut cmd, _, seen) = read(vec![
+        token_invalid.clone(),
+        serde_json::json!({ "access_token": fresh, "token_type": "Bearer", "expires_in": 3600 }),
+        stub_reading(0.9, true),
+    ]);
+    cmd.assert().success();
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange", "/v1/grounding"]
+    );
+
+    let (mut cmd, base, seen) = read(vec![
+        token_invalid,
+        serde_json::json!({ "__status": 400, "body": { "error": "invalid_grant", "error_description": "refresh token revoked" } }),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("your sign-in is no longer valid"))
+        .stderr(predicate::str::contains(format!(
+            "hint: fluree login --url {base}"
+        )));
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange"]
+    );
+}
+
+/// Two documents to ingest: `docs/memo.md` and a copy of it.
+fn two_memos(tmp: &TempDir) {
+    std::fs::copy(
+        tmp.path().join("docs/memo.md"),
+        tmp.path().join("docs/memo-2.md"),
+    )
+    .unwrap();
+}
+
+fn ingest_through_the_account(tmp: &TempDir, home: &std::path::Path) -> Command {
+    let mut cmd = fluree_cmd(tmp);
+    cmd.env("FLUREE_HOME", home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader", "--no-cache"]);
+    cmd
+}
+
+/// A sign-in that is refused and can't be renewed ends an ingest at that
+/// document, with one error: the stored token still looks valid, so each
+/// later document would only send another refused call and a failing
+/// renewal. The documents after it are not read.
+#[test]
+fn doc_ingest_through_the_account_stops_when_the_sign_in_is_gone() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    two_memos(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![
+        config_stale(),
+        serde_json::json!({ "__status": 400, "body": { "error": "invalid_grant", "error_description": "refresh token revoked" } }),
+        stub_reading(0.9, true),
+    ]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    let out = ingest_through_the_account(&tmp, &home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "leaving 1 document(s) unread that would fail the same way",
+        ))
+        .stderr(predicate::str::contains(
+            "the reader refused the sign-in, and renewing it failed",
+        ))
+        .stderr(predicate::str::contains("your sign-in is no longer valid"))
+        .stderr(predicate::str::contains(format!(
+            "hint: fluree login --url {base}"
+        )))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches('✗').count(), 1, "{stdout}");
+    assert!(stdout.contains("0 ingested"), "{stdout}");
+    assert_eq!(
+        request_paths(&seen),
+        vec!["/v1/grounding", "/v1/oauth/exchange"]
+    );
+}
+
+/// A renewal that fails before a document is read ends the run the same
+/// way: the token is about to expire, so every later document would need
+/// the same renewal first. What was read before it is kept.
+#[test]
+fn doc_ingest_through_the_account_stops_when_renewing_before_a_document_fails() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    two_memos(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    // The setup's exchange and the first document's succeed, each with a
+    // token inside the refresh margin; the second document's is refused.
+    let (exchange, exchanged) = spawn_stub_reader(vec![
+        serde_json::json!({ "access_token": jwt_expiring_in(30, "t0"), "token_type": "Bearer", "expires_in": 30 }),
+        serde_json::json!({ "access_token": jwt_expiring_in(30, "t1"), "token_type": "Bearer", "expires_in": 30 }),
+        serde_json::json!({ "__status": 400, "body": { "error": "invalid_grant", "error_description": "refresh token revoked" } }),
+    ]);
+    let home = tmp.path().join("home");
+    write_account(&home, &base, &exchange, &jwt_expiring_in(30, "t-old"));
+    let out = ingest_through_the_account(&tmp, &home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("renewing the sign-in"))
+        .stderr(predicate::str::contains("your sign-in is no longer valid"))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 ingested"), "{stdout}");
+    assert_eq!(stdout.matches('✗').count(), 1, "{stdout}");
+    assert_eq!(seen.lock().unwrap().len(), 1, "one document was read");
+    assert_eq!(exchanged.lock().unwrap().len(), 3);
+}
+
+/// `account = true` beside an `api_key` is refused, whichever of the file
+/// and the environment set each: the run would otherwise use one and
+/// quietly ignore the other.
+#[test]
+fn doc_read_refuses_an_account_reader_with_a_key() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    write_account(
+        &home,
+        &base,
+        &format!("{base}/v1/oauth/exchange"),
+        &long_lived_jwt(),
+    );
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", &home)
+        .env("FLUREE_DOC_READER_ACCOUNT", "true")
+        .env("FLUREE_DOC_READER_API_KEY", "k-123")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "both `account = true` and an `api_key`",
+        ))
+        .stderr(predicate::str::contains("pick one"));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// `FLUREE_DOC_READER_ACCOUNT` takes yes or no and nothing else: `on` is an
+/// error, not a quiet no that would turn off `account = true` in the file.
+#[test]
+fn doc_read_refuses_an_account_variable_it_cannot_read() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    fluree_cmd(&tmp)
+        .env("FLUREE_HOME", tmp.path().join("home"))
+        .env("FLUREE_DOC_READER_ACCOUNT", "on")
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+        .args(["--model", "stub-reader", "--no-cache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "FLUREE_DOC_READER_ACCOUNT=\"on\": expected 1, true or yes, or 0, false or no",
+        ));
+}
+
+/// A reader that asks for a wait past what a call waits (an account over a
+/// quota) ends an ingest at that document, with one error that says how
+/// long: every document after it would be refused the same way, so none of
+/// them is sent, and nothing is resent.
+#[test]
+fn doc_ingest_stops_when_the_reader_asks_to_wait_past_the_cap() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    for copy in ["docs/memo-2.md", "docs/memo-3.md"] {
+        std::fs::copy(tmp.path().join("docs/memo.md"), tmp.path().join(copy)).unwrap();
+    }
+    let (url, seen) = spawn_stub_reader(vec![serde_json::json!({
+        "__status": 429,
+        "__headers": ["Retry-After: 3600"],
+        "body": { "error": { "message": "Monthly quota reached", "status": 429, "error": "quota_exceeded" } }
+    })]);
+    let out = fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "docs", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "leaving 2 document(s) unread that would fail the same way",
+        ))
+        .stderr(predicate::str::contains(
+            "429 quota_exceeded: Monthly quota reached",
+        ))
+        .stderr(predicate::str::contains("the reader asks to wait 3600s"))
+        .stderr(predicate::str::contains(
+            "hint: the reader refuses every call for about 60 min",
+        ))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches('✗').count(), 1, "{stdout}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// `rel` under the project: `docs/memo.md`'s text, repeated past what one
+/// reader call takes, so the document is read in two.
+fn write_two_call_memo(tmp: &TempDir, rel: &str) {
+    let mut memo = std::fs::read_to_string(tmp.path().join("docs/memo.md")).unwrap();
+    while memo.len() < 70_000 {
+        memo.push_str(
+            "\nThe board reviewed the quarterly staffing plan in detail and agreed on it.\n",
+        );
+    }
+    std::fs::write(tmp.path().join(rel), memo).unwrap();
+}
+
+fn ingest_with_stub_reader(tmp: &TempDir, url: &str) -> Command {
+    let mut cmd = fluree_cmd(tmp);
+    cmd.env("FLUREE_DOC_READER_URL", url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "docs", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .arg("--no-cache");
+    cmd
+}
+
+/// Claims in `doc`'s reading graph, all or those of one run.
+fn reading_claims(tmp: &TempDir, doc: &str, run: Option<&str>) -> usize {
+    let run = run.map_or(String::new(), |r| {
+        format!("; <http://www.w3.org/ns/prov#wasGeneratedBy> <{r}>")
+    });
+    sparql_rows(
+        tmp,
+        "memos",
+        &format!(
+            "SELECT ?c WHERE {{ GRAPH <urn:fluree:doc:{doc}/reading> {{ ?c a <https://ns.flur.ee/extract#Claim> {run} }} }}"
+        ),
+    )
+}
+
+/// A document read in two calls is two commits into one reading graph,
+/// each with its own run as its metadata, the second call's offsets moved
+/// into the document's text; a re-read replaces both calls' readings.
+#[test]
+fn doc_ingest_commits_each_call_of_a_reading_into_one_graph() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    write_two_call_memo(&tmp, "docs/memo.md");
+    let (url, seen) = spawn_stub_reader(vec![
+        stub_reading(0.9, true),
+        stub_reading(0.8, true),
+        stub_reading(0.6, true),
+        stub_reading(0.4, false),
+    ]);
+    ingest_with_stub_reader(&tmp, &url)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reading: 2 call(s), 2,064 tokens"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    let g = "<urn:fluree:doc:memo.md/reading>";
+    assert_eq!(reading_claims(&tmp, "memo.md", None), 2);
+    // The same fact, read in both calls, is one triple with two claims.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            &format!("SELECT ?s WHERE {{ GRAPH {g} {{ ?s <https://schema.org/worksFor> ?o }} }}")
+        ),
+        1
+    );
+    // A commit per call, each with its run.
+    let runs = "SELECT ?run FROM NAMED <memos:main#txn-meta> WHERE { GRAPH <memos:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }";
+    assert_eq!(sparql_rows(&tmp, "memos", runs), 2);
+    // The second call's two mentions sit past the first call's text.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            &format!(
+                "SELECT ?m WHERE {{ GRAPH {g} {{ ?m <http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#beginIndex> ?b FILTER(?b > 1000) }} }}"
+            )
+        ),
+        2
+    );
+
+    ingest_with_stub_reader(&tmp, &url)
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert_eq!(reading_claims(&tmp, "memo.md", None), 1);
+    assert_eq!(
+        reading_claims(&tmp, "memo.md", Some("urn:fluree:run:01TEST60")),
+        1
+    );
+    assert_eq!(sparql_rows(&tmp, "memos", runs), 4);
+}
+
+/// A reading whose commit fails partway fails that document, not the run:
+/// the next document is read and committed. Its first call's reading is
+/// left in the reading graph with no document node, and the next run, with
+/// no earlier ingest to retract, still clears it before committing the new
+/// reading.
+#[test]
+fn doc_ingest_recovers_from_a_reading_a_failed_run_left_behind() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Read first (by name), in two calls; `memo.md` after it, in one.
+    write_two_call_memo(&tmp, "docs/memo-2.md");
+    // Metadata in Fluree's own namespace, which no transaction may set:
+    // the reading parses, and its commit is refused.
+    let mut refused = stub_reading(0.8, true);
+    refused["txn-meta"]["https://ns.flur.ee/db#t"] = serde_json::json!(7);
+    let (url, seen) = spawn_stub_reader(vec![
+        stub_reading(0.9, true),
+        refused,
+        stub_reading(0.7, true),
+        stub_reading(0.6, true),
+        stub_reading(0.5, true),
+    ]);
+    let out = ingest_with_stub_reader(&tmp, &url)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 1 failed",
+        ))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("✗") && l.contains("memo-2.md") && l.contains("committing")),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("✓") && l.contains("memo.md") && !l.contains("memo-2")),
+        "{stdout}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // The first call's reading went in; the document node did not.
+    assert_eq!(
+        reading_claims(&tmp, "memo-2.md", Some("urn:fluree:run:01TEST90")),
+        1
+    );
+    let stamped =
+        "SELECT ?g WHERE { <urn:fluree:doc:memo-2.md> <https://ns.flur.ee/doc#readingGraph> ?g }";
+    assert_eq!(sparql_rows(&tmp, "memos", stamped), 0);
+
+    ingest_with_stub_reader(&tmp, &url)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 ingested, 1 unchanged, 0 failed",
+        ));
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    assert_eq!(
+        reading_claims(&tmp, "memo-2.md", Some("urn:fluree:run:01TEST90")),
+        0
+    );
+    assert_eq!(reading_claims(&tmp, "memo-2.md", None), 2);
+    assert_eq!(sparql_rows(&tmp, "memos", stamped), 1);
+}
+
+/// The answer recorded from the reader's service, committed as `ingest`
+/// commits it and inserted as `doc read` prints it: the transactor takes
+/// its annotated typed literal (`t:total`, an `xsd:decimal` with the claim
+/// behind it) and its typed mention values, not only IRI objects.
+#[test]
+fn doc_ingest_and_insert_take_the_recorded_answer() {
+    const ANSWER: &str =
+        include_str!("../../fluree-db-doc/tests/fixtures/reader/invoice-answer.jsonld");
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let docs = tmp.path().join("invoices");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("invoice.md"),
+        "Invoice\n\nInvoice no.: DX-2026-07731\nSupplier: Daxin Scientific Supply Co., Ltd.\nDate: 2026/08/06\n\nTotal: NT$5,170.00\n",
+    )
+    .unwrap();
+    let answer: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+    let (url, seen) = spawn_stub_reader(vec![answer]);
+    let reader = |cmd: &mut Command| {
+        cmd.env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+            .arg("--no-cache");
+    };
+    let total = |graph: &str| {
+        format!(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?v WHERE {{ {graph} {{ ?s <urn:example:check:total> ?v FILTER(datatype(?v) = xsd:decimal && ?v = 5170) }} }}"
+        )
+    };
+    let claim = |graph: &str| {
+        format!(
+            "SELECT ?c WHERE {{ {graph} {{ ?c <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s <urn:example:check:total> ?o )>> ; <https://ns.flur.ee/extract#score> ?score }} }}"
+        )
+    };
+    let dated = |graph: &str| {
+        format!(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?m WHERE {{ {graph} {{ ?m <http://www.w3.org/1999/02/22-rdf-syntax-ns#value> ?v FILTER(datatype(?v) = xsd:date) }} }}"
+        )
+    };
+
+    let mut ingest = fluree_cmd(&tmp);
+    ingest.args(["doc", "ingest", "invoices", "-l", "invoices", "--no-embed"]);
+    reader(&mut ingest);
+    ingest.assert().success();
+    let g = "GRAPH <urn:fluree:doc:invoice.md/reading>";
+    assert_eq!(sparql_rows(&tmp, "invoices", &total(g)), 1);
+    assert_eq!(sparql_rows(&tmp, "invoices", &claim(g)), 1);
+    assert_eq!(sparql_rows(&tmp, "invoices", &dated(g)), 1);
+
+    let out = tmp.path().join("invoice.jsonld");
+    let mut read = fluree_cmd(&tmp);
+    read.args(["doc", "read", "invoices/invoice.md", "-o"])
+        .arg(&out);
+    reader(&mut read);
+    read.assert().success();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    fluree_cmd(&tmp)
+        .args(["create", "inserted"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["insert", "inserted", "-f"])
+        .arg(&out)
+        .assert()
+        .success();
+    let default = "";
+    assert_eq!(sparql_rows(&tmp, "inserted", &total(default)), 1);
+    assert_eq!(sparql_rows(&tmp, "inserted", &claim(default)), 1);
+    // The run is the commit's metadata.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "inserted",
+            "SELECT ?run FROM NAMED <inserted:main#txn-meta> WHERE { GRAPH <inserted:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }"
+        ),
+        1
+    );
+}
+
+/// A document read in two calls is a transaction per call: as JSON-LD on
+/// stdout it is refused before anything is sent, naming `-o` and `--format
+/// trig`; with `-o` each call goes to a file of its own, which `fluree
+/// insert -f` takes with its run as the commit's metadata.
+#[test]
+fn doc_read_writes_a_reading_of_several_calls_to_a_file_per_call() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    write_two_call_memo(&tmp, "docs/memo.md");
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true), stub_reading(0.8, true)]);
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is read in 2 calls"))
+        .stderr(predicate::str::contains("-o FILE.jsonld"))
+        .stderr(predicate::str::contains("--format trig"));
+    assert!(seen.lock().unwrap().is_empty(), "refused before sending");
+
+    let target = tmp.path().join("memo.jsonld");
+    read()
+        .arg("-o")
+        .arg(&target)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("call 2 of 2"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(!target.exists(), "the per-call files take its place");
+    fluree_cmd(&tmp)
+        .args(["create", "memos"])
+        .assert()
+        .success();
+    for n in [1, 2] {
+        let call = tmp.path().join(format!("memo-{n}.jsonld"));
+        let tx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&call).unwrap()).unwrap();
+        assert!(tx.is_object(), "one transaction a file");
+        fluree_cmd(&tmp)
+            .args(["insert", "memos", "-f"])
+            .arg(&call)
+            .assert()
+            .success();
+    }
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            "SELECT ?run FROM NAMED <memos:main#txn-meta> WHERE { GRAPH <memos:main#txn-meta> { ?c <https://ns.flur.ee/extract#run> ?run } }"
+        ),
+        2
+    );
 }

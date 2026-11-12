@@ -18,7 +18,8 @@ Map an Iceberg table as a queryable graph source.
 ### Usage
 
 ```bash
-fluree iceberg map <NAME> [OPTIONS]
+fluree iceberg map <NAME> --r2rml <PATH> [OPTIONS]
+fluree iceberg map <NAME> --remote <REMOTE> --stored-mapping <ID> [OPTIONS]
 ```
 
 ### Arguments
@@ -40,7 +41,7 @@ fluree iceberg map <NAME> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--catalog-uri <URI>` | REST catalog URI (required for rest mode) |
-| `--table <ID>` | Table identifier in `namespace.table` format (required if not specified in R2RML mapping) |
+| `--table <ID>` | Table identifier in `namespace.table` format. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables |
 | `--warehouse <NAME>` | Warehouse (or catalog) name as the REST catalog knows it; the catalog's own route prefix is looked up from it |
 | `--no-vended-credentials` | Disable vended credentials (enabled by default); the same as `--storage-identity ambient`, and not given with it |
 
@@ -54,7 +55,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--table <ID>` | Table identifier `namespace.table`; required unless `--r2rml` is given, whose `rr:tableName` entries then name the tables. For `glue`, `namespace` is the Glue database. |
+| `--table <ID>` | Table identifier `namespace.table`. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables. For `glue`, `namespace` is the Glue database. |
 | `--region <REGION>` | AWS region of the Glue / S3 Tables API. Glue falls back to `--s3-region`, then the AWS SDK's region chain; S3 Tables defaults to the table bucket ARN's region and refuses a `--region` that contradicts it. S3 data reads use `--s3-region` when given, else this region. Must be an AWS region code (e.g. `us-east-1`). |
 | `--catalog-id <ID>` | Glue catalog id for cross-account access (`glue` mode; defaults to the caller's account) |
 | `--table-bucket-arn <ARN>` | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required for `s3tables` mode; any AWS partition) |
@@ -63,8 +64,15 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--r2rml <PATH>` | R2RML mapping file (Turtle format, required). Defines how table rows become RDF triples. Table references come from the mapping's `rr:tableName` entries. |
+| `--r2rml <PATH>` | R2RML mapping file (Turtle format). Defines how table rows become RDF triples. Table references come from the mapping's `rr:tableName` entries. Required, unless `--stored-mapping` names a mapping the remote stores |
 | `--r2rml-type <TYPE>` | Mapping media type (e.g., `text/turtle`); inferred from extension if omitted |
+
+**Stored on the remote** (`--remote` only; see [Stored connections and mappings](#stored-connections-and-mappings)):
+
+| Option | Description |
+|--------|-------------|
+| `--stored-catalog <ID>` | A catalog connection the remote stores, by its id there. Replaces every connection, credential and storage option; needs a mapping (`--r2rml` or `--stored-mapping`) |
+| `--stored-mapping <ID>` | An R2RML mapping the remote stores, by its id there. Replaces `--r2rml` and implies its catalog connection; `--table` defaults to the mapping's first table |
 
 **Authentication:**
 
@@ -123,7 +131,7 @@ The default is the CLI's (Python's `map_iceberg` has the same one); the server s
 
 Maps an Apache Iceberg table as a graph source that can be queried using SPARQL or JSON-LD queries. The table is accessed read-only; Fluree does not modify the Iceberg table.
 
-An R2RML mapping (`--r2rml`) is required to define how Iceberg table rows are transformed into RDF triples.
+An R2RML mapping is required to define how Iceberg table rows are transformed into RDF triples: a file (`--r2rml`), or, on a remote that stores mappings, one of its own (`--stored-mapping`; see [Stored connections and mappings](#stored-connections-and-mappings)). Without either, `map` is refused before it registers anything or contacts a remote.
 
 Four catalog modes are supported:
 
@@ -132,7 +140,31 @@ Four catalog modes are supported:
 - **AWS Glue mode** (`--mode glue`): Looks the table up in the AWS Glue Data Catalog (Glue `GetTable`) and reads the metadata file its `metadata_location` parameter names. The Glue database is the namespace; `--catalog-id` reads another account's catalog.
 - **AWS S3 Tables mode** (`--mode s3tables`): Resolves the table's metadata file in an S3 Tables table bucket (`--table-bucket-arn`) with `GetTableMetadataLocation`.
 
-Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` tests the connection for REST catalogs only: for Glue and S3 Tables it reports `Connection: not tested`, and catalog errors surface at query time. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` loads each table the mapping names the way a query will: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata at the location (Direct). It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail `map`: it registers the source and reports `Connection: not verified: ` followed by why: the table that did not load and the catalog's or storage's reason, a catalog that did not answer, a catalog client that could not be built, or a check that ran past 10 s (in which case the tables may only be slow). Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`). A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+
+### Stored connections and mappings
+
+Some remotes store catalog connections and R2RML mappings themselves, under ids of their own. There, `map` can name them instead of restating them:
+
+```bash
+# A mapping the remote stores; it implies its catalog connection and first table
+fluree iceberg map orders --remote origin --stored-mapping <MAPPING-ID>
+
+# A connection the remote stores, read with a local mapping file
+fluree iceberg map orders --remote origin \
+  --stored-catalog <CATALOG-ID> \
+  --r2rml mappings/orders.ttl --table sales.orders
+```
+
+The request carries the ids (`stored_catalog_id`, `stored_mapping_id`) and the source's own options (`--table`, `--branch`, `--model`, `--default-allow`), plus the mapping file's text with `--stored-catalog`. It never carries a connection, so no credential is sent again. The CLI refuses before sending anything when:
+
+- a connection, credential or storage option (`--mode`, `--catalog-uri`, `--auth-*`, `--storage-*`, `--s3-*`, ...) is given beside either reference;
+- `--r2rml` or `--r2rml-type` is given beside `--stored-mapping`;
+- `--stored-catalog` is given with `--r2rml` but no `--table` (a stored connection is mapped one named table at a time);
+- an id is empty;
+- no `--remote` is given: only a named remote stores connections or mappings, and neither a local map nor one routed through a running local server has any.
+
+Both references together must name the mapping's own connection; the remote checks. A server that does not store connections or mappings, a Fluree server among them, refuses the request. The CLI then shows the server's message and adds a hint: if the remote does not store catalog connections or mappings, it refuses references to them; otherwise the id may name nothing it has.
 
 ### Examples
 

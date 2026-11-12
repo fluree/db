@@ -254,6 +254,7 @@ pub fn from_snowflake(yaml: &str) -> Result<Model, SemanticError> {
                     Vec::new()
                 },
                 references: None,
+                label: None,
             });
         }
         tables.push(table);

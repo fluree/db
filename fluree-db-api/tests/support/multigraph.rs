@@ -237,7 +237,7 @@ async fn assert_no_default_graph_leaf(fluree: &Fluree, ledger: &str) {
     let handle = fluree.ledger_cached(ledger).await.expect("ledger");
     let view = handle.snapshot().await;
     let store = view.binary_store.as_ref().expect("indexed");
-    let g1 = store.graph_id_for_iri(G1).expect("g1 is indexed");
+    let g1 = store.assigned_graph_id(G1).expect("g1 is indexed");
     for &order in RunSortOrder::all_build_orders() {
         assert!(
             store

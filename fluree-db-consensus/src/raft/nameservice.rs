@@ -62,7 +62,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
@@ -1477,7 +1477,7 @@ fn build_create_command(ledger_id: &str) -> std::result::Result<SmCommand, NameS
 }
 
 fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
     Ok(SmCommand::RetractLedger {
         ledger_id: ledger_name,
         branch,
@@ -1596,7 +1596,7 @@ fn build_create_branch_command(
 }
 
 fn build_drop_branch_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
     Ok(SmCommand::DropBranch {
         ledger_id: ledger_name,
         branch,

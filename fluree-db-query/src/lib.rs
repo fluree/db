@@ -98,6 +98,7 @@ pub mod property_path;
 pub mod r2rml;
 pub mod range_semijoin;
 pub mod reasoning;
+pub mod reasoning_ops;
 pub mod remote_service;
 pub mod rewrite;
 pub mod rewrite_owl_ql;

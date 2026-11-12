@@ -729,3 +729,137 @@ fn a_dbt_project_resolves_doc_blocks_and_names_files_it_cannot_read() {
     assert!(ttl.contains("rdfs:comment \"One row per order.\""), "{ttl}");
     assert!(!ttl.contains("{{"), "{ttl}");
 }
+
+/// `CALL apoc.meta.schema() YIELD value RETURN value`, exported as JSON, for a
+/// small movies graph.
+const NEO4J_SCHEMA: &str = r#"[{"value": {
+  "Person": {"type": "node", "count": 133, "labels": [], "properties": {
+      "name": {"type": "STRING", "indexed": true, "unique": false, "existence": false},
+      "born": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "out", "count": 172, "labels": ["Movie"],
+                   "properties": {"roles": {"type": "LIST", "array": true}}},
+      "DIRECTED": {"direction": "out", "count": 44, "labels": ["Movie"], "properties": {}},
+      "REVIEWED": {"direction": "out", "count": 9, "labels": ["Movie"],
+                   "properties": {"summary": {"type": "STRING"}, "rating": {"type": "INTEGER"}}},
+      "FOLLOWS": {"direction": "out", "count": 3, "labels": ["Person"], "properties": {}}}},
+  "Movie": {"type": "node", "count": 38, "labels": [], "properties": {
+      "title": {"type": "STRING", "indexed": true, "unique": true, "existence": false},
+      "released": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false},
+      "tagline": {"type": "STRING", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "in", "count": 172, "labels": ["Person"], "properties": {}}}},
+  "ACTED_IN": {"type": "relationship", "count": 172, "properties": {"roles": {"type": "LIST", "array": true}}}
+}}]"#;
+
+#[test]
+fn from_a_neo4j_schema() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "movies-schema.json", NEO4J_SCHEMA);
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "movies-schema.json",
+            "--base",
+            "https://example.com/movies/",
+            "-o",
+            "movies.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 classes, 9 properties"))
+        .stderr(predicate::str::contains(
+            "3 relationship propert(ies) left out",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("movies.ttl")).unwrap();
+    assert!(ttl.contains("movies:actedIn a rdf:Property"), "{ttl}");
+    assert!(
+        ttl.contains("rdfs:comment \"A person acted in a movie.\""),
+        "{ttl}"
+    );
+    assert!(ttl.contains("rdfs:label \"acted in\""), "{ttl}");
+    assert!(ttl.contains("rdfs:range movies:Movie"), "{ttl}");
+    let (report, code) = check_json(&tmp, &["movies.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
+fn json_ld_is_never_read_as_another_source() {
+    let tmp = TempDir::new().unwrap();
+    // JSON-LD whose keys a converter might mistake for its own
+    write(
+        &tmp,
+        "data.json",
+        r#"{"@context": {"ex": "https://example.com/"}, "nodes": [], "relationships": [],
+            "datasets": [], "@graph": [{"@id": "ex:acme", "ex:name": "Acme"}]}"#,
+    );
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "data.json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no classes found"));
+}
+
+/// Commitments as events, with their kinds as catalog records.
+const COMMITMENTS: &str = r#"
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix xt: <https://ns.flur.ee/extract#> .
+@prefix ex: <https://example.com/crm/> .
+ex:Commitment a rdfs:Class, xt:EventClass ; rdfs:label "commitment" ;
+  rdfs:comment "Something a person says they will do." ;
+  xt:example "I'll call you back tomorrow" .
+ex:CommitmentKind a rdfs:Class ; rdfs:label "commitment kind" .
+ex:kind a rdf:Property ; rdfs:label "kind" .
+ex:Callback a ex:CommitmentKind ; skos:prefLabel "callback" .
+ex:SendQuote a ex:CommitmentKind ; skos:prefLabel "send a quote" .
+"#;
+
+#[test]
+fn event_classes_are_read_with_their_kinds_and_examples_are_refused() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "events.ttl", COMMITMENTS);
+    let (report, code) = check_json(&tmp, &["events.ttl"]);
+    assert_eq!(code, 1, "xt:example is refused: {report}");
+    assert_eq!(report["will_fail"][0]["code"], "example-refused");
+    assert_eq!(report["event_classes"], 1);
+    assert_eq!(report["event_kinds"], 2);
+
+    // `from` drops the examples; what's left passes, and says so
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "events.ttl", "-o", "fixed.ttl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("xt:example dropped"));
+    fluree_cmd(&tmp)
+        .args(["ontology", "check", "fixed.ttl"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 classes, 1 property (1 event class with 2 kinds), 2 catalog records",
+        ));
+
+    // the same ontology without its xt:EventClass reads no events at all
+    write(
+        &tmp,
+        "plain.ttl",
+        &COMMITMENTS
+            .replace("a rdfs:Class, xt:EventClass", "a rdfs:Class")
+            .replace(
+                "  xt:example \"I'll call you back tomorrow\" .",
+                "  rdfs:comment \"x\" .",
+            ),
+    );
+    let (report, code) = check_json(&tmp, &["plain.ttl"]);
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(report["event_classes"], 0);
+    let advice: Vec<&str> = report["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(advice.contains(&"event-class-not-marked"), "{advice:?}");
+}

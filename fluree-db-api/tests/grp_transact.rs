@@ -21,6 +21,8 @@ mod it_enforce_unique_upsert_indexed;
 mod it_export_lists;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
+#[path = "it_jsonld_value_object_coercion.rs"]
+mod it_jsonld_value_object_coercion;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
 #[path = "it_overflow_iri_delete_index.rs"]
@@ -33,6 +35,8 @@ mod it_rdf_text_parity;
 mod it_reserved_graph_writes;
 #[path = "it_stable_blank_nodes.rs"]
 mod it_stable_blank_nodes;
+#[path = "it_staging_compacts_novelty.rs"]
+mod it_staging_compacts_novelty;
 #[path = "it_temporal_storage_precision.rs"]
 mod it_temporal_storage_precision;
 #[path = "it_transact.rs"]

@@ -72,6 +72,34 @@ impl fmt::Display for CliError {
     }
 }
 
+impl CliError {
+    /// This error with `context` ahead of its message, as the same kind, so
+    /// it keeps its exit code (a usage error still exits 2) and prints one
+    /// `error:` prefix. Formatting a `CliError` into a new one's message
+    /// would repeat the prefix and turn every kind into the new one.
+    ///
+    /// A typed error (`Api`, `Credential`) has no message to prefix and
+    /// becomes `Remote` with its text; `NoActiveLedger`, `NoFlureeDir` and
+    /// `ExitCode` carry their own guidance and are returned unchanged.
+    pub fn context(self, context: impl fmt::Display) -> Self {
+        let with = |msg: String| format!("{context}: {msg}");
+        match self {
+            CliError::Config(msg) => CliError::Config(with(msg)),
+            CliError::Input(msg) => CliError::Input(with(msg)),
+            CliError::NotFound(msg) => CliError::NotFound(with(msg)),
+            CliError::Usage(msg) => CliError::Usage(with(msg)),
+            CliError::Import(msg) => CliError::Import(with(msg)),
+            CliError::Remote(msg) => CliError::Remote(with(msg)),
+            CliError::Server(msg) => CliError::Server(with(msg)),
+            CliError::Api(e) => CliError::Remote(with(e.to_string())),
+            CliError::Credential(e) => CliError::Remote(with(e.to_string())),
+            unchanged @ (CliError::NoActiveLedger
+            | CliError::NoFlureeDir
+            | CliError::ExitCode(_)) => unchanged,
+        }
+    }
+}
+
 impl fmt::Debug for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -168,3 +196,26 @@ pub fn exit_with_error(err: CliError) -> ! {
 }
 
 pub type CliResult<T> = std::result::Result<T, CliError>;
+
+#[cfg(test)]
+mod tests {
+    use super::CliError;
+
+    #[test]
+    fn context_keeps_the_kind_and_one_prefix() {
+        let remote = CliError::Remote("bad request: no such table".into()).context("failed to map");
+        assert!(
+            matches!(remote, CliError::Remote(ref m) if m == "failed to map: bad request: no such table")
+        );
+        assert_eq!(remote.to_string().matches("error:").count(), 1, "{remote}");
+        // A usage error stays one, so it still exits 2.
+        let usage = CliError::Usage("--table is required".into()).context("failed to map");
+        assert!(
+            matches!(usage, CliError::Usage(ref m) if m == "failed to map: --table is required")
+        );
+        assert!(matches!(
+            CliError::ExitCode(3).context("failed to map"),
+            CliError::ExitCode(3)
+        ));
+    }
+}
