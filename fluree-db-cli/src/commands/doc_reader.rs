@@ -200,7 +200,9 @@ impl From<ReadFailure> for CliError {
 /// A sign-in that was refused and could not be renewed ends the run
 /// ([`ReadFailure::Run`]): its stored token still looks valid, so every
 /// later document would send a refused call and a failing renewal of its
-/// own.
+/// own. So does a reader that asks for a wait past what a call waits
+/// ([`DocError::Unavailable`], such as an account over a quota): it refuses
+/// every call until the wait is over.
 pub fn read_document(
     setup: &ReaderSetup,
     doc: &PreparedDocument,
@@ -214,13 +216,28 @@ pub fn read_document(
                 failed.context("the reader refused the sign-in, and renewing it failed"),
             );
         }
-        ReadFailure::Document(match e {
-            DocError::Endpoint { status: 401, .. } if setup.account => CliError::Config(format!(
-                "{e}\n  hint: the sign-in was refused; run `fluree login` again"
-            )),
-            e => CliError::from(e),
-        })
+        match e {
+            DocError::Unavailable { wait, .. } => ReadFailure::Run(CliError::Remote(format!(
+                "{e}\n  hint: the reader refuses every call for about {}; try again after that",
+                about(wait)
+            ))),
+            DocError::Endpoint { status: 401, .. } if setup.account => {
+                ReadFailure::Document(CliError::Config(format!(
+                    "{e}\n  hint: the sign-in was refused; run `fluree login` again"
+                )))
+            }
+            e => ReadFailure::Document(CliError::from(e)),
+        }
     })
+}
+
+/// A wait as a person would say it: seconds, minutes or hours.
+fn about(wait: std::time::Duration) -> String {
+    match wait.as_secs() {
+        s @ 0..120 => format!("{s}s"),
+        s @ 120..7_200 => format!("{} min", s.div_ceil(60)),
+        s => format!("{} h", s.div_ceil(3_600)),
+    }
 }
 
 /// What reading a document would take, with nothing sent (`--dry-run`):

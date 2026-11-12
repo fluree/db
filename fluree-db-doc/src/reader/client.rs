@@ -3,14 +3,27 @@
 //! Blocking, like [`crate::LlmClient`] and for the same reason: readings run
 //! inside a `spawn_blocking` task, and ureq carries no runtime to drop there.
 //!
-//! **Resends.** A read is resent only when the answer is a 503 that carries
-//! `Retry-After`: the endpoint saying it had no capacity (a model still
-//! starting, a full queue) and when to come back. Nothing else is resent —
-//! not a timeout, not a dropped connection, not a 503 without the header —
-//! because any of those may follow a read that ran, and a read is billed.
-//! Attempts and total waiting are capped, and every wait is reported through
-//! the caller's `on_wait`, so a model starting from cold shows as waiting
-//! rather than as a hang.
+//! **Resends.** A read is resent only when the answer is a 503 or a 429 that
+//! carries `Retry-After`: the endpoint saying it had no capacity (a model
+//! still starting, a full queue) or that the caller is over a rate limit,
+//! and when to come back. Nothing else is resent — not a timeout, not a
+//! dropped connection, not a 503 or 429 without the header — because any of
+//! those may follow a read that ran, and a read is billed.
+//!
+//! That a refusal with `Retry-After` was not billed is the reader's promise,
+//! not HTTP's: RFC 9110 and RFC 6585 define 503 and 429 by their cause and
+//! say nothing about work done. fluree.ai's reader keeps it: it bills only a
+//! call it answers, so neither its own rate limit's 429 nor a 503 or 429 it
+//! passes on from a model is billed. A reader of another kind should send
+//! `Retry-After` with them only when the same holds.
+//!
+//! A resend waits the time the endpoint names, never less. Waiting is capped
+//! at [`MAX_WAIT`] across a call's resends, and attempts at [`ATTEMPTS`]: a
+//! wait that would pass the cap fails at once, naming the wait asked for.
+//! One that passes it on its own is [`DocError::Unavailable`], since every
+//! call is refused until it is over, and a caller with more to read stops.
+//! Every wait is reported through the caller's `on_wait`, so a model
+//! starting from cold shows as waiting rather than as a hang.
 //!
 //! **A refused credential.** A client given a [`Renewal`] (an account
 //! sign-in whose token can be renewed) answers a 401 by renewing once and
@@ -29,8 +42,6 @@ const TIMEOUT: Duration = Duration::from_secs(330);
 pub const ATTEMPTS: u32 = 4;
 /// Waiting across all resends of one request.
 pub const MAX_WAIT: Duration = Duration::from_secs(300);
-/// The longest single `Retry-After` honoured.
-const MAX_RETRY_AFTER: u64 = 60;
 
 /// Renews a refused credential: run once when a call is answered 401, and
 /// that call resent with the credential it returns.
@@ -148,6 +159,8 @@ pub struct ReaderClient {
     credential: std::sync::RwLock<Option<Credential>>,
     /// How a refused credential is renewed, when it can be.
     renewal: Option<Renewal>,
+    /// How a wait is spent: the thread sleeps, except in tests.
+    sleep: fn(Duration),
 }
 
 impl std::fmt::Debug for ReaderClient {
@@ -180,6 +193,7 @@ impl ReaderClient {
             url: url.to_string(),
             credential: std::sync::RwLock::new(credential),
             renewal: None,
+            sleep: std::thread::sleep,
         }
     }
 
@@ -187,6 +201,13 @@ impl ReaderClient {
     /// and resend that call once with the renewed one.
     pub fn with_renewal(mut self, renewal: Renewal) -> Self {
         self.renewal = Some(renewal);
+        self
+    }
+
+    /// Spend waits with `sleep` instead of sleeping.
+    #[cfg(test)]
+    fn with_sleep(mut self, sleep: fn(Duration)) -> Self {
+        self.sleep = sleep;
         self
     }
 
@@ -277,41 +298,58 @@ impl ReaderClient {
                 }
             }
             let message = error_message(&text);
-            let retry_after = (status == 503)
+            let retry_after = (status == 503 || status == 429)
                 .then(|| headers.get("retry-after"))
                 .flatten()
                 .and_then(|v| v.to_str().ok())
                 .and_then(retry_after_secs);
-            match retry_after {
-                Some(secs) if attempt < ATTEMPTS => {
-                    let wait = Duration::from_secs(secs.clamp(1, MAX_RETRY_AFTER));
-                    if waited + wait > MAX_WAIT {
-                        return Err(DocError::Endpoint {
-                            model: model.to_string(),
-                            status,
-                            message: format!(
-                                "no capacity after {}s of waiting: {message}",
-                                waited.as_secs()
-                            ),
-                        });
-                    }
-                    on_wait(&format!(
-                        "{model}: {message}; trying again in {}s (attempt {} of {ATTEMPTS})",
-                        wait.as_secs(),
-                        attempt + 1
-                    ));
-                    std::thread::sleep(wait);
-                    waited += wait;
-                    attempt += 1;
-                }
-                _ => {
-                    return Err(DocError::Endpoint {
-                        model: model.to_string(),
-                        status,
-                        message,
-                    });
-                }
+            let refused = |message: String| DocError::Endpoint {
+                model: model.to_string(),
+                status,
+                message,
+            };
+            let Some(secs) = retry_after else {
+                return Err(refused(message));
+            };
+            // The wait the endpoint names, never cut short: a resend before
+            // it is sure to be refused again.
+            let wait = Duration::from_secs(secs.max(1));
+            let past_the_cap = || {
+                format!(
+                    "{message}; the reader asks to wait {}s, and a call waits at most {}s in all \
+                     ({}s so far), so it is not resent",
+                    wait.as_secs(),
+                    MAX_WAIT.as_secs(),
+                    waited.as_secs()
+                )
+            };
+            // A wait past the cap on its own holds for every call until it
+            // is over (an account over a quota), not for this one alone.
+            if wait > MAX_WAIT {
+                return Err(DocError::Unavailable {
+                    model: model.to_string(),
+                    status,
+                    wait,
+                    message: past_the_cap(),
+                });
             }
+            if attempt >= ATTEMPTS {
+                return Err(refused(format!(
+                    "still refused after {ATTEMPTS} attempts and {}s of waiting: {message}",
+                    waited.as_secs()
+                )));
+            }
+            if waited + wait > MAX_WAIT {
+                return Err(refused(past_the_cap()));
+            }
+            on_wait(&format!(
+                "{model}: {message}; trying again in {}s (attempt {} of {ATTEMPTS})",
+                wait.as_secs(),
+                attempt + 1
+            ));
+            (self.sleep)(wait);
+            waited += wait;
+            attempt += 1;
         }
     }
 }
@@ -499,18 +537,40 @@ mod tests {
         );
     }
 
-    /// Only a 503 with `Retry-After` is resent: without it the read may have
-    /// run, and the resend rule covers no other status.
     #[test]
-    fn a_503_without_retry_after_and_any_other_error_are_not_resent() {
+    fn a_429_with_retry_after_is_resent() {
+        let (url, seen) = stub(vec![
+            http(
+                "429 Too Many Requests",
+                &["Retry-After: 1"],
+                r#"{"error":{"message":"Too many","status":429,"error":"rate_limited"}}"#,
+            ),
+            http("200 OK", &["X-Fluree-Serialized-Tokens: 5"], "[]"),
+        ]);
+        let waits = Mutex::new(Vec::new());
+        let answer = ReaderClient::new(&endpoint(&url))
+            .read("x", "m", None, &|w| {
+                waits.lock().unwrap().push(w.to_string());
+            })
+            .unwrap();
+        assert_eq!(answer.resends, 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(waits.into_inner().unwrap()[0].contains("attempt 2 of 4"));
+    }
+
+    /// Only a 503 or 429 with `Retry-After` is resent: without it the read
+    /// may have run, and the resend rule covers no other status.
+    #[test]
+    fn a_503_or_429_without_retry_after_and_any_other_error_are_not_resent() {
         for response in [
             http(
                 "503 Service Unavailable",
                 &[],
                 r#"{"error":"Extraction service unavailable"}"#,
             ),
+            http("429 Too Many Requests", &[], "slow down"),
             http("504 Gateway Timeout", &["Retry-After: 1"], "timed out"),
-            http("429 Too Many Requests", &["Retry-After: 1"], "slow down"),
+            http("502 Bad Gateway", &["Retry-After: 1"], "upstream"),
         ] {
             let (url, seen) = stub(vec![response]);
             let err = ReaderClient::new(&endpoint(&url))
@@ -520,15 +580,94 @@ mod tests {
         }
     }
 
+    /// A wait longer than a call may wait in all fails at once, saying the
+    /// wait asked for; it is never resent early. It is told apart
+    /// ([`DocError::Unavailable`], with the wait), since every call meets
+    /// it until the wait is over.
+    #[test]
+    fn a_wait_past_the_cap_is_not_resent() {
+        for (status, code) in [
+            ("429 Too Many Requests", 429),
+            ("503 Service Unavailable", 503),
+        ] {
+            let (url, seen) = stub(vec![http(status, &["Retry-After: 301"], "slow down")]);
+            let err = ReaderClient::new(&endpoint(&url))
+                .with_sleep(|_| panic!("no wait expected"))
+                .read("x", "m", None, &|_| panic!("no wait expected"))
+                .unwrap_err();
+            assert_eq!(seen.lock().unwrap().len(), 1, "{err}");
+            let text = err.to_string();
+            assert!(text.contains("asks to wait 301s"), "{text}");
+            assert!(text.contains("at most 300s in all (0s so far)"), "{text}");
+            match err {
+                DocError::Unavailable { status, wait, .. } => {
+                    assert_eq!((status, wait), (code, Duration::from_secs(301)));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A 429 asking for two minutes is resent after two minutes, not after
+    /// one: the wait is the endpoint's, uncut.
+    #[test]
+    fn a_long_retry_after_is_waited_in_full() {
+        let (url, seen) = stub(vec![
+            http("429 Too Many Requests", &["Retry-After: 120"], "slow down"),
+            http("200 OK", &[], "[]"),
+        ]);
+        let waits = Mutex::new(Vec::new());
+        let answer = ReaderClient::new(&endpoint(&url))
+            .with_sleep(|_| {})
+            .read("x", "m", None, &|w| {
+                waits.lock().unwrap().push(w.to_string());
+            })
+            .unwrap();
+        assert_eq!(answer.resends, 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let waits = waits.into_inner().unwrap();
+        assert!(waits[0].contains("trying again in 120s"), "{waits:?}");
+    }
+
+    /// Waits add up against [`MAX_WAIT`]: two of two minutes are spent, and
+    /// the third, which would pass five minutes, fails at once.
+    #[test]
+    fn waiting_stops_at_the_total_cap() {
+        let busy = || http("503 Service Unavailable", &["Retry-After: 120"], "busy");
+        let (url, seen) = stub(vec![busy(), busy(), busy()]);
+        let waits = Mutex::new(0);
+        let err = ReaderClient::new(&endpoint(&url))
+            .with_sleep(|_| {})
+            .read("x", "m", None, &|_| *waits.lock().unwrap() += 1)
+            .unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(*waits.lock().unwrap(), 2);
+        let text = err.to_string();
+        assert!(text.contains("asks to wait 120s"), "{text}");
+        assert!(text.contains("(240s so far)"), "{text}");
+        // This call's waits ran out, but the next call's start afresh: the
+        // endpoint isn't refusing every call.
+        assert!(
+            matches!(err, DocError::Endpoint { status: 503, .. }),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn resends_stop_at_the_attempt_cap() {
         let busy = || http("503 Service Unavailable", &["Retry-After: 1"], "busy");
         let (url, seen) = stub(vec![busy(), busy(), busy(), busy()]);
         let err = ReaderClient::new(&endpoint(&url))
+            .with_sleep(|_| {})
             .read("x", "m", None, &|_| {})
             .unwrap_err();
         assert_eq!(seen.lock().unwrap().len(), ATTEMPTS as usize);
         assert!(err.to_string().contains("503"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("still refused after 4 attempts and 3s of waiting"),
+            "{err}"
+        );
     }
 
     #[test]
