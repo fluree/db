@@ -1,6 +1,8 @@
 //! `QueryEvaluationTest` / `UpdateEvaluationTest` handlers: create an
 //! in-memory Fluree ledger, load test data (default + named graphs), execute
-//! a SPARQL query or update, and compare against expected results.
+//! a SPARQL query or update, and compare against expected results. Each test
+//! runs twice, its data loaded once by transaction (queries read novelty) and
+//! once by bulk import (queries read the index).
 
 use std::time::Duration;
 
@@ -19,7 +21,8 @@ use crate::result_format::{
 };
 use crate::subprocess::{run_in_subprocess, TestDescriptor};
 
-/// Max time for a single query evaluation test (data load + query + compare).
+/// Max time for a single query evaluation test (data load + query + compare,
+/// once per load).
 const EVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ledger alias used for every W3C test (each test runs in its own
@@ -140,14 +143,139 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
 // Graph store setup (shared by query-eval and update-eval)
 // ---------------------------------------------------------------------------
 
-/// Create the test ledger and load initial state: default graph data plus
-/// named graphs. Returns the resulting ledger state.
+/// How a test's data reaches the ledger. Every evaluation test runs once per
+/// load, so the suite guards both lanes a query reads: novelty, and the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Load {
+    /// Turtle and TriG transactions: the data stays in novelty.
+    Transaction,
+    /// Bulk import: the data is indexed.
+    Import,
+}
+
+/// Every load a test runs under, in order.
+const LOADS: [Load; 2] = [Load::Transaction, Load::Import];
+
+/// Tests whose data carries an ill-typed literal on purpose
+/// (`"xyz"^^xsd:integer`, `"yes"^^xsd:boolean`) to exercise how queries
+/// compare one. A transaction refuses such a literal and bulk import keeps it
+/// as written, so these run over an import only.
 ///
-/// The data loads through bulk import, Fluree's one lenient write path. W3C
-/// test data carries ill-typed literals on purpose (`open-eq-07`..`12`,
-/// `eq-bool`: `"xyz"^^xsd:integer`, `"yes"^^xsd:boolean`), which a
-/// transaction refuses and import keeps as written, so the query-semantics
-/// tests over them still run.
+/// Checked both ways, as the skip registers are: a test listed here whose
+/// data a transaction loads fails, and so does any other test whose data a
+/// transaction refuses.
+const ILL_TYPED_DATA: &[&str] = &[
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-07",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-08",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-09",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-10",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-11",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-12",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-bool",
+];
+
+/// Create the test ledger and load initial state, default graph data plus
+/// named graphs, as `load` says. Returns the resulting ledger state, or
+/// `None` when a transaction refused the data of a test in
+/// [`ILL_TYPED_DATA`], which then runs over its import only.
+async fn setup_graph_store(
+    fluree: &Fluree,
+    load: Load,
+    test_id: &str,
+    data_url: Option<&str>,
+    graph_data: &[(String, String)],
+) -> Result<Option<LedgerState>> {
+    let ill_typed = ILL_TYPED_DATA.contains(&test_id);
+    match load {
+        Load::Import => load_by_import(fluree, data_url, graph_data).await.map(Some),
+        Load::Transaction => match load_by_transaction(fluree, data_url, graph_data).await {
+            Ok(_) if ill_typed => bail!(
+                "{test_id} is listed in ILL_TYPED_DATA, but a transaction loaded its \
+                 data: remove it from the list"
+            ),
+            Ok(ledger) => Ok(Some(ledger)),
+            Err(e) if ill_typed && format!("{e:#}").contains("Cannot parse '") => Ok(None),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Load the data through transactions, so it stays in novelty.
+///
+/// Named graphs are loaded as TriG `GRAPH <name> { ... }` blocks through the
+/// alias-based transact builder (`upsert_turtle`), which parses the document
+/// once with the Turtle parser. Each file's `@prefix`/`@base` directives are
+/// hoisted above the GRAPH block (a directive cannot sit inside a block),
+/// and each graph loads in its own transaction so prefix declarations can't
+/// collide across files.
+async fn load_by_transaction(
+    fluree: &Fluree,
+    data_url: Option<&str>,
+    graph_data: &[(String, String)],
+) -> Result<LedgerState> {
+    let ledger = fluree
+        .create_ledger(TEST_LEDGER)
+        .await
+        .context("Failed to create test ledger")?;
+
+    // Default graph data (.ttl or .rdf).
+    // For .ttl: prepend @base so relative IRIs resolve correctly.
+    // For .rdf: convert RDF/XML to N-Triples (absolute IRIs) first.
+    // Some W3C tests (e.g., empty.ttl) have valid syntax but no triples —
+    // Fluree rejects these as empty transactions, so we skip gracefully.
+    let mut current = ledger;
+    if let Some(data_url) = data_url {
+        let raw = read_file_to_string(data_url)
+            .with_context(|| format!("Reading test data: {data_url}"))?;
+        if !raw.trim().is_empty() {
+            let turtle = prepare_for_insert(&raw, data_url)?;
+            match fluree.insert_turtle(current.clone(), &turtle).await {
+                Ok(result) => current = result.ledger,
+                Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
+                Err(e) => return Err(e).with_context(|| format!("Loading test data: {data_url}")),
+            }
+        }
+    }
+
+    // Named graph data as TriG GRAPH blocks.
+    for (graph_name, graph_url) in graph_data {
+        let raw = read_file_to_string(graph_url)
+            .with_context(|| format!("Reading named graph data: {graph_url}"))?;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let content = prepare_for_insert(&raw, graph_url)?;
+        let (directives, body) = split_turtle_directives(&content);
+        if body.trim().is_empty() {
+            continue;
+        }
+        let trig = format!("{directives}GRAPH <{graph_name}> {{\n{body}}}\n");
+        // Either verb reads a TriG body; upsert keeps a repeated load of the
+        // same graph from accumulating copies.
+        match fluree
+            .graph(TEST_LEDGER)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+        {
+            Ok(_) => {
+                current = fetch_state(fluree).await?;
+            }
+            Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Loading named graph data: {graph_url} as <{graph_name}>")
+                })
+            }
+        }
+    }
+
+    Ok(current)
+}
+
+/// Load the data through bulk import, so it is indexed. Import is also
+/// Fluree's one lenient write path: it keeps an ill-typed literal as written.
 ///
 /// Each file becomes one TriG file in a scratch directory, imported in name
 /// order, one file at a time: the default graph as written (Turtle and
@@ -157,7 +285,7 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
 /// document, so prefixes and blank-node labels stay per file. Some W3C files
 /// (e.g., empty.ttl) have valid syntax but no triples; they are skipped, and
 /// with no data at all the ledger is created empty.
-async fn setup_graph_store(
+async fn load_by_import(
     fluree: &Fluree,
     data_url: Option<&str>,
     graph_data: &[(String, String)],
@@ -422,10 +550,34 @@ fn dataset_clause_graphs(sparql: &str) -> Vec<(String, String)> {
     graphs
 }
 
-/// Inner async function that does the actual test work.
+/// Inner async function that does the actual test work: the test runs once
+/// per [`Load`], and fails if any run fails.
 ///
 /// Public for use by the `run-w3c-test` subprocess binary.
 pub async fn run_eval_test(
+    test_id: &str,
+    query_url: &str,
+    data_url: Option<&str>,
+    result_url: &str,
+    graph_data: &[(String, String)],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for load in LOADS {
+        if let Err(e) = eval_once(load, test_id, query_url, data_url, result_url, graph_data).await
+        {
+            failures.push(format!("[{load:?} load] {e:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("\n\n"))
+    }
+}
+
+/// One run of a query evaluation test, its data loaded as `load` says.
+async fn eval_once(
+    load: Load,
     test_id: &str,
     query_url: &str,
     data_url: Option<&str>,
@@ -462,7 +614,10 @@ pub async fn run_eval_test(
     }
 
     // 2. Create the ledger + load default and named graph data.
-    let ledger = setup_graph_store(&fluree, data_url, &graph_data).await?;
+    let Some(ledger) = setup_graph_store(&fluree, load, test_id, data_url, &graph_data).await?
+    else {
+        return Ok(());
+    };
 
     // 3. Execute the SPARQL query.
     let db = GraphDb::from_ledger_state(&ledger);
@@ -534,7 +689,8 @@ pub async fn run_eval_test(
 // Update evaluation (inner, runs inside the subprocess)
 // ---------------------------------------------------------------------------
 
-/// Inner async function for `mf:UpdateEvaluationTest`.
+/// Inner async function for `mf:UpdateEvaluationTest`: the test runs once
+/// per [`Load`] of its initial state, and fails if any run fails.
 ///
 /// Public for use by the `run-w3c-test` subprocess binary.
 pub async fn run_update_eval_test(
@@ -545,9 +701,48 @@ pub async fn run_update_eval_test(
     result_data_url: Option<&str>,
     result_graph_data: &[(String, String)],
 ) -> Result<()> {
+    let mut failures = Vec::new();
+    for load in LOADS {
+        if let Err(e) = update_once(
+            load,
+            test_id,
+            request_url,
+            data_url,
+            graph_data,
+            result_data_url,
+            result_graph_data,
+        )
+        .await
+        {
+            failures.push(format!("[{load:?} load] {e:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("\n\n"))
+    }
+}
+
+/// One run of an update evaluation test, its initial state loaded as `load`
+/// says.
+async fn update_once(
+    load: Load,
+    test_id: &str,
+    request_url: &str,
+    data_url: Option<&str>,
+    graph_data: &[(String, String)],
+    result_data_url: Option<&str>,
+    result_graph_data: &[(String, String)],
+) -> Result<()> {
     // 1. Initial graph store state
     let fluree = FlureeBuilder::memory().build_memory();
-    setup_graph_store(&fluree, data_url, graph_data).await?;
+    if setup_graph_store(&fluree, load, test_id, data_url, graph_data)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
 
     // 2. Apply the update request
     let sparql = read_file_to_string(request_url)
