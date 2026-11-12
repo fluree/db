@@ -92,7 +92,9 @@ Accepting a request does the following, in order:
    the manifest and the [signature mode](#signatures) in its txn-meta (`f:erasureRequest`,
    `f:erasureRequester`, `f:erasureManifest`, `f:erasureSignatures`). It records no value, and anchors
    the authorization in the ledger's history.
-3. **A job.** It is kept in the branch's retention registration and returned as a receipt:
+3. **A job.** It is kept in the retention registration of the branch the request was made on, and
+   returned as a receipt. Dropping that branch drops the job with it, for every branch: make the
+   request on a branch you keep, or again on one that remains. The receipt:
 
 ```json
 {
