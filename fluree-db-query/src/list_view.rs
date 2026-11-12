@@ -36,7 +36,7 @@ use fluree_db_core::{
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// A list, named by the graph, subject and predicate that own it.
@@ -49,8 +49,9 @@ type List = (Owner, Vec<Flake>);
 #[derive(Debug)]
 pub struct ListView {
     /// Predicates whose values include list members; `None` when that is
-    /// not known, and any may.
-    predicates: Option<HashSet<Sid>>,
+    /// not known, and any may. Ordered, so a read across them meets the
+    /// lists in the same order every time, and names their cells alike.
+    predicates: Option<BTreeSet<Sid>>,
     /// The index ids of `predicates`, sorted; `None` when they are not known.
     predicate_ids: Option<Vec<u32>>,
     /// The lists this request has named a cell of: list `n` is `owners[n]`.
@@ -88,7 +89,7 @@ impl ListView {
         overlay: &dyn OverlayProvider,
         store: Option<&Arc<BinaryIndexStore>>,
     ) -> Result<Option<Arc<Self>>> {
-        let mut predicates: Option<HashSet<Sid>> = Some(HashSet::new());
+        let mut predicates: Option<BTreeSet<Sid>> = Some(BTreeSet::new());
         if snapshot.has_list_meta != Some(false) {
             predicates = match store {
                 Some(store) => {
@@ -105,7 +106,7 @@ impl ListView {
             (_, None) => predicates = None,
             (None, Some(_)) => {}
         }
-        if predicates.as_ref().is_some_and(HashSet::is_empty) {
+        if predicates.as_ref().is_some_and(BTreeSet::is_empty) {
             return Ok(None);
         }
         let predicate_ids = match (&predicates, store) {
@@ -191,7 +192,7 @@ impl ListView {
     }
 
     /// The predicates holding list members, when known.
-    pub(crate) fn predicates(&self) -> Option<&HashSet<Sid>> {
+    pub(crate) fn predicates(&self) -> Option<&BTreeSet<Sid>> {
         self.predicates.as_ref()
     }
 

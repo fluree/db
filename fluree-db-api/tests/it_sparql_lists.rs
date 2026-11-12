@@ -305,6 +305,43 @@ async fn construct_writes_a_list_as_a_collection() {
     );
 }
 
+/// Lists on several predicates are met in the same order by every request,
+/// so their cells take the same labels and the Graph Store `GET`'s CONSTRUCT
+/// writes the same N-Triples each time, from novelty and from an index.
+#[tokio::test]
+async fn every_request_names_the_cells_alike() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    let ttl = "ex:s ex:a (1 2) ; ex:b (3 4) ; ex:c (5 6) ; ex:d (7 8) .\n\
+               ex:t ex:a (9) ; ex:d (10) .";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let novel = ledger_with(&fluree, "named-alike", ttl).await;
+    let indexed = indexed_ledger_with(&fluree, "named-alike-indexed", ttl).await;
+    let query = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+    for (lane, ledger) in [("novelty", &novel), ("index", &indexed)] {
+        let mut written = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            let result = rdf_query(&fluree, ledger, query).await.expect("construct");
+            let nt = format_results_string(
+                &result,
+                &result.context,
+                &ledger.snapshot,
+                &FormatterConfig::ntriples(),
+            )
+            .expect("n-triples");
+            written.insert(nt);
+        }
+        assert_eq!(written.len(), 1, "{lane}: {written:#?}");
+        let nt = written.first().unwrap();
+        // Owner edges, then two triples per cell: ex:s's, then ex:t's.
+        assert_eq!(
+            nt.lines().count(),
+            (4 + 2 * 8) + (2 + 2 * 2),
+            "{lane}:\n{nt}"
+        );
+    }
+}
+
 /// The fuel of `rdf:rest*/rdf:first` grows with the list, not with its
 /// square or cube: the walk starts at the owner, though statistics count no
 /// `rdf:first` for a compact list, and reads the list once.
