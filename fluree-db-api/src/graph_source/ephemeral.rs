@@ -197,7 +197,7 @@ async fn load_from_catalog(
 /// Load `table_name` from its local directory in `dirs`: the newest
 /// `metadata/*.metadata.json`, with file references remapped from the
 /// metadata's own `location` to that directory.
-async fn load_local(
+pub(super) async fn load_local(
     dirs: &std::collections::HashMap<String, String>,
     table_name: &str,
 ) -> QueryResult<(IcebergStorageBackend, TableMetadata)> {
@@ -238,10 +238,15 @@ async fn scan_loaded_table(
     let schema = metadata.current_schema().ok_or_else(|| {
         QueryError::Internal(format!("Table '{table_name}' has no current schema"))
     })?;
-    // The map's row filter, refused when the schema cannot decide it.
+    // The map's row filter, refused when the schema cannot decide it: the
+    // schema an unpinned read of the table reads, which registration and the
+    // validate dry-run check it against too.
+    let filter_schema = super::r2rml::unpinned_read_schema(metadata).ok_or_else(|| {
+        QueryError::Internal(format!("Table '{table_name}' has no current schema"))
+    })?;
     let row_filter = logical
-        .row_filter(schema)
-        .map_err(QueryError::InvalidQuery)?;
+        .row_filter(&filter_schema)
+        .map_err(|e| QueryError::InvalidQuery(e.message))?;
 
     // Resolve projected column names to field IDs (all non-nested columns when
     // the projection is empty, matching the persisted scan default).
