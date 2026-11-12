@@ -2202,9 +2202,10 @@ mod tests {
         }
     }
 
-    /// Four int64 columns of 64 KiB pages, about 38 MB: a decode of it through
-    /// the range-backed reader takes many fetches.
-    fn many_page_parquet() -> Bytes {
+    /// Four int64 columns of 64 KiB pages, about 38 MB, in `row_groups` row
+    /// groups: a decode of it through the range-backed reader takes many
+    /// fetches.
+    fn many_page_parquet(row_groups: usize) -> Bytes {
         use arrow::array::{ArrayRef, Int64Array, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use parquet::arrow::ArrowWriter;
@@ -2230,6 +2231,7 @@ mod tests {
         let props = WriterProperties::builder()
             .set_dictionary_enabled(false)
             .set_data_page_size_limit(64 * 1024)
+            .set_max_row_group_row_count(Some(ROWS as usize / row_groups))
             .build();
         let mut buf = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
@@ -2245,7 +2247,7 @@ mod tests {
     async fn a_dropped_large_file_read_stops_fetching() {
         use std::sync::atomic::Ordering::SeqCst;
 
-        let bytes = many_page_parquet();
+        let bytes = many_page_parquet(1);
         let file_size = bytes.len() as u64;
         assert!(file_size > 4 * 8 * MIB, "file is {file_size} bytes");
         let gate = Arc::new(tokio::sync::Semaphore::new(2));
@@ -2286,6 +2288,95 @@ mod tests {
             range_reads.load(SeqCst),
             3,
             "the decode fetched more after its read was dropped"
+        );
+    }
+
+    /// A store for a two-row-group file: it fails every read in the first row
+    /// group, holds every read in the second until the test lets it through
+    /// (counting them), and answers footer reads (those that reach the end of
+    /// the file) straight away.
+    #[derive(Debug)]
+    struct FailFirstRowGroup {
+        bytes: Bytes,
+        second_row_group_start: u64,
+        gate: Arc<tokio::sync::Semaphore>,
+        second_row_group_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for FailFirstRowGroup {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            panic!("a large file is read by range");
+        }
+
+        async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
+            let footer = range.end == self.bytes.len() as u64;
+            // A fetch is aligned down to 64 KiB, so one for the second row
+            // group's first page can start a little before it.
+            if !footer && range.start + 64 * 1024 <= self.second_row_group_start {
+                return Err(IcebergError::storage("injected failure in row group 0"));
+            }
+            if !footer {
+                self.second_row_group_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.gate.acquire().await.expect("gate open").forget();
+            }
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    /// A row-group-parallel decode returns at the first slice that fails, and
+    /// the slices after it, on blocking threads of their own, used to go on
+    /// reading their row groups. Now the decode's return stops them at their
+    /// next fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_slice_stops_the_slices_after_it() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let bytes = many_page_parquet(2);
+        let file_size = bytes.len() as u64;
+        let second_row_group_start = {
+            let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+            assert_eq!(reader.metadata().num_row_groups(), 2);
+            reader.metadata().row_group(1).column(0).byte_range().0
+        };
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let second_row_group_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(FailFirstRowGroup {
+            bytes,
+            second_row_group_start,
+            gate: Arc::clone(&gate),
+            second_row_group_reads: Arc::clone(&second_row_group_reads),
+        });
+
+        let err = SendParquetReader::<'static, FailFirstRowGroup>::decode_large_file(
+            source,
+            "mem://two-row-groups.parquet".to_string(),
+            file_size,
+            vec![1, 2, 3, 4],
+            None,
+            None,
+            Handle::current(),
+            None,
+            2,
+        )
+        .await
+        .expect_err("the first slice fails");
+        assert!(err.to_string().contains("injected failure"), "{err}");
+
+        // The second slice is held at a fetch, or hasn't reached one yet.
+        let held = second_row_group_reads.load(SeqCst);
+        gate.add_permits(1 << 20);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            second_row_group_reads.load(SeqCst),
+            held,
+            "the second slice fetched more after the decode returned"
         );
     }
 }

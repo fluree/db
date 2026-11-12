@@ -16,7 +16,7 @@ aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts
 # Iceberg / R2RML graph source support (pulls in AWS SDK + native deps). The
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
-iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws", "dep:tokio-util"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint). Stacks on `iceberg`
 # because the graph-source provider dispatch lives there; the crate itself adds
 # only an HTTP client, no database drivers.
@@ -76,6 +76,8 @@ fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
+# `AbortOnDropHandle` for an Iceberg scan's per-file reads (`graph_source::file_read`).
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
 fluree-db-delta = { path = "../fluree-db-delta", optional = true }

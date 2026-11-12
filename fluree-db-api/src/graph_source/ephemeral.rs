@@ -48,7 +48,7 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
 
 use crate::graph_source::config::IcebergConnectionConfig;
-use crate::graph_source::file_read::read_in_own_task;
+use crate::graph_source::file_read::spawn_file_read;
 use crate::graph_source::iceberg_catalog::{build_preview_storage, catalog_client};
 use crate::view::{GraphDb, QueryInput};
 use crate::{QueryExecutionOptions, Result};
@@ -209,7 +209,7 @@ impl EphemeralR2rmlProvider {
         let stream = futures::stream::iter(tasks)
             .map(move |task| {
                 let storage = Arc::clone(&storage);
-                read_in_own_task(move || async move {
+                spawn_file_read(async move {
                     let reader = SendParquetReader::new(storage.as_ref());
                     reader.read_task(&task).await.map_err(|e| {
                         QueryError::Internal(format!(

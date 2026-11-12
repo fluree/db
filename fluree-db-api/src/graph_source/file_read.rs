@@ -5,38 +5,36 @@ use std::future::Future;
 
 use fluree_db_iceberg::io::ColumnBatch;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
-/// Aborts its task when dropped.
-struct AbortOnDrop<T>(JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Run one data file's read, built by `read`, on its own task, so a scan's
-/// reads run in parallel, and wait for it.
+/// Spawn one data file's `read` on its own task, so a scan's reads run in
+/// parallel, and return a future of its result that aborts the task when it is
+/// dropped.
 ///
-/// Dropping the returned future aborts the task. A scan streams its files'
-/// reads through `buffer_unordered`, so dropping the scan's stream (its
-/// consumer has the rows it needs, or the query was cancelled or timed out)
-/// drops the reads in flight. A bare `tokio::spawn` left each of those reads
-/// running to the end of its file, for no one.
+/// A scan streams its files' reads through `buffer_unordered`, so dropping the
+/// scan's stream (its consumer has the rows it needs, or a cancelled query
+/// unwinds) drops the reads in flight. A bare `tokio::spawn` left each of those
+/// reads running to the end of its file, for no one.
 ///
-/// The read is built on the first poll and spawned in the same step, so until
-/// then the stream holds only what builds it: a scan's stream must be `Sync`,
-/// and a pending read is not.
-pub(crate) async fn read_in_own_task<R, F>(read: R) -> QueryResult<Vec<ColumnBatch>>
+/// It spawns the read it is given right away, so the future it returns holds
+/// only the task's handle and is `Sync` whatever the read is: a scan's stream
+/// must be `Sync`, and a pending read is not. That fits both a fan-out that
+/// builds the read where it spawns it and one that builds it ahead and holds
+/// it in a `Mutex` until then, as #2315's `read_files_in_order` does. Once
+/// #2315 lands, all four fan-outs read through `read_files_in_order`, and this
+/// call (and `a_dropped_scan_stream_aborts_the_reads_in_flight`, driving
+/// `read_files_in_order` under both of its combinators) belongs there.
+pub(crate) fn spawn_file_read<F>(
+    read: F,
+) -> impl Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + Sync + 'static
 where
-    R: FnOnce() -> F,
     F: Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + 'static,
 {
-    let mut task = AbortOnDrop(tokio::spawn(read()));
-    (&mut task.0)
-        .await
-        .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+    let task = AbortOnDropHandle::new(tokio::spawn(read));
+    async move {
+        task.await
+            .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+    }
 }
 
 #[cfg(test)]
@@ -85,8 +83,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_read_aborts_its_task() {
         let (started, dropped) = (Arc::default(), Arc::default());
-        let mut read = Box::pin(read_in_own_task(|| endless_read(&started, &dropped)));
-        assert!(futures::poll!(&mut read).is_pending());
+        let read = spawn_file_read(endless_read(&started, &dropped));
         wait_for(&started, 1).await;
 
         drop(read);
@@ -95,9 +92,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_finished_read_returns_its_batches_and_errors() {
-        let ok = read_in_own_task(|| async { Ok(Vec::new()) }).await.unwrap();
+        let ok = spawn_file_read(async { Ok(Vec::new()) }).await.unwrap();
         assert!(ok.is_empty());
-        let err = read_in_own_task(|| async { Err(QueryError::Internal("no file".into())) })
+        let err = spawn_file_read(async { Err(QueryError::Internal("no file".into())) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no file"), "{err}");
@@ -112,10 +109,7 @@ mod tests {
         let reads = {
             let (started, dropped) = (Arc::clone(&started), Arc::clone(&dropped));
             futures::stream::iter(0..16)
-                .map(move |_| {
-                    let (started, dropped) = (Arc::clone(&started), Arc::clone(&dropped));
-                    read_in_own_task(move || endless_read(&started, &dropped))
-                })
+                .map(move |_| spawn_file_read(endless_read(&started, &dropped)))
                 .buffer_unordered(4)
         };
         let mut reads = Box::pin(reads);
@@ -130,5 +124,35 @@ mod tests {
             4,
             "no read starts after the drop"
         );
+    }
+
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+
+    /// A read that is `Send` but not `Sync` (it holds a `Cell` across an
+    /// await) still gives a `Sync` future, both called directly and from a
+    /// future that keeps the built read in a `Mutex` until it spawns it, the
+    /// way #2315's `read_files_in_order` keeps its reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_read_future_is_sync_for_a_read_that_is_not() {
+        async fn not_sync_read() -> QueryResult<Vec<ColumnBatch>> {
+            let held = std::cell::Cell::new(0);
+            tokio::task::yield_now().await;
+            held.set(1);
+            Ok(Vec::new())
+        }
+
+        let direct = spawn_file_read(not_sync_read());
+        assert_send_sync(&direct);
+        assert!(direct.await.unwrap().is_empty());
+
+        let pending = std::sync::Mutex::new(not_sync_read());
+        let held_ahead = async move {
+            let read = pending
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            spawn_file_read(read).await
+        };
+        assert_send_sync(&held_ahead);
+        assert!(held_ahead.await.unwrap().is_empty());
     }
 }

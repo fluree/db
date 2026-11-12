@@ -8,7 +8,7 @@
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::R2rmlCreateConfig;
-use crate::graph_source::file_read::read_in_own_task;
+use crate::graph_source::file_read::spawn_file_read;
 use crate::graph_source::iceberg_catalog::storage_query_error;
 use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
 use crate::graph_source::storage::{plan_storage, CatalogGrant, StoragePlan};
@@ -2104,7 +2104,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .map(move |task| {
                 let storage = Arc::clone(&storage);
                 let footers = Arc::clone(&footers);
-                read_in_own_task(move || async move {
+                spawn_file_read(async move {
                     let reader = SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
                     reader.read_task(&task).await.map_err(|e| {
                         QueryError::Internal(format!(
@@ -4718,7 +4718,7 @@ impl FlureeR2rmlProvider<'_> {
                             path = %task.data_file.file_path,
                             file_size = task.data_file.file_size_in_bytes,
                         );
-                        read_in_own_task(move || async move {
+                        spawn_file_read(async move {
                             let reader = SendParquetReader::with_caches(
                                 storage.as_ref(),
                                 footers.as_ref(),
@@ -4786,7 +4786,7 @@ impl FlureeR2rmlProvider<'_> {
                     path = %task.data_file.file_path,
                     file_size = task.data_file.file_size_in_bytes,
                 );
-                read_in_own_task(move || async move {
+                spawn_file_read(async move {
                     let reader = SendParquetReader::with_caches(
                         storage.as_ref(),
                         footers.as_ref(),
