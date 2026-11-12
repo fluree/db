@@ -558,8 +558,8 @@ FROM <table>
 <literal>   := an integer | a decimal | 'a string' ('' escapes a quote) | TRUE | FALSE
 ```
 
-- The table resolves the way an `rr:tableName` does (`namespace.table`).
-- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive; quote a column whose name is a keyword.
+- The table resolves the way an `rr:tableName` does (`namespace.table`). As there, a table name may not begin with `sqlQuery:`, which is reserved for the aliases of `rr:sqlQuery` logical tables.
+- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive. Quote a column or table whose name is a keyword or one of the refused words below (`top`, `left`, `on`, `all`, ...): `WHERE "top" = 1`.
 - A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
 - The select list is the logical table's columns, as in R2RML. Every column the map reads (its term maps, and the parent columns of a join into it) must be in the list, or registration refuses the map. A column the list names must exist. `SELECT *` selects every column.
 - Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
@@ -577,7 +577,7 @@ Each literal is checked against the column's type in the schema of the snapshot 
 | boolean | `TRUE` or `FALSE` |
 | date, timestamp, time, binary, uuid, and other types | `IS [NOT] NULL` only (comparisons may be accepted by a later version) |
 
-A column the table does not have, or a literal that does not fit its column, fails the read with an error naming the column and its type. Nothing is approximated.
+A column the table does not have (or spells in another case), or a literal that does not fit its column, is refused with an error naming the map, the column and its type. Registration loads the tables the mapping reads and refuses such a mapping with HTTP `400`; [`r2rml/validate`](#schema-mismatch) reports the same message as an error before you save. A read checks again against the schema of the snapshot it reads, so a table changed after registration, or a table registration could not load, fails the read with that error instead. An empty table refuses such a filter too. Nothing is approximated.
 
 What else changes for a filtered map:
 
@@ -1291,6 +1291,17 @@ native twin of the same data):
   constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
   aggregates, and `GRAPH` blocks in a dataset query.
 
+A source read through a graph scope is filtered by its own policy (the
+request's and the source's model), whatever governs the graph the query
+reads by default. A graph scope reads a source only as a named graph of the
+query's dataset: name it in `from-named` (SPARQL: `FROM NAMED <iri>`) and use
+`GRAPH <iri>`, `VALUES ?g { <iri> }`, or an unbound `GRAPH ?g` ranging over
+the named graphs. A query over one ledger that reaches a source through a
+graph scope without naming it in the dataset does not read it, governed
+source or not: JSON-LD answers `400` `err:db/InvalidQuery` with that remedy,
+and a SPARQL query with `FROM` and no `FROM NAMED` answers no rows, as for
+any graph outside its dataset.
+
 Not supported: **`f:query`** policies. A virtual source has no graph to run the
 policy query against, so a targeted `f:query` evaluates as "no rows" and
 denies its targets — it never falls open. Relationship gates that join the
@@ -1411,13 +1422,13 @@ To try the Glue mode without an AWS account, `scripts/glue-local/` in the reposi
 
 ### Schema Mismatch
 
-Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
+Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables, except an [`rr:sqlQuery` row filter](#row-filters-rrsqlquery)'s, which it refuses when a table it loads does not accept it. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
 
 | `code` | `severity` | `message` |
 |---|---|---|
-| `compileError` | `error` | `R2RML mapping failed to compile: …` |
+| `compileError` | `error` | `R2RML mapping failed to compile: …`, or, for an [`rr:sqlQuery` row filter](#row-filters-rrsqlquery) registration would refuse, its refusal: ``triples map <…>: rr:sqlQuery condition `valid_from > '2024-01-01'`: column 'valid_from' is date; …`` |
 | `tableNotFound` | `error` | `Table 'sales.orders' referenced by TriplesMap <…> was not found in the live catalog schema.` When the catalog could not load the table, its reason follows in parentheses. |
-| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` |
+| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` A row filter naming a column the table does not have, or spells in another case, gets registration's message: `triples map <…>: rr:sqlQuery names column 'region', which table 'crm.customers_history' does not have` |
 | `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
 | `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
 | `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |

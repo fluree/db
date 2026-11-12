@@ -1,14 +1,13 @@
 //! A run of reads: what every document is read with (the client, model,
-//! ontology and catalog), and one document read, cut into calls and
-//! gathered back in the document's own offsets.
+//! ontology and catalog, what the answer holds), and one document read, cut
+//! into calls and gathered back in the document's own offsets.
 //!
 //! Shared by the `fluree` CLI and the Python package, so a document read
 //! from either is cut, sent, resent, cached and kept the same way.
 
-use super::client::{ReaderClient, Usage};
-use super::reading::{profile, read_answer, Frame, Vocabulary};
+use super::client::{Controls, Include, ReaderClient, Usage};
+use super::reading::{read_answer, Claim, Frame, Mention, Reading};
 use super::request::{self, Document, Limits, Part, PromptSize, Structure};
-use crate::vocab::{DOC_NS, NIF_NS};
 use crate::{DocCache, DocError, PreparedDocument, Result};
 use fluree_graph_ir::Graph;
 use serde_json::{json, Value};
@@ -24,17 +23,20 @@ pub struct Session {
     pub model: String,
     /// The cache mode sent with each call; `None` sends none.
     pub cache: Option<String>,
+    /// What each answer holds besides the facts.
+    pub include: Include,
     ontology: Graph,
     catalog: Graph,
     size: PromptSize,
-    vocabulary: Option<&'static Vocabulary>,
-    /// Answers kept by request body, so a rerun that sends the same
-    /// request is not read (or billed) twice.
+    /// Answers kept by request, so a rerun that sends the same request is
+    /// not read (or billed) twice.
     doc_cache: Option<DocCache>,
 }
 
 impl Session {
-    /// `cache` is checked against [`CACHE_MODES`]; `off` sends none.
+    /// `cache` is checked against [`CACHE_MODES`]; `off` sends none. Each
+    /// answer holds the claims and the mentions until [`Self::with_include`]
+    /// says otherwise.
     pub fn new(
         client: ReaderClient,
         model: &str,
@@ -60,21 +62,28 @@ impl Session {
             client,
             model: model.to_string(),
             cache: cache.filter(|c| c != "off"),
+            include: Include::default(),
             ontology,
             catalog,
             size,
-            vocabulary: profile(model).map(|p| &p.vocabulary),
             doc_cache,
         })
+    }
+
+    /// What each answer holds besides the facts.
+    pub fn with_include(mut self, include: Include) -> Self {
+        self.include = include;
+        self
     }
 
     pub fn ontology_terms(&self) -> usize {
         self.size.ontology_terms
     }
 
-    /// Hash of the model, ontology and catalog: what makes an earlier
-    /// reading of an unchanged document still current. An error rather
-    /// than a hash of nothing when a graph can't be written.
+    /// Hash of the model, ontology and catalog, and what the answer holds:
+    /// what makes an earlier reading of an unchanged document still
+    /// current. An error rather than a hash of nothing when a graph can't
+    /// be written.
     pub fn fingerprint(&self) -> Result<String> {
         let hash = |g: &Graph| -> Result<String> {
             Ok(crate::cache::sha256_hex(
@@ -83,8 +92,9 @@ impl Session {
         };
         Ok(crate::cache::sha256_hex(
             format!(
-                "reader|{}|{}|{}",
+                "reader|{}|{}|{}|{}",
                 self.model,
+                self.include.header(),
                 hash(&self.ontology)?,
                 hash(&self.catalog)?
             )
@@ -133,15 +143,29 @@ impl Session {
         Ok((structure, requests))
     }
 
-    /// Where an answer to `body` is cached. The endpoint is part of the
-    /// key: two readers serving one model name are two readers.
-    fn answer_key(&self, body: &str) -> String {
+    fn controls(&self, part: &Part) -> Controls {
+        Controls {
+            include: self.include,
+            windows: part.windows.clone(),
+        }
+    }
+
+    /// Where an answer to `body` asked with `controls` is cached. The
+    /// endpoint is part of the key: two readers serving one model name are
+    /// two readers. So is every header that shapes the answer.
+    fn answer_key(&self, body: &str, controls: &Controls) -> String {
+        let headers: Vec<String> = controls
+            .headers()
+            .into_iter()
+            .map(|(h, v)| format!("{h}={v}"))
+            .collect();
         DocCache::reading_key(
             &format!(
-                "reader|{}|{}|{}",
+                "reader|layout-2|{}|{}|{}|{}",
                 self.client.url(),
                 self.model,
-                self.cache.as_deref().unwrap_or("")
+                self.cache.as_deref().unwrap_or(""),
+                headers.join(";")
             ),
             body,
             &[],
@@ -158,10 +182,10 @@ impl Session {
         let (_, requests) = self.requests(doc, requests_to)?;
         let cached = requests
             .iter()
-            .filter(|(_, body)| {
+            .filter(|(part, body)| {
                 self.doc_cache
                     .as_ref()
-                    .and_then(|c| c.load_reading(&self.answer_key(body)))
+                    .and_then(|c| c.load_reading(&self.answer_key(body, &self.controls(part))))
                     .flatten()
                     .is_some()
             })
@@ -169,8 +193,8 @@ impl Session {
         Ok((requests.len(), cached))
     }
 
-    /// Read one parsed document: cut it into calls, read each, and gather
-    /// the answers in the document's own offsets. Blocking (the client is).
+    /// Read one parsed document: cut it into calls, read each, and move each
+    /// answer's offsets into the document's text. Blocking (the client is).
     /// `on_wait` hears each wait for capacity, prefixed with the document's
     /// path (and the call, when there are several). `requests_to` as in
     /// [`Session::plan`].
@@ -182,117 +206,170 @@ impl Session {
     ) -> Result<Read> {
         let (structure, requests) = self.requests(doc, requests_to)?;
         let parts = requests.len();
-        let mut read = Read {
-            calls: parts,
-            ..Default::default()
-        };
+        let mut read = Read::default();
         for (i, (part, body)) in requests.iter().enumerate() {
-            let key = self.answer_key(body);
+            let controls = self.controls(part);
+            let key = self.answer_key(body, &controls);
             let cached = self
                 .doc_cache
                 .as_ref()
                 .and_then(|c| c.load_reading(&key))
                 .flatten()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-            let (answer_body, release) = match cached {
-                Some(hit) => {
-                    read.cached += 1;
-                    (
-                        hit["body"].as_str().unwrap_or_default().to_string(),
-                        hit["release"].as_str().map(str::to_string),
-                    )
-                }
+            let frame = Frame {
+                doc_iri: &doc.doc_iri,
+                offset: part.begin,
+            };
+            let field = |v: &Value, k: &str| v[k].as_str().map(str::to_string);
+            let (mut reading, release, request_id, run, from_cache) = match cached {
+                Some(hit) => (
+                    read_answer(hit["body"].as_str().unwrap_or_default(), &frame)?,
+                    field(&hit, "release"),
+                    field(&hit, "request_id"),
+                    field(&hit, "run"),
+                    true,
+                ),
                 None => {
                     let label = if parts > 1 {
                         format!("{} (call {} of {parts})", doc.meta.relative_path, i + 1)
                     } else {
                         doc.meta.relative_path.clone()
                     };
-                    let answer =
-                        self.client
-                            .read(body, &self.model, self.cache.as_deref(), &|wait| {
-                                on_wait(&format!("{label}: {wait}"));
-                            })?;
+                    let answer = self.client.read(
+                        body,
+                        &self.model,
+                        self.cache.as_deref(),
+                        &controls,
+                        &|wait| on_wait(&format!("{label}: {wait}")),
+                    )?;
                     read.usage.add(&answer.usage);
                     for note in &answer.ontology_notes {
                         if !read.ontology_notes.contains(note) {
                             read.ontology_notes.push(note.clone());
                         }
                     }
+                    // Read before it is cached: an answer this can't read is
+                    // not kept to be refused again.
+                    let reading =
+                        read_answer(&answer.body, &frame).map_err(|e| with_request(e, &answer))?;
                     if let Some(c) = &self.doc_cache {
-                        let entry = json!({ "body": answer.body, "release": answer.release });
+                        let entry = json!({
+                            "body": answer.body,
+                            "release": answer.release,
+                            "request_id": answer.request_id,
+                            "run": answer.run,
+                        });
                         // A cache that cannot be written costs a rerun, not this run.
                         let _ = c.store_reading(&key, Some(&entry.to_string()));
                     }
-                    (answer.body, answer.release)
+                    (
+                        reading,
+                        answer.release,
+                        answer.request_id,
+                        answer.run,
+                        false,
+                    )
                 }
             };
-            if release.is_some() {
-                read.release = release;
+            if reading.run.is_none() {
+                reading.run = run;
             }
-            let frame = Frame {
-                doc_iri: &doc.doc_iri,
-                offset: part.begin,
-                part: i,
-                parts,
-            };
-            let reading = read_answer(&answer_body, &frame, self.vocabulary)?;
-            read.mentions += reading.mentions;
-            read.entities += reading.entities;
-            read.relations += reading.relations;
-            read.linked.extend(reading.linked);
-            let mut nodes = reading.nodes;
-            source_elements(&structure, &mut nodes);
-            read.nodes.extend(nodes);
+            reading.release = release;
+            reading.request_id = request_id;
+            reading.cached = from_cache;
+            for m in &mut reading.mentions {
+                if let (Some(b), Some(e)) = (m.begin, m.end) {
+                    m.element = structure.element_at(b, e).map(str::to_string);
+                }
+            }
+            read.readings.push(reading);
         }
         Ok(read)
     }
 }
 
-/// One document's reading.
+fn with_request(e: DocError, answer: &super::client::Answer) -> DocError {
+    match (&e, &answer.request_id) {
+        (DocError::Model(m), Some(id)) => DocError::Model(format!("{m} (request {id})")),
+        _ => e,
+    }
+}
+
+/// One document's reading: one transaction per call, in text order.
 #[derive(Debug, Default)]
 pub struct Read {
-    /// Expanded JSON-LD nodes, ready for the document's commit.
-    pub nodes: Vec<Value>,
-    pub mentions: usize,
-    pub entities: usize,
-    pub relations: usize,
-    /// Catalog records the reading links to.
-    pub linked: BTreeSet<String>,
+    pub readings: Vec<Reading>,
     pub usage: Usage,
-    /// Calls the document took, and how many of them a cached answer served.
-    pub calls: usize,
-    pub cached: usize,
-    /// The release that served, as the reader names it.
-    pub release: Option<String>,
     /// What the reader set aside or adapted in the ontology.
     pub ontology_notes: Vec<String>,
 }
 
-/// A mention (see [`super::reading::is_occurrence`]) gets
-/// `doc:sourceElement`, the element its span sits in, as the
-/// language-model path gives one.
-fn source_elements(structure: &Structure, nodes: &mut [Value]) {
-    let offset = |node: &Value, p: &str| {
-        let v = node
-            .get(format!("{NIF_NS}{p}"))?
-            .as_array()?
-            .first()?
-            .get("@value")?;
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            .map(|n| n as usize)
-    };
-    for node in nodes {
-        let is_mention = super::reading::is_occurrence(node);
-        let key = format!("{DOC_NS}sourceElement");
-        if !is_mention || node.get(&key).is_some() {
-            continue;
-        }
-        if let (Some(b), Some(e)) = (offset(node, "beginIndex"), offset(node, "endIndex")) {
-            if let Some(element) = structure.element_at(b, e) {
-                node[key] = json!([{ "@id": element }]);
-            }
-        }
+impl Read {
+    /// Calls the document took.
+    pub fn calls(&self) -> usize {
+        self.readings.len()
+    }
+
+    /// How many of them the reading cache answered.
+    pub fn cached(&self) -> usize {
+        self.readings.iter().filter(|r| r.cached).count()
+    }
+
+    /// The release that served the last call that names one.
+    pub fn release(&self) -> Option<&str> {
+        self.readings
+            .iter()
+            .rev()
+            .find_map(|r| r.release.as_deref())
+    }
+
+    pub fn mentions(&self) -> impl Iterator<Item = &Mention> {
+        self.readings.iter().flat_map(|r| r.mentions.iter())
+    }
+
+    pub fn claims(&self) -> impl Iterator<Item = &Claim> {
+        self.readings.iter().flat_map(|r| r.claims.iter())
+    }
+
+    /// Statements in the facts, claims aside, over every call.
+    pub fn facts(&self) -> usize {
+        self.readings.iter().map(|r| r.facts).sum()
+    }
+
+    /// Entities the runs minted.
+    pub fn new_entities(&self) -> BTreeSet<&str> {
+        self.readings
+            .iter()
+            .flat_map(|r| r.new_entities.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Catalog records the mentions link to.
+    pub fn linked(&self) -> BTreeSet<&str> {
+        self.readings
+            .iter()
+            .flat_map(|r| r.linked.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// One line per call: the run, the release and the endpoint's ID for
+    /// the call, as far as each is known.
+    pub fn run_lines(&self) -> Vec<String> {
+        self.readings
+            .iter()
+            .map(|r| {
+                let mut parts = vec![format!("run {}", r.run.as_deref().unwrap_or("(not named)"))];
+                if let Some(release) = &r.release {
+                    parts.push(format!("release {release}"));
+                }
+                if let Some(id) = &r.request_id {
+                    parts.push(format!("request {id}"));
+                }
+                if r.cached {
+                    parts.push("from cache".into());
+                }
+                parts.join(", ")
+            })
+            .collect()
     }
 }

@@ -14,6 +14,17 @@
 //! manifest `COUNT` shortcut, `/info` class counts, the trusted crawl's foreign
 //! key shortcut) decline for a filtered map instead, since no metadata knows
 //! which rows a filter keeps.
+//!
+//! [`check_query_map`] is every check a read makes of a map's query, as one
+//! function: the validate dry-run reports its refusal as a diagnostic, and
+//! registration refuses the mapping with it, against the schema an unpinned
+//! read of the table reads now
+//! ([`unpinned_read_schema`](super::r2rml::unpinned_read_schema)). The read
+//! checks again against the schema of the snapshot it reads
+//! ([`LogicalScan::resolve`], then [`LogicalScan::row_filter`]), since the
+//! table can change after registration and a mapping registered by an address
+//! that could not be read then was never checked. The three run the same
+//! checks over the same schema, so they cannot disagree.
 
 use std::sync::Arc;
 
@@ -21,8 +32,68 @@ use fluree_db_iceberg::metadata::{Schema, SchemaField};
 use fluree_db_iceberg::scan::{ComparisonOp, ExactPredicate, ExactRowFilter, LiteralValue};
 use fluree_db_r2rml::mapping::{
     CompiledR2rmlMapping, LogicalTable, RestrictedSelect, RowCmpOp, RowCondition, SqlLiteral,
-    UnsupportedSql,
+    TriplesMap, UnsupportedSql,
 };
+
+/// Why a triples map's `rr:sqlQuery` is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryRefusal {
+    /// What every surface reports: names the map, the query and the reason.
+    pub(crate) message: String,
+    /// The column the query names that the table does not have, when that is
+    /// the reason.
+    pub(crate) missing_column: Option<String>,
+}
+
+impl std::fmt::Display for QueryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl QueryRefusal {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            missing_column: None,
+        }
+    }
+
+    /// The same refusal, naming the triples map it is of.
+    fn of_map(self, tm: &TriplesMap) -> Self {
+        Self {
+            message: format!("triples map <{}>: {}", tm.iri, self.message),
+            ..self
+        }
+    }
+}
+
+/// Every check a read makes of triples map `tm`'s `rr:sqlQuery`, with the
+/// message a read would give, naming the map:
+///
+/// - the query is in the restricted subset;
+/// - its select list holds every column the map reads ([`check_select_list`]);
+/// - given `schema`, its `FROM` table's, every column it names exists, exactly
+///   as written, and each literal types against its column
+///   ([`LogicalScan::row_filter`]).
+///
+/// `schema` is `None` when the table could not be loaded; only the checks
+/// that need no schema run then. `Ok(None)` for a map over a table.
+pub(crate) fn check_query_map(
+    compiled: &CompiledR2rmlMapping,
+    tm: &TriplesMap,
+    schema: Option<&Schema>,
+) -> Result<Option<RestrictedSelect>, QueryRefusal> {
+    let Some(sql) = tm.sql_query() else {
+        return Ok(None);
+    };
+    let select = parse_restricted(sql).map_err(|e| QueryRefusal::other(e).of_map(tm))?;
+    check_select_list(compiled, tm, &select).map_err(QueryRefusal::other)?;
+    if let Some(schema) = schema {
+        typed_row_filter(&select, schema).map_err(|e| e.of_map(tm))?;
+    }
+    Ok(Some(select))
+}
 
 /// A logical table as an Iceberg source reads it: the table to scan, and the
 /// query that narrows it when the logical table is an `rr:sqlQuery`.
@@ -75,24 +146,36 @@ impl LogicalScan {
             .is_some_and(|select| !select.conditions.is_empty())
     }
 
-    /// The row filter typed against `schema`, or `None` when the logical table
-    /// keeps every row. Checks every column the query names, select list
-    /// included, so a query naming a column the table lacks is refused even
-    /// when it filters nothing.
-    pub(crate) fn row_filter(&self, schema: &Schema) -> Result<Option<ExactRowFilter>, String> {
-        let Some(select) = &self.select else {
-            return Ok(None);
-        };
-        for column in select.named_columns() {
-            field(schema, &select.table, column)?;
+    /// The row filter typed against `schema`, or `None` when the logical
+    /// table keeps every row. See [`typed_row_filter`].
+    pub(crate) fn row_filter(
+        &self,
+        schema: &Schema,
+    ) -> Result<Option<ExactRowFilter>, QueryRefusal> {
+        match &self.select {
+            Some(select) => typed_row_filter(select, schema),
+            None => Ok(None),
         }
-        let predicates = select
-            .conditions
-            .iter()
-            .map(|condition| typed_predicate(schema, &select.table, condition))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ExactRowFilter::new(predicates))
     }
+}
+
+/// `select`'s row filter typed against its table's `schema`, or `None` when
+/// it keeps every row. Checks every column the query names, select list
+/// included, so a query naming a column the table lacks is refused even when
+/// it filters nothing.
+fn typed_row_filter(
+    select: &RestrictedSelect,
+    schema: &Schema,
+) -> Result<Option<ExactRowFilter>, QueryRefusal> {
+    for column in select.named_columns() {
+        field(schema, &select.table, column)?;
+    }
+    let predicates = select
+        .conditions
+        .iter()
+        .map(|condition| typed_predicate(schema, &select.table, condition))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ExactRowFilter::new(predicates))
 }
 
 /// Parse `sql` as the restricted subset, with a message saying what an
@@ -112,21 +195,27 @@ pub(crate) fn unsupported_query_message(sql: &str, why: &UnsupportedSql) -> Stri
 }
 
 /// Refuse a mapping whose `rr:sqlQuery` logical tables are not all in the
-/// restricted subset, at registration rather than at first query. The columns
-/// and literal types are checked at scan time, against the schema of the
-/// snapshot being read.
+/// restricted subset, or whose select lists leave out a column their maps
+/// read: the checks of [`check_query_map`] that need no schema. Registration
+/// runs them before anything is stored, then the rest once it has loaded
+/// the tables.
 pub(crate) fn check_restricted_queries(compiled: &CompiledR2rmlMapping) -> Result<(), String> {
-    let mut maps: Vec<_> = compiled
-        .triples_maps
-        .values()
-        .filter_map(|tm| tm.sql_query().map(|sql| (tm.iri.as_str(), sql, tm)))
-        .collect();
-    maps.sort_unstable_by_key(|(iri, sql, _)| (*iri, *sql));
-    for (iri, sql, tm) in maps {
-        let select = parse_restricted(sql).map_err(|e| format!("triples map <{iri}>: {e}"))?;
-        check_select_list(compiled, tm, &select)?;
+    for tm in query_maps(compiled) {
+        check_query_map(compiled, tm, None).map_err(|e| e.message)?;
     }
     Ok(())
+}
+
+/// `compiled`'s `rr:sqlQuery` triples maps, by IRI, so the first refusal
+/// reported is always the same one.
+pub(crate) fn query_maps(compiled: &CompiledR2rmlMapping) -> Vec<&TriplesMap> {
+    let mut maps: Vec<&TriplesMap> = compiled
+        .triples_maps
+        .values()
+        .filter(|tm| tm.sql_query().is_some())
+        .collect();
+    maps.sort_unstable_by(|a, b| a.iri.cmp(&b.iri));
+    maps
 }
 
 /// Refuse a select list that leaves out a column the map reads.
@@ -136,7 +225,7 @@ pub(crate) fn check_restricted_queries(compiled: &CompiledR2rmlMapping) -> Resul
 /// name a column the query selects. `SELECT *` selects every column.
 fn check_select_list(
     compiled: &CompiledR2rmlMapping,
-    tm: &fluree_db_r2rml::mapping::TriplesMap,
+    tm: &TriplesMap,
     select: &RestrictedSelect,
 ) -> Result<(), String> {
     let Some(selected) = &select.columns else {
@@ -176,7 +265,11 @@ fn check_select_list(
 }
 
 /// The schema field `column` names, exactly as written.
-fn field<'s>(schema: &'s Schema, table: &str, column: &str) -> Result<&'s SchemaField, String> {
+fn field<'s>(
+    schema: &'s Schema,
+    table: &str,
+    column: &str,
+) -> Result<&'s SchemaField, QueryRefusal> {
     if let Some(field) = schema.field_by_name(column) {
         return Ok(field);
     }
@@ -192,23 +285,26 @@ fn field<'s>(schema: &'s Schema, table: &str, column: &str) -> Result<&'s Schema
             )
         })
         .unwrap_or_default();
-    Err(format!(
-        "rr:sqlQuery names column '{column}', which table '{table}' does not have{hint}"
-    ))
+    Err(QueryRefusal {
+        message: format!(
+            "rr:sqlQuery names column '{column}', which table '{table}' does not have{hint}"
+        ),
+        missing_column: Some(column.to_string()),
+    })
 }
 
 fn typed_predicate(
     schema: &Schema,
     table: &str,
     condition: &RowCondition,
-) -> Result<ExactPredicate, String> {
+) -> Result<ExactPredicate, QueryRefusal> {
     let field = field(schema, table, condition.column())?;
     if field.is_nested() {
-        return Err(format!(
+        return Err(QueryRefusal::other(format!(
             "rr:sqlQuery condition `{condition}`: '{}' is a nested column, which a row filter \
              cannot test",
             field.name
-        ));
+        )));
     }
     let (field_id, column) = (field.id, field.name.clone());
     Ok(match condition {
@@ -217,8 +313,9 @@ fn typed_predicate(
         RowCondition::Compare { op, value, .. } => ExactPredicate::Compare {
             field_id,
             op: comparison_op(*op),
-            value: typed_literal(field, value)
-                .map_err(|why| format!("rr:sqlQuery condition `{condition}`: {why}"))?,
+            value: typed_literal(field, value).map_err(|why| {
+                QueryRefusal::other(format!("rr:sqlQuery condition `{condition}`: {why}"))
+            })?,
             column,
         },
     })
@@ -355,6 +452,7 @@ mod tests {
         scan(sql)
             .row_filter(&schema())
             .map(|f| f.map(|f| f.predicates().to_vec()).unwrap_or_default())
+            .map_err(|e| e.message)
     }
 
     fn compare(

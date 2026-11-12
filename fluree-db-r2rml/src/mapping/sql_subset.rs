@@ -33,7 +33,7 @@
 
 use std::fmt;
 
-use super::LogicalTable;
+use super::{LogicalTable, SQL_QUERY_ALIAS_PREFIX};
 
 /// A parsed restricted `rr:sqlQuery`: see the [module docs](self).
 #[derive(Debug, Clone, PartialEq)]
@@ -349,33 +349,106 @@ fn quoted(
 
 /// Words that end a clause of the subset. A bare identifier spelling one is a
 /// keyword, never a column; quote the column to use such a name.
+///
+/// A bare word in a name's position that is one of these or a refused
+/// construct ([`refusal_for`]) is refused either way. Which message it gets
+/// depends on what follows it: followed as a name is ([`Name::follows`]), it
+/// is a column or table that needs quoting (`WHERE top = 1`); otherwise it is
+/// the construct (`SELECT TOP 5`, `SELECT DISTINCT a`).
 const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE",
 ];
 
 /// Constructs the subset refuses, with how to say what is meant instead. Matched
 /// by the upper-cased bare word where the parser expected something else.
+const REFUSED: &[(&[&str], &str)] = &[
+    (
+        &["OR"],
+        "OR is not supported: the WHERE clause must be a conjunction (AND) of conditions",
+    ),
+    (
+        &["NOT"],
+        "NOT is not supported except in IS NOT NULL; use the inverse comparison",
+    ),
+    (
+        &[
+            "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "ON", "USING",
+        ],
+        "joins are not supported: map each table with its own triples map and relate them \
+         with rr:parentTriplesMap",
+    ),
+    (&["GROUP", "HAVING"], "GROUP BY / HAVING are not supported"),
+    (&["ORDER"], "ORDER BY is not supported"),
+    (
+        &["LIMIT", "OFFSET", "FETCH", "TOP"],
+        "LIMIT / OFFSET are not supported",
+    ),
+    (
+        &["UNION", "INTERSECT", "EXCEPT", "MINUS"],
+        "set operations are not supported",
+    ),
+    (
+        &["DISTINCT", "ALL"],
+        "SELECT DISTINCT / ALL is not supported",
+    ),
+    (&["AS"], "aliases (AS) are not supported"),
+    (&["IN"], "IN lists are not supported"),
+    (
+        &["BETWEEN"],
+        "BETWEEN is not supported; write two comparisons joined by AND",
+    ),
+    (
+        &["LIKE", "ILIKE", "SIMILAR", "REGEXP", "RLIKE"],
+        "pattern matching is not supported",
+    ),
+    (
+        &["WITH"],
+        "WITH (common table expressions) is not supported",
+    ),
+    (
+        &["CASE", "CAST", "EXISTS"],
+        "expressions are not supported, only columns and literals",
+    ),
+];
+
 fn refusal_for(word: &str) -> Option<&'static str> {
-    Some(match word {
-        "OR" => "OR is not supported: the WHERE clause must be a conjunction (AND) of conditions",
-        "NOT" => "NOT is not supported except in IS NOT NULL; use the inverse comparison",
-        "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL" | "ON" | "USING" => {
-            "joins are not supported: map each table with its own triples map and relate them \
-             with rr:parentTriplesMap"
+    REFUSED
+        .iter()
+        .find(|(words, _)| words.contains(&word))
+        .map(|(_, refusal)| *refusal)
+}
+
+/// Which name the parser expects.
+#[derive(Debug, Clone, Copy)]
+enum Name {
+    Column,
+    Table,
+}
+
+impl Name {
+    fn describe(self) -> &'static str {
+        match self {
+            Name::Column => "a column name",
+            Name::Table => "a table name",
         }
-        "GROUP" | "HAVING" => "GROUP BY / HAVING are not supported",
-        "ORDER" => "ORDER BY is not supported",
-        "LIMIT" | "OFFSET" | "FETCH" | "TOP" => "LIMIT / OFFSET are not supported",
-        "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => "set operations are not supported",
-        "DISTINCT" | "ALL" => "SELECT DISTINCT / ALL is not supported",
-        "AS" => "aliases (AS) are not supported",
-        "IN" => "IN lists are not supported",
-        "BETWEEN" => "BETWEEN is not supported; write two comparisons joined by AND",
-        "LIKE" | "ILIKE" | "SIMILAR" | "REGEXP" | "RLIKE" => "pattern matching is not supported",
-        "WITH" => "WITH (common table expressions) is not supported",
-        "CASE" | "CAST" | "EXISTS" => "expressions are not supported, only columns and literals",
-        _ => return None,
-    })
+    }
+
+    /// Whether `next`, the token after a bare word in this name's position,
+    /// is one that follows such a name: an operator, `,`, `.`, `FROM` or `IS`
+    /// after a column; `.`, `;`, `WHERE` or the end after a table.
+    fn follows(self, next: Option<&Token>) -> bool {
+        let keyword = next.and_then(Token::keyword);
+        match self {
+            Name::Column => {
+                matches!(next, Some(Token::Op(_) | Token::Comma | Token::Dot))
+                    || matches!(keyword.as_deref(), Some("FROM" | "IS"))
+            }
+            Name::Table => {
+                matches!(next, None | Some(Token::Dot | Token::Semicolon))
+                    || keyword.as_deref() == Some("WHERE")
+            }
+        }
+    }
 }
 
 struct Parser {
@@ -424,12 +497,18 @@ impl Parser {
     }
 
     /// An identifier that is not a keyword (or any quoted identifier).
-    fn identifier(&mut self, what: &str) -> Result<String, UnsupportedSql> {
+    fn identifier(&mut self, name: Name) -> Result<String, UnsupportedSql> {
+        let what = name.describe();
         match self.peek() {
             Some(Token::Ident { text, quoted }) => {
-                let is_keyword = !quoted && KEYWORDS.contains(&text.to_ascii_uppercase().as_str());
-                let is_refused = !quoted && refusal_for(&text.to_ascii_uppercase()).is_some();
-                if is_keyword || is_refused {
+                if !quoted && is_clause_word(text) {
+                    // Used as a name, it is a name that needs quoting, not
+                    // the construct the word spells.
+                    if name.follows(self.tokens.get(self.pos + 1)) {
+                        return Err(UnsupportedSql::new(format!(
+                            "{text} is a reserved word; to use it as {what}, quote it: \"{text}\""
+                        )));
+                    }
                     return Err(self.unexpected(what));
                 }
                 if text.is_empty() {
@@ -447,7 +526,7 @@ impl Parser {
 
     /// A column reference: one identifier, not qualified by a table.
     fn column(&mut self) -> Result<String, UnsupportedSql> {
-        let column = self.identifier("a column name")?;
+        let column = self.identifier(Name::Column)?;
         if self.peek() == Some(&Token::Dot) {
             return Err(UnsupportedSql::new(format!(
                 "qualified column references ('{column}.…') are not supported; name the column \
@@ -523,14 +602,24 @@ impl Parser {
                 "table aliases are not supported; name the table alone",
             ));
         }
-        Ok(LogicalTable::normalize_table_name(&parts.join(".")))
+        let table = LogicalTable::normalize_table_name(&parts.join("."));
+        // Readers tell an `rr:sqlQuery` map's alias from a table by this
+        // prefix, so a FROM table spelled with it would be taken for an alias,
+        // as an `rr:tableName` would (the loader refuses that too).
+        if LogicalTable::is_sql_query_alias(&table) {
+            return Err(UnsupportedSql::new(format!(
+                "table \"{table}\" begins with \"{SQL_QUERY_ALIAS_PREFIX}\", which is reserved \
+                 for the aliases of rr:sqlQuery logical tables"
+            )));
+        }
+        Ok(table)
     }
 
     fn table_part(&mut self) -> Result<String, UnsupportedSql> {
         if self.peek() == Some(&Token::Other('(')) {
             return Err(UnsupportedSql::new("subqueries are not supported"));
         }
-        let part = self.identifier("a table name")?;
+        let part = self.identifier(Name::Table)?;
         if part.contains('.') {
             return Err(UnsupportedSql::new(format!(
                 "table name part \"{part}\" contains '.', which cannot be told apart from a \
@@ -749,6 +838,86 @@ mod tests {
         let parsed = parse("SELECT * FROM t WHERE a <= -0.050 AND b = 'o''k' AND c IS NOT NULL");
         let shown: Vec<String> = parsed.conditions.iter().map(ToString::to_string).collect();
         assert_eq!(shown, vec!["a <= -0.050", "b = 'o''k'", "c IS NOT NULL"]);
+    }
+
+    /// A bare word that spells a keyword or a refused construct is never a
+    /// name. Where it is used as one it is refused with how to quote it, not
+    /// with the construct's message; where it starts the construct it gets the
+    /// construct's. Every such word, in every name position.
+    #[test]
+    fn a_reserved_word_used_as_a_name_says_to_quote_it() {
+        let words = KEYWORDS
+            .iter()
+            .chain(REFUSED.iter().flat_map(|(words, _)| words.iter()));
+        for upper in words {
+            for word in [upper.to_string(), upper.to_ascii_lowercase()] {
+                for sql in [
+                    format!("SELECT * FROM t WHERE {word} = 1"),
+                    format!("SELECT * FROM t WHERE a = 1 AND {word} <> 'x'"),
+                    format!("SELECT * FROM t WHERE {word} IS NULL"),
+                    format!("SELECT {word}, a FROM t"),
+                    format!("SELECT a, {word} FROM t"),
+                    format!("SELECT * FROM {word}"),
+                    format!("SELECT * FROM {word} WHERE a = 1"),
+                    format!("SELECT * FROM {word}.t"),
+                    format!("SELECT * FROM ns.{word};"),
+                ] {
+                    let message = refusal(&sql);
+                    assert!(
+                        message.contains(&format!("quote it: \"{word}\"")),
+                        "{sql}: {message}"
+                    );
+                }
+                // Quoted, it is the name.
+                let quoted = parse(&format!(
+                    "SELECT \"{word}\" FROM \"{word}\" WHERE \"{word}\" = 1"
+                ));
+                assert_eq!(quoted.table, word);
+                assert_eq!(quoted.conditions[0].column(), word);
+            }
+        }
+        // Where the word starts its construct, the construct is named.
+        for (sql, needle) in [
+            ("SELECT TOP 5 * FROM t", "LIMIT / OFFSET"),
+            ("SELECT DISTINCT a FROM t", "DISTINCT"),
+            ("SELECT ALL a FROM t", "DISTINCT / ALL"),
+            ("SELECT * FROM t WHERE NOT a = 1", "NOT is not supported"),
+            (
+                "SELECT * FROM t WHERE a = 1 AND NOT b IS NULL",
+                "NOT is not supported",
+            ),
+            ("SELECT CASE WHEN a = 1 THEN 1 END FROM t", "expressions"),
+            ("SELECT * FROM t WHERE EXISTS (SELECT 1)", "expressions"),
+            ("SELECT FROM t", "expected a column name, found 'FROM'"),
+        ] {
+            let message = refusal(sql);
+            assert!(message.contains(needle), "{sql}: {message}");
+            assert!(!message.contains("quote it"), "{sql}: {message}");
+        }
+    }
+
+    /// Readers tell an `rr:sqlQuery` map's alias from a table by its prefix,
+    /// so a FROM table spelled with it is refused, as an `rr:tableName` is.
+    #[test]
+    fn a_from_table_with_the_alias_prefix_is_refused() {
+        for sql in [
+            "SELECT * FROM \"sqlQuery:x\"",
+            "SELECT * FROM \"sqlQuery:0123456789abcdef\" WHERE a = 1",
+            "SELECT * FROM \"sqlQuery:x\".t",
+            "SELECT * FROM \"sqlQuery:x/t\"",
+        ] {
+            let message = refusal(sql);
+            assert!(
+                message.contains("reserved for the aliases of rr:sqlQuery"),
+                "{sql}: {message}"
+            );
+        }
+        // Not a prefix of the table: an ordinary table.
+        assert_eq!(
+            parse("SELECT * FROM ns.\"sqlQuery:x\"").table,
+            "ns.sqlQuery:x"
+        );
+        assert_eq!(parse("SELECT * FROM \"SQLQUERY:x\"").table, "SQLQUERY:x");
     }
 
     #[test]

@@ -260,6 +260,11 @@ pub struct ExecutionContext<'a> {
     /// When present, scan operators should use this for per-leaf batch filtering
     /// via `filter_flakes`. This provides full f:query support without deadlocks.
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is: the query's primary
+    /// (a ledger or a graph source) when the caller resolves policy per
+    /// graph, `None` when it does not. A graph-source scan outside a dataset
+    /// reads this context's policy only when it is that source's own.
+    pub policy_source: Option<Arc<str>>,
     /// Optional BM25 index provider for `Pattern::IndexSearch` (legacy, returns raw index)
     pub bm25_provider: Option<&'a dyn Bm25IndexProvider>,
     /// Optional BM25 search provider for `Pattern::IndexSearch` (preferred, returns search results)
@@ -408,6 +413,11 @@ pub struct ExecutionContext<'a> {
     /// by an EXACT `rr:class` match and a subclass-entailed subject would be
     /// silently dropped. Defaults to `false` (no reasoning).
     pub reasoning_active: bool,
+    /// The reasoning materialization's translated overlay ops, shared across
+    /// the queries reading it (see [`crate::reasoning_ops`]). Set with
+    /// `reasoning_active` when the query has derived facts; propagated across
+    /// per-graph derivations, which use it only while reading its overlay.
+    pub reasoning_ops: Option<crate::reasoning_ops::ReasoningOpsHandle>,
     /// The snapshot this context was originally constructed from.
     ///
     /// Equal to `active_snapshot` in the common single-graph case. In per-graph
@@ -520,6 +530,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000, // Default batch size
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -550,6 +561,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -584,6 +596,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -614,6 +627,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -652,6 +666,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -682,6 +697,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -709,6 +725,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -739,6 +756,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -765,6 +783,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -795,6 +814,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -823,6 +843,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -853,6 +874,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -1600,6 +1622,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1630,6 +1653,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
@@ -1667,6 +1691,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1697,6 +1722,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
@@ -1730,6 +1756,12 @@ impl<'a> ExecutionContext<'a> {
                 .policy_enforcer
                 .clone()
                 .or_else(|| self.policy_enforcer.clone()),
+            // A graph's own enforcer is built for that graph.
+            policy_source: if graph.policy_enforcer.is_some() {
+                Some(Arc::clone(&graph.ledger_id))
+            } else {
+                self.policy_source.clone()
+            },
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1760,6 +1792,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             // A fresh per-graph scope: dataset members are stamped at the
             // member boundary by their owning `DatasetOperator`, and the
@@ -1863,6 +1896,12 @@ impl<'a> ExecutionContext<'a> {
     /// Force eager materialization of binary-scan bindings.
     pub fn with_eager_materialization(mut self) -> Self {
         self.eager_materialization = true;
+        self
+    }
+
+    /// See [`reasoning_ops`](Self::reasoning_ops).
+    pub fn with_reasoning_ops(mut self, ops: crate::reasoning_ops::ReasoningOpsHandle) -> Self {
+        self.reasoning_ops = Some(ops);
         self
     }
 
