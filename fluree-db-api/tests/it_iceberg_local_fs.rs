@@ -43,6 +43,7 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
 //! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
 //! cp -r /tmp/fluree-local-iceberg/silver/versions fluree-db-api/tests/fixtures/iceberg/silver/versions
+//! cp -r /tmp/fluree-local-iceberg/silver/tombstones fluree-db-api/tests/fixtures/iceberg/silver/tombstones
 //! ```
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
@@ -3898,6 +3899,81 @@ async fn a_filtered_first_scan_keeps_the_whole_file_list() {
         sparql_window_ids(&fluree, from, "").await,
         id_range(1, 3000)
     );
+}
+
+const TOMBSTONES_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Tombstones>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.tombstones" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
+"#;
+
+/// With a delete convention and no ordering column, a materialize pass keeps
+/// the last row it reads for each subject, so it must read the source's files
+/// in commit order. `silver.tombstones` commits 200,000 live revisions of
+/// subjects 1..=10 in one large file, then subject 7's tombstone in a one-row
+/// file. Read in commit order the tombstone is applied last and subject 7 is
+/// retracted; read as the reads finish (the materialize read before this
+/// branch), the small file tends to be read first, and the large file's later
+/// live rows resurrect the subject. Five fresh materializations must all
+/// retract it and keep the other nine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tombstone_committed_after_a_large_file_retracts_its_subject() {
+    allow_fixture_roots();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/tombstones",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("tomb", &location, TOMBSTONES_R2RML)
+                .with_mapping_media_type("text/turtle")
+                .with_delete_convention(fluree_db_api::DeleteConvention {
+                    column: "op".to_string(),
+                    deleted_values: vec![Some("d".to_string())],
+                }),
+        )
+        .await
+        .expect("create the tombstones graph source");
+
+    let mut runs = Vec::new();
+    for run in 0..5 {
+        let target = format!("tomb_native_{run}:main");
+        fluree.create_ledger(&target).await.expect("target ledger");
+        fluree
+            .materialize_r2rml_graph_source("tomb:main", &target, true)
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let result = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s FROM <{target}> WHERE {{ ?s <http://example.org/name> ?n }}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let mut people: Vec<i64> = result["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings: {result}"))
+            .iter()
+            .map(|b| person_number(b["s"]["value"].as_str().expect("an IRI")))
+            .collect();
+        people.sort_unstable();
+        people.dedup();
+        runs.push(people);
+    }
+    let want: Vec<i64> = (1..=10).filter(|&id| id != 7).collect();
+    for (run, people) in runs.iter().enumerate() {
+        assert_eq!(people, &want, "run {run}: subject 7 is retracted");
+    }
 }
 
 /// Every scan records its file selection on `iceberg.scan_plan`, a scan
