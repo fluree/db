@@ -1222,3 +1222,130 @@ async fn a_slice_that_seeds_nothing_is_read_once() {
          update docs/graph-sources/overview.md when this changes"
     );
 }
+
+/// An R2RML mapping produces no edge annotations: it has no term map for one,
+/// and a native ledger refuses a user-written `f:reifies*` triple, so a ledger
+/// loaded with the mapping's triples holds none either. An annotation pattern
+/// therefore matches nothing over a graph source, in a sub-select or not,
+/// inside the source's scope or beside the user's own graph block, on both
+/// surfaces, as it matches nothing on the twin. An ungrouped `COUNT` makes
+/// the empty match visible as a 0, and the same count without the annotation
+/// counts every order, so the 0 is the annotation's.
+#[tokio::test]
+async fn annotation_patterns_match_nothing_over_a_graph_source() {
+    let fluree = setup().await;
+    let count_of = |rows: &[String]| -> String {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows[0].clone()
+    };
+
+    // SPARQL: the annotation tail `{| … |}` and the reifier form.
+    for (what, inner, expected) in [
+        ("plain", "?o ex:customer ?c", "k=200"),
+        (
+            "annotation tail",
+            "?o ex:customer ?c {| ex:since ?d |}",
+            "k=0",
+        ),
+        (
+            "reifier",
+            "?r rdf:reifies <<( ?o ex:customer ?c )>> . ?r ex:since ?d",
+            "k=0",
+        ),
+    ] {
+        let rows = sparql_agrees(
+            &fluree,
+            &format!("SPARQL sub-select, {what}"),
+            &format!(
+                "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                 SELECT ?k FROM <{{G}}> WHERE {{ {{ SELECT (COUNT(?o) AS ?k) WHERE {{ {inner} }} }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(count_of(&rows), expected, "SPARQL sub-select, {what}");
+        let rows = sparql_agrees(
+            &fluree,
+            &format!("SPARQL, {what}"),
+            &format!(
+                "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                 SELECT (COUNT(?o) AS ?k) FROM <{{G}}> WHERE {{ {inner} }}"
+            ),
+        )
+        .await;
+        assert_eq!(count_of(&rows), expected, "SPARQL, {what}");
+    }
+
+    // JSON-LD: `@annotation` on the edge, and `@reifies` naming it.
+    let ungrouped = |inner: Value| {
+        json!({
+            "@context": ctx(),
+            "from": "{G}",
+            "select": ["?k"],
+            "where": [["query", {
+                "@context": ctx(),
+                "select": ["(as (count ?o) ?k)"],
+                "where": inner
+            }]]
+        })
+    };
+    for (what, inner, expected) in [
+        ("plain", json!({"@id": "?o", "ex:customer": "?c"}), "[200]"),
+        (
+            "@annotation",
+            json!({"@id": "?o", "ex:customer": {"@id": "?c", "@annotation": {"ex:since": "?d"}}}),
+            "[0]",
+        ),
+        (
+            "@reifies",
+            json!({"@id": "?r", "@reifies": {"@id": "?o", "ex:customer": {"@id": "?c"}}, "ex:since": "?d"}),
+            "[0]",
+        ),
+    ] {
+        let rows = jsonld_agrees(
+            &fluree,
+            &format!("JSON-LD sub-select, {what}"),
+            &ungrouped(inner),
+        )
+        .await;
+        assert_eq!(count_of(&rows), expected, "JSON-LD sub-select, {what}");
+    }
+
+    // Beside the user's own graph block on the source's handle, the body reads
+    // the default view, which holds no annotation either: it is evaluated, not
+    // refused, and counts 0.
+    let graph = fluree.graph(LAKE);
+    let rows = graph
+        .query()
+        .with_r2rml()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?n ?k WHERE {{ GRAPH <{LAKE}> {{ ?c ex:name ?n }} \
+             {{ SELECT (COUNT(?o) AS ?k) WHERE {{ ?o ex:customer ?x {{| ex:since ?d |}} }} }} }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("SPARQL: an annotation body outside the graph block");
+    let rows = rows_of(&rows);
+    assert_eq!(rows.len(), 50, "{rows:?}");
+    assert!(rows.iter().all(|r| r.starts_with("k=0 ")), "{rows:?}");
+    let rows = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&json!({
+            "@context": ctx(),
+            "select": ["?n", "?k"],
+            "where": [
+                ["graph", LAKE, {"@id": "?c", "ex:name": "?n"}],
+                ["query", {
+                    "@context": ctx(),
+                    "select": ["(as (count ?o) ?k)"],
+                    "where": {"@id": "?o", "ex:customer": {"@id": "?x", "@annotation": {"ex:since": "?d"}}}
+                }]
+            ]
+        }))
+        .execute_formatted()
+        .await
+        .expect("JSON-LD: an annotation body outside the graph block");
+    let rows = jsonld_rows(&rows);
+    assert_eq!(rows.len(), 50, "{rows:?}");
+    assert!(rows.iter().all(|r| r.ends_with(",0]")), "{rows:?}");
+}
