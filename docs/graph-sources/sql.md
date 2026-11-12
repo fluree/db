@@ -496,6 +496,16 @@ refused, and every map without a declared key answers with set semantics.
 A source registered before the probe recorded the keys it verified keeps
 trusting every table it did not flag; run `fluree sql check` to record them.
 
+Registration and `fluree sql check` name each map no key proves
+subject-unique: the response's `diagnostics` holds a `keylessMap` advisory
+per map (`fluree sql map` and `check` print them), with the `f:key` that
+would prove it. Statements over such a map carry `DISTINCT`, or decline to
+the per-scan lane, so a `COUNT` or a star over it costs more than over a
+keyed map. If an upgrade made such queries slower, see
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade).
+An endpoint unreachable at registration gets no advisories; `check` reports
+them once it succeeds.
+
 **Not pushed** in the per-scan lane: `ORDER BY … LIMIT` (a NULL in a key or
 required column would consume `LIMIT` slots for rows the mapping drops) and
 joins between triples maps, which run in the engine.

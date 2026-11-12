@@ -541,6 +541,76 @@ Table and column names are not checked when the source is mapped. A table or col
 
 ### Slow Queries
 
+#### A map with no key (most likely after an upgrade)
+
+**Symptom.** After upgrading to a version that answers over the set of
+triples a mapping defines, queries over a graph source got slower or heavier:
+
+- a `COUNT`, `SUM`, `AVG` or `GROUP BY` reads the table where it used to
+  answer from table metadata or fold rows directly;
+- a same-subject star (`?s ex:name ?n ; ex:city ?c`) runs as one scan per
+  predicate joined on the subject, where it used to read each row once;
+- an `ORDER BY … LIMIT` reads every data file where it used to stop early;
+- the query's memory use grows with the number of distinct solutions it has
+  seen, and a query that ran close to the
+  [query memory budget](../api/errors.md#507-insufficient-storage) now fails
+  with `MemoryBudgetExceeded` (HTTP `507`).
+
+**Cause.** No key proves the map's subjects unique, so its queries remove
+repeated solutions as they read (see
+[Declaring a Table's Keys](#declaring-a-tables-keys-fkey)). That is what
+makes their answers right where rows repeat: before, each row that repeated
+a triple returned it again. A mapping written or generated without `f:key`,
+over an Iceberg table whose writer set no identifier fields, has no key, so
+most maps take this path after the upgrade, including maps over tables whose
+rows never repeat.
+
+**Which maps.** Mapping a source reports each such map: the response to
+`POST /iceberg/map`, `POST /delta/map` and `POST /sql/map` (and to
+`fluree iceberg map`, `fluree delta map`, `fluree sql map` and
+`fluree sql check`) carries an advisory per map, and so do the dry runs
+(`POST /iceberg/r2rml/validate`, `fluree delta validate`) and the mapping
+generators:
+
+```text
+advisory: sales.customers: TriplesMap <http://example.org/mapping#Customer>: no key of its logical table 'sales.customers' lies within its subject's columns (customer_id), and it has no known key, so queries over it remove repeated solutions as they run. … If customer_id identifies a row, declare `f:key ( "customer_id" )` on its logical table, or make it the table's identifier field.
+```
+
+In JSON the advisory is `{"severity": "advisory", "code": "keylessMap", "table": …, "message": …}`.
+It is informational: the source is registered and answers correctly.
+
+**Which lane a query took.** Each R2RML scan stamps the routing decision
+`r2rml_scan_proven_distinct` on the `fluree::fastpath` tracing target:
+`proceed` when every map it reads is proven unique (no deduplication),
+`fallback:gate_declined` when it deduplicates, and `fallback:kill_switch`
+when fast paths are disabled (`FLUREE_DISABLE_QUERY_FAST_PATHS`, which
+deduplicates everything). A fused aggregate that deduplicates stamps
+`fused_r2rml_aggregate_dedupe`. To see them, run the server with
+`RUST_LOG=info,fluree::fastpath=debug`, or the CLI with
+`RUST_LOG=fluree::fastpath=debug fluree --verbose query …`:
+
+```text
+DEBUG fluree::fastpath: fast-path outcome site="r2rml_scan_proven_distinct" outcome="fallback:gate_declined"
+```
+
+With `fluree_db_query=debug` as well, each deduplication set reports its
+size and memory when it is released (`R2RML scan: deduplication set
+released`, with `solutions`, `charged_bytes` and `peak_bytes`).
+
+**Fix.** If the columns the subject is built from identify a row, say so:
+declare `f:key ( "customer_id" )` on the map's logical table, or, on an
+Iceberg table of format version 1 to 3, make those columns its identifier
+fields. The map then reads its rows straight through again, as fast as
+before. On a history table whose key holds only for the current rows,
+declare it on an `rr:sqlQuery` that selects them. A SQL source's
+registration probe records a key it verified (`fluree sql check` re-runs
+it). Declare only a key the table's writer keeps: Fluree trusts it and does
+not check the data. If the rows do repeat the map's triples, the
+deduplication is what makes the answer right; narrow the query, or raise
+the query memory budget.
+
+#### Other causes
+
 **Causes:**
 - Large result sets (many Parquet files scanned)
 - No partition pruning

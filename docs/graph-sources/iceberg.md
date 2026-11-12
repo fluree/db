@@ -1426,6 +1426,7 @@ Mapping a source compiles the R2RML mapping (a mapping that does not parse or co
 | `columnNotFound` | `error` | `f:key on 'sales.orders' names column 'order_key', which the table does not have.` A declared key's column, checked as a query checks it (see [R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)). |
 | `casingMismatch` | `error` | `f:key on 'sales.orders' names column 'ORDER_ID', which the schema spells 'order_id'; a key column must match exactly.` |
 | `nonKeyTypeSkipped` | `error` | `f:key on 'sales.orders' names column 'score' of type Float64; a floating-point value cannot identify a row (NaN is unequal to itself).` Also for a nested column. |
+| `keylessMap` | `advisory` | `TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, so queries over it remove repeated solutions as they run. …` One per map that neither an `f:key` nor the table's identifier fields prove subject-unique; it names the `f:key` that would. Informational: queries answer correctly, but more slowly (see [R2RML → Slow Queries](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Registration (`POST /iceberg/map`, `fluree iceberg map`) reports the same advisories in its `diagnostics`. |
 
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 
@@ -1436,6 +1437,15 @@ At query time a column the table does not have is read like a NULL: the triples 
 Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
+
+**After an upgrade, a `COUNT`, a same-subject star or an `ORDER BY … LIMIT`
+got slower, or a query now fails with `MemoryBudgetExceeded`.** The most
+likely cause is a map with no key: neither an `f:key` nor the table's
+identifier fields prove its subjects unique, so its queries remove repeated
+solutions as they read. Registration and `POST /iceberg/r2rml/validate` name
+each such map (`keylessMap`). See
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)
+for how to confirm it per query and how to declare the key.
 
 **Causes:**
 - Large result sets
