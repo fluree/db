@@ -1417,20 +1417,6 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// A FILTER, BIND or UNWIND with no embedded pattern (EXISTS, pattern
-/// comprehension): its result depends on the row alone, not on the graph it is
-/// evaluated in.
-fn reads_only_its_row(pattern: &Pattern) -> bool {
-    let expr = match pattern {
-        Pattern::Filter(expr) | Pattern::Bind { expr, .. } => expr,
-        Pattern::Unwind { list, .. } => list,
-        _ => return false,
-    };
-    let mut embeds_patterns = false;
-    expr.for_each_embedded_patterns(&mut |_| embeds_patterns = true);
-    !embeds_patterns
-}
-
 /// Try to nest a deferred pattern into a compound pattern's inner lists.
 ///
 /// Returns `true` if the pattern was nested, `false` if the pattern is not
@@ -1444,12 +1430,12 @@ fn reads_only_its_row(pattern: &Pattern) -> bool {
 /// variables need the intersection check.
 ///
 /// For Graph and Service the deferred pattern is nested only when it reads
-/// nothing but its row ([`reads_only_its_row`]): the body runs against another
-/// graph or endpoint, and a pattern nested there would read that one instead of
-/// its own group's.
+/// nothing but its row ([`Pattern::reads_dataset`]): the body runs against
+/// another graph or endpoint, and a pattern nested there would read that one
+/// instead of its own group's.
 fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool {
     if matches!(compound, Pattern::Graph { .. } | Pattern::Service(_))
-        && !reads_only_its_row(&deferred.pattern)
+        && deferred.pattern.reads_dataset()
     {
         return false;
     }
@@ -6184,6 +6170,20 @@ mod tests {
                 patterns: vec![Pattern::Triple(make_pattern(s, "knows", o))],
                 negated: true,
             }),
+            Pattern::Filter(Expression::gt(
+                Expression::call(
+                    Function::Fulltext,
+                    vec![
+                        Expression::Var(VarId(2)),
+                        Expression::Const(FlakeValue::String("rust".into())),
+                    ],
+                ),
+                Expression::Const(FlakeValue::Long(0)),
+            )),
+            Pattern::Bind {
+                var: o,
+                expr: Expression::call(Function::Labels, vec![Expression::Var(s)]),
+            },
         ];
         let body = || vec![Pattern::Triple(make_pattern(s, "age", VarId(2)))];
         let containers = [
