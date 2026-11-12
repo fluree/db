@@ -1417,6 +1417,20 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
+/// A FILTER, BIND or UNWIND with no embedded pattern (EXISTS, pattern
+/// comprehension): its result depends on the row alone, not on the graph it is
+/// evaluated in.
+fn reads_only_its_row(pattern: &Pattern) -> bool {
+    let expr = match pattern {
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } => expr,
+        Pattern::Unwind { list, .. } => list,
+        _ => return false,
+    };
+    let mut embeds_patterns = false;
+    expr.for_each_embedded_patterns(&mut |_| embeds_patterns = true);
+    !embeds_patterns
+}
+
 /// Try to nest a deferred pattern into a compound pattern's inner lists.
 ///
 /// Returns `true` if the pattern was nested, `false` if the pattern is not
@@ -1429,8 +1443,16 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
 /// parent scope and available inside each branch, so only the UNION-specific
 /// variables need the intersection check.
 ///
-/// For Graph and Service the deferred pattern is nested unconditionally.
+/// For Graph and Service the deferred pattern is nested only when it reads
+/// nothing but its row ([`reads_only_its_row`]): the body runs against another
+/// graph or endpoint, and a pattern nested there would read that one instead of
+/// its own group's.
 fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool {
+    if matches!(compound, Pattern::Graph { .. } | Pattern::Service(_))
+        && !reads_only_its_row(&deferred.pattern)
+    {
+        return false;
+    }
     match compound {
         Pattern::Union(branches) => {
             let produced_in_every_branch = branches
@@ -6146,6 +6168,48 @@ mod tests {
                 sp.patterns.iter().any(is_filter),
                 "Service inner patterns should contain the filter"
             );
+        }
+    }
+
+    #[test]
+    fn graph_reading_patterns_stay_outside_a_preceding_graph_or_service() {
+        use crate::ir::{ServiceEndpoint, ServicePattern};
+
+        let (s, o) = (VarId(0), VarId(1));
+        let reads_a_graph = [
+            Pattern::NotExists(vec![Pattern::Triple(make_pattern(s, "knows", o))]),
+            Pattern::Exists(vec![Pattern::Triple(make_pattern(s, "knows", o))]),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(s, "knows", o))]),
+            Pattern::Filter(Expression::Exists {
+                patterns: vec![Pattern::Triple(make_pattern(s, "knows", o))],
+                negated: true,
+            }),
+        ];
+        let body = || vec![Pattern::Triple(make_pattern(s, "age", VarId(2)))];
+        let containers = [
+            Pattern::Graph {
+                name: GraphName::Iri(Arc::from("http://example.org/g")),
+                patterns: body(),
+            },
+            Pattern::Service(ServicePattern::new(
+                false,
+                ServiceEndpoint::Iri(Arc::from("fluree:ledger:mydb:main")),
+                body(),
+            )),
+        ];
+
+        for container in &containers {
+            for pattern in &reads_a_graph {
+                let reordered =
+                    reorder_patterns(&[container.clone(), pattern.clone()], None, &HashSet::new());
+                assert_eq!(reordered.len(), 2, "{reordered:?}");
+                let inner = match &reordered[0] {
+                    Pattern::Graph { patterns, .. } => patterns,
+                    Pattern::Service(sp) => &sp.patterns,
+                    other => panic!("container should stay first: {other:?}"),
+                };
+                assert_eq!(inner.len(), 1, "nested into the container: {reordered:?}");
+            }
         }
     }
 

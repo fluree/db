@@ -1277,3 +1277,55 @@ async fn optional_exists_reuses_partial_keys_across_batches() {
         normalize_rows(&json!([["ex:p2", "ex:orgB"], ["ex:p3", null]]))
     );
 }
+
+/// A group's NOT EXISTS reads the group's graph wherever a `GRAPH` block sits
+/// in it.
+#[tokio::test]
+async fn not_exists_reads_the_default_graph_after_a_graph_block() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, "negation/after-graph:main"))
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.com/> .
+               ex:alice a ex:Person ; ex:knows ex:bob .
+               ex:bob a ex:Person .
+               ex:carol a ex:Person .
+               GRAPH ex:g { ex:note ex:label "anything" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let graph = "GRAPH ex:g { ?n ex:label ?l }";
+    let people = "?p a ex:Person . FILTER(?p != ex:alice)";
+    let negation = "FILTER NOT EXISTS { ex:alice ex:knows ?p }";
+    let in_an_expression = "FILTER(?p = ex:nobody || NOT EXISTS { ex:alice ex:knows ?p })";
+    let minus = "MINUS { ex:alice ex:knows ?p }";
+    for body in [
+        format!("{people} {negation} {graph}"),
+        format!("{graph} {people} {negation}"),
+        format!("{people} {graph} {negation}"),
+        format!("{graph} {people} {in_an_expression}"),
+        format!("{graph} {people} {minus}"),
+    ] {
+        let query = format!("PREFIX ex: <http://example.com/> SELECT ?p WHERE {{ {body} }}");
+        let rows = support::query_sparql_formatted(&fluree, &ledger, &query)
+            .await
+            .expect("query");
+        assert_eq!(rows, json!([["ex:carol"]]), "{query}");
+    }
+    let jsonld = json!({
+        "@context": ctx_ex(),
+        "select": ["?p"],
+        "where": [
+            ["graph", "ex:g", {"@id": "?n", "ex:label": "?l"}],
+            {"@id": "?p", "@type": "ex:Person"},
+            ["filter", "(!= ?p ex:alice)"],
+            ["not-exists", {"@id": "ex:alice", "ex:knows": {"@id": "?p"}}]
+        ]
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &jsonld)
+        .await
+        .expect("query");
+    assert_eq!(rows, json!([["ex:carol"]]), "{jsonld}");
+}
