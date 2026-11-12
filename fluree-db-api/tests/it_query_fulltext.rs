@@ -2173,3 +2173,247 @@ async fn fulltext_configured_through_jsonld_node_graph() {
     let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, ["ex:doc1"], "{hits:?}");
 }
+
+// =============================================================================
+// `fulltext()` under a policy
+// =============================================================================
+
+/// An indexed ledger with `ex:title` declared in `f:fullTextDefaults`,
+/// `ex:content` typed `@fulltext`, and a reader whose policy class holds
+/// `view_policy`.
+async fn policed_fulltext_ledger(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    view_policy: JsonValue,
+) -> support::MemoryLedger {
+    use fluree_db_api::ReindexOptions;
+
+    let ledger = support::genesis_ledger_for_fluree(fluree, ledger_id);
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [{
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "@type": "f:LedgerConfig",
+                    "@graph": format!("urn:fluree:{ledger_id}#config"),
+                    "f:fullTextDefaults": {
+                        "@type": "f:FullTextDefaults",
+                        "f:defaultLanguage": "en",
+                        "f:property": [
+                            { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } }
+                        ]
+                    }
+                }]
+            }),
+        )
+        .await
+        .expect("write config")
+        .ledger;
+    let fulltext = |text: &str| json!({ "@value": text, "@type": "@fulltext" });
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [
+                    { "@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "graph databases make relationship queries fast",
+                      "ex:content": fulltext("graph databases make relationship queries fast") },
+                    { "@id": "ex:doc2", "@type": "ex:Doc", "ex:title": "time series databases store ordered data",
+                      "ex:content": fulltext("time series databases store ordered data") },
+                    { "@id": "ex:doc3", "@type": "ex:Doc", "ex:title": "a graph of graph algorithms",
+                      "ex:content": fulltext("a graph of graph algorithms") },
+                    { "@id": "ex:reader", "f:policyClass": [{ "@id": "ex:ReaderPolicy" }] },
+                    view_policy
+                ]
+            }),
+        )
+        .await
+        .expect("insert docs");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+    assert!(loaded.index_t() > 0, "the documents must be indexed");
+    loaded
+}
+
+fn allow_every_read() -> JsonValue {
+    json!({
+        "@id": "ex:allow-all",
+        "@type": ["f:AccessPolicy", "ex:ReaderPolicy"],
+        "f:action": [{ "@id": "f:view" }],
+        "f:allow": true
+    })
+}
+
+fn hide_doc3() -> JsonValue {
+    json!({
+        "@id": "ex:all-but-doc3",
+        "@type": ["f:AccessPolicy", "ex:ReaderPolicy"],
+        "f:action": [{ "@id": "f:view" }],
+        "f:query": {
+            "@value": "{\"where\": [[\"filter\", \"(!= ?$this <http://example.org/doc3>)\"]]}",
+            "@type": "http://www.w3.org/2001/XMLSchema#string"
+        }
+    })
+}
+
+enum Surface {
+    JsonLd,
+    Sparql,
+}
+
+/// `(id, score)` of every document `fulltext()` scores above zero for
+/// "graph" on `property`, best first, read as `ex:reader` when `as_reader`.
+/// `joined` adds a class pattern, so the scored value is reached by a join.
+async fn graph_hits(
+    fluree: &support::MemoryFluree,
+    ledger: &support::MemoryLedger,
+    property: &str,
+    surface: Surface,
+    joined: bool,
+    as_reader: bool,
+) -> Vec<(String, f64)> {
+    let mut db = support::graphdb_from_ledger(ledger);
+    if as_reader {
+        let opts = fluree_db_api::GovernanceOptions {
+            identity: Some("http://example.org/reader".to_string()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        db = fluree.wrap_policy(db, &opts).await.expect("wrap policy");
+    }
+    let result = match surface {
+        Surface::JsonLd => {
+            let mut pattern = json!({ "@id": "?id", property: "?text" });
+            if joined {
+                pattern["@type"] = json!("ex:Doc");
+            }
+            let query = json!({
+                "@context": fulltext_context(),
+                "select": ["?id", "?score"],
+                "where": [
+                    pattern,
+                    ["bind", "?score", "(fulltext ?text \"graph\")"],
+                    ["filter", "(> ?score 0)"]
+                ],
+                "orderBy": [["desc", "?score"]]
+            });
+            fluree.query(&db, &query).await
+        }
+        Surface::Sparql => {
+            let class = if joined { "a ex:Doc ;" } else { "" };
+            let query = format!(
+                "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#> \
+                 SELECT ?id ?score WHERE {{ ?id {class} {property} ?text \
+                 BIND(f:fulltext(?text, \"graph\") AS ?score) FILTER(?score > 0) }} \
+                 ORDER BY DESC(?score)"
+            );
+            fluree.query(&db, query.as_str()).await
+        }
+    }
+    .expect("fulltext query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().expect("id").to_string(),
+                row[1].as_f64().expect("score"),
+            )
+        })
+        .collect()
+}
+
+async fn assert_reader_scores_match_unrestricted(surface: fn() -> Surface, ledger_id: &str) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = policed_fulltext_ledger(&fluree, ledger_id, allow_every_read()).await;
+    let ledger = assert_reader_matches(&fluree, ledger, &surface, &["ex:doc3", "ex:doc1"]).await;
+
+    let with_novelty = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@id": "ex:doc4",
+                "@type": "ex:Doc",
+                "ex:title": "graph graph graph",
+                "ex:content": { "@value": "graph graph graph", "@type": "@fulltext" }
+            }),
+        )
+        .await
+        .expect("insert unindexed doc")
+        .ledger;
+    assert_reader_matches(
+        &fluree,
+        with_novelty,
+        &surface,
+        &["ex:doc4", "ex:doc3", "ex:doc1"],
+    )
+    .await;
+}
+
+async fn assert_reader_matches(
+    fluree: &support::MemoryFluree,
+    ledger: support::MemoryLedger,
+    surface: &fn() -> Surface,
+    expected_ids: &[&str],
+) -> support::MemoryLedger {
+    for property in ["ex:title", "ex:content"] {
+        for joined in [false, true] {
+            let unrestricted =
+                graph_hits(fluree, &ledger, property, surface(), joined, false).await;
+            let ids: Vec<&str> = unrestricted.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(
+                ids, expected_ids,
+                "{property} joined={joined}: {unrestricted:?}"
+            );
+            let as_reader = graph_hits(fluree, &ledger, property, surface(), joined, true).await;
+            assert_eq!(as_reader, unrestricted, "{property} joined={joined}");
+        }
+    }
+    ledger
+}
+
+/// A reader who may read everything gets the scores an unrestricted request
+/// gets, on a configured property and on a `@fulltext` value.
+#[tokio::test]
+async fn fulltext_scores_under_an_allow_all_policy() {
+    assert_reader_scores_match_unrestricted(|| Surface::JsonLd, "it/fulltext-policy-jsonld:main")
+        .await;
+}
+
+#[tokio::test]
+async fn fulltext_sparql_scores_under_an_allow_all_policy() {
+    assert_reader_scores_match_unrestricted(|| Surface::Sparql, "it/fulltext-policy-sparql:main")
+        .await;
+}
+
+async fn assert_hidden_document_is_not_a_hit(surface: fn() -> Surface, ledger_id: &str) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = policed_fulltext_ledger(&fluree, ledger_id, hide_doc3()).await;
+    for property in ["ex:title", "ex:content"] {
+        for joined in [false, true] {
+            let hits = graph_hits(&fluree, &ledger, property, surface(), joined, true).await;
+            let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(ids, ["ex:doc1"], "{property} joined={joined}: {hits:?}");
+        }
+    }
+}
+
+/// A document the policy hides is not a hit; the ones it shows still score.
+#[tokio::test]
+async fn fulltext_under_a_policy_omits_a_hidden_document() {
+    assert_hidden_document_is_not_a_hit(|| Surface::JsonLd, "it/fulltext-policy-hide-jsonld:main")
+        .await;
+}
+
+#[tokio::test]
+async fn fulltext_sparql_under_a_policy_omits_a_hidden_document() {
+    assert_hidden_document_is_not_a_hit(|| Surface::Sparql, "it/fulltext-policy-hide-sparql:main")
+        .await;
+}
