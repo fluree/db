@@ -41,7 +41,7 @@
 //! that cell rather than dropping the entire row.
 
 use super::config::{FormatterConfig, OutputFormat};
-use super::datatype::may_print_bare;
+use super::datatype::{ill_typed_json_literal, json_document, may_print_bare};
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
@@ -2243,12 +2243,11 @@ impl<'a> HydrationFormatter<'a> {
 
         // Special handling for @json datatype: deserialize the JSON string.
         // Accept both Json and String variants (see jsonld.rs for rationale).
+        // Text that is not JSON is written as the typed literal it is.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })
+                    Ok(json_document(json_str).unwrap_or_else(|| ill_typed_json_literal(json_str)))
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2379,17 +2378,18 @@ impl<'a> HydrationFormatter<'a> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
 
-        // @json datatype: deserialize and wrap with @type
+        // @json datatype: deserialize and wrap with @type; text that is not
+        // JSON as the typed literal it is.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    let json_val: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })?;
-                    Ok(json!({
-                        "@value": json_val,
-                        "@type": "@json"
-                    }))
+                    Ok(match json_document(json_str) {
+                        Some(json_val) => json!({
+                            "@value": json_val,
+                            "@type": "@json"
+                        }),
+                        None => ill_typed_json_literal(json_str),
+                    })
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2534,12 +2534,13 @@ impl<'a> HydrationFormatter<'a> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
 
+        // The document, or text that is not JSON as that text; `@type`
+        // beside it names the datatype.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })
+                    Ok(json_document(json_str)
+                        .unwrap_or_else(|| JsonValue::String(json_str.clone())))
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),

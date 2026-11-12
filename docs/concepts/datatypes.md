@@ -263,7 +263,7 @@ Two consequences are worth knowing:
 - **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
 - **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
 
-`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written, and it reads back as typed text (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
 
 Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
 
@@ -474,9 +474,11 @@ allows, so a dataset from elsewhere loads in one pass: the literal is stored
 with its text and its datatype and reads back exactly as written, with its
 datatype (in JSON-LD results, `{"@value": "300", "@type": "xsd:byte"}`), but
 it is not a date or a number, so it never equals one. An `rdf:JSON` literal
-that is not JSON is kept as written too, but a query that returns it fails
-with "Invalid JSON in @json value". An `f:embeddingVector` literal that is
-not a vector fails the import, as it fails a transaction.
+that is not JSON is kept as written too, and reads back as the typed literal
+it is, not as JSON: `"not json"^^rdf:JSON` in SPARQL results and RDF text,
+`{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`
+in JSON-LD. An `f:embeddingVector` literal that is not a vector fails the
+import, as it fails a transaction.
 
 To remove a stored one, bind it through a variable, or replace the
 property's values with an [upsert](../transactions/upsert.md) or a

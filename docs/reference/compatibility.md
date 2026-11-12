@@ -611,7 +611,7 @@ A typed literal whose lexical form is not in its datatype's lexical space, such 
 
 Bulk import (`fluree create --from`, `fluree graph import`) still keeps such a literal as text under its datatype, so data that carries one can be loaded as written that way. A ledger that holds an ill-typed literal keeps it, reads it back with its datatype, and can delete it through a variable ([Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)).
 
-JSON-LD results (a select and a graph crawl) print such a stored literal with its `@type`: `{"@value": "landed", "@type": "xsd:integer"}`. Under a datatype JSON-LD infers from a JSON number or boolean (`xsd:integer`, `xsd:double`, `xsd:boolean`, …) it used to print as a bare string, which reads back as an `xsd:string`.
+JSON-LD results (a select and a graph crawl) print such a stored literal with its `@type`: `{"@value": "landed", "@type": "xsd:integer"}`. Under a datatype JSON-LD infers from a JSON number or boolean (`xsd:integer`, `xsd:double`, `xsd:boolean`, …) it used to print as a bare string, which reads back as an `xsd:string`. An `rdf:JSON` literal whose text is not JSON prints the same way, `{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`, in JSON-LD, typed JSON and agent JSON results; a query returning one used to fail with "Invalid JSON in @json value". A valid JSON literal prints as before.
 
 #### Bulk import stored wrong `rdf:JSON` and `xsd:duration` values (data integrity)
 

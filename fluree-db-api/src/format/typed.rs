@@ -16,6 +16,7 @@
 //! - IRIs are compacted using @context
 
 use super::config::FormatterConfig;
+use super::datatype::{ill_typed_json_literal, json_document};
 use super::iri::IriCompactor;
 use super::json_write::{push_bool, push_f64, push_i64, push_json_string, push_value};
 use super::{materialize, FormatError, Result};
@@ -321,14 +322,15 @@ fn write_lit(
             push_json_string(out, &dt_iri);
             out.push('}');
         }
-        FlakeValue::Json(json_str) => {
-            let json_val: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-            })?;
-            out.push_str(r#"{"@value":"#);
-            push_value(out, &json_val)?;
-            out.push_str(r#","@type":"@json"}"#);
-        }
+        FlakeValue::Json(json_str) => match json_document(json_str) {
+            Some(json_val) => {
+                out.push_str(r#"{"@value":"#);
+                push_value(out, &json_val)?;
+                out.push_str(r#","@type":"@json"}"#);
+            }
+            // Text that is not JSON, as the typed literal it is.
+            None => push_value(out, &ill_typed_json_literal(json_str))?,
+        },
         FlakeValue::Null => out.push_str("null"),
         FlakeValue::Ref(_) => {
             return Err(FormatError::InvalidBinding(
@@ -440,16 +442,15 @@ pub(crate) fn format_binding(
                     "@value": v,
                     "@type": dt_iri
                 })),
-                FlakeValue::Json(json_str) => {
-                    // @json datatype: deserialize for output
-                    let json_val: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })?;
-                    Ok(json!({
+                // @json datatype: deserialize for output; text that is not
+                // JSON as the typed literal it is.
+                FlakeValue::Json(json_str) => Ok(match json_document(json_str) {
+                    Some(json_val) => json!({
                         "@value": json_val,
                         "@type": "@json"
-                    }))
-                }
+                    }),
+                    None => ill_typed_json_literal(json_str),
+                }),
                 FlakeValue::Null => Ok(JsonValue::Null),
                 FlakeValue::Ref(_) => {
                     // This should never happen due to Binding invariant
