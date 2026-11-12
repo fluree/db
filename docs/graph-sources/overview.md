@@ -259,7 +259,7 @@ A graph source has no native RDF index. Its triples are materialized per query f
 
 A query using one against a graph source returns **HTTP 400 `err:db/InvalidQuery`**, naming the pattern kind. The refusal is deliberate: these patterns would otherwise read the graph source's empty native index and return a wrong answer as a success — nothing at all for `p+`, and the starting node alone for `p*` and `p?`. Unquantified alternation (`a|b`) and inverse (`^p`) are unaffected; they lower to ordinary triple patterns and run normally.
 
-Sub-selects are evaluated, with one exception and one cost to know about: see [Sub-selects over a Graph Source](#sub-selects-over-a-graph-source).
+Sub-selects are evaluated, with one exception and one cost to know about: see [Sub-selects over a Graph Source](#sub-selects-over-a-graph-source). So is an `EXISTS` in the `WHERE` clause; one in `HAVING` or `ORDER BY` is refused (see [EXISTS over a Graph Source](#exists-over-a-graph-source)).
 
 **Workaround: bounded fixed-length paths.** Sequence paths do lower to table scans, so a traversal whose maximum depth you know can be written as a union of explicit hops:
 
@@ -351,6 +351,27 @@ SELECT ?name ?orders WHERE {
 ```
 
 Dropping the explicit `GRAPH` block works as well: the whole query, sub-select included, is then scoped to the source.
+
+### EXISTS over a Graph Source
+
+An `EXISTS` or `NOT EXISTS` in the `WHERE` clause reads the graph source wherever it sits: as a pattern (`FILTER EXISTS { … }`, JSON-LD `["exists", …]`), inside an expression (`BIND(EXISTS { … } AS ?b)`, `FILTER(EXISTS { … } || …)`, a JSON-LD compound `filter` such as `["or", ["exists", …], …]`), or in a sub-select's `HAVING` or `ORDER BY`. Its body lowers to table scans like the rest of the scope.
+
+A query's own `HAVING` and `ORDER BY` run after the `WHERE` clause, outside the graph source's scope. So do the expressions a query evaluates after a trailing `VALUES` block: its `GROUP BY` expressions, aggregate inputs and `SELECT` expressions. An `EXISTS` there would read the source's empty native index, where every `EXISTS` is false. A query with one is refused with **HTTP 400 `err:db/InvalidQuery`** naming `EXISTS outside the WHERE clause`, with or without a `GRAPH` block of its own. Move the condition into the `WHERE` clause:
+
+```sparql
+# Refused: the EXISTS is in HAVING
+SELECT ?c (COUNT(?o) AS ?orders) FROM <warehouse-orders:main> WHERE {
+  ?o ex:customer ?c
+} GROUP BY ?c HAVING (EXISTS { ?c ex:name ?name })
+
+# Correct: the same condition as a FILTER in WHERE
+SELECT ?c (COUNT(?o) AS ?orders) FROM <warehouse-orders:main> WHERE {
+  ?o ex:customer ?c
+  FILTER EXISTS { ?c ex:name ?name }
+} GROUP BY ?c
+```
+
+To order by an `EXISTS`, `BIND` it to a variable in the `WHERE` clause and order by that variable.
 
 ### Search Indexes (BM25, Vector)
 

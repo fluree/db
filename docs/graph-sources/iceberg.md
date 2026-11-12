@@ -1299,6 +1299,13 @@ triples map a scan skipped because its predicates were hidden.
    A sub-select outside every `GRAPH` block whose body reads the default view
    is refused; see [A sub-select outside every GRAPH
    block](overview.md#a-sub-select-outside-every-graph-block).
+7. **An `EXISTS` after the `WHERE` clause is refused:** an `EXISTS` in the
+   query's own `HAVING` or `ORDER BY`, or in an expression evaluated after a
+   trailing `VALUES`, runs outside the source's scope and is refused with HTTP
+   400 `err:db/InvalidQuery`. Move the condition into the `WHERE` clause as a
+   `FILTER` or `BIND`; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source). An `EXISTS` inside the
+   `WHERE` clause, in a pattern or an expression, scans the tables normally.
 
 ### Environment switches
 

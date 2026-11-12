@@ -388,6 +388,9 @@ An R2RML graph source is *virtual* — every query re-reads the underlying table
    outer rows reads its tables once per outer row, and a sub-select outside
    every `GRAPH` block whose body reads the default view is refused; see
    [Sub-selects over a Graph Source](overview.md#sub-selects-over-a-graph-source).
+   An `EXISTS` in the `WHERE` clause scans the tables too, while one in the
+   query's own `HAVING` or `ORDER BY` is refused; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source).
 5. **One object map per predicate on a projected scan:** when a query names a
    predicate, the scan reads the first `rr:predicateObjectMap` of the triples
    map that carries it. A second predicate-object map for the same predicate
