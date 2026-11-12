@@ -302,16 +302,15 @@ impl PartialParentIndex {
             keys = keys.len(),
             "R2RML parent: reading the rows of a window's join keys"
         );
-        let mut stream = provider
-            .scan_table(
-                graph_source_id,
-                &self.source.parent_table,
-                &self.source.projection,
-                &filters,
-                None,
-                parent_as_of_t(ctx),
-            )
-            .await?;
+        let mut stream = scan_for_lookup(
+            provider,
+            graph_source_id,
+            &self.source.parent_table,
+            &self.source.projection,
+            &filters,
+            parent_as_of_t(ctx),
+        )
+        .await?;
         loop {
             ctx.check_cancelled()?;
             let Some(batch) = stream.next().await else {
@@ -359,6 +358,33 @@ fn key_set_filter(column: &str, mut values: Vec<String>) -> crate::r2rml::ScanFi
             ),
         }
     }
+}
+
+/// Read a table whose rows are folded into a structure that holds the same
+/// contents whatever order the rows arrive in: a parent lookup (keep-min on a
+/// duplicate key), a dimension map, a semi-join key set. Such a read owes no
+/// row order, so it asks for [`ScanOrder::Any`] and each data file is folded
+/// as its read finishes, even inside a sliced query. The query's own row order
+/// comes from its main scan, never from these reads.
+pub(crate) async fn scan_for_lookup(
+    provider: &dyn super::R2rmlTableProvider,
+    graph_source_id: &str,
+    table_name: &str,
+    projection: &[String],
+    filters: &[crate::r2rml::ScanFilter],
+    as_of_t: Option<i64>,
+) -> Result<ColumnBatchStream> {
+    provider
+        .scan_table_ordered(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            None,
+            as_of_t,
+            ScanOrder::Any,
+        )
+        .await
 }
 
 /// The `as_of_t` a parent table is read at.
@@ -2019,16 +2045,15 @@ impl R2rmlScanOperator {
         source: &ParentSource,
         lookup_key: &LookupCacheKey,
     ) -> Result<Arc<CompleteParentLookup>> {
-        let stream = provider
-            .scan_table(
-                &self.pattern.graph_source_id,
-                &source.parent_table,
-                &source.projection,
-                &[],
-                None,
-                parent_as_of_t(ctx),
-            )
-            .await?;
+        let stream = scan_for_lookup(
+            provider,
+            &self.pattern.graph_source_id,
+            &source.parent_table,
+            &source.projection,
+            &[],
+            parent_as_of_t(ctx),
+        )
+        .await?;
         let lookup =
             Arc::new(build_parent_lookup(ctx, parent_tm, &source.parent_cols, stream).await?);
         if self.parent_memo && lookup.len() <= materialize_window_rows() {
@@ -5179,6 +5204,9 @@ mod tests {
             /// key, not only the keys' rows. Replaces `customers` and `files`.
             customer_files: Option<Vec<Vec<(i64, i64)>>>,
             scans: Mutex<Vec<(String, Vec<ScanFilter>)>>,
+            /// The order each read through `scan_table_ordered` asked for; a
+            /// read through plain `scan_table` records nothing here.
+            orders: Mutex<Vec<(String, crate::r2rml::ScanOrder)>>,
         }
         impl Tables {
             fn new(cust_ids: Vec<i64>, customers: Vec<i64>) -> Self {
@@ -5190,6 +5218,7 @@ mod tests {
                     files: None,
                     customer_files: None,
                     scans: Mutex::new(Vec::new()),
+                    orders: Mutex::new(Vec::new()),
                 }
             }
             fn with_files(mut self, files: Vec<(i64, i64)>) -> Self {
@@ -5289,6 +5318,31 @@ mod tests {
                     selected,
                     pruned: files.len() as u64 - selected,
                 }))
+            }
+
+            async fn scan_table_ordered(
+                &self,
+                graph_source_id: &str,
+                table_name: &str,
+                projection: &[String],
+                filters: &[ScanFilter],
+                topk: Option<&crate::r2rml::ScanTopK>,
+                as_of_t: Option<i64>,
+                order: crate::r2rml::ScanOrder,
+            ) -> Result<ColumnBatchStream> {
+                self.orders
+                    .lock()
+                    .unwrap()
+                    .push((table_name.to_string(), order));
+                self.scan_table(
+                    graph_source_id,
+                    table_name,
+                    projection,
+                    filters,
+                    topk,
+                    as_of_t,
+                )
+                .await
             }
 
             async fn scan_table(
@@ -5459,6 +5513,52 @@ mod tests {
                 whole.iter().all(|(_, c)| c.ends_with('1')),
                 "keep-min binds the smaller subject: {whole:?}"
             );
+        }
+
+        /// A parent read, by key or whole, folds into a lookup that holds the
+        /// same contents in any read order, so it asks for no order, while the
+        /// main scan of a sliced query keeps its fixed order. Every `customers`
+        /// read goes through `scan_table_ordered` with `ScanOrder::Any`.
+        #[test]
+        fn parent_reads_ask_for_no_order() {
+            use crate::r2rml::ScanOrder;
+            let cust_ids = vec![90, 3, 3, 91, 7, 1, 2, 90, 5, 6, 4, 1];
+            let mut probed = false;
+            let mut whole = false;
+            for (budget, key_pushdown) in [
+                (Some(2), true),
+                (None, true),
+                (Some(2), false),
+                (None, false),
+            ] {
+                let tables = Tables::new(cust_ids.clone(), (1..=7).collect());
+                run(&tables, budget, key_pushdown);
+                let scans = customer_scans(&tables);
+                probed |= scans.iter().any(|(_, f)| !f.is_empty());
+                whole |= scans.iter().any(|(_, f)| f.is_empty());
+                let orders = tables.orders.lock().unwrap().clone();
+                let parent: Vec<ScanOrder> = orders
+                    .iter()
+                    .filter(|(t, _)| t == "customers")
+                    .map(|(_, o)| *o)
+                    .collect();
+                assert_eq!(
+                    parent,
+                    vec![ScanOrder::Any; scans.len()],
+                    "LIMIT {budget:?}, key pushdown {key_pushdown}: every parent read asks \
+                     for no order"
+                );
+                let main: Vec<ScanOrder> = orders
+                    .iter()
+                    .filter(|(t, _)| t == "orders")
+                    .map(|(_, o)| *o)
+                    .collect();
+                assert!(
+                    !main.is_empty() && main.iter().all(|o| *o == ScanOrder::Deterministic),
+                    "LIMIT {budget:?}: the main scan keeps its fixed order: {orders:?}"
+                );
+            }
+            assert!(probed && whole, "both a probe and a whole read were made");
         }
 
         /// Under `LIMIT 2` the parent is read for the keys of the first two

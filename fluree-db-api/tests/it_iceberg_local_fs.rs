@@ -5103,29 +5103,12 @@ fn person_number(iri: &str) -> i64 {
         .unwrap_or_else(|| panic!("not a person IRI: {iri}"))
 }
 
-/// A client paging an unordered graph-source query with LIMIT/OFFSET (no ORDER
-/// BY) sees the pages partition the answer: one execution after another, a
-/// sliced query emits the table's files smallest first (ties in commit order),
-/// whatever order the file reads finish in.
-///
-/// `people_paged` is five 600-row commits, one data file each, ids ascending
-/// in commit order, so the deterministic order is each commit's persons in
-/// order, the commits taken by data-file size (read here from the table's own
-/// files, and checked to differ from commit order).
-///
-/// A query with no slice cannot observe its order, so it may stream files as
-/// their reads finish: it is checked for its rows only. A crawl pages subjects
-/// itself (an OFFSET with no LIMIT reaches its flat query as no slice), so it
-/// asks for the deterministic order explicitly. The materialize read keeps
-/// commit order, persons 1..=3000.
-#[tokio::test]
-async fn unordered_pages_partition_a_multi_file_answer() {
-    allow_fixture_roots();
-    let staging =
-        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
-    let table_dir = staging.path().join("people_paged");
-    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
-
+/// The persons of `people_paged` (or a table written the same way: five
+/// 600-row commits, one data file each, ids ascending in commit order) in the
+/// order a sliced scan emits them: the commits taken by data-file size, ties
+/// in commit order, each commit's persons in order. Read from the table's own
+/// files, and checked to differ from commit order.
+fn paged_scan_order(table_dir: &std::path::Path) -> Vec<i64> {
     // Each commit's data file, in commit order: the snapshot with sequence
     // number n names its manifest list `snap-<id>-<n>-<uuid>.avro`, and
     // pyiceberg names that commit's data file `<…>-<uuid>.parquet`.
@@ -5186,13 +5169,39 @@ async fn unordered_pages_partition_a_multi_file_answer() {
         "the fixture's sizes must not already be in commit order, or size order and commit \
          order are indistinguishable: {commit_files:?}"
     );
-    let everyone: Vec<i64> = by_size
+    by_size
         .iter()
         .flat_map(|&c| {
             let lo = i64::try_from(c).expect("commit") * 600 + 1;
             lo..lo + 600
         })
-        .collect();
+        .collect()
+}
+
+/// A client paging an unordered graph-source query with LIMIT/OFFSET (no ORDER
+/// BY) sees the pages partition the answer: one execution after another, a
+/// sliced query emits the table's files smallest first (ties in commit order),
+/// whatever order the file reads finish in.
+///
+/// `people_paged` is five 600-row commits, one data file each, ids ascending
+/// in commit order, so the deterministic order is each commit's persons in
+/// order, the commits taken by data-file size (read here from the table's own
+/// files, and checked to differ from commit order).
+///
+/// A query with no slice cannot observe its order, so it may stream files as
+/// their reads finish: it is checked for its rows only. A crawl pages subjects
+/// itself (an OFFSET with no LIMIT reaches its flat query as no slice), so it
+/// asks for the deterministic order explicitly. The materialize read keeps
+/// commit order, persons 1..=3000.
+#[tokio::test]
+async fn unordered_pages_partition_a_multi_file_answer() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+
+    let everyone = paged_scan_order(&table_dir);
 
     let fluree = FlureeBuilder::memory().build_memory();
     let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
@@ -5413,4 +5422,154 @@ async fn unordered_grouped_pages_are_the_same_on_every_execution() {
         runs[0], runs[1],
         "two fresh instances page the groups alike"
     );
+}
+
+/// `people_paged` references `people_window` twice. `ex:peer` joins by
+/// `score` (`id % 100`), so each key sits on 30 parent rows spread over all
+/// five files and the join keeps the smallest `peer` IRI. `ex:twin` joins by
+/// `id`: one parent row per key, in files of disjoint `id` ranges.
+const PAGED_REFERENCES_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_paged" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:peer ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Peer> ;
+                rr:joinCondition [ rr:child "score" ; rr:parent "score" ]
+            ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:twin ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Twin> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Peer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/peer/{id}" ] .
+
+    <http://example.org/mapping#Twin>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/twin/{id}" ] .
+"#;
+
+/// A paged unordered query over a referencing map returns the same pages on
+/// every execution, on SPARQL and JSON-LD. The parent's reads ask for no order
+/// (they fold into a lookup whose contents do not depend on it), so the rows
+/// come in the child's sliced scan order, each with its keep-min parent, and
+/// the pages partition exactly that answer in two fresh instances. `ex:peer`
+/// reads the parent whole (every file holds every key); `ex:twin` reads it by
+/// the keys of each page's rows.
+#[tokio::test]
+async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution() {
+    allow_fixture_roots();
+    let silver = fixtures_dir().join("silver");
+    let order = paged_scan_order(&silver.join("people_paged"));
+    let root = format!("file://{}", silver.display());
+    let parent = |kind: &str, id: i64| format!("http://example.org/{kind}/{id}");
+    let mut keep_min: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for id in 1..=3000 {
+        let iri = parent("peer", id);
+        let kept = keep_min.entry(id % 100).or_insert_with(|| iri.clone());
+        if iri < *kept {
+            *kept = iri;
+        }
+    }
+    let expected = |predicate: &str| -> Vec<(String, String)> {
+        order
+            .iter()
+            .map(|&id| {
+                let object = if predicate == "peer" {
+                    keep_min[&(id % 100)].clone()
+                } else {
+                    parent("twin", id)
+                };
+                (person(u32::try_from(id).expect("an id")), object)
+            })
+            .collect()
+    };
+    const PAGE: usize = 500;
+
+    for run in 0..2 {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct("paged-refs", &root, PAGED_REFERENCES_R2RML)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+        for predicate in ["peer", "twin"] {
+            let iri = format!("http://example.org/{predicate}");
+            let mut sparql_pages = Vec::new();
+            let mut jsonld_pages = Vec::new();
+            for k in 0..order.len().div_ceil(PAGE) {
+                let sparql = format!(
+                    "SELECT ?s ?o FROM <paged-refs:main> WHERE {{ ?s <{iri}> ?o }} \
+                     LIMIT {PAGE} OFFSET {}",
+                    k * PAGE
+                );
+                let rows = fluree
+                    .query_from()
+                    .sparql(&sparql)
+                    .execute_formatted()
+                    .await
+                    .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+                sparql_pages.extend(
+                    rows["results"]["bindings"]
+                        .as_array()
+                        .unwrap_or_else(|| panic!("bindings: {rows}"))
+                        .iter()
+                        .map(|b| {
+                            let term =
+                                |v: &str| b[v]["value"].as_str().expect("an IRI").to_string();
+                            (term("s"), term("o"))
+                        }),
+                );
+                let jsonld = serde_json::json!({
+                    "from": "paged-refs:main",
+                    "select": ["?s", "?o"],
+                    "where": {"@id": "?s", iri.as_str(): "?o"},
+                    "limit": PAGE,
+                    "offset": k * PAGE,
+                });
+                let rows = fluree
+                    .query_from()
+                    .jsonld(&jsonld)
+                    .execute_formatted()
+                    .await
+                    .unwrap_or_else(|e| panic!("JSON-LD {predicate} page {k}: {e}"));
+                jsonld_pages.extend(
+                    rows.as_array()
+                        .unwrap_or_else(|| panic!("rows: {rows}"))
+                        .iter()
+                        .map(|row| {
+                            let term = |i: usize| row[i].as_str().expect("an IRI").to_string();
+                            (term(0), term(1))
+                        }),
+                );
+            }
+            let want = expected(predicate);
+            assert!(
+                sparql_pages == want,
+                "SPARQL ex:{predicate}, run {run}: the pages are the child's scan order with \
+                 each row's keep-min parent; first difference at {:?}",
+                sparql_pages.iter().zip(&want).position(|(a, b)| a != b)
+            );
+            assert!(
+                jsonld_pages == want,
+                "JSON-LD ex:{predicate}, run {run}: first difference at {:?}",
+                jsonld_pages.iter().zip(&want).position(|(a, b)| a != b)
+            );
+        }
+    }
 }
