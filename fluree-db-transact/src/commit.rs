@@ -372,6 +372,10 @@ impl CommitOpts {
     }
 
     /// Set the commit timestamp (ISO 8601). When not set, `Utc::now()` is used.
+    ///
+    /// A relative TTL counts from the commit's receive time, or from this
+    /// timestamp where the commit records none: a backfill that sets a past
+    /// time here should set [`Self::with_received_at`] too.
     pub fn with_timestamp(mut self, ts: impl Into<String>) -> Self {
         self.timestamp = Some(ts.into());
         self
