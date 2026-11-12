@@ -605,7 +605,9 @@ fn explain_from_parsed(
     // build error (e.g. an unbound select var the executor would reject) is
     // surfaced in-band rather than failing the whole explain.
     let physical_value = {
+        // One ledger's own default graph, as the query runs over it.
         let planning = fluree_db_query::PlanningContext::current()
+            .with_dataset_scope(None)
             .with_semantic_elision(allow_semantic_elision);
         let stats_arc = stats_view.clone().map(std::sync::Arc::new);
         match fluree_db_query::build_operator_tree(parsed, stats_arc, &planning) {

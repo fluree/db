@@ -117,7 +117,7 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
-            index_scope_kind: ScopeKind::One,
+            index_scope_kind: ScopeKind::None,
             spans_ledgers: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
@@ -131,7 +131,7 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
-            index_scope_kind: ScopeKind::One,
+            index_scope_kind: ScopeKind::None,
             spans_ledgers: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
@@ -211,5 +211,23 @@ impl PlanningContext {
     #[inline]
     pub const fn is_history(self) -> bool {
         self.mode.is_history()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan that was never given its scope reads no index; the scope of a
+    /// ledger's own default graph is one graph.
+    #[test]
+    fn a_plan_without_its_scope_reads_no_index() {
+        for planning in [PlanningContext::current(), PlanningContext::history()] {
+            assert_eq!(planning.index_scope_kind, ScopeKind::None);
+            assert!(!planning.reads_one_graph_index(true));
+            let scoped = planning.with_dataset_scope(None);
+            assert_eq!(scoped.index_scope_kind, ScopeKind::One);
+            assert!(scoped.reads_one_graph_index(true));
+        }
     }
 }
