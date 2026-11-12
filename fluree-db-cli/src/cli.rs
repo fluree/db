@@ -4508,16 +4508,19 @@ pub enum DocAction {
     ///
     /// Parses the file as `fluree doc parse` does, sends its text and
     /// structure with the ontology and catalog to the HTTP reader that
-    /// serves `--model` (`[doc.reader]`), and prints what it read: mentions
-    /// linked to catalog records, entities, and claims, each anchored to the
-    /// text's offsets. Needs no project; where there is one (or a global
-    /// config), its `[doc]` settings and caches are used. What the read was
-    /// billed goes to stderr.
+    /// serves `--model` (`[doc.reader]`), and prints its reading: a Fluree DB
+    /// transaction holding the run, the facts in the ontology's terms, the
+    /// claims behind them and the mentions (`--include`), each mention
+    /// anchored to the text's offsets. Needs no project; where there is one
+    /// (or a global config), its `[doc]` settings and caches are used. What
+    /// the read was billed, and each call's run, release and request ID, go
+    /// to stderr.
     ///
     /// Examples:
     ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
     ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
     ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    ///   fluree doc read memo.md --ontology onto.ttl --include none > facts.jsonld
     #[command(verbatim_doc_comment)]
     Read(DocReadArgs),
 
@@ -4597,6 +4600,13 @@ pub struct DocIngestArgs {
     #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
+    /// What a reader's answer holds besides the facts, which it always
+    /// holds: `claims` (the claim behind each fact), `mentions` (each
+    /// occurrence in the text and the record it links to), both, or `none`.
+    /// Default: `claims,mentions`
+    #[arg(long, value_name = "claims,mentions|claims|mentions|none")]
+    pub include: Option<String>,
+
     /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
     /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
     /// ledger, a graph source mapped over a table (`fluree iceberg|sql|delta
@@ -4607,7 +4617,8 @@ pub struct DocIngestArgs {
 
     /// What becomes of the relations the language model reports: `direct`
     /// writes an edge for every predicate the model admits, `reified` keeps
-    /// them as review nodes only, `off` extracts entities alone
+    /// them as review nodes only, `off` extracts entities alone. A reader's
+    /// facts always come with its reading (see `--include`)
     #[arg(long, value_enum, default_value_t = DocRelationMode::Direct)]
     pub relations: DocRelationMode,
 
@@ -4717,12 +4728,27 @@ pub struct DocReadArgs {
     #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
-    /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the
-    /// structure graph and the reading, each in a named graph
+    /// What the reading holds besides the facts, which it always holds:
+    /// `claims` (the claim behind each fact), `mentions` (each occurrence
+    /// in the text and the record it links to), both, or `none`
+    #[arg(
+        long,
+        value_name = "claims,mentions|claims|mentions|none",
+        default_value = "claims,mentions"
+    )]
+    pub include: String,
+
+    /// `jsonld` prints the reading as the reader wrote it, a Fluree DB
+    /// transaction (`fluree insert -f` takes it). A document read in
+    /// several calls is a transaction per call, so as `jsonld` it needs
+    /// `-o`, and each call goes to a file of its own. `trig` is the same as
+    /// TriG, the run in `<#txn-meta>`; `turtle` its statements without the
+    /// run
     #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
     pub format: DocReadFormat,
 
-    /// Write to this file instead of stdout
+    /// Write to this file instead of stdout. A JSON-LD reading of several
+    /// calls goes to a file per call named after it: `FILE-1.jsonld`, …
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 

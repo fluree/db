@@ -5,13 +5,15 @@
 //! A reader takes the document whole, so where the language-model path
 //! asks about each chunk and scans each for catalog labels, this sends the
 //! parser's text and structure with the ontology and catalog, in as few
-//! calls as the reader's limits allow, and keeps what it answers.
+//! calls as the reader's limits allow, and keeps what it answers: a Fluree
+//! DB transaction per call, committed as it is in the document's reading
+//! graph ([`reading_graph`]).
 
 use crate::commands::doc_sources::{self, Source};
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_doc::reader::{Credential, Read, ReaderClient, Session, CACHE_MODES};
+use fluree_db_doc::reader::{Credential, Include, Read, ReaderClient, Session, CACHE_MODES};
 use fluree_db_doc::{DocCache, DocError, PreparedDocument, ReaderEndpoint};
 use std::sync::{Arc, Mutex};
 
@@ -117,12 +119,33 @@ pub async fn renew(setup: &ReaderSetup) -> Result<(), ReadFailure> {
     Ok(())
 }
 
+/// The named graph a document's reading is committed in: `<doc>/reading`,
+/// so a re-read replaces it whole by clearing that graph. Every call's
+/// transaction (the facts, the claims annotating them, the mentions) goes
+/// there; the document's structure stays in the default graph.
+pub fn reading_graph(doc_iri: &str) -> String {
+    format!("{doc_iri}/reading")
+}
+
+/// What `--include` asks for: claims and mentions unless it says otherwise.
+pub fn include(flag: Option<&str>) -> CliResult<Include> {
+    match flag {
+        None => Ok(Include::default()),
+        Some(v) => Include::parse(v).map_err(|e| match e {
+            fluree_db_doc::DocError::Config(m) => CliError::Usage(format!("--{m}")),
+            e => e.into(),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn setup(
     model: &str,
     endpoint: &ReaderEndpoint,
     ontology: Option<&str>,
     catalog: &[String],
     cache_flag: Option<&str>,
+    include: Include,
     doc_cache: Option<DocCache>,
     dirs: Option<&FlureeDir>,
 ) -> CliResult<ReaderSetup> {
@@ -164,7 +187,8 @@ pub async fn setup(
             }
         }));
     }
-    let session = Session::new(client, model, cache, ontology, loaded.graph, doc_cache)?;
+    let session = Session::new(client, model, cache, ontology, loaded.graph, doc_cache)?
+        .with_include(include);
     Ok(ReaderSetup {
         session,
         catalog_counts: loaded.counts,
