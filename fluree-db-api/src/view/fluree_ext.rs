@@ -415,9 +415,12 @@ impl Fluree {
         // we intentionally skip attaching a binary store so the query engine
         // takes the overlay/range path instead of the binary scan path.
         if view.snapshot.t > 0 {
-            // Use nameservice record (not cached handle) to avoid stale index.
+            // The record supplies branch ancestry only. An index can publish
+            // since the historical snapshot was loaded: using its new root with
+            // the snapshot's old watermarks would make novelty IDs shadow
+            // persisted strings. Keep the store bound to the snapshot's root.
             if let Some(record) = self.nameservice().lookup(ledger_id).await? {
-                if let Some(index_cid) = record.index_head_id.as_ref() {
+                if let Some(index_cid) = view.snapshot.index_root_id() {
                     // Branch-aware store so historical queries on a branch
                     // can resolve inherited leaf/branch/history blobs that
                     // live under the source branch's namespace.
@@ -445,8 +448,8 @@ impl Fluree {
                     // Unlike the primary load path (sync_store_and_snapshot_ns), we can't
                     // reconcile store codes back into the snapshot because view.snapshot
                     // is Arc<LedgerSnapshot> (shared/read-only). This is safe because the
-                    // index root's namespace table is a subset of the commit-derived table
-                    // (the root is a materialized cache at index_t ≤ view.to_t).
+                    // store and snapshot come from the same root, with the snapshot's
+                    // table extended by any commits replayed after index_t.
                     store
                         .augment_namespace_codes(view.snapshot.namespaces())
                         .map_err(|e| ApiError::internal(format!("augment namespace codes: {e}")))?;
