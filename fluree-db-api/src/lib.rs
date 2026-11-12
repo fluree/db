@@ -4500,11 +4500,15 @@ impl Fluree {
     /// Build `ledger_id`'s index in this process: incremental over the
     /// commits since the last index when possible, a full rebuild otherwise.
     /// The caller publishes the result. A branch whose built commits carry
-    /// retention input is registered for retention first.
+    /// retention input is registered for retention first, and the build
+    /// leaves out the history its `f:noHistory` rules dropped.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn build_index(&self, ledger_id: &str) -> Result<fluree_db_indexer::IndexResult> {
-        let config = fluree_db_indexer::IndexerConfig::default()
+        let mut config = fluree_db_indexer::IndexerConfig::default()
             .with_ledger_config_provider(self.ledger_config_provider());
+        config.history_suppression = self
+            .suppressed_history_for_index(fluree_db_core::LedgerId::parse(ledger_id)?.as_str())
+            .await?;
         warn_if_staging_plaintext(&self.backend, &config);
         let content_store = self.branched_content_store(ledger_id).await?;
         let built = fluree_db_indexer::build_index_for_ledger(

@@ -663,6 +663,33 @@ async fn no_history_compacts_the_index_history() {
     );
 }
 
+/// A build through [`Fluree::build_index`], as a host without a background
+/// indexer runs, leaves out what a rule dropped, as a reindex does.
+#[tokio::test]
+async fn a_build_in_process_leaves_suppressed_history_out() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/nohist-build-index").await;
+    for n in 1..=3 {
+        upsert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:c", "ex:count": n}),
+        )
+        .await;
+    }
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    fluree.run_retention(&id).await.expect("pass");
+    let built = fluree.build_index(&id).await.expect("build");
+    crate::support::publish_built_index(&fluree, &id, built.index_t, &built.root_id).await;
+    assert_eq!(indexed_history_entries(&fluree, &id).await, 0);
+    assert_eq!(
+        read(&fluree, &id, json!(id), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        vec![json!(3)]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_builds_leave_suppressed_history_out() {
     use std::sync::Arc;
