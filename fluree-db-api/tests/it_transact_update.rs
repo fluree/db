@@ -2787,6 +2787,137 @@ async fn multi_operation_sparql_update_executes_sequentially() {
     );
 }
 
+/// Every operation of a request is lowered before the first one stages. An
+/// operation can register a namespace while it stages (an IRI it binds in
+/// WHERE and then writes), so the codes the lowering gave later operations'
+/// namespaces must already be taken by then: otherwise the two namespaces
+/// get one code, and the request fails with a namespace conflict however
+/// often it is retried.
+#[tokio::test]
+async fn multi_operation_namespaces_registered_while_staging_follow_the_lowered_ones() {
+    async fn run(fluree: &fluree_db_api::Fluree, ledger_id: &str, update: &str) -> JsonValue {
+        fluree.create_ledger(ledger_id).await.expect("create");
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(r#"PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:s ex:p "a" }"#)
+            .commit()
+            .await
+            .expect("seed");
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(update)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{ledger_id}: the request commits: {e}"));
+        let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+        let rows = support::query_sparql(
+            fluree,
+            &ledger,
+            r"PREFIX ex: <http://example.org/ns/>
+               SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?p != ex:p || ?o = 'b') }
+               ORDER BY ?s ?p ?o",
+        )
+        .await
+        .expect("query");
+        rows.to_sparql_json(&ledger.snapshot).expect("sparql json")["results"]["bindings"].clone()
+    }
+    fn triples(bindings: &JsonValue) -> Vec<(String, String, String)> {
+        bindings
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .map(|row| {
+                let term = |var: &str| {
+                    let cell = &row[var];
+                    match cell["datatype"].as_str() {
+                        Some(dt) => format!("{}^^{dt}", cell["value"].as_str().unwrap()),
+                        None => cell["value"].as_str().unwrap().to_string(),
+                    }
+                };
+                (term("s"), term("p"), term("o"))
+            })
+            .collect()
+    }
+    let t = |s: &str, p: &str, o: &str| (s.to_string(), p.to_string(), o.to_string());
+    let ex = |local: &str| format!("http://example.org/ns/{local}");
+    let then_b = r#"INSERT DATA { <http://unseen-b.example/y> ex:p "b" }"#;
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    for (n, bind) in [
+        r#"BIND(IRI("http://unseen-a.example/o") AS ?o)"#,
+        r"BIND(<http://unseen-a.example/o> AS ?o)",
+        r"VALUES ?o { <http://unseen-a.example/o> }",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let update = format!(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT {{ ex:s ex:ref ?o }} WHERE {{ ex:s ex:p "a" {bind} }} ;
+               {then_b}"#
+        );
+        let rows = run(&fluree, &format!("ns-order-{n}:main"), &update).await;
+        assert_eq!(
+            triples(&rows),
+            vec![
+                t(&ex("s"), &ex("ref"), "http://unseen-a.example/o"),
+                t("http://unseen-b.example/y", &ex("p"), "b"),
+            ],
+            "{bind}"
+        );
+    }
+
+    let update = format!(
+        r#"PREFIX ex: <http://example.org/ns/>
+           INSERT {{ ex:s ex:val ?v }}
+           WHERE {{ ex:s ex:p "a" BIND(STRDT("x", <http://unseen-a.example/T>) AS ?v) }} ;
+           {then_b}"#
+    );
+    let rows = run(&fluree, "ns-order-strdt:main", &update).await;
+    assert_eq!(
+        triples(&rows),
+        vec![
+            t(&ex("s"), &ex("val"), "x^^http://unseen-a.example/T"),
+            t("http://unseen-b.example/y", &ex("p"), "b"),
+        ]
+    );
+
+    // Both operations name one unseen IRI, the first by binding it: they
+    // must write it under one code, or the ledger holds two subjects for it.
+    let update = r#"PREFIX ex: <http://example.org/ns/>
+        INSERT { ex:s ex:ref ?o } WHERE { ex:s ex:p "a" BIND(IRI("http://unseen-a.example/o") AS ?o) } ;
+        INSERT DATA { <http://unseen-b.example/y> ex:ref <http://unseen-a.example/o> }"#;
+    let fluree_shared = FlureeBuilder::memory().build_memory();
+    run(&fluree_shared, "ns-order-shared:main", update).await;
+    let ledger = fluree_shared
+        .ledger("ns-order-shared:main")
+        .await
+        .expect("ledger");
+    let rows = support::query_sparql(
+        &fluree_shared,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s (COUNT(*) AS ?n) WHERE { ?s ex:ref <http://unseen-a.example/o> }
+           GROUP BY ?s ORDER BY ?s",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let subjects: Vec<&str> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| row["s"]["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        subjects,
+        vec![ex("s").as_str(), "http://unseen-b.example/y"],
+        "one IRI, one code: {json}"
+    );
+}
+
 /// A fact an operation reverses back to how the request found it is not in
 /// the commit: last-wins netting alone committed `INSERT x ; DELETE x` as a
 /// retraction of a fact the ledger never held, visible in its history.
