@@ -238,6 +238,104 @@ async fn filters_over_a_function_of_the_object_answer_alike_on_every_lane() {
     );
 }
 
+/// Once a ledger is indexed, a new row whose language tag or datatype the
+/// index's dictionaries don't hold can't be encoded, and the scan emits it
+/// decoded. The filters the scan compiled into checks on the encoded object
+/// hold for those rows too: (filter, the subjects it keeps).
+const OVER_THE_INDEX: &[(&str, &[&str])] = &[
+    (r#"LANG(?v) = "en""#, &["a", "x"]),
+    (r"ISBLANK(?v)", &["k"]),
+    (r"?s = ?v", &["w"]),
+    (
+        r"?s != ?v",
+        &["a", "b", "c", "d", "e", "f", "g", "h", "k", "x", "y", "z"],
+    ),
+];
+
+#[tokio::test]
+async fn novelty_rows_the_index_cannot_encode_meet_the_compiled_filters() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/filter-pushdown-unencodable:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    fluree.insert_turtle(ledger, DATA).await.expect("data");
+    fluree
+        .reindex(id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    // `de` and `:newdt` are new to the index; the rest it can encode.
+    fluree
+        .insert_turtle(
+            ledger,
+            r#"@prefix : <http://example.org/#> .
+:z :v "neu"@de .
+:y :v "q"^^:newdt .
+:x :v "new"@en .
+:k :v [] .
+:w :v :w .
+"#,
+        )
+        .await
+        .expect("novelty over the index");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    assert!(ledger.snapshot.range_provider.is_some(), "setup: indexed");
+
+    let _guard = FastPathGuard;
+    let mut failures = Vec::new();
+    for fast in [true, false] {
+        set_fast_paths_disabled(!fast);
+        let lane = if fast {
+            "fast paths on"
+        } else {
+            "fast paths off"
+        };
+        for (filter, keeps) in OVER_THE_INDEX {
+            let q = format!(
+                "PREFIX : <http://example.org/#> SELECT ?s WHERE {{ ?s :v ?v FILTER({filter}) }}"
+            );
+            let got = subjects(&query_sparql_formatted(&fluree, &ledger, &q).await.unwrap());
+            if got != *keeps {
+                failures.push(format!(
+                    "{lane}: FILTER({filter}): {got:?}, expected {keeps:?}"
+                ));
+            }
+            let count = format!(
+                "PREFIX : <http://example.org/#> SELECT (COUNT(*) AS ?n) WHERE {{ ?s :v ?v FILTER({filter}) }}"
+            );
+            let n = query_sparql_formatted(&fluree, &ledger, &count)
+                .await
+                .unwrap();
+            let n = n
+                .as_array()
+                .and_then(|rows| rows.first())
+                .map(|r| r.as_array().map_or(r, |cells| &cells[0]).clone())
+                .and_then(|v| v.as_u64())
+                .expect("a count");
+            if n != keeps.len() as u64 {
+                failures.push(format!(
+                    "{lane}: COUNT FILTER({filter}): {n}, expected {}",
+                    keeps.len()
+                ));
+            }
+        }
+        let q = json!({
+            "@context": {"ex": "http://example.org/#"},
+            "select": "?s",
+            "where": [{"@id": "?s", "ex:v": "?v"}, ["filter", r#"(= (lang ?v) "en")"#]]
+        });
+        let got = subjects(&query_jsonld_formatted(&fluree, &ledger, &q).await.unwrap());
+        if got != ["a", "x"] {
+            failures.push(format!("{lane}: JSON-LD (= (lang ?v) \"en\"): {got:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 /// A store built after another was dropped does not answer with the dropped
 /// one's verdicts. Each round builds an indexed ledger whose only string is
 /// `"abc"` or `"xyz"` in turn, at the same dictionary position, so the encoded

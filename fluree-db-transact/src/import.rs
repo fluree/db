@@ -63,7 +63,15 @@ mod inner {
         let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
             Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
                 GraphPosition::Default => return Ok(None),
-                GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => iri.into_owned(),
+                // Another ledger's config graph is refused below, as any is.
+                GraphPosition::OtherLedgersSystemGraph(iri)
+                    if fluree_db_core::graph_registry::names_txn_meta_graph(&iri) =>
+                {
+                    return Err(crate::stage::other_ledgers_system_graph(&id, &iri));
+                }
+                GraphPosition::Registered { iri, .. }
+                | GraphPosition::New(iri)
+                | GraphPosition::OtherLedgersSystemGraph(iri) => iri.into_owned(),
                 GraphPosition::NotAGraph => {
                     return Err(TransactError::Parse(format!(
                         "<{iri}> names no graph an import can write: an address of this \
@@ -98,7 +106,8 @@ mod inner {
                 graph_iri: iri.to_string(),
             });
         }
-        if iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id) {
+        // Any ledger's config graph IRI is this ledger's config graph.
+        if fluree_db_core::graph_registry::names_config_graph(iri) {
             return Err(TransactError::ConfigGraphImportUnsupported {
                 graph_iri: iri.to_string(),
             });
@@ -532,6 +541,7 @@ mod inner {
                 txn_meta: Vec::new(),
                 graph_delta: HashMap::new(),
                 ns_split_mode,
+                graph_drops: Vec::new(),
             };
 
             (writer, op_count, spool_result, envelope)
@@ -696,6 +706,7 @@ mod inner {
                 txn_meta: Vec::new(),
                 graph_delta: HashMap::new(),
                 ns_split_mode,
+                graph_drops: Vec::new(),
             };
 
             (writer, op_count, spool_result, envelope)
@@ -1081,6 +1092,7 @@ mod inner {
             txn_meta,
             graph_delta,
             ns_split_mode,
+            graph_drops: Vec::new(),
         };
 
         // 7. Finalize blob
@@ -1733,6 +1745,7 @@ mod inner {
                 txn_meta: parsed.txn_meta,
                 graph_delta,
                 ns_split_mode,
+                graph_drops: Vec::new(),
             };
 
             let result = parsed.writer.finish(&envelope)?;

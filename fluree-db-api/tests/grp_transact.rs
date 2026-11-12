@@ -23,6 +23,8 @@ mod it_export_lists;
 mod it_ill_typed_literals;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
+#[path = "it_jsonld_value_object_coercion.rs"]
+mod it_jsonld_value_object_coercion;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
 #[path = "it_overflow_iri_delete_index.rs"]

@@ -317,6 +317,13 @@ path = "tests/grp_query_sparql.rs"
 name = "grp_reasoning"
 path = "tests/grp_reasoning.rs"
 
+# Own binary: its tests read the overlay ops an earlier query left on a
+# reasoning materialization, which a sibling in grp_reasoning can evict from
+# the process-wide reasoning cache.
+[[test]]
+name = "it_reasoning_lane_cache"
+path = "tests/it_reasoning_lane_cache.rs"
+
 [[test]]
 name = "grp_transact"
 path = "tests/grp_transact.rs"
@@ -712,6 +719,10 @@ harness = false
 
 [[bench]]
 name = "query_cold_reload"
+harness = false
+
+[[bench]]
+name = "query_time_travel_below_index"
 harness = false
 
 [[bench]]

@@ -1159,9 +1159,13 @@ class Ledger:
         return [IRI(g["iri"]) for g in named if g["iri"] not in system]
 
     def drop_graph(self, graph: str) -> Commit:
-        """Retract everything in named graph ``graph`` (its full IRI) in one
-        commit. History keeps it, and the graph can be written to again. The
-        default graph and Fluree's own graphs cannot be dropped."""
+        """Drop named graph ``graph`` (its full IRI) in one commit, as SPARQL
+        ``DROP GRAPH`` does: the graph and its history are no longer queryable
+        — a query as of an earlier ``t`` naming it raises — though the commits
+        that wrote it keep its facts, so a branch from before the drop has
+        them. Writing to the IRI again starts the graph afresh. The default
+        graph and Fluree's own graphs cannot be dropped; SPARQL ``CLEAR
+        GRAPH`` empties a graph and keeps its history."""
         self._require_unrestricted("drop_graph")
         return Commit(**self._connection._native.drop_graph(self._id, graph))
 

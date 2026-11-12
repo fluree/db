@@ -137,6 +137,8 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// The reasoning memory budget `derived_overlay` was materialized under.
+    pub reasoning_memory_limit: usize,
     /// Whether any reasoning/entailment mode was enabled for this query.
     ///
     /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
@@ -574,6 +576,7 @@ pub async fn prepare_execution_with_config(
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_memory_limit: derived_outcome.memory_limit_bytes,
             reasoning_active: reasoning.has_any_enabled(),
         })
     }
@@ -752,6 +755,9 @@ pub struct ContextConfig<'a, 'b> {
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
     /// Access the raw PolicyContext via `enforcer.policy()` if needed.
     pub policy_enforcer: Option<Arc<crate::policy::QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is (see
+    /// [`ExecutionContext::policy_source`]).
+    pub policy_source: Option<Arc<str>>,
     pub dataset: Option<&'a DataSet<'a>>,
     pub r2rml: Option<(
         &'b dyn crate::r2rml::R2rmlProvider,
@@ -945,6 +951,15 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if prepared.reasoning_active {
         ctx = ctx.with_reasoning_active(true);
     }
+    if let Some(derived) = prepared.derived_overlay.as_ref() {
+        if let Some(ops) = crate::reasoning_ops::ReasoningOpsHandle::attach(
+            derived,
+            prepared.reasoning_memory_limit,
+            ctx.overlay().content_version(),
+        ) {
+            ctx = ctx.with_reasoning_ops(ops);
+        }
+    }
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
@@ -968,6 +983,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);
     }
+    ctx.policy_source = config.policy_source;
     if let Some(dataset) = patched_dataset.as_ref().or(config.dataset) {
         ctx = ctx.with_dataset(dataset);
     }

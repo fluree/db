@@ -47,11 +47,10 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphMgmtRef, GraphOrDefault,
-    GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
-    LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
-    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
-    TriplePattern, UpdateOperation,
+    AnnotationUnit, AnnotationVerb, BlankNode, GraphMgmtRef, GraphOrDefault, GraphPattern,
+    GraphRefAll, GraphTransfer, Iri, IriValue, Literal, LiteralValue as SparqlLiteralValue, Load,
+    Modify, PredicateTerm, Prologue, PropertyPath, QuadData, QuadPattern, QuadPatternElement,
+    QueryBody, ReifierId, SparqlAst, SubjectTerm, Term, TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use fluree_graph_ir::syntax::reserved_blank_label;
@@ -108,7 +107,7 @@ pub enum LowerError {
     InvalidLiteral { message: String, span: SourceSpan },
 }
 
-/// Counter for generating anonymous blank node labels.
+/// Counter for the reifier labels annotation expansion mints.
 struct BlankNodeCounter {
     next: u32,
 }
@@ -118,19 +117,10 @@ impl BlankNodeCounter {
         Self { next: 0 }
     }
 
-    /// The label of a template `[]`.
-    fn next(&mut self) -> String {
-        format!("_:{}", self.mint("anon"))
-    }
-
     /// The label of the reifier an annotation without `~` gets, in its own
-    /// `-ann` space so it can't meet a template `[]`.
+    /// `-ann` space so it can't meet the parser's `-anon` labels for `[]`.
     fn next_annotation(&mut self) -> String {
-        self.mint("ann")
-    }
-
-    fn mint(&mut self, kind: &str) -> String {
-        let label = reserved_blank_label(kind, self.next);
+        let label = reserved_blank_label("ann", self.next);
         self.next += 1;
         label
     }
@@ -588,7 +578,7 @@ fn reject_user_authored_reifies(
 ///   existing stored node (see `it_stable_blank_nodes.rs`).
 /// - DELETE WHERE is NOT routed through this check at lowering: its blank
 ///   nodes keep Fluree's documented existential-variable semantics
-///   ([`BlankNodeVarNamer`]); the strict SPARQL surface rejects them in
+///   ([`bnode_var_name`]); the strict SPARQL surface rejects them in
 ///   `validate()`, and the api seam waives exactly that rejection via
 ///   `Capabilities::with_delete_where_extensions`.
 fn reject_blank_nodes_in_delete_quad_pattern(
@@ -596,10 +586,8 @@ fn reject_blank_nodes_in_delete_quad_pattern(
     context: &'static str,
 ) -> Result<(), LowerError> {
     fn check_blank_node(bn: &BlankNode, context: &'static str) -> Result<(), LowerError> {
-        if let BlankNodeValue::Labeled(l) = &bn.value {
-            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                return Ok(());
-            }
+        if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+            return Ok(());
         }
         Err(LowerError::BlankNodeInDelete {
             context,
@@ -675,46 +663,22 @@ fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerErro
     Ok(())
 }
 
-/// Assign stable variable names for SPARQL blank nodes when lowering
-/// DELETE WHERE forms — the triple-only fast path directly, and the
-/// GRAPH-bearing path via [`rewrite_blank_nodes_to_vars`].
+/// The variable a SPARQL blank node stands for when lowering DELETE WHERE
+/// forms — the triple-only fast path directly, and the GRAPH-bearing path
+/// via [`rewrite_blank_nodes_to_vars`].
 ///
 /// In SPARQL graph patterns, blank node labels behave like locally-scoped
 /// existential variables; lowering rewrites them to query variables with
-/// reserved names. Two invariants keep the reserved namespace airtight:
+/// reserved names. Every name starts with `_:`, which can never be lexed as
+/// a SPARQL variable (`?`/`$` names cannot contain `:`), so no user-written
+/// variable can unify with a rewritten existential. The names live only as
+/// opaque registry keys; nothing re-lexes them.
 ///
-/// - Every name starts with `_:`, which can never be lexed as a SPARQL
-///   variable (`?`/`$` names cannot contain `:`), so no user-written
-///   variable can unify with a rewritten existential. The names live only
-///   as opaque registry keys; nothing re-lexes them.
-/// - The anonymous arm mints `_:[]{N}`: `[` is illegal in a
-///   BLANK_NODE_LABEL, so anonymous names are disjoint from the labeled
-///   arm's `_:{label}` for every possible label. (Plain `_:b{N}` collided
-///   with a user-written `_:b0`, silently unifying two distinct
-///   existentials — the same label-space hazard `BlankNodeCounter` avoids
-///   for stored nodes with its leading `-`.)
-///
-/// Same label ⇒ same name, per SPARQL's blank-node label scoping within a
-/// request.
-struct BlankNodeVarNamer {
-    anon_counter: u32,
-}
-
-impl BlankNodeVarNamer {
-    fn new() -> Self {
-        Self { anon_counter: 0 }
-    }
-
-    fn var_name(&mut self, bn: &BlankNodeValue) -> Arc<str> {
-        match bn {
-            BlankNodeValue::Labeled(label) => Arc::from(format!("_:{label}")),
-            BlankNodeValue::Anon => {
-                let name: Arc<str> = Arc::from(format!("_:[]{}", self.anon_counter));
-                self.anon_counter += 1;
-                name
-            }
-        }
-    }
+/// Every blank node has a label (the parser reserves `-anon<N>` for each
+/// `[]`, which no user label can spell), so same label ⇒ same name, per
+/// SPARQL's blank-node label scoping within a request.
+fn bnode_var_name(bn: &BlankNode) -> Arc<str> {
+    Arc::from(format!("_:{}", bn.label))
 }
 
 /// Result of converting a literal to template form.
@@ -877,23 +841,21 @@ pub fn lower_sparql_update(
             lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         // Graph-management verbs. CLEAR/DROP/ADD/COPY/MOVE lower to a
-        // graph-management directive executed by whole-graph scan at staging
-        // time; CREATE and SILENT LOAD lower to an empty no-op transaction;
-        // non-SILENT remote LOAD is a documented divergence (D-5).
-        UpdateOperation::Clear(gm) | UpdateOperation::Drop(gm) => {
-            lower_clear_drop(gm, prologue, opts)?
-        }
+        // graph-management directive executed at staging time; CREATE and
+        // SILENT LOAD lower to a transaction that writes no flake; non-SILENT
+        // remote LOAD is a documented divergence (D-5).
+        UpdateOperation::Clear(gm) => lower_clear(gm, prologue, opts)?,
+        UpdateOperation::Drop(gm) => lower_drop(gm, prologue, opts)?,
         UpdateOperation::Create(create) => {
-            // Fluree cannot represent an empty named graph (roadmap D-6), so
-            // CREATE stages no flakes — but it DOES register the graph IRI in
-            // the additive registry (same `write_graphs` mechanism as a
-            // transfer destination). Registration is what O3's source-existence
-            // check consults, so `CREATE GRAPH <g>` followed by a non-SILENT
-            // `COPY <g> TO <h>` is a legitimate empty source rather than the
-            // contradictory "source graph does not exist" error. CREATE of an
-            // ALREADY-registered graph stays a no-op rather than the spec's
-            // §3.2.2 error (D-6: the registry can't distinguish an
-            // intentionally-created empty graph from an emptied one), so
+            // CREATE stages no flakes, but it DOES register the graph IRI
+            // (same `write_graphs` mechanism as a transfer destination), or
+            // brings a dropped graph back. Registration is what O3's
+            // source-existence check consults, so `CREATE GRAPH <g>` followed
+            // by a non-SILENT `COPY <g> TO <h>` is a legitimate empty source
+            // rather than the contradictory "source graph does not exist"
+            // error. CREATE of a graph that exists stays a no-op rather than
+            // the spec's §3.2.2 error (D-6: an intentionally-created empty
+            // graph and an emptied one are the same to the registry), so
             // `silent` has nothing to suppress; the graph remains
             // non-enumerable until a flake lands in it.
             let iri = expand_iri(&create.graph, prologue)?;
@@ -953,30 +915,35 @@ fn graph_or_default_to_sel(
     })
 }
 
-/// Lower `CLEAR`/`DROP` to a graph-management retract-all directive.
+/// Lower `CLEAR` to a graph-management retract-all directive.
 ///
-/// `DROP ≡ CLEAR` in Fluree's model (roadmap D-6): the graph registry is
-/// additive-only and an emptied graph is indistinguishable from a dropped one.
-///
-/// The parsed `SILENT` flag is deliberately not consulted: in the D-6 model a
-/// CLEAR/DROP of an unregistered graph is a no-op rather than the spec's
-/// "graph does not exist" error, so there is no error for SILENT to suppress —
-/// a documented divergence, symmetric with CREATE-of-existing staying a no-op.
-fn lower_clear_drop(
-    gm: &GraphMgmtRef,
-    prologue: &Prologue,
-    opts: TxnOpts,
-) -> Result<Txn, LowerError> {
+/// The parsed `SILENT` flag is deliberately not consulted: a CLEAR of an
+/// unregistered graph is a no-op rather than the spec's "graph does not exist"
+/// error, so there is no error for SILENT to suppress — a documented
+/// divergence, symmetric with CREATE-of-existing staying a no-op.
+fn lower_clear(gm: &GraphMgmtRef, prologue: &Prologue, opts: TxnOpts) -> Result<Txn, LowerError> {
     let target = graph_ref_all_to_target(&gm.target, prologue)?;
     Ok(Txn::graph_mgmt(GraphMgmtOp::Clear(target)).with_opts(opts))
 }
 
+/// Lower `DROP` to a graph-management drop directive
+/// ([`GraphMgmtOp::Drop`]). Dropping a named graph that does not exist is an
+/// error unless `SILENT`, as the spec has it.
+fn lower_drop(gm: &GraphMgmtRef, prologue: &Prologue, opts: TxnOpts) -> Result<Txn, LowerError> {
+    let target = graph_ref_all_to_target(&gm.target, prologue)?;
+    Ok(Txn::graph_mgmt(GraphMgmtOp::Drop {
+        target,
+        silent: gm.silent,
+    })
+    .with_opts(opts))
+}
+
 /// Lower `ADD`/`COPY`/`MOVE` to a graph-management transfer directive.
 ///
-/// Composes over the CLEAR primitive: COPY/MOVE clear the destination first,
-/// MOVE additionally clears the source afterward. A destination named graph is
-/// recorded in `write_graphs` so the commit registers it even when it
-/// did not previously exist (COPY/ADD into a fresh graph).
+/// COPY/MOVE clear the destination first, keeping its history, and MOVE
+/// drops the source afterward. A destination named graph is recorded in
+/// `write_graphs` so the commit registers it even when it did not previously
+/// exist (COPY/ADD into a fresh graph).
 fn lower_transfer(
     t: &GraphTransfer,
     prologue: &Prologue,
@@ -985,7 +952,7 @@ fn lower_transfer(
 ) -> Result<Txn, LowerError> {
     let from = graph_or_default_to_sel(&t.from, prologue)?;
     let to = graph_or_default_to_sel(&t.to, prologue)?;
-    let (clear_dest, clear_src) = match mode {
+    let (clear_dest, drop_src) = match mode {
         TransferMode::Add => (false, false),
         TransferMode::Copy => (true, false),
         TransferMode::Move => (true, true),
@@ -994,7 +961,7 @@ fn lower_transfer(
         from,
         to: to.clone(),
         clear_dest,
-        clear_src,
+        drop_src,
         // Thread SILENT through so staging can suppress the missing-source
         // error (SPARQL §3.2 / roadmap O3) exactly when the user opted in.
         silent: t.silent,
@@ -1057,7 +1024,6 @@ fn lower_insert_data(
         prologue,
         ns,
         vars,
-        bnodes,
         &mut write_graphs,
         None,
     )?;
@@ -1112,7 +1078,6 @@ fn lower_delete_data(
         prologue,
         ns,
         vars,
-        bnodes,
         &mut write_graphs,
         None,
     )?;
@@ -1194,15 +1159,14 @@ fn lower_delete_where(
         })
         .collect();
 
-    let mut bnode_vars = BlankNodeVarNamer::new();
     let mut where_patterns: Vec<UnresolvedPattern> = Vec::with_capacity(triples.len());
     let mut delete_templates: Vec<TripleTemplate> = Vec::with_capacity(triples.len());
 
     for tp in triples {
         // WHERE side: lower to UnresolvedPattern::Triple with bnodes rewritten as vars
-        let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut bnode_vars)?;
+        let s = subject_to_unresolved_delete_where(&tp.subject, prologue)?;
         let p = predicate_to_unresolved(&tp.predicate, prologue)?;
-        let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut bnode_vars)?;
+        let obj = object_to_unresolved_delete_where(&tp.object, prologue)?;
 
         where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
             s,
@@ -1213,11 +1177,7 @@ fn lower_delete_where(
 
         // DELETE side: lower to TripleTemplate with the same bnode->var mapping
         delete_templates.push(lower_triple_to_delete_template_delete_where(
-            tp,
-            prologue,
-            ns,
-            vars,
-            &mut bnode_vars,
+            tp, prologue, ns, vars,
         )?);
     }
 
@@ -1273,15 +1233,11 @@ fn lower_delete_where_with_graphs(
     };
 
     let mut write_graphs = BTreeSet::new();
-    // Blank nodes were rewritten to variables above, so the counter is only a
-    // signature requirement here — the template lowering never mints from it.
-    let mut bnodes = BlankNodeCounter::new();
     let delete_templates = lower_quad_pattern_to_templates(
         &rewritten.patterns,
         prologue,
         ns,
         vars,
-        &mut bnodes,
         &mut write_graphs,
         None,
     )?;
@@ -1312,8 +1268,8 @@ fn lower_delete_where_with_graphs(
 /// SPARQL blank nodes in a graph pattern are locally-scoped existential
 /// variables. Because a DELETE WHERE pattern is used as both the WHERE clause
 /// and the DELETE template, the same variable must appear on both sides, so
-/// the rewrite happens once on the shared AST. Naming comes from the shared
-/// [`BlankNodeVarNamer`] — the same scheme the triple-only DELETE WHERE path
+/// the rewrite happens once on the shared AST. Naming comes from
+/// [`bnode_var_name`] — the same scheme the triple-only DELETE WHERE path
 /// ships — whose `_:`-prefixed names cannot be lexed as user variables (the
 /// previous lexable `_fluree_bn_{label}` names let a user-written
 /// `?_fluree_bn_x` in the same request unify with the rewritten existential,
@@ -1325,14 +1281,11 @@ fn lower_delete_where_with_graphs(
 fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
     use fluree_db_sparql::ast::Var;
 
-    let mut namer = BlankNodeVarNamer::new();
-    let mut rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
-        if let BlankNodeValue::Labeled(l) = &bn.value {
-            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                return None;
-            }
+    let rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
+        if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+            return None;
         }
-        Some(Var::new(namer.var_name(&bn.value), bn.span))
+        Some(Var::new(bnode_var_name(bn), bn.span))
     };
 
     let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
@@ -1507,7 +1460,6 @@ fn lower_modify(
             prologue,
             ns,
             vars,
-            bnodes,
             &mut write_graphs,
             default_template_graph.clone(),
         )?
@@ -1531,7 +1483,6 @@ fn lower_modify(
             prologue,
             ns,
             vars,
-            bnodes,
             &mut write_graphs,
             default_template_graph.clone(),
         )?
@@ -1565,7 +1516,6 @@ fn lower_quad_pattern_to_templates(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
     write_graphs: &mut BTreeSet<String>,
     default_graph: Option<Arc<str>>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
@@ -1573,7 +1523,7 @@ fn lower_quad_pattern_to_templates(
     for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
-                let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
+                let mut t = lower_triple_to_template(tp, prologue, ns, vars)?;
                 if let Some(iri) = &default_graph {
                     t = t.in_graph(Arc::clone(iri));
                 }
@@ -1586,7 +1536,7 @@ fn lower_quad_pattern_to_templates(
                     let iri: Arc<str> = Arc::from(iri);
                     for tp in triples {
                         out.push(
-                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                            lower_triple_to_template(tp, prologue, ns, vars)?
                                 .in_graph(Arc::clone(&iri)),
                         );
                     }
@@ -1597,7 +1547,7 @@ fn lower_quad_pattern_to_templates(
                     let graph_var = vars.get_or_insert(&format!("?{}", v.name));
                     for tp in triples {
                         out.push(
-                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
+                            lower_triple_to_template(tp, prologue, ns, vars)?
                                 .with_graph_var(graph_var),
                         );
                     }
@@ -1614,9 +1564,8 @@ fn lower_triple_to_template(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
 ) -> Result<TripleTemplate, LowerError> {
-    let subject = subject_to_template(&triple.subject, prologue, ns, vars, bnodes)?;
+    let subject = subject_to_template(&triple.subject, prologue, ns, vars)?;
     let predicate = predicate_to_template(&triple.predicate, prologue, ns, vars)?;
 
     // Object needs special handling for literal metadata
@@ -1625,7 +1574,7 @@ fn lower_triple_to_template(
             let result = literal_to_template(lit, prologue, ns)?;
             (result.term, result.dtc)
         }
-        other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
+        other => (object_to_template(other, prologue, ns, vars)?, None),
     };
 
     Ok(TripleTemplate {
@@ -1646,7 +1595,6 @@ fn lower_triple_to_template(
 fn subject_to_unresolved_delete_where(
     term: &SubjectTerm,
     prologue: &Prologue,
-    bnodes: &mut BlankNodeVarNamer,
 ) -> Result<UnresolvedTerm, LowerError> {
     match term {
         SubjectTerm::Var(v) => Ok(UnresolvedTerm::Var(Arc::from(format!("?{}", v.name)))),
@@ -1654,12 +1602,10 @@ fn subject_to_unresolved_delete_where(
         SubjectTerm::BlankNode(bn) => {
             // Stable Fluree blank-node ids match the stored node as a
             // constant; other labels act as existential variables (§3.1).
-            if let BlankNodeValue::Labeled(l) = &bn.value {
-                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                    return Ok(UnresolvedTerm::Iri(Arc::from(format!("_:{l}"))));
-                }
+            if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+                return Ok(UnresolvedTerm::Iri(Arc::from(format!("_:{}", bn.label))));
             }
-            Ok(UnresolvedTerm::Var(bnodes.var_name(&bn.value)))
+            Ok(UnresolvedTerm::Var(bnode_var_name(bn)))
         }
         SubjectTerm::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF-star quoted triple",
@@ -1686,7 +1632,6 @@ fn predicate_to_unresolved(
 fn object_to_unresolved_delete_where(
     term: &Term,
     prologue: &Prologue,
-    bnodes: &mut BlankNodeVarNamer,
 ) -> Result<UnresolvedTermWithMeta, LowerError> {
     match term {
         Term::Var(v) => Ok(UnresolvedTermWithMeta {
@@ -1701,16 +1646,14 @@ fn object_to_unresolved_delete_where(
         Term::BlankNode(bn) => {
             // Stable Fluree blank-node ids match as constants
             // (see subject_to_unresolved_delete_where).
-            if let BlankNodeValue::Labeled(l) = &bn.value {
-                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                    return Ok(UnresolvedTermWithMeta {
-                        term: UnresolvedTerm::Iri(Arc::from(format!("_:{l}"))),
-                        dtc: None,
-                    });
-                }
+            if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+                return Ok(UnresolvedTermWithMeta {
+                    term: UnresolvedTerm::Iri(Arc::from(format!("_:{}", bn.label))),
+                    dtc: None,
+                });
             }
             Ok(UnresolvedTermWithMeta {
-                term: UnresolvedTerm::Var(bnodes.var_name(&bn.value)),
+                term: UnresolvedTerm::Var(bnode_var_name(bn)),
                 dtc: None,
             })
         }
@@ -1730,7 +1673,6 @@ fn lower_triple_to_delete_template_delete_where(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeVarNamer,
 ) -> Result<TripleTemplate, LowerError> {
     // Subject
     let subject = match &triple.subject {
@@ -1740,17 +1682,10 @@ fn lower_triple_to_delete_template_delete_where(
             TemplateTerm::Sid(ns.sid_for_iri(&expanded))
         }
         SubjectTerm::BlankNode(bn) => {
-            let stable = match &bn.value {
-                BlankNodeValue::Labeled(l) => crate::namespace::stable_blank_node_sid_from_label(l),
-                BlankNodeValue::Anon => None,
-            };
-            match stable {
+            match crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
                 // Stable Fluree blank-node ids retract from the stored node.
                 Some(sid) => TemplateTerm::Sid(sid),
-                None => {
-                    let name = bnodes.var_name(&bn.value);
-                    TemplateTerm::Var(vars.get_or_insert(&name))
-                }
+                None => TemplateTerm::Var(vars.get_or_insert(&bnode_var_name(bn))),
             }
         }
         SubjectTerm::QuotedTriple(qt) => {
@@ -1792,16 +1727,12 @@ fn lower_triple_to_delete_template_delete_where(
             (r.term, r.dtc)
         }
         Term::BlankNode(bn) => {
-            let stable = match &bn.value {
-                BlankNodeValue::Labeled(l) => crate::namespace::stable_blank_node_sid_from_label(l),
-                BlankNodeValue::Anon => None,
-            };
-            match stable {
+            match crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
                 Some(sid) => (TemplateTerm::Sid(sid), None),
-                None => {
-                    let name = bnodes.var_name(&bn.value);
-                    (TemplateTerm::Var(vars.get_or_insert(&name)), None)
-                }
+                None => (
+                    TemplateTerm::Var(vars.get_or_insert(&bnode_var_name(bn))),
+                    None,
+                ),
             }
         }
         Term::QuotedTriple(qt) => {
@@ -1910,7 +1841,6 @@ fn subject_to_template(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
 ) -> Result<TemplateTerm, LowerError> {
     match term {
         SubjectTerm::Var(v) => {
@@ -1922,19 +1852,13 @@ fn subject_to_template(
             Ok(TemplateTerm::Sid(ns.sid_for_iri(&expanded)))
         }
         SubjectTerm::BlankNode(bn) => {
-            let label = match &bn.value {
-                BlankNodeValue::Labeled(l) => {
-                    // Stable Fluree blank-node ids address the existing
-                    // stored node instead of skolemizing a fresh one, which
-                    // makes DELETE templates on them meaningful.
-                    if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(l) {
-                        return Ok(TemplateTerm::Sid(sid));
-                    }
-                    format!("_:{l}")
-                }
-                BlankNodeValue::Anon => bnodes.next(),
-            };
-            Ok(TemplateTerm::BlankNode(label))
+            // Stable Fluree blank-node ids address the existing stored node
+            // instead of skolemizing a fresh one, which makes DELETE
+            // templates on them meaningful.
+            if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
+                return Ok(TemplateTerm::Sid(sid));
+            }
+            Ok(TemplateTerm::BlankNode(format!("_:{}", bn.label)))
         }
         SubjectTerm::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF-star quoted triple",
@@ -1975,7 +1899,6 @@ fn object_to_template(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
 ) -> Result<TemplateTerm, LowerError> {
     match term {
         Term::Var(v) => {
@@ -1989,18 +1912,12 @@ fn object_to_template(
         // Literals should go through literal_to_template for metadata; this is a fallback
         Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns)?.term),
         Term::BlankNode(bn) => {
-            let label = match &bn.value {
-                BlankNodeValue::Labeled(l) => {
-                    // Stable Fluree blank-node ids resolve to the stored node
-                    // (see subject_to_template).
-                    if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(l) {
-                        return Ok(TemplateTerm::Sid(sid));
-                    }
-                    format!("_:{l}")
-                }
-                BlankNodeValue::Anon => bnodes.next(),
-            };
-            Ok(TemplateTerm::BlankNode(label))
+            // Stable Fluree blank-node ids resolve to the stored node
+            // (see subject_to_template).
+            if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
+                return Ok(TemplateTerm::Sid(sid));
+            }
+            Ok(TemplateTerm::BlankNode(format!("_:{}", bn.label)))
         }
         Term::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
@@ -2330,9 +2247,8 @@ mod tests {
         let var = Var::new("name", test_span());
         let prologue = test_prologue();
         let subject = SubjectTerm::Var(var);
-        let mut namer = BlankNodeVarNamer::new();
 
-        let result = subject_to_unresolved_delete_where(&subject, &prologue, &mut namer).unwrap();
+        let result = subject_to_unresolved_delete_where(&subject, &prologue).unwrap();
         match result {
             UnresolvedTerm::Var(name) => assert_eq!(name.as_ref(), "?name"),
             _ => panic!("Expected variable term"),
@@ -2346,9 +2262,8 @@ mod tests {
         let bn = BlankNode::labeled("b1", test_span());
         let prologue = test_prologue();
         let subject = SubjectTerm::BlankNode(bn);
-        let mut namer = BlankNodeVarNamer::new();
 
-        let result = subject_to_unresolved_delete_where(&subject, &prologue, &mut namer).unwrap();
+        let result = subject_to_unresolved_delete_where(&subject, &prologue).unwrap();
         assert_eq!(result, UnresolvedTerm::Var(Arc::from("_:b1")));
     }
 
@@ -2373,9 +2288,8 @@ mod tests {
     #[test]
     fn test_blank_node_counter() {
         let mut counter = BlankNodeCounter::new();
-        assert_eq!(counter.next(), "_:-anon0");
+        assert_eq!(counter.next_annotation(), "-ann0");
         assert_eq!(counter.next_annotation(), "-ann1");
-        assert_eq!(counter.next(), "_:-anon2");
     }
 
     #[test]
@@ -2564,16 +2478,17 @@ mod tests {
 
     #[test]
     fn test_delete_where_anon_bnode_vars_disjoint_from_labels() {
-        // A user-written label `_:b0` and an anonymous `[]` are distinct
-        // existentials. The old `_:b{N}` anonymous names lived inside the
-        // label namespace, so `[]` unified with a user's `_:b0` — deleting
-        // by the JOIN of two patterns that the spec treats independently.
-        // The `_:[]{N}` anonymous namespace cannot be produced by any
-        // BLANK_NODE_LABEL. Pin both DELETE WHERE paths.
+        // A user-written label and an anonymous `[]` are distinct
+        // existentials. Anonymous names once lived inside the label
+        // namespace (`_:b{N}`), so `[]` unified with a user's `_:b0` —
+        // deleting by the JOIN of two patterns that the spec treats
+        // independently. The parser's `-anon<N>` labels cannot be spelled as
+        // a BLANK_NODE_LABEL. Pin both DELETE WHERE paths.
         for input in [
-            // Triple-only fast path (BlankNodeVarNamer used directly).
+            // Triple-only fast path.
             "DELETE WHERE { _:b0 <http://example.org/p> ?o . [] <http://example.org/q> ?r }",
-            // GRAPH path (rewrite_blank_nodes_to_vars, shared namer).
+            "DELETE WHERE { _:anon0 <http://example.org/p> ?o . [] <http://example.org/q> ?r }",
+            // GRAPH path (rewrite_blank_nodes_to_vars).
             "DELETE WHERE { GRAPH <urn:g1> { _:b0 <http://example.org/p> ?o . \
              [] <http://example.org/q> ?r } }",
         ] {
@@ -2597,6 +2512,49 @@ mod tests {
                 "a user label _:b0 must not unify with an anonymous [] existential ({input})"
             );
         }
+    }
+
+    #[test]
+    fn test_delete_where_anon_bnode_names_one_var_on_both_sides() {
+        // Each `[]` of a triple-only DELETE WHERE is one existential: its
+        // template must read the variable its WHERE pattern binds, as subject,
+        // as object, with several in one pattern, and across the copies a `;`
+        // list makes of its subject.
+        let input = "DELETE WHERE { [] <http://example.org/p> ?o . \
+                     <http://example.org/s> <http://example.org/q> [] . \
+                     [] <http://example.org/r> [] . \
+                     [] <http://example.org/t> ?x ; <http://example.org/u> ?y }";
+        let parsed = fluree_db_sparql::parse_sparql(input);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        assert!(txn.sparql_where.is_none(), "the triple-only path");
+        let var_of = |term: &UnresolvedTerm| match term {
+            UnresolvedTerm::Var(name) => txn.vars.get(name),
+            _ => None,
+        };
+        let mut anon = Vec::new();
+        for (pattern, template) in txn.where_patterns.iter().zip(&txn.delete_templates) {
+            let UnresolvedPattern::Triple(tp) = pattern else {
+                panic!("a triple pattern: {pattern:?}");
+            };
+            for (where_term, template_term) in
+                [(&tp.s, &template.subject), (&tp.o, &template.object)]
+            {
+                if let TemplateTerm::Var(v) = template_term {
+                    assert_eq!(var_of(where_term), Some(*v), "{where_term:?}");
+                    anon.push(*v);
+                }
+            }
+        }
+        anon.retain(|v| txn.vars.name(*v).starts_with("_:-anon"));
+        let distinct: std::collections::HashSet<_> = anon.iter().collect();
+        assert_eq!(
+            (anon.len(), distinct.len()),
+            (6, 5),
+            "five `[]`, the `;` copy reading its subject's existential"
+        );
     }
 
     #[test]
