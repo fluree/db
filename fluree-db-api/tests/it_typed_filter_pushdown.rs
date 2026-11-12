@@ -43,50 +43,105 @@ impl Drop for FastPathGuard {
 }
 
 /// One FILTER over a pattern binding `?o`: (name, pattern, filter, the
-/// answer's local names, whether the plan pushes bounds, and whether an
-/// indexed scan must seek the typed term: `Some(true)` must, `Some(false)`
-/// must not, `None` either, as the join lanes probe instead).
+/// answer's local names, whether the plan shows the bounds pushed (`None`
+/// where the operator reports none: a property join applies them without
+/// saying so), and whether an indexed scan must seek the typed term:
+/// `Some(true)` must, `Some(false)` must not, `None` either, as the join
+/// lanes probe instead).
 type Case = (
     &'static str,
     &'static str,
     &'static str,
     &'static [&'static str],
-    bool,
+    Option<bool>,
     Option<bool>,
 );
 
 const P: &str = "?s ex:p ?o";
 const JOIN: &str = "?s a ex:Thing . ?s ex:p ?o";
 const STAR: &str = "?s ex:p ?o ; ex:q ?q";
+const VALUES: &str = "VALUES ?s { ex:t ex:u ex:plain ex:en ex:t2 } ?s ex:p ?o";
+const STAR3: &str = "?s a ex:Thing ; ex:q ?q ; ex:p ?o";
 const MUST: Option<bool> = Some(true);
 const NEVER: Option<bool> = Some(false);
 
 fn sparql_cases() -> Vec<Case> {
     vec![
-        ("custom", P, r#"?o = "x"^^ex:T"#, &["t"], true, MUST),
-        ("reversed", P, r#""x"^^ex:T = ?o"#, &["t"], true, MUST),
-        ("STRDT", P, r#"?o = STRDT("x", ex:T)"#, &["t"], true, MUST),
-        ("anyURI", P, r#"?o = "x"^^xsd:anyURI"#, &["uri"], true, MUST),
-        ("token", P, r#"?o = "x"^^xsd:token"#, &["tok"], true, MUST),
-        ("other text", P, r#"?o = "y"^^ex:T"#, &["ty"], true, MUST),
-        ("no scheme", P, r#"?o = "x"^^<T>"#, &["bare"], true, MUST),
+        ("custom", P, r#"?o = "x"^^ex:T"#, &["t"], Some(true), MUST),
+        ("reversed", P, r#""x"^^ex:T = ?o"#, &["t"], Some(true), MUST),
+        (
+            "STRDT",
+            P,
+            r#"?o = STRDT("x", ex:T)"#,
+            &["t"],
+            Some(true),
+            MUST,
+        ),
+        (
+            "anyURI",
+            P,
+            r#"?o = "x"^^xsd:anyURI"#,
+            &["uri"],
+            Some(true),
+            MUST,
+        ),
+        (
+            "token",
+            P,
+            r#"?o = "x"^^xsd:token"#,
+            &["tok"],
+            Some(true),
+            MUST,
+        ),
+        (
+            "other text",
+            P,
+            r#"?o = "y"^^ex:T"#,
+            &["ty"],
+            Some(true),
+            MUST,
+        ),
+        (
+            "no scheme",
+            P,
+            r#"?o = "x"^^<T>"#,
+            &["bare"],
+            Some(true),
+            MUST,
+        ),
         (
             "unseen namespace",
             P,
             r#"?o = "x"^^<http://nowhere.example/T>"#,
             &[],
-            true,
+            Some(true),
             MUST,
         ),
-        ("join", JOIN, r#"?o = "x"^^ex:T"#, &["t"], true, None),
-        ("star", STAR, r#"?o = "x"^^ex:T"#, &["t"], true, None),
+        ("join", JOIN, r#"?o = "x"^^ex:T"#, &["t"], Some(true), None),
+        ("star", STAR, r#"?o = "x"^^ex:T"#, &["t"], Some(true), None),
+        (
+            "values join",
+            VALUES,
+            r#"?o = "x"^^ex:T"#,
+            &["t"],
+            Some(true),
+            None,
+        ),
+        (
+            "star of three",
+            STAR3,
+            r#"?o = "x"^^ex:T"#,
+            &["t"],
+            None,
+            None,
+        ),
         // Canaries: nothing here may fold into a typed bound.
         (
             "integer",
             P,
             r#"?o = "5"^^xsd:integer"#,
             &["num"],
-            true,
+            Some(true),
             NEVER,
         ),
         (
@@ -94,16 +149,23 @@ fn sparql_cases() -> Vec<Case> {
             P,
             r#"STRDT("5", xsd:integer) = ?o"#,
             &["num"],
-            false,
+            Some(false),
             NEVER,
         ),
-        ("or", P, r#"?o = "x"^^ex:T || false"#, &["t"], false, NEVER),
+        (
+            "or",
+            P,
+            r#"?o = "x"^^ex:T || false"#,
+            &["t"],
+            Some(false),
+            NEVER,
+        ),
         (
             "two datatypes",
             P,
             r#"?o = "x"^^ex:T && ?o = "x"^^ex:U"#,
             &[],
-            false,
+            Some(false),
             NEVER,
         ),
         // A plain and a typed `=` on one variable are two terms: the merge
@@ -113,7 +175,7 @@ fn sparql_cases() -> Vec<Case> {
             r#"?s ex:p ?o FILTER(?o = "x")"#,
             r#"?o = "x"^^ex:T"#,
             &[],
-            true,
+            Some(true),
             NEVER,
         ),
     ]
@@ -300,7 +362,7 @@ async fn typed_literal_equality_pushes_as_its_term() {
                 P,
                 r#"?o = "x"^^ex:N"#,
                 &["n"],
-                true,
+                Some(true),
                 MUST,
             ));
             cases.push((
@@ -308,7 +370,7 @@ async fn typed_literal_equality_pushes_as_its_term() {
                 P,
                 r#"?o = "zzz"^^ex:T"#,
                 &["z"],
-                true,
+                Some(true),
                 MUST,
             ));
         }
@@ -321,10 +383,11 @@ async fn typed_literal_equality_pushes_as_its_term() {
                 .explain_sparql(&db, &format!("{PREFIX}{q}"))
                 .await
                 .unwrap();
-            if pushes_bounds(&plan) != pushed {
+            if pushed.is_some_and(|pushed| pushes_bounds(&plan) != pushed) {
                 failures.push(format!(
-                    "{what}: pushed = {}, want {pushed}: {}",
-                    !pushed, plan["plan"]["physical"]
+                    "{what}: pushed = {}, want {pushed:?}: {}",
+                    pushes_bounds(&plan),
+                    plan["plan"]["physical"]
                 ));
             }
             let (got, proceeded) = routed(&store, sparql(&fluree, &view, &q)).await;
