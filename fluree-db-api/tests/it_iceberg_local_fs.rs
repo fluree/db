@@ -42,6 +42,7 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/people_paged fluree-db-api/tests/fixtures/iceberg/silver/people_paged
 //! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
 //! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
+//! cp -r /tmp/fluree-local-iceberg/silver/versions fluree-db-api/tests/fixtures/iceberg/silver/versions
 //! ```
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
@@ -60,6 +61,9 @@ use futures::TryStreamExt;
 
 #[path = "support/span_capture.rs"]
 mod span_capture;
+
+// Top-k cases over `silver.versions`, in a module of their own.
+mod iceberg_local_fs_top_k;
 
 const PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
@@ -3416,7 +3420,12 @@ async fn sparql_construct_over_a_graph_source_keeps_the_ordered_page() {
         .execute_formatted()
         .await
         .expect_err("DESCRIBE over a graph source is refused");
-    assert!(err.to_string().contains("subquery"), "DESCRIBE: {err}");
+    // DESCRIBE's expansion follows `rdf:rest*`, a path no graph source evaluates.
+    let err = err.to_string();
+    assert!(
+        err.contains("cannot be evaluated over a virtual dataset"),
+        "DESCRIBE: {err}"
+    );
 }
 
 /// The people table mapped twice over disjoint subject templates: persons
@@ -4554,5 +4563,233 @@ async fn unordered_grouped_pages_are_the_same_on_every_execution() {
     assert_eq!(
         runs[0], runs[1],
         "two fresh instances page the groups alike"
+    );
+}
+
+/// `people_window` read as five files with disjoint `id` ranges (1..=600,
+/// 601..=1200, …), so a scan-side top-k by `id` can prune files.
+const WINDOW_PEOPLE_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#WindowMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
+"#;
+
+/// The ids (in answer order) of the first column named `id` in a SPARQL or
+/// JSON-LD result.
+fn answer_ids(result: &serde_json::Value) -> Vec<i64> {
+    let parse = |v: &serde_json::Value| -> i64 {
+        match v {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            serde_json::Value::String(s) => s.parse().unwrap(),
+            serde_json::Value::Object(o) => match &o["value"] {
+                serde_json::Value::String(s) => s.parse().unwrap(),
+                other => other.as_i64().unwrap(),
+            },
+            other => panic!("not an id: {other}"),
+        }
+    };
+    if let Some(bindings) = result["results"]["bindings"].as_array() {
+        return bindings.iter().map(|b| parse(&b["id"])).collect();
+    }
+    result
+        .as_array()
+        .unwrap_or_else(|| panic!("not a result: {result}"))
+        .iter()
+        .map(|row| parse(&row[0]))
+        .collect()
+}
+
+/// `people_window.id` references `cells.i32`; persons 9 and 10 reference
+/// cells 2 and 5 (each key sits on two cells, and the smaller wins), and most
+/// persons' references dangle.
+const PERSON_CELL_TOPK_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:cell ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Cell> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "i32" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/cell/{id}" ] .
+"#;
+
+/// A `VALUES` binding the object of a reference: `ORDER BY DESC(?id) LIMIT 3`
+/// answers the persons that reference those cells (ids 10 and 9), not the
+/// table's top three ids, which the join with the `VALUES` then drops.
+#[tokio::test]
+async fn order_by_limit_over_a_scan_its_input_binds_answers_the_bound_rows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("topk-cell", &root, PERSON_CELL_TOPK_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cells = [
+        "http://example.org/cell/2".to_string(),
+        "http://example.org/cell/5".to_string(),
+    ];
+    let mut wrong = Vec::new();
+    let sparql = format!(
+        "SELECT ?id FROM <topk-cell:main> WHERE {{ VALUES ?c {{ {} }} \
+         ?p <http://example.org/cell> ?c ; <http://example.org/id> ?id }} \
+         ORDER BY DESC(?id) LIMIT 3",
+        cells
+            .iter()
+            .map(|c| format!("<{c}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    if answer_ids(&result) != [10, 9] {
+        wrong.push(format!("SPARQL: {result}"));
+    }
+    let ids: Vec<serde_json::Value> = cells
+        .iter()
+        .map(|c| serde_json::json!({"@id": c}))
+        .collect();
+    let jsonld = serde_json::json!({
+        "from": "topk-cell:main",
+        "select": ["?id"],
+        "where": [
+            ["values", ["?c", ids]],
+            {"@id": "?p", "http://example.org/cell": "?c", "http://example.org/id": "?id"}
+        ],
+        "orderBy": "(desc ?id)",
+        "limit": 3,
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("JSON-LD: {e}"));
+    if answer_ids(&result) != [10, 9] {
+        wrong.push(format!("JSON-LD: {result}"));
+    }
+    assert!(
+        wrong.is_empty(),
+        "expected ids [10, 9]:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// `ORDER BY … LIMIT k` over a scan whose rows are joined to its input (a
+/// `VALUES` block, here) answers the top k of the JOINED rows. The scan-side
+/// top-k keeps the k best rows the reader returns and skips every file that
+/// cannot beat them, which is sound only when the reader returns no row the
+/// operator later drops. The join with the `VALUES` drops rows, and a pushed
+/// `IN` may be applied only partly by the reader: fed those rows, the heap
+/// fills with ids 2401..=3000 from the last file, stops before the first, and
+/// loses id 5.
+#[tokio::test]
+async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cases = [
+        // A single-var VALUES also pushes an `IN` on the id column.
+        (
+            "VALUES ?id { 5 2500 }",
+            serde_json::json!(["values", ["?id", [5, 2500]]]),
+        ),
+        // A two-var VALUES pushes nothing; the join alone drops rows.
+        (
+            "VALUES (?s ?id) { (<http://example.org/person/5> 5) (<http://example.org/person/2500> 2500) }",
+            serde_json::json!(["values", [["?s", "?id"], [
+                [{"@id": "http://example.org/person/5"}, 5],
+                [{"@id": "http://example.org/person/2500"}, 2500]
+            ]]]),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (values, jsonld_values) in cases {
+        let sparql = format!(
+            "SELECT ?id FROM <topk-window:main> \
+             WHERE {{ {values} ?s <http://example.org/id> ?id }} \
+             ORDER BY DESC(?id) LIMIT 2"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+        if answer_ids(&result) != [2500, 5] {
+            wrong.push(format!("SPARQL {values}: {result}"));
+        }
+
+        let jsonld = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "topk-window:main",
+            "select": ["?id"],
+            "where": [jsonld_values, {"@id": "?s", "ex:id": "?id"}],
+            "orderBy": "(desc ?id)",
+            "limit": 2,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {values}: {e}"));
+        if answer_ids(&result) != [2500, 5] {
+            wrong.push(format!("JSON-LD {values}: {result}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "expected ids [2500, 5]:\n{}",
+        wrong.join("\n")
     );
 }

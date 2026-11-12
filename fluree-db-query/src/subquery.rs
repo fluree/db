@@ -988,7 +988,7 @@ impl SubqueryOperator {
 const SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS: usize = 8;
 
 /// Variables bound in *every* solution of `patterns` — produced by a top-level
-/// required pattern (triple / property path), or exported by a slice-free nested
+/// required pattern (triple / property path / R2RML scan), or exported by a slice-free nested
 /// sub-SELECT whose own body always-binds them. NOT vars bound only inside a
 /// `UNION` branch or `OPTIONAL` (conditional), nor a sub-SELECT's pass-throughs.
 /// These are the only correlation variables safe to use as evaluate-once
@@ -1001,6 +1001,11 @@ pub(crate) fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
             Pattern::Triple(_) | Pattern::ListView(_) | Pattern::PropertyPath(_) => {
                 produced.extend(p.produced_vars());
             }
+            // An R2RML scan: a graph-source sub-select body, lowered by the
+            // rewrite. It binds its variables in every row it emits, like the
+            // triples it replaces, with the one exception its own method
+            // leaves out.
+            Pattern::R2rml(rp) => produced.extend(rp.always_bound_vars()),
             // A nested sub-SELECT binds the SELECT vars its own body always
             // binds, so those are always-bound here too. A slice would make
             // per-row seeding of such a var result-sensitive, so skip it then.
@@ -1028,6 +1033,35 @@ mod tests {
     use crate::ir::SubqueryPattern;
     use crate::seed::SeedOperator;
     use crate::var_registry::VarId;
+
+    /// A graph-source sub-select body is R2RML scans after the rewrite. Their
+    /// variables are hash-join keys like a triple's, so a JSON-LD sub-select
+    /// joining on one is seeded per outer row with it rather than reading the
+    /// table per outer row unseeded. A type variable fused into a wildcard is
+    /// the exception: over a classless map it is left unbound.
+    #[test]
+    fn r2rml_scans_produce_their_always_bound_vars() {
+        use crate::ir::R2rmlPattern;
+        let (s, o, p, t, x) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let star = R2rmlPattern::new("gs:main", s, Some(o))
+            .with_predicate("http://example.org/customer")
+            .with_star_bindings(vec![("http://example.org/amount".into(), x)]);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(star)]),
+            HashSet::from([s, o, x])
+        );
+        let typed = R2rmlPattern::new("gs:main", s, None).with_type_var(t);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(typed)]),
+            HashSet::from([s, t])
+        );
+        let mut crawl = R2rmlPattern::new("gs:main", s, Some(o)).with_type_var(t);
+        crawl.predicate_var = Some(p);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(crawl)]),
+            HashSet::from([s, o, p])
+        );
+    }
 
     #[tokio::test]
     async fn materialized_join_matches_partial_keys_without_reviving_poisoned_rows() {

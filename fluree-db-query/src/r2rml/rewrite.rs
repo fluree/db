@@ -46,8 +46,10 @@ pub struct R2rmlRewriteResult {
     pub unconverted_count: usize,
     /// Non-lowered sub-scope patterns that would evaluate against the R2RML
     /// graph source's (empty) native index and **silently return no rows** —
-    /// property paths, shortest paths, and subqueries, whose bodies traverse or
-    /// scan the enclosing graph. The caller MUST error (via
+    /// property paths and shortest paths, which traverse the enclosing graph.
+    /// Collected from every nested body the rewrite descends into, a
+    /// sub-select's included (its body is lowered like any other scope). The
+    /// caller MUST error (via
     /// [`unsupported_subscope_error`]) when this is non-empty rather than hand
     /// back a silently-wrong empty result. Holds each SPARQL kind name for the
     /// error message. Deliberately excludes the search patterns
@@ -86,25 +88,50 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
         .map(|iri| format!("'{iri}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    // Only the out-of-scope guard reports a sub-select (inside a graph scope
+    // the rewrite lowers its body), so its advice is to move it into one.
+    let paths = unique.iter().any(|kind| *kind != "subquery");
+    let mut advice = Vec::with_capacity(2);
+    if paths {
+        advice.push(
+            "Rewrite paths as fixed-length steps between nodes, or run them against a \
+             native ledger.",
+        );
+    }
+    if unique.contains(&"subquery") {
+        advice.push(
+            "A sub-select reads a graph source only from inside that source's graph \
+             block; move it there, or drop the explicit graph block so the whole query \
+             is scoped to the graph source.",
+        );
+    }
     crate::error::QueryError::InvalidQuery(format!(
         "{subject} {names} {verb} pattern(s) that cannot be evaluated over a \
          virtual dataset (a graph source has no native index, so these would silently \
-         return no rows): {}. Rewrite them as fixed-length steps between nodes, or run \
-         them against a native ledger.",
-        unique.join(", ")
+         return no rows): {}. {}",
+        unique.join(", "),
+        advice.join(" ")
     ))
 }
 
 /// The kinds of pattern a graph source cannot evaluate, collected from the
 /// patterns that sit **outside** every `GRAPH` scope.
 ///
-/// [`rewrite_patterns_for_r2rml`] records the same three kinds for the patterns
+/// [`rewrite_patterns_for_r2rml`] records the path kinds for the patterns
 /// *inside* one graph-source scope, and `GraphOperator` refuses on them. But a
 /// query addressed to a graph source can carry them at the top level too, where
 /// no `GRAPH` scope — and so no rewrite, and no refusal — ever sees them. There
 /// they evaluate against the graph source's view, which is a zero-flake genesis
 /// snapshot, and return silently-wrong results: `p+` nothing at all, `p*`/`p?`
-/// the zero-length identity match only. The API layer calls this before
+/// the zero-length identity match only.
+///
+/// A sub-select is refused here too when its body reads this view (a triple or
+/// list pattern outside every `GRAPH` scope of its own), although the rewrite
+/// lowers one inside a graph scope: out here nothing lowers that body, so it
+/// would read the same empty snapshot (an ungrouped `COUNT` answering 0). A
+/// sub-select whose body reads only through its own `GRAPH` blocks, or reads
+/// nothing (only `VALUES` or `BIND`), is evaluated like any other, and the
+/// paths inside its body are still collected. The API layer calls this before
 /// execution and refuses with [`unsupported_subscope_error`], so the refusal
 /// does not depend on whether the query happens to contain a `GRAPH` block.
 ///
@@ -122,33 +149,47 @@ pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static st
     kinds
 }
 
-fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Vec<&'static str>) {
+/// Collect into `kinds`; returns whether `patterns` read this view through a
+/// triple or list pattern outside every `GRAPH` scope.
+fn collect_unsupported_outside_graph_scopes(
+    patterns: &[Pattern],
+    kinds: &mut Vec<&'static str>,
+) -> bool {
+    let mut reads_view = false;
     for pattern in patterns {
         match pattern {
-            // The three kinds the rewriter flags, named identically so one
+            // The path kinds the rewriter flags, named identically so one
             // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
-            Pattern::Subquery(_) => kinds.push("subquery"),
+            // A sub-select whose body reads this view, which no rewrite
+            // reaches out here (see above).
+            Pattern::Subquery(sq) => {
+                if collect_unsupported_outside_graph_scopes(&sq.patterns, kinds) {
+                    kinds.push("subquery");
+                    reads_view = true;
+                }
+            }
+            // The leaves that read this view's index.
+            Pattern::Triple(_) | Pattern::ListView(_) => reads_view = true,
             // Containers whose bodies evaluate against this view.
             Pattern::Optional(inner)
             | Pattern::Minus(inner)
             | Pattern::Exists(inner)
             | Pattern::NotExists(inner)
             | Pattern::DefaultGraphSource { patterns: inner } => {
-                collect_unsupported_outside_graph_scopes(inner, kinds);
+                reads_view |= collect_unsupported_outside_graph_scopes(inner, kinds);
             }
             Pattern::Union(branches) => {
                 for branch in branches {
-                    collect_unsupported_outside_graph_scopes(branch, kinds);
+                    reads_view |= collect_unsupported_outside_graph_scopes(branch, kinds);
                 }
             }
-            // Everything else is either a leaf, routed elsewhere, or its own
-            // scope — see the doc comment. Listed exhaustively so a new pattern
-            // variant that reads this view's index forces a decision here.
-            Pattern::Triple(_)
-            | Pattern::ListView(_)
-            | Pattern::Filter(_)
+            // Everything else is either a leaf that reads no index, routed
+            // elsewhere, or its own scope — see the doc comment. Listed
+            // exhaustively so a new pattern variant that reads this view's
+            // index forces a decision here.
+            Pattern::Filter(_)
             | Pattern::Bind { .. }
             | Pattern::Unwind { .. }
             | Pattern::Values { .. }
@@ -163,6 +204,7 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             | Pattern::AnnotationTarget { .. } => {}
         }
     }
+    reads_view
 }
 
 /// The typed refusal for an R2RML graph-source query carrying `unconverted`
@@ -247,8 +289,9 @@ pub fn rewrite_patterns_for_r2rml(
     let mut origins: Vec<usize> = Vec::with_capacity(patterns.len());
     let mut star_origin: HashMap<VarId, usize> = HashMap::new();
     let mut class_origin: HashMap<VarId, usize> = HashMap::new();
-    // Variables of each positional pattern (OPTIONAL, MINUS) seen so far, by
-    // input position.
+    // Variables each pattern that holds its written place (OPTIONAL, MINUS, a
+    // correlated sub-select; see `written_order_reads`) reads, by input
+    // position.
     let mut barrier_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
 
     for (i, pattern) in patterns.iter().enumerate() {
@@ -304,16 +347,23 @@ pub fn rewrite_patterns_for_r2rml(
                 }
             }
             // Recurse into structural containers (except Graph, which this
-            // rewriter is graph-source-bounded and treats as a leaf, and
-            // Subquery, which is its own scope).
+            // rewriter is graph-source-bounded and treats as a leaf). Each body
+            // is rewritten as its own scope, so nothing fuses across the
+            // boundary. A sub-select's body scans this same graph source, so
+            // it is lowered here too: `SubqueryOperator` then builds R2RML
+            // scans from it under the enclosing graph context, and anything
+            // its body cannot lower still lands in `unconverted`/`unsupported`
+            // and refuses the whole scope rather than reading the source's
+            // empty native index.
             Pattern::Optional(_)
             | Pattern::Union(_)
             | Pattern::Minus(_)
             | Pattern::Exists(_)
             | Pattern::NotExists(_)
-            | Pattern::Service(_) => {
-                if pattern.order_role().is_positional() {
-                    barrier_vars.push((i, pattern.referenced_vars().into_iter().collect()));
+            | Pattern::Service(_)
+            | Pattern::Subquery(_) => {
+                if let Some(reads) = written_order_reads(pattern) {
+                    barrier_vars.push((i, reads));
                 }
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
                     let r = rewrite_patterns_for_r2rml(
@@ -336,8 +386,7 @@ pub fn rewrite_patterns_for_r2rml(
             // graph source's (empty) native index, so if left unconverted they
             // return no rows *silently* (fluree/db virtual-dataset findings
             // F1/F2). Record them so the caller errors loudly instead. A
-            // property/shortest path traverses the graph; a subquery's WHERE
-            // scans it. Sequence paths (`a/b`) never reach here — SPARQL
+            // property/shortest path traverses the graph. Sequence paths (`a/b`) never reach here — SPARQL
             // lowering decomposes them into triples upstream — so a residual
             // `PropertyPath` is a transitive/complex path. We do NOT attempt to
             // lower these (out of scope); we only convert silent-wrong into a
@@ -349,11 +398,6 @@ pub fn rewrite_patterns_for_r2rml(
             }
             Pattern::ShortestPath(_) => {
                 unsupported.push("shortest path");
-                result_patterns.push(pattern.clone());
-                origins.push(i);
-            }
-            Pattern::Subquery(_) => {
-                unsupported.push("subquery");
                 result_patterns.push(pattern.clone());
                 origins.push(i);
             }
@@ -712,10 +756,10 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
-    // An OPTIONAL or a MINUS is evaluated over what is written before it, so
-    // restore written order around it: the grouped scans above were emitted
-    // after the loop, below every positional pattern.
-    if patterns.iter().any(|p| p.order_role().is_positional()) {
+    // An OPTIONAL, a MINUS or a correlated sub-select is evaluated over what is
+    // written before it, so restore written order around it: the grouped scans
+    // above were emitted after the loop, below every such pattern.
+    if patterns.iter().any(|p| written_order_reads(p).is_some()) {
         assert_eq!(origins.len(), result_patterns.len());
         let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
         ordered.sort_by_key(|(origin, _)| *origin);
@@ -1093,9 +1137,30 @@ fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> 
     Some(ScanValue::Decimal { unscaled, scale })
 }
 
+/// The variables a pattern that holds its written place reads from the patterns
+/// written before it, or `None` when the planner may move it freely.
+///
+/// An OPTIONAL or a MINUS (see [`crate::ir::OrderRole::is_positional`]) reads
+/// every variable it references. A correlated sub-select (JSON-LD's, seeded
+/// per outer row) reads its SELECT list: the planner takes its correlation
+/// inputs from the siblings written before it (`subquery_correlation_vars`),
+/// so the grouped scans this rewrite emits after its loop must be ordered back
+/// above it. Left below, `[?c ex:name ?n, sub-select]` became
+/// `[sub-select, star(?c)]`, and the sub-select ran once, uncorrelated: its
+/// `LIMIT` kept the top rows overall instead of per `?c`. A SPARQL sub-select
+/// is evaluated independently of where it is written, so it moves freely.
+fn written_order_reads(pattern: &Pattern) -> Option<HashSet<VarId>> {
+    match pattern {
+        Pattern::Subquery(sq) if !sq.uncorrelated => Some(sq.select.iter().copied().collect()),
+        p if p.order_role().is_positional() => Some(p.referenced_vars().into_iter().collect()),
+        _ => None,
+    }
+}
+
 /// Whether lifting a scan written at slot `from` up to slot `to` (`to < from`)
-/// carries it past a positional pattern (an OPTIONAL or a MINUS, see
-/// [`crate::ir::OrderRole::is_positional`]) that reads one of `vars`.
+/// carries it past a pattern that holds its written place (an OPTIONAL, a
+/// MINUS, a correlated sub-select: [`written_order_reads`]) that reads one of
+/// `vars`.
 ///
 /// Every fusion here merges scans written at different slots into one, and the
 /// written-order restore places the fused scan at a single slot. That slot must
@@ -3325,6 +3390,57 @@ mod tests {
         assert!(star < minus, "{out:?}");
     }
 
+    /// `?s name ?n {sub-select ?s ?k} ?s nick ?k`. A JSON-LD sub-select is
+    /// correlated with what is written before it (the planner seeds it from
+    /// those siblings only), so the star written above it stays above it:
+    /// emitted after the loop it ran below, and the sub-select ran once,
+    /// uncorrelated. And the `nick` member, which binds one of its SELECT
+    /// variables, is not lifted into that star above it, where `?k` would
+    /// become a correlation input. A SPARQL sub-select is evaluated
+    /// independently, so it holds no place and the member fuses.
+    #[test]
+    fn a_correlated_sub_select_keeps_its_written_order() {
+        use crate::ir::pattern::SubqueryPattern;
+        for uncorrelated in [false, true] {
+            let mut sq = SubqueryPattern::new(
+                vec![VarId(0), VarId(2)],
+                vec![triple(0, SCORE_PRED, Term::Var(VarId(2)))],
+            );
+            sq.uncorrelated = uncorrelated;
+            let out = rewrite_scope(
+                &[
+                    triple(0, PRED, Term::Var(VarId(1))),
+                    Pattern::Subquery(sq),
+                    triple(0, OTHER_PRED, Term::Var(VarId(2))),
+                ],
+                false,
+            );
+            let at = |pred: &str| {
+                out.iter().position(|p| {
+                    matches!(p, Pattern::R2rml(rp) if rp.predicate_filter.as_deref() == Some(pred))
+                })
+            };
+            let sub = out
+                .iter()
+                .position(|p| matches!(p, Pattern::Subquery(_)))
+                .expect("the sub-select stays a scope");
+            let star = at(PRED).expect("the name star");
+            if uncorrelated {
+                let Pattern::R2rml(rp) = &out[star] else {
+                    unreachable!()
+                };
+                assert!(
+                    rp.star_bindings.iter().any(|(p, _)| p == OTHER_PRED),
+                    "SPARQL: nick fuses into the star: {out:?}"
+                );
+            } else {
+                assert!(star < sub, "the star stays above: {out:?}");
+                let nick = at(OTHER_PRED).expect("nick is a scan of its own");
+                assert!(sub < nick, "nick stays below: {out:?}");
+            }
+        }
+    }
+
     /// `?s a C ; name ?n . ?s ?p ?o`: the class fuses into the `name` star, so
     /// the crawl wildcard beside it is hinted to C's maps. Unhinted it resolves
     /// every map, and when the star's subjects are few its LIMIT budget is never
@@ -3397,13 +3513,12 @@ mod tests {
     }
 
     /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML
-    /// source's empty native index (property/shortest path, subquery) is
-    /// recorded in `unsupported` so the caller errors loudly instead of
-    /// returning a silently-empty result (fluree/db virtual-dataset F1/F2).
+    /// source's empty native index (property/shortest path) is recorded in
+    /// `unsupported` so the caller errors loudly instead of returning a
+    /// silently-empty result (fluree/db virtual-dataset F1/F2).
     #[test]
     fn non_lowered_subscopes_are_flagged_unsupported() {
         use crate::ir::path::{PathModifier, PropertyPathPattern};
-        use crate::ir::pattern::SubqueryPattern;
         let snapshot = LedgerSnapshot::genesis("test:main");
 
         // Transitive property path.
@@ -3415,11 +3530,6 @@ mod tests {
         ));
         let r = rewrite_patterns_for_r2rml(&[path], "gs:main", &snapshot, None, false, false);
         assert_eq!(r.unsupported, vec!["property path"]);
-
-        // Subquery.
-        let sub = Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], vec![]));
-        let r = rewrite_patterns_for_r2rml(&[sub], "gs:main", &snapshot, None, false, false);
-        assert_eq!(r.unsupported, vec!["subquery"]);
 
         // A property path nested inside an OPTIONAL is caught via recursion.
         let opt = Pattern::Optional(vec![Pattern::PropertyPath(PropertyPathPattern::new(
@@ -3434,6 +3544,116 @@ mod tests {
             vec!["property path"],
             "recursion into OPTIONAL must catch a nested path"
         );
+    }
+
+    /// A sub-select's body scans the enclosing graph source, so the rewrite
+    /// lowers it as its own scope: its triples become R2RML scans (counted in
+    /// `converted_count`), its projection and modifiers are untouched, and
+    /// nothing is flagged. What its body cannot lower still refuses: a path
+    /// inside it lands in `unsupported`, a variable predicate with a bound
+    /// object in `unconverted_count`, exactly as at the top of the scope.
+    #[test]
+    fn a_sub_select_body_is_lowered_as_its_own_scope() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let wildcard = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Var(VarId(1)),
+            Term::Var(VarId(2)),
+        ));
+
+        let mut sq = SubqueryPattern::new(vec![VarId(0)], vec![wildcard.clone()]);
+        sq.distinct = true;
+        sq.limit = Some(3);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(sq)],
+            "gs:main",
+            &snapshot,
+            None,
+            false,
+            false,
+        );
+        assert!(r.unsupported.is_empty(), "{:?}", r.unsupported);
+        assert_eq!((r.converted_count, r.unconverted_count), (1, 0));
+        let [Pattern::Subquery(out)] = r.patterns.as_slice() else {
+            panic!("the sub-select stays a sub-select: {:?}", r.patterns);
+        };
+        assert!(
+            matches!(out.patterns.as_slice(), [Pattern::R2rml(rp)] if rp.graph_source_id == "gs:main"),
+            "its body is an R2RML scan of the enclosing source: {:?}",
+            out.patterns
+        );
+        assert_eq!(
+            (out.select.as_slice(), out.distinct, out.limit),
+            ([VarId(0)].as_slice(), true, Some(3)),
+            "projection and modifiers are carried over"
+        );
+
+        // Nested one level deeper, the inner body is lowered too.
+        let inner = SubqueryPattern::new(vec![VarId(0)], vec![wildcard.clone()]);
+        let outer = SubqueryPattern::new(vec![VarId(0)], vec![Pattern::Subquery(inner)]);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(outer)],
+            "gs:main",
+            &snapshot,
+            None,
+            false,
+            false,
+        );
+        assert!(r.unsupported.is_empty());
+        assert_eq!(r.converted_count, 1);
+
+        // A path inside the body still refuses the scope.
+        let path = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "knows"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        ));
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![wildcard, path]);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(sq)],
+            "gs:main",
+            &snapshot,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(r.unsupported, vec!["property path"]);
+
+        // So does an unconvertible triple (variable predicate, bound object).
+        let bound_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Var(VarId(1)),
+            Term::Value(FlakeValue::String("x".to_string())),
+        ));
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![bound_object]);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(sq)],
+            "gs:main",
+            &snapshot,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(r.unconverted_count, 1);
+    }
+
+    /// The out-of-scope guard reports a sub-select with advice that fits it:
+    /// move it into the source's graph block. Paths keep their own advice.
+    #[test]
+    fn a_stranded_sub_select_is_told_where_to_go() {
+        let msg = unsupported_subscope_error(&["gs:main"], &["subquery"]).to_string();
+        assert!(msg.contains("subquery"), "{msg}");
+        assert!(
+            msg.contains("from inside that source's graph block"),
+            "{msg}"
+        );
+        assert!(!msg.contains("fixed-length"), "{msg}");
+        let msg = unsupported_subscope_error(&["gs:main"], &["property path"]).to_string();
+        assert!(msg.contains("fixed-length"), "{msg}");
+        assert!(!msg.contains("sub-select"), "{msg}");
     }
 
     /// PR-0/0a negative case: patterns that only transform already-bound
@@ -3533,6 +3753,59 @@ mod tests {
             ))])
             .is_empty(),
             "a SERVICE body runs elsewhere and may have a native index"
+        );
+    }
+
+    /// A sub-select outside every graph scope is refused only when its body
+    /// reads this view: a body that reads through its own `GRAPH` block is
+    /// lowered there, and one that reads nothing (`VALUES`, `BIND`) needs no
+    /// index. Paths inside a body are still flagged.
+    #[test]
+    fn out_of_scope_scan_flags_a_sub_select_only_when_its_body_reads_this_view() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        use crate::ir::GraphName;
+
+        let sub = |patterns: Vec<Pattern>| {
+            Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], patterns))
+        };
+        let reads = || triple(0, PRED, Term::Var(VarId(1)));
+        let in_graph = |patterns: Vec<Pattern>| Pattern::Graph {
+            name: GraphName::Iri("gs:main".into()),
+            patterns,
+        };
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![reads()])]),
+            vec!["subquery"]
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![Pattern::Optional(vec![reads()])])]),
+            vec!["subquery"],
+            "an OPTIONAL in the body reads this view too"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![sub(vec![reads()])])])
+                .contains(&"subquery"),
+            "a nested body that reads this view"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![in_graph(vec![reads()])])]).is_empty(),
+            "a body that reads only through its own graph block"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![])]).is_empty(),
+            "a body that reads no index"
+        );
+        let path = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "edge"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        ));
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![path, in_graph(vec![reads()])])]),
+            vec!["property path"],
+            "a path in the body is still flagged"
         );
     }
 

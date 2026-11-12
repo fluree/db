@@ -36,6 +36,11 @@
 - `silver.orders`: orders referencing `customers_history.customer_id`,
   including a current customer, a deleted one, one with no current row, and a
   dangling id.
+- `silver.versions`: two snapshots (one file each) of rows that do not all
+  yield a solution: the second file holds the top names, among them a row
+  whose `id` (the subject's only column) is null and a row whose `city` is
+  null, so a top-k that counted them would prune the first file, whose
+  `erin` belongs in the answer.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -360,3 +365,25 @@ orders.append(pa.table({
 }, schema=orders_schema))
 orders = catalog.load_table("silver.orders")
 print("orders table_location:", orders.location())
+
+# ---------------------------------------------------------------------------
+# silver.versions: rows that yield no solution sorting above rows that do.
+# ---------------------------------------------------------------------------
+versions_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("city", pa.string()),
+])
+versions = catalog.create_table("silver.versions", schema=versions_schema)
+versions.append(pa.table({
+    "id": pa.array([1, 5], pa.int64()),
+    "name": pa.array(["alice", "erin"]),
+    "city": pa.array(["c1", "c5"]),
+}, schema=versions_schema))
+versions.append(pa.table({
+    "id": pa.array([2, 3, None, 6], pa.int64()),
+    "name": pa.array(["hank", "gina", "zed", "ivan"]),
+    "city": pa.array(["c2", "c3", "c0", None]),
+}, schema=versions_schema))
+versions = catalog.load_table("silver.versions")
+print("versions table_location:", versions.location())

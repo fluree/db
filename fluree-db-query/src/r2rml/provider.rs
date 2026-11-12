@@ -162,6 +162,12 @@ pub struct ScanTopK {
     /// does, and an `xsd:integer` over a string column's `"9"` bound sits above
     /// its `"100"`.
     pub order: TermOrder,
+    /// The columns a row must hold non-null to yield a solution (the
+    /// subject's, and each same-subject star member's). A row with a NULL in
+    /// one is dropped after the scan, so the bound counts only rows non-null
+    /// in all of them; a provider that cannot check one of them must not
+    /// prune.
+    pub required_columns: Vec<String>,
 }
 
 /// The order the engine sorts an object map's terms in, from its datatype. A
