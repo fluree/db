@@ -129,7 +129,9 @@ pub struct RestoreResult {
 /// Mirrors the integrity rules the pull path uses: a commit-v2 blob hashes
 /// over its canonical sub-range (so the digest is derived via
 /// `verify_commit_blob`), while every other content kind is a full-bytes
-/// SHA-256 verified against the CID. Reimplemented here (rather than reusing
+/// SHA-256 verified against the CID. An erased commit's replacement travels
+/// as an erasure frame, so one is never taken as a commit under the hash of
+/// its own bytes. Reimplemented here (rather than reusing
 /// `fluree-db-nameservice-sync::ingest_pack_frame`) so the API lib does not
 /// pull that crate's `reqwest` tree out of dev-dependencies.
 async fn ingest_cas_object<S: ContentAddressedWrite>(
@@ -142,13 +144,7 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
         .content_kind()
         .ok_or_else(|| ApiError::http(400, format!("unknown content kind for CID {cid}")))?;
 
-    let is_commit_v2 = cid.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(b"FCV2");
-    let integrity_ok = if is_commit_v2 {
-        fluree_db_core::commit::codec::commit_blob_matches(cid, bytes)
-    } else {
-        cid.verify(bytes)
-    };
-    if !integrity_ok {
+    if !object_matches(cid, bytes) {
         return Err(ApiError::http(
             400,
             format!("integrity check failed for {cid}"),
@@ -161,6 +157,16 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
         .await
         .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
     Ok(())
+}
+
+fn object_matches(cid: &ContentId, bytes: &[u8]) -> bool {
+    if cid.codec() != CODEC_FLUREE_COMMIT {
+        cid.verify(bytes)
+    } else if bytes.starts_with(b"FCV2") {
+        fluree_db_core::commit::codec::commit_blob_matches(cid, bytes)
+    } else {
+        !fluree_db_core::commit::codec::replacement::is_replacement(bytes) && cid.verify(bytes)
+    }
 }
 
 impl Serialize for Base64Bytes {

@@ -12,6 +12,10 @@ use fluree_db_core::{ContentId, ContentKind, CODEC_FLUREE_COMMIT};
 ///
 /// - Commit blobs (`FCV2` magic): the commit format's own hashing rules, via
 ///   `commit_blob_matches`
+/// - An erased commit's replacement (`FCR1` magic) under a commit CID: never.
+///   It stands for the commit it erased and travels with its erasure's
+///   chain, so it is no object under the hash of its own bytes, where the
+///   commit reader would decode it with no proof checked.
 /// - All other kinds (txn, config, dict, index, etc.): the full bytes, under
 ///   the CID's own hash algorithm
 ///
@@ -21,10 +25,12 @@ use fluree_db_core::{ContentId, ContentKind, CODEC_FLUREE_COMMIT};
 pub fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
     const COMMIT_V2_MAGIC: &[u8] = b"FCV2";
 
-    if id.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(COMMIT_V2_MAGIC) {
+    if id.codec() != CODEC_FLUREE_COMMIT {
+        id.verify(bytes)
+    } else if bytes.starts_with(COMMIT_V2_MAGIC) {
         fluree_db_core::commit::codec::commit_blob_matches(id, bytes)
     } else {
-        id.verify(bytes)
+        !fluree_db_core::commit::codec::replacement::is_replacement(bytes) && id.verify(bytes)
     }
 }
 

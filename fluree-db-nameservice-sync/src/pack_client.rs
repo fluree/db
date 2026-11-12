@@ -534,6 +534,19 @@ mod tests {
         assert!(!verify_object_integrity(&cid, b"wrong data"));
     }
 
+    /// An erased commit's replacement is no commit under the hash of its
+    /// own bytes, where the commit reader would decode it unproved.
+    #[test]
+    fn a_replacement_never_verifies_as_a_commit_object() {
+        let mut bytes = fluree_db_core::commit::codec::replacement::REPLACEMENT_MAGIC.to_vec();
+        bytes.extend_from_slice(b" redacted");
+        let as_commit = ContentId::new(ContentKind::Commit, &bytes);
+        assert!(as_commit.verify(&bytes));
+        assert!(!verify_object_integrity(&as_commit, &bytes));
+        let as_txn = ContentId::new(ContentKind::Txn, &bytes);
+        assert!(verify_object_integrity(&as_txn, &bytes));
+    }
+
     #[test]
     fn test_encode_minimal_pack_stream() {
         // Build a minimal pack stream (header + end only) to validate
