@@ -552,6 +552,160 @@ async fn a_search_enabled_connection_query_refuses_removed_history() {
     assert_eq!(current.to_jsonld(&now.snapshot).unwrap(), json!(["a@new"]));
 }
 
+/// A ledger with a `dev` branch whose `ex:alice` email was `a@old` (at the
+/// returned `t`) and is `a@new`, the old one removed there.
+async fn removed_on_a_branch(fluree: &Fluree, name: &str) -> (String, String, i64) {
+    let main = ledger(fluree, name).await;
+    let dev = format!("{name}:dev");
+    upsert(
+        fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:base", "ex:n": 0}),
+    )
+    .await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let email = |v: &str| json!({"@context": ctx(), "@id": "ex:alice", "ex:email": v});
+    let t_old = upsert(fluree, &dev, email("a@old")).await;
+    upsert(fluree, &dev, email("a@new")).await;
+    fluree
+        .remove_occurrences(&dev, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    (main, dev, t_old)
+}
+
+/// The branch's removal journal, as its status shows it.
+async fn journal_of(fluree: &Fluree, ledger_id: &str) -> JsonValue {
+    let status = fluree.retention_status(ledger_id).await.unwrap();
+    serde_json::to_value(status.registration.unwrap().journal).unwrap()
+}
+
+async fn head_of(fluree: &Fluree, ledger_id: &str) -> Option<fluree_db_core::ContentId> {
+    let record = fluree.nameservice().lookup(ledger_id).await.unwrap();
+    record.unwrap().commit_head_id
+}
+
+/// A merge brings the source's commits onto the target, and with them what
+/// the source removed: the target refuses the same history, and its raw
+/// storage is audit data, whether the merge fast-forwards or not.
+#[tokio::test]
+async fn a_merge_brings_the_sources_removals() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, fast_forward) in [("it/removal-merge-ff", true), ("it/removal-merge", false)] {
+        let (main, dev, t_old) = removed_on_a_branch(&fluree, name).await;
+        if !fast_forward {
+            upsert(
+                &fluree,
+                &main,
+                json!({"@context": ctx(), "@id": "ex:m", "ex:n": 1}),
+            )
+            .await;
+        }
+        assert!(!fluree.history_suppressed(&main).await.unwrap(), "{name}");
+        let merged = fluree
+            .merge_branch(name, "dev", Some("main"), Default::default())
+            .await
+            .expect("merge");
+        assert_eq!(merged.fast_forward, fast_forward, "{name}");
+        assert!(fluree.history_suppressed(&main).await.unwrap(), "{name}");
+        if fast_forward {
+            let at = json!(format!("{main}@t:{t_old}"));
+            assert!(
+                unavailable(read(&fluree, &main, at, "ex:alice", "ex:email").await),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            read(&fluree, &main, json!(main), "ex:alice", "ex:email")
+                .await
+                .unwrap(),
+            vec![json!("a@new")],
+            "{name}"
+        );
+        // Merged again, nothing is recorded again.
+        let before = journal_of(&fluree, &main).await;
+        upsert(
+            &fluree,
+            &dev,
+            json!({"@context": ctx(), "@id": "ex:later", "ex:n": 2}),
+        )
+        .await;
+        fluree
+            .merge_branch(name, "dev", Some("main"), Default::default())
+            .await
+            .expect("merge again");
+        assert_eq!(journal_of(&fluree, &main).await, before, "{name}");
+    }
+}
+
+/// A rebase would write a removed occurrence again, in a new commit at a new
+/// point no removal names: it is refused, and the branch still refuses the
+/// history.
+#[tokio::test]
+async fn a_rebase_that_would_replay_a_removed_commit_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/removal-rebase";
+    let (main, dev, t_old) = removed_on_a_branch(&fluree, name).await;
+    upsert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:m", "ex:n": 1}),
+    )
+    .await;
+    let before = head_of(&fluree, &dev).await;
+    let refused = fluree
+        .rebase_branch(name, "dev", Default::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.status_code(), 409, "{refused}");
+    assert_eq!(head_of(&fluree, &dev).await, before);
+    let at = json!(format!("{dev}@t:{t_old}"));
+    assert!(unavailable(
+        read(&fluree, &dev, at, "ex:alice", "ex:email").await
+    ));
+}
+
+/// A rebase puts the branch on the source's line: it takes what the source
+/// removed from the history it now holds.
+#[tokio::test]
+async fn a_rebase_brings_the_sources_removals() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/removal-rebase-source";
+    let main = ledger(&fluree, name).await;
+    let dev = format!("{name}:dev");
+    upsert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:base", "ex:n": 0}),
+    )
+    .await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    upsert(
+        &fluree,
+        &dev,
+        json!({"@context": ctx(), "@id": "ex:d", "ex:n": 1}),
+    )
+    .await;
+    let email = |v: &str| json!({"@context": ctx(), "@id": "ex:alice", "ex:email": v});
+    let t_old = upsert(&fluree, &main, email("a@old")).await;
+    upsert(&fluree, &main, email("a@new")).await;
+    fluree
+        .remove_occurrences(&main, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    assert!(!fluree.history_suppressed(&dev).await.unwrap());
+    let report = fluree
+        .rebase_branch(name, "dev", Default::default())
+        .await
+        .expect("rebase");
+    assert_eq!(report.replayed, 1);
+    assert!(fluree.history_suppressed(&dev).await.unwrap());
+    let at = json!(format!("{dev}@t:{t_old}"));
+    assert!(unavailable(
+        read(&fluree, &dev, at, "ex:alice", "ex:email").await
+    ));
+}
+
 #[tokio::test]
 async fn removing_one_occurrence_preserves_the_others() {
     let fluree = FlureeBuilder::memory().build_memory();

@@ -367,6 +367,7 @@ async fn a_job_fails_at_its_third_proving_timeout() {
             .is_some_and(|e| e.contains("too large to prove")),
         "{too_slow:?}"
     );
+
 }
 
 /// Proving a commit past the most operations a proof can cover would only
@@ -3436,6 +3437,64 @@ async fn a_value_outside_the_leaves_is_purged_by_a_rebuild() {
     assert!(objects(&fluree, &id, "ex:alice", "ex:balance")
         .await
         .is_empty());
+}
+
+/// A rebase begun after an erasure is accepted would write the occurrence
+/// again in commits the erasure does not name: it is refused, and the
+/// erasure publishes against the branch's own line.
+#[tokio::test]
+async fn a_rebase_is_refused_while_the_branch_holds_an_erased_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let name = "it/erase-rebase";
+    let main = ledger(&fluree, name).await;
+    let dev = format!("{name}:dev");
+    insert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:base", "ex:n": 0}),
+    )
+    .await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    insert(
+        &fluree,
+        &dev,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&dev, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    insert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:m", "ex:n": 1}),
+    )
+    .await;
+    let refused = fluree
+        .rebase_branch(name, "dev", ConflictStrategy::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.status_code(), 409, "{refused}");
+    reindex(&fluree, &dev).await;
+    assert_eq!(fluree.run_erasure_pass(&dev).await.unwrap().published, 1);
+    let store = fluree.branched_content_store(&dev).await.unwrap();
+    let record = fluree.nameservice().lookup(&dev).await.unwrap().unwrap();
+    let head = record.commit_head_id.as_ref().unwrap();
+    for (t, cid) in collect_first_parent_cids(store.as_ref(), head, 0)
+        .await
+        .unwrap()
+    {
+        let commit = load_commit_by_id(store.as_ref(), &cid).await.unwrap();
+        assert!(
+            !commit
+                .flakes
+                .iter()
+                .any(|f| f.o == FlakeValue::String("a@secret".into())),
+            "t {t} still states the value"
+        );
+    }
 }
 
 /// `?o` of `s p ?o`, or `?s` of `?s p o`, read from `from` (to `to`, for a

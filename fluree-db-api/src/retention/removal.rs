@@ -427,6 +427,79 @@ impl Fluree {
         }))
     }
 
+    /// Give `target_id` the removals `source_id`'s journal holds, as a merge
+    /// or rebase brings the source's commits onto it: it then holds the
+    /// history they were removed from. History rules are left to the
+    /// target's own configuration commits.
+    pub(crate) async fn take_removals(&self, source_id: &str, target_id: &str) -> Result<()> {
+        let ns = self.publisher()?;
+        let Some(source) = registry::read(ns, self.registry_objects(), source_id)
+            .await?
+            .1
+            .filter(|r| !r.journal.removals.is_empty())
+        else {
+            return Ok(());
+        };
+        let held: HashSet<(String, u32)> = registry::read(ns, self.registry_objects(), target_id)
+            .await?
+            .1
+            .map(|r| r.journal.removals)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.commit, r.slot))
+            .collect();
+        let missing: Vec<Removal> = source
+            .journal
+            .removals
+            .into_iter()
+            .filter(|r| !held.contains(&(r.commit.clone(), r.slot)))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.record_removals(target_id, source.active_since_t, missing)
+            .await?;
+        Ok(())
+    }
+
+    /// Refuse a rebase of `branch_id` onto `onto` that would replay a commit
+    /// one of the branch's removals names. The replay writes the occurrence
+    /// again in a commit of its own, which neither the journal nor an
+    /// erasure of the original covers.
+    pub(crate) async fn refuse_replaying_removed(
+        &self,
+        branch_id: &str,
+        onto: &str,
+        replayed: &[ContentId],
+    ) -> Result<()> {
+        if replayed.is_empty() {
+            return Ok(());
+        }
+        let Some(registration) =
+            registry::read(self.publisher()?, self.registry_objects(), branch_id)
+                .await?
+                .1
+        else {
+            return Ok(());
+        };
+        let removed = registration.journal.removals.iter().find(|r| {
+            r.commit
+                .parse::<ContentId>()
+                .is_ok_and(|commit| replayed.contains(&commit))
+        });
+        match removed {
+            None => Ok(()),
+            Some(removal) => Err(ApiError::http(
+                409,
+                format!(
+                    "{branch_id} has removed an occurrence in commit {}, which a rebase would \
+                     write again as a new commit; merge {onto} into the branch instead",
+                    removal.commit
+                ),
+            )),
+        }
+    }
+
     /// Add `removals` to `ledger_id`'s journal and its lineage's checkpoint.
     async fn record_removals(
         &self,
