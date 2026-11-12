@@ -333,7 +333,14 @@ fn parse_context_map(
         Some(JsonValue::String(s)) => {
             result.base = Some(match base.base.as_deref() {
                 Some(current) => resolve_iri(current, s),
-                None => s.clone(),
+                None if fluree_vocab::iri::is_absolute_iri(s) => s.clone(),
+                None => {
+                    return Err(JsonLdError::InvalidContext {
+                        message: format!(
+                            "@base \"{s}\" is relative, and there is no base to resolve it against"
+                        ),
+                    })
+                }
             });
         }
         Some(JsonValue::Null) => result.base = None,

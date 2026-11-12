@@ -328,6 +328,7 @@ fn parse_node_value(
             }
 
             let mut results = Vec::new();
+            let mut scoped_nodes = None;
             for (i, item) in arr.iter().enumerate() {
                 let item_path = path.index(i);
 
@@ -339,15 +340,21 @@ fn parse_node_value(
 
                 let expanded = match item {
                     JsonValue::Object(map)
-                        if map.contains_key("@value") || map.contains_key("value") =>
+                        if map.contains_key("@value")
+                            || map.contains_key("value")
+                            || is_list_item(map)
+                            || is_set_item(map) =>
                     {
                         parse_node_value(item, entry, context, nodes, &item_path, strict)?
                     }
-                    JsonValue::Object(map) if is_list_item(map) || is_set_item(map) => {
-                        vec![expand_node_internal(item, context, &item_path, strict)?]
-                    }
-                    JsonValue::Object(map) => vec![expand_nested_node(
-                        item, map, entry, context, nodes, &item_path, strict,
+                    JsonValue::Object(_) => vec![expand_nested_node(
+                        item,
+                        entry,
+                        context,
+                        nodes,
+                        &mut scoped_nodes,
+                        &item_path,
+                        strict,
                     )?],
                     _ => parse_node_value(item, entry, context, nodes, &item_path, strict)?,
                 };
@@ -465,7 +472,7 @@ fn parse_node_value(
             }
 
             Ok(vec![expand_nested_node(
-                value, map, entry, context, nodes, path, strict,
+                value, entry, context, nodes, &mut None, path, strict,
             )?])
         }
     }
@@ -476,22 +483,28 @@ fn parse_node_value(
 /// `context`, as the expansion algorithm keeps it in the typed node's.
 fn expand_nested_node(
     value: &JsonValue,
-    map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
     nodes: &ParsedContext,
+    scoped_nodes: &mut Option<ParsedContext>,
     path: &Path<'_>,
     strict: bool,
 ) -> Result<JsonValue> {
-    let is_reference = map.len() == 1 && map.keys().all(|k| k == "@id" || *k == context.id_key);
-    let start = if is_reference { context } else { nodes };
-    let ctx = match entry.and_then(|e| e.context.as_deref()) {
-        Some(scoped) => {
-            let mut merged = start.clone();
-            apply_scoped_context(&mut merged, scoped);
-            Cow::Owned(merged)
+    let with_scoped = |start: &ParsedContext, scoped: &ParsedContext| {
+        let mut merged = start.clone();
+        apply_scoped_context(&mut merged, scoped);
+        merged
+    };
+    let is_reference = value.as_object().is_some_and(|map| {
+        map.len() == 1 && map.keys().all(|k| k == "@id" || *k == context.id_key)
+    });
+    let ctx = match (entry.and_then(|e| e.context.as_deref()), is_reference) {
+        (None, true) => Cow::Borrowed(context),
+        (None, false) => Cow::Borrowed(nodes),
+        (Some(scoped), true) => Cow::Owned(with_scoped(context, scoped)),
+        (Some(scoped), false) => {
+            Cow::Borrowed(&*scoped_nodes.get_or_insert_with(|| with_scoped(nodes, scoped)))
         }
-        None => Cow::Borrowed(start),
     };
     expand_node_internal(value, &ctx, path, strict)
 }
@@ -939,7 +952,9 @@ fn expand_node_entries(
                     reason: "the value must be a map of reverse properties",
                 });
             }
-            if let JsonValue::Object(props) = expand_node_internal(v, context, &key_path, strict)? {
+            if let JsonValue::Object(props) =
+                expand_node_internal(v, keys.nodes, &key_path, strict)?
+            {
                 for (property, values) in props {
                     if property.starts_with('@') {
                         return Err(JsonLdError::InvalidKeywordValue {
@@ -1851,8 +1866,8 @@ mod tests {
         );
         assert_eq!(
             value(
-                json!({"@value": "v", "@direction": "ltr"}),
-                json!({"@language": "en"})
+                json!({"@value": "v", "@language": "en", "@direction": "ltr"}),
+                json!({})
             )
             .unwrap(),
             json!({"@value": "v", "@language": "en--ltr"})
@@ -1866,6 +1881,52 @@ mod tests {
             json!({})
         )
         .is_err());
+    }
+
+    /// A type's scoped context stops at the nodes in a list an array holds
+    /// and in an `@reverse` map too, and the list's nodes still take their
+    /// property's scoped context.
+    #[test]
+    fn type_scoped_context_stops_inside_array_lists_and_reverse() {
+        let expanded = crate::expand(&json!({
+            "@context": {
+                "@vocab": "http://vocab.org/",
+                "T": {"@id": "http://vocab.org/T", "@context": {"name": "http://scoped.org/name"}},
+                "q": {"@id": "http://vocab.org/q", "@context": {"label": "http://q.org/label"}}
+            },
+            "@id": "http://ex.org/s",
+            "@type": "T",
+            "p": [{"@list": [{"@id": "http://ex.org/a", "name": "in a list"}]}],
+            "q": [{"@list": [{"@id": "http://ex.org/b", "label": "scoped by q"}]}],
+            "@reverse": {"r": {"@id": "http://ex.org/c", "name": "reversed"}}
+        }))
+        .unwrap();
+
+        let listed = &expanded["http://vocab.org/p"][0]["@list"][0];
+        assert!(listed.get("http://vocab.org/name").is_some(), "{expanded}");
+        let scoped = &expanded["http://vocab.org/q"][0]["@list"][0];
+        assert!(scoped.get("http://q.org/label").is_some(), "{expanded}");
+        let reversed = &expanded["@reverse"]["http://vocab.org/r"][0];
+        assert!(
+            reversed.get("http://vocab.org/name").is_some(),
+            "{expanded}"
+        );
+    }
+
+    /// A relative `@base` needs a base to resolve against; with none it is
+    /// refused rather than kept as a base with no scheme.
+    #[test]
+    fn relative_base_without_a_base_is_refused() {
+        let err = crate::expand(&json!({
+            "@context": {"@base": "foo/"},
+            "@id": "a",
+            "http://example.org/p": 1
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("@base \"foo/\" is relative"),
+            "{err}"
+        );
     }
 
     /// A property's scoped context applies to every node object it holds,

@@ -414,7 +414,9 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
 - Quads compare as RDF statements: a set of them keeps an IRI apart from a
   string with its text, `"fund"` apart from `"fund"@en`, and `1` apart from
   `True` and `1.0`. `str(quad)` is its N-Quads line, which sorts and diffs
-  as text.
+  as text. Literals parsed as Python values compare by value, so
+  `"1"^^xsd:int` and `"01"^^xsd:integer` are one quad in a set; for RDF term
+  identity (dedup, diff, sort), parse with `literals="lexical"`.
 - Quads come in the order the document writes them, and the list `parse`
   returns has the `prefixes` a Turtle or TriG document declares.
   `serialize` keeps the quads' order: graphs in the order they first appear,

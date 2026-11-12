@@ -166,12 +166,13 @@ pub(crate) fn serialize_rdf<'py>(
     let mut dataset = Dataset::new();
     let mut graph_order: Vec<Option<Term>> = Vec::new();
     let mut named: HashSet<Term> = HashSet::new();
+    let mut default_seen = false;
     for quad in quads.try_iter()? {
         let quad = quad?;
         let graph = quad.getattr(intern!(py, "graph"))?;
         let graph = (!graph.is_none()).then(|| nodes.term(graph)).transpose()?;
         match &graph {
-            None if !graph_order.contains(&None) => graph_order.push(None),
+            None if !std::mem::replace(&mut default_seen, true) => graph_order.push(None),
             Some(name) if named.insert(name.clone()) => graph_order.push(Some(name.clone())),
             _ => {}
         }

@@ -156,8 +156,11 @@ about *which* IRIs each keyword may shorten:
   not `@vocab`.
 
 Explicit prefix/term mappings apply in both positions. As a special case,
-setting `@vocab: ""` maps the vocabulary to `@base`, so bare terms and
-base-relative identifiers share the same namespace.
+setting `@vocab: ""` maps the vocabulary to `@base`. Bare terms and
+base-relative identifiers then share a namespace when `@base` ends in `/`.
+Under any other base they differ: a term is appended to the base, and an
+identifier resolves against it by RFC 3986 (`alice` under
+`http://example.org/ns#` is `http://example.org/alice`; write `#alice`).
 
 ## IRI Resolution Rules
 

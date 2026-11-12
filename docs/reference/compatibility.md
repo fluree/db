@@ -51,13 +51,13 @@ See [Edge annotations](../concepts/edge-annotations.md).
 Base-direction language tags (`"text"@en--ltr`) parse and round-trip, but are
 stored as a single `rdf:langString` whose language is the whole `en--ltr`
 string, rather than as `rdf:dirLangString` with a separate direction. Nothing
-is dropped, but `LANG()` returns `en--ltr`, and `langMatches(?l, "en")` will
-not match it. JSON-LD reads a value object's `@direction` into that tag
+is dropped, but `LANG()` returns `en--ltr`, so `LANG(?x) = "en"` does not
+match it (`langMatches(LANG(?x), "en")` does). JSON-LD reads a value object's `@direction` into that tag
 (`{"@value": "text", "@language": "en", "@direction": "ltr"}` is
 `"text"@en--ltr`, in a transaction, a query or `fluree.parse`) and writes the
 tag back as `@language` and `@direction`. A `@direction` with no language is
-dropped, as JSON-LD's conversion to RDF drops it; a default `@direction` in a
-`@context` is not read. First-class `rdf:dirLangString` is a future
+dropped, as JSON-LD's conversion to RDF drops it; a `@direction` in a
+`@context`, as the default or on a term, is not read. First-class `rdf:dirLangString` is a future
 extension.
 
 **Specification:** https://www.w3.org/TR/rdf12-concepts/
@@ -390,9 +390,17 @@ A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, a
 - Under a base ending in a path segment, the segment is replaced: `alice` under `http://example.org/doc` is `http://example.org/alice`.
 - Under a non-hierarchical base such as `urn:ex:`, `alice` is `urn:alice`. Define a prefix for such a namespace instead.
 
-A relative `@base` or `@vocab` resolves against the base already in effect. Data already written stays as it is.
+A relative `@base` or `@vocab` resolves against the base already in effect. A relative `@base` with no base to resolve against is refused; it used to be joined as written.
+
+**Check any context whose `@base` does not end in `/`.** With no `@vocab`, Fluree's JSON-LD transactions and queries use `@base` as the vocabulary too, so `{"@base": "http://example.org/ns#"}` put ids, types and properties in one namespace. Types and properties still land there; ids no longer do. `{"@id": "alice", "@type": "Person"}` now writes `http://example.org/alice` typed `http://example.org/ns#Person`. Data already written stays as it is, so on a ledger written before the upgrade the same document adds a second subject beside the stored `http://example.org/ns#alice`, and a `where`, delete or upsert that names `"alice"` no longer reaches the stored one. Nothing reports an error. Write the id as `#alice`, or define a prefix and write `ns:alice`.
+
+Query results change the same way. An `@id` under a base ending in `#` is written `#alice`, where it was `alice`. Under any other base, an id whose remainder starts with `/`, has a `:` in its first segment or holds a `.` or `..` segment is written as the full IRI, since the shortened form would resolve to something else.
 
 A type's scoped context applies to the typed node's own properties, and no longer to the node objects nested in it: JSON-LD 1.1's default. Mark it `"@propagate": true` to keep it in force for them. A property's scoped context now applies to each node object in an array value, as it did to a single one.
+
+#### Python RDF terms compare as RDF terms (breaking)
+
+In the Python binding, `fluree.IRI`, `fluree.BlankNode` and `fluree.LangString` are still `str` subclasses, and print, slice and pass as their text. They no longer equal a plain string with that text: `row.s == "http://example.org/alice"` is now `False`, and so is a `dict` or `set` lookup by the plain string. An `IRI` equals only an `IRI`, a `BlankNode` only a `BlankNode`, and a `LangString` only a `LangString` with the same language and direction. Compare with `fluree.IRI("http://example.org/alice")`, or with `str(row.s)` for the text alone.
 
 #### `DROP` drops a graph's history (breaking)
 
