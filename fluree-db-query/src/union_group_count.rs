@@ -130,6 +130,10 @@ pub struct UnionGroupCount<'a> {
     pub(crate) position: GroupedPosition,
 }
 
+/// What one run of [`count_groups_over_union`]'s scan is charged to the
+/// query's memory budget: the entry and the vector's slack around it.
+const RUN_EST_BYTES: usize = 2 * std::mem::size_of::<((u16, u64), u64)>();
+
 /// The rows of `spec`'s pattern over `set`'s members, counted per group, or
 /// why the index cannot give them exactly.
 pub(crate) fn count_groups_over_union(
@@ -185,6 +189,7 @@ pub(crate) fn count_groups_over_union(
             GroupedPosition::Subject => (0, batch.s_id.get(row)),
             GroupedPosition::Object => (batch.o_type.get(row), batch.o_key.get(row)),
         };
+        let held = runs.len();
         for row in 0..batch.row_count {
             let key = key_at(row);
             match runs.last_mut() {
@@ -192,6 +197,9 @@ pub(crate) fn count_groups_over_union(
                 _ => runs.push((key, 1)),
             }
         }
+        // One run per distinct key, held until the fold: charged as it
+        // grows, so the next checkpoint weighs it before the scan goes on.
+        ctx.record_alloc((runs.len() - held) * RUN_EST_BYTES);
     }
 
     // Decode each run's key as a member scan of the union binds it (eagerly:

@@ -45,7 +45,7 @@
 //! alone answers for every member.
 
 use crate::binding::{Batch, Binding};
-use crate::context::WellKnownDatatypes;
+use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{build_range_cursor, predicate_range_keys, FastPathOperator};
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
@@ -142,7 +142,7 @@ pub fn count_by_predicate_union_operator(
             Some(IndexScope::Union(set)) if !set.all_current() => {
                 Ok(union_declined(FastPathFallback::Novelty))
             }
-            Some(IndexScope::Union(set)) => match count_by_predicate_union(&set)? {
+            Some(IndexScope::Union(set)) => match count_by_predicate_union(ctx, &set)? {
                 Ok(counts) => {
                     predicate_count_batch(set.store(), &batch_schema, counts.into_iter(), None)
                 }
@@ -225,6 +225,7 @@ fn predicate_count_batch(
 /// Exact per-predicate counts over the union of `set`'s members, or why they
 /// cannot be had from the index.
 fn count_by_predicate_union(
+    ctx: &ExecutionContext<'_>,
     set: &MemberSet<'_>,
 ) -> Result<std::result::Result<Vec<(u32, i64)>, FastPathFallback>> {
     let store = set.store();
@@ -274,10 +275,10 @@ fn count_by_predicate_union(
             continue;
         }
         let (first, last) = (run[0].0, run[run.len() - 1].0);
-        match distinct_facts(set, first, last, &mut merged) {
+        match distinct_facts(ctx, set, first, last, &mut merged) {
             Ok(Ok(())) => {}
             Ok(Err(decline)) => return Ok(Err(decline.fallback())),
-            Err(e) => return Ok(Err(read_failed(e))),
+            Err(e) => return Ok(Err(read_failed(e)?)),
         }
     }
     let mut counts = Vec::with_capacity(plan.len());
@@ -285,10 +286,10 @@ fn count_by_predicate_union(
         let count = match counted {
             Counted::Rows(rows) => rows,
             Counted::Merge => merged.get(&p_id).copied().unwrap_or(0),
-            Counted::ByValue(rows) => match distinct_facts_by_value(set, p_id, rows) {
+            Counted::ByValue(rows) => match distinct_facts_by_value(ctx, set, p_id, rows) {
                 Ok(Ok(count)) => count,
                 Ok(Err(reason)) => return Ok(Err(reason)),
-                Err(e) => return Ok(Err(read_failed(e))),
+                Err(e) => return Ok(Err(read_failed(e)?)),
             },
         };
         counts.push((p_id, count));
@@ -309,11 +310,24 @@ enum Counted {
 }
 
 /// The decline a failed read stamps: the generic scan runs, and a genuine
-/// fault resurfaces there.
-fn read_failed(e: QueryError) -> FastPathFallback {
+/// fault resurfaces there. A cancellation or an exhausted budget is no
+/// failed read: it ends the query.
+fn read_failed(e: QueryError) -> Result<FastPathFallback> {
+    if e.ends_the_query() {
+        return Err(e);
+    }
     tracing::warn!(error = %e, "count by predicate over several graphs: read failed; declining to generic scan");
-    FastPathFallback::GateDeclined
+    Ok(FastPathFallback::GateDeclined)
 }
+
+/// What one distinct fact of [`distinct_facts_by_value`]'s set is charged to
+/// the query's memory budget: the entry and the table's slack around it.
+const FACT_EST_BYTES: usize = 2 * std::mem::size_of::<(u64, u16, u64, u32)>();
+
+/// The most entries [`distinct_facts_by_value`] reserves before reading: its
+/// facts are at most the predicate's rows over the members, which can be far
+/// more than the distinct facts the members share.
+const FACT_SET_PRESIZE_CAP: usize = 1 << 16;
 
 /// One predicate across the members of a union: what decides how its count
 /// is had.
@@ -334,6 +348,7 @@ struct Holders {
 /// added to `counts` per predicate: their PSOT rows merged as one range,
 /// where the members' copies of one fact are adjacent, counted by `p_id`.
 fn distinct_facts(
+    ctx: &ExecutionContext<'_>,
     set: &MemberSet<'_>,
     first: u32,
     last: u32,
@@ -354,10 +369,11 @@ fn distinct_facts(
         BinaryFilter::default(),
         p_only,
     ) {
-        Ok(merged) => merged,
+        Ok(merged) => merged.with_tracker(&ctx.tracker),
         Err(decline) => return Ok(Err(decline)),
     };
     loop {
+        ctx.checkpoint()?;
         match merged.next_batch()? {
             Ok(Some(batch)) => match &batch.p_id {
                 // A predicate's leaflets carry it as a constant.
@@ -392,6 +408,7 @@ fn distinct_facts(
 /// `o_key`. Vectors and spatial values, whose arenas have no such key,
 /// decline.
 fn distinct_facts_by_value(
+    ctx: &ExecutionContext<'_>,
     set: &MemberSet<'_>,
     p_id: u32,
     rows: i64,
@@ -415,8 +432,10 @@ fn distinct_facts_by_value(
     // A fact: subject, object type, object, list position. A big number's
     // object is the id of its value: one per distinct normalized repr across
     // the members, so equal values share it whatever their handles.
-    let mut facts: FxHashSet<(u64, u16, u64, u32)> =
-        FxHashSet::with_capacity_and_hasher(usize::try_from(rows).unwrap_or(0), Default::default());
+    let mut facts: FxHashSet<(u64, u16, u64, u32)> = FxHashSet::with_capacity_and_hasher(
+        usize::try_from(rows).unwrap_or(0).min(FACT_SET_PRESIZE_CAP),
+        Default::default(),
+    );
     let mut value_ids: FxHashMap<NumBigRepr, u64> = FxHashMap::default();
     for member in set.members() {
         if indexes_nothing(store, member.g_id()) {
@@ -440,10 +459,16 @@ fn distinct_facts_by_value(
             return Ok(Err(FastPathFallback::GateDeclined));
         };
         cursor.set_to_t(member.to_t());
-        while let Some(batch) = cursor
-            .next_batch()
-            .map_err(|e| QueryError::from_io("count by predicate", e))?
-        {
+        let mut cursor = cursor.with_tracker(ctx.tracker.clone());
+        loop {
+            ctx.checkpoint()?;
+            let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::from_io("count by predicate", e))?
+            else {
+                break;
+            };
+            let held = facts.len() + value_ids.len();
             for row in 0..batch.row_count {
                 let o_type = batch.o_type.get(row);
                 let o_key = batch.o_key.get(row);
@@ -469,8 +494,12 @@ fn distinct_facts_by_value(
                 let o_i = batch.o_i.get_or(row, u32::MAX);
                 facts.insert((batch.s_id.get(row), o_type, object, o_i));
             }
+            // The set grows for as long as the scan runs: charge each
+            // batch's new entries, which the next checkpoint weighs.
+            ctx.record_alloc((facts.len() + value_ids.len() - held) * FACT_EST_BYTES);
         }
     }
+    ctx.checkpoint()?;
     Ok(Ok(facts.len() as i64))
 }
 

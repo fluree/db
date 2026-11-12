@@ -617,6 +617,118 @@ async fn per_predicate_count_union_keys_big_numbers_by_value() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// The union count lanes weigh what they hold against the query's memory
+/// budget while they scan. The per-predicate count keys a predicate holding
+/// big numbers by value in a set that grows with its distinct facts, and the
+/// grouped count holds a run per distinct key until it folds them into
+/// groups. Under a budget either outgrows, the query fails with the budget's
+/// error, and the grouped count fails during its scan, before it has folded
+/// every group.
+#[tokio::test(flavor = "current_thread")]
+async fn union_counts_answer_to_the_memory_budget() {
+    use fluree_db_api::{
+        set_fast_paths_disabled, ApiError, FlureeBuilder, GraphDb, QueryCancellation,
+        ReindexOptions,
+    };
+    use fluree_db_query::QueryError;
+    const LEDGER: &str = "it/mg-lanes-budget:main";
+    const N: usize = 8_000;
+    const BUDGET: usize = 64 * 1024;
+    /// `GROUP_EST_BYTES`: what the fold charges per group.
+    const GROUP_BYTES: usize = 128;
+
+    let mut trig = String::from(
+        "@prefix ex: <http://example.org/> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    for g in ["urn:g1", "urn:g2"] {
+        trig.push_str(&format!("GRAPH <{g}> {{\n"));
+        for i in 0..N {
+            let big = 100_000_000_000_000_000_000u128 + i as u128;
+            trig.push_str(&format!(
+                "ex:s{i} ex:big \"{big}\"^^xsd:integer ; ex:q \"v{i}\" .\n"
+            ));
+        }
+        trig.push_str("}\n");
+    }
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    fluree.create_ledger(LEDGER).await.expect("create ledger");
+    let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("seed");
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("index");
+    fluree.disconnect_ledger(LEDGER).await;
+    let handle = fluree.ledger_cached(LEDGER).await.expect("reload");
+    let view = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
+
+    let _switch = multigraph::switch().lock().await;
+    set_fast_paths_disabled(false);
+    let run = |query: &'static str, budget: Option<usize>| {
+        let (fluree, view) = (fluree.clone(), view.clone());
+        async move {
+            let cancellation = QueryCancellation::new();
+            if let Some(budget) = budget {
+                cancellation.set_memory_limit(budget);
+            }
+            let (store, guard) = span_capture::init_test_tracing();
+            let result = view
+                .query(&fluree)
+                .sparql(query)
+                .cancellation(cancellation)
+                .execute_formatted()
+                .await;
+            drop(guard);
+            (result, multigraph::outcomes(&store))
+        }
+    };
+    let mut failures = Vec::new();
+    let per_predicate = "SELECT ?p (COUNT(?s) AS ?c) FROM <urn:g1> FROM <urn:g2> \
+                         WHERE { ?s ?p ?o } GROUP BY ?p";
+    let grouped = "PREFIX ex: <http://example.org/>
+                   SELECT ?o (COUNT(*) AS ?n) FROM <urn:g1> FROM <urn:g2>
+                   WHERE { ?s ex:q ?o } GROUP BY ?o";
+    for (query, site, rows) in [
+        (per_predicate, PER_PREDICATE_UNION, 2),
+        (grouped, GROUPED_COUNT_UNION, N),
+    ] {
+        // Without a budget, the union lane answers.
+        let (result, outcomes) = run(query, None).await;
+        match result {
+            Ok(json) => {
+                let got = json["results"]["bindings"].as_array().map_or(0, Vec::len);
+                if got != rows {
+                    failures.push(format!("{site}: {got} rows, want {rows}"));
+                }
+            }
+            Err(e) => failures.push(format!("{site}: without a budget: {e}")),
+        }
+        if !outcomes.iter().any(|(s, o)| s == site && o == "proceed") {
+            failures.push(format!("{site} did not proceed: {outcomes:?}"));
+        }
+        // Under a budget its own state outgrows, the budget ends the query.
+        match run(query, Some(BUDGET)).await.0 {
+            Err(ApiError::Query(QueryError::MemoryBudgetExceeded { used_bytes, .. })) => {
+                if site == GROUPED_COUNT_UNION && used_bytes >= N * GROUP_BYTES {
+                    failures.push(format!(
+                        "{site}: failed only once every group was folded ({used_bytes} B)"
+                    ));
+                }
+            }
+            other => failures.push(format!(
+                "{site}: under a {BUDGET} B budget: {:?}",
+                other.map(|json| json["results"]["bindings"].as_array().map_or(0, Vec::len))
+            )),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // ---------------------------------------------------------------------------
 // The cyclic join over a union (`Shape::Triangle`).
 
