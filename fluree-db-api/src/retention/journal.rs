@@ -155,6 +155,15 @@ impl Journal {
         self.history_rules.is_empty() && self.removals.is_empty()
     }
 
+    /// The journal as a reader without audit access is given it: what it
+    /// needs to refuse removed history, without who asked for each removal.
+    pub(crate) fn without_requesters(mut self) -> Self {
+        for removal in &mut self.removals {
+            removal.requester = None;
+        }
+        self
+    }
+
     /// The rule in force for `predicate` in `graph`, if any.
     pub fn active_rule(&self, predicate: &str, graph: Option<&str>) -> Option<&HistoryRule> {
         self.history_rules.iter().find(|r| {

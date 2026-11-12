@@ -291,7 +291,8 @@ impl crate::Fluree {
     /// query peer through the storage proxy) needs of `ledger_id`'s config:
     /// its retention activation and journal, the journal's chunked removals
     /// inlined, so the reader refuses the history this ledger refuses. None
-    /// of the registration's other state, such as erasure requests.
+    /// of the registration's other state, such as erasure requests, nor
+    /// who asked for a removal.
     pub async fn config_for_reader(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let (config, stored) = read_stored(&self.nameservice_mode, ledger_id).await?;
         let Some(config) = config else {
@@ -303,7 +304,9 @@ impl crate::Fluree {
             // and must not cache an older empty answer indefinitely.
             return Ok(Some(ConfigValue::new(config.v, None)));
         };
-        let journal = resolve_journal(&stored, self.registry_objects()).await?;
+        let journal = resolve_journal(&stored, self.registry_objects())
+            .await?
+            .without_requesters();
         let reader = serde_json::json!({
             "activeSinceT": stored.get("activeSinceT").cloned().unwrap_or_default(),
             "journal": serde_json::to_value(&journal)
@@ -834,16 +837,32 @@ pub(crate) async fn archived_at<N: fluree_db_nameservice::ConfigLookup + ?Sized>
     ledger_id: &str,
 ) -> Result<(Option<ConfigValue>, Option<serde_json::Value>)> {
     let (config, registration) = read(ns, objects, ledger_id).await?;
-    let Some(registration) = registration else {
-        return Ok((config, None));
-    };
-    let archived = ArchivedRetention {
-        active_since_t: registration.active_since_t,
-        journal: registration.journal,
-    };
-    let section = serde_json::to_value(archived)
-        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))?;
-    Ok((config, Some(section)))
+    let section = registration
+        .map(|r| section(r.active_since_t, r.journal))
+        .transpose()?;
+    Ok((config, section))
+}
+
+/// [`archived_at`] as a reader without audit access is given it: see
+/// [`Journal::without_requesters`](super::journal::Journal::without_requesters).
+pub(crate) async fn archived_for_reader_at<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
+    ns: &N,
+    objects: Option<Objects<'_>>,
+    ledger_id: &str,
+) -> Result<(Option<ConfigValue>, Option<serde_json::Value>)> {
+    let (config, registration) = read(ns, objects, ledger_id).await?;
+    let section = registration
+        .map(|r| section(r.active_since_t, r.journal.without_requesters()))
+        .transpose()?;
+    Ok((config, section))
+}
+
+fn section(active_since_t: i64, journal: super::journal::Journal) -> Result<serde_json::Value> {
+    serde_json::to_value(ArchivedRetention {
+        active_since_t,
+        journal,
+    })
+    .map_err(|e| ApiError::internal(format!("retention registration: {e}")))
 }
 
 /// Register a restored ledger: its archive's retention section (if any),

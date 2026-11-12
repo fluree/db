@@ -188,8 +188,10 @@ impl Fluree {
     }
 
     /// [`Self::retention_archive_section`] for the branch `record`
-    /// describes, reused while it names the same configuration revision.
-    pub async fn retention_archive_section_of(
+    /// describes, as a storage reader without audit access is given it
+    /// (without who asked for each removal), reused while it names the same
+    /// configuration revision.
+    pub async fn retention_section_for_reader(
         &self,
         record: &fluree_db_nameservice::NsRecord,
     ) -> Result<Option<serde_json::Value>> {
@@ -207,9 +209,12 @@ impl Fluree {
                 }
             }
         }
-        let (config, section) =
-            registry::archived_at(&self.nameservice_mode, self.registry_objects(), &ledger_id)
-                .await?;
+        let (config, section) = registry::archived_for_reader_at(
+            &self.nameservice_mode,
+            self.registry_objects(),
+            &ledger_id,
+        )
+        .await?;
         if let Some(key) = key.filter(|(_, v)| config.as_ref().is_some_and(|c| c.v == *v)) {
             archives.lock().insert(ledger_id, (key, section.clone()));
         }

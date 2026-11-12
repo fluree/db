@@ -403,6 +403,28 @@ async fn a_removal_records_who_asked() {
         .journal
         .removals
         .is_empty());
+
+    // A storage reader is given the removals it must refuse, not who asked.
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let for_reader = [
+        serde_json::to_value(fluree.config_for_reader(&id).await.unwrap()).unwrap(),
+        fluree
+            .retention_section_for_reader(&record)
+            .await
+            .unwrap()
+            .expect("a section"),
+    ];
+    for view in for_reader {
+        let text = view.to_string();
+        assert!(text.contains("\"removals\""), "{text}");
+        assert!(!text.contains("z6MkAdmin"), "{text}");
+    }
+    let archived = fluree
+        .retention_archive_section(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(archived.to_string().contains("z6MkAdmin"));
 }
 
 #[tokio::test]
