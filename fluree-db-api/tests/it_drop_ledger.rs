@@ -946,12 +946,12 @@ async fn leave_a_legacy_branch(
 }
 
 /// A branch an earlier release let take a name the grammar now refuses (one
-/// beginning with `/`, or holding `@` or `#`) is listed under its id, but no
-/// nameservice operation addresses that id. Dropping its ledger, in either
-/// mode, is refused before anything is touched: the branch's record and
-/// files, the other branches and the shared dictionaries all stay.
+/// beginning with `/`, or holding `@` or `#`) is listed under its id, though
+/// no request can name it. Dropping its ledger drops it with the rest: a soft
+/// drop retracts every record and keeps every file, and a hard drop leaves
+/// neither a record nor a file.
 #[tokio::test]
-async fn a_ledger_drop_with_a_legacy_branch_is_refused_before_deleting_anything() {
+async fn a_ledger_drop_takes_a_legacy_branch_with_it() {
     for legacy in ["/old", "v@1", "v#1"] {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().to_string_lossy().to_string();
@@ -974,16 +974,19 @@ async fn a_ledger_drop_with_a_legacy_branch_is_refused_before_deleting_anything(
         leave_a_legacy_branch(&fluree, tmp.path(), "slashed", legacy).await;
 
         let legacy_id = format!("slashed:{legacy}");
-        let listed: Vec<String> = fluree
-            .nameservice()
-            .all_records()
-            .await
-            .expect("list")
-            .into_iter()
-            .map(|r| r.ledger_id.to_string())
-            .collect();
+        let records = || async {
+            fluree
+                .nameservice()
+                .all_records()
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|r| (r.ledger_id.to_string(), r.retracted))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let listed = records().await;
         assert!(
-            listed.len() == 2 && listed.contains(&legacy_id),
+            listed.len() == 2 && listed.get(&legacy_id) == Some(&false),
             "{legacy}: listed under its id: {listed:?}"
         );
         assert!(
@@ -992,40 +995,47 @@ async fn a_ledger_drop_with_a_legacy_branch_is_refused_before_deleting_anything(
         );
 
         let files = tmp.path().join("slashed");
-        let records = tmp.path().join("ns@v2");
-        let (files_before, records_before) = (tree(&files), tree(&records));
+        let files_before = tree(&files);
+        let on_disk = format!("/slashed/{}/commit/", legacy.trim_start_matches('/'));
         assert!(
             files_before
                 .keys()
-                .any(|f| f.to_string_lossy().contains("/@shared/dicts/")),
-            "fixture: the ledger has shared dictionaries"
+                .any(|f| f.to_string_lossy().contains(&on_disk))
+                && files_before
+                    .keys()
+                    .any(|f| f.to_string_lossy().contains("/@shared/dicts/")),
+            "fixture: the branch has commits and the ledger shared dictionaries"
         );
-        // Hard first, and state before message: without the refusal a hard
-        // drop deletes the branch's files and only then fails.
-        for mode in [DropMode::Hard, DropMode::Soft] {
-            let err = fluree
-                .drop_ledger("slashed", mode)
-                .await
-                .expect_err("a ledger holding the branch is not dropped");
-            assert_eq!(
-                changed_since(&files_before, &files),
-                Vec::<std::path::PathBuf>::new(),
-                "{legacy} {mode:?}: every file stays"
-            );
-            assert_eq!(
-                changed_since(&records_before, &records),
-                Vec::<std::path::PathBuf>::new(),
-                "{legacy} {mode:?}: every record stays"
-            );
-            assert_eq!(err.status_code(), 409, "{legacy} {mode:?}: {err}");
-            let err = err.to_string();
-            assert!(
-                err.contains(&legacy_id) && err.contains("Nothing was dropped"),
-                "{legacy} {mode:?}: {err}"
-            );
-        }
-        fluree.disconnect_ledger("slashed").await;
-        assert!(fluree.db("slashed").await.expect("main still loads").t > 0);
+
+        let soft = fluree
+            .drop_ledger("slashed", DropMode::Soft)
+            .await
+            .unwrap_or_else(|e| panic!("{legacy}: soft drop: {e}"));
+        assert_eq!(soft.status, DropStatus::Dropped, "{legacy}");
+        let listed = records().await;
+        assert!(
+            listed.len() == 2 && listed.values().all(|retracted| *retracted),
+            "{legacy}: a soft drop retracts every branch: {listed:?}"
+        );
+        assert_eq!(
+            changed_since(&files_before, &files),
+            Vec::<std::path::PathBuf>::new(),
+            "{legacy}: a soft drop keeps every file"
+        );
+
+        fluree
+            .drop_ledger("slashed", DropMode::Hard)
+            .await
+            .unwrap_or_else(|e| panic!("{legacy}: hard drop: {e}"));
+        assert!(
+            records().await.is_empty(),
+            "{legacy}: a hard drop leaves no record"
+        );
+        assert_eq!(
+            tree(&files).keys().collect::<Vec<_>>(),
+            Vec::<&std::path::PathBuf>::new(),
+            "{legacy}: a hard drop leaves no file"
+        );
     }
 }
 

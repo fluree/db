@@ -119,6 +119,13 @@ impl DynamoDbNameService {
         Ok(LedgerId::parse(ledger_id)?.to_string())
     }
 
+    /// [`Self::normalize`] under the stored-record grammar, for the
+    /// operations that remove a record an earlier release wrote under a name
+    /// no request can address.
+    fn normalize_persisted(ledger_id: &str) -> std::result::Result<String, NameServiceError> {
+        Ok(LedgerId::parse_persisted(ledger_id)?.to_string())
+    }
+
     /// Current epoch time in milliseconds.
     fn now_epoch_ms() -> u64 {
         SystemTime::now()
@@ -906,7 +913,7 @@ impl BranchLifecycle for DynamoDbNameService {
         &self,
         ledger_id: &str,
     ) -> std::result::Result<Option<u32>, NameServiceError> {
-        let pk = Self::normalize(ledger_id)?;
+        let pk = Self::normalize_persisted(ledger_id)?;
 
         // Read metadata rows for this branch to find the parent.
         let meta_items = self.query_metadata_items(&pk).await?;
@@ -1298,7 +1305,7 @@ impl LedgerLifecycle for DynamoDbNameService {
     }
 
     async fn retract(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id)?;
+        let pk = Self::normalize_persisted(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
         self.client
