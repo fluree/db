@@ -448,8 +448,10 @@ impl<'q> State<'q> {
     }
 }
 
-/// Every ordering of `items`, duplicates included, as the algorithm asks,
-/// made one at a time: a group of n indistinguishable neighbours has n!.
+/// Every distinct ordering of `items`, made one at a time. A blank node can
+/// be in a group several times (once per quad it shares), and orderings that
+/// differ only in which copy stands where give one path, so they are made
+/// once: m copies of one node have a single ordering, not m!.
 struct Permutations<'i, 'a> {
     items: &'i [&'a str],
     order: Vec<usize>,
@@ -457,9 +459,11 @@ struct Permutations<'i, 'a> {
 }
 
 fn permutations<'i, 'a>(items: &'i [&'a str]) -> Permutations<'i, 'a> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| items[i]);
     Permutations {
         items,
-        order: (0..items.len()).collect(),
+        order,
         started: false,
     }
 }
@@ -469,12 +473,14 @@ impl<'a> Iterator for Permutations<'_, 'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.started {
-            // The next order in lexicographic order of the indices.
-            let order = &mut self.order;
-            let pivot = (1..order.len()).rev().find(|&i| order[i - 1] < order[i])?;
+            // The next order in lexicographic order of the labels.
+            let (items, order) = (self.items, &mut self.order);
+            let pivot = (1..order.len())
+                .rev()
+                .find(|&i| items[order[i - 1]] < items[order[i]])?;
             let swap = (pivot..order.len())
                 .rev()
-                .find(|&j| order[j] > order[pivot - 1])?;
+                .find(|&j| items[order[j]] > items[order[pivot - 1]])?;
             order.swap(pivot - 1, swap);
             order[pivot..].reverse();
         }
@@ -520,7 +526,7 @@ fn push_term(out: &mut String, term: &Term, label: &dyn Fn(&str) -> String) {
             language,
         } => {
             out.push('"');
-            push_escaped(out, &value.lexical());
+            fluree_graph_ir::syntax::push_string(out, &value.lexical());
             out.push('"');
             if let Some(language) = language {
                 out.push('@');
@@ -540,26 +546,6 @@ fn push_term(out: &mut String, term: &Term, label: &dyn Fn(&str) -> String) {
             out.push_str(")>>");
         }
         Term::BlankNode(_) => unreachable!("handled as a blank label above"),
-    }
-}
-
-/// Canonical N-Quads string escaping: `\b \t \n \f \r \" \\`, `\uXXXX`
-/// (uppercase) for the other control characters, and nothing else.
-fn push_escaped(out: &mut String, text: &str) {
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\u{0}'..='\u{1f}' | '\u{7f}' => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            other => out.push(other),
-        }
     }
 }
 
@@ -618,6 +604,60 @@ mod tests {
             canonical(doc).nquads,
             "<http://e/s> <http://e/p> \"tab\\there\\u0001 é 'q' \\\"\" .\n"
         );
+    }
+
+    /// The noncharacters U+FFFE and U+FFFF are outside XML's `Char`, so
+    /// they are written as escapes.
+    #[test]
+    fn noncharacters_are_escaped() {
+        let mut sink = fluree_graph_ir::GraphCollectorSink::with_named_graphs();
+        fluree_graph_turtle::parse_nquads(
+            "<http://e/s> <http://e/p> \"a\\uFFFFb\\uFFFEc\" .\n",
+            &mut sink,
+        )
+        .unwrap();
+        let c = canonicalize(&sink.into_dataset(), &CanonicalizeOptions::default()).unwrap();
+        assert_eq!(
+            c.nquads,
+            "<http://e/s> <http://e/p> \"a\\uFFFFb\\uFFFEc\" .\n"
+        );
+    }
+
+    /// A blank node two others each point at once per named graph is in
+    /// their neighbour groups once per graph. Its copies have one ordering,
+    /// so the work does not grow as the factorial of the graph count, and
+    /// the limit on deep calls bounds it.
+    #[test]
+    fn a_neighbour_shared_across_many_graphs_is_ordered_once() {
+        let shared: String = (0..20)
+            .map(|i| {
+                format!(
+                    "_:x <http://e/p> _:y <http://e/g{i}> .\n_:x2 <http://e/p> _:y <http://e/g{i}> .\n"
+                )
+            })
+            .collect();
+        let doc = format!("_:y <http://e/name> \"Y\" .\n{shared}");
+        let c = canonical(&doc);
+        assert_eq!(c.dataset.len(), 41);
+        assert_eq!(c.issued.len(), 3);
+    }
+
+    #[test]
+    fn permutations_are_distinct_orderings() {
+        fn orderings<'a>(items: &[&'a str]) -> Vec<Vec<&'a str>> {
+            permutations(items).collect()
+        }
+        assert_eq!(
+            orderings(&["b", "a", "b"]),
+            [
+                vec!["a", "b", "b"],
+                vec!["b", "a", "b"],
+                vec!["b", "b", "a"]
+            ]
+        );
+        assert_eq!(orderings(&["a", "a", "a", "a"]).len(), 1);
+        assert_eq!(orderings(&["c", "a", "b"]).len(), 6);
+        assert_eq!(orderings(&[]), [Vec::<&str>::new()]);
     }
 
     /// A dataset whose blank nodes need more deep comparisons than allowed

@@ -246,11 +246,12 @@ fn rdf_error(error: RdfError) -> PyErr {
 /// The canonical N-Quads (RDFC-1.0) of `quads`, each a `fluree.Quad`, hashed
 /// with `hash`: `"sha256"` or `"sha384"`.
 #[pyfunction]
-#[pyo3(signature = (quads, hash = "sha256"))]
+#[pyo3(signature = (quads, hash = "sha256", max_deep_calls = None))]
 pub(crate) fn canonicalize_rdf<'py>(
     py: Python<'py>,
     quads: &Bound<'py, PyAny>,
     hash: &str,
+    max_deep_calls: Option<usize>,
 ) -> PyResult<String> {
     let hash = match hash.to_ascii_lowercase().as_str() {
         "sha256" | "sha-256" => rdf::HashAlgorithm::Sha256,
@@ -276,7 +277,7 @@ pub(crate) fn canonicalize_rdf<'py>(
     }
     let options = rdf::CanonicalizeOptions {
         hash,
-        ..rdf::CanonicalizeOptions::default()
+        max_deep_calls,
     };
     py.detach(|| rdf::canonicalize(&dataset, &options))
         .map(|canonical| canonical.nquads)

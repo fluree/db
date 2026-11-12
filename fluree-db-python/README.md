@@ -459,8 +459,16 @@ alone and lines in a fixed order, so two sets of quads holding the same
 statements give the same text, whatever their blank node labels and order:
 
 ```python
-same = fluree.canonicalize(fluree.parse(a, "trig")) == fluree.canonicalize(fluree.parse(b, "trig"))
+def canonical(doc):
+    return fluree.canonicalize(fluree.parse(doc, "trig", literals="lexical"))
+
+same = canonical(a) == canonical(b)
 ```
+
+Parse with `literals="lexical"` when the text will be hashed or signed: by
+default a literal becomes its Python value, which writes `"01"^^xsd:long` and
+`"1"^^xsd:integer` alike. `max_deep_calls=` lowers the work a dataset from an
+untrusted source may take before it is refused.
 
 ## rdflib
 

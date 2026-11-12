@@ -35,3 +35,18 @@ def test_a_poison_graph_is_refused():
     clique = PREFIXES + "".join(f"_:n{i} ex:p _:n{j} . " for i in range(10) for j in range(10) if i != j)
     with pytest.raises(InvalidRequestError, match="too complex"):
         fluree.canonicalize(fluree.parse(clique, "turtle"))
+
+
+def test_the_limit_can_be_lowered():
+    ring = PREFIXES + "".join(f"_:n{i} ex:p _:n{(i + 1) % 6} . " for i in range(6))
+    quads = fluree.parse(ring, "turtle")
+    assert fluree.canonicalize(quads).count("\n") == 6
+    with pytest.raises(InvalidRequestError, match="more than 2 deep comparisons"):
+        fluree.canonicalize(quads, max_deep_calls=2)
+
+
+def test_lexical_literals_keep_their_spelling():
+    doc = '<http://example.org/s> <http://example.org/p> "01"^^<http://www.w3.org/2001/XMLSchema#long> .'
+    assert '"01"^^<http://www.w3.org/2001/XMLSchema#long>' in fluree.canonicalize(
+        fluree.parse(doc, "ntriples", literals="lexical")
+    )
