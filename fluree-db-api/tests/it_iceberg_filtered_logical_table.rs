@@ -1027,7 +1027,7 @@ async fn a_key_on_a_filtered_logical_table_serves_the_keyed_lanes() {
 async fn a_key_the_query_does_not_select_is_refused_at_registration() {
     let _serial = SERIAL.lock().await;
     let fluree = FlureeBuilder::memory().build_memory();
-    std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", fixtures_dir());
+    set_local_roots();
     let location = format!("file://{}/silver", fixtures_dir());
     let logical = r#"rr:sqlQuery "SELECT name, tier, balance FROM silver.customers_history WHERE is_current = 1" ; f:key ( "customer_id" )"#;
     let err = fluree
@@ -1237,7 +1237,7 @@ async fn a_filtered_map_planned_from_the_kept_file_list_applies_its_filter() {
     let create = |fluree: Fluree| {
         let (location, ttl) = (location.clone(), ttl.clone());
         async move {
-            std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", fixtures_dir());
+            set_local_roots();
             fluree
                 .create_r2rml_graph_source(
                     R2rmlCreateConfig::new_direct("kept", &location, &ttl)
