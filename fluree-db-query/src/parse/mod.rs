@@ -2108,6 +2108,29 @@ mod tests {
         );
     }
 
+    /// A value object's `@direction` joins its language tag, as a
+    /// transaction stores it.
+    #[test]
+    fn direction_joins_the_language_tag_in_where() {
+        let json = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:p": {"@value": "v", "@language": "ar", "@direction": "rtl"}}
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(
+                &pattern.dtc,
+                Some(fluree_vocab::UnresolvedDatatypeConstraint::LangTag(tag)) if tag.as_ref() == "ar--rtl"
+            ),
+            "{:?}",
+            pattern.dtc
+        );
+    }
+
     #[test]
     fn test_where_array_format() {
         let json = json!({
@@ -2517,6 +2540,104 @@ mod tests {
         assert!(
             matches!(&pattern.o, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/alice")
         );
+    }
+
+    /// A `@vocab`-typed term's value is an IRI, as a transaction writes it.
+    #[test]
+    fn vocab_typed_term_value_is_an_iri() {
+        let json = json!({
+            "@context": {
+                "@vocab": "http://example.org/",
+                "status": {"@type": "@vocab"}
+            },
+            "select": ["?s"],
+            "where": { "@id": "?s", "status": "Active" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&pattern.o, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/Active"),
+            "{:?}",
+            pattern.o
+        );
+    }
+
+    /// A `@json`-typed term's value is one canonical JSON literal, a string
+    /// serialized, as a transaction writes it; a variable stays a variable.
+    #[test]
+    fn json_typed_term_value_is_a_json_literal() {
+        let object_of = |value: JsonValue| {
+            let json = json!({
+                "@context": {"ex": "http://example.org/", "p": {"@id": "ex:p", "@type": "@json"}},
+                "select": ["?s"],
+                "where": { "@id": "?s", "p": value }
+            });
+            let (ast, _) = parse_query_ast(&json, None).unwrap();
+            let pattern = triple(&ast.patterns[0]).clone();
+            (pattern.o, pattern.dtc)
+        };
+        let json_dt = Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+            fluree_vocab::rdf::JSON,
+        )));
+
+        for (value, document) in [
+            (json!(5), "5"),
+            (json!("hello"), r#""hello""#),
+            (json!({"b": 1, "a": [true]}), r#"{"a":[true],"b":1}"#),
+            (json!([1, "x"]), r#"[1,"x"]"#),
+        ] {
+            let (o, dtc) = object_of(value.clone());
+            assert!(
+                matches!(&o, UnresolvedTerm::Literal(LiteralValue::String(s)) if s.as_ref() == document),
+                "{value}: {o:?}"
+            );
+            assert_eq!(dtc, json_dt, "{value}");
+        }
+
+        let (o, dtc) = object_of(json!("?v"));
+        assert!(matches!(o, UnresolvedTerm::Var(_)), "{o:?}");
+        assert_eq!(dtc, None);
+    }
+
+    /// A map in `where` is a node pattern under an `@index` term too: the
+    /// term's values can be nodes, and a pattern has to reach into them.
+    #[test]
+    fn index_term_map_in_where_is_a_node_pattern() {
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "m": {"@id": "ex:m", "@container": "@index"}
+            },
+            "select": ["?o"],
+            "where": { "@id": "?s", "m": {"@id": "?o", "ex:q": "x"} }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 2);
+        let link = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&link.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/m")
+        );
+        assert!(matches!(&link.o, UnresolvedTerm::Var(v) if v.as_ref() == "?o"));
+        let nested = triple(&ast.patterns[1]);
+        assert!(matches!(&nested.s, UnresolvedTerm::Var(v) if v.as_ref() == "?o"));
+    }
+
+    /// A term defined as `null` names no property, so a pattern on it is
+    /// refused rather than matching nothing.
+    #[test]
+    fn null_term_in_where_is_refused() {
+        let json = json!({
+            "@context": {"@vocab": "http://example.org/", "gone": null},
+            "select": ["?s"],
+            "where": { "@id": "?s", "gone": "?v" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err().to_string();
+        assert!(err.contains("'gone' is defined as null"), "{err}");
     }
 
     #[test]

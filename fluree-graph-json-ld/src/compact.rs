@@ -98,8 +98,14 @@ fn compact_with(
     for (prefix_iri, prefix_name) in prefixes {
         if iri.starts_with(prefix_iri.as_str()) {
             let suffix = &iri[prefix_iri.len()..];
-            if prefix_name == ":vocab" || prefix_name == ":base" {
-                if allow_vocab_strip || prefix_name == ":base" {
+            if prefix_name == ":base" {
+                match base_reference(prefix_iri, suffix) {
+                    Some(reference) => return reference,
+                    None => continue,
+                }
+            }
+            if prefix_name == ":vocab" {
+                if allow_vocab_strip {
                     return suffix.to_string();
                 }
                 continue;
@@ -110,6 +116,23 @@ fn compact_with(
 
     // 3. No match
     iri.to_string()
+}
+
+/// The reference that resolves against `base` (RFC 3986) back to `base`
+/// followed by `suffix`: `#suffix` under a base ending in `#`, the suffix
+/// itself under one ending in `/`, and `None` for a suffix resolution would
+/// read differently (a leading `/`, a scheme-like first segment, a dot
+/// segment).
+fn base_reference(base: &str, suffix: &str) -> Option<String> {
+    if base.ends_with('#') {
+        return Some(format!("#{suffix}"));
+    }
+    let path = suffix.split(['?', '#']).next().unwrap_or("");
+    let first_segment = path.split('/').next().unwrap_or("");
+    let reads_back = !path.starts_with('/')
+        && !first_segment.contains(':')
+        && !path.split('/').any(|s| s == "." || s == "..");
+    reads_back.then(|| suffix.to_string())
 }
 
 /// Like `compact_with` but records which terms were used.
@@ -132,16 +155,21 @@ fn compact_with_tracking(
     for (prefix_iri, prefix_name) in prefixes {
         if iri.starts_with(prefix_iri.as_str()) {
             let suffix = &iri[prefix_iri.len()..];
+            let shortened = match prefix_name.as_str() {
+                ":base" => base_reference(prefix_iri, suffix),
+                ":vocab" => allow_vocab_strip.then(|| suffix.to_string()),
+                _ => None,
+            };
             if prefix_name == ":vocab" || prefix_name == ":base" {
-                if allow_vocab_strip || prefix_name == ":base" {
-                    if let Some(used) = used {
-                        if let Ok(mut guard) = used.lock() {
-                            guard.insert(prefix_name.clone(), prefix_iri.clone());
-                        }
+                let Some(shortened) = shortened else {
+                    continue;
+                };
+                if let Some(used) = used {
+                    if let Ok(mut guard) = used.lock() {
+                        guard.insert(prefix_name.clone(), prefix_iri.clone());
                     }
-                    return suffix.to_string();
                 }
-                continue;
+                return shortened;
             }
             if let Some(used) = used {
                 if let Ok(mut guard) = used.lock() {
@@ -330,6 +358,37 @@ mod tests {
                 guard.get("REPLACE"),
                 Some(&"http://schema.org/Person".to_string())
             );
+        }
+    }
+
+    /// An `@id` compacted against `@base` expands back to the same IRI; one
+    /// that would not stays whole.
+    #[test]
+    fn base_compaction_expands_back() {
+        let cases = [
+            ("http://b.org/ns#", "http://b.org/ns#alice", "#alice"),
+            ("http://b.org/dir/", "http://b.org/dir/alice", "alice"),
+            ("http://b.org/dir/", "http://b.org/dir/a/b?q#f", "a/b?q#f"),
+            (
+                "http://b.org/dir/",
+                "http://b.org/dir//x",
+                "http://b.org/dir//x",
+            ),
+            (
+                "http://b.org/dir/",
+                "http://b.org/dir/a:b",
+                "http://b.org/dir/a:b",
+            ),
+            (
+                "http://b.org/dir/",
+                "http://b.org/dir/../x",
+                "http://b.org/dir/../x",
+            ),
+        ];
+        for (base, iri, compacted) in cases {
+            let ctx = ParsedContext::parse(None, &json!({"@base": base})).unwrap();
+            assert_eq!(compact_id(iri, &ctx), compacted, "{iri} under {base}");
+            assert_eq!(crate::expand::iri(compacted, &ctx, false), iri);
         }
     }
 }

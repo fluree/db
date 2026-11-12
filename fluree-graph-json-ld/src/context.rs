@@ -1,5 +1,6 @@
 use crate::error::{JsonLdError, Result};
 use crate::iri;
+use fluree_vocab::iri::resolve_iri;
 use serde_json::{Map, Value as JsonValue};
 use std::collections::HashMap;
 
@@ -40,6 +41,12 @@ pub struct ContextEntry {
     pub is_type_definition: bool,
     /// Whether this entry was derived (copied from compact IRI to full IRI)
     pub derived: bool,
+    /// Defined as `null`, or with `"@id": null`: the term maps to no IRI, so
+    /// a property using it is dropped rather than expanded against `@vocab`.
+    pub null_mapping: bool,
+    /// A property-valued `@index`, unsupported: an index map under this
+    /// term is refused.
+    pub index: Option<String>,
 }
 
 impl ContextEntry {
@@ -65,6 +72,8 @@ impl ContextEntry {
 
         if let Some(ref id) = self.id {
             obj.insert("@id".to_string(), JsonValue::String(id.clone()));
+        } else if self.null_mapping {
+            obj.insert("@id".to_string(), JsonValue::Null);
         }
         if let Some(ref rev) = self.reverse {
             obj.insert("@reverse".to_string(), JsonValue::String(rev.clone()));
@@ -104,6 +113,9 @@ impl ContextEntry {
                 );
             }
         }
+        if let Some(ref index) = self.index {
+            obj.insert("@index".to_string(), JsonValue::String(index.clone()));
+        }
         if let Some(ref lang) = self.language {
             match lang {
                 Some(l) => {
@@ -139,6 +151,10 @@ pub struct ParsedContext {
     pub version: Option<f64>,
     /// Whether context is protected (@protected)
     pub protected: Option<bool>,
+    /// This context definition's `@propagate`: whether, as a type's scoped
+    /// context, it also applies to the node objects nested in the typed
+    /// node. Not inherited by contexts parsed on top of it.
+    pub propagate: Option<bool>,
     /// Term definitions (string keys map to entries)
     pub terms: HashMap<String, ContextEntry>,
 }
@@ -194,6 +210,9 @@ impl ParsedContext {
         }
         if let Some(protected) = self.protected {
             ctx.insert("@protected".to_string(), JsonValue::Bool(protected));
+        }
+        if let Some(propagate) = self.propagate {
+            ctx.insert("@propagate".to_string(), JsonValue::Bool(propagate));
         }
 
         for (key, entry) in &self.terms {
@@ -277,31 +296,16 @@ impl ParsedContext {
 }
 
 /// Compute @vocab value, handling empty string and relative IRIs
-fn compute_vocab(
-    base_context: &ParsedContext,
-    context: &Map<String, JsonValue>,
-    value: &JsonValue,
-) -> Result<Option<String>> {
+fn compute_vocab(document_base: Option<&str>, value: &JsonValue) -> Result<Option<String>> {
     match value {
         JsonValue::String(s) => {
             if s.is_empty() {
                 // Empty string means use @base as @vocab
-                let base = context
-                    .get("@base")
-                    .and_then(|v| v.as_str())
-                    .map(std::string::ToString::to_string)
-                    .or_else(|| base_context.base.clone());
-                Ok(base.map(|b| iri::add_trailing_slash(&b)))
+                Ok(document_base.map(iri::add_trailing_slash))
             } else if !iri::is_absolute(s) {
-                // Relative vocab: join with base
-                let base = context
-                    .get("@base")
-                    .and_then(|v| v.as_str())
-                    .or(base_context.base.as_deref());
-                if let Some(base) = base {
-                    Ok(Some(iri::join(base, s)))
-                } else {
-                    Ok(Some(iri::add_trailing_slash(s)))
+                match document_base {
+                    Some(base) => Ok(Some(resolve_iri(base, s))),
+                    None => Ok(Some(iri::add_trailing_slash(s))),
                 }
             } else {
                 Ok(Some(iri::add_trailing_slash(s)))
@@ -321,20 +325,34 @@ fn parse_context_map(
     depth: usize,
 ) -> Result<ParsedContext> {
     let mut result = base.clone();
+    result.propagate = None;
+
+    // `@base` first, so a relative `@vocab` beside it resolves against it. A
+    // relative `@base` resolves against the base already in effect.
+    match map.get("@base") {
+        Some(JsonValue::String(s)) => {
+            result.base = Some(match base.base.as_deref() {
+                Some(current) => resolve_iri(current, s),
+                None if fluree_vocab::iri::is_absolute_iri(s) => s.clone(),
+                None => {
+                    return Err(JsonLdError::InvalidContext {
+                        message: format!(
+                            "@base \"{s}\" is relative, and there is no base to resolve it against"
+                        ),
+                    })
+                }
+            });
+        }
+        Some(JsonValue::Null) => result.base = None,
+        _ => {}
+    }
 
     // First pass: extract @-prefixed keys
     for (key, value) in map {
         if let Some(keyword) = key.strip_prefix('@') {
             match keyword {
                 "vocab" => {
-                    result.vocab = compute_vocab(base, map, value)?;
-                }
-                "base" => {
-                    if let JsonValue::String(s) = value {
-                        result.base = Some(s.clone());
-                    } else if value.is_null() {
-                        result.base = None;
-                    }
+                    result.vocab = compute_vocab(result.base.as_deref(), value)?;
                 }
                 "language" => {
                     result.language = value.as_str().map(std::string::ToString::to_string);
@@ -344,6 +362,9 @@ fn parse_context_map(
                 }
                 "protected" => {
                     result.protected = value.as_bool();
+                }
+                "propagate" => {
+                    result.propagate = value.as_bool();
                 }
                 _ => {} // Ignore unknown @-keywords
             }
@@ -536,6 +557,11 @@ fn parse_context_entry(
     depth: usize,
 ) -> Result<ContextEntry> {
     match value {
+        JsonValue::Null => Ok(ContextEntry {
+            null_mapping: true,
+            ..Default::default()
+        }),
+
         JsonValue::String(s) => {
             // Resolve potentially nested references
             let mut visited = Vec::new();
@@ -554,8 +580,8 @@ fn parse_context_entry(
 
             for (k, v) in map {
                 match k.as_str() {
-                    "@id" => {
-                        if let JsonValue::String(s) = v {
+                    "@id" => match v {
+                        JsonValue::String(s) => {
                             entry.id = Some(resolve_compact_iri(
                                 s,
                                 original_context,
@@ -563,7 +589,9 @@ fn parse_context_entry(
                                 default_vocab,
                             ));
                         }
-                    }
+                        JsonValue::Null => entry.null_mapping = true,
+                        _ => {}
+                    },
                     "@type" => {
                         entry.type_ =
                             parse_type_value(v, original_context, base_context, default_vocab)?;
@@ -580,6 +608,9 @@ fn parse_context_entry(
                     }
                     "@container" => {
                         entry.container = Some(parse_container(v)?);
+                    }
+                    "@index" => {
+                        entry.index = v.as_str().map(str::to_string);
                     }
                     "@context" => {
                         let nested = ParsedContext::parse_guarded(
@@ -601,7 +632,7 @@ fn parse_context_entry(
             }
 
             // If no @id but @type exists, infer @id from key
-            if entry.id.is_none() && entry.reverse.is_none() {
+            if entry.id.is_none() && entry.reverse.is_none() && !entry.null_mapping {
                 entry.id = Some(resolve_compact_iri(
                     key,
                     original_context,

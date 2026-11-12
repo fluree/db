@@ -89,6 +89,17 @@ pub mod rdf {
     /// other facts annotate the asserted edge `s p o`. Fluree maps this
     /// to its native edge-annotation primitive.
     pub const REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+
+    /// A language tag split into its language and its RDF 1.2 base
+    /// direction: `ar--rtl` is `("ar", Some("rtl"))`. Fluree holds a
+    /// directional string's direction in its language tag; a tag without
+    /// `--ltr` or `--rtl` is all language.
+    pub fn split_base_direction(tag: &str) -> (&str, Option<&str>) {
+        match tag.rsplit_once("--") {
+            Some((language, direction @ ("ltr" | "rtl"))) => (language, Some(direction)),
+            _ => (tag, None),
+        }
+    }
 }
 
 /// RDFS vocabulary constants

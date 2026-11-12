@@ -755,7 +755,7 @@ fn value_json(
         return json!({"@id": resolve(sid)});
     }
     if let Some(lang) = lang {
-        return json!({"@value": lexical_form(value), "@language": lang});
+        return crate::format::language_tagged(json!(lexical_form(value)), lang);
     }
     if let Some(dt) = datatype {
         let dt_iri = resolve(dt);

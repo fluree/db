@@ -118,8 +118,7 @@ fn convert(obj: &Bound<'_, PyAny>, values: Values) -> PyResult<JsonValue> {
                 return Ok(serde_json::json!({ "@id": format!("_:{text}") }));
             }
             if obj.is_instance(term_class(py, &LANG_STRING_CLASS, "LangString")?)? {
-                let language: String = obj.getattr("language")?.extract()?;
-                return Ok(serde_json::json!({ "@value": text, "@language": language }));
+                return Ok(serde_json::json!({ "@value": text, "@language": lang_tag(obj)? }));
             }
         }
         return Ok(JsonValue::String(text));
@@ -289,8 +288,7 @@ pub(crate) fn ir_term(obj: &Bound<'_, PyAny>) -> PyResult<Term> {
             return Ok(Term::blank(text));
         }
         if obj.is_instance(term_class(py, &LANG_STRING_CLASS, "LangString")?)? {
-            let language: String = obj.getattr("language")?.extract()?;
-            return Ok(Term::lang_string(text, language));
+            return Ok(Term::lang_string(text, lang_tag(obj)?));
         }
         return Ok(Term::string(text));
     }
@@ -340,9 +338,24 @@ static DATE_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static TIME_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
-/// `iri` as a `fluree.IRI`.
+/// `iri` as a `fluree.IRI`, made as `str.__new__(IRI, iri)` so the IRI
+/// class's syntax check does not run: an IRI the engine holds is read back
+/// as it is.
 pub(crate) fn iri<'py>(py: Python<'py>, iri: &str) -> PyResult<Bound<'py, PyAny>> {
-    term_class(py, &IRI_CLASS, "IRI")?.call1((iri,))
+    let class = term_class(py, &IRI_CLASS, "IRI")?;
+    py.get_type::<PyString>()
+        .call_method1(pyo3::intern!(py, "__new__"), (class, iri))
+}
+
+/// A `fluree.LangString`'s tag as the engine holds it: its language, and
+/// `--ltr` or `--rtl` for a base direction.
+fn lang_tag(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    let language: String = obj.getattr("language")?.extract()?;
+    let direction: Option<String> = obj.getattr("direction")?.extract()?;
+    Ok(match direction {
+        Some(direction) => format!("{language}--{direction}"),
+        None => language,
+    })
 }
 
 /// Whether `obj` is exactly a `fluree.IRI` or a `fluree.BlankNode`.

@@ -59,6 +59,37 @@ pub(crate) mod sparql;
 mod sparql_xml;
 mod typed;
 
+/// A language-tagged string as a JSON-LD value object: `@language`, and
+/// `@direction` when the tag carries an RDF 1.2 base direction (`ar--rtl`).
+pub(crate) fn language_tagged(value: serde_json::Value, tag: &str) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("@value".to_string(), value);
+    insert_language(&mut obj, tag);
+    serde_json::Value::Object(obj)
+}
+
+/// `tag` into a JSON-LD value object as `@language`, and `@direction` when
+/// it carries a base direction.
+pub(crate) fn insert_language(obj: &mut serde_json::Map<String, serde_json::Value>, tag: &str) {
+    let (language, direction) = fluree_vocab::rdf::split_base_direction(tag);
+    obj.insert("@language".to_string(), language.into());
+    if let Some(direction) = direction {
+        obj.insert("@direction".to_string(), direction.into());
+    }
+}
+
+/// `tag` as the `@language` entry of a value object being written, and its
+/// `@direction` entry when it carries a base direction.
+pub(crate) fn push_language(out: &mut String, tag: &str) {
+    let (language, direction) = fluree_vocab::rdf::split_base_direction(tag);
+    out.push_str(r#","@language":"#);
+    json_write::push_json_string(out, language);
+    if let Some(direction) = direction {
+        out.push_str(r#","@direction":"#);
+        json_write::push_json_string(out, direction);
+    }
+}
+
 /// A triple term's subject, predicate and object as the bindings a formatter
 /// renders: nodes, or an object literal with its datatype or language tag (a
 /// nested term among them, which the formatter renders recursively).
@@ -809,6 +840,27 @@ pub async fn format_results_string_async_dataset(
 mod tests {
     use super::*;
     use fluree_db_query::var_registry::VarRegistry;
+
+    /// Every JSON-LD writer gives a directional tag as `@language` and
+    /// `@direction`, and any other tag as it is.
+    #[test]
+    fn language_tag_writes_direction_apart() {
+        assert_eq!(
+            language_tagged(serde_json::json!("v"), "ar--rtl"),
+            serde_json::json!({"@value": "v", "@language": "ar", "@direction": "rtl"})
+        );
+        assert_eq!(
+            language_tagged(serde_json::json!("v"), "en-GB"),
+            serde_json::json!({"@value": "v", "@language": "en-GB"})
+        );
+        let mut out = String::from(r#"{"@value":"v""#);
+        push_language(&mut out, "en--ltr");
+        out.push('}');
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!({"@value": "v", "@language": "en", "@direction": "ltr"})
+        );
+    }
 
     fn make_test_result() -> QueryResult {
         QueryResult {

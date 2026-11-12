@@ -1,6 +1,7 @@
 """RDF documents to and from quads: fluree.parse(), fluree.serialize(), and
 quads written to a ledger."""
 
+import json
 import pickle
 from decimal import Decimal
 
@@ -10,7 +11,7 @@ import fluree
 from fluree import IRI, BlankNode, InvalidRequestError, LangString, Literal, Quad, Triple
 
 EX = "http://example.org/"
-REIFIES = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies"
+REIFIES = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies")
 XSD = "http://www.w3.org/2001/XMLSchema#"
 PREFIXES = f"PREFIX ex: <{EX}>\nPREFIX xsd: <{XSD}>\n"
 
@@ -370,3 +371,114 @@ def test_a_quad_takes_plain_strings_as_iris():
     for args in [(1, EX + "p", 1), (EX + "s", BlankNode("p"), 1), (EX + "s", EX + "p", 1, 5)]:
         with pytest.raises(TypeError):
             Quad(*args)
+
+
+def test_terms_compare_as_rdf_terms_do():
+    # An IRI, a blank node, a plain string and each tagged string are five
+    # terms, though their text is one.
+    terms = [ex("Paris"), BlankNode(EX + "Paris"), EX + "Paris", LangString(EX + "Paris", "fr"), LangString(EX + "Paris", "en")]
+    assert len(set(terms)) == 5
+    assert ex("x") != EX + "x" and EX + "x" != ex("x")
+    assert ex("x") == IRI(EX + "x") and hash(ex("x")) == hash(IRI(EX + "x"))
+    assert LangString("chat", "FR") == LangString("chat", "fr")
+    assert LangString("chat", "fr") != "chat"
+    assert ex("x") < ex("y") and ex("x").startswith("http:")
+    # Five quads stay five, and value-mode literals stay apart by kind.
+    assert len({Quad(ex("s"), ex("p"), term) for term in terms}) == 5
+    assert len({Quad(ex("s"), ex("p"), value) for value in [1, True, 1.0, Decimal(1)]}) == 4
+    assert len({Quad(ex("s"), ex("p"), {"a": [1]}), Quad(ex("s"), ex("p"), {"a": [1]})}) == 1
+
+
+def test_parsed_terms_keep_their_kinds_in_a_set():
+    doc = f'{PREFIXES}ex:s ex:p ex:o, "{EX}o", "fund", "fund"@en .'
+    assert len(set(fluree.parse(doc, "turtle"))) == 4
+
+
+def test_an_iri_and_a_datatype_are_checked():
+    for text in ["not an iri", "relative/path", "", "http://e/a b", "http://e/<x>"]:
+        with pytest.raises(ValueError):
+            IRI(text)
+    with pytest.raises(ValueError):
+        Literal("x", "notadatatype")
+    with pytest.raises(ValueError):
+        Quad("relative", EX + "p", 1)
+    assert IRI("urn:isbn:0451450523") == IRI("urn:isbn:0451450523")
+
+
+def test_a_direction_is_its_own_field():
+    rtl = LangString("مرحبا", "ar", "rtl")
+    assert (rtl.language, rtl.direction) == ("ar", "rtl")
+    assert LangString("مرحبا", "ar--rtl") == rtl and rtl != LangString("مرحبا", "ar")
+    with pytest.raises(ValueError):
+        LangString("x", "ar", "up")
+    assert pickle.loads(pickle.dumps(rtl)) == rtl
+    (quad,) = fluree.parse(f'{PREFIXES}ex:s ex:p "مرحبا"@ar--rtl .', "turtle")
+    assert quad.object == rtl
+    (quad,) = fluree.parse({"@id": EX + "s", EX + "p": {"@value": "مرحبا", "@language": "ar", "@direction": "rtl"}}, "jsonld")
+    assert quad.object == rtl
+    written = fluree.serialize([quad], "jsonld")
+    assert '"@direction": "rtl"' in written and '"@language": "ar"' in written
+
+
+def test_ntriples_writes_a_term_or_a_quad():
+    assert fluree.ntriples(ex("x")) == f"<{EX}x>"
+    assert fluree.ntriples(BlankNode("b0")) == "_:b0"
+    assert fluree.ntriples("say \"hi\"") == '"say \\"hi\\""'
+    assert fluree.ntriples(LangString("chat", "fr")) == '"chat"@fr'
+    assert fluree.ntriples(1) == f'"1"^^<{XSD}integer>'
+    assert fluree.ntriples(Triple(ex("a"), ex("p"), ex("b"))) == f"<<( <{EX}a> <{EX}p> <{EX}b> )>>"
+    quad = Quad(ex("s"), ex("p"), "v", ex("g"))
+    assert str(quad) == f'<{EX}s> <{EX}p> "v" <{EX}g> .'
+    assert str(quad) == fluree.serialize([quad], "nquads").strip()
+
+
+def test_bytes_parse_as_utf8_text():
+    doc = f'{PREFIXES}ex:s ex:p "é" .'
+    assert fluree.parse(doc.encode(), "turtle") == fluree.parse(doc, "turtle")
+    assert fluree.parse(b"\xef\xbb\xbf" + doc.encode(), "turtle") == fluree.parse(doc, "turtle")
+    with pytest.raises(InvalidRequestError, match="not UTF-8"):
+        fluree.parse(b"\xff\xfe", "turtle")
+
+
+def test_quads_come_in_document_order():
+    trig = f"{PREFIXES}ex:g1 {{ ex:a ex:p ex:b }}\nex:a ex:p ex:c .\nex:g2 {{ ex:d ex:p ex:e }}"
+    assert [(q.subject, q.graph) for q in fluree.parse(trig, "trig")] == [
+        (ex("a"), ex("g1")), (ex("a"), None), (ex("d"), ex("g2"))
+    ]
+    doc = {"@context": {"@vocab": EX}, "@id": EX + "a", "p": {"@id": EX + "b", "q": "x"}, "t": "z"}
+    assert [(q.subject, q.predicate) for q in fluree.parse(doc)] == [
+        (ex("a"), ex("p")), (ex("b"), ex("q")), (ex("a"), ex("t"))
+    ]
+
+
+def test_a_parse_keeps_the_prefixes_declared():
+    doc = f"PREFIX ex: <{EX}>\n@prefix dc: <http://purl.org/dc/terms/> .\nex:s dc:title 'x' .\nPREFIX ex: <http://b.example/>\nex:t dc:title 'y' ."
+    quads = fluree.parse(doc, "turtle")
+    assert isinstance(quads, list) and isinstance(quads, fluree.Quads)
+    assert quads.prefixes == {"ex": "http://b.example/", "dc": "http://purl.org/dc/terms/"}
+    assert fluree.parse(f"<{EX}s> <{EX}p> <{EX}o> .", "ntriples").prefixes == {}
+
+
+def test_serialize_keeps_graph_order_and_gathers_subjects():
+    quads = [
+        Quad(ex("a"), ex("p"), ex("b"), ex("g2")),
+        Quad(ex("z"), ex("p"), ex("y")),
+        Quad(ex("c"), ex("p"), ex("d"), ex("g1")),
+        Quad(ex("a"), ex("q"), ex("e"), ex("g2")),
+        Quad(ex("a"), ex("p"), ex("h"), ex("g2")),
+    ]
+    trig = fluree.serialize(quads, "trig", prefixes={"ex": EX})
+    assert trig.index("GRAPH ex:g2") < trig.index("ex:z ex:p ex:y") < trig.index("GRAPH ex:g1")
+    assert "ex:a ex:p ex:b, ex:h ;\n        ex:q ex:e ." in trig
+    nquads = fluree.serialize(quads, "nquads").splitlines()
+    assert [line.split()[-2] for line in nquads] == [f"<{EX}g2>"] * 3 + ["<http://example.org/y>", f"<{EX}g1>"]
+    assert set(fluree.parse(trig, "trig")) == set(quads)
+
+
+def test_serialize_writes_expanded_json_ld():
+    quads = [Quad(ex("a"), ex("n"), 1), Quad(ex("a"), ex("r"), ex("b"))]
+    expanded = json.loads(fluree.serialize(quads, "jsonld", expanded=True))
+    assert expanded == [{"@id": EX + "a", EX + "n": [{"@value": 1}], EX + "r": [{"@id": EX + "b"}]}]
+    assert set(fluree.parse(expanded)) == set(quads)
+    with pytest.raises(InvalidRequestError, match="expanded"):
+        fluree.serialize(quads, "turtle", expanded=True)

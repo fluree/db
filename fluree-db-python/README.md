@@ -141,10 +141,15 @@ frozen view that every query sees identically.
   `get`'s default applies only to a column the result doesn't have.
 - Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
   ...); IRIs are `fluree.IRI` and language-tagged strings
-  `fluree.LangString`, both `str` subclasses. A literal with no lossless
-  Python type stays a `fluree.Literal`. An RDF 1.2 triple term, such as the
-  `?t` of `?r rdf:reifies ?t`, is a `fluree.Triple(subject, predicate,
-  object)`, which unpacks like a tuple.
+  `fluree.LangString` (with a `language` and, in RDF 1.2, a `direction`),
+  both `str` subclasses. They print, slice and pass as their text, but
+  compare as RDF terms: an `IRI` equals only an `IRI`, never the plain string
+  with its text, which is a literal, so compare with `fluree.IRI(...)`. A
+  literal with no lossless Python type stays a `fluree.Literal`. An RDF 1.2
+  triple term, such as the `?t` of `?r rdf:reifies ?t`, is a
+  `fluree.Triple(subject, predicate, object)`, which unpacks like a tuple.
+  `fluree.ntriples(term)` writes any of them in N-Triples syntax, and
+  `str(quad)` is the quad's N-Quads line.
 - Dates and times come back as Fluree stores them
   ([temporal values](https://fluree.github.io/db/reference/compatibility.html#sparql-11-query)):
   an `xsd:dateTime` is a `datetime` in UTC whatever offset it was written
@@ -403,8 +408,20 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
 
 - A path (a `Path`, not a `str`, which is the document's text) gives its
   format by extension (`.ttl`, `.trig`, `.nt`, `.nq`, `.jsonld`, `.json`);
-  text needs `format=`, and a dict or list is JSON-LD. Turtle, TriG and
-  JSON-LD resolve relative IRIs against `base=`.
+  text, as a `str` or UTF-8 `bytes`, needs `format=`, and a dict or list is
+  JSON-LD. Turtle, TriG and JSON-LD resolve relative IRIs against `base=`,
+  by RFC 3986.
+- Quads compare as RDF statements: a set of them keeps an IRI apart from a
+  string with its text, `"fund"` apart from `"fund"@en`, and `1` apart from
+  `True` and `1.0`. `str(quad)` is its N-Quads line, which sorts and diffs
+  as text. Literals parsed as Python values compare by value, so
+  `"1"^^xsd:int` and `"01"^^xsd:integer` are one quad in a set; for RDF term
+  identity (dedup, diff, sort), parse with `literals="lexical"`.
+- Quads come in the order the document writes them, and the list `parse`
+  returns has the `prefixes` a Turtle or TriG document declares.
+  `serialize` keeps the quads' order: graphs in the order they first appear,
+  and in Turtle and TriG each subject's statements together. `expanded=True`
+  writes expanded JSON-LD.
 - RDF 1.2 is read whole. A triple term is a `fluree.Triple`, and an
   annotation or a reified triple is the quad `(reifier, rdf:reifies,
   Triple(...))`, the annotated triple being a quad of its own. `serialize`
@@ -435,6 +452,23 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
 [RDF documents](https://fluree.github.io/db/reference/rdf-documents.html) in
 the Fluree documentation shows how each syntax writes named graphs,
 annotations, reified triples and triple terms.
+
+`fluree.canonicalize(quads)` returns the quads' canonical N-Quads (RDF
+Dataset Canonicalization, RDFC-1.0): blank nodes labeled from the statements
+alone and lines in a fixed order, so two sets of quads holding the same
+statements give the same text, whatever their blank node labels and order:
+
+```python
+def canonical(doc):
+    return fluree.canonicalize(fluree.parse(doc, "trig", literals="lexical"))
+
+same = canonical(a) == canonical(b)
+```
+
+Parse with `literals="lexical"` when the text will be hashed or signed: by
+default a literal becomes its Python value, which writes `"01"^^xsd:long` and
+`"1"^^xsd:integer` alike. `max_deep_calls=` lowers the work a dataset from an
+untrusted source may take before it is refused.
 
 ## rdflib
 

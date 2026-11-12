@@ -20,6 +20,7 @@ JSON-LD or Turtle and query it with SPARQL or JSON-LD::
 
 from importlib.metadata import version as _version
 
+from fluree._canon import canonicalize
 from fluree._connection import Connection, Ledger, QueryProfile, Snapshot, Transaction, connect
 from fluree._graph import Node, Path, Relationship
 from fluree._records import (
@@ -54,8 +55,8 @@ from fluree._sources import (
     Unity,
 )
 from fluree import doc
-from fluree._rdf import RdfFormat, parse, serialize
-from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector
+from fluree._rdf import Quads, RdfFormat, parse, serialize
+from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector, ntriples
 from fluree.errors import (
     ConflictError,
     DatabaseInUseError,
@@ -106,6 +107,7 @@ __all__ = [
     "PermissionDeniedError",
     "QueryProfile",
     "Quad",
+    "Quads",
     "QueryTimeoutError",
     "RdfFormat",
     "RebaseResult",
@@ -128,7 +130,9 @@ __all__ = [
     "ValidationResult",
     "Vector",
     "VerifyReport",
+    "canonicalize",
     "connect",
+    "ntriples",
     "parse",
     "serialize",
     "set_log_level",

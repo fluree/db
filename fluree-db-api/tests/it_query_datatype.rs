@@ -1952,3 +1952,63 @@ async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
         normalize_rows(&json!([[1.5], [2.5], [3.5]]))
     );
 }
+
+/// A directional string written in JSON-LD (`@direction`) and one written in
+/// Turtle (`@ar--rtl`) are the same term: a JSON-LD query with `@direction`
+/// matches both, and JSON-LD output gives the direction as `@direction`.
+#[tokio::test]
+async fn directional_strings_read_and_write_direction() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "ledger/direction:main").await;
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@id": "ex:a",
+        "ex:label": {"@value": "مرحبا", "@language": "ar", "@direction": "rtl"}
+    });
+    let ledger1 = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+    let ledger = fluree
+        .insert_turtle(
+            ledger1,
+            "@prefix ex: <http://example.org/ns/> .\nex:b ex:label \"مرحبا\"@ar--rtl .",
+        )
+        .await
+        .expect("insert turtle")
+        .ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?s", "?label"],
+        "where": {"@id": "?s", "ex:label": "?label"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let label = json!({"@value": "مرحبا", "@language": "ar", "@direction": "rtl"});
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a", label], ["ex:b", label]]))
+    );
+
+    let matching = json!({
+        "@context": ctx,
+        "select": "?s",
+        "where": {"@id": "?s", "ex:label": {"@value": "مرحبا", "@language": "ar", "@direction": "rtl"}}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &matching)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!(["ex:a", "ex:b"]))
+    );
+}
