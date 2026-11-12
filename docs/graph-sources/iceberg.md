@@ -558,8 +558,8 @@ FROM <table>
 <literal>   := an integer | a decimal | 'a string' ('' escapes a quote) | TRUE | FALSE
 ```
 
-- The table resolves the way an `rr:tableName` does (`namespace.table`).
-- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive; quote a column whose name is a keyword.
+- The table resolves the way an `rr:tableName` does (`namespace.table`). As there, a table name may not begin with `sqlQuery:`, which is reserved for the aliases of `rr:sqlQuery` logical tables.
+- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive. Quote a column or table whose name is a keyword or one of the refused words below (`top`, `left`, `on`, `all`, ...): `WHERE "top" = 1`.
 - A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
 - The select list is the logical table's columns, as in R2RML. Every column the map reads (its term maps, and the parent columns of a join into it) must be in the list, or registration refuses the map. A column the list names must exist. `SELECT *` selects every column.
 - Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
