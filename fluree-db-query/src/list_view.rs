@@ -128,6 +128,18 @@ impl ListView {
         })))
     }
 
+    /// A view whose list members are on `predicates`, for planning tests.
+    #[cfg(test)]
+    pub(crate) fn of_predicates(predicates: impl IntoIterator<Item = Sid>) -> Arc<Self> {
+        Arc::new(Self {
+            predicates: Some(predicates.into_iter().collect()),
+            predicate_ids: None,
+            lists: Mutex::new(ListTable::default()),
+            reads: Mutex::new(HashMap::new()),
+            subjects: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// Whether a list triple can have `subject` as its subject in `graphs`:
     /// an unbound subject, a cell this request named, or a node with a list
     /// row in novelty or in the index. A `false` is exact.
