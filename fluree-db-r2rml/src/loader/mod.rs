@@ -293,6 +293,33 @@ mod sql_query_tests {
             rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
     "#;
 
+    /// A table whose name begins with the alias prefix would be read as an
+    /// `rr:sqlQuery` map's alias by every reader, so the loader refuses it.
+    #[test]
+    fn a_table_name_with_the_alias_prefix_is_refused() {
+        let ttl = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "sqlQuery:0123456789abcdef" ] ;
+                rr:subjectMap [ rr:template "http://example.org/t/{id}" ] .
+        "#;
+        let err = R2rmlLoader::from_turtle(ttl)
+            .unwrap()
+            .compile()
+            .expect_err("the alias prefix is reserved");
+        let message = err.to_string();
+        assert!(
+            message.contains("rr:tableName") && message.contains("reserved"),
+            "{message}"
+        );
+        // Not a prefix of the name: an ordinary table.
+        let ok = ttl.replace("\"sqlQuery:0123456789abcdef\"", "\"crm.sqlQuery:x\"");
+        R2rmlLoader::from_turtle(&ok)
+            .unwrap()
+            .compile()
+            .expect("an ordinary table");
+    }
+
     #[test]
     fn sql_query_compiles_to_a_stable_alias_that_resolves_back_to_the_query() {
         let compiled = R2rmlLoader::from_turtle(MAPPING)

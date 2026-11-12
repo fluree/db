@@ -28,7 +28,7 @@ use crate::manifest::{
     DEFAULT_MANIFEST_READ_CONCURRENCY,
 };
 use crate::metadata::{Schema, Snapshot, TableMetadata};
-use crate::scan::predicate::Expression;
+use crate::scan::predicate::{ExactRowFilter, Expression};
 use crate::scan::pruning::can_contain_file;
 
 /// Configuration for a table scan.
@@ -105,7 +105,10 @@ pub struct FileScanTask {
     pub projected_field_ids: Vec<i32>,
     /// Residual filter to apply after reading (predicates not fully evaluated by
     /// stats). Shared: every task of a plan holds the same filter.
+    /// Advisory: the reader may keep rows it cannot decide (see [`ExactRowFilter`]).
     pub residual_filter: Option<Arc<Expression>>,
+    /// A row filter the reader must enforce on every row; see [`ExactRowFilter`].
+    pub exact_filter: Option<ExactRowFilter>,
     /// Start position for split reading (0 for whole file).
     pub start: i64,
     /// Length for split reading (file size for whole file).
@@ -135,6 +138,14 @@ impl FileScanTask {
         self
     }
 
+    /// Require every row this task reads to satisfy `filter`; see
+    /// [`ExactRowFilter`]. The task's projection must include its fields.
+    #[must_use]
+    pub fn with_exact_filter(mut self, filter: Option<ExactRowFilter>) -> Self {
+        self.exact_filter = filter;
+        self
+    }
+
     /// Create a task for reading an entire file.
     pub fn for_whole_file(
         data_file: DataFile,
@@ -146,6 +157,7 @@ impl FileScanTask {
             data_file,
             projected_field_ids,
             residual_filter,
+            exact_filter: None,
             start: 0,
             length,
             iceberg_schema: None,
@@ -165,6 +177,7 @@ impl FileScanTask {
             data_file,
             projected_field_ids,
             residual_filter,
+            exact_filter: None,
             start: 0,
             length,
             iceberg_schema: Some(schema),

@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use fluree_db_iceberg::FieldType;
 use fluree_db_r2rml::emit::{DiagCode, Diagnostic, Severity};
 use fluree_db_r2rml::loader::R2rmlLoader;
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, RestrictedSelect, TriplesMap};
 
 use super::config::IcebergConnectionConfig;
 use super::iceberg_catalog::{
@@ -128,6 +128,26 @@ const ICEBERG_WORDING: Wording = Wording {
     unread: "catalog preview failed",
 };
 
+/// Which table an `rr:sqlQuery` triples map is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryTables {
+    /// The query's alias, as a table name: a source that refuses queries
+    /// reports the alias as a table it cannot find.
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
+    Alias,
+    /// The `FROM` table of a query in the restricted subset an Iceberg source
+    /// evaluates (see [`super::row_filter`]); a query outside it is an error.
+    FromTable,
+}
+
+/// The table `tm` is checked against; `None` for a query outside the subset.
+fn source_table(tm: &TriplesMap, queries: QueryTables) -> Option<String> {
+    match (queries, tm.sql_query()) {
+        (QueryTables::FromTable, Some(sql)) => RestrictedSelect::parse(sql).ok().map(|s| s.table),
+        _ => tm.table_name().map(str::to_string),
+    }
+}
+
 /// How a referenced column resolves against a live schema.
 enum ColumnResolution<'a> {
     /// Exact byte-for-byte name match.
@@ -212,7 +232,13 @@ fn cross_check_mapping(
             (name.clone(), columns)
         })
         .collect();
-    cross_check_live(compiled, &live, load_errors, ICEBERG_WORDING)
+    cross_check_live(
+        compiled,
+        &live,
+        load_errors,
+        ICEBERG_WORDING,
+        QueryTables::FromTable,
+    )
 }
 
 /// [`cross_check_mapping`] over any table format's columns.
@@ -221,6 +247,7 @@ pub(crate) fn cross_check_live(
     schemas: &HashMap<String, Vec<LiveColumn>>,
     load_errors: &HashMap<String, String>,
     wording: Wording,
+    queries: QueryTables,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -229,9 +256,33 @@ pub(crate) fn cross_check_live(
     tms.sort_by(|a, b| a.iri.cmp(&b.iri));
 
     for tm in tms {
-        let Some(table) = tm.table_name() else {
+        // An `rr:sqlQuery` in the restricted subset is checked against its FROM
+        // table, with the columns it names; one outside the subset is refused
+        // at registration, so it is an error here.
+        let query = match (queries, tm.sql_query()) {
+            (QueryTables::FromTable, Some(sql)) => match RestrictedSelect::parse(sql) {
+                Ok(select) => Some(select),
+                Err(e) => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: DiagCode::CompileError,
+                        table: None,
+                        column: None,
+                        message: format!(
+                            "TriplesMap <{}>: {}",
+                            tm.iri,
+                            super::row_filter::unsupported_query_message(sql, &e)
+                        ),
+                    });
+                    continue;
+                }
+            },
+            _ => None,
+        };
+        let Some(table) = source_table(tm, queries) else {
             continue; // logical table is always a table name today; skip defensively.
         };
+        let table = table.as_str();
 
         let Some(schema) = schemas.get(table) else {
             let detail = load_errors
@@ -261,6 +312,9 @@ pub(crate) fn cross_check_live(
         if let Some(col) = &tm.subject_map.column {
             referenced.insert(col.as_str());
         }
+        if let Some(select) = &query {
+            referenced.extend(select.named_columns());
+        }
         let mut resolved: HashMap<&str, Option<&LiveColumn>> = HashMap::new();
         for &name in &referenced {
             let ci = check_column(schema, table, name, wording, &mut diagnostics);
@@ -274,8 +328,8 @@ pub(crate) fn cross_check_live(
             };
 
             let parent_tm = compiled.get(&rom.parent_triples_map);
-            let parent_table = parent_tm.and_then(|p| p.table_name());
-            let parent_schema = parent_table.and_then(|t| schemas.get(t));
+            let parent_table = parent_tm.and_then(|p| source_table(p, queries));
+            let parent_schema = parent_table.as_deref().and_then(|t| schemas.get(t));
 
             if parent_tm.is_none() {
                 // Dangling parentTriplesMap — there is no parent table to resolve.
@@ -299,7 +353,7 @@ pub(crate) fn cross_check_live(
                 // Parent column is resolved against the PARENT table's schema. When
                 // the parent table/schema is absent its own TableNotFound already
                 // fired (parent is iterated as its own TriplesMap), so skip here.
-                let parent_ci = match (parent_table, parent_schema) {
+                let parent_ci = match (parent_table.as_deref(), parent_schema) {
                     (Some(pt), Some(ps)) => {
                         check_column(ps, pt, &jc.parent_column, wording, &mut diagnostics)
                     }
@@ -322,7 +376,7 @@ pub(crate) fn cross_check_live(
                                     table,
                                     jc.child_column,
                                     ct,
-                                    parent_table.unwrap_or_default(),
+                                    parent_table.as_deref().unwrap_or_default(),
                                     jc.parent_column,
                                     pt_ty
                                 ),
@@ -444,10 +498,11 @@ impl crate::Fluree {
         };
 
         // Distinct logical tables referenced by the mapping (sorted, deterministic).
+        // An `rr:sqlQuery` map's table is its query's FROM table.
         let mut table_names_set: BTreeSet<String> = BTreeSet::new();
         for tm in compiled.triples_maps.values() {
-            if let Some(t) = tm.table_name() {
-                table_names_set.insert(t.to_string());
+            if let Some(t) = source_table(tm, QueryTables::FromTable) {
+                table_names_set.insert(t);
             }
         }
 
@@ -600,6 +655,50 @@ mod tests {
             "a correct mapping must produce no diagnostics, got: {diags:?}"
         );
         assert!(!has_error(&diags));
+    }
+
+    /// An `rr:sqlQuery` map is checked against its query's FROM table, columns
+    /// the query names included, never reported as a missing table named by
+    /// its alias. A query outside the restricted subset is an error.
+    #[test]
+    fn a_query_map_is_checked_against_its_from_table() {
+        let mut tm = dim_store_map();
+        tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(
+            "SELECT * FROM DW.DIM_STORE WHERE NAME IS NOT NULL",
+        );
+        let compiled = CompiledR2rmlMapping::new(vec![tm.clone()]);
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), dim_store_schema());
+        let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+        assert!(diags.is_empty(), "{diags:?}");
+
+        tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(
+            "SELECT * FROM DW.DIM_STORE WHERE REGION = 'west'",
+        );
+        let diags = cross_check_mapping(
+            &CompiledR2rmlMapping::new(vec![tm.clone()]),
+            &schemas,
+            &no_errors(),
+        );
+        assert!(
+            diags.iter().any(
+                |d| d.code == DiagCode::ColumnNotFound && d.column.as_deref() == Some("REGION")
+            ),
+            "{diags:?}"
+        );
+        assert!(!has_code(&diags, DiagCode::TableNotFound), "{diags:?}");
+
+        tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(
+            "SELECT * FROM DW.DIM_STORE WHERE NAME = 'a' OR NAME = 'b'",
+        );
+        let diags =
+            cross_check_mapping(&CompiledR2rmlMapping::new(vec![tm]), &schemas, &no_errors());
+        assert!(
+            diags.iter().any(|d| d.code == DiagCode::CompileError
+                && d.severity == Severity::Error
+                && d.message.contains("OR is not supported")),
+            "{diags:?}"
+        );
     }
 
     #[test]

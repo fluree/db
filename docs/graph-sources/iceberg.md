@@ -76,7 +76,7 @@ fluree iceberg map orders \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
-For a catalog-backed source, `info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. The count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`, and its class and property counts are `null`.
+For a catalog-backed source, `info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. The count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`, and its class and property counts are `null`. A count that metadata cannot give exactly but can bound is `null`, with a `count-upper-bound` beside it: the true count is at most that. A triples map narrowed by a [row filter](#row-filters-rrsqlquery) keeps only some of its table's rows, so each class and property it contributes to reports the sum of the contributing tables' row counts as the bound (absent when one of them is unknown), and its per-datatype counts are `null`.
 
 #### Warehouse-root `--table-location` (multi-table, catalog-less)
 
@@ -535,6 +535,58 @@ A column's value becomes an RDF literal through its object map. With `rr:datatyp
 
 An un-annotated numeric, boolean or temporal column therefore compares, sorts and aggregates as text: `FILTER(?score > 80)` compares `"9"` with `80` and finds no match. Give such a column an `rr:datatype`, as a generated mapping does. An `rr:template` object map produces an IRI (or, with `rr:termType rr:Literal`, an `xsd:string` literal), and a reference object map the parent's subject IRI.
 
+### Row filters (`rr:sqlQuery`)
+
+An Iceberg source has no SQL engine behind it, so it accepts an `rr:sqlQuery` logical table only in a restricted form it evaluates itself: one table, narrowed by a conjunction of column comparisons. The usual case is a history table mapped to its current rows:
+
+```turtle
+<#Customer> a rr:TriplesMap ;
+  rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1 AND is_deleted = FALSE" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+```
+
+The accepted form:
+
+```text
+SELECT * | <column> [, <column>]...
+FROM <table>
+[WHERE <condition> [AND <condition>]...]
+
+<condition> := <column> <op> <literal> | <column> IS [NOT] NULL
+<op>        := = | <> | != | < | <= | > | >=
+<literal>   := an integer | a decimal | 'a string' ('' escapes a quote) | TRUE | FALSE
+```
+
+- The table resolves the way an `rr:tableName` does (`namespace.table`).
+- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive; quote a column whose name is a keyword.
+- A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
+- The select list is the logical table's columns, as in R2RML. Every column the map reads (its term maps, and the parent columns of a join into it) must be in the list, or registration refuses the map. A column the list names must exist. `SELECT *` selects every column.
+- Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
+
+**The filter is exact.** It is part of what the map means, not an optimization, so it is applied to every row of every read regardless of `FLUREE_ICEBERG_PREDICATE_PUSHDOWN`. That covers queries, `COUNT`, `ORDER BY … LIMIT`, references into the map, and `fluree materialize`. It also prunes data files and row groups by their statistics. A comparison with a null cell is unknown and drops the row, and only `IS NULL` keeps one. A column added to the table after a data file was written reads as null in that file.
+
+Each literal is checked against the column's type in the schema of the snapshot being read:
+
+| Column type | Accepted comparison |
+|-------------|---------------------|
+| int, long | an integer within the column's range (a decimal with a zero fraction, `1.0`, counts as one) |
+| decimal(p, s) | an integer or a decimal, compared exactly |
+| float, double | an integer within ±2^53, compared as IEEE numbers: a NaN cell satisfies only `<>`, and -0.0 equals 0.0. A decimal literal (`0.1`) has no exact binary value and is refused |
+| string | a quoted string, ordered by Unicode code point |
+| boolean | `TRUE` or `FALSE` |
+| date, timestamp, time, binary, uuid, and other types | `IS [NOT] NULL` only (comparisons may be accepted by a later version) |
+
+A column the table does not have, or a literal that does not fit its column, fails the read with an error naming the column and its type. Nothing is approximated.
+
+What else changes for a filtered map:
+
+- A `COUNT` over it scans the data files, because the manifest row-count shortcut cannot know which rows a filter keeps.
+- A reference into it (`rr:parentTriplesMap`) joins the rows the filter keeps. A child row whose key names an excluded row has no reference, in the browse crawl too.
+- In `info` / `/info`, its class and property counts are `null`, with `count-upper-bound` reporting the most they can be.
+- [Tracking materialization](#tracking-keep-the-target-fresh-automatically) (`/iceberg/materialize`, `/iceberg/track`) refuses a mapping with any `rr:sqlQuery` logical table. A row that stops matching the `WHERE` (say, `is_current` going from 1 to 0) is never read again, so the subject it produced would never be retracted. Build a [native twin](#materializing-a-native-twin) with `fluree materialize` instead, and rebuild it to refresh.
+- Delta sources refuse `rr:sqlQuery`; [SQL sources](sql.md#rrsqlquery) hand any query to their engine.
+
 ## Querying Iceberg Tables
 
 Iceberg graph sources are queried using standard SPARQL and JSON-LD syntax. In the Rust API, mapped sources resolve transparently through the lazy query builders:
@@ -680,6 +732,9 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{ "source": "orders:main", "target": "orders-native:main" }'
 ```
+
+A mapping with an `rr:sqlQuery` logical table is refused by `materialize` and
+`track`: see [Row filters](#row-filters-rrsqlquery).
 
 - `POST {api_base_url}/iceberg/untrack` — stop tracking (leaves materialized data in place).
 - `GET {api_base_url}/iceberg/tracking` — list tracked jobs and worker stats.
