@@ -1,5 +1,6 @@
 use crate::error::{JsonLdError, Result};
 use crate::iri;
+use fluree_vocab::iri::resolve_iri;
 use serde_json::{Map, Value as JsonValue};
 use std::collections::HashMap;
 
@@ -150,6 +151,10 @@ pub struct ParsedContext {
     pub version: Option<f64>,
     /// Whether context is protected (@protected)
     pub protected: Option<bool>,
+    /// This context definition's `@propagate`: whether, as a type's scoped
+    /// context, it also applies to the node objects nested in the typed
+    /// node. Not inherited by contexts parsed on top of it.
+    pub propagate: Option<bool>,
     /// Term definitions (string keys map to entries)
     pub terms: HashMap<String, ContextEntry>,
 }
@@ -205,6 +210,9 @@ impl ParsedContext {
         }
         if let Some(protected) = self.protected {
             ctx.insert("@protected".to_string(), JsonValue::Bool(protected));
+        }
+        if let Some(propagate) = self.propagate {
+            ctx.insert("@propagate".to_string(), JsonValue::Bool(propagate));
         }
 
         for (key, entry) in &self.terms {
@@ -288,31 +296,16 @@ impl ParsedContext {
 }
 
 /// Compute @vocab value, handling empty string and relative IRIs
-fn compute_vocab(
-    base_context: &ParsedContext,
-    context: &Map<String, JsonValue>,
-    value: &JsonValue,
-) -> Result<Option<String>> {
+fn compute_vocab(document_base: Option<&str>, value: &JsonValue) -> Result<Option<String>> {
     match value {
         JsonValue::String(s) => {
             if s.is_empty() {
                 // Empty string means use @base as @vocab
-                let base = context
-                    .get("@base")
-                    .and_then(|v| v.as_str())
-                    .map(std::string::ToString::to_string)
-                    .or_else(|| base_context.base.clone());
-                Ok(base.map(|b| iri::add_trailing_slash(&b)))
+                Ok(document_base.map(iri::add_trailing_slash))
             } else if !iri::is_absolute(s) {
-                // Relative vocab: join with base
-                let base = context
-                    .get("@base")
-                    .and_then(|v| v.as_str())
-                    .or(base_context.base.as_deref());
-                if let Some(base) = base {
-                    Ok(Some(iri::join(base, s)))
-                } else {
-                    Ok(Some(iri::add_trailing_slash(s)))
+                match document_base {
+                    Some(base) => Ok(Some(resolve_iri(base, s))),
+                    None => Ok(Some(iri::add_trailing_slash(s))),
                 }
             } else {
                 Ok(Some(iri::add_trailing_slash(s)))
@@ -332,20 +325,34 @@ fn parse_context_map(
     depth: usize,
 ) -> Result<ParsedContext> {
     let mut result = base.clone();
+    result.propagate = None;
+
+    // `@base` first, so a relative `@vocab` beside it resolves against it. A
+    // relative `@base` resolves against the base already in effect.
+    match map.get("@base") {
+        Some(JsonValue::String(s)) => {
+            result.base = Some(match base.base.as_deref() {
+                Some(current) => resolve_iri(current, s),
+                None if fluree_vocab::iri::is_absolute_iri(s) => s.clone(),
+                None => {
+                    return Err(JsonLdError::InvalidContext {
+                        message: format!(
+                            "@base \"{s}\" is relative, and there is no base to resolve it against"
+                        ),
+                    })
+                }
+            });
+        }
+        Some(JsonValue::Null) => result.base = None,
+        _ => {}
+    }
 
     // First pass: extract @-prefixed keys
     for (key, value) in map {
         if let Some(keyword) = key.strip_prefix('@') {
             match keyword {
                 "vocab" => {
-                    result.vocab = compute_vocab(base, map, value)?;
-                }
-                "base" => {
-                    if let JsonValue::String(s) = value {
-                        result.base = Some(s.clone());
-                    } else if value.is_null() {
-                        result.base = None;
-                    }
+                    result.vocab = compute_vocab(result.base.as_deref(), value)?;
                 }
                 "language" => {
                     result.language = value.as_str().map(std::string::ToString::to_string);
@@ -355,6 +362,9 @@ fn parse_context_map(
                 }
                 "protected" => {
                     result.protected = value.as_bool();
+                }
+                "propagate" => {
+                    result.propagate = value.as_bool();
                 }
                 _ => {} // Ignore unknown @-keywords
             }

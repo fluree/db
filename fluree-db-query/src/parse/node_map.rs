@@ -1404,7 +1404,15 @@ fn parse_literal_edge_annotation(
     for k in stripped.keys() {
         let allowed = matches!(
             k.as_str(),
-            "@value" | "value" | "@type" | "type" | "@language" | "language" | "@t" | "@op"
+            "@value"
+                | "value"
+                | "@type"
+                | "type"
+                | "@language"
+                | "language"
+                | "@direction"
+                | "@t"
+                | "@op"
         );
         if !allowed {
             return Err(ParseError::InvalidWhere(format!(
@@ -1696,6 +1704,20 @@ fn parse_value_object(
     let (constant_lang, lang_var): (Option<Arc<str>>, Option<Arc<str>>) = match explicit_lang {
         Some(ref l) if is_variable(l) => (None, Some(l.clone())),
         other => (other, None),
+    };
+
+    // `@direction` joins the language tag, as a transaction stores it; with
+    // no language it is dropped there, so it is here.
+    let constant_lang = match (constant_lang, obj.get("@direction")) {
+        (lang, None | Some(JsonValue::Null)) => lang,
+        (lang, Some(JsonValue::String(d))) if d == "ltr" || d == "rtl" => {
+            lang.map(|lang| Arc::from(format!("{lang}--{d}")))
+        }
+        (_, Some(_)) => {
+            return Err(ParseError::InvalidWhere(
+                "@direction is \"ltr\" or \"rtl\"".to_string(),
+            ))
+        }
     };
 
     // Validate: a value object cannot have both a constant non-langString @type and

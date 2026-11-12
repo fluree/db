@@ -2004,7 +2004,7 @@ impl<'a> HydrationFormatter<'a> {
         wrapper.insert("@value".to_string(), current);
         if let Some(ref meta) = flake.m {
             if let Some(ref lang) = meta.lang {
-                wrapper.insert("@language".to_string(), json!(lang));
+                super::insert_language(&mut wrapper, lang);
                 return Ok(JsonValue::Object(wrapper));
             }
         }
@@ -2121,10 +2121,7 @@ impl<'a> HydrationFormatter<'a> {
         if let Some(ref meta) = flake.m {
             if let Some(ref lang) = meta.lang {
                 return match &flake.o {
-                    FlakeValue::String(s) => Ok(json!({
-                        "@value": s,
-                        "@language": lang
-                    })),
+                    FlakeValue::String(s) => Ok(super::language_tagged(json!(s), lang)),
                     FlakeValue::Null => Ok(JsonValue::Null),
                     _ => Err(FormatError::InvalidBinding(
                         "Language-tagged literals must be strings".to_string(),
@@ -2264,10 +2261,7 @@ impl<'a> HydrationFormatter<'a> {
         if let Some(ref meta) = flake.m {
             if let Some(ref lang) = meta.lang {
                 return match &flake.o {
-                    FlakeValue::String(s) => Ok(json!({
-                        "@value": s,
-                        "@language": lang
-                    })),
+                    FlakeValue::String(s) => Ok(super::language_tagged(json!(s), lang)),
                     FlakeValue::Null => Ok(JsonValue::Null),
                     _ => Err(FormatError::InvalidBinding(
                         "Language-tagged literals must be strings".to_string(),
@@ -2387,7 +2381,7 @@ impl<'a> HydrationFormatter<'a> {
 
         if want_language {
             if let Some(lang) = flake.m.as_ref().and_then(|m| m.lang.as_ref()) {
-                obj.insert("@language".to_string(), json!(lang));
+                super::insert_language(&mut obj, lang);
             }
         }
 

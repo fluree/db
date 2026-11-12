@@ -1403,7 +1403,7 @@ fn flake_to_jsonld_raw(
         }
         FlakeValue::String(s) => {
             if let Some(lang) = lang {
-                return Some(serde_json::json!({ "@value": s, "@language": lang }));
+                return Some(crate::format::language_tagged(serde_json::json!(s), lang));
             }
             match dt_iri().as_deref() {
                 None | Some(xsd::STRING) => Some(serde_json::Value::String(s.clone())),
@@ -1637,7 +1637,7 @@ fn flake_to_jsonld(
         FlakeValue::String(s) => {
             // Language-tagged string
             if let Some(lang) = store.resolve_lang_tag(o_type) {
-                return serde_json::json!({ "@value": s, "@language": lang });
+                return crate::format::language_tagged(serde_json::json!(s), lang);
             }
 
             // Resolve datatype

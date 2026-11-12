@@ -51,7 +51,9 @@ pub use dataset::Dataset;
 pub use datatype::Datatype;
 pub use graph::{Graph, Reification};
 pub use json_canonical::{canonicalize_json, canonicalize_json_value};
-pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
+pub use sink::{
+    GraphCollectorSink, GraphSink, OrderedDataset, SinkError, SinkResult, StatementPosition, TermId,
+};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;
 pub use xsd_double::{

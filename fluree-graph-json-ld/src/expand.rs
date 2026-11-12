@@ -54,7 +54,13 @@ fn match_default(
 
     default_match.and_then(|default| {
         if !iri::any_iri(compact_iri) && !compact_iri.starts_with('@') {
-            let full_iri = format!("{default}{compact_iri}");
+            // A term is `@vocab` joined to the term; a reference resolves
+            // against `@base` (RFC 3986), as Turtle's do.
+            let full_iri = if vocab {
+                format!("{default}{compact_iri}")
+            } else {
+                fluree_vocab::iri::resolve_iri(default, compact_iri)
+            };
             Some((
                 full_iri.clone(),
                 ContextEntry {
@@ -212,11 +218,14 @@ fn is_set_item(map: &Map<String, JsonValue>) -> bool {
             || (map.len() == 2 && (map.contains_key("@index") || map.contains_key("index"))))
 }
 
-/// Parse a value based on its type and context info
+/// Parse a value based on its type and context info. `context` expands the
+/// value; `nodes` is the context a node object in it starts from, without a
+/// type's scoped context that does not propagate.
 fn parse_node_value(
     value: &JsonValue,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    nodes: &ParsedContext,
     path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
@@ -319,6 +328,7 @@ fn parse_node_value(
             }
 
             let mut results = Vec::new();
+            let mut scoped_nodes = None;
             for (i, item) in arr.iter().enumerate() {
                 let item_path = path.index(i);
 
@@ -328,15 +338,25 @@ fn parse_node_value(
                     });
                 }
 
-                let expanded = if item.is_object() {
-                    let map = item.as_object().unwrap();
-                    if map.contains_key("@value") || map.contains_key("value") {
-                        parse_node_value(item, entry, context, &item_path, strict)?
-                    } else {
-                        vec![expand_node_internal(item, context, &item_path, strict)?]
+                let expanded = match item {
+                    JsonValue::Object(map)
+                        if map.contains_key("@value")
+                            || map.contains_key("value")
+                            || is_list_item(map)
+                            || is_set_item(map) =>
+                    {
+                        parse_node_value(item, entry, context, nodes, &item_path, strict)?
                     }
-                } else {
-                    parse_node_value(item, entry, context, &item_path, strict)?
+                    JsonValue::Object(_) => vec![expand_nested_node(
+                        item,
+                        entry,
+                        context,
+                        nodes,
+                        &mut scoped_nodes,
+                        &item_path,
+                        strict,
+                    )?],
+                    _ => parse_node_value(item, entry, context, nodes, &item_path, strict)?,
                 };
                 results.extend(expanded);
             }
@@ -360,7 +380,8 @@ fn parse_node_value(
             if is_list_item(map) {
                 let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
                 let list_path = path.key("@list");
-                let expanded = parse_node_value(list_val, entry, context, &list_path, strict)?;
+                let expanded =
+                    parse_node_value(list_val, entry, context, nodes, &list_path, strict)?;
                 let mut obj = Map::new();
                 obj.insert("@list".to_string(), JsonValue::Array(expanded));
                 return Ok(vec![JsonValue::Object(obj)]);
@@ -369,12 +390,12 @@ fn parse_node_value(
             // Check for @set (flatten it)
             if is_set_item(map) {
                 let set_val = map.get("@set").or_else(|| map.get("set")).unwrap();
-                return parse_node_value(set_val, entry, context, &path.key("@set"), strict);
+                return parse_node_value(set_val, entry, context, nodes, &path.key("@set"), strict);
             }
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, path, strict);
+                return parse_value_object(map, entry, context, nodes, path, strict);
             }
 
             // Check for @container: @language
@@ -442,6 +463,7 @@ fn parse_node_value(
                         item,
                         Some(&unindexed),
                         context,
+                        nodes,
                         &path.key(index),
                         strict,
                     )?);
@@ -449,22 +471,42 @@ fn parse_node_value(
                 return Ok(results);
             }
 
-            // Otherwise, expand as nested node
-            let ctx = if let Some(e) = entry {
-                if let Some(ref nested) = e.context {
-                    let mut merged = context.clone();
-                    apply_scoped_context(&mut merged, nested);
-                    Cow::Owned(merged)
-                } else {
-                    Cow::Borrowed(context)
-                }
-            } else {
-                Cow::Borrowed(context)
-            };
-
-            Ok(vec![expand_node_internal(value, &ctx, path, strict)?])
+            Ok(vec![expand_nested_node(
+                value, entry, context, nodes, &mut None, path, strict,
+            )?])
         }
     }
+}
+
+/// A node object a property holds, expanded against `nodes` with the
+/// property's scoped context applied. A lone `{"@id": …}` reference stays in
+/// `context`, as the expansion algorithm keeps it in the typed node's.
+fn expand_nested_node(
+    value: &JsonValue,
+    entry: Option<&ContextEntry>,
+    context: &ParsedContext,
+    nodes: &ParsedContext,
+    scoped_nodes: &mut Option<ParsedContext>,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<JsonValue> {
+    let with_scoped = |start: &ParsedContext, scoped: &ParsedContext| {
+        let mut merged = start.clone();
+        apply_scoped_context(&mut merged, scoped);
+        merged
+    };
+    let is_reference = value.as_object().is_some_and(|map| {
+        map.len() == 1 && map.keys().all(|k| k == "@id" || *k == context.id_key)
+    });
+    let ctx = match (entry.and_then(|e| e.context.as_deref()), is_reference) {
+        (None, true) => Cow::Borrowed(context),
+        (None, false) => Cow::Borrowed(nodes),
+        (Some(scoped), true) => Cow::Owned(with_scoped(context, scoped)),
+        (Some(scoped), false) => {
+            Cow::Borrowed(&*scoped_nodes.get_or_insert_with(|| with_scoped(nodes, scoped)))
+        }
+    };
+    expand_node_internal(value, &ctx, path, strict)
 }
 
 /// Parse a @value object
@@ -472,6 +514,7 @@ fn parse_value_object(
     map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    nodes: &ParsedContext,
     path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
@@ -511,6 +554,7 @@ fn parse_value_object(
             .map(std::string::ToString::to_string)
             .or_else(|| context.language.clone()),
     };
+    let direction = base_direction(map)?;
 
     // Build result
     let mut obj = Map::new();
@@ -527,7 +571,11 @@ fn parse_value_object(
         if let Some(t) = type_iri {
             obj.insert("@type".to_string(), json!(t));
         } else if let Some(l) = lang {
-            obj.insert("@language".to_string(), json!(l));
+            let tag = match direction {
+                Some(direction) => format!("{l}--{direction}"),
+                None => l,
+            };
+            obj.insert("@language".to_string(), json!(tag));
         }
     }
 
@@ -535,7 +583,7 @@ fn parse_value_object(
     // reifier of the triple this value completes, and expands as a node does.
     if let Some(annotation) = map.get("@annotation") {
         let expanded =
-            match expand_node_internal(annotation, context, &path.key("@annotation"), strict)? {
+            match expand_node_internal(annotation, nodes, &path.key("@annotation"), strict)? {
                 JsonValue::Array(nodes) => nodes,
                 node => vec![node],
             };
@@ -545,12 +593,28 @@ fn parse_value_object(
     Ok(vec![JsonValue::Object(obj)])
 }
 
-/// Parse @type values and return expanded types with potentially updated context
+/// A value object's `@direction`, which Fluree joins to its language tag as
+/// RDF 1.2 writes it (`ar` and `rtl` are `ar--rtl`). A string with a
+/// direction but no language is plain, as JSON-LD's RDF conversion makes it.
+fn base_direction(map: &Map<String, JsonValue>) -> Result<Option<&str>> {
+    match map.get("@direction") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(d)) if d == "ltr" || d == "rtl" => Ok(Some(d.as_str())),
+        Some(_) => Err(JsonLdError::InvalidKeywordValue {
+            keyword: "@direction",
+            reason: "a base direction is \"ltr\" or \"rtl\"",
+        }),
+    }
+}
+
+/// Parse @type values and return expanded types with potentially updated
+/// context, and whether the types' scoped contexts reach the node objects
+/// nested in the node: only one marked `"@propagate": true` does.
 fn parse_type<'c>(
     node_map: &Map<String, JsonValue>,
     context: &'c ParsedContext,
     strict: bool,
-) -> Result<(Vec<String>, Cow<'c, ParsedContext>)> {
+) -> Result<(Vec<String>, Cow<'c, ParsedContext>, bool)> {
     let type_key = &context.type_key;
     let type_id = context.get(type_key).and_then(|e| e.id.clone());
 
@@ -582,17 +646,19 @@ fn parse_type<'c>(
             _ => vec![],
         };
 
+        let mut propagates = true;
         for orig_t in original_types {
             if let Some(entry) = context.get(orig_t) {
                 if let Some(ref sub_ctx) = entry.context {
                     apply_scoped_context(updated_context.to_mut(), sub_ctx);
+                    propagates &= sub_ctx.propagate == Some(true);
                 }
             }
         }
 
-        Ok((types, updated_context))
+        Ok((types, updated_context, propagates))
     } else {
-        Ok((vec![], Cow::Borrowed(context)))
+        Ok((vec![], Cow::Borrowed(context), true))
     }
 }
 
@@ -753,7 +819,7 @@ fn expand_node_internal(
             };
 
             // Parse @type and get updated context
-            let (types, context_with_types) = parse_type(map, &merged_context, strict)?;
+            let (types, context_with_types, propagates) = parse_type(map, &merged_context, strict)?;
 
             // Build result
             let mut result = Map::new();
@@ -768,6 +834,11 @@ fn expand_node_internal(
             let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
             let keys = NodeKeys {
                 context: &context_with_types,
+                nodes: if propagates {
+                    &context_with_types
+                } else {
+                    &merged_context
+                },
                 type_key: &type_key,
                 type_id: type_id.as_deref(),
                 strict,
@@ -784,6 +855,9 @@ fn expand_node_internal(
 /// What a node object's entries expand against.
 struct NodeKeys<'a> {
     context: &'a ParsedContext,
+    /// The context a node object nested in this node starts from: `context`
+    /// without a type's scoped context that does not propagate.
+    nodes: &'a ParsedContext,
     /// The `@type` key and its alias, handled by [`parse_type`].
     type_key: &'a str,
     type_id: Option<&'a str>,
@@ -829,7 +903,7 @@ fn expand_node_entries(
                     reason: "a nested value cannot carry `@graph`",
                 });
             }
-            let graph_expanded = expand_node_internal(v, context, &key_path, strict)?;
+            let graph_expanded = expand_node_internal(v, keys.nodes, &key_path, strict)?;
             result.insert("@graph".to_string(), graph_expanded);
             continue;
         }
@@ -854,7 +928,7 @@ fn expand_node_entries(
                 JsonValue::Object(_) => {
                     result.insert(
                         "@id".to_string(),
-                        expand_node_internal(v, context, &key_path, strict)?,
+                        expand_node_internal(v, keys.nodes, &key_path, strict)?,
                     );
                 }
                 _ => {}
@@ -878,7 +952,9 @@ fn expand_node_entries(
                     reason: "the value must be a map of reverse properties",
                 });
             }
-            if let JsonValue::Object(props) = expand_node_internal(v, context, &key_path, strict)? {
+            if let JsonValue::Object(props) =
+                expand_node_internal(v, keys.nodes, &key_path, strict)?
+            {
                 for (property, values) in props {
                     if property.starts_with('@') {
                         return Err(JsonLdError::InvalidKeywordValue {
@@ -897,7 +973,8 @@ fn expand_node_entries(
         }
 
         // Expand value
-        let expanded_values = parse_node_value(v, entry.as_ref(), context, &key_path, strict)?;
+        let expanded_values =
+            parse_node_value(v, entry.as_ref(), context, keys.nodes, &key_path, strict)?;
 
         // A key whose values expand to nothing is dropped — EXCEPT
         // `@list`: `{"@list": []}` is a value, the empty list, which
@@ -958,7 +1035,7 @@ fn expand_nest_value(
                 })
             }
         };
-        let (types, _) = parse_type(nested, keys.context, keys.strict)?;
+        let (types, _, _) = parse_type(nested, keys.context, keys.strict)?;
         if !types.is_empty() {
             let slot = result
                 .entry("@type".to_string())
@@ -1695,6 +1772,177 @@ mod tests {
             matches!(err, JsonLdError::InvalidGraphValue { .. }),
             "{err}"
         );
+    }
+
+    /// A relative `@id` resolves against `@base` per RFC 3986, as Turtle's
+    /// do; a relative `@base` or `@vocab` resolves against the base in effect.
+    #[test]
+    fn relative_references_resolve_against_base_per_rfc_3986() {
+        let id = |context: JsonValue, reference: &str| {
+            let doc = json!({"@context": context, "@id": reference, "http://example.org/p": 1});
+            crate::expand(&doc).unwrap()["@id"].clone()
+        };
+        let cases = [
+            ("http://b.org/x/y", "../b", "http://b.org/b"),
+            ("http://b.org/doc", "a", "http://b.org/a"),
+            ("http://b.org/dir/", "a", "http://b.org/dir/a"),
+            ("http://b.org/ns#", "#a", "http://b.org/ns#a"),
+            ("http://b.org/doc?q=1", "#f", "http://b.org/doc?q=1#f"),
+        ];
+        for (base, reference, resolved) in cases {
+            assert_eq!(
+                id(json!({"@base": base}), reference),
+                resolved,
+                "{reference} against {base}"
+            );
+        }
+
+        let nested = json!([{"@base": "http://b.org/x/"}, {"@base": "../y/"}]);
+        assert_eq!(id(nested, "a"), "http://b.org/y/a");
+
+        let vocab =
+            ParsedContext::parse(None, &json!({"@base": "http://b.org/doc", "@vocab": "ns/"}))
+                .unwrap();
+        assert_eq!(vocab.vocab.as_deref(), Some("http://b.org/ns/"));
+    }
+
+    /// A type's scoped context applies to the typed node's own properties,
+    /// not to the node objects nested in it, unless it is marked
+    /// `"@propagate": true`.
+    #[test]
+    fn type_scoped_context_stops_at_nested_nodes() {
+        let doc = |propagate: Option<bool>| {
+            let mut scoped = json!({"name": "http://scoped.org/name"});
+            if let Some(propagate) = propagate {
+                scoped["@propagate"] = json!(propagate);
+            }
+            json!({
+                "@context": {
+                    "@vocab": "http://vocab.org/",
+                    "T": {"@id": "http://vocab.org/T", "@context": scoped}
+                },
+                "@id": "http://ex.org/s",
+                "@type": "T",
+                "name": "own",
+                "child": {"@id": "http://ex.org/c", "name": "nested"},
+                "children": [{"@id": "http://ex.org/d", "name": "in an array"}]
+            })
+        };
+
+        let expanded = crate::expand(&doc(None)).unwrap();
+        assert_eq!(expanded["http://scoped.org/name"][0]["@value"], "own");
+        for property in ["http://vocab.org/child", "http://vocab.org/children"] {
+            let nested = &expanded[property][0];
+            assert!(nested.get("http://vocab.org/name").is_some(), "{expanded}");
+        }
+
+        let propagated = crate::expand(&doc(Some(true))).unwrap();
+        for property in ["http://vocab.org/child", "http://vocab.org/children"] {
+            let nested = &propagated[property][0];
+            assert!(
+                nested.get("http://scoped.org/name").is_some(),
+                "{propagated}"
+            );
+        }
+    }
+
+    /// A value object's `@direction` joins its language tag (`ar--rtl`), the
+    /// form RDF 1.2 and Fluree hold it in; with no language it is dropped,
+    /// and a direction other than `ltr` or `rtl` is refused.
+    #[test]
+    fn direction_joins_the_language_tag() {
+        let value = |object: JsonValue, context: JsonValue| {
+            let doc =
+                json!({"@context": context, "@id": "http://ex.org/s", "http://ex.org/p": object});
+            crate::expand(&doc).map(|expanded| expanded["http://ex.org/p"][0].clone())
+        };
+        assert_eq!(
+            value(
+                json!({"@value": "v", "@language": "ar", "@direction": "rtl"}),
+                json!({})
+            )
+            .unwrap(),
+            json!({"@value": "v", "@language": "ar--rtl"})
+        );
+        assert_eq!(
+            value(
+                json!({"@value": "v", "@language": "en", "@direction": "ltr"}),
+                json!({})
+            )
+            .unwrap(),
+            json!({"@value": "v", "@language": "en--ltr"})
+        );
+        assert_eq!(
+            value(json!({"@value": "v", "@direction": "rtl"}), json!({})).unwrap(),
+            json!({"@value": "v"})
+        );
+        assert!(value(
+            json!({"@value": "v", "@language": "ar", "@direction": "up"}),
+            json!({})
+        )
+        .is_err());
+    }
+
+    /// A type's scoped context stops at the nodes in a list an array holds
+    /// and in an `@reverse` map too, and the list's nodes still take their
+    /// property's scoped context.
+    #[test]
+    fn type_scoped_context_stops_inside_array_lists_and_reverse() {
+        let expanded = crate::expand(&json!({
+            "@context": {
+                "@vocab": "http://vocab.org/",
+                "T": {"@id": "http://vocab.org/T", "@context": {"name": "http://scoped.org/name"}},
+                "q": {"@id": "http://vocab.org/q", "@context": {"label": "http://q.org/label"}}
+            },
+            "@id": "http://ex.org/s",
+            "@type": "T",
+            "p": [{"@list": [{"@id": "http://ex.org/a", "name": "in a list"}]}],
+            "q": [{"@list": [{"@id": "http://ex.org/b", "label": "scoped by q"}]}],
+            "@reverse": {"r": {"@id": "http://ex.org/c", "name": "reversed"}}
+        }))
+        .unwrap();
+
+        let listed = &expanded["http://vocab.org/p"][0]["@list"][0];
+        assert!(listed.get("http://vocab.org/name").is_some(), "{expanded}");
+        let scoped = &expanded["http://vocab.org/q"][0]["@list"][0];
+        assert!(scoped.get("http://q.org/label").is_some(), "{expanded}");
+        let reversed = &expanded["@reverse"]["http://vocab.org/r"][0];
+        assert!(
+            reversed.get("http://vocab.org/name").is_some(),
+            "{expanded}"
+        );
+    }
+
+    /// A relative `@base` needs a base to resolve against; with none it is
+    /// refused rather than kept as a base with no scheme.
+    #[test]
+    fn relative_base_without_a_base_is_refused() {
+        let err = crate::expand(&json!({
+            "@context": {"@base": "foo/"},
+            "@id": "a",
+            "http://example.org/p": 1
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("@base \"foo/\" is relative"),
+            "{err}"
+        );
+    }
+
+    /// A property's scoped context applies to every node object it holds,
+    /// one alone or each in an array.
+    #[test]
+    fn property_scoped_context_reaches_each_node_in_an_array() {
+        let ctx = json!({
+            "@vocab": "http://vocab.org/",
+            "p": {"@id": "http://vocab.org/p", "@context": {"name": "http://scoped.org/name"}}
+        });
+        for value in [json!({"name": "a"}), json!([{"name": "a"}, {"name": "b"}])] {
+            let expanded = crate::expand(&json!({"@context": ctx, "p": value})).unwrap();
+            for node in expanded["http://vocab.org/p"].as_array().unwrap() {
+                assert!(node.get("http://scoped.org/name").is_some(), "{expanded}");
+            }
+        }
     }
 
     const EX: &str = "http://example.org/";

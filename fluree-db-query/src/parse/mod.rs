@@ -2108,6 +2108,29 @@ mod tests {
         );
     }
 
+    /// A value object's `@direction` joins its language tag, as a
+    /// transaction stores it.
+    #[test]
+    fn direction_joins_the_language_tag_in_where() {
+        let json = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:p": {"@value": "v", "@language": "ar", "@direction": "rtl"}}
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(
+                &pattern.dtc,
+                Some(fluree_vocab::UnresolvedDatatypeConstraint::LangTag(tag)) if tag.as_ref() == "ar--rtl"
+            ),
+            "{:?}",
+            pattern.dtc
+        );
+    }
+
     #[test]
     fn test_where_array_format() {
         let json = json!({

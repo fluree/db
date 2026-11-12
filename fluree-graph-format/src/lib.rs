@@ -33,7 +33,13 @@ mod policy;
 mod prefix;
 mod rdf_text;
 
-pub use jsonld::{format_jsonld, format_jsonld_dataset, JsonLdFormatConfig, LiteralAsNode};
+pub use jsonld::{
+    format_jsonld, format_jsonld_dataset, format_jsonld_dataset_ordered, JsonLdFormatConfig,
+    LiteralAsNode,
+};
 pub use policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 pub use prefix::PrefixMap;
-pub use rdf_text::{format_nquads, format_ntriples, format_trig, format_turtle, InvalidLangTag};
+pub use rdf_text::{
+    format_nquads, format_nquads_ordered, format_nt_term, format_ntriples, format_trig,
+    format_trig_ordered, format_turtle, InvalidLangTag,
+};

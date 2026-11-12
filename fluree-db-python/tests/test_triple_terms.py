@@ -9,7 +9,7 @@ import fluree
 from fluree import IRI, BlankNode, LangString, Triple
 
 EX = "http://example.org/"
-REIFIES = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies"
+REIFIES = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies")
 PREFIXES = f"PREFIX ex: <{EX}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> "
 
 CLAIMS = f"""

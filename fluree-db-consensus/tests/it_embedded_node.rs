@@ -722,8 +722,14 @@ async fn a_retry_that_joins_a_queued_entry_releases_its_own_envelope() {
         idempotency_key: Some(IdempotencyKey::new(key).unwrap()),
         ..bulk_request_round(ledger_id, 1, round)
     };
+    // The ledger's data sits under its incarnation's `@<id>` directory.
     let envelopes = || {
-        std::fs::read_dir(dirs.1.path().join("embedded/joined/main/txn"))
+        let incarnation = std::fs::read_dir(dirs.1.path().join("embedded/joined"))
+            .expect("ledger dir")
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .expect("incarnation dir");
+        std::fs::read_dir(incarnation.join("main/txn"))
             .expect("txn dir")
             .filter(|file| {
                 let bytes = std::fs::read(file.as_ref().unwrap().path()).unwrap();

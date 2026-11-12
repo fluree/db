@@ -5,8 +5,8 @@ from fluree import Change, IRI
 
 EX = "http://example.org/"
 CONTEXT = {"ex": EX}
-NAME = EX + "name"
-AGE = EX + "age"
+NAME = IRI(EX + "name")
+AGE = IRI(EX + "age")
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ def test_connection_query_spans_ledgers(conn):
         f"PREFIX ex: <{EX}> SELECT ?s ?n FROM <a:main> FROM <b:main> WHERE {{ ?s ex:n ?n }} ORDER BY ?n"
     )
     assert rows.columns == ["s", "n"]
-    assert [(r.s, r.n) for r in rows] == [(EX + "x", 1), (EX + "y", 2)]
+    assert [(r.s, r.n) for r in rows] == [(IRI(EX + "x"), 1), (IRI(EX + "y"), 2)]
     jsonld = conn.query({"@context": CONTEXT, "from": ["a:main", "b:main"], "select": "?n",
                          "where": {"@id": "?s", "ex:n": "?n"}, "orderBy": "?n"})
     assert jsonld == [1, 2]
@@ -118,9 +118,9 @@ def test_changes_resolve_refs_and_blank_nodes(conn):
     ledger = conn.create("refs")
     ledger.insert(f"@prefix ex: <{EX}> . ex:a ex:knows ex:b ; ex:owns [ ex:n 1 ] .")
     changes = ledger.changes(1)
-    knows = next(c for c in changes if c.predicate == EX + "knows")
+    knows = next(c for c in changes if c.predicate == IRI(EX + "knows"))
     assert knows.value == IRI(EX + "b") and isinstance(knows.value, IRI)
-    owned = next(c for c in changes if c.predicate == EX + "owns").value
+    owned = next(c for c in changes if c.predicate == IRI(EX + "owns")).value
     assert isinstance(owned, fluree.BlankNode)
     assert any(c.subject == owned and c.value == 1 for c in changes)
 
