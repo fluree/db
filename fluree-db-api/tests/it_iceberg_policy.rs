@@ -1550,33 +1550,66 @@ async fn a_governed_source_in_a_dataset_keeps_its_own_policy() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// A governed graph source named by `GRAPH` inside a query over one ledger
-/// keeps its own view policy.
+/// A graph source is read through a graph scope only as a named graph of the
+/// query's dataset. A query over one ledger that names one in a graph scope,
+/// or gives it to the scope's graph variable, without naming it in
+/// `from-named` / `FROM NAMED` does not read it, governed or not: JSON-LD
+/// refuses with a 400 that names the source and the remedy, and SPARQL, whose
+/// `FROM` builds a dataset with no such named graph, answers no rows.
 #[tokio::test]
-async fn a_governed_source_named_by_graph_keeps_its_own_policy() {
+async fn a_source_named_by_graph_outside_the_dataset_is_not_read() {
     let fluree = setup().await;
+    let mut sources = graph_governed_sources(&fluree).await;
+    sources.extend(virtual_sources(GS));
+    let pattern = json!({ "@id": "?s", "ex:name": "?n" });
     let mut wrong = Vec::new();
-    for source in graph_governed_sources(&fluree).await {
-        let q = json!({
-            "@context": context(),
-            "from": NATIVE,
-            "select": ["?s", "?n"],
-            "where": [["graph", source, { "@id": "?s", "ex:name": "?n" }]],
-        });
-        let got = fluree
-            .query_from()
-            .jsonld(&q)
-            .execute_formatted()
-            .await
-            .map_err(|e| e.to_string());
-        wrong.extend(
-            graph_scope_disagreements(
-                &fluree,
-                source,
-                vec![("JSON-LD from + graph".to_string(), got, None)],
-            )
-            .await,
+    for source in sources {
+        let remedy = format!(
+            "Name it in from-named (SPARQL: FROM NAMED <{source}>) and use GRAPH \
+             <{source}> or VALUES ?g {{ <{source}> }}"
         );
+        let jsonld = [
+            (
+                "JSON-LD from + graph",
+                json!([["graph", source, pattern.clone()]]),
+            ),
+            (
+                "JSON-LD from + values ?g + graph ?g",
+                json!([
+                    ["values", ["?g", [source]]],
+                    ["graph", "?g", pattern.clone()]
+                ]),
+            ),
+        ];
+        for (label, wh) in jsonld {
+            let q = json!({
+                "@context": context(), "from": NATIVE, "select": ["?s", "?n"], "where": wh,
+            });
+            match fluree.query_from().jsonld(&q).execute_formatted().await {
+                Err(e) if e.status_code() == 400 && e.to_string().contains(&remedy) => {}
+                Err(e) => wrong.push(format!("{source} {label}: {} {e}", e.status_code())),
+                Ok(v) => wrong.push(format!("{source} {label}: answered {v}")),
+            }
+        }
+        let sparql = [
+            (
+                "SPARQL FROM + GRAPH",
+                format!("GRAPH <{source}> {{ ?s <http://example.org/name> ?n }}"),
+            ),
+            (
+                "SPARQL FROM + VALUES ?g + GRAPH ?g",
+                format!(
+                    "VALUES ?g {{ <{source}> }} GRAPH ?g {{ ?s <http://example.org/name> ?n }}"
+                ),
+            ),
+        ];
+        for (label, body) in sparql {
+            let q = format!("SELECT ?s ?n FROM <{NATIVE}> WHERE {{ {body} }}");
+            match fluree.query_from().sparql(&q).execute_formatted().await {
+                Ok(v) if result_len(&v) == 0 => {}
+                other => wrong.push(format!("{source} {label}: {other:?}")),
+            }
+        }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
@@ -1649,11 +1682,10 @@ async fn direct_rows(fluree: &fluree_db_api::Fluree, source: &str, opts: &Option
 }
 
 /// `?s ex:name ?n` reaching `source` through a graph scope from the native
-/// ledger, in each shape that names it: JSON-LD with `from-named`, JSON-LD
-/// over one ledger with the name in the graph pattern, JSON-LD binding a graph
-/// variable with `values`, and SPARQL with `FROM NAMED` (its options as
-/// connection options). Each answers as many rows as the source queried
-/// directly with the same options does.
+/// ledger, with the source a named graph of the dataset: JSON-LD naming it in
+/// the graph pattern, JSON-LD binding a graph variable with `values`, and
+/// SPARQL with `FROM NAMED` (its options as connection options). Each answers
+/// as many rows as the source queried directly with the same options does.
 async fn graph_scope_rows_match_direct(
     fluree: &fluree_db_api::Fluree,
     source: &str,
@@ -1668,12 +1700,8 @@ async fn graph_scope_rows_match_direct(
                     "where": [["graph", source, pattern.clone()]] }),
         ),
         (
-            "JSON-LD from + graph",
-            json!({ "from": NATIVE, "where": [["graph", source, pattern.clone()]] }),
-        ),
-        (
-            "JSON-LD from + values ?g + graph ?g",
-            json!({ "from": NATIVE, "where": [
+            "JSON-LD from + from-named + values ?g + graph ?g",
+            json!({ "from": NATIVE, "from-named": [source], "where": [
                 ["values", ["?g", [source]]],
                 ["graph", "?g", pattern.clone()]
             ] }),
@@ -1711,11 +1739,11 @@ async fn graph_scope_rows_match_direct(
     wrong
 }
 
-/// A graph variable bound through `values` to a source's name reads the
-/// source with its own policy: a governed one as it answers directly, an
-/// ungoverned one wholly, as on the single-ledger path before.
+/// A source named in the dataset is read through a graph scope with its own
+/// policy, by name or through a graph variable bound with `values`: a governed
+/// one as it answers directly, an ungoverned one wholly.
 #[tokio::test]
-async fn a_graph_variable_bound_by_values_reads_the_source_under_its_own_policy() {
+async fn a_source_in_the_dataset_is_read_through_a_graph_scope_under_its_own_policy() {
     let fluree = setup().await;
     let mut sources: Vec<String> = graph_governed_sources(&fluree)
         .await
@@ -1784,26 +1812,6 @@ async fn a_graph_variable_bound_from_data_is_refused_with_the_remedy() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// A query over one ledger naming an ungoverned graph source in a graph
-/// pattern answers as the source queried directly does, as before.
-#[tokio::test]
-async fn an_ungoverned_source_named_by_graph_answers_as_before() {
-    let fluree = setup().await;
-    let q = json!({
-        "@context": context(),
-        "from": NATIVE,
-        "select": ["?s", "?n"],
-        "where": [["graph", GS, { "@id": "?s", "ex:name": "?n" }]],
-    });
-    let got = fluree
-        .query_from()
-        .jsonld(&q)
-        .execute_formatted()
-        .await
-        .expect("ungoverned graph scope");
-    assert_eq!(result_len(&got), 5, "{got}");
-}
-
 /// An ungoverned source in a graph scope beside a native default graph under a
 /// request policy keeps every row the request leaves it, as a direct query
 /// with the same options does: the request's policy governs it, nothing else.
@@ -1823,7 +1831,7 @@ async fn an_ungoverned_source_beside_a_governed_default_graph_keeps_its_rows() {
 }
 
 /// A root caller reads a governed source through a graph scope unfiltered, as
-/// a direct query with the root policy does.
+/// a direct query with the root policy does, where the dataset names it.
 #[tokio::test]
 async fn a_root_caller_reads_a_governed_source_unfiltered_through_a_graph_scope() {
     use fluree_db_api::{PolicyContext, PolicyWrapper};
@@ -1857,7 +1865,9 @@ async fn a_root_caller_reads_a_governed_source_unfiltered_through_a_graph_scope(
                                 "select": ["?s", "?n"],
                                 "where": [["graph", source, pattern.clone()]] }))
         .await;
-        if direct != Ok(5) || named != direct || graph != direct {
+        // Outside the dataset the source is not read, whoever asks.
+        let refused = matches!(&graph, Err(e) if e.contains("Name it in from-named"));
+        if direct != Ok(5) || named != direct || !refused {
             wrong.push(format!(
                 "{source}: direct {direct:?}, from-named {named:?}, graph {graph:?}"
             ));

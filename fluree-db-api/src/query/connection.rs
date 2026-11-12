@@ -32,65 +32,6 @@ pub(crate) enum FormatTarget {
 }
 
 impl Fluree {
-    /// [`connection_dataset_spec`], with the graph sources the query names by
-    /// IRI in a `graph` pattern added as named graphs when it reads one ledger
-    /// ([`Self::route_graph_scoped_sources`]).
-    async fn routed_connection_dataset_spec(
-        &self,
-        query_json: &JsonValue,
-        options: &QueryExecutionOptions,
-    ) -> Result<(DatasetSpec, GovernanceOptions)> {
-        let (mut spec, qc_opts) = connection_dataset_spec(query_json, options)?;
-        self.route_graph_scoped_sources(&mut spec, query_json)
-            .await?;
-        Ok((spec, qc_opts))
-    }
-
-    /// A JSON-LD query over one ledger that names a graph source by IRI in a
-    /// `graph` pattern, anywhere in the query, or as a `values` / `bind`
-    /// constant of a variable a `graph` pattern reads, reads that source as a
-    /// named graph of a dataset. A graph scope then reads the source with its own
-    /// view policy (the request's, and the source's model), as a query naming
-    /// it in `from-named` does, instead of under the ledger's. A name that is
-    /// not a graph source (a graph of the ledger, a variable) is left as is,
-    /// so such a query answers as before.
-    pub(crate) async fn route_graph_scoped_sources(
-        &self,
-        spec: &mut DatasetSpec,
-        query_json: &JsonValue,
-    ) -> Result<()> {
-        if spec.default_graphs.len() != 1
-            || !spec.named_graphs.is_empty()
-            || spec.history_range.is_some()
-        {
-            return Ok(());
-        }
-        let mut names: Vec<String> = Vec::new();
-        collect_graph_pattern_names(query_json, &mut names);
-        for name in names {
-            if spec.default_graphs[0].identifier == name
-                || spec.named_graphs.iter().any(|g| g.identifier == name)
-            {
-                continue;
-            }
-            let Ok(id) = fluree_db_core::LedgerId::parse(&name) else {
-                continue;
-            };
-            let is_source = self
-                .nameservice()
-                .lookup_graph_source(id.as_str())
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))?
-                .is_some_and(|record| !record.retracted);
-            if is_source {
-                let source = crate::dataset::GraphSource::parse(&name)
-                    .map_err(|e| ApiError::invalid_query(e.to_string()))?;
-                spec.named_graphs.push(source);
-            }
-        }
-        Ok(())
-    }
-
     async fn prepare_single_view_for_connection(
         &self,
         spec: &DatasetSpec,
@@ -187,9 +128,7 @@ impl Fluree {
         query_json: &JsonValue,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
@@ -228,9 +167,7 @@ impl Fluree {
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
         options: QueryExecutionOptions,
     ) -> Result<(QueryResult, FormatTarget)> {
-        let (spec, qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
@@ -300,9 +237,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
@@ -386,9 +321,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -455,9 +388,7 @@ impl Fluree {
         policy: &PolicyContext,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, _qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await?;
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
@@ -489,9 +420,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, _qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await?;
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
@@ -541,9 +470,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -606,9 +533,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, _qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -671,9 +596,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, _qc_opts) = self
-            .routed_connection_dataset_spec(query_json, &options)
-            .await
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -1254,108 +1177,4 @@ fn apply_policy_to_dataset(mut dataset: DataSetDb, policy: &PolicyContext) -> Da
         .collect();
 
     dataset
-}
-
-/// The names a JSON-LD query can give a graph scope, at any depth (nested
-/// groups, `optional`, `union`, `exists`, sub-selects): each non-variable name
-/// of a `graph` pattern (`["graph", <name>, …]`), and each constant a `values`
-/// block or a `bind` gives a variable some `graph` pattern reads as its graph
-/// (`["graph", "?g", …]`).
-fn collect_graph_pattern_names(query: &JsonValue, out: &mut Vec<String>) {
-    let mut graph_vars: Vec<String> = Vec::new();
-    walk_graph_patterns(query, out, &mut graph_vars);
-    if !graph_vars.is_empty() {
-        walk_graph_constants(query, &graph_vars, out);
-    }
-}
-
-fn walk_graph_patterns(value: &JsonValue, names: &mut Vec<String>, vars: &mut Vec<String>) {
-    match value {
-        JsonValue::Array(items) => {
-            if let [JsonValue::String(kw), JsonValue::String(name), ..] = items.as_slice() {
-                if kw == "graph" {
-                    let into = if name.starts_with('?') {
-                        &mut *vars
-                    } else {
-                        &mut *names
-                    };
-                    if !into.contains(name) {
-                        into.push(name.clone());
-                    }
-                }
-            }
-            for item in items {
-                walk_graph_patterns(item, names, vars);
-            }
-        }
-        JsonValue::Object(map) => {
-            for v in map.values() {
-                walk_graph_patterns(v, names, vars);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The constants `values` blocks and `bind`s give the graph variables `vars`.
-fn walk_graph_constants(value: &JsonValue, vars: &[String], out: &mut Vec<String>) {
-    match value {
-        JsonValue::Array(items) => {
-            match items.as_slice() {
-                [JsonValue::String(kw), JsonValue::String(var), bound]
-                    if kw == "bind" && vars.contains(var) =>
-                {
-                    push_constant(bound, out);
-                }
-                [JsonValue::String(kw), JsonValue::Array(block)] if kw == "values" => {
-                    match block.as_slice() {
-                        // ["values", ["?g", [v1, v2, …]]]
-                        [JsonValue::String(var), JsonValue::Array(rows)] if vars.contains(var) => {
-                            for v in rows {
-                                push_constant(v, out);
-                            }
-                        }
-                        // ["values", [["?a", "?g"], [[a1, g1], …]]]
-                        [JsonValue::Array(header), JsonValue::Array(rows)] => {
-                            for (i, h) in header.iter().enumerate() {
-                                if h.as_str().is_some_and(|h| vars.iter().any(|v| v == h)) {
-                                    for row in rows {
-                                        if let Some(v) = row.get(i) {
-                                            push_constant(v, out);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-            for item in items {
-                walk_graph_constants(item, vars, out);
-            }
-        }
-        JsonValue::Object(map) => {
-            for v in map.values() {
-                walk_graph_constants(v, vars, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// A string or `{"@id": …}` constant, as a graph name.
-fn push_constant(value: &JsonValue, out: &mut Vec<String>) {
-    let name = match value {
-        JsonValue::String(s) if !s.starts_with('?') => s.as_str(),
-        JsonValue::Object(map) => match map.get("@id").and_then(JsonValue::as_str) {
-            Some(id) => id,
-            None => return,
-        },
-        _ => return,
-    };
-    if !out.iter().any(|n| n == name) {
-        out.push(name.to_string());
-    }
 }
