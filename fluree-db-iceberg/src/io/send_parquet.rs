@@ -16,6 +16,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -324,6 +325,79 @@ impl<S: SendIcebergStorage + 'static> SendIcebergStorage for LocalFileStorage<S>
 
     async fn file_size(&self, _path: &str) -> Result<u64> {
         Ok(self.size)
+    }
+}
+
+/// The storage a large file's decode reads through. It refuses every read once
+/// the async read that started the decode is dropped.
+///
+/// A large file decodes on blocking threads (see
+/// [`SendParquetReader::decode_large_file`]), and dropping or aborting the
+/// future that awaits them doesn't stop them. They went on fetching and
+/// decoding the rest of the file for a scan that no longer wanted it: a scan
+/// whose consumer had its rows (a LIMIT), a cancelled query, or the sibling
+/// slices of a row-group-parallel decode one of which failed. Each read checks
+/// first, so such a decode ends at its next fetch, with an error no one reads.
+#[derive(Debug)]
+struct AbandonableStorage<S: SendIcebergStorage> {
+    inner: Arc<S>,
+    abandoned: Arc<AtomicBool>,
+}
+
+/// Marks an [`AbandonableStorage`] abandoned when dropped.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl<S: SendIcebergStorage> AbandonableStorage<S> {
+    /// `inner`, refusing reads once the returned guard is dropped.
+    fn wrap(inner: Arc<S>) -> (Arc<Self>, AbandonOnDrop) {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let guard = AbandonOnDrop(Arc::clone(&abandoned));
+        (Arc::new(Self { inner, abandoned }), guard)
+    }
+
+    fn refuse_if_abandoned(&self, path: &str) -> Result<()> {
+        if self.abandoned.load(Ordering::Acquire) {
+            return Err(IcebergError::storage(format!(
+                "read of {path} abandoned: the scan that wanted it was dropped"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<S: SendIcebergStorage + 'static> SendIcebergStorage for AbandonableStorage<S> {
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        self.refuse_if_abandoned(path)?;
+        self.inner.read(path).await
+    }
+
+    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        self.refuse_if_abandoned(path)?;
+        self.inner.read_range(path, range).await
+    }
+
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        self.refuse_if_abandoned(path)?;
+        self.inner.read_ranges(path, ranges).await
+    }
+
+    async fn file_size(&self, path: &str) -> Result<u64> {
+        self.inner.file_size(path).await
+    }
+
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list_dir(prefix).await
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list_files(prefix).await
     }
 }
 
@@ -807,6 +881,12 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         max_rows: Option<usize>,
         rowgroup_concurrency: usize,
     ) -> Result<Vec<ColumnBatch>> {
+        // Every blocking decode below reads through this storage. Dropping this
+        // future (its scan was dropped, or a sibling slice failed and returned
+        // early) drops the guard, and those decodes stop at their next fetch
+        // instead of reading the rest of the file.
+        let (storage, _abandon_on_drop) = AbandonableStorage::wrap(storage);
+
         // T2.3: decode this file's row groups across up to `rowgroup_concurrency`
         // blocking tasks (each a contiguous slice of the row groups) when the scan
         // granted concurrency > 1 — a single-file table otherwise decodes on ONE
@@ -2092,6 +2172,120 @@ mod tests {
         assert!(
             sampled[0].column_by_id(1).is_none(),
             "name column not projected"
+        );
+    }
+
+    /// A store that counts the ranges it is asked for and holds each one until
+    /// the test lets it through.
+    #[derive(Debug)]
+    struct MeteredSource {
+        bytes: Bytes,
+        gate: Arc<tokio::sync::Semaphore>,
+        range_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for MeteredSource {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            panic!("a large file is read by range");
+        }
+
+        async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
+            self.range_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.acquire().await.expect("gate open").forget();
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    /// Four int64 columns of 64 KiB pages, about 38 MB: a decode of it through
+    /// the range-backed reader takes many fetches.
+    fn many_page_parquet() -> Bytes {
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        const ROWS: i64 = 1_200_000;
+        let fields: Vec<Field> = (1..=4)
+            .map(|id| {
+                Field::new(format!("c{id}"), DataType::Int64, false).with_metadata(HashMap::from([
+                    ("PARQUET:field_id".to_owned(), id.to_string()),
+                ]))
+            })
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let columns: Vec<ArrayRef> = (1..=4i64)
+            .map(|k| {
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS).map(move |i| i.wrapping_mul(2_654_435_761 + k)),
+                )) as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(64 * 1024)
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    /// A large file decodes on a blocking thread, which aborting the read does
+    /// not stop. It used to go on fetching and decoding the rest of the file
+    /// after its scan was gone; now its next fetch is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_large_file_read_stops_fetching() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let bytes = many_page_parquet();
+        let file_size = bytes.len() as u64;
+        assert!(file_size > 4 * 8 * MIB, "file is {file_size} bytes");
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        let range_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(MeteredSource {
+            bytes,
+            gate: Arc::clone(&gate),
+            range_reads: Arc::clone(&range_reads),
+        });
+
+        let read = tokio::spawn(
+            SendParquetReader::<'static, MeteredSource>::decode_large_file(
+                source,
+                "mem://big.parquet".to_string(),
+                file_size,
+                vec![1, 2, 3, 4],
+                None,
+                None,
+                Handle::current(),
+                None,
+                1,
+            ),
+        );
+        // Two fetches go through; the third waits at the gate.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while range_reads.load(SeqCst) < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the decode reaches its third fetch");
+
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        gate.add_permits(1 << 20);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            range_reads.load(SeqCst),
+            3,
+            "the decode fetched more after its read was dropped"
         );
     }
 }

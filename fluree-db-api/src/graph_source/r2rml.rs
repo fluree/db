@@ -8,6 +8,7 @@
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::R2rmlCreateConfig;
+use crate::graph_source::file_read::read_in_own_task;
 use crate::graph_source::iceberg_catalog::storage_query_error;
 use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
 use crate::graph_source::storage::{plan_storage, CatalogGrant, StoragePlan};
@@ -2103,20 +2104,15 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .map(move |task| {
                 let storage = Arc::clone(&storage);
                 let footers = Arc::clone(&footers);
-                async move {
-                    tokio::spawn(async move {
-                        let reader =
-                            SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
-                        reader.read_task(&task).await.map_err(|e| {
-                            QueryError::Internal(format!(
-                                "Failed to read Parquet file '{}': {e}",
-                                task.data_file.file_path
-                            ))
-                        })
+                read_in_own_task(move || async move {
+                    let reader = SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                    reader.read_task(&task).await.map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read Parquet file '{}': {e}",
+                            task.data_file.file_path
+                        ))
                     })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
-                }
+                })
             })
             .buffer_unordered(concurrency)
             // One file's `Result<Vec<ColumnBatch>>` becomes individual
@@ -4710,53 +4706,48 @@ impl FlureeR2rmlProvider<'_> {
                 // Parallel fallback tail (same bounded-parallel read as the normal
                 // path). The bound still holds; we just stop paying sequentiality.
                 let concurrency = iceberg_scan_concurrency(tail.len());
-                let tail_stream =
-                    futures::stream::iter(tail)
-                        .map(move |task| {
-                            let storage = Arc::clone(&storage);
-                            let footers = Arc::clone(&footers);
-                            let disk_cache = Arc::clone(&disk_cache);
-                            let cache_dir = cache_dir.clone();
-                            let scope = scope.clone();
-                            let read_span = tracing::debug_span!(
-                                "iceberg.parquet_read",
-                                path = %task.data_file.file_path,
-                                file_size = task.data_file.file_size_in_bytes,
+                let tail_stream = futures::stream::iter(tail)
+                    .map(move |task| {
+                        let storage = Arc::clone(&storage);
+                        let footers = Arc::clone(&footers);
+                        let disk_cache = Arc::clone(&disk_cache);
+                        let cache_dir = cache_dir.clone();
+                        let scope = scope.clone();
+                        let read_span = tracing::debug_span!(
+                            "iceberg.parquet_read",
+                            path = %task.data_file.file_path,
+                            file_size = task.data_file.file_size_in_bytes,
+                        );
+                        read_in_own_task(move || async move {
+                            let reader = SendParquetReader::with_caches(
+                                storage.as_ref(),
+                                footers.as_ref(),
+                                &disk_cache,
+                                &cache_dir,
+                                &scope,
                             );
-                            async move {
-                                tokio::spawn(async move {
-                                    let reader = SendParquetReader::with_caches(
-                                        storage.as_ref(),
-                                        footers.as_ref(),
-                                        &disk_cache,
-                                        &cache_dir,
-                                        &scope,
-                                    );
-                                    reader.read_task(&task).instrument(read_span).await.map_err(
-                                        |e| {
-                                            storage_query_error(
-                                                &format!(
-                                                    "Failed to read Parquet file '{}'",
-                                                    task.data_file.file_path
-                                                ),
-                                                e,
-                                            )
-                                        },
-                                    )
-                                })
+                            reader
+                                .read_task(&task)
+                                .instrument(read_span)
                                 .await
                                 .map_err(|e| {
-                                    QueryError::Internal(format!("Parquet read worker failed: {e}"))
-                                })?
-                            }
+                                    storage_query_error(
+                                        &format!(
+                                            "Failed to read Parquet file '{}'",
+                                            task.data_file.file_path
+                                        ),
+                                        e,
+                                    )
+                                })
                         })
-                        .buffer_unordered(concurrency)
-                        .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                            Ok(batches) => futures::stream::iter(
-                                batches.into_iter().map(Ok).collect::<Vec<_>>(),
-                            ),
-                            Err(e) => futures::stream::iter(vec![Err(e)]),
-                        });
+                    })
+                    .buffer_unordered(concurrency)
+                    .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+                        Ok(batches) => {
+                            futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
+                        }
+                        Err(e) => futures::stream::iter(vec![Err(e)]),
+                    });
                 return Ok(Box::pin(prefix.chain(tail_stream)));
             }
         }
@@ -4795,33 +4786,29 @@ impl FlureeR2rmlProvider<'_> {
                     path = %task.data_file.file_path,
                     file_size = task.data_file.file_size_in_bytes,
                 );
-                async move {
-                    tokio::spawn(async move {
-                        let reader = SendParquetReader::with_caches(
-                            storage.as_ref(),
-                            footers.as_ref(),
-                            &disk_cache,
-                            &cache_dir,
-                            &scope,
-                        )
-                        .with_rowgroup_concurrency(rowgroup_concurrency);
-                        reader
-                            .read_task(&task)
-                            .instrument(read_span)
-                            .await
-                            .map_err(|e| {
-                                storage_query_error(
-                                    &format!(
-                                        "Failed to read Parquet file '{}'",
-                                        task.data_file.file_path
-                                    ),
-                                    e,
-                                )
-                            })
-                    })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
-                }
+                read_in_own_task(move || async move {
+                    let reader = SendParquetReader::with_caches(
+                        storage.as_ref(),
+                        footers.as_ref(),
+                        &disk_cache,
+                        &cache_dir,
+                        &scope,
+                    )
+                    .with_rowgroup_concurrency(rowgroup_concurrency);
+                    reader
+                        .read_task(&task)
+                        .instrument(read_span)
+                        .await
+                        .map_err(|e| {
+                            storage_query_error(
+                                &format!(
+                                    "Failed to read Parquet file '{}'",
+                                    task.data_file.file_path
+                                ),
+                                e,
+                            )
+                        })
+                })
             })
             .buffer_unordered(concurrency)
             // Flatten each file's `Result<Vec<ColumnBatch>>` into individual
