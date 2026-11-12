@@ -16,6 +16,8 @@ Fluree implements the W3C RDF 1.1 specification:
 - Blank nodes
 - RDF datasets
 
+**Deviation (ill-typed literals):** RDF 1.1 admits a literal whose lexical form is not in its datatype's lexical space, such as `"xyz"^^xsd:integer`, as a literal that denotes no value. Fluree stores typed values rather than lexical forms, so every transaction refuses one. Bulk import keeps one as text under its datatype. See [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype).
+
 **Specification:** https://www.w3.org/TR/rdf11-concepts/
 
 ### RDF 1.2
@@ -598,6 +600,18 @@ an optional field on the terminal `end` record). It is additive and present
 only when a non-root policy context governed the request, so clients that
 ignore unknown fields are unaffected. See
 [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
+
+#### Every transaction refuses an ill-typed literal (breaking)
+
+A typed literal whose lexical form is not in its datatype's lexical space, such as `"landed"^^xsd:integer` or `"300"^^xsd:byte`, is now refused by every transaction with the error `INSERT DATA` and the JSON-LD insert already gave ("Cannot parse 'landed' as integer"), and nothing is committed. These used to store it as text under its datatype:
+
+- an update that builds one at run time (`STRDT`, `STRDT(CONCAT(..))`, JSON-LD `str-dt`), and an `INSERT … WHERE` that copies one a ledger holds;
+- Turtle, TriG and N-Triples insert and upsert, the TriG insert fallback, graph insert and graph sync;
+- a JSON-LD value object typed `@json` (or `rdf:JSON`) whose string `@value` is not JSON.
+
+Bulk import (`fluree create --from`, `fluree graph import`) still keeps such a literal as text under its datatype, so data that carries one can be loaded as written that way. A ledger that holds an ill-typed literal keeps it, reads it back with its datatype, and can delete it through a variable ([Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)).
+
+JSON-LD results (a select and a graph crawl) print such a stored literal with its `@type`: `{"@value": "landed", "@type": "xsd:integer"}`. Under a datatype JSON-LD infers from a JSON number or boolean (`xsd:integer`, `xsd:double`, `xsd:boolean`, …) it used to print as a bare string, which reads back as an `xsd:string`.
 
 #### Bulk import stored wrong `rdf:JSON` and `xsd:duration` values (data integrity)
 

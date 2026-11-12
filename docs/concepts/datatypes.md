@@ -458,12 +458,25 @@ Numeric types (long, double, bigint, decimal) are mutually comparable via automa
 ### Text That Is Not a Value of Its Datatype
 
 A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
-built-in datatype but is not one of its values. JSON-LD transactions and
-SPARQL UPDATE reject it wherever it is written as a constant, in a DELETE as
-in an INSERT or a WHERE, naming the datatype in the error. Turtle
-transactions and bulk import keep it, as RDF allows: the literal is stored with
-its text and its datatype and reads back exactly as written, but it is not a
-date or a number, so it never equals one.
+built-in datatype but is not one of its values. Every transaction refuses it,
+naming the datatype in the error ("Cannot parse '2024-02-30' as xsd:date"),
+and commits nothing:
+
+- JSON-LD transactions and SPARQL UPDATE, wherever it is written as a
+  constant, in a DELETE as in an INSERT or a WHERE;
+- an update that builds one at run time (`STRDT`, JSON-LD `str-dt`), or that
+  copies one a ledger holds (`INSERT … WHERE`);
+- Turtle, TriG and N-Triples transactions, insert and upsert, graph insert
+  and graph sync.
+
+Bulk import (`fluree create --from`, `fluree graph import`) keeps it, as RDF
+allows, so a dataset from elsewhere loads in one pass: the literal is stored
+with its text and its datatype and reads back exactly as written, with its
+datatype (in JSON-LD results, `{"@value": "300", "@type": "xsd:byte"}`), but
+it is not a date or a number, so it never equals one. An `rdf:JSON` literal
+that is not JSON is kept as written too, but a query that returns it fails
+with "Invalid JSON in @json value". An `f:embeddingVector` literal that is
+not a vector fails the import, as it fails a transaction.
 
 To remove a stored one, bind it through a variable, or replace the
 property's values with an [upsert](../transactions/upsert.md) or a
