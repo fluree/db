@@ -72,7 +72,7 @@ fluree graph import <IRI> --from <PATH> [OPTIONS]
 | `--from <PATH>` | File or directory to import. |
 | `-l, --ledger <LEDGER>` | Ledger identifier (e.g. `mydb` or `mydb:feature-x`). Defaults to the active ledger. |
 | `--remote <REMOTE>` | Run the import on a remote server by remote name. `--from` must be a single file. |
-| `--memory-budget-mb`, `--parallelism`, `--chunk-size-mb`, `--skolem-namespace`, `--leaflet-rows`, `--leaflets-per-leaf` | Bulk-import tuning, as for [`fluree create --from`](create.md). |
+| `--memory-budget-mb`, `--parallelism`, `--chunk-size-mb`, `--skolem-namespace` | Bulk-import tuning, as for [`fluree create --from`](create.md). |
 | `--edge-properties`, `--base-iri` | CSV/Cypher conversion, as for [`fluree create --from`](create.md#property-graph-imports-csv--cypher). |
 
 **Description:**
@@ -87,9 +87,9 @@ fluree graph import <IRI> --from <PATH> [OPTIONS]
 
 The source holds default-graph data: Turtle, N-Triples, JSON-LD, or JSONL/NDJSON files (optionally `.gz`/`.zst`), or CSV / Cypher inputs, as a single file or a directory. TriG, N-Quads, and JSON-LD that names graphs of its own are refused, since their statements belong to other graphs. Blank nodes are minted from the ledger id and the graph IRI unless `--skolem-namespace` is given, so importing one file into two graphs gives each its own blank nodes.
 
-If the source holds statement annotations (RDF 1.2 / `f:reifies`), the ledger's annotation index is set aside: annotation queries stay correct but read by scan until [`fluree reindex`](reindex.md) seals it again. The CLI prints a note when this happens.
+Statement annotations and triple terms import with the graph: RDF 1.2 annotations (`{| … |}`, `<< … >>`, `~ reifier`), triple terms as values (`<<( s p o )>>`, nested ones included), JSON-LD `@annotation` / `@reifies`, and CSV / Cypher edge properties under `--edge-properties annotated`. They read at full speed once the import publishes. A triple the ledger already reifies or names keeps its term, so an annotation in the new graph and one in the default graph are annotations of the same triple, and a query over both graphs finds both.
 
-A graph the ledger dropped can be imported into again; it starts empty, under the IRI and `g_id` it had. The following are refused with nothing written: a graph the ledger already has, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, and the source formats above.
+A graph the ledger dropped can be imported into again; it starts empty, under the IRI and `g_id` it had. The following are refused with nothing written: a graph the ledger already has, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, and the source formats above. A ledger whose index holds annotations from before they were stored as `rdf:reifies` links takes plain data but refuses annotations and triple terms, once the source is read; run [`fluree reindex`](reindex.md) first.
 
 **If an import fails.** Until its last step an import publishes nothing, so a failure leaves the ledger as it was, including when another writer moved the ledger's head during the import. The last step publishes the import's commits and then its index. If the index does not publish, because publishing it fails or the process stops in between, the import is in the ledger all the same: the error says it is published through `t=…`, and queries see the graph, read from the import's commits until an index covers them. Every load of the ledger reads those commits into memory until then, so after a large import run [`fluree reindex`](reindex.md). The log records each import's commit head and index root (`publishing graph import`) before it publishes them.
 

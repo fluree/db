@@ -377,6 +377,107 @@ async fn cross_ledger_sh_class_value_set_resolved_against_model_ledger() {
     );
 }
 
+/// With shapes from a model ledger, the data ledger's own
+/// `f:additionalDataSource` graphs are still read with the validated graph:
+/// the states are typed in a graph of D, not in M.
+#[tokio::test]
+async fn cross_ledger_shapes_read_local_additional_data_sources() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-shapes/membership-model:main";
+    let model = genesis_ledger(&fluree, model_id).await;
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:PersonShape rdf:type sh:NodeShape ;
+                               sh:targetClass ex:Person ;
+                               sh:property ex:pshape_state .
+                ex:pshape_state sh:path ex:homeState ;
+                                sh:class ex:USState .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M shapes");
+
+    let data_id = "test/cross-ledger-shapes/membership-data:main";
+    let data = genesis_ledger(&fluree, data_id).await;
+    let config_iri = config_graph_iri(data_id);
+    let data = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <http://example.org/states> {{
+                ex:illinois rdf:type ex:USState .
+            }}
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+                <urn:cfg:shacl> f:additionalDataSource <urn:cfg:states-ref> .
+                <urn:cfg:states-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:states-src> .
+                <urn:cfg:states-src> f:graphSelector <http://example.org/states> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger SHACL config with a local data source")
+        .ledger;
+
+    let data = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:homeState": {"@id": "ex:illinois"}
+            }),
+        )
+        .await
+        .expect("a state typed in D's states graph satisfies M's sh:class")
+        .ledger;
+
+    let err = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:bob",
+                "@type": "ex:Person",
+                "ex:homeState": {"@id": "ex:narnia"}
+            }),
+        )
+        .await
+        .expect_err("a state typed nowhere is not a member");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "expected a SHACL violation, got: {err:?}"
+    );
+}
+
 /// Cross-ledger RDFS entailment for enforcement: the class hierarchy lives
 /// in model ledger M (`f:reasoningDefaults` / `f:schemaSource` with
 /// `f:ledger`), while the shape lives locally in D. A Manager-typed record

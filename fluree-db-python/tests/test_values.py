@@ -118,8 +118,10 @@ def test_language_strings_compare_consistently():
     en, fr = LangString("hi", "en"), LangString("hi", "fr")
     assert en != fr and not en == fr
     assert en == LangString("hi", "EN") and not en != LangString("hi", "EN")
-    assert en == "hi" and not en != "hi"
-    assert hash(en) == hash(fr) == hash("hi")  # equal values hash alike
+    assert hash(en) == hash(LangString("hi", "EN"))  # equal values hash alike
+    # A tagged string is not the plain string with its text, either way round.
+    assert en != "hi" and not en == "hi" and "hi" != en
+    assert len({en, fr, "hi"}) == 3
 
 
 def test_records_and_results_pickle(ledger):

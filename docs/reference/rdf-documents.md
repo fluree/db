@@ -46,6 +46,15 @@ The Rust `RdfFormat` also accepts common aliases such as `ttl`, `n-quads` and
   uses. Every parsed document can therefore be written in any format. A JSON-LD
   label that starts with `-`, which no other syntax allows, gets one more `-`:
   `_:-b1` is read as `--b1`.
+- **Order:** statements come in the order the document writes them
+  (`rdf::parse_document` in Rust; `fluree.parse` in Python). A TriG or
+  N-Quads document's graphs interleave as written, an annotation stands where
+  it is written, and a JSON-LD node's statement comes before those of the node
+  nested in it, with a list's cells where the list is.
+- **Prefixes:** the prefixes a Turtle or TriG document declares are kept, in
+  order (`Document::prefixes`; in Python, the `prefixes` of the list
+  `fluree.parse` returns).
+- **Text:** Python also takes UTF-8 `bytes`, such as a request body.
 - **Errors:** a malformed document raises an error naming its line and column.
 - **Memory:** a document is read whole, and parsing holds the text, the parsed
   dataset and, in Python, every `Quad` at once: roughly ten times the
@@ -109,6 +118,15 @@ object is a triple term into a reification.
   Writing a named graph in either is an error; use TriG, N-Quads or JSON-LD.
 - **Prefixes:** Turtle and TriG declare the prefixes you pass and shorten IRIs
   with them. JSON-LD uses them as its `@context` and compacts IRIs with them.
+- **Order:** `rdf::serialize_ordered` (and `fluree.serialize`) writes the
+  graphs in the order given, the default graph among them, and in Turtle and
+  TriG gathers each subject's statements under one subject, with `;` and `,`,
+  subjects in the order they first appear. `rdf::serialize` writes the default
+  graph first and the named graphs by name.
+- **Expanded JSON-LD:** `rdf::serialize_expanded_jsonld` (in Python,
+  `fluree.serialize(quads, "jsonld", expanded=True)`) writes the
+  `json-ld#expanded` profile: an array of node objects with full IRIs, no
+  context, and every value in an array.
 - **Reifications:** when the triple is asserted, the reification is written as
   an annotation where the syntax has one (`~` in Turtle and TriG,
   `@annotation` in JSON-LD). Otherwise it is written as `rdf:reifies` or
@@ -131,11 +149,46 @@ object is a triple term into a reification.
 - **An IRI left relative after expansion is an error.** This is usually a
   property with no `@context` entry. JSON-LD processors usually drop such a
   property without telling you; Fluree's reader names it instead.
-- **`@direction` is not read.** Write the base direction in `@language`
-  (`"ar--rtl"`), as the writer does.
+- **`@direction` is read from a value object only.** It joins the language
+  tag (`ar` and `rtl` read as `"…"@ar--rtl`), and the writer gives it back as
+  `@language` and `@direction`. A default `@direction` in a `@context` is not
+  read, and a direction with no language is dropped.
 - **A JSON number can lose its declared datatype in Rust.** A number typed
   anything but `xsd:integer` or `xsd:double`, such as
   `{"@value": 5, "@type": "xsd:long"}`, is written back by `rdf::serialize`
   as a bare `5`, which reads as `xsd:integer`. From Python,
   `literals="lexical"` keeps the datatype.
 - **No framing:** output is compacted only with the prefixes you pass.
+
+## Canonicalization
+
+`rdf::canonicalize` (in Python, `fluree.canonicalize(quads)`) applies
+[RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0).
+It labels a dataset's blank nodes `_:c14n0`, `_:c14n1`, … from its
+statements alone, drops duplicate statements, and writes canonical N-Quads
+with the lines in code point order. Two datasets that hold the same
+statements give the same text, whatever their blank node labels and
+statement order, so the text can be compared, hashed or signed.
+
+- **Hash:** SHA-256 by default; SHA-384 on request.
+- **Poison graphs:** some datasets have blank nodes that no statement tells
+  apart, and canonicalizing them can take time exponential in their size.
+  Such a dataset is refused once it needs more deep comparisons (calls to the
+  algorithm's Hash N-Degree Quads step) than its limit: by default 16 per
+  blank node, at least 1,024. `CanonicalizeOptions::max_deep_calls` (in
+  Python, `max_deep_calls=`) sets the limit; lower it for input from an
+  untrusted source.
+- **Literals:** a literal is written with the spelling and datatype it has in
+  the dataset. In Python, parse with `literals="lexical"` to keep them: by
+  default a literal becomes its Python value, and `"01"^^xsd:long` and
+  `"1"^^xsd:integer` then canonicalize alike.
+- **RDF 1.2:** RDFC-1.0 defines RDF 1.1 datasets. A triple term is written
+  `<<( s p o )>>`, as N-Quads 1.2 writes it, and its blank nodes are labeled
+  with the quad's.
+- **When it runs:** only when called. Reading, writing and transactions never
+  canonicalize.
+
+The implementation passes the W3C RDFC-1.0 test suite, its SHA-384,
+identifier-map and poison-graph tests included: all 86 tests of the suite
+run in CI.
+

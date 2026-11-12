@@ -713,6 +713,23 @@ pub async fn resolve_incremental_commits_v6(
     };
     let t_remap_fulltext_ms = t0.elapsed().as_millis() as u64;
 
+    // 8b. Remap spatial hook entries' chunk-local subject ids.
+    if let Some(ref mut spatial) = shared.spatial_hook {
+        spatial.retain_mut(|entry| {
+            let local_s = entry.subject_id as usize;
+            match reconcile.subject_remap.get(local_s) {
+                Some(&global_s) => {
+                    entry.subject_id = global_s;
+                    true
+                }
+                None => {
+                    tracing::warn!(local_s, "spatial entry subject_id remap miss; skipping");
+                    false
+                }
+            }
+        });
+    }
+
     // 9. Remap all V1 records in-place, then convert to V2.
     let t0 = Instant::now();
     let mut v1_records = chunk.records;
@@ -874,17 +891,7 @@ pub async fn resolve_incremental_commits_v6(
                 "V6 incremental resolve: links replayed"
             );
         }
-        let new_terms: Vec<(u32, u32, Vec<u8>)> = builder
-            .entries_sorted()
-            .into_iter()
-            .map(|(h, key)| {
-                (
-                    fluree_db_core::triple_term::term_handle_p_id(h),
-                    fluree_db_core::triple_term::term_handle_seq(h),
-                    key.to_be_bytes().to_vec(),
-                )
-            })
-            .collect();
+        let new_terms = builder.new_term_entries();
         let mut wms: std::collections::BTreeMap<u32, u32> = base_wms.into_iter().collect();
         for (p_id, wm) in builder.watermarks() {
             wms.insert(p_id, wm);

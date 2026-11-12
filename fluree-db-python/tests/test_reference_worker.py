@@ -136,7 +136,7 @@ def test_retained_extractions_are_reused_until_the_text_changes(ledger):
     assert model.calls == []
     # Only the generation record changed.
     changed = {c.subject for c in ledger.changes(again.t)}
-    assert changed == {f"{EXTRACTIONS}#generation"}
+    assert changed == {fluree.IRI(f"{EXTRACTIONS}#generation")}
 
     ledger.update(
         P + 'DELETE { ex:doc1b ex:text ?t } INSERT { ex:doc1b ex:text "Invoice from Acme for 900.00" } '
@@ -252,7 +252,7 @@ def test_an_empty_result_still_publishes_a_generation(ledger):
     record = generation(ledger, DECISIONS)
     assert (record["generation"], record["outputCount"]) == (2, 0)
     assert empty.output_hash == worker.output_hash([])
-    assert DECISIONS in ledger.graphs()
+    assert fluree.IRI(DECISIONS) in ledger.graphs()
     assert outcomes(ledger.at(t=first.t)) == V1
 
 
@@ -312,7 +312,7 @@ def test_native_rules_can_read_a_published_graph(ledger):
         },
     })
     rows = ledger.query("# PRAGMA reasoning: datalog\n" + P + "SELECT ?c WHERE { ?c a ex:NeedsAnalyst } ORDER BY ?c")
-    assert [c for (c,) in rows] == [EX + "case4", EX + "case5"]
+    assert [c for (c,) in rows] == [fluree.IRI(EX + "case4"), fluree.IRI(EX + "case5")]
 
 
 def setup_step(page):

@@ -286,8 +286,7 @@ fn write_lit(
             out.push_str(r#"{"@value":"#);
             push_json_string(out, s);
             if let Some(lang) = dtc.lang_tag() {
-                out.push_str(r#","@language":"#);
-                push_json_string(out, lang);
+                super::push_language(out, lang);
             } else {
                 out.push_str(r#","@type":"#);
                 push_json_string(out, &dt_iri);
@@ -409,10 +408,7 @@ pub(crate) fn format_binding(
                 FlakeValue::String(s) => {
                     if let Some(lang_tag) = dtc.lang_tag() {
                         // Language-tagged string - use @language instead of @type
-                        Ok(json!({
-                            "@value": s,
-                            "@language": lang_tag
-                        }))
+                        Ok(super::language_tagged(json!(s), lang_tag))
                     } else {
                         Ok(json!({
                             "@value": s,

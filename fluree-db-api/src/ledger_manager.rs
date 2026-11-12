@@ -296,6 +296,11 @@ struct LedgerHandleInner {
     /// path holds it alone until it installs that head, so queries go on
     /// reading `state` meanwhile ([`LedgerHandle::exclude_writers`]).
     writer: Arc<tokio::sync::Mutex<()>>,
+    /// Held by [`LedgerManager::notify`] from its plan to its last apply, so a
+    /// reader behind the head watermark waits for the catch-up in flight
+    /// rather than starting another ([`LedgerManager::get_or_load`]). Taken
+    /// before `state`, and never while holding `entries`.
+    catch_up: tokio::sync::Mutex<()>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: LedgerId,
     /// Last access time (monotonic secs since process start)
@@ -472,6 +477,7 @@ impl LedgerHandle {
             inner: Arc::new(LedgerHandleInner {
                 state: Arc::new(RwLock::new(state)),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
+                catch_up: tokio::sync::Mutex::new(()),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
@@ -759,6 +765,11 @@ impl LedgerHandle {
     /// Get ledger ID
     pub fn id(&self) -> &LedgerId {
         &self.inner.ledger_id
+    }
+
+    /// Whether `other` is a handle on this same cached state.
+    fn is_same(&self, other: &LedgerHandle) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Check if currently locked (for eviction - skip if in use)
@@ -1075,6 +1086,16 @@ enum LoadState {
     },
 }
 
+/// A leader's error as its waiters get it. `ApiError` isn't `Clone`, so
+/// waiters share an `ApiError::Http` carrying its status and message; the
+/// leader itself returns the original error.
+fn shared_load_error(shared: Arc<ApiError>) -> ApiError {
+    match shared.as_ref() {
+        ApiError::Http { status, message } => ApiError::http(*status, message),
+        other => ApiError::http(other.status_code(), other.to_string()),
+    }
+}
+
 // ============================================================================
 // LoadingLeaderGuard - cancellation safety for single-flight loads
 // ============================================================================
@@ -1092,9 +1113,10 @@ enum LoadState {
 ///
 /// On drop-before-publish this guard reclaims the orphaned slot. Removing the
 /// entry drops the queued waiter `oneshot` senders, so parked waiters receive
-/// `RecvError` (surfaced as `ApiError::internal("load cancelled")`) and the
-/// next caller re-elects a fresh leader. The leader calls [`Self::disarm`]
-/// once it has published (success or error), making normal completion a no-op.
+/// `RecvError` and go round again: one leads a fresh load and the rest join it.
+/// A waiter's own request is still live, so it never fails for its leader's
+/// cancellation. The leader calls [`Self::disarm`] once it has published
+/// (success or error), making normal completion a no-op.
 struct LoadingLeaderGuard {
     entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
     alias: LedgerId,
@@ -1152,9 +1174,9 @@ impl Drop for LoadingLeaderGuard {
 /// permanently stalls future `reload`s and `current_t` for that ledger.
 ///
 /// On drop-before-publish this guard evicts its own orphaned slot (generation
-/// match), dropping the waiter senders so parked reloaders get `RecvError`
-/// (surfaced as `ApiError::internal("reload cancelled")`). Eviction is safe —
-/// the next query cold-loads the ledger fresh — and avoids re-inserting after a
+/// match), dropping the waiter senders so parked reloaders get `RecvError`;
+/// they find nothing left to reload and return. Eviction is safe — the next
+/// query cold-loads the ledger fresh — and avoids re-inserting after a
 /// concurrent `disconnect`/shutdown. The leader calls [`Self::disarm`] once it
 /// has published.
 struct ReloadLeaderGuard {
@@ -1530,7 +1552,7 @@ pub struct LedgerManager {
     /// Highest commit `t` reported per alias by head-advancing
     /// components outside this manager's own load/commit pipeline
     /// (see [`Self::note_head_advance`]). [`Self::get_or_load`]
-    /// treats a cached handle behind its alias's watermark as stale.
+    /// brings a cached handle behind its alias's watermark up to it.
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
@@ -1646,8 +1668,10 @@ impl LedgerManager {
     /// that advance heads outside that pipeline (a raft state
     /// machine applying replicated commits) call it synchronously
     /// at each advance, upholding the invariant that whoever moves
-    /// a head keeps this cache coherent. Cache hits behind the
-    /// watermark reload; the reload cost stays on the read path.
+    /// a head keeps this cache coherent. A read that finds its cached
+    /// handle behind the watermark brings it up by the commits it
+    /// lacks, or waits for the catch-up already doing so; that cost
+    /// stays on the read path.
     pub fn note_head_advance(&self, ledger_id: &LedgerId, commit_t: i64) {
         let mut watermarks = self
             .head_watermarks
@@ -1705,24 +1729,36 @@ impl LedgerManager {
         &self.config
     }
 
-    /// Compare the cached handle's `t` against the alias's head
-    /// watermark ([`Self::note_head_advance`]) and report whether
-    /// the cache is behind.
-    ///
-    /// A pure in-memory comparison — no nameservice involvement, so
-    /// it costs the same under every nameservice implementation. An
-    /// alias with no watermark is never stale: its heads only move
-    /// through this manager's own pipeline, which keeps the cache
-    /// coherent by construction.
-    async fn cached_handle_is_stale(&self, handle: &LedgerHandle) -> bool {
-        let cached_t = handle.t().await;
-        let watermark = self
-            .head_watermarks
-            .read()
-            .expect("head watermark lock never poisoned: no panics inside critical section")
-            .get(handle.id())
-            .copied();
-        matches!(watermark, Some(w) if w > cached_t)
+    /// Whether `handle` holds every commit up to `target`, the head
+    /// watermark ([`Self::note_head_advance`]) a read found when it
+    /// arrived. Without one the alias's heads move only through this
+    /// manager's own pipeline, which keeps the cache coherent by
+    /// construction.
+    async fn holds(handle: &LedgerHandle, target: Option<i64>) -> bool {
+        match target {
+            Some(target) => handle.t().await >= target,
+            None => true,
+        }
+    }
+
+    /// Bring `handle` up to `target` ([`Self::holds`]) by the commits it
+    /// lacks, through the same plan as [`Self::notify`], or wait for the
+    /// catch-up already in flight on it. `false` when the handle is still
+    /// behind afterwards: it was evicted, or the record was behind `target`.
+    async fn catch_up(&self, handle: &LedgerHandle, target: Option<i64>) -> Result<bool> {
+        if Self::holds(handle, target).await {
+            return Ok(true);
+        }
+        let _in_flight = handle.inner.catch_up.lock().await;
+        if Self::holds(handle, target).await {
+            return Ok(true);
+        }
+        let notify = NsNotify {
+            ledger_id: handle.id().clone(),
+            record: None,
+        };
+        let result = self.notify_handle(handle.clone(), notify).await?;
+        Ok(result != NotifyResult::Evicted && Self::holds(handle, target).await)
     }
 
     /// Return a read-only `LedgerView` for a currently-loaded ledger
@@ -1779,91 +1815,135 @@ impl LedgerManager {
         // Normalize ledger_id to canonical form for consistent cache keys
         // This ensures "mydb" and "mydb:main" use the same cache entry
         let canonical_alias = ledger_id.clone();
+        // The head this node had applied when the request arrived. Commits
+        // applied after it are not waited for, so a reader never chases
+        // a head that steady writes keep moving.
+        let target = self.head_watermark(&canonical_alias);
 
-        // Fast path: already loaded
-        {
-            let entries = self.entries.read().await;
-            if let Some(LoadState::Ready(handle)) = entries.get(&canonical_alias) {
-                let handle = handle.clone();
+        // A pass returns, or ends with this caller leading a load. It repeats
+        // when the load this caller joined ended without a result — its
+        // leader was cancelled or its entry evicted. This caller's request is
+        // still live, so it joins or leads the next load. It also repeats
+        // when another caller's load published a handle: that load sampled
+        // its head when it began, so the handle is checked against the
+        // target like any cached one.
+        let generation = loop {
+            // Fast path: already loaded
+            {
+                let entries = self.entries.read().await;
+                let cached = match entries.get(&canonical_alias) {
+                    // A reload in flight serves the state it replaces.
+                    Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
+                        Some(handle.clone())
+                    }
+                    Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                        return Err(ApiError::http(error.status_code(), error.to_string()));
+                    }
+                    _ => None,
+                };
                 drop(entries);
-                if !self.cached_handle_is_stale(&handle).await {
-                    return Ok(handle);
-                }
-                // Stale: fall through to the load path, which will
-                // re-fetch from nameservice + backend.
-                self.entries.write().await.remove(&canonical_alias);
-            } else if let Some(LoadState::Reloading { handle, .. }) = entries.get(&canonical_alias)
-            {
-                // Handle is valid even during reload
-                return Ok(handle.clone());
-            } else if let Some(LoadState::Failed { error, retry_at }) =
-                entries.get(&canonical_alias)
-            {
-                if Instant::now() < *retry_at {
-                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                if let Some(handle) = cached {
+                    match self.catch_up(&handle, target).await {
+                        Ok(true) => return Ok(handle),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::debug!(alias = %canonical_alias, %error, "ledger.catch_up.failed");
+                        }
+                    }
+                    // Still behind: evict it and fall through to the load
+                    // path — if it is still the entry. The catch-up waited on
+                    // the handle's locks, and meanwhile another caller may
+                    // have evicted it and begun a load or reload, whose
+                    // waiters a removal would cancel, or published a newer
+                    // handle.
+                    let mut entries = self.entries.write().await;
+                    if matches!(
+                        entries.get(&canonical_alias),
+                        Some(LoadState::Ready(cached)) if cached.is_same(&handle)
+                    ) {
+                        entries.remove(&canonical_alias);
+                    }
                 }
             }
-        }
 
-        // Slow path: need to coordinate loading
-        let (rx, generation) = {
-            let mut entries = self.entries.write().await;
+            // Slow path: need to coordinate loading
+            enum Wait {
+                Load(oneshot::Receiver<std::result::Result<LedgerHandle, Arc<ApiError>>>),
+                Reload(oneshot::Receiver<std::result::Result<(), Arc<ApiError>>>),
+            }
+            let wait = {
+                let mut entries = self.entries.write().await;
 
-            match entries.get_mut(&canonical_alias) {
-                Some(LoadState::Ready(handle)) => {
-                    // Another task loaded while we waited for write lock
-                    return Ok(handle.clone());
+                match entries.get_mut(&canonical_alias) {
+                    // Another task loaded while we waited for the write lock.
+                    Some(LoadState::Ready(_)) => continue,
+                    Some(LoadState::Reloading { waiters, .. }) => {
+                        // The handle this pass found was behind its target,
+                        // and a reload is bringing it up: wait for that
+                        // rather than serve the state it replaces.
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        Wait::Reload(rx)
+                    }
+                    Some(LoadState::Loading { waiters, .. }) => {
+                        // Someone else is loading - add ourselves as waiter
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        Wait::Load(rx)
+                    }
+                    Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                        return Err(ApiError::http(error.status_code(), error.to_string()));
+                    }
+                    // A failure whose window has passed loads again.
+                    Some(LoadState::Failed { .. }) | None => {
+                        // We're first - mark as loading (with a fresh generation),
+                        // release lock, do I/O.
+                        let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
+                        entries.insert(
+                            canonical_alias.clone(),
+                            LoadState::Loading {
+                                generation,
+                                waiters: Vec::new(),
+                            },
+                        );
+                        break generation;
+                    }
                 }
-                Some(LoadState::Reloading { handle, .. }) => {
-                    // Handle is valid even during reload
-                    return Ok(handle.clone());
+            };
+            // Manager lock released here
+
+            match wait {
+                Wait::Load(rx) => {
+                    // Phase instrumentation (debug!): a waiter parked here with
+                    // no matching leader publish is the orphaned-Loading signature.
+                    tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
+                    match rx.await {
+                        Ok(published) => {
+                            let handle = published.map_err(shared_load_error)?;
+                            if Self::holds(&handle, target).await {
+                                return Ok(handle);
+                            }
+                        }
+                        Err(_) if self.is_shutdown() => {
+                            return Err(ApiError::internal("load cancelled"));
+                        }
+                        Err(_) => {
+                            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.rejoin");
+                        }
+                    }
                 }
-                Some(LoadState::Loading { waiters, .. }) => {
-                    // Someone else is loading - add ourselves as waiter
-                    let (tx, rx) = oneshot::channel();
-                    waiters.push(tx);
-                    (Some(rx), 0)
-                }
-                Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
-                    return Err(ApiError::http(error.status_code(), error.to_string()));
-                }
-                // A failure whose window has passed loads again.
-                Some(LoadState::Failed { .. }) | None => {
-                    // We're first - mark as loading (with a fresh generation),
-                    // release lock, do I/O.
-                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
-                    entries.insert(
-                        canonical_alias.clone(),
-                        LoadState::Loading {
-                            generation,
-                            waiters: Vec::new(),
-                        },
-                    );
-                    (None, generation)
-                }
+                // Reloaded, the handle is checked against the target again.
+                Wait::Reload(rx) => match rx.await {
+                    Ok(reloaded) => reloaded.map_err(shared_load_error)?,
+                    Err(_) if self.is_shutdown() => {
+                        return Err(ApiError::internal("reload cancelled"));
+                    }
+                    Err(_) => {
+                        tracing::debug!(alias = %canonical_alias, "ledger.reload.waiter.rejoin");
+                    }
+                },
             }
         };
-        // Manager lock released here
-
-        if let Some(rx) = rx {
-            // Phase instrumentation (debug!): a waiter parked here with
-            // no matching leader publish is the orphaned-Loading signature.
-            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
-            // Wait for the loader to finish
-            // Note: Waiters receive an Http error (preserving status code) since
-            // ApiError isn't Clone. The leader (first caller) gets the full error type.
-            return rx
-                .await
-                .map_err(|_| ApiError::internal("load cancelled"))?
-                .map_err(|arc_err| {
-                    // The Arc contains an ApiError::Http - extract status and message
-                    match arc_err.as_ref() {
-                        ApiError::Http { status, message } => ApiError::http(*status, message),
-                        // Fallback for any other error type (shouldn't happen)
-                        other => ApiError::http(other.status_code(), other.to_string()),
-                    }
-                });
-        }
 
         // We're the loader. Arm a guard over the `Loading` slot: if this
         // leader future is cancelled before it publishes (HTTP handler dropped
@@ -2055,8 +2135,9 @@ impl LedgerManager {
 
     /// Remove ledger from cache
     ///
-    /// Note: If loading/reloading is in progress, waiters will receive
-    /// cancellation errors. This is acceptable - disconnect is a "force evict."
+    /// A load or reload in progress loses its entry: its leader publishes
+    /// nothing, and its waiters go round again — a load's waiters load the
+    /// ledger afresh, a reload's find nothing to reload.
     pub async fn disconnect(&self, ledger_id: &LedgerId) {
         // Normalize ledger_id to match cache key format
         let canonical_alias = ledger_id.clone();
@@ -2079,9 +2160,9 @@ impl LedgerManager {
     /// Sets a shutdown flag that prevents in-flight load/reload leaders from
     /// re-inserting entries after this call completes.
     ///
-    /// Any in-flight Loading/Reloading waiters will receive cancellation
-    /// errors when their oneshot senders are dropped. This is the expected
-    /// behavior for a force-evict during shutdown.
+    /// Any in-flight Loading/Reloading waiters fail with a cancellation error
+    /// when their oneshot senders are dropped, rather than load again into a
+    /// manager that is closing.
     pub async fn disconnect_all(&self) {
         self.shutdown.store(true, Ordering::Release);
         let mut entries = self.entries.write().await;
@@ -2103,6 +2184,8 @@ impl LedgerManager {
     /// - Reloading{h, waiters} → add waiter, await completion
     /// - Loading(waiters) → wait for initial load, then return Ok(())
     /// - None → Ok(()) (not loaded, nothing to reload)
+    ///
+    /// A waiter whose load or reload ended without a result decides again.
     pub async fn reload(&self, ledger_id: &LedgerId) -> Result<()> {
         // Normalize ledger_id to match cache key format
         let canonical_alias = ledger_id.clone();
@@ -2117,239 +2200,233 @@ impl LedgerManager {
             NotLoaded,
         }
 
-        // Determine action under lock
-        let action = {
-            let mut entries = self.entries.write().await;
+        // A pass returns, or ends with this caller leading the reload. It
+        // repeats when the load or reload this caller joined ended without a
+        // result — its leader was cancelled or its entry evicted — to decide
+        // again from what is cached now.
+        let (handle, generation) = loop {
+            // Determine action under lock
+            let action = {
+                let mut entries = self.entries.write().await;
 
-            match entries.get_mut(&canonical_alias) {
-                Some(LoadState::Ready(h)) => {
-                    // Transition to Reloading, become leader. Tag the slot with
-                    // a fresh generation so a cancelled leader's guard reclaims
-                    // only its own slot.
-                    let handle = h.clone();
-                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
-                    let reloading = LoadState::Reloading {
-                        generation,
-                        handle: handle.clone(),
-                        waiters: Vec::new(),
-                    };
-                    entries.insert(canonical_alias.clone(), reloading);
-                    ReloadAction::BecomeLeader { handle, generation }
+                match entries.get_mut(&canonical_alias) {
+                    Some(LoadState::Ready(h)) => {
+                        // Transition to Reloading, become leader. Tag the slot with
+                        // a fresh generation so a cancelled leader's guard reclaims
+                        // only its own slot.
+                        let handle = h.clone();
+                        let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
+                        let reloading = LoadState::Reloading {
+                            generation,
+                            handle: handle.clone(),
+                            waiters: Vec::new(),
+                        };
+                        entries.insert(canonical_alias.clone(), reloading);
+                        ReloadAction::BecomeLeader { handle, generation }
+                    }
+                    Some(LoadState::Reloading { waiters, .. }) => {
+                        // Join existing reload
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        ReloadAction::WaitForReload(rx)
+                    }
+                    Some(LoadState::Loading { waiters, .. }) => {
+                        // Initial load in progress - wait for it, then done
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        ReloadAction::WaitForInitialLoad(rx)
+                    }
+                    // Nothing is cached to reload; the next request loads.
+                    Some(LoadState::Failed { .. }) | None => ReloadAction::NotLoaded,
                 }
-                Some(LoadState::Reloading { waiters, .. }) => {
-                    // Join existing reload
-                    let (tx, rx) = oneshot::channel();
-                    waiters.push(tx);
-                    ReloadAction::WaitForReload(rx)
-                }
-                Some(LoadState::Loading { waiters, .. }) => {
-                    // Initial load in progress - wait for it, then done
-                    let (tx, rx) = oneshot::channel();
-                    waiters.push(tx);
-                    ReloadAction::WaitForInitialLoad(rx)
-                }
-                // Nothing is cached to reload; the next request loads.
-                Some(LoadState::Failed { .. }) | None => ReloadAction::NotLoaded,
+            };
+            // Manager lock released
+
+            match action {
+                ReloadAction::NotLoaded => return Ok(()),
+                ReloadAction::BecomeLeader { handle, generation } => break (handle, generation),
+                // A fresh load leaves nothing to reload.
+                ReloadAction::WaitForInitialLoad(rx) => match rx.await {
+                    Ok(loaded) => {
+                        loaded.map_err(shared_load_error)?;
+                        return Ok(());
+                    }
+                    Err(_) if self.is_shutdown() => {
+                        return Err(ApiError::internal("load cancelled"));
+                    }
+                    Err(_) => {}
+                },
+                ReloadAction::WaitForReload(rx) => match rx.await {
+                    Ok(reloaded) => return reloaded.map_err(shared_load_error),
+                    Err(_) if self.is_shutdown() => {
+                        return Err(ApiError::internal("reload cancelled"));
+                    }
+                    Err(_) => {}
+                },
             }
         };
-        // Manager lock released
 
-        match action {
-            ReloadAction::NotLoaded => Ok(()),
+        // Guard the Reloading slot: a cancelled reload-leader future
+        // would otherwise orphan it (stalling future reloads/current_t).
+        let mut reload_guard = ReloadLeaderGuard {
+            entries: Arc::clone(&self.entries),
+            alias: canonical_alias.clone(),
+            generation,
+            armed: true,
+        };
 
-            ReloadAction::WaitForInitialLoad(rx) => {
-                // Wait for initial load to complete, then we're fresh
-                // Note: Waiters receive Http error (preserving status code) since ApiError isn't Clone
-                rx.await
-                    .map_err(|_| ApiError::internal("load cancelled"))?
-                    .map_err(|arc_err| {
-                        // Extract Http error preserving status code
-                        match arc_err.as_ref() {
-                            ApiError::Http { status, message } => ApiError::http(*status, message),
-                            other => ApiError::http(other.status_code(), other.to_string()),
+        // We're the reload leader. Build the replacement state + binary
+        // store WITHOUT holding the handle `state` lock, so concurrent
+        // queries (snapshot() -> state.lock()) are not blocked behind the
+        // reload's nameservice/S3/index I/O. The lock is taken only for
+        // the brief coherent swap below. The `entries` lock is likewise
+        // not held over any of this and is acquired after the swap, so
+        // the two locks never overlap (avoids the entries↔state ordering
+        // hazard with `current_t`).
+        let loaded = LedgerState::load_decoding_root(
+            &self.nameservice_mode,
+            ledger_id,
+            &self.backend,
+            decode_index_root,
+        )
+        .await
+        .map_err(ApiError::from);
+        let result = 'load: {
+            match loaded {
+                Ok((mut new_state, root)) => {
+                    // Attempt to load binary index store (v2 only) — still off-lock.
+                    // Artifacts shared with the store being replaced are
+                    // carried over; the slot is read on its own (no
+                    // `state` lock held), which keeps the lock order.
+                    let prev_store = handle.inner.binary_store.read().await.clone();
+                    let new_binary_store = match load_and_attach_binary_store(
+                        &self.backend,
+                        self.nameservice_mode.reader(),
+                        &mut new_state,
+                        self.config.leaflet_cache.clone(),
+                        prev_store.as_deref(),
+                        root,
+                    )
+                    .await
+                    {
+                        Ok(store) => store,
+                        Err(e) => {
+                            // Keep serving the state and store the handle
+                            // has rather than swap in one without a store.
+                            tracing::warn!(
+                                ledger_id = %ledger_id,
+                                error = %e,
+                                "Failed to load binary store during reload; keeping the previous state"
+                            );
+                            break 'load Err(e);
                         }
-                    })?;
-                Ok(())
-            }
+                    };
 
-            ReloadAction::WaitForReload(rx) => {
-                // Wait for reload leader to complete
-                // Note: Waiters receive Http error (preserving status code) since ApiError isn't Clone
-                rx.await
-                    .map_err(|_| ApiError::internal("reload cancelled"))?
-                    .map_err(|arc_err| {
-                        // Extract Http error preserving status code
-                        match arc_err.as_ref() {
-                            ApiError::Http { status, message } => ApiError::http(*status, message),
-                            other => ApiError::http(other.status_code(), other.to_string()),
-                        }
-                    })
-            }
-
-            ReloadAction::BecomeLeader { handle, generation } => {
-                // Guard the Reloading slot: a cancelled reload-leader future
-                // would otherwise orphan it (stalling future reloads/current_t).
-                let mut reload_guard = ReloadLeaderGuard {
-                    entries: Arc::clone(&self.entries),
-                    alias: canonical_alias.clone(),
-                    generation,
-                    armed: true,
-                };
-
-                // We're the reload leader. Build the replacement state + binary
-                // store WITHOUT holding the handle `state` lock, so concurrent
-                // queries (snapshot() -> state.lock()) are not blocked behind the
-                // reload's nameservice/S3/index I/O. The lock is taken only for
-                // the brief coherent swap below. The `entries` lock is likewise
-                // not held over any of this and is acquired after the swap, so
-                // the two locks never overlap (avoids the entries↔state ordering
-                // hazard with `current_t`).
-                let loaded = LedgerState::load_decoding_root(
-                    &self.nameservice_mode,
-                    ledger_id,
-                    &self.backend,
-                    decode_index_root,
-                )
-                .await
-                .map_err(ApiError::from);
-                let result = 'load: {
-                    match loaded {
-                        Ok((mut new_state, root)) => {
-                            // Attempt to load binary index store (v2 only) — still off-lock.
-                            // Artifacts shared with the store being replaced are
-                            // carried over; the slot is read on its own (no
-                            // `state` lock held), which keeps the lock order.
-                            let prev_store = handle.inner.binary_store.read().await.clone();
-                            let new_binary_store = match load_and_attach_binary_store(
-                                &self.backend,
-                                self.nameservice_mode.reader(),
-                                &mut new_state,
-                                self.config.leaflet_cache.clone(),
-                                prev_store.as_deref(),
-                                root,
-                            )
-                            .await
-                            {
-                                Ok(store) => store,
-                                Err(e) => {
-                                    // Keep serving the state and store the handle
-                                    // has rather than swap in one without a store.
-                                    tracing::warn!(
-                                        ledger_id = %ledger_id,
-                                        error = %e,
-                                        "Failed to load binary store during reload; keeping the previous state"
-                                    );
-                                    break 'load Err(e);
-                                }
-                            };
-
-                            // Brief coherent swap. Lock order: state -> binary_store;
-                            // acquire both before mutating so there is no `.await`
-                            // between the two assignments (no incoherent
-                            // state/binary_store window on cancellation, and readers
-                            // blocked on `state` never observe a half-applied swap).
-                            let mut write_guard = handle.lock_for_write().await;
-                            // Compare total `t()` (novelty included), not `index_t()`:
-                            // this is deliberately novelty-protective. If the reloaded
-                            // state carries a newer persisted index but an older total
-                            // `t` than the in-memory state, we skip the swap and keep
-                            // the fresher novelty — transiently forgoing the newer
-                            // index, which the next reload picks up. Never clobber a
-                            // newer in-memory commit to adopt a newer index. A state
-                            // of another activation is replaced whatever its t: its
-                            // commits can no longer be published.
-                            let replaced = new_state.ns_record.as_ref().is_some_and(|record| {
-                                other_activation(write_guard.state().ns_record.as_ref(), record)
-                            });
-                            if replaced || new_state.t() >= write_guard.state().t() {
-                                let mut bs_guard = handle.inner.binary_store.write().await;
-                                write_guard.replace(new_state);
-                                *bs_guard = new_binary_store;
-                                // Out-of-band swap: any resolved-config entry may
-                                // have been cached against a state this swap just
-                                // replaced — including a detached-commit
-                                // placeholder whose marker (0) a reloaded state
-                                // can legitimately share. See `config_cache_clear`.
-                                // Taking the config lock while holding `state` is
-                                // safe: no path acquires `state` while holding the
-                                // config lock.
-                                handle.config_cache_clear().await;
-                            } else {
-                                // A concurrent commit advanced the in-memory state
-                                // past the reloaded storage HEAD (a txn took the
-                                // still-valid handle via get_or_load's Reloading
-                                // fast path while we loaded). Keep the fresher
-                                // in-memory state rather than clobber the commit.
-                                tracing::debug!(
-                                    ledger_id = %ledger_id,
-                                    "reload: in-memory state newer than reloaded storage; skipping swap"
-                                );
-                            }
-                            Ok(())
-                            // state (and binary_store) guards dropped here, before `entries`.
-                        }
-                        Err(e) => Err(e),
+                    // Brief coherent swap. Lock order: state -> binary_store;
+                    // acquire both before mutating so there is no `.await`
+                    // between the two assignments (no incoherent
+                    // state/binary_store window on cancellation, and readers
+                    // blocked on `state` never observe a half-applied swap).
+                    let mut write_guard = handle.lock_for_write().await;
+                    // Compare total `t()` (novelty included), not `index_t()`:
+                    // this is deliberately novelty-protective. If the reloaded
+                    // state carries a newer persisted index but an older total
+                    // `t` than the in-memory state, we skip the swap and keep
+                    // the fresher novelty — transiently forgoing the newer
+                    // index, which the next reload picks up. Never clobber a
+                    // newer in-memory commit to adopt a newer index. A state
+                    // of another activation is replaced whatever its t: its
+                    // commits can no longer be published.
+                    let replaced = new_state.ns_record.as_ref().is_some_and(|record| {
+                        other_activation(write_guard.state().ns_record.as_ref(), record)
+                    });
+                    if replaced || new_state.t() >= write_guard.state().t() {
+                        let mut bs_guard = handle.inner.binary_store.write().await;
+                        write_guard.replace(new_state);
+                        *bs_guard = new_binary_store;
+                        // Out-of-band swap: any resolved-config entry may
+                        // have been cached against a state this swap just
+                        // replaced — including a detached-commit
+                        // placeholder whose marker (0) a reloaded state
+                        // can legitimately share. See `config_cache_clear`.
+                        // Taking the config lock while holding `state` is
+                        // safe: no path acquires `state` while holding the
+                        // config lock.
+                        handle.config_cache_clear().await;
+                    } else {
+                        // A concurrent commit advanced the in-memory state
+                        // past the reloaded storage HEAD (a txn took the
+                        // still-valid handle via get_or_load's Reloading
+                        // fast path while we loaded). Keep the fresher
+                        // in-memory state rather than clobber the commit.
+                        tracing::debug!(
+                            ledger_id = %ledger_id,
+                            "reload: in-memory state newer than reloaded storage; skipping swap"
+                        );
                     }
-                };
+                    Ok(())
+                    // state (and binary_store) guards dropped here, before `entries`.
+                }
+                Err(e) => Err(e),
+            }
+        };
 
-                // Publish under a brief `entries` lock — no `.await` between the
-                // lock and disarm, so the leader can't be cancelled mid-publish.
-                let mut entries = self.entries.write().await;
-                let shutting_down = self.is_shutdown();
-                reload_guard.disarm();
+        // Publish under a brief `entries` lock — no `.await` between the
+        // lock and disarm, so the leader can't be cancelled mid-publish.
+        let mut entries = self.entries.write().await;
+        let shutting_down = self.is_shutdown();
+        reload_guard.disarm();
 
-                // Only publish if WE still own the slot (our `Reloading`
-                // generation). If `disconnect` cleared it and a newer reload
-                // inserted a fresh `Reloading`, that slot belongs to the newer
-                // leader; removing/notifying/restoring over it would deliver our
-                // stale success/error to its waiters and clobber it. In that
-                // case do nothing and return our own result to the caller.
-                let owns_slot = matches!(
-                    entries.get(&canonical_alias),
-                    Some(LoadState::Reloading { generation: g, .. }) if *g == generation
-                );
+        // Only publish if WE still own the slot (our `Reloading`
+        // generation). If `disconnect` cleared it and a newer reload
+        // inserted a fresh `Reloading`, that slot belongs to the newer
+        // leader; removing/notifying/restoring over it would deliver our
+        // stale success/error to its waiters and clobber it. In that
+        // case do nothing and return our own result to the caller.
+        let owns_slot = matches!(
+            entries.get(&canonical_alias),
+            Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+        );
 
-                match result {
-                    Ok(()) => {
-                        // Notify waiters and restore Ready state (unless shutting down)
-                        if owns_slot {
-                            if let Some(LoadState::Reloading {
-                                handle, waiters, ..
-                            }) = entries.remove(&canonical_alias)
-                            {
-                                for tx in waiters {
-                                    let _ = tx.send(Ok(()));
-                                }
-                                if !shutting_down {
-                                    entries.insert(canonical_alias, LoadState::Ready(handle));
-                                }
-                            }
+        match result {
+            Ok(()) => {
+                // Notify waiters and restore Ready state (unless shutting down)
+                if owns_slot {
+                    if let Some(LoadState::Reloading {
+                        handle, waiters, ..
+                    }) = entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Ok(()));
                         }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // Capture error with status code for waiters before consuming the error
-                        // Note: Waiters receive Http error (preserving status code); leader gets original type
-                        if owns_slot {
-                            let error_for_waiters =
-                                Arc::new(ApiError::http(e.status_code(), e.to_string()));
-                            // Notify waiters of failure, restore Ready (keep old data) unless shutting down
-                            if let Some(LoadState::Reloading {
-                                handle, waiters, ..
-                            }) = entries.remove(&canonical_alias)
-                            {
-                                for tx in waiters {
-                                    let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
-                                }
-                                if !shutting_down {
-                                    entries.insert(canonical_alias, LoadState::Ready(handle));
-                                }
-                            }
+                        if !shutting_down {
+                            entries.insert(canonical_alias, LoadState::Ready(handle));
                         }
-                        // Leader returns the original error (preserves full type/variant)
-                        Err(e)
                     }
                 }
+                Ok(())
+            }
+            Err(e) => {
+                // Capture error with status code for waiters before consuming the error
+                // Note: Waiters receive Http error (preserving status code); leader gets original type
+                if owns_slot {
+                    let error_for_waiters =
+                        Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                    // Notify waiters of failure, restore Ready (keep old data) unless shutting down
+                    if let Some(LoadState::Reloading {
+                        handle, waiters, ..
+                    }) = entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                        }
+                        if !shutting_down {
+                            entries.insert(canonical_alias, LoadState::Ready(handle));
+                        }
+                    }
+                }
+                // Leader returns the original error (preserves full type/variant)
+                Err(e)
             }
         }
     }
@@ -2657,7 +2734,12 @@ impl LedgerManager {
                 _ => return Ok(NotifyResult::NotLoaded),
             }
         };
+        let _in_flight = handle.inner.catch_up.lock().await;
+        self.notify_handle(handle.clone(), input).await
+    }
 
+    /// [`Self::notify`] for a cached `handle`, under its `catch_up` lock.
+    async fn notify_handle(&self, handle: LedgerHandle, input: NsNotify) -> Result<NotifyResult> {
         // Get fresh record from nameservice if not provided
         let ns_record = match input.record {
             Some(r) => r,
@@ -3465,7 +3547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_handle_is_stale_follows_head_watermark() {
+    async fn the_head_watermark_marks_a_cached_handle_behind() {
         use fluree_db_core::{LedgerSnapshot, MemoryStorage};
         use fluree_db_ledger::LedgerState;
         use fluree_db_nameservice::memory::MemoryNameService;
@@ -3479,30 +3561,33 @@ mod tests {
         let handle = LedgerHandle::new(id("test:main"), state, None);
 
         let mgr = LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default());
+        async fn behind(mgr: &LedgerManager, handle: &LedgerHandle) -> bool {
+            !LedgerManager::holds(handle, mgr.head_watermark(handle.id())).await
+        }
 
         // No watermark: never stale. Heads that only move through
         // this manager's own pipeline keep the cache coherent by
         // construction, so nothing reports advances and hits serve
         // as-is — the single-node behavior.
-        assert!(!mgr.cached_handle_is_stale(&handle).await);
+        assert!(!behind(&mgr, &handle).await);
 
         // A watermark at the cached `t` is still fresh.
         mgr.note_head_advance(&id("test:main"), 5);
-        assert!(!mgr.cached_handle_is_stale(&handle).await);
+        assert!(!behind(&mgr, &handle).await);
 
         // A head-advancer reporting past the cached `t` marks it stale.
         mgr.note_head_advance(&id("test:main"), 12);
-        assert!(mgr.cached_handle_is_stale(&handle).await);
+        assert!(behind(&mgr, &handle).await);
 
         // Monotonic: a late, lower report can't roll the watermark back.
         mgr.note_head_advance(&id("test:main"), 3);
-        assert!(mgr.cached_handle_is_stale(&handle).await);
+        assert!(behind(&mgr, &handle).await);
 
         // Disconnect clears the watermark with the entry, so a
         // ledger re-created under the same alias isn't permanently
         // flagged stale by a leftover high watermark.
         mgr.disconnect(&id("test:main")).await;
-        assert!(!mgr.cached_handle_is_stale(&handle).await);
+        assert!(!behind(&mgr, &handle).await);
     }
 
     #[tokio::test]
@@ -3919,6 +4004,514 @@ mod tests {
             ),
             "stale reload guard (gen 4) must not remove the newer slot (gen 9)"
         );
+    }
+
+    // ========================================================================
+    // Waiters outlive the load or reload they joined
+    // ========================================================================
+
+    /// A manager whose nameservice holds `alias` as an empty ledger, so a
+    /// caller that leads a load of it gets a handle.
+    async fn manager_holding(alias: &str) -> Arc<LedgerManager> {
+        use fluree_db_core::MemoryStorage;
+        use fluree_db_nameservice::memory::MemoryNameService;
+        let ns = MemoryNameService::new();
+        fluree_db_nameservice::testing::create(&ns, alias)
+            .await
+            .unwrap();
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(ns));
+        Arc::new(LedgerManager::new(
+            backend,
+            ns_mode,
+            LedgerManagerConfig::default(),
+        ))
+    }
+
+    /// Yield until `holds` does: these tests wait on state they can see,
+    /// never on time. The timeout only turns a hang into a failure.
+    async fn until<F, Fut>(mut holds: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !holds().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the awaited state never came about");
+    }
+
+    fn same(a: &LedgerHandle, b: &LedgerHandle) -> bool {
+        Arc::ptr_eq(&a.inner, &b.inner)
+    }
+
+    fn spawn_get(
+        mgr: &Arc<LedgerManager>,
+        alias: &LedgerId,
+    ) -> tokio::task::JoinHandle<Result<LedgerHandle>> {
+        let (mgr, alias) = (Arc::clone(mgr), alias.clone());
+        tokio::spawn(async move { mgr.get_or_load(&alias).await })
+    }
+
+    fn spawn_reload(
+        mgr: &Arc<LedgerManager>,
+        alias: &LedgerId,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let (mgr, alias) = (Arc::clone(mgr), alias.clone());
+        tokio::spawn(async move { mgr.reload(&alias).await })
+    }
+
+    /// Stand in for a load leader: insert its `Loading` slot.
+    async fn begin_load(mgr: &LedgerManager, alias: &LedgerId) -> u64 {
+        let generation = mgr.load_generation.fetch_add(1, Ordering::Relaxed);
+        mgr.entries.write().await.insert(
+            alias.clone(),
+            LoadState::Loading {
+                generation,
+                waiters: Vec::new(),
+            },
+        );
+        generation
+    }
+
+    /// Publish as the leader of `generation` does: only into its own slot.
+    async fn publish_load(
+        mgr: &LedgerManager,
+        alias: &LedgerId,
+        generation: u64,
+        handle: &LedgerHandle,
+    ) {
+        let mut entries = mgr.entries.write().await;
+        if !matches!(
+            entries.get(alias),
+            Some(LoadState::Loading { generation: g, .. }) if *g == generation
+        ) {
+            return;
+        }
+        if let Some(LoadState::Loading { waiters, .. }) = entries.remove(alias) {
+            for tx in waiters {
+                let _ = tx.send(Ok(handle.clone()));
+            }
+        }
+        entries.insert(alias.clone(), LoadState::Ready(handle.clone()));
+    }
+
+    async fn load_waiters(mgr: &LedgerManager, alias: &LedgerId, generation: u64) -> Option<usize> {
+        match mgr.entries.read().await.get(alias) {
+            Some(LoadState::Loading {
+                generation: g,
+                waiters,
+            }) if *g == generation => Some(waiters.len()),
+            _ => None,
+        }
+    }
+
+    /// Stand in for a reload leader: turn `handle`'s entry into its
+    /// `Reloading` slot.
+    async fn begin_reload(mgr: &LedgerManager, alias: &LedgerId, handle: &LedgerHandle) -> u64 {
+        let generation = mgr.load_generation.fetch_add(1, Ordering::Relaxed);
+        mgr.entries.write().await.insert(
+            alias.clone(),
+            LoadState::Reloading {
+                generation,
+                handle: handle.clone(),
+                waiters: Vec::new(),
+            },
+        );
+        generation
+    }
+
+    /// Publish as the reload leader of `generation` does: only into its own
+    /// slot.
+    async fn publish_reload(mgr: &LedgerManager, alias: &LedgerId, generation: u64) {
+        let mut entries = mgr.entries.write().await;
+        if !matches!(
+            entries.get(alias),
+            Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+        ) {
+            return;
+        }
+        if let Some(LoadState::Reloading {
+            handle, waiters, ..
+        }) = entries.remove(alias)
+        {
+            for tx in waiters {
+                let _ = tx.send(Ok(()));
+            }
+            entries.insert(alias.clone(), LoadState::Ready(handle));
+        }
+    }
+
+    async fn reload_waiters(
+        mgr: &LedgerManager,
+        alias: &LedgerId,
+        generation: u64,
+    ) -> Option<usize> {
+        match mgr.entries.read().await.get(alias) {
+            Some(LoadState::Reloading {
+                generation: g,
+                waiters,
+                ..
+            }) if *g == generation => Some(waiters.len()),
+            _ => None,
+        }
+    }
+
+    /// A reader evicts the stale handle it found only while that handle is
+    /// still the cached entry. Its staleness check waits on the handle's
+    /// state lock, which a commit holds; meanwhile another reader can evict
+    /// the same handle and lead a load that a third reader joins. Evicting by
+    /// name removed that load and failed the third reader with
+    /// `load cancelled`.
+    #[tokio::test]
+    async fn a_stale_eviction_leaves_a_newer_load_to_its_waiters() {
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let stale = make_test_handle("x:main");
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(stale.clone()));
+        mgr.note_head_advance(&alias, 1);
+
+        let commit = stale.inner.state.write().await;
+        let holders = Arc::strong_count(&stale.inner);
+        let checking = spawn_get(&mgr, &alias);
+        let held = &stale.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+
+        let generation = begin_load(&mgr, &alias).await;
+        let joined = spawn_get(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(1) }).await;
+
+        drop(commit);
+        let j = &joined;
+        until(|| async move { j.is_finished() || load_waiters(m, a, generation).await == Some(2) })
+            .await;
+
+        let fresh = ready_handle("x:main");
+        publish_load(&mgr, &alias, generation, &fresh).await;
+
+        let joined = joined
+            .await
+            .unwrap()
+            .expect("a reader that joined a load gets its result");
+        assert!(
+            same(&joined, &fresh),
+            "the joined load was displaced by another"
+        );
+        let checked = checking
+            .await
+            .unwrap()
+            .expect("the reader that found the stale handle gets a fresh one");
+        assert!(same(&checked, &fresh));
+        assert!(mgr
+            .ready_handle(&alias)
+            .await
+            .is_some_and(|h| same(&h, &fresh)));
+    }
+
+    /// As above, where the stale handle's entry became a reload (the cache
+    /// listener catching it up) while the reader checked it: evicting by name
+    /// failed the reload's waiters with `reload cancelled`. The reader joins
+    /// the reload and reads what it brought up, not the state it replaced.
+    #[tokio::test]
+    async fn a_stale_eviction_leaves_a_reload_to_its_waiters() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let stale = make_test_handle("x:main");
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(stale.clone()));
+        mgr.note_head_advance(&alias, 1);
+
+        let commit = stale.inner.state.write().await;
+        let holders = Arc::strong_count(&stale.inner);
+        let checking = spawn_get(&mgr, &alias);
+        let held = &stale.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+
+        let generation = begin_reload(&mgr, &alias, &stale).await;
+        let reloading = spawn_reload(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { reload_waiters(m, a, generation).await == Some(1) }).await;
+
+        drop(commit);
+        until(|| async move { reload_waiters(m, a, generation).await == Some(2) }).await;
+        assert!(
+            !checking.is_finished(),
+            "the reader took the state being replaced"
+        );
+        *stale.inner.state.write().await =
+            LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        publish_reload(&mgr, &alias, generation).await;
+        let checked = checking
+            .await
+            .unwrap()
+            .expect("a reader behind its target gets the reloaded handle");
+        assert_eq!(checked.t().await, 1);
+
+        reloading
+            .await
+            .unwrap()
+            .expect("a caller that joined a reload gets its result");
+        assert!(same(&checked, &stale));
+        assert!(
+            mgr.ready_handle(&alias)
+                .await
+                .is_some_and(|h| same(&h, &stale)),
+            "the reload was displaced by a load"
+        );
+    }
+
+    /// A reader whose cached handle is behind the head while a catch-up is
+    /// applying the missing commit waits for that catch-up and reads the
+    /// handle it brought up, rather than loading the ledger again.
+    #[tokio::test]
+    async fn a_reader_behind_the_head_waits_for_the_catch_up_in_flight() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let cached = make_test_handle("x:main");
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(cached.clone()));
+        mgr.note_head_advance(&alias, 1);
+
+        let in_flight = cached.inner.catch_up.lock().await;
+        let holders = Arc::strong_count(&cached.inner);
+        let reading = spawn_get(&mgr, &alias);
+        let held = &cached.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+
+        *cached.inner.state.write().await =
+            LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        drop(in_flight);
+
+        let read = reading
+            .await
+            .unwrap()
+            .expect("the reader gets the handle the catch-up brought up");
+        assert!(same(&read, &cached), "the reader loaded the ledger again");
+        assert_eq!(read.t().await, 1);
+    }
+
+    /// A reader that joins a load is held to its target like any other. The
+    /// load sampled its head when it began, so a commit applied since, before
+    /// the reader arrived, is one its handle lacks. The reader waits for what
+    /// brings that handle up, here a reload, rather than take it as published.
+    #[tokio::test]
+    async fn a_load_waiter_is_held_to_its_target() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let generation = begin_load(&mgr, &alias).await;
+        mgr.note_head_advance(&alias, 1);
+        let joined = spawn_get(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(1) }).await;
+
+        let loaded = make_test_handle("x:main");
+        let applying = loaded.inner.state.write().await;
+        publish_load(&mgr, &alias, generation, &loaded).await;
+        let reload = begin_reload(&mgr, &alias, &loaded).await;
+        drop(applying);
+        let j = &joined;
+        until(|| async move { j.is_finished() || reload_waiters(m, a, reload).await == Some(1) })
+            .await;
+        assert!(
+            !joined.is_finished(),
+            "the reader took a handle behind its target"
+        );
+
+        *loaded.inner.state.write().await =
+            LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        publish_reload(&mgr, &alias, reload).await;
+        let read = joined
+            .await
+            .unwrap()
+            .expect("a reader that joined a load gets the handle brought up");
+        assert!(same(&read, &loaded), "the reader loaded the ledger again");
+        assert_eq!(read.t().await, 1);
+    }
+
+    /// The same for a reader that goes to load and finds another caller's
+    /// load already published: the handle is checked, here while the commit
+    /// it lacks is being applied to it, before the reader takes it.
+    #[tokio::test]
+    async fn a_reader_finding_a_load_published_is_held_to_its_target() {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let stale = make_test_handle("x:main");
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(stale.clone()));
+        mgr.note_head_advance(&alias, 1);
+
+        let commit = stale.inner.state.write().await;
+        let holders = Arc::strong_count(&stale.inner);
+        let reading = spawn_get(&mgr, &alias);
+        let held = &stale.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+
+        let loaded = make_test_handle("x:main");
+        let mut applying = loaded.inner.state.write().await;
+        mgr.entries
+            .write()
+            .await
+            .insert(alias.clone(), LoadState::Ready(loaded.clone()));
+        let holders = Arc::strong_count(&loaded.inner);
+        drop(commit);
+        let held = &loaded.inner;
+        until(|| async move { Arc::strong_count(held) > holders }).await;
+        assert!(
+            !reading.is_finished(),
+            "the reader took a handle behind its target"
+        );
+
+        *applying = LedgerState::new(LedgerSnapshot::genesis("x:main"), Novelty::new(1));
+        drop(applying);
+        let read = reading
+            .await
+            .unwrap()
+            .expect("the reader gets the published handle once it is brought up");
+        assert!(same(&read, &loaded), "the reader loaded the ledger again");
+        assert_eq!(read.t().await, 1);
+    }
+
+    /// A reader that joined a load still wants the ledger when the load's
+    /// leader is cancelled (its request dropped or timed out): it loads the
+    /// ledger itself rather than failing with `load cancelled`.
+    #[tokio::test]
+    async fn a_load_waiter_outlives_its_cancelled_leader() {
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let generation = begin_load(&mgr, &alias).await;
+        let leader = LoadingLeaderGuard {
+            entries: Arc::clone(&mgr.entries),
+            alias: alias.clone(),
+            generation,
+            armed: true,
+        };
+        let joined = spawn_get(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(1) }).await;
+
+        drop(leader);
+        let loaded = joined
+            .await
+            .unwrap()
+            .expect("a waiter whose leader was cancelled loads the ledger");
+        assert!(mgr
+            .ready_handle(&alias)
+            .await
+            .is_some_and(|h| same(&h, &loaded)));
+    }
+
+    /// The same when the loading entry is evicted, as `disconnect` does after
+    /// a commit's cache refresh fails or the ledger's history is rewritten.
+    #[tokio::test]
+    async fn a_load_waiter_outlives_an_eviction_of_its_load() {
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let generation = begin_load(&mgr, &alias).await;
+        let joined = spawn_get(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(1) }).await;
+
+        mgr.disconnect(&alias).await;
+        let loaded = joined
+            .await
+            .unwrap()
+            .expect("a waiter whose load was evicted loads the ledger");
+
+        publish_load(&mgr, &alias, generation, &make_test_handle("x:main")).await;
+        assert!(
+            mgr.ready_handle(&alias)
+                .await
+                .is_some_and(|h| same(&h, &loaded)),
+            "the evicted load's leader must not publish over the newer entry"
+        );
+    }
+
+    /// A reload's waiter, when the reload's leader is cancelled: the
+    /// cancelled reload evicted the entry, so nothing is left to reload.
+    #[tokio::test]
+    async fn a_reload_waiter_outlives_its_cancelled_leader() {
+        let alias = id("x:main");
+        let mgr = Arc::new(make_test_manager());
+        let handle = make_test_handle("x:main");
+        let generation = begin_reload(&mgr, &alias, &handle).await;
+        let leader = ReloadLeaderGuard {
+            entries: Arc::clone(&mgr.entries),
+            alias: alias.clone(),
+            generation,
+            armed: true,
+        };
+        let reloading = spawn_reload(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { reload_waiters(m, a, generation).await == Some(1) }).await;
+
+        drop(leader);
+        reloading
+            .await
+            .unwrap()
+            .expect("a reload whose leader was cancelled finds nothing to reload");
+    }
+
+    /// A reload that found the ledger loading waits on that load, and
+    /// outlives its leader's cancellation the same way.
+    #[tokio::test]
+    async fn a_reload_waiting_on_a_load_outlives_its_cancelled_leader() {
+        let alias = id("x:main");
+        let mgr = Arc::new(make_test_manager());
+        let generation = begin_load(&mgr, &alias).await;
+        let leader = LoadingLeaderGuard {
+            entries: Arc::clone(&mgr.entries),
+            alias: alias.clone(),
+            generation,
+            armed: true,
+        };
+        let reloading = spawn_reload(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(1) }).await;
+
+        drop(leader);
+        reloading
+            .await
+            .unwrap()
+            .expect("a reload whose load was cancelled finds nothing to reload");
+    }
+
+    /// Shutdown is the one eviction a waiter does not outlive: it fails
+    /// rather than load into a manager that is closing.
+    #[tokio::test]
+    async fn waiters_fail_when_the_manager_shuts_down() {
+        let alias = id("x:main");
+        let mgr = manager_holding("x:main").await;
+        let generation = begin_load(&mgr, &alias).await;
+        let joined = spawn_get(&mgr, &alias);
+        let reloading = spawn_reload(&mgr, &alias);
+        let (m, a) = (&mgr, &alias);
+        until(|| async move { load_waiters(m, a, generation).await == Some(2) }).await;
+
+        mgr.disconnect_all().await;
+        assert!(joined.await.unwrap().is_err());
+        assert!(reloading.await.unwrap().is_err());
+        assert!(mgr.entries.read().await.is_empty());
     }
 
     #[test]

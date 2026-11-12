@@ -103,6 +103,9 @@ pub struct DerivedFactsOutcome {
     /// went on without it: an OWL 2 RL pass that failed under a positive
     /// datalog program, which still derives what it can.
     pub failed: Option<String>,
+    /// The reasoning memory budget the overlay was materialized under. What
+    /// queries keep beside it (`crate::reasoning_ops`) counts toward it too.
+    pub memory_limit_bytes: usize,
 }
 
 /// `rdfs` and `owl2ql` widen the query's own patterns, and rule bodies run
@@ -238,6 +241,7 @@ async fn compute_derived_facts_with_cache(
                 overlay: (!cached.overlay.is_empty()).then(|| cached.overlay.clone()),
                 diagnostics: Some(cached.diagnostics.clone()),
                 failed: None,
+                memory_limit_bytes: budget.max_memory_bytes,
             });
         }
         (Some(rule_set), key)
@@ -331,6 +335,7 @@ async fn compute_derived_facts_with_cache(
                         overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
                         diagnostics,
                         failed: None,
+                        memory_limit_bytes: budget.max_memory_bytes,
                     });
                 }
 
@@ -496,6 +501,7 @@ async fn compute_derived_facts_with_cache(
         overlay: (!derived_overlay.is_empty()).then(|| derived_overlay.clone()),
         diagnostics,
         failed: owl_failed,
+        memory_limit_bytes: budget.max_memory_bytes,
     })
 }
 
@@ -519,8 +525,10 @@ pub async fn compute_derived_facts_incremental(
     if !reasoning.owl2rl || reasoning.datalog || reasoning.owl_datalog || reasoning.has_rules() {
         return Ok(None);
     }
+    let budget = reasoning_budget(reasoning);
+    let memory_limit_bytes = budget.max_memory_bytes;
     let opts = ReasoningOptions {
-        budget: reasoning_budget(reasoning),
+        budget,
         cancellation: request.cancellation.cloned().unwrap_or_default(),
         tracker: request.tracker.cloned().unwrap_or_default(),
         maintenance,
@@ -532,6 +540,7 @@ pub async fn compute_derived_facts_incremental(
             overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
             diagnostics: Some(result.diagnostics.clone()),
             failed: None,
+            memory_limit_bytes,
         })),
         Err(fluree_db_reasoner::ReasonerError::Cancelled(reason)) => {
             Err(crate::error::QueryError::Cancelled { reason })
@@ -543,6 +552,7 @@ pub async fn compute_derived_facts_incremental(
             overlay: None,
             diagnostics: None,
             failed: Some(format!("OWL 2 RL materialization failed: {e}")),
+            memory_limit_bytes,
         })),
     }
 }

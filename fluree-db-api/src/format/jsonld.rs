@@ -323,8 +323,7 @@ fn write_lit(
             FlakeValue::String(s) => {
                 out.push_str(r#"{"@value":"#);
                 push_json_string(out, s);
-                out.push_str(r#","@language":"#);
-                push_json_string(out, lang_tag);
+                super::push_language(out, lang_tag);
                 out.push('}');
                 Ok(())
             }
@@ -462,10 +461,7 @@ fn format_binding(
             // Language-tagged strings always use @language form (no @type)
             if let Some(lang_tag) = dtc.lang_tag() {
                 return match val {
-                    FlakeValue::String(s) => Ok(json!({
-                        "@value": s,
-                        "@language": lang_tag
-                    })),
+                    FlakeValue::String(s) => Ok(super::language_tagged(json!(s), lang_tag)),
                     FlakeValue::Null => Ok(JsonValue::Null),
                     FlakeValue::Ref(_) => Err(FormatError::InvalidBinding(
                         "Binding::Lit invariant violated: contains Ref".to_string(),

@@ -191,7 +191,7 @@ def test_a_reader_with_its_own_key_reads_a_file(stub, files):
         ledger.insert(r.to_jsonld())
         rows = ledger.query("SELECT ?e WHERE { ?m a <https://ns.flur.ee/doc#Mention> ; "
                             "<http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#entity> ?e }")
-        assert [row[0] for row in rows] == ["https://example.org/org/acme"]
+        assert [row[0] for row in rows] == [fluree.IRI("https://example.org/org/acme")]
 
 
 def test_a_nif_occurrence_is_a_mention_row_whatever_else_it_is(stub, files):

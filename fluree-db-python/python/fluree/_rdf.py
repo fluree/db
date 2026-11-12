@@ -25,17 +25,35 @@ _SUFFIXES: dict[str, RdfFormat] = {
 }
 
 
+class Quads(list):  # type: ignore[type-arg]
+    """The quads :func:`parse` reads, in the order the document writes them:
+    a ``list`` of :class:`Quad`, with the document's ``prefixes``."""
+
+    prefixes: dict[str, str]
+    """The prefixes a Turtle or TriG document declares, ``{"ex":
+    "http://example.org/"}``, in the order declared; a prefix declared again
+    holds its last IRI. Other formats declare none."""
+
+    def __init__(self, quads: Iterable[Quad] = (), prefixes: dict[str, str] | None = None) -> None:
+        super().__init__(quads)
+        self.prefixes = {} if prefixes is None else prefixes
+
+
 def parse(
-    data: str | os.PathLike[str] | dict[str, Any] | list[Any],
+    data: str | bytes | os.PathLike[str] | dict[str, Any] | list[Any],
     format: RdfFormat | None = None,
     *,
     base: str | None = None,
     literals: _Literal["value", "lexical"] = "value",
-) -> list[Quad]:
+) -> Quads:
     """The quads of an RDF document: Turtle, TriG, N-Triples, N-Quads or
-    JSON-LD.
+    JSON-LD, in the order the document writes them, as a :class:`Quads`
+    list whose ``prefixes`` are the prefixes a Turtle or TriG document
+    declares. A JSON-LD node's statement comes before those of a node
+    nested in it, and a list's cells stand where the list does.
 
-    ``data`` is the document's text, with its ``format`` given; a path,
+    ``data`` is the document's text (a ``str``, or UTF-8 ``bytes`` such as
+    a request body), with its ``format`` given; a path,
     whose extension (``.ttl``, ``.trig``, ``.nt``, ``.nq``, ``.jsonld``,
     ``.json``) gives the format when ``format`` does not; or a JSON-LD
     document as a dict or list. Turtle, TriG and JSON-LD resolve relative
@@ -55,6 +73,11 @@ def parse(
     (``[]``, a collection, an annotation) gets a fresh label. Malformed input
     raises :class:`InvalidRequestError` naming the line and column.
     """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        try:
+            data = bytes(data).decode("utf-8-sig")
+        except UnicodeDecodeError as e:
+            raise InvalidRequestError(f"the document is not UTF-8: {e}") from None
     if isinstance(data, (dict, list)):
         if format not in (None, "jsonld"):
             raise InvalidRequestError(f"a dict or list is JSON-LD, not {format}")
@@ -79,7 +102,8 @@ def parse(
             return trusted_triple(term[1], term[2], value(term[3]))
         return literal(term)
 
-    return [trusted_quad(s, p, value(o), g) for s, p, o, g in native.parse_rdf(data, format, base)]
+    quads, prefixes = native.parse_rdf(data, format, base)
+    return Quads((trusted_quad(s, p, value(o), g) for s, p, o, g in quads), dict(prefixes))
 
 
 def serialize(
@@ -87,6 +111,7 @@ def serialize(
     format: RdfFormat,
     *,
     prefixes: dict[str, str] | None = None,
+    expanded: bool = False,
 ) -> str:
     """Write quads as an RDF document: Turtle, TriG, N-Triples, N-Quads or
     JSON-LD.
@@ -98,8 +123,16 @@ def serialize(
     (``{"ex": "http://example.org/"}``) and write IRIs with them, and JSON-LD
     makes them its ``@context``. A quad ``(r, rdf:reifies, Triple(...))`` is
     written as an annotation where the format has one.
+
+    The quads' order is kept: graphs come in the order the quads first name
+    them, the default graph among them, and in Turtle and TriG each subject's
+    statements are written together, with ``;`` and ``,``, subjects in the
+    order they first appear. ``expanded=True`` writes JSON-LD in expanded
+    form (the ``json-ld#expanded`` profile): full IRIs, no context, every
+    value in an array.
     """
-    return native.serialize_rdf([q if type(q) is Quad else _quad(q) for q in quads], format, prefixes)
+    items = [q if type(q) is Quad else _quad(q) for q in quads]
+    return native.serialize_rdf(items, format, prefixes, expanded)
 
 
 def _quad(item: Quad | tuple[Any, ...]) -> Quad:
