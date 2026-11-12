@@ -12,8 +12,10 @@
 //! An instance that shares its storage with other writers (a root opened
 //! without its lock, S3) sees none of their changes as events. It serves
 //! what it last learned of a branch, like every other read it makes, and
-//! learns it again in the background once that is [`REVALIDATE_MS`] old:
-//! a change made elsewhere reaches its reads within about that long.
+//! learns it again in the background once that is [`REVALIDATE_MS`] old.
+//! Past a quiet spell nothing kept it young, so a read of an earlier point
+//! that finds it [`STALE_MS`] old learns it before it is decided: a removal
+//! made elsewhere reaches such reads within about that long.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +24,20 @@ use std::sync::RwLock;
 use fluree_db_nameservice::{Fence, NameServiceEvent, NsRecord};
 
 /// How old what an instance sharing its storage learned of a branch may
-/// grow before a read has it learned again.
+/// grow before a read has it learned again, in the background.
 pub(crate) const REVALIDATE_MS: i64 = 1_000;
+
+/// How old it may grow before it no longer decides whether a read needs
+/// removed history: such a read learns it again first.
+pub(crate) const STALE_MS: i64 = 2 * REVALIDATE_MS;
+
+/// Taken before a read of the nameservice whose result the watch is to
+/// keep: the last change it had seen, and when the read began.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Token {
+    seq: u64,
+    at_ms: i64,
+}
 
 /// What a branch's removal journal holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +100,7 @@ struct Branch {
     /// See [`Seen::Live::history`]; kept here so forgetting the branch
     /// does not start it over.
     history: u64,
-    /// When the nameservice last confirmed what is kept (ms).
+    /// When the read that last confirmed what is kept began (ms).
     validated_ms: i64,
     /// A background read is learning it again.
     revalidating: bool,
@@ -199,7 +213,7 @@ impl BranchWatch {
         let state = self.state.read().expect("watch lock never poisoned");
         let branch = state.branches.get(ledger_id)?;
         let fresh = self.coherent.load(Ordering::Acquire)
-            || super::worker::now_ms() - branch.validated_ms < REVALIDATE_MS;
+            || (0..REVALIDATE_MS).contains(&(super::worker::now_ms() - branch.validated_ms));
         match branch.seen {
             Some(Seen::Live { .. }) if fresh => Some(branch.source.clone()),
             _ => None,
@@ -216,10 +230,9 @@ impl BranchWatch {
         }
         let now = super::worker::now_ms();
         let due = |branch: &Branch| {
-            branch.seen.is_some()
+            branch.revalidates()
                 && !branch.revalidating
-                && (!branch.replicated || branch.version().is_none())
-                && now - branch.validated_ms >= REVALIDATE_MS
+                && !(0..REVALIDATE_MS).contains(&(now - branch.validated_ms))
         };
         {
             let state = self.state.read().expect("watch lock never poisoned");
@@ -237,13 +250,29 @@ impl BranchWatch {
         }
     }
 
-    /// End a read [`Self::revalidation_due`] claimed: record what it
-    /// found, unless something changed the branch since `token`.
+    /// Whether what is kept of `ledger_id` is too old to decide a read by:
+    /// [`STALE_MS`] on an instance sharing its storage, where nothing
+    /// learned it again in the background meanwhile. A clock set back
+    /// leaves its age unknown.
+    pub(crate) fn stale(&self, ledger_id: &str) -> bool {
+        if self.coherent.load(Ordering::Acquire) || !self.tracking.load(Ordering::Acquire) {
+            return false;
+        }
+        let state = self.state.read().expect("watch lock never poisoned");
+        state.branches.get(ledger_id).is_some_and(|branch| {
+            branch.revalidates()
+                && !(0..STALE_MS).contains(&(super::worker::now_ms() - branch.validated_ms))
+        })
+    }
+
+    /// End a read that learned the branch again, as one
+    /// [`Self::revalidation_due`] claimed: record what it found, unless
+    /// something changed the branch since `token`.
     pub(crate) fn revalidated(
         &self,
         ledger_id: &str,
         found: Option<(Option<&NsRecord>, Option<Holds>)>,
-        token: u64,
+        token: Token,
     ) {
         let mut state = self.state.write().expect("watch lock never poisoned");
         let Some(branch) = state.branches.get_mut(ledger_id) else {
@@ -253,7 +282,18 @@ impl BranchWatch {
         let Some((record, holds)) = found else {
             return;
         };
-        if branch.touched > token {
+        if branch.touched > token.seq {
+            // What is kept is newer than the read. The read still confirms
+            // its journal where both name one incarnation and revision:
+            // otherwise a branch written faster than it is read would stay
+            // stale.
+            if let (Some(record), Some(kept)) = (record, branch.seen) {
+                if record.config_version.is_some()
+                    && kept.revision() == Seen::live(record).revision()
+                {
+                    branch.validated_ms = token.at_ms;
+                }
+            }
             return;
         }
         match record {
@@ -263,7 +303,7 @@ impl BranchWatch {
         if let (Some(holds), Some(Seen::Live { journal, .. })) = (holds, &mut branch.seen) {
             *journal = Some(holds);
         }
-        branch.validated_ms = super::worker::now_ms();
+        branch.validated_ms = token.at_ms;
     }
 
     /// The ledgers (canonically spelled) graph source `id` indexes, when
@@ -276,22 +316,22 @@ impl BranchWatch {
         let state = self.state.read().expect("watch lock never poisoned");
         let source = state.sources.get(id)?;
         let current = self.coherent.load(Ordering::Acquire)
-            || super::worker::now_ms() - source.learned_ms < REVALIDATE_MS;
+            || (0..REVALIDATE_MS).contains(&(super::worker::now_ms() - source.learned_ms));
         current.then(|| std::sync::Arc::clone(&source.dependencies))
     }
 
     /// Record the ledgers graph source `id` indexes, looked up after
     /// `token`, unless a graph source changed since.
-    pub(crate) fn learn_source(&self, id: &str, dependencies: Vec<String>, token: u64) {
+    pub(crate) fn learn_source(&self, id: &str, dependencies: Vec<String>, token: Token) {
         let mut state = self.state.write().expect("watch lock never poisoned");
-        if state.sources_changed > token {
+        if state.sources_changed > token.seq {
             return;
         }
         state.sources.insert(
             id.to_string(),
             Source {
                 dependencies: dependencies.into(),
-                learned_ms: super::worker::now_ms(),
+                learned_ms: token.at_ms,
             },
         );
     }
@@ -308,33 +348,36 @@ impl BranchWatch {
 
     /// A token for [`Self::learn`] and [`Self::learn_journal`], taken
     /// before the read whose result they record.
-    pub(crate) fn token(&self) -> u64 {
-        self.state.read().expect("watch lock never poisoned").seq
+    pub(crate) fn token(&self) -> Token {
+        Token {
+            seq: self.state.read().expect("watch lock never poisoned").seq,
+            at_ms: super::worker::now_ms(),
+        }
     }
 
     /// Record a branch looked up after `token`, unless something changed it
     /// since.
-    pub(crate) fn learn(&self, ledger_id: &str, record: Option<&NsRecord>, token: u64) {
+    pub(crate) fn learn(&self, ledger_id: &str, record: Option<&NsRecord>, token: Token) {
         let mut state = self.state.write().expect("watch lock never poisoned");
         let branch = state.branches.entry(ledger_id.to_string()).or_default();
-        if branch.touched > token {
+        if branch.touched > token.seq {
             return;
         }
         match record {
             Some(record) => branch.adopt(record),
             None => branch.seen = Some(Seen::Absent),
         }
-        branch.validated_ms = super::worker::now_ms();
+        branch.validated_ms = token.at_ms;
     }
 
     /// Record what a journal read after `token` holds, unless something
     /// changed the branch since.
-    pub(crate) fn learn_journal(&self, ledger_id: &str, holds: Holds, token: u64) {
+    pub(crate) fn learn_journal(&self, ledger_id: &str, holds: Holds, token: Token) {
         let mut state = self.state.write().expect("watch lock never poisoned");
         let Some(branch) = state.branches.get_mut(ledger_id) else {
             return;
         };
-        if branch.touched > token {
+        if branch.touched > token.seq {
             return;
         }
         if let Some(Seen::Live { journal, .. }) = &mut branch.seen {
@@ -450,6 +493,12 @@ impl BranchWatch {
 }
 
 impl Branch {
+    /// Whether what is kept is learned again as it ages: not what a peer's
+    /// stream keeps current.
+    fn revalidates(&self) -> bool {
+        self.seen.is_some() && (!self.replicated || self.version().is_none())
+    }
+
     fn version(&self) -> Option<i64> {
         match self.seen {
             Some(Seen::Live { config_version, .. }) => config_version,
@@ -495,6 +544,19 @@ impl Branch {
 }
 
 impl Seen {
+    /// The incarnation and configuration revision a live branch names.
+    fn revision(&self) -> Option<(Option<Fence>, u128, Option<i64>)> {
+        match *self {
+            Seen::Live {
+                fence,
+                instance,
+                config_version,
+                ..
+            } => Some((fence, instance, config_version)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn live(record: &NsRecord) -> Self {
         Seen::Live {
             fence: record.fence,
@@ -681,8 +743,10 @@ mod tests {
                     ..
                 })
             ));
-            backdate(watch, "w:main");
+            backdate(watch, "w:main", REVALIDATE_MS);
             assert_eq!(watch.revalidation_due("w:main"), !locked);
+            backdate(watch, "w:main", STALE_MS);
+            assert_eq!(watch.stale("w:main"), !locked);
         }
     }
 
@@ -697,10 +761,11 @@ mod tests {
         watch.learn("w:main", Some(&r), watch.token());
         watch.learn_journal("w:main", Holds::Rules, watch.token());
         assert!(!watch.revalidation_due("w:main"));
-        backdate(&watch, "w:main");
+        backdate(&watch, "w:main", REVALIDATE_MS);
         assert!(watch.revalidation_due("w:main"));
         // Claimed: one read at a time.
         assert!(!watch.revalidation_due("w:main"));
+        assert!(!watch.stale("w:main"));
         let token = watch.token();
         watch.revalidated("w:main", Some((Some(&r), None)), token);
         assert!(matches!(
@@ -712,7 +777,7 @@ mod tests {
         ));
         assert!(!watch.revalidation_due("w:main"));
         // A new revision: what the journal holds is read again.
-        backdate(&watch, "w:main");
+        backdate(&watch, "w:main", REVALIDATE_MS);
         assert!(watch.revalidation_due("w:main"));
         r.config_version = Some(3);
         watch.revalidated("w:main", Some((Some(&r), None)), watch.token());
@@ -721,10 +786,44 @@ mod tests {
             Some(Seen::Live { journal: None, .. })
         ));
         // A failed read releases the claim and keeps what is known.
-        backdate(&watch, "w:main");
+        backdate(&watch, "w:main", REVALIDATE_MS);
         assert!(watch.revalidation_due("w:main"));
         watch.revalidated("w:main", None, watch.token());
         assert!(watch.revalidation_due("w:main"));
+    }
+
+    /// Past a quiet spell nothing learned the branch again in the
+    /// background: it is stale, whether or not a read is learning it now,
+    /// until one records what it found.
+    #[test]
+    fn a_branch_nothing_learned_again_grows_stale() {
+        let watch = tracking();
+        let mut r = record(3);
+        r.config_version = Some(2);
+        watch.learn("w:main", Some(&r), watch.token());
+        assert!(!watch.stale("w:main"));
+        backdate(&watch, "w:main", STALE_MS);
+        assert!(watch.stale("w:main"));
+        assert!(watch.revalidation_due("w:main"));
+        assert!(watch.stale("w:main"));
+        watch.revalidated("w:main", Some((Some(&r), None)), watch.token());
+        assert!(!watch.stale("w:main"));
+        // What a read found is as old as the read: one that began before
+        // a long pause does not make the branch young again.
+        let mut token = watch.token();
+        token.at_ms -= STALE_MS;
+        watch.revalidated("w:main", Some((Some(&r), None)), token);
+        assert!(watch.stale("w:main"));
+        // A read overtaken by a commit here leaves the newer head in
+        // place, and still confirms the revision both name.
+        let token = watch.token();
+        watch.observe(&commit(9));
+        watch.revalidated("w:main", Some((Some(&r), None)), token);
+        assert!(!watch.stale("w:main"));
+        assert!(matches!(get(&watch), Some(Seen::Live { head_t: 9, .. })));
+        // An instance that observes every change keeps nothing stale.
+        watch.set_sole_writer();
+        assert!(!watch.stale("w:main"));
     }
 
     /// A head set below the one known, a refresh or another incarnation
@@ -774,9 +873,9 @@ mod tests {
         assert!(watch.source_dependencies("gs").is_none());
     }
 
-    /// Make what is kept of `ledger_id` old enough to be learned again.
-    fn backdate(watch: &BranchWatch, ledger_id: &str) {
+    /// Make what is kept of `ledger_id` older by `ms`.
+    fn backdate(watch: &BranchWatch, ledger_id: &str, ms: i64) {
         let mut state = watch.state.write().unwrap();
-        state.branches.get_mut(ledger_id).unwrap().validated_ms -= REVALIDATE_MS;
+        state.branches.get_mut(ledger_id).unwrap().validated_ms -= ms;
     }
 }

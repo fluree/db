@@ -1,8 +1,9 @@
 //! What retention costs a query. A ledger without a removal reads nothing
 //! for it, and one with a removal reads its journal once, not after every
 //! commit. An instance sharing its storage with another serves what it
-//! learned and learns again in the background, so a removal made elsewhere
-//! reaches its reads within about a second, even one that commits nothing.
+//! learned and learns again in the background, or first once that is
+//! stale, so a removal made elsewhere reaches its reads within about two
+//! seconds, even one that commits nothing.
 
 use async_trait::async_trait;
 use fluree_db_api::{ApiError, Fluree, FlureeBuilder, NameServiceMode};
@@ -305,4 +306,34 @@ async fn a_removal_made_elsewhere_reaches_this_instance() {
             other => panic!("the removal never reached this instance: {other:?}"),
         }
     }
+}
+
+/// An instance nothing queried for a while has learned nothing in the
+/// background meanwhile: its first read after a removal made elsewhere is
+/// refused, and its raw storage is audit data from the first ask.
+#[tokio::test]
+async fn a_removal_made_elsewhere_reaches_the_first_read_after_a_quiet_spell() {
+    let (data, ns) = (MemoryStorage::new(), ReadCounting::new());
+    let here = instance(&data, &ns);
+    let (queried, t1) = two_emails(&here, "it/costs-quiet-query").await;
+    let (gated, _) = two_emails(&here, "it/costs-quiet-gate").await;
+    let past = here.db_at_t(&queried, t1).await.unwrap();
+    here.query(&past, &email_query()).await.expect("before");
+    assert!(!here.history_suppressed(&gated).await.unwrap());
+
+    // Longer than what this instance keeps of a branch may grow stale.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let elsewhere = instance(&data, &ns);
+    for id in [&queried, &gated] {
+        elsewhere
+            .remove_occurrences(id, removal_of("a@one"))
+            .await
+            .expect("remove");
+    }
+
+    assert!(matches!(
+        here.query(&past, &email_query()).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+    assert!(here.history_suppressed(&gated).await.unwrap());
 }

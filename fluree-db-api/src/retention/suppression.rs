@@ -293,6 +293,39 @@ pub(crate) enum Freshness {
     },
 }
 
+/// Learn `ledger_id` again for `watch`: its record, and what its journal
+/// holds where the record does not tell.
+async fn revalidate(
+    watch: &super::watch::BranchWatch,
+    ns: &crate::NameServiceMode,
+    ledger_id: &str,
+) -> Result<()> {
+    use fluree_db_nameservice::NameServiceLookup;
+    let token = watch.token();
+    let found: Result<_> = async {
+        let record = ns.lookup(ledger_id).await?;
+        // A record that names no revision tells nothing of a change to
+        // the journal: read it.
+        let holds = match &record {
+            Some(r) if r.config_version.is_none() => {
+                Some(match registry::read_stored(ns, ledger_id).await?.1 {
+                    Some(stored) => registry::journal_holds(&stored),
+                    None => super::watch::Holds::Nothing,
+                })
+            }
+            _ => None,
+        };
+        Ok((record, holds))
+    }
+    .await;
+    watch.revalidated(
+        ledger_id,
+        found.as_ref().ok().map(|(r, h)| (r.as_ref(), *h)),
+        token,
+    );
+    found.map(|_| ())
+}
+
 /// Suppressions held between reads, by branch. One is reused only for a
 /// journal of the same identity, which its record names without its chunks
 /// being read: a ledger created again under a dropped one's name starts its
@@ -320,12 +353,19 @@ impl Fluree {
                 db.ledger_id
             ))
         };
-        let seen = match watch.check(&db.ledger_id, db.fence) {
+        let mut check = watch.check(&db.ledger_id, db.fence);
+        // A view at the head this instance knows reads current state, as
+        // every read it makes does. One behind it reads an earlier point,
+        // which what is kept decides only while it is not stale.
+        let behind = matches!(check, Check::Known(Seen::Live { head_t, .. }) if db.historical || db.t < head_t);
+        if behind && self.revalidate_if_stale(&db.ledger_id).await? {
+            check = watch.check(&db.ledger_id, db.fence);
+        } else if matches!(check, Check::Known(_)) {
+            self.revalidate_if_due(&db.ledger_id);
+        }
+        let seen = match check {
             Check::FenceDropped => return Err(gone()),
-            Check::Known(seen) => {
-                self.revalidate_if_due(&db.ledger_id);
-                seen
-            }
+            Check::Known(seen) => seen,
             Check::Unknown => {
                 let Ok(id) = fluree_db_core::LedgerId::parse(&db.ledger_id) else {
                     return Ok(Freshness::Current);
@@ -374,30 +414,22 @@ impl Fluree {
         let ns = self.nameservice_mode.clone();
         let ledger_id = ledger_id.to_string();
         crate::wasm_compat::spawn_detached(async move {
-            let token = watch.token();
-            let found = async {
-                use fluree_db_nameservice::NameServiceLookup;
-                let record = ns.lookup(&ledger_id).await.ok()?;
-                // A record that names no revision tells nothing of a
-                // change to the journal: read it.
-                let holds = match &record {
-                    Some(r) if r.config_version.is_none() => {
-                        Some(match registry::read_stored(&ns, &ledger_id).await.ok()?.1 {
-                            Some(stored) => registry::journal_holds(&stored),
-                            None => super::watch::Holds::Nothing,
-                        })
-                    }
-                    _ => None,
-                };
-                Some((record, holds))
-            }
-            .await;
-            watch.revalidated(
-                &ledger_id,
-                found.as_ref().map(|(r, h)| (r.as_ref(), *h)),
-                token,
-            );
+            let _ = revalidate(&watch, &ns, &ledger_id).await;
         });
+    }
+
+    /// Learn `ledger_id` again before the read that asked goes on, when
+    /// what is kept of it is stale (see
+    /// [`super::watch::BranchWatch::stale`]); in the background when it is
+    /// only due. Whether it was learned before returning.
+    async fn revalidate_if_stale(&self, ledger_id: &str) -> Result<bool> {
+        let watch = &self.retention.watch;
+        if !watch.stale(ledger_id) {
+            self.revalidate_if_due(ledger_id);
+            return Ok(false);
+        }
+        revalidate(watch, &self.nameservice_mode, ledger_id).await?;
+        Ok(true)
     }
 
     /// The branch's suppression, using this node's replicated journal.
@@ -430,8 +462,8 @@ impl Fluree {
             let record = self.nameservice().lookup(ledger_id).await?;
             watch.learn(ledger_id, record.as_ref(), token);
             check = watch.check(ledger_id, None);
-        } else {
-            self.revalidate_if_due(ledger_id);
+        } else if self.revalidate_if_stale(ledger_id).await? {
+            check = watch.check(ledger_id, None);
         }
         let token = watch.token();
         let (key, head_t) = match check {
@@ -783,15 +815,17 @@ impl Fluree {
     }
 
     /// Whether this instance knows `ledger_id` (canonically spelled) to
-    /// hold no removal, without reading anything.
+    /// hold no removal, without reading anything. What is kept of it once
+    /// stale tells nothing.
     fn holds_no_removal(&self, ledger_id: &str) -> bool {
+        let watch = &self.retention.watch;
         let known = matches!(
-            self.retention.watch.check(ledger_id, None),
+            watch.check(ledger_id, None),
             Check::Known(Seen::Live {
                 journal: Some(holds),
                 ..
             }) if !holds.removals()
-        );
+        ) && !watch.stale(ledger_id);
         if known {
             self.revalidate_if_due(ledger_id);
         }
