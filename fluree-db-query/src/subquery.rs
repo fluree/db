@@ -371,7 +371,14 @@ impl SubqueryOperator {
                 || subquery.grouping.is_some()
                 || !pass_through_ok);
 
-        let join_mode = if must_evaluate_once {
+        // Per-row mode seeds only `join_keys`, so with none every parent row
+        // runs the same body from the same empty seed and gets the same rows.
+        // Evaluating it once and joining is then the same answer at any parent
+        // size, sliced or not: a slice cuts that one evaluation either way.
+        // (A pinned import is always a join key, so none is lost here.)
+        let seeds_nothing = join_keys.is_empty();
+
+        let join_mode = if must_evaluate_once || seeds_nothing {
             true
         } else {
             // Evaluate-once + hash-join only when there is no inner slice and
@@ -1407,6 +1414,64 @@ mod tests {
                 assert_eq!(ctx.mem_used(), baseline + 123);
             }
         }
+    }
+
+    /// A sliced correlated sub-select runs per parent row, seeded with its join
+    /// keys. One that seeds nothing (no shared variable, or one bound only in
+    /// an OPTIONAL) would rerun the same body from the same empty seed for
+    /// every parent row, so it is evaluated once instead.
+    #[test]
+    fn a_slice_that_seeds_nothing_is_evaluated_once() {
+        use crate::ir::{Ref, Term, TriplePattern};
+        use fluree_db_core::Sid;
+        let (c, o, a) = (VarId(0), VarId(1), VarId(2));
+        let triple = |s, p: &str, o| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(100, p)),
+                Term::Var(o),
+            ))
+        };
+        let plan = |select: Vec<VarId>, patterns: Vec<Pattern>| {
+            // Three parent rows binding ?c: not an identity parent.
+            let parent = Batch::new(
+                Arc::from(vec![c]),
+                vec![vec![Binding::Unbound, Binding::Unbound, Binding::Unbound]],
+            )
+            .unwrap();
+            SubqueryOperator::new(
+                Box::new(crate::seed::BatchReplayOperator::new(
+                    Arc::from(vec![c]),
+                    vec![parent],
+                )),
+                SubqueryPattern::new(select, patterns).with_limit(2),
+                None,
+                PlanningContext::current(),
+            )
+        };
+
+        let seeded = plan(
+            vec![c, o, a],
+            vec![triple(o, "customer", c), triple(o, "amount", a)],
+        );
+        assert_eq!(seeded.join_keys, vec![c]);
+        assert!(!seeded.join_mode, "a slice per seeded parent row");
+
+        let unshared = plan(vec![o, a], vec![triple(o, "amount", a)]);
+        assert!(unshared.correlation_vars.is_empty());
+        assert!(unshared.join_mode, "no shared variable: evaluated once");
+
+        let optional = plan(
+            vec![c, o, a],
+            vec![
+                triple(o, "amount", a),
+                Pattern::Optional(vec![triple(o, "customer", c)]),
+            ],
+        );
+        assert_eq!(optional.correlation_vars, vec![c]);
+        assert!(optional.join_keys.is_empty());
+        assert_eq!(optional.reconcile_vars, vec![c]);
+        assert!(optional.join_mode, "seeds nothing: evaluated once");
     }
 
     /// Verifies that correlation uses SELECT vars, not internal pattern vars.

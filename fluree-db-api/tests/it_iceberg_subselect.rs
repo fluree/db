@@ -1104,3 +1104,121 @@ async fn scans_per_shape() {
         "a seeded JSON-LD sub-select is evaluated once, whatever the outer rows"
     );
 }
+
+/// A sliced JSON-LD sub-select is seeded per outer row only with the variables
+/// its body binds in every row. One that seeds nothing (it shares no variable
+/// with the rows before it, or binds the shared one only in an `OPTIONAL`)
+/// answers the same rows for every outer row, so it is read once whatever the
+/// outer rows; it used to be read once per outer row. The answers match the
+/// twin: the two largest orders, paired with every customer, and those orders
+/// joined to their own customers only.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slice_that_seeds_nothing_is_read_once() {
+    let fluree = setup().await;
+    let (store, _guard) = span_capture::init_test_tracing();
+    let count = || store.find_spans("r2rml.scan_table").len();
+
+    let before = count();
+    sparql_json(
+        &fluree,
+        &format!("SELECT ?n FROM <{LAKE}> WHERE {{ ?c ex:name ?n }}"),
+    )
+    .await
+    .expect("names");
+    let outer = count() - before;
+
+    let ids: Vec<Value> = (1..=50)
+        .map(|i| json!({"@id": format!("http://example.org/customer/{i}")}))
+        .collect();
+    let top_two = |select: &Value, body: &Value| {
+        json!({
+            "@context": ctx(),
+            "from": "{G}",
+            "select": ["?n", "?o", "?a"],
+            "where": [
+                ["values", ["?c", ids.clone()]],
+                {"@id": "?c", "ex:name": "?n"},
+                ["query", {
+                    "@context": ctx(),
+                    "select": select,
+                    "where": body,
+                    "orderBy": "(desc ?a)",
+                    "limit": 2
+                }]
+            ]
+        })
+    };
+    let mut reads = Vec::new();
+    for (what, select, body, expected) in [
+        (
+            "no shared variable",
+            json!(["?o", "?a"]),
+            json!({"@id": "?o", "ex:amount": "?a"}),
+            100,
+        ),
+        (
+            "shared only through an OPTIONAL",
+            json!(["?c", "?o", "?a"]),
+            json!([
+                {"@id": "?o", "ex:amount": "?a"},
+                ["optional", {"@id": "?o", "ex:customer": "?c"}]
+            ]),
+            2,
+        ),
+    ] {
+        // The body alone, as a query of its own.
+        let before = count();
+        fluree
+            .query_from()
+            .jsonld(&json!({
+                "@context": ctx(),
+                "from": LAKE,
+                "select": select,
+                "where": body,
+                "orderBy": "(desc ?a)",
+                "limit": 2
+            }))
+            .execute_formatted()
+            .await
+            .expect("the body alone");
+        let alone = count() - before;
+
+        let before = count();
+        let started = std::time::Instant::now();
+        let rows = jsonld_agrees(&fluree, what, &top_two(&select, &body)).await;
+        let ms = started.elapsed().as_millis();
+        // The twin reads no table, so every read counted is the source's.
+        reads.push((what, alone, count() - before, ms));
+        assert_eq!(rows.len(), expected, "{what}: {rows:?}");
+    }
+    eprintln!(
+        "slice that seeds nothing: outer = {outer}; \
+         (shape, body alone, under 50 outer rows, ms) = {reads:?}"
+    );
+    assert!(outer > 0, "the scan spans are captured");
+    for (what, alone, under, _) in reads {
+        assert_eq!(
+            under,
+            outer + alone,
+            "{what}: the sub-select is read once, not once per outer row"
+        );
+    }
+
+    // The cost the docs state: a slice seeded with the outer row's key is a
+    // top-k per outer row, and reads its tables once per outer row (each read
+    // whole, with no key pushed into the scan yet).
+    let select = json!(["?c", "?o", "?a"]);
+    let body = json!({"@id": "?o", "ex:customer": "?c", "ex:amount": "?a"});
+    let before = count();
+    let started = std::time::Instant::now();
+    let rows = jsonld_agrees(&fluree, "seeded slice", &top_two(&select, &body)).await;
+    let ms = started.elapsed().as_millis();
+    let seeded = count() - before;
+    eprintln!("slice seeded per outer row: {seeded} reads under 50 outer rows ({ms} ms)");
+    assert_eq!(rows.len(), 100, "the two largest orders of each customer");
+    assert!(
+        seeded >= outer + 50,
+        "a seeded slice reads its table once per outer row ({seeded} reads); \
+         update docs/graph-sources/overview.md when this changes"
+    );
+}
