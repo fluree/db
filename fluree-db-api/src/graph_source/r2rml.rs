@@ -201,7 +201,7 @@ pub(crate) fn unpinned_read_schema(
     metadata: &TableMetadata,
 ) -> Option<std::borrow::Cow<'_, fluree_db_iceberg::metadata::Schema>> {
     match metadata.current_snapshot() {
-        Some(snapshot) => read_schema(metadata, snapshot),
+        Some(snapshot) => metadata.read_schema_for_snapshot(snapshot),
         None => metadata.current_schema().map(std::borrow::Cow::Borrowed),
     }
 }
