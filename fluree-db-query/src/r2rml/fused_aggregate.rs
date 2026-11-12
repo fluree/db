@@ -1332,6 +1332,12 @@ struct KeptChainRow {
     /// The kept row's FK value to the NEXT hop (interior levels only); `None` on the
     /// terminal level or when that FK column is null (a null FK breaks the chain).
     next_fk: Option<Vec<String>>,
+    /// Whether another row with this key and this same subject disagrees with the
+    /// kept row on `passes_own` or `next_fk` (an SCD-2 collision, id=3717339904).
+    /// A smaller subject arriving later replaces the row and clears this, so after
+    /// the whole read it describes the keep-min subject's rows alone, whatever
+    /// order the rows arrived in.
+    conflict: bool,
 }
 
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
@@ -4143,9 +4149,10 @@ impl FusedR2rmlAggregateOperator {
     /// #1583: the membership *set* models an inner join only while each FK is
     /// single-valued (one fact row → at most one branch row per hop). A fan-out
     /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]). Relatedly, the keep-min
-    /// build DECLINES a same-key/same-subject SCD-2 collision whose rows disagree on the
-    /// constraint result or next-hop FK (id=3717339904) — keep-min alone would let scan
-    /// order decide the answer.
+    /// build DECLINES a same-key/same-subject SCD-2 collision on the keep-min subject
+    /// whose rows disagree on the constraint result or next-hop FK (id=3717339904) —
+    /// keep-min alone would let scan order decide the answer. Whether it declines does not
+    /// depend on the order a level's rows arrive in.
     async fn build_semi_join_membership(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -4336,6 +4343,7 @@ impl FusedR2rmlAggregateOperator {
                                 subject,
                                 passes_own,
                                 next_fk,
+                                conflict: false,
                             });
                         }
                         Entry::Occupied(mut e) => {
@@ -4348,11 +4356,14 @@ impl FusedR2rmlAggregateOperator {
                             // subject, so it would keep whichever row the scan hit first —
                             // a scan-order-dependent ANSWER (the generic chained join
                             // materializes every version's triples; this fold tests one).
-                            // Decline to the generic path. An IDENTICAL duplicate (same
-                            // subject, same constraint result, same next FK) is benign.
+                            // Such a collision on the keep-min subject declines to the
+                            // generic path once the level is read (below); one on a larger
+                            // subject is discarded with that subject. An IDENTICAL
+                            // duplicate (same subject, same constraint result, same next
+                            // FK) is benign.
                             if subject == e.get().subject {
                                 if passes_own != e.get().passes_own || next_fk != e.get().next_fk {
-                                    return Ok(None);
+                                    e.get_mut().conflict = true;
                                 }
                             } else if subject_sort_key(&subject)
                                 < subject_sort_key(&e.get().subject)
@@ -4361,12 +4372,18 @@ impl FusedR2rmlAggregateOperator {
                                     subject,
                                     passes_own,
                                     next_fk,
+                                    conflict: false,
                                 });
                             }
                         }
                     }
                 }
                 ctx.record_alloc((kept.len() - kept_before) * crate::context::GROUP_EST_BYTES);
+            }
+            // Decided on the whole level, so the order its rows arrive in cannot
+            // change whether the fuse declines.
+            if kept.values().any(|k| k.conflict) {
+                return Ok(None);
             }
 
             // Reduce the kept (keep-min) rows to this level's admitted set.
@@ -8313,6 +8330,90 @@ mod tests {
             "a same-key/same-subject SCD-2 collision with differing constraint results \
              must DECLINE (keep-min would let scan order decide the answer)"
         );
+    }
+
+    /// The semi-join build reads each level in no particular order, so whether it
+    /// declines must not depend on the order a level's rows arrive in. `ORDER_KEY` 10
+    /// is held by three `order_t` rows: the keep-min subject `order/o10` (customer
+    /// 1000, Enterprise) and two rows minting `order/o50` that disagree on the
+    /// customer (1000 vs 1002). The collision is on a subject keep-min discards, so in
+    /// every arrival order the fuse keeps `o10` and answers as the clean fixture does;
+    /// when the colliding subject is the keep-min one (`o05`), every order declines.
+    #[tokio::test]
+    async fn p3_semijoin_decline_does_not_depend_on_row_order() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        fn order_t(rows: &[(&str, i64, i64)]) -> ColumnBatch {
+            mk_batch(vec![
+                scol("OID", 1, rows.iter().map(|r| r.0).collect()),
+                icol("ORDER_KEY", 2, rows.iter().map(|r| Some(r.1)).collect()),
+                icol("CUSTOMER_KEY", 3, rows.iter().map(|r| Some(r.2)).collect()),
+            ])
+        }
+        async fn fuses(batches: std::collections::HashMap<String, Vec<ColumnBatch>>) -> bool {
+            let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+            let pats = crt_patterns();
+            let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+            let provider = CrtProvider {
+                mapping: Arc::clone(&mapping),
+                batches,
+            };
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let ctx =
+                ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+            let star =
+                FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+                    .expect("crt_join_reorder must decompose");
+            crt_op()
+                .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+                .await
+                .expect("resolve must not error")
+                .is_some()
+        }
+        let others = [("o11", 11, 1000), ("o12", 12, 1001), ("o13", 13, 1002)];
+        let orders_of = |key10: [(&'static str, i64, i64); 3]| {
+            let mut runs = Vec::new();
+            for perm in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let rows: Vec<(&str, i64, i64)> = perm
+                    .iter()
+                    .map(|&i| key10[i])
+                    .chain(others.iter().copied())
+                    .collect();
+                runs.push(vec![order_t(&rows)]);
+                runs.push(rows.iter().map(|r| order_t(&[*r])).collect());
+            }
+            runs
+        };
+
+        let discarded = [("o50", 10, 1000), ("o50", 10, 1002), ("o10", 10, 1000)];
+        let expected = vec![
+            ("Gadgets".to_string(), long_sum(3)),
+            ("Widgets".to_string(), long_sum(12)),
+        ];
+        for order_batches in orders_of(discarded) {
+            let mut batches = clean_batches();
+            batches.insert("order_t".to_string(), order_batches);
+            let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), batches).await;
+            assert_eq!(out, expected, "a collision on a discarded subject");
+        }
+
+        let kept = [("o05", 10, 1000), ("o05", 10, 1002), ("o10", 10, 1000)];
+        for order_batches in orders_of(kept) {
+            let mut batches = clean_batches();
+            batches.insert("order_t".to_string(), order_batches);
+            assert!(
+                !fuses(batches).await,
+                "a collision on the keep-min subject declines in every order"
+            );
+        }
     }
 
     /// (a′) VALUE-IDENTITY, Dec i128 path: the same shape with an xsd:decimal measure
