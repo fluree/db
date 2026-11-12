@@ -445,14 +445,15 @@ impl ShapesArtifactWire {
 ///
 /// Delegates to [`fluree_db_transact::value_convert::parse_xsd_lexical`]
 /// so cross-ledger SHACL literals parse with the **same parser the
-/// same-ledger import path uses** for every XSD-recognized datatype:
-/// integer family (with `i64 → BigInt` overflow), `xsd:decimal`
-/// (arbitrary-precision), `xsd:dateTime` / `xsd:date` / `xsd:time`,
-/// the `xsd:gYear*` family, `xsd:duration` / `dayTimeDuration` /
-/// `yearMonthDuration`, `xsd:double` / `xsd:float`, `xsd:boolean`,
-/// the string family, and `rdf:JSON`. SHACL range / `sh:hasValue`
-/// constraints against any of these now produce identical match
-/// behavior between same- and cross-ledger shape sources.
+/// same-ledger write paths use** for every recognized datatype:
+/// integer family (range-checked, with `i64 → BigInt` overflow),
+/// `xsd:decimal` (arbitrary-precision), `xsd:dateTime` / `xsd:date` /
+/// `xsd:time`, the `xsd:gYear*` family, `xsd:duration` /
+/// `dayTimeDuration` / `yearMonthDuration`, `xsd:double` / `xsd:float`,
+/// `xsd:boolean`, the string family, `rdf:JSON`, a `geo:wktLiteral`
+/// point and `f:embeddingVector`. SHACL range / `sh:hasValue`
+/// constraints against any of these produce identical match behavior
+/// between same- and cross-ledger shape sources.
 ///
 /// Returns `Err(detail)` when the lexical form is invalid against a
 /// recognized XSD datatype (e.g., `"abc"^^xsd:integer`). The caller
@@ -475,11 +476,7 @@ fn literal_to_flake_value(
     value: &str,
     datatype: &str,
 ) -> Result<fluree_db_core::FlakeValue, String> {
-    use fluree_db_core::FlakeValue;
-    match fluree_db_transact::value_convert::parse_xsd_lexical(value, datatype)? {
-        Some(fv) => Ok(fv),
-        None => Ok(FlakeValue::String(value.to_string())),
-    }
+    fluree_db_transact::value_convert::parse_xsd_lexical(value, datatype)
 }
 
 /// Term-neutral wire form for a datalog rules artifact.
