@@ -260,7 +260,11 @@ impl crate::Fluree {
             let rollback_snapshot = staged.rollback_snapshot.clone();
             let branch_basis = staged.branch_basis.clone();
 
-            match self.apply_rebase(staged).await {
+            // Held past a rollback: until the head is back on the line the
+            // rebase replaced, a collection pass would find that line's
+            // commits named by nothing.
+            let mut pins = Vec::new();
+            match self.apply_rebase(staged, &mut pins).await {
                 Ok(report) => Ok(report),
                 Err(e) => {
                     tracing::warn!(
@@ -628,7 +632,8 @@ impl crate::Fluree {
 
     /// Pin the planned replays and the line they replace, with its
     /// transactions, and record them as garbage. The pins hold until the
-    /// rebase ends, so no collection pass decides on them meanwhile.
+    /// rebase ends, a rollback of it included, so no collection pass
+    /// decides on them meanwhile.
     async fn record_rebase(
         &self,
         namespace: &StorageNamespace,
@@ -675,7 +680,11 @@ impl crate::Fluree {
     /// the line they replace (with its transactions) are pinned and
     /// recorded as garbage: the collector deletes whichever side the
     /// branch no longer references once the pins go.
-    async fn apply_rebase(&self, staged: StagedRebase) -> Result<RebaseReport> {
+    async fn apply_rebase(
+        &self,
+        staged: StagedRebase,
+        pins: &mut Vec<fluree_db_core::BlobPin>,
+    ) -> Result<RebaseReport> {
         let StagedRebase {
             branch: _,
             branch_id,
@@ -703,7 +712,7 @@ impl crate::Fluree {
         } = staged;
 
         if let Some(ref last_head_id) = new_head_id {
-            let _pins = self
+            *pins = self
                 .record_rebase(&branch_namespace, &pending_replays, &superseded)
                 .await?;
             if !pending_replays.is_empty() {
