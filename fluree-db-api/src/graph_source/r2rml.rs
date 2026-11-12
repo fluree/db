@@ -3374,6 +3374,10 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         if self.delta_source(graph_source_id).await?.is_some() {
             return Ok(None);
         }
+        // A filtered logical table keeps at most its table's rows: the table's
+        // count bounds it, which is all a caller sizing a cache needs.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
         let TableContext {
             metadata,
             metadata_location,
@@ -3422,6 +3426,11 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         if self.delta_source(graph_source_id).await?.is_some() {
             return Ok(None);
         }
+        // A filtered logical table plans `filters` against the table it reads.
+        // Its row filter may prune more files than these counts show; they
+        // only decide whether a keyed read is worth making.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
         let TableContext {
             storage,
             metadata,
