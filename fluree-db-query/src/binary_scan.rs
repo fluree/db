@@ -213,6 +213,10 @@ pub struct BinaryScanOperator {
     ///
     /// Evaluated on `(s_id, o_type, o_key)` before any value decoding.
     encoded_pre_filters: Vec<EncodedPreFilter>,
+    /// The filters `encoded_pre_filters` were compiled from, for novelty rows
+    /// the store cannot encode: those leave the scan decoded and never meet a
+    /// check on the encoded object. Filled only when such rows exist.
+    decoded_lane_filters: Vec<InlineOperator>,
     // Kept for: plan-time emit pruning and index override during query optimization.
     // Use when: planner emits BinaryScanOperator with pruned columns or forced index.
     #[expect(dead_code)]
@@ -399,7 +403,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
     pattern: &TriplePattern,
     store: &BinaryIndexStore,
     allow_string_prefix_pushdown: bool,
-) -> (Vec<EncodedPreFilter>, Vec<InlineOperator>) {
+) -> (Vec<EncodedPreFilter>, Vec<InlineOperator>, Vec<usize>) {
     use crate::ir::{Expression, Function};
 
     let obj_var = match &pattern.o {
@@ -413,7 +417,9 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
 
     let mut out = Vec::new();
     let mut pruned = Vec::with_capacity(inline_ops.len());
-    for op in inline_ops {
+    // Positions in `inline_ops` of the filters compiled into `out`.
+    let mut compiled = Vec::new();
+    for (position, op) in inline_ops.iter().enumerate() {
         let InlineOperator::Filter(expr) = op else {
             pruned.push(op.clone());
             continue;
@@ -429,6 +435,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
                 match build_prefix_id_ranges(store, prefix.as_ref()) {
                     Ok(id_ranges) => {
                         out.push(EncodedPreFilter::ObjectStringPrefix { id_ranges });
+                        compiled.push(position);
                         continue;
                     }
                     Err(_) => {
@@ -444,6 +451,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
                 if let (Some(ov), Expression::Var(v)) = (obj_var, &args[0]) {
                     if *v == ov {
                         out.push(EncodedPreFilter::ObjectIsBlankNode);
+                        compiled.push(position);
                         continue;
                     }
                 }
@@ -461,6 +469,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
             if let Some(lang_id) = store.resolve_lang_id(tag) {
                 let required_otype = fluree_db_core::o_type::OType::lang_string(lang_id).as_u16();
                 out.push(EncodedPreFilter::LangEqualsOType { required_otype });
+                compiled.push(position);
                 continue;
             }
             pruned.push(op.clone());
@@ -483,10 +492,12 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
             Function::Ne => out.push(EncodedPreFilter::SubjectNeObjectRef),
             _ => {
                 pruned.push(op.clone());
+                continue;
             }
         }
+        compiled.push(position);
     }
-    (out, pruned)
+    (out, pruned, compiled)
 }
 
 fn string_literal_str_wrapper_safe(dtc: Option<&DatatypeConstraint>) -> bool {
@@ -759,6 +770,7 @@ impl BinaryScanOperator {
             hide_list_members: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
+            decoded_lane_filters: Vec::new(),
             emit,
             index_hint,
             object_bounds,
@@ -807,6 +819,73 @@ impl BinaryScanOperator {
             return Ok(Some(Batch::empty_schema_with_len(produced)));
         }
         Ok(Some(Batch::new(self.schema.clone(), columns)?))
+    }
+
+    /// The binding a decoded flake's object takes in this scan's rows.
+    fn decoded_object_binding(&self, flake: &Flake) -> Binding {
+        match &flake.o {
+            // Object bindings carry the assertion time for both
+            // ref- and literal-valued flakes — `T(?v)` resolves
+            // uniformly. The `op` channel is only populated in
+            // history mode, where the scan emits both asserts
+            // and retracts; current-state scans only ever see
+            // asserts so the distinction would be misleading.
+            FlakeValue::Ref(r) if self.mode.is_history() => {
+                Binding::sid_with_t_op(r.clone(), flake.t, flake.op)
+            }
+            FlakeValue::Ref(r) => Binding::sid_with_t(r.clone(), flake.t),
+            v => {
+                let dtc = match flake
+                    .m
+                    .as_ref()
+                    .and_then(|m| m.lang.as_ref())
+                    .map(|s| Arc::<str>::from(s.as_str()))
+                {
+                    Some(lang) => DatatypeConstraint::LangTag(lang),
+                    None => DatatypeConstraint::Explicit(flake.dt.clone()),
+                };
+                Binding::Lit {
+                    val: v.clone(),
+                    dtc,
+                    t: Some(flake.t),
+                    op: if self.mode.is_history() {
+                        Some(flake.op)
+                    } else {
+                        None
+                    },
+                    p_id: None,
+                }
+            }
+        }
+    }
+
+    /// Whether a decoded flake passes the filters the scan compiled into
+    /// checks on the encoded object. They name only the pattern's subject and
+    /// object, which are bound here whether or not the scan emits them.
+    fn decoded_row_passes_compiled_filters(
+        &self,
+        flake: &Flake,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<bool> {
+        let mut schema = Vec::with_capacity(2);
+        let mut bindings = Vec::with_capacity(2);
+        if let Ref::Var(s) = &self.pattern.s {
+            schema.push(*s);
+            bindings.push(Binding::sid(flake.s.clone()));
+        }
+        if let Term::Var(o) = &self.pattern.o {
+            schema.push(*o);
+            bindings.push(self.decoded_object_binding(flake));
+        }
+        let row = crate::binding::BindingRow::new(&schema, &bindings);
+        for op in &self.decoded_lane_filters {
+            if let InlineOperator::Filter(expr) = op {
+                if !expr.eval_to_bool_non_strict(&row, Some(ctx))? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Convert Flakes from the range_iter fallback into bindings, mirroring
@@ -894,6 +973,12 @@ impl BinaryScanOperator {
                 }
             }
 
+            if !self.decoded_lane_filters.is_empty()
+                && !self.decoded_row_passes_compiled_filters(&flake, ctx)?
+            {
+                continue;
+            }
+
             let mut bindings: Vec<Binding> = vec![Binding::Unbound; base_len];
 
             if let Some(pos) = self.s_var_pos.filter(|p| *p < base_len) {
@@ -903,40 +988,7 @@ impl BinaryScanOperator {
                 bindings[pos] = Binding::sid(flake.p.clone());
             }
             if let Some(pos) = self.o_var_pos.filter(|p| *p < base_len) {
-                bindings[pos] = match &flake.o {
-                    // Object bindings carry the assertion time for both
-                    // ref- and literal-valued flakes — `T(?v)` resolves
-                    // uniformly. The `op` channel is only populated in
-                    // history mode, where the scan emits both asserts
-                    // and retracts; current-state scans only ever see
-                    // asserts so the distinction would be misleading.
-                    FlakeValue::Ref(r) if self.mode.is_history() => {
-                        Binding::sid_with_t_op(r.clone(), flake.t, flake.op)
-                    }
-                    FlakeValue::Ref(r) => Binding::sid_with_t(r.clone(), flake.t),
-                    v => {
-                        let dtc = match flake
-                            .m
-                            .as_ref()
-                            .and_then(|m| m.lang.as_ref())
-                            .map(|s| Arc::<str>::from(s.as_str()))
-                        {
-                            Some(lang) => DatatypeConstraint::LangTag(lang),
-                            None => DatatypeConstraint::Explicit(flake.dt.clone()),
-                        };
-                        Binding::Lit {
-                            val: v.clone(),
-                            dtc,
-                            t: Some(flake.t),
-                            op: if self.mode.is_history() {
-                                Some(flake.op)
-                            } else {
-                                None
-                            },
-                            p_id: None,
-                        }
-                    }
-                };
+                bindings[pos] = self.decoded_object_binding(&flake);
             }
 
             if !apply_inline(&self.inline_ops, &self.schema, &mut bindings, Some(ctx))? {
@@ -2916,12 +2968,18 @@ impl Operator for BinaryScanOperator {
         self.state = OperatorState::Open;
 
         // Compile pre-filters that can run on encoded columns (no decoding).
-        let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+        let (encoded, pruned, compiled) = compile_encoded_pre_filters_and_prune_inline_ops(
             &self.inline_ops,
             &self.pattern,
             store_ref,
             !crate::fast_path_common::overlay_has_novelty(ctx),
         );
+        if self.range_iter.is_some() {
+            self.decoded_lane_filters = compiled
+                .into_iter()
+                .map(|position| self.inline_ops[position].clone())
+                .collect();
+        }
         self.encoded_pre_filters = encoded;
         self.inline_ops = pruned;
 

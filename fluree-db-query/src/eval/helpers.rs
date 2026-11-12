@@ -291,15 +291,7 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
         return Ok(None);
     }
 
-    // The store's instance id, not its address: a dropped store's address can
-    // be reused by the next one built, and its verdicts would then answer for
-    // a different dictionary (an ABA misread).
-    let cache_key = (
-        store.store_id(),
-        ctx.binary_g_id,
-        spec.expr_hash,
-        binding_key,
-    );
+    let cache_key = encoded_bool_predicate_key(store, ctx.binary_g_id, spec.expr_hash, binding_key);
     if let Some(hit) =
         ENCODED_BOOL_PREDICATE_CACHE.with(|cache| cache.borrow_mut().get(&cache_key).copied())
     {
@@ -311,6 +303,18 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
         cache.borrow_mut().put(cache_key, pass);
     });
     Ok(Some(pass))
+}
+
+/// Keyed by the store's instance id, not its address: a dropped store's
+/// address can be reused by the next one built, and its verdicts would then
+/// answer for a different dictionary (an ABA misread).
+fn encoded_bool_predicate_key(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    g_id: u16,
+    expr_hash: u64,
+    binding_key: EncodedBindingCacheKey,
+) -> EncodedBoolPredicateKey {
+    (store.store_id(), g_id, expr_hash, binding_key)
 }
 
 /// `Eq`/`Ne` between one variable and one variable-free operand — the shape
@@ -1058,6 +1062,24 @@ mod tests {
     /// A verdict is remembered only for ids the store persisted: a string or
     /// subject id up to its watermark and a predicate id below the store's
     /// count. One past them is a view's own and is not.
+    /// The key names a store by its instance id, which no later store takes,
+    /// and not by its address, which the next store built can.
+    #[test]
+    fn a_verdict_is_keyed_by_the_stores_instance_id() {
+        use fluree_db_binary_index::BinaryIndexStore;
+
+        let binding = EncodedBindingCacheKey::Pid { p_id: 1 };
+        let dropped = BinaryIndexStore::empty(std::env::temp_dir());
+        let dropped_key = encoded_bool_predicate_key(&dropped, 0, 7, binding);
+        assert_eq!(dropped_key.0, dropped.store_id());
+        drop(dropped);
+
+        let rebuilt = BinaryIndexStore::empty(std::env::temp_dir());
+        let rebuilt_key = encoded_bool_predicate_key(&rebuilt, 0, 7, binding);
+        assert_eq!(rebuilt_key.0, rebuilt.store_id());
+        assert_ne!(rebuilt_key, dropped_key);
+    }
+
     #[test]
     fn only_ids_the_store_persisted_are_remembered() {
         let novelty = DictNovelty::with_watermarks(vec![0, 10], 100);
