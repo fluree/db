@@ -34,9 +34,10 @@ enum TransferKind {
 /// operations and MUST succeed. Collecting from those forms would wrongly
 /// reject them, so they are excluded here.
 ///
-/// Parser-synthesized labels (`-bnpl<N>` from blank-node property lists) are
-/// minted from a counter that is monotonic across the whole request, so they
-/// can never collide across operations; they flow through here harmlessly.
+/// Parser-synthesized labels (`-anon<N>` for `[]`, `-bnpl<N>` for blank-node
+/// property lists) are minted from a counter that is monotonic across the
+/// whole request, so they can never collide across operations; they flow
+/// through here harmlessly.
 pub(super) fn collect_template_bnode_labels(
     op: &UpdateOperation,
     out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
@@ -45,21 +46,17 @@ pub(super) fn collect_template_bnode_labels(
         tp: &crate::ast::TriplePattern,
         out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
     ) {
-        use crate::ast::{BlankNodeValue, SubjectTerm, Term};
+        use crate::ast::{SubjectTerm, Term};
 
         fn from_subject(s: &SubjectTerm, out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>) {
             match s {
                 SubjectTerm::BlankNode(bn) => {
-                    if let BlankNodeValue::Labeled(label) = &bn.value {
-                        out.push((label.clone(), bn.span));
-                    }
+                    out.push((bn.label.clone(), bn.span));
                 }
                 SubjectTerm::QuotedTriple(qt) => {
                     from_subject(&qt.subject, out);
                     if let Term::BlankNode(bn) = qt.object.as_ref() {
-                        if let BlankNodeValue::Labeled(label) = &bn.value {
-                            out.push((label.clone(), bn.span));
-                        }
+                        out.push((bn.label.clone(), bn.span));
                     }
                 }
                 // A triple-term value subject (deferred, D-1) — mirror the
@@ -68,9 +65,7 @@ pub(super) fn collect_template_bnode_labels(
                 SubjectTerm::TripleTerm(tt) => {
                     from_subject(&tt.subject, out);
                     if let Term::BlankNode(bn) = &tt.object {
-                        if let BlankNodeValue::Labeled(label) = &bn.value {
-                            out.push((label.clone(), bn.span));
-                        }
+                        out.push((bn.label.clone(), bn.span));
                     }
                 }
                 SubjectTerm::Var(_) | SubjectTerm::Iri(_) => {}
@@ -79,23 +74,17 @@ pub(super) fn collect_template_bnode_labels(
 
         from_subject(&tp.subject, out);
         if let Term::BlankNode(bn) = &tp.object {
-            if let BlankNodeValue::Labeled(label) = &bn.value {
-                out.push((label.clone(), bn.span));
-            }
+            out.push((bn.label.clone(), bn.span));
         }
         if let Some(annotation) = &tp.annotation {
             for unit in &annotation.units {
                 if let Some(crate::ast::annotation::ReifierId::BlankNode(bn)) = &unit.reifier {
-                    if let BlankNodeValue::Labeled(label) = &bn.value {
-                        out.push((label.clone(), bn.span));
-                    }
+                    out.push((bn.label.clone(), bn.span));
                 }
                 if let Some(block) = &unit.block {
                     for entry in &block.entries {
                         if let Term::BlankNode(bn) = &entry.object {
-                            if let BlankNodeValue::Labeled(label) = &bn.value {
-                                out.push((label.clone(), bn.span));
-                            }
+                            out.push((bn.label.clone(), bn.span));
                         }
                     }
                 }

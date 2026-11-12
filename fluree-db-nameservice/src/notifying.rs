@@ -111,7 +111,7 @@ where
         // their per-branch state. Without this notification the new
         // whole-ledger drop path would leave stale caches behind.
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
         });
         Ok(remaining)
     }
@@ -153,7 +153,7 @@ where
     async fn retract(&self, ledger_id: &str) -> Result<()> {
         self.inner.retract(ledger_id).await?;
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
         });
         Ok(())
     }
