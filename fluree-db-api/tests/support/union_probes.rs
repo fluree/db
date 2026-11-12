@@ -24,7 +24,7 @@
 //! The lists are list members, values of the predicate that holds them, as
 //! both SPARQL and JSON-LD read them (#2217).
 
-use crate::multigraph::{outcomes, switch};
+use crate::multigraph::{batched_flush_ran, outcomes, switch};
 use crate::span_capture::init_test_tracing;
 use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
 use serde_json::{json, Value as JsonValue};
@@ -592,6 +592,9 @@ pub struct Run {
     pub generic: Result<Vec<String>, String>,
     pub proceeded: Vec<String>,
     pub fell_back: Vec<(String, String)>,
+    /// Whether a batched join flush ran in the fast run
+    /// ([`crate::multigraph::batched_flush_ran`]).
+    pub flushed: bool,
 }
 
 /// `shape` on `surface`, with fast paths on and off.
@@ -611,7 +614,7 @@ pub async fn run_on(
     set_fast_paths_disabled(true);
     let generic = fx.on(surface, ledger, prologue, dataset, shape).await;
     set_fast_paths_disabled(false);
-    Run::of(fast, generic, outcomes(&store))
+    Run::of(fast, generic, outcomes(&store), batched_flush_ran(&store))
 }
 
 /// A SPARQL `SELECT` of `vars` with `body` as the whole `WHERE` clause,
@@ -632,7 +635,7 @@ pub async fn run_where(
     set_fast_paths_disabled(true);
     let generic = fx.sparql_where(ledger, prologue, dataset, body, vars).await;
     set_fast_paths_disabled(false);
-    Run::of(fast, generic, outcomes(&store))
+    Run::of(fast, generic, outcomes(&store), batched_flush_ran(&store))
 }
 
 impl Run {
@@ -640,10 +643,12 @@ impl Run {
         fast: Result<Vec<String>, String>,
         generic: Result<Vec<String>, String>,
         stamps: Vec<(String, String)>,
+        flushed: bool,
     ) -> Self {
         Run {
             fast,
             generic,
+            flushed,
             proceeded: stamps
                 .iter()
                 .filter(|(_, o)| o == "proceed")

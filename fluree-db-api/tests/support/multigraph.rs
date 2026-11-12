@@ -1517,6 +1517,9 @@ pub struct Run {
     pub proceeded: Vec<String>,
     /// The fast-path sites that stamped a fallback, with its outcome.
     pub fell_back: Vec<(String, String)>,
+    /// Whether a batched join flush ran in the fast run
+    /// ([`batched_flush_ran`]).
+    pub flushed: bool,
 }
 
 /// The lock every run that sets the process-wide fast-path switch holds.
@@ -1568,7 +1571,24 @@ where
             .into_iter()
             .filter(|(_, o)| o != "proceed")
             .collect(),
+        flushed: batched_flush_ran(&store),
     }
+}
+
+/// The nested-loop join's union probe stamps `proceed` when it plans, before
+/// any row reaches it; whether it then ran shows only in its flush span. A
+/// flush that hands its rows to the per-row path answers the same rows,
+/// so the answers alone can't show it either.
+pub const NESTED_LOOP_BATCHED_UNION: &str = "nested-loop-batched-union";
+
+/// Whether `store` captured a batched join flush: the span each batched
+/// lane's flush runs under, which a flush that reroutes its rows per-row
+/// never opens.
+pub fn batched_flush_ran(store: &SpanStore) -> bool {
+    store
+        .span_names()
+        .iter()
+        .any(|name| name.starts_with("join_flush_batched"))
 }
 
 /// The fast-path outcomes `store` captured, as `(site, outcome)`.
@@ -1663,6 +1683,11 @@ pub fn assert_routing(
             failures.push(format!(
                 "{}: `{site}` did not proceed (proceeded: {:?}; fell back: {:?})",
                 run.label, run.proceeded, run.fell_back
+            ));
+        } else if *site == NESTED_LOOP_BATCHED_UNION && !run.flushed {
+            failures.push(format!(
+                "{}: `{site}` proceeded but never flushed",
+                run.label
             ));
         }
     }

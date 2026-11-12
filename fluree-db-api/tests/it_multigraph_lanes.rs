@@ -1382,6 +1382,8 @@ fn check_union_probes(
                 "{label}: `{site}` did not proceed (proceeded {:?}, fell back {:?})",
                 run.proceeded, run.fell_back
             ));
+        } else if *site == multigraph::NESTED_LOOP_BATCHED_UNION && !run.flushed {
+            failures.push(format!("{label}: `{site}` proceeded but never flushed"));
         }
     }
     for site in must_not_fire {
