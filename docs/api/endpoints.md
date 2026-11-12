@@ -2838,6 +2838,27 @@ Returns comprehensive ledger metadata including namespace codes, property stats,
 }
 ```
 
+For a graph source (Iceberg, Delta, SQL), a class or property `count` is the exact number a native ledger loaded with the mapping's triples would report, or `null` where table metadata cannot prove it. A `null` count carries `count-upper-bound` when a bound is provable, and a `null` entry of `ref-classes` carries its bound under `ref-classes-upper-bound`:
+
+```json
+"classes": {
+  "ex:Customer": {
+    "count": null,
+    "count-upper-bound": 9000000,
+    "properties": {
+      "ex:placedBy": {
+        "count": null,
+        "count-upper-bound": 6000000,
+        "ref-classes": { "ex:Customer": null },
+        "ref-classes-upper-bound": { "ex:Customer": 6000000 }
+      }
+    }
+  }
+}
+```
+
+Earlier releases put the tables' row counts in `count`. A client that displays a count reads `count`, falls back to `count-upper-bound` ("at most N"), and shows a count with neither as unknown, never as 0. Most counts of a map with no declared key are `null`; see [Iceberg → `info`](../graph-sources/iceberg.md) for when a count is exact.
+
 When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
 
 **Response (proxy storage mode):**
