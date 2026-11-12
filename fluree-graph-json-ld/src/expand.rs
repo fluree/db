@@ -517,10 +517,13 @@ fn parse_value_object(
     let mut obj = Map::new();
 
     if type_iri.as_deref() == Some("@id") {
-        let iri_val = match val.as_str() {
-            Some(s) => iri_dispatch(s, context, false, strict)?,
-            None => String::new(),
+        let Some(iri) = val.as_str() else {
+            return Err(JsonLdError::InvalidKeywordValue {
+                keyword: "@value",
+                reason: "a value object typed @id names an IRI, so its @value must be a string",
+            });
         };
+        let iri_val = iri_dispatch(iri, context, false, strict)?;
         obj.insert("@id".to_string(), json!(iri_val));
     } else {
         obj.insert("@value".to_string(), val.clone());
@@ -1286,6 +1289,17 @@ mod tests {
                 json!([{"@value": "TWD"}]),
                 "{coercion}: {expanded}"
             );
+        }
+
+        // An explicit `@id` type names an IRI, which only a string can.
+        for value in [json!(5), json!(true), JsonValue::Null] {
+            let doc = json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:price",
+                "ex:unit": {"@value": value, "@type": "@id"}
+            });
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("@value must be a string"), "{value}: {err}");
         }
 
         // The string beside it is still coerced.

@@ -89,3 +89,30 @@ async fn value_object_under_id_or_vocab_term_stores_a_literal() {
         );
     }
 }
+
+/// A value object typed `@id` names an IRI, which only a string can: any
+/// other `@value` is refused rather than stored as a reference to nothing.
+#[tokio::test]
+async fn a_value_object_typed_id_with_a_non_string_value_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, value) in [json!(5), json!(true)].into_iter().enumerate() {
+        let ledger = fluree
+            .create_ledger(&format!("tx/value-object-id-non-string-{i}:main"))
+            .await
+            .expect("genesis");
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:price",
+            "ex:unit": {"@value": value, "@type": "@id"}
+        });
+        let err = fluree
+            .insert(ledger, &doc)
+            .await
+            .expect_err("a non-string @value typed @id");
+        assert_eq!(err.status_code(), 400, "{value}: {err}");
+        assert!(
+            err.to_string().contains("@value must be a string"),
+            "{value}: {err}"
+        );
+    }
+}

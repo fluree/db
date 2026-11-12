@@ -116,9 +116,10 @@ pub(crate) fn reject_deferred_object_wrappers(map: &Map<String, Value>) -> Resul
 /// explicit `@type` / `@language` on the value object.
 ///
 /// Why: the JSON-LD expander applies a predicate's term-coerced
-/// `@type` and the active default `@language` to bare `{"@value": ...}`
-/// objects, so the base flake's `EdgeKey` ends up with the coerced
-/// datatype / language. The reified bundle synthesized by this module,
+/// `@type` (a datatype or `@json`; `@id` and `@vocab` coerce only strings,
+/// never a value object) and the active default `@language` to bare
+/// `{"@value": ...}` objects, so the base flake's `EdgeKey` ends up with
+/// the coerced datatype / language. The reified bundle synthesized by this module,
 /// however, only copies *explicit* `@type` / `@language` from the
 /// value object. Without rejection, the two EdgeKeys would silently
 /// diverge — exactly the failure mode the gate tests in
@@ -145,13 +146,13 @@ pub(crate) fn reject_context_coercion_on_annotated_literal(
     // datatype. `@id` and `@vocab` coerce only strings, never a value
     // object, so they leave both sides a plain literal.
     if let Some(e) = entry {
-        if let Some(type_) = e.type_.as_ref() {
-            if !map.contains_key("@type") {
-                let coerced = match type_ {
-                    TypeValue::Iri(t) => t.clone(),
-                    TypeValue::Json => "@json".to_string(),
-                    TypeValue::Id | TypeValue::Vocab => return Ok(()),
-                };
+        if !map.contains_key("@type") {
+            let coerced = match e.type_.as_ref() {
+                Some(TypeValue::Iri(t)) => Some(t.clone()),
+                Some(TypeValue::Json) => Some("@json".to_string()),
+                Some(TypeValue::Id | TypeValue::Vocab) | None => None,
+            };
+            if let Some(coerced) = coerced {
                 return Err(TransactError::Parse(format!(
                     "annotated literal on '{predicate}' relies on @context term coercion \
                      (@type='{coerced}'); annotated literals must carry an explicit @type so the \
@@ -2591,6 +2592,48 @@ mod tests {
                 && (msg.contains("XMLSchema#date") || msg.contains("xsd:date")),
             "got: {msg}"
         );
+    }
+
+    /// A term typed `@id` or `@vocab` leaves an annotated value object a
+    /// plain literal, so the default language still reaches it and is still
+    /// refused, as under an untyped term.
+    #[test]
+    fn rejects_default_language_on_annotated_string_under_an_id_or_vocab_term() {
+        for coercion in ["@id", "@vocab"] {
+            let doc = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "@language": "fr",
+                    "label": { "@id": "ex:label", "@type": coercion }
+                },
+                "@id": "ex:alice",
+                "label": {
+                    "@value": "chat",
+                    "@annotation": { "ex:source": "lex" }
+                }
+            });
+            let msg = lower(doc).unwrap_err().to_string();
+            assert!(
+                msg.contains("@context language coercion (@language='fr')"),
+                "{coercion}: {msg}"
+            );
+
+            // With its own language the same literal is annotated.
+            let explicit = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "@language": "fr",
+                    "label": { "@id": "ex:label", "@type": coercion }
+                },
+                "@id": "ex:alice",
+                "label": {
+                    "@value": "chat",
+                    "@language": "en",
+                    "@annotation": { "ex:source": "lex" }
+                }
+            });
+            assert!(lower(explicit).is_ok(), "{coercion}: explicit language");
+        }
     }
 
     #[test]
