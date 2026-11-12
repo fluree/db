@@ -1558,6 +1558,97 @@ async fn update_where_bind_str_dt_with_an_unseen_datatype_iri() {
     assert_eq!(both, json!(["ex:direct", "ex:error"]));
 }
 
+/// `str-dt` takes any IRI as its datatype, and nothing else: a datatype that
+/// is not an IRI is a type error, which leaves the value unbound in a query
+/// and fails an update, on both surfaces. It used to build a literal whose
+/// datatype was the string, and an update stored it.
+#[tokio::test]
+async fn str_dt_refuses_a_datatype_that_is_not_an_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/transact-update:str-dt-not-an-iri";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(r#"PREFIX ex: <http://example.com/> INSERT DATA { ex:s ex:text "a" }"#)
+        .commit()
+        .await
+        .expect("seed");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+
+    for (datatype, bound) in [
+        (r#""not an iri""#, false),
+        ("5", false),
+        (r#""urn:example:dt""#, true),
+        (r#"IRI("urn:example:dt")"#, true),
+        ("<urn:example:dt>", true),
+    ] {
+        let query = format!(
+            r#"PREFIX ex: <http://example.com/>
+               SELECT ?b WHERE {{ ex:s ex:text ?t BIND(STRDT(?t, {datatype}) AS ?v) BIND(BOUND(?v) AS ?b) }}"#
+        );
+        let json = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{datatype}: {e}"))
+            .to_sparql_json(&ledger.snapshot)
+            .expect("sparql json");
+        assert_eq!(
+            json["results"]["bindings"][0]["b"]["value"],
+            bound.to_string(),
+            "SPARQL STRDT with {datatype}: {json}"
+        );
+    }
+    for (datatype, bound) in [("\"not an iri\"", false), ("\"urn:example:dt\"", true)] {
+        let rows = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id": "ex:s", "ex:text": "?t"},
+                    ["bind", "?v", format!("(str-dt ?t {datatype})"), "?b", "(bound ?v)"]
+                ],
+                "select": "?b"
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{datatype}: {e}"))
+        .to_jsonld(&ledger.snapshot)
+        .expect("format");
+        assert_eq!(rows, json!([bound]), "JSON-LD str-dt with {datatype}");
+    }
+
+    let sparql = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.com/>
+               INSERT { ex:s ex:typed ?v } WHERE { ex:s ex:text ?t BIND(STRDT(?t, "not an iri") AS ?v) }"#,
+        )
+        .commit()
+        .await;
+    assert!(
+        sparql.is_err(),
+        "SPARQL update stored it: {:?}",
+        sparql.ok().map(|r| r.receipt.t)
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id": "ex:s", "ex:text": "?t"},
+                    ["bind", "?v", "(str-dt ?t \"not an iri\")"]
+                ],
+                "insert": {"id": "ex:s", "ex:typed": "?v"}
+            }),
+        )
+        .await;
+    assert!(jsonld.is_err(), "JSON-LD update stored it");
+}
+
 #[tokio::test]
 async fn update_where_bind_error_handling_invalid_iri_type() {
     // W3C §17: type mismatch in IRI() produces unbound, not an error.
