@@ -262,7 +262,32 @@ impl Fluree {
             .as_ref()
             .and_then(|r| r.erasures.iter().find(|j| j.request_id == request_id))
         {
-            return Ok(receipt_of(job, manifest, removals));
+            if job.stage != ErasureStage::Failed {
+                return Ok(receipt_of(job, manifest, removals));
+            }
+            // Asked again, a failed job is tried again from where it
+            // stopped, under the authorization it has.
+            let retried = registry::update(ns, self.registry_objects(), ledger_id.as_str(), |r| {
+                let mut next = r?.clone();
+                let job = next
+                    .erasures
+                    .iter_mut()
+                    .find(|j| j.request_id == request_id && j.stage == ErasureStage::Failed)?;
+                job.stage = ErasureStage::Proving;
+                job.retries = 0;
+                job.timeouts = 0;
+                job.retry_at_ms = None;
+                job.last_error = None;
+                Some(next)
+            })
+            .await?;
+            self.retention.mark_active(ledger_id.as_str());
+            let job = retried
+                .and_then(|r| r.erasures.into_iter().find(|j| j.request_id == request_id))
+                .ok_or_else(|| {
+                    ApiError::internal(format!("erasure {request_id} was not recorded"))
+                })?;
+            return Ok(receipt_of(&job, manifest, removals));
         }
 
         let commits = self.commits_to_erase(&ledger_id, &found, &branches).await?;

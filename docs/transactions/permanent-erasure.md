@@ -392,7 +392,7 @@ and timings, but not its requester, `commits`, properties or `lastError`.
 
 | Field | Meaning |
 |---|---|
-| `stage` | `proving`, `indexing` (proved, waiting for an index of its commits), `published`, `purging`, `purged`, or `failed`. A later release may add stages: treat one you do not know as still in progress. |
+| `stage` | `proving`, `indexing` (proved, waiting for an index of its commits), `published`, `purging`, `purged`, or `failed`. A failed request is tried again, from where it stopped, when the same request is made again. A later release may add stages: treat one you do not know as still in progress. |
 | `commits[].proved` | Per commit, once this request proved it: the slots it removed, the replacement it redacted further (`base`, absent for the original), the replacement, the receipt hash, input and replacement sizes, cycles, segments, proving time. Absent when an earlier request's erasure already removes the commit's requested occurrences. |
 | `retries`, `retryAtMs`, `lastError` | Failed steps and when the next try runs |
 | `acceptedMs`, `publishedMs` | When the request was accepted and published |

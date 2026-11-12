@@ -368,6 +368,23 @@ async fn a_job_fails_at_its_third_proving_timeout() {
         "{too_slow:?}"
     );
 
+    // Asked again, the failed job is tried again, and now proves.
+    let id = "it/erase-too-slow:main";
+    let receipt = fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase again");
+    assert_eq!(receipt.request_id, too_slow.request_id);
+    assert_eq!(receipt.stage, ErasureStage::Proving);
+    fluree.run_erasure_pass(id).await.unwrap();
+    let status = fluree.retention_status(id).await.unwrap();
+    let retried = &status.registration.unwrap().erasures[0];
+    assert_ne!(retried.stage, ErasureStage::Failed, "{retried:?}");
+    assert_eq!(retried.timeouts, 0, "{retried:?}");
+    assert!(
+        retried.commits.iter().all(|c| c.proved.is_some()),
+        "{retried:?}"
+    );
 }
 
 /// Proving a commit past the most operations a proof can cover would only
