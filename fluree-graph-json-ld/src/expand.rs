@@ -493,14 +493,16 @@ fn parse_value_object(
 
     // The object's own `@type` and `@language` exclude each other. Its own
     // language overrides the datatype its term would give, and a datatype
-    // excludes the default language.
+    // excludes the default language. A term's `@id` or `@vocab` coercion
+    // never applies here: JSON-LD 1.1 coerces only a string value to an IRI
+    // (Value Expansion), and a value object is a literal. Only an explicit
+    // `"@type": "@id"` on the object makes it a reference.
     let type_iri = match explicit_type {
         Some(_) if explicit_language.is_some() => return Err(JsonLdError::LanguageWithType),
         Some(t) => Some(t),
         None if explicit_language.is_some() => None,
         None => entry.as_ref().and_then(|e| match &e.type_ {
             Some(TypeValue::Iri(t)) => Some(t.clone()),
-            Some(TypeValue::Id) => Some("@id".to_string()),
             _ => None,
         }),
     };
@@ -515,10 +517,13 @@ fn parse_value_object(
     let mut obj = Map::new();
 
     if type_iri.as_deref() == Some("@id") {
-        let iri_val = match val.as_str() {
-            Some(s) => iri_dispatch(s, context, false, strict)?,
-            None => String::new(),
+        let Some(iri) = val.as_str() else {
+            return Err(JsonLdError::InvalidKeywordValue {
+                keyword: "@value",
+                reason: "a value object typed @id names an IRI, so its @value must be a string",
+            });
         };
+        let iri_val = iri_dispatch(iri, context, false, strict)?;
         obj.insert("@id".to_string(), json!(iri_val));
     } else {
         obj.insert("@value".to_string(), val.clone());
@@ -1233,6 +1238,82 @@ mod tests {
         let obj = result.as_object().unwrap();
 
         assert_eq!(obj["bar"][0]["@value"], false);
+    }
+
+    /// A term's `@id` or `@vocab` coercion turns a string into an IRI, but a
+    /// value object stays a literal, with only its own `@type` or
+    /// `@language` (JSON-LD 1.1 API, Expansion Algorithm step 4.3 and Value
+    /// Expansion). An explicit `"@type": "@id"` still makes a reference.
+    #[test]
+    fn value_object_under_id_or_vocab_term_stays_a_literal() {
+        let xsd_string = "http://www.w3.org/2001/XMLSchema#string";
+        for coercion in ["@id", "@vocab"] {
+            let doc = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#",
+                    "unit": {"@id": "ex:unit", "@type": coercion}
+                },
+                "@id": "ex:price",
+                "unit": [
+                    {"@value": "TWD"},
+                    {"@value": "TWD", "@language": "en"},
+                    {"@value": "TWD", "@type": "xsd:string"},
+                    {"@value": 5},
+                    {"@value": "ex:TWD", "@type": "@id"}
+                ]
+            });
+            let expanded = crate::expand(&doc).unwrap();
+            assert_eq!(
+                expanded["http://example.org/unit"],
+                json!([
+                    {"@value": "TWD"},
+                    {"@value": "TWD", "@language": "en"},
+                    {"@value": "TWD", "@type": xsd_string},
+                    {"@value": 5},
+                    {"@id": "http://example.org/TWD"}
+                ]),
+                "{coercion}: {expanded}"
+            );
+
+            // A single value object, not in an array, the shape an
+            // extraction service's answer writes.
+            let single = json!({
+                "@context": {"ex": "http://example.org/", "unit": {"@id": "ex:unit", "@type": coercion}},
+                "@id": "ex:price",
+                "unit": {"@value": "TWD"}
+            });
+            let expanded = crate::expand(&single).unwrap();
+            assert_eq!(
+                expanded["http://example.org/unit"],
+                json!([{"@value": "TWD"}]),
+                "{coercion}: {expanded}"
+            );
+        }
+
+        // An explicit `@id` type names an IRI, which only a string can.
+        for value in [json!(5), json!(true), JsonValue::Null] {
+            let doc = json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:price",
+                "ex:unit": {"@value": value, "@type": "@id"}
+            });
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("@value must be a string"), "{value}: {err}");
+        }
+
+        // The string beside it is still coerced.
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "unit": {"@id": "ex:unit", "@type": "@id"}},
+            "@id": "ex:price",
+            "unit": "ex:TWD"
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(
+            expanded["http://example.org/unit"],
+            json!([{"@id": "http://example.org/TWD"}]),
+            "{expanded}"
+        );
     }
 
     #[test]
