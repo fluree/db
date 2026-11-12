@@ -885,6 +885,13 @@ name = "it_string_filter_pushdown"
 path = "tests/it_string_filter_pushdown.rs"
 required-features = ["native"]
 
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# the typed string-bound seek's routing via span capture.
+[[test]]
+name = "it_typed_filter_pushdown"
+path = "tests/it_typed_filter_pushdown.rs"
+required-features = ["native"]
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Test hooks: halting a ledger, and building incrementally without fallback.
 fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }

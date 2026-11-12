@@ -2224,6 +2224,9 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        if let Some(bounds) = self.object_bounds.as_mut() {
+            resolve_bound_datatype(bounds, ctx, self.store.as_deref());
+        }
         // Over a dataset spanning ledgers the list view is not applied, and a
         // member is a value of its predicate.
         self.hide_list_members &= !ctx.is_multi_ledger();
@@ -2733,7 +2736,44 @@ impl Operator for BinaryScanOperator {
                 // on the other side) keeps that narrowing.
                 let narrowed =
                     range_o_type.is_some() || range_min_okey.is_some() || range_max_okey.is_some();
-                if let Some(otypes) = bounds.string_bound_otypes().filter(|_| !narrowed) {
+                // An `=` against a typed literal (`"x"^^ex:T`) seeks its one
+                // term, as `?s <p> "x"^^ex:T` does; a string or datatype the
+                // index has never held is in novelty or nowhere.
+                if let (Some(typed), Some((FlakeValue::String(_), _))) =
+                    (bounds.string_datatype.as_ref(), bounds.lower.as_ref())
+                {
+                    stamp_typed_string_bound_seek();
+                    let (value, _) = bounds.lower.as_ref().expect("matched above");
+                    let encoded = match typed.sid() {
+                        Some(dt) => value_to_otype_okey(
+                            value,
+                            dt,
+                            None,
+                            store_ref,
+                            ctx.dict_novelty.as_ref(),
+                            None,
+                        ),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "typed bound's datatype not resolved",
+                        )),
+                    };
+                    match encoded {
+                        Ok((ot, key)) => {
+                            filter.o_type = Some(ot.as_u16());
+                            filter.o_key = Some(key);
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+                            ) =>
+                        {
+                            return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                        }
+                        Err(e) => return Err(QueryError::from_io("typed string bound", e)),
+                    }
+                } else if let Some(otypes) = bounds.string_bound_otypes().filter(|_| !narrowed) {
                     stamp_string_bound_seek();
                     let point = match (&bounds.lower, &bounds.upper) {
                         (
@@ -4100,22 +4140,12 @@ pub(crate) fn value_to_otype_okey(
         }
         FlakeValue::String(s) => {
             let str_id = resolve_string_v3(s, store, dict_novelty)?;
-            let ot = dt_otype
-                .and_then(|ot| {
-                    if ot.is_string_keyed() {
-                        Some(ot)
-                    } else {
-                        // Ill-typed literal: keyed like the indexer's
-                        // `OTypeRegistry::resolve` keys it (#1987).
-                        store.find_dt_id(dt_sid).map(OType::customer_datatype)
-                    }
-                })
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "datatype not resolvable to OType for String value",
-                    )
-                })?;
+            let ot = string_keyed_otype(dt_otype, dt_sid, store).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "datatype not resolvable to OType for String value",
+                )
+            })?;
             Ok((ot, str_id as u64))
         }
         FlakeValue::Json(s) => {
@@ -4441,6 +4471,49 @@ fn stamp_bare_number_seek(seeks: bool) {
 /// Routing stamp: a scan under a string object bound seeks the `o_type`
 /// slices the bound admits (see `ObjectBounds::string_bound_otypes`).
 const STRING_BOUND_SEEK_SITE: &str = "string_bound_seek";
+
+/// Routing stamp: a scan seeks the one term an `=` against a typed literal
+/// names (a pushed `FILTER(?o = "x"^^ex:T)`).
+const TYPED_STRING_BOUND_SEEK_SITE: &str = "typed_string_bound_seek";
+
+fn stamp_typed_string_bound_seek() {
+    use crate::fast_path_outcome::{stamp_fast_path, FastPathOutcome};
+    stamp_fast_path(TYPED_STRING_BOUND_SEEK_SITE, FastPathOutcome::Proceed);
+}
+
+/// The `o_type` a string of datatype `dt_sid` is keyed under in `store`
+/// (`dt_otype` is the datatype's own, when it has one): a string-keyed
+/// type's own, else the customer type of the datatype's id, as the indexer
+/// keys an ill-typed literal (#1987).
+fn string_keyed_otype(
+    dt_otype: Option<OType>,
+    dt_sid: &Sid,
+    store: &BinaryIndexStore,
+) -> Option<OType> {
+    dt_otype.and_then(|ot| {
+        if ot.is_string_keyed() {
+            Some(ot)
+        } else {
+            store.find_dt_id(dt_sid).map(OType::customer_datatype)
+        }
+    })
+}
+
+/// Resolve `bounds`' typed string datatype
+/// ([`ObjectBounds::resolve_string_datatype`]) for a reader of `ctx`'s
+/// snapshot and, when given, `store`'s index, which keys it as
+/// [`value_to_otype_okey`] keys a string of that datatype.
+pub(crate) fn resolve_bound_datatype(
+    bounds: &mut ObjectBounds,
+    ctx: &ExecutionContext<'_>,
+    store: Option<&BinaryIndexStore>,
+) {
+    use crate::parse::encode::IriEncoder;
+    bounds.resolve_string_datatype(
+        |iri| Some(ctx.active_snapshot.encode_datatype(iri)),
+        |dt| store.and_then(|store| string_keyed_otype(otype_from_dt_sid(dt, store), dt, store)),
+    );
+}
 
 fn stamp_string_bound_seek() {
     use crate::fast_path_outcome::{stamp_fast_path, FastPathOutcome};

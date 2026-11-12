@@ -1457,6 +1457,9 @@ impl Operator for NestedLoopJoinOperator {
         // Open left operator
         self.left.open(ctx).await?;
         self.norm = equality_norm(ctx);
+        if let Some(bounds) = self.object_bounds.as_mut() {
+            crate::binary_scan::resolve_bound_datatype(bounds, ctx, ctx.binary_store.as_deref());
+        }
 
         // Reset state for fresh execution
         self.pending_output.clear();
@@ -4061,9 +4064,34 @@ pub(crate) fn batched_subject_probe_binary(
     params: &SubjectProbeParams<'_>,
     probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
+    let resolved = resolved_bounds(params.object_bounds, ctx, store);
+    let resolved_params;
+    let params = match &resolved {
+        Some(bounds) => {
+            resolved_params = SubjectProbeParams {
+                object_bounds: Some(bounds),
+                ..*params
+            };
+            &resolved_params
+        }
+        None => params,
+    };
     let matches = batched_subject_probe_binary_uncharged(ctx, store, params, probe_ops)?;
     charge_probe_rows(ctx, matches.len())?;
     Ok(matches)
+}
+
+/// `bounds` resolved for `store`'s index when they hold a typed string bound
+/// ([`crate::binary_scan::resolve_bound_datatype`]); `None` when there is
+/// nothing to resolve.
+fn resolved_bounds(
+    bounds: Option<&ObjectBounds>,
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+) -> Option<ObjectBounds> {
+    let mut bounds = bounds.filter(|b| b.string_datatype.is_some())?.clone();
+    crate::binary_scan::resolve_bound_datatype(&mut bounds, ctx, Some(store));
+    Some(bounds)
 }
 
 /// Charge a batch of index-probe rows at [`PER_ROW_MICRO_FUEL`].
@@ -4348,6 +4376,27 @@ pub(crate) fn batched_subject_star_spot(
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
     probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
+    let resolved: Vec<Option<ObjectBounds>> = predicates
+        .iter()
+        .map(|p| resolved_bounds(p.object_bounds, ctx, store))
+        .collect();
+    let resolved_predicates: Vec<SpotStarPredicateParams<'_>>;
+    let predicates = if resolved.iter().any(Option::is_some) {
+        resolved_predicates = predicates
+            .iter()
+            .zip(&resolved)
+            .map(|(p, bounds)| SpotStarPredicateParams {
+                predicate_idx: p.predicate_idx,
+                pred_sid: p.pred_sid.clone(),
+                object_bounds: bounds.as_ref().or(p.object_bounds),
+                bound_object: p.bound_object,
+                emit_object: p.emit_object,
+            })
+            .collect();
+        resolved_predicates.as_slice()
+    } else {
+        predicates
+    };
     let matches = batched_subject_star_spot_uncharged(
         ctx,
         store,

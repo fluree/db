@@ -139,7 +139,9 @@ impl RangeMatch {
 /// text, as SPARQL's `=` and `<` find those unequal or incomparable. That is
 /// why matching takes the stored object's datatype, as a `Sid`
 /// ([`Self::matches`]) or a binary-index `o_type`
-/// ([`Self::matches_encoded`]).
+/// ([`Self::matches_encoded`]). An `=` against a typed literal whose datatype
+/// has no value space of its own (`"x"^^ex:T`, `"x"^^xsd:anyURI`) is a
+/// string bound of that datatype instead ([`Self::string_datatype`]).
 #[derive(Clone, Debug, Default)]
 pub struct ObjectBounds {
     /// Lower bound: (value, inclusive)
@@ -155,6 +157,49 @@ pub struct ObjectBounds {
     /// with a temporal. So bounds that came from an `=` leave it off. A
     /// tagged or otherwise-typed string is never read as a temporal.
     pub temporal_string_ordering: bool,
+    /// The datatype the string bounds' terms have when it is not
+    /// `xsd:string`: set only from an `=` against a typed literal whose
+    /// datatype has no value space of its own, so the bound is that one term
+    /// and admits only objects of that datatype with that lexical form.
+    pub string_datatype: Option<StringDatatype>,
+}
+
+/// The datatype of a typed string bound ([`ObjectBounds::string_datatype`]).
+/// It is planned as an IRI, since the planner codes no IRIs, and a reader
+/// resolves it against what it reads before matching: the `Sid` its
+/// snapshot codes the datatype as, for a flake, and the `o_type` its store
+/// keys it under, for a binary-index row. Until then it admits nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StringDatatype {
+    iri: Arc<str>,
+    sid: Option<Sid>,
+    o_type: Option<OType>,
+}
+
+impl StringDatatype {
+    /// An unresolved datatype.
+    pub fn new(iri: impl Into<Arc<str>>) -> Self {
+        Self {
+            iri: iri.into(),
+            sid: None,
+            o_type: None,
+        }
+    }
+
+    /// The datatype's IRI.
+    pub fn iri(&self) -> &str {
+        &self.iri
+    }
+
+    /// The `Sid` a flake of this datatype carries, once resolved.
+    pub fn sid(&self) -> Option<&Sid> {
+        self.sid.as_ref()
+    }
+
+    /// The `o_type` a binary-index row of this datatype has, once resolved.
+    pub fn o_type(&self) -> Option<OType> {
+        self.o_type
+    }
 }
 
 /// A value of each temporal type a string bound can order against, keyed by
@@ -231,14 +276,52 @@ impl ObjectBounds {
     /// To test many objects, [`Self::prepare`] the bounds once.
     #[inline]
     pub fn matches(&self, value: &FlakeValue, dt: &Sid) -> bool {
-        self.matches_object(value, || crate::datatypes::is_xsd_string_datatype(dt), None)
+        self.matches_object(value, || self.is_string_datatype(dt), None)
     }
 
     /// [`Self::matches`] for a binary-index row, whose datatype is its
     /// `o_type`.
     #[inline]
     pub fn matches_encoded(&self, value: &FlakeValue, o_type: OType) -> bool {
-        self.matches_object(value, || o_type == OType::XSD_STRING, None)
+        self.matches_object(value, || self.is_string_otype(o_type), None)
+    }
+
+    /// Whether a flake's datatype `dt` is the string bounds' datatype.
+    #[inline]
+    fn is_string_datatype(&self, dt: &Sid) -> bool {
+        match &self.string_datatype {
+            None => crate::datatypes::is_xsd_string_datatype(dt),
+            Some(typed) => typed.sid.as_ref() == Some(dt),
+        }
+    }
+
+    /// Whether a binary-index row's `o_type` is the string bounds' datatype.
+    #[inline]
+    fn is_string_otype(&self, o_type: OType) -> bool {
+        match &self.string_datatype {
+            None => o_type == OType::XSD_STRING,
+            Some(typed) => typed.o_type == Some(o_type),
+        }
+    }
+
+    /// A typed string bound of `datatype` ([`Self::string_datatype`]).
+    pub fn with_string_datatype(mut self, datatype: impl Into<Arc<str>>) -> Self {
+        self.string_datatype = Some(StringDatatype::new(datatype));
+        self
+    }
+
+    /// Resolve a typed string bound's datatype for a reader: `sid` as its
+    /// snapshot codes the datatype, and, for a binary-index reader,
+    /// `o_type` as its store keys it. A no-op without a typed bound.
+    pub fn resolve_string_datatype(
+        &mut self,
+        sid: impl FnOnce(&str) -> Option<Sid>,
+        o_type: impl FnOnce(&Sid) -> Option<OType>,
+    ) {
+        if let Some(typed) = self.string_datatype.as_mut() {
+            typed.sid = sid(&typed.iri);
+            typed.o_type = typed.sid.as_ref().and_then(o_type);
+        }
     }
 
     /// [`Self::matches`] for a number, whose datatype the bounds never
@@ -361,9 +444,10 @@ impl ObjectBounds {
     }
 
     /// The `o_type`s a stored object needs to satisfy these bounds when a
-    /// bound is a string, or `None` when no bound is. Always `xsd:string`;
-    /// with [`Self::temporal_string_ordering`], also each temporal type
-    /// every string bound parses as. A binary-index scan seeks these slices
+    /// bound is a string, or `None` when no bound is. `xsd:string`, and with
+    /// [`Self::temporal_string_ordering`] also each temporal type every
+    /// string bound parses as; for a typed bound, its datatype's resolved
+    /// `o_type` alone (`None` until resolved). A binary-index scan seeks these slices
     /// rather than reading every type the predicate holds.
     pub fn string_bound_otypes(&self) -> Option<Vec<OType>> {
         let strings: Vec<&FlakeValue> = [&self.lower, &self.upper]
@@ -374,6 +458,10 @@ impl ObjectBounds {
             .collect();
         if strings.is_empty() {
             return None;
+        }
+        // A typed bound is `=`-only: its datatype's slice, once resolved.
+        if let Some(typed) = &self.string_datatype {
+            return typed.o_type.map(|ot| vec![ot]);
         }
         let mut otypes = vec![OType::XSD_STRING];
         if self.temporal_string_ordering {
@@ -446,7 +534,7 @@ impl PreparedBounds<'_> {
     pub fn matches(&self, value: &FlakeValue, dt: &Sid) -> bool {
         self.bounds.matches_object(
             value,
-            || crate::datatypes::is_xsd_string_datatype(dt),
+            || self.bounds.is_string_datatype(dt),
             Some(&self.lexicals),
         )
     }
@@ -454,8 +542,11 @@ impl PreparedBounds<'_> {
     /// [`ObjectBounds::matches_encoded`].
     #[inline]
     pub fn matches_encoded(&self, value: &FlakeValue, o_type: OType) -> bool {
-        self.bounds
-            .matches_object(value, || o_type == OType::XSD_STRING, Some(&self.lexicals))
+        self.bounds.matches_object(
+            value,
+            || self.bounds.is_string_otype(o_type),
+            Some(&self.lexicals),
+        )
     }
 }
 

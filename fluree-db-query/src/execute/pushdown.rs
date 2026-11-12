@@ -146,8 +146,21 @@ pub fn count_filter_vars(expr: &Expression) -> usize {
 /// Returns `None` when two bounds on one side cannot be ordered against each
 /// other (a number and a string, a date and a time, or two strings a temporal
 /// row reads as temporals): the tighter one is then unknowable, and keeping
-/// either would drop the other's filter.
+/// either would drop the other's filter. So do string bounds of two
+/// datatypes (a typed string bound and a plain one, or two typed ones of
+/// different datatypes): they are different terms, and a bound carries one
+/// datatype.
 pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> Option<ObjectBounds> {
+    let has_string = |x: &ObjectBounds| {
+        [&x.lower, &x.upper]
+            .into_iter()
+            .flatten()
+            .any(|(v, _)| matches!(v, FlakeValue::String(_)))
+    };
+    let datatype = |x: &ObjectBounds| x.string_datatype.as_ref().map(|d| d.iri().to_string());
+    if has_string(a) && has_string(b) && datatype(a) != datatype(b) {
+        return None;
+    }
     // Both sets of bounds hold, so an `=` in either rules out comparing a
     // string with a temporal.
     let temporal_string_ordering = a.temporal_string_ordering && b.temporal_string_ordering;
@@ -172,6 +185,10 @@ pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> Option<ObjectB
         lower: merge_lower_bound(a.lower.as_ref(), b.lower.as_ref()),
         upper: merge_upper_bound(a.upper.as_ref(), b.upper.as_ref()),
         temporal_string_ordering,
+        string_datatype: a
+            .string_datatype
+            .clone()
+            .or_else(|| b.string_datatype.clone()),
     })
 }
 
@@ -391,6 +408,7 @@ mod tests {
             lower: a(),
             upper: a(),
             temporal_string_ordering: false,
+            string_datatype: None,
         };
         let merged = |x: &ObjectBounds, y: &ObjectBounds| {
             merge_object_bounds(x, y).unwrap().temporal_string_ordering

@@ -18,7 +18,7 @@
 //! ```
 
 // Re-export query parameter types from their canonical home.
-pub use crate::query_bounds::{ObjectBounds, RangeMatch, RangeOptions, RangeTest};
+pub use crate::query_bounds::{ObjectBounds, RangeMatch, RangeOptions, RangeTest, StringDatatype};
 
 use crate::comparator::IndexType;
 use crate::db::LedgerSnapshot;

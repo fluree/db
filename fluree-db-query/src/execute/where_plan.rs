@@ -5678,6 +5678,7 @@ mod tests {
                 lower: Some((FlakeValue::String("2026-01-01".to_string()), true)),
                 upper: None,
                 temporal_string_ordering: true,
+                string_datatype: None,
             },
         );
 

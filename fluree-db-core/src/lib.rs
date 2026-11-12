@@ -176,7 +176,8 @@ pub use overlay::{NoOverlay, OverlayProvider, OverlaySegmentMeta};
 pub use prefix_trie::PrefixTrie;
 pub use range::{
     flake_matches_range_eq, overlay_eq_bounds, range, range_bounded_with_overlay,
-    range_with_overlay, ObjectBounds, RangeMatch, RangeOptions, RangeTest, BATCHED_JOIN_SIZE,
+    range_with_overlay, ObjectBounds, RangeMatch, RangeOptions, RangeTest, StringDatatype,
+    BATCHED_JOIN_SIZE,
 };
 pub use range_provider::{RangeProvider, RangeQuery};
 pub use runtime_small_dicts::RuntimeSmallDicts;

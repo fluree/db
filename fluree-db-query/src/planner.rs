@@ -12,6 +12,7 @@ use crate::ir::{CompareOp, Function, Grouping, OrderRole, Pattern, SubqueryPatte
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // =============================================================================
 // Statistics-Based Selectivity Estimation
@@ -522,6 +523,13 @@ pub enum RangeValue {
     String(String),
     /// Temporal value for range pushdown (NOT used for xsd:duration — it has no total order)
     Temporal(fluree_db_core::value::FlakeValue),
+    /// A typed literal whose datatype has no value space of its own
+    /// ([`Expression::as_typed_string_literal`]): only ever an `=` bound, the
+    /// one term with this lexical form and datatype IRI.
+    TypedString {
+        value: String,
+        datatype: Arc<str>,
+    },
 }
 
 impl RangeConstraint {
@@ -659,6 +667,19 @@ fn compare_range_values(
     temporal_strings: bool,
 ) -> Option<std::cmp::Ordering> {
     match (a, b) {
+        // A typed string orders only against its own datatype's strings, and
+        // is only ever an `=` bound, so two compare only to merge equalities.
+        (
+            RangeValue::TypedString {
+                value: x,
+                datatype: dx,
+            },
+            RangeValue::TypedString {
+                value: y,
+                datatype: dy,
+            },
+        ) if dx == dy => Some(x.cmp(y)),
+        (RangeValue::TypedString { .. }, _) | (_, RangeValue::TypedString { .. }) => None,
         (RangeValue::String(x), RangeValue::String(y)) => {
             let reads_as_temporal =
                 |s: &String| ObjectBounds::string_orders_temporals(&FlakeValue::String(s.clone()));
@@ -731,6 +752,25 @@ pub fn extract_range_constraints(expr: &Expression) -> Option<Vec<RangeConstrain
                 }
                 let (left, right) = (&args[0], &args[1]);
 
+                // `?var = "x"^^ex:T`, either way round: the one term.
+                if op == crate::ir::CompareOp::Eq {
+                    let typed = |e: &Expression| {
+                        e.as_typed_string_literal().map(|(value, datatype)| {
+                            RangeValue::TypedString {
+                                value: value.to_string(),
+                                datatype: Arc::from(datatype),
+                            }
+                        })
+                    };
+                    let found = match (extract_var(left), extract_var(right)) {
+                        (Some(var), _) => typed(right).map(|val| (var, val)),
+                        (_, Some(var)) => typed(left).map(|val| (var, val)),
+                        _ => None,
+                    };
+                    if let Some((var, val)) = found {
+                        return Some(vec![create_constraint(var, op, val, false)]);
+                    }
+                }
                 // Try ?var op const
                 if let (Some(var), Some(val)) = (extract_var(left), extract_const(right)) {
                     return Some(vec![create_constraint(var, op, val, false)]);
@@ -890,7 +930,9 @@ impl RangeValue {
             RangeValue::Long(n) => FlakeValue::Long(*n),
             RangeValue::Double(d) => FlakeValue::Double(*d),
             RangeValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
-            RangeValue::String(s) => FlakeValue::String(s.clone()),
+            RangeValue::String(s) | RangeValue::TypedString { value: s, .. } => {
+                FlakeValue::String(s.clone())
+            }
             RangeValue::Temporal(fv) => fv.clone(),
         }
     }
@@ -916,6 +958,18 @@ impl RangeConstraint {
 
         if let Some((val, inclusive)) = &self.upper {
             bounds = bounds.with_upper(val.to_flake_value(), *inclusive);
+        }
+
+        let typed =
+            [&self.lower, &self.upper]
+                .into_iter()
+                .flatten()
+                .find_map(|(val, _)| match val {
+                    RangeValue::TypedString { datatype, .. } => Some(Arc::clone(datatype)),
+                    _ => None,
+                });
+        if let Some(datatype) = typed {
+            bounds = bounds.with_string_datatype(datatype);
         }
 
         Some(bounds)
