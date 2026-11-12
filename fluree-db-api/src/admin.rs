@@ -652,12 +652,17 @@ impl crate::Fluree {
             .iter()
             .find_map(|r| LedgerId::parse(r.ledger_id.as_str()).err().map(|e| (r, e)))
         {
-            return Err(ApiError::Drop(format!(
-                "Cannot drop ledger '{ledger_name}': its branch '{}' has an id an \
-                 earlier release allowed and this one does not address ({refused}). \
-                 Nothing was dropped.",
-                legacy.ledger_id
-            )));
+            // 409, not `ApiError::Drop`'s 500: the ledger's own state refuses
+            // the drop, and a retry meets the same refusal.
+            return Err(ApiError::Http {
+                status: 409,
+                message: format!(
+                    "Cannot drop ledger '{ledger_name}': its branch '{}' has an id an \
+                     earlier release allowed and this one does not address ({refused}). \
+                     Nothing was dropped.",
+                    legacy.ledger_id
+                ),
+            });
         }
 
         // Aggregate status: AlreadyRetracted iff every branch was already
