@@ -43,8 +43,9 @@
 //! cached window that covers `start` with at least [`GET_READ_MIN_TAIL`] bytes
 //! to spare, or that runs to the end of the file; otherwise it fetches a fresh
 //! [`GET_READ_WINDOW`] from `start`. So a column chunk read page by page costs
-//! about one fetch per window, not one per page. The reader it returns runs to
-//! the end of the file, fetching past its window only if read that far.
+//! about one fetch per window, not one per page. The reader it returns reads
+//! up to [`GET_READ_WINDOW`] from `start`, as the old 8 MiB cursor did,
+//! fetching past a cached window's end only if read that far.
 
 use std::io::{Cursor, Read};
 use std::ops::Range;
@@ -350,17 +351,21 @@ impl<S: SendIcebergStorage + 'static> ChunkReader for RangeBackedChunkReader<S> 
     /// `GET_READ_WINDOW` past the offset instead meant a fresh 8 MiB fetch for
     /// nearly every page: 8 MiB moved per 1 MiB page.
     fn get_read(&self, start: u64) -> std::result::Result<Self::T, parquet::errors::ParquetError> {
+        if start > self.file_size {
+            return Err(ParquetError::EOF(format!(
+                "Expected to read at offset {start}, while {} has length {}",
+                self.path, self.file_size
+            )));
+        }
+        let limit = (start + GET_READ_WINDOW).min(self.file_size);
         let head = match self.cached_tail(start)? {
-            Some(tail) => tail,
-            None => {
-                let len = self.file_size.saturating_sub(start).min(GET_READ_WINDOW) as usize;
-                self.fetch_bytes(start, len)?
-            }
+            Some(tail) => tail.slice(..tail.len().min((limit - start) as usize)),
+            None => self.fetch_bytes(start, (limit - start) as usize)?,
         };
         Ok(RangeRead {
             next: start + head.len() as u64,
             head: Cursor::new(head),
-            file_size: self.file_size,
+            limit,
             storage: Arc::clone(&self.storage),
             path: Arc::clone(&self.path),
             runtime: self.runtime.clone(),
@@ -377,15 +382,20 @@ impl<S: SendIcebergStorage + 'static> ChunkReader for RangeBackedChunkReader<S> 
 }
 
 /// The reader [`RangeBackedChunkReader::get_read`] returns: the bytes from its
-/// offset that one window holds, then the rest of the file, fetched a window at
-/// a time and only if read that far (a page header longer than the window's
-/// remainder, say). Fetches past the first window are not cached.
+/// offset that a cached or fresh window holds, then, only if read past them,
+/// the rest of [`GET_READ_WINDOW`] from that offset, fetched uncached. That is
+/// the old 8 MiB cursor's reach: a page header longer than a served window's
+/// remainder still reads whole, while a corrupt header that declares a longer
+/// field than that runs into the end of the reader, as it did before, instead
+/// of pulling the rest of the file through it.
 pub struct RangeRead<S: SendIcebergStorage + 'static> {
     /// The bytes not yet read from the current window.
     head: Cursor<Bytes>,
     /// The file offset just past the current window.
     next: u64,
-    file_size: u64,
+    /// The file offset this reader stops at: `GET_READ_WINDOW` past where it
+    /// started, or the end of the file.
+    limit: u64,
     storage: Arc<S>,
     path: Arc<str>,
     runtime: Handle,
@@ -394,12 +404,16 @@ pub struct RangeRead<S: SendIcebergStorage + 'static> {
 impl<S: SendIcebergStorage + 'static> Read for RangeRead<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.head.read(buf)?;
-        if n > 0 || buf.is_empty() || self.next >= self.file_size {
+        if n > 0 || buf.is_empty() || self.next >= self.limit {
             return Ok(n);
         }
-        let end = (self.next + GET_READ_WINDOW).min(self.file_size);
-        let bytes = fetch_range(&self.storage, &self.path, &self.runtime, self.next..end)
-            .map_err(std::io::Error::other)?;
+        let bytes = fetch_range(
+            &self.storage,
+            &self.path,
+            &self.runtime,
+            self.next..self.limit,
+        )
+        .map_err(std::io::Error::other)?;
         if bytes.is_empty() {
             // A store that returns nothing for a range inside the file would
             // otherwise loop here; report it as the end of what can be read.
@@ -748,48 +762,131 @@ mod tests {
         assert_eq!(check.fetches().len(), 1, "fetches: {:?}", check.fetches());
     }
 
-    /// The reader `get_read` returns runs to the end of the file: a read past
-    /// its first window (a page header longer than what a cached window has
-    /// left, say) fetches the rest rather than stopping short.
+    /// The reader `get_read` returns reaches `GET_READ_WINDOW` from its offset,
+    /// as the old 8 MiB cursor did, and no further. Served from a cached window
+    /// with less than that left, a read past the window's end fetches the rest
+    /// of the reach in one uncached range (a page header longer than what the
+    /// window has left still reads whole); a read past the reach ends there, so
+    /// a corrupt header that declares a longer field can't pull the rest of the
+    /// file through the reader.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_read_reads_on_past_its_window() {
-        let storage = CountingStorage::patterned(20 * MIB);
+    async fn get_read_reads_up_to_its_reach_and_no_further() {
+        let storage = CountingStorage::patterned(32 * MIB);
         let data = storage.data.clone();
         let check = Arc::clone(&storage);
-        let all = tokio::task::spawn_blocking(move || {
+        let (first_end, served, from_miss) = tokio::task::spawn_blocking(move || {
             let reader = reader_over(&storage);
-            let mut all = Vec::new();
+            reader.get_read(0).unwrap();
+            let first_end = storage.fetches()[0].end;
+
+            // Served from the first window, 2 MiB before its end.
+            let start = first_end - 2 * MIB;
+            let mut served = Vec::new();
             reader
-                .get_read(1000)
+                .get_read(start)
                 .unwrap()
-                .read_to_end(&mut all)
+                .read_to_end(&mut served)
                 .unwrap();
-            all
+            assert_eq!(
+                served,
+                data[start as usize..(start + GET_READ_WINDOW) as usize]
+            );
+
+            // A miss: the fresh window is the whole reach.
+            let start = 20 * MIB + 1000;
+            let mut from_miss = Vec::new();
+            reader
+                .get_read(start)
+                .unwrap()
+                .read_to_end(&mut from_miss)
+                .unwrap();
+            assert_eq!(
+                from_miss,
+                data[start as usize..(start + GET_READ_WINDOW) as usize]
+            );
+            (first_end, served.len(), from_miss.len())
         })
         .await
         .unwrap();
 
-        assert_eq!(all, data[1000..]);
-        // The first fetch is the window the reader starts with; the rest pick
-        // up where its bytes end and run to the end of the file.
+        assert_eq!(served as u64, GET_READ_WINDOW);
+        assert_eq!(from_miss as u64, GET_READ_WINDOW);
         let fetches = check.fetches();
-        assert!(fetches.len() > 2, "fetches: {fetches:?}");
+        assert_eq!(fetches.len(), 3, "fetches: {fetches:?}");
+        // The served reader fetched only what its window lacked of the reach.
         assert_eq!(
-            fetches[1].start,
-            1000 + GET_READ_WINDOW,
+            fetches[1],
+            first_end..first_end - 2 * MIB + GET_READ_WINDOW,
             "fetches: {fetches:?}"
         );
-        assert!(
-            fetches[1..].windows(2).all(|w| w[0].end == w[1].start),
-            "each fetch past the first window starts where the last ended: {fetches:?}"
+    }
+
+    /// An offset past the end of the file is an EOF error, as parquet's own
+    /// `Bytes` reader gives, not a fetch of an inverted range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_read_past_the_end_of_the_file_is_an_eof_error() {
+        let storage = CountingStorage::patterned(MIB);
+        let check = Arc::clone(&storage);
+        let err = tokio::task::spawn_blocking(move || {
+            reader_over(&storage)
+                .get_read(MIB + 1)
+                .err()
+                .expect("an offset past the end is an error")
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(err, ParquetError::EOF(_)), "{err}");
+        assert!(check.fetches().is_empty());
+    }
+
+    /// A page longer than what its header's window has left past the header
+    /// (Iceberg writes 1 MiB pages by default, and real pages vary) costs one
+    /// extra fetch at that window's edge: the body is fetched on its own, and
+    /// the next header, with less than `GET_READ_MIN_TAIL` left in that body's
+    /// range, starts a fresh window. Ten 1.75 MiB pages take four fetches,
+    /// against ten 8 MiB fetches before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_longer_than_its_windows_remainder_costs_one_extra_fetch() {
+        const PAGE: u64 = 1792 * 1024;
+        const HEADER: u64 = 32;
+        let storage = CountingStorage::patterned(24 * MIB);
+        let data = storage.data.clone();
+        let check = Arc::clone(&storage);
+        tokio::task::spawn_blocking(move || {
+            let reader = reader_over(&storage);
+            for page in 0..10 {
+                let offset = page * PAGE;
+                let mut read = reader.get_read(offset).unwrap();
+                let header = read_n(&mut read, HEADER as usize);
+                assert_eq!(header, data[offset as usize..(offset + HEADER) as usize]);
+                let body = reader
+                    .get_bytes(offset + HEADER, (PAGE - HEADER) as usize)
+                    .unwrap();
+                assert_eq!(
+                    body,
+                    data[(offset + HEADER) as usize..(offset + PAGE) as usize]
+                );
+            }
+        })
+        .await
+        .unwrap();
+
+        // A window from the first header; the fifth page's body, which runs
+        // past it; a window from the sixth header; the tenth page's body.
+        let fetches = check.fetches();
+        let starts: Vec<u64> = fetches.iter().map(|r| r.start).collect();
+        assert_eq!(
+            starts,
+            vec![0, 4 * PAGE, 5 * PAGE, 9 * PAGE],
+            "fetches: {fetches:?}"
         );
-        assert_eq!(fetches.last().unwrap().end, 20 * MIB);
     }
 
     /// End to end through the Arrow decoder: a file of small pages decodes to
-    /// the same rows through the range-backed reader as from memory, and moves
-    /// little more than the file from storage. Before page headers were served
-    /// from cached windows, this 19 MB file took 43 fetches and 363 MB.
+    /// the same rows through the range-backed reader as from memory, in five
+    /// fetches and little more than the file's bytes. Before page headers were
+    /// served from cached windows, this 19 MB file took 43 fetches and 363 MB.
     #[tokio::test(flavor = "multi_thread")]
     async fn small_page_parquet_decodes_with_about_one_pass_over_the_file() {
         use arrow::array::{ArrayRef, Int64Array, RecordBatch};
@@ -871,5 +968,7 @@ mod tests {
             check.bytes_fetched(),
             check.fetches().len()
         );
+        // The footer, then a window per ~7 MiB of the two column chunks.
+        assert_eq!(check.fetches().len(), 5, "fetches: {:?}", check.fetches());
     }
 }
