@@ -533,7 +533,7 @@ impl crate::Fluree {
             )
             .await?;
         let diagnostics = self
-            .keyless_sql_maps(&graph_source_id.to_string(), &compiled)
+            .keyless_sql_maps(graph_source_id.as_ref(), &compiled)
             .await;
         Ok(SqlCheckResult {
             graph_source_id: graph_source_id.to_string(),
