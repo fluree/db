@@ -4,7 +4,9 @@
 //! merges (the target's head is on the source's first-parent line) and
 //! general merges with conflict resolution strategies.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold, OwnChanges};
+use crate::commit_data::{
+    collect_from_commits, CollectedCommitData, ConfigGraphs, Fold, NetChange, OwnChanges,
+};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
@@ -114,6 +116,23 @@ pub struct MergeReport {
     pub conflict_count: usize,
     /// Conflict resolution strategy used, if applicable.
     pub strategy: Option<String>,
+}
+
+/// Refuse to merge histories either of which dropped a graph since they
+/// forked, unless the merge is a fast-forward, which adopts the source's
+/// commits as they are. A merge commit carries flakes; a drop is not one, and
+/// what the other side wrote to the graph means something else once it is
+/// gone. The same check guards the merge preview and a non-fast-forward
+/// rebase, so a refusal comes before anything is written.
+pub(crate) fn refuse_merging_graph_drops(diff: &fluree_db_core::BranchDiff) -> Result<()> {
+    if diff.source.drops_graphs || diff.target.drops_graphs {
+        return Err(ApiError::BranchConflict(
+            "a graph was dropped on one of the branches since they forked; merging or \
+             rebasing over a graph drop is supported only as a fast-forward"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl crate::Fluree {
@@ -300,6 +319,11 @@ impl crate::Fluree {
         // first-parent line. The target then adopts a line that continues
         // its own, so its `t` keeps rising.
         let is_fast_forward = diff.as_ref().is_none_or(|d| d.fast_forward);
+        if !is_fast_forward {
+            if let Some(diff) = &diff {
+                refuse_merging_graph_drops(diff)?;
+            }
+        }
 
         // A fast-forward checks the adopted commits first, against the
         // target's configuration as it is before the merge, when that
@@ -538,7 +562,10 @@ impl crate::Fluree {
         // lands on the target in between fails the merge rather than slipping
         // past the validation.
         if let (Some(base), Some(diff)) = (base, diff) {
-            if let Some(outcome) = self.validate_fast_forward(base, source_store, diff).await? {
+            if let Some(outcome) = self
+                .validate_fast_forward(base, source_branch, source_store, diff)
+                .await?
+            {
                 outcome.into_result()?;
             }
         }
@@ -605,11 +632,37 @@ impl crate::Fluree {
             ));
         }
 
-        // Fold the source's commits, and collect the keys its own changes
-        // touched, in one pass. The target's keys need their own read.
-        let (source_data, source_delta) =
-            collect_commit_data(source_store, &diff.source.commits, &diff.source.own).await?;
         let target_delta = delta_keys_of(&target_store, &diff.target.own).await?;
+
+        // The target's names for the config graph, read without its write
+        // lock: its namespace table and graph registry only grow, and the
+        // lock held across the fold below would stall the target's writers
+        // for the whole read. Without a manager there is no lock, and the
+        // state loaded here is the one the merge stages on.
+        let (mut config, loaded_target) = match self.ledger_manager.as_ref() {
+            Some(mgr) => {
+                let head = mgr.get_or_load(&target_id).await?.graph_names().await;
+                (ConfigGraphs::for_snapshot(&head.snapshot), None)
+            }
+            None => {
+                let state = self
+                    .load_queryable_state_with_store(target_store.clone(), target_record.clone())
+                    .await?;
+                (ConfigGraphs::for_target(&state), Some(state))
+            }
+        };
+
+        // Fold the source's commits, and collect the keys its own changes
+        // touched, in one pass, both sides naming the config graph as the
+        // target does.
+        let (source_data, source_delta) = collect_commit_data(
+            source_store,
+            &diff.source.commits,
+            &diff.source.own,
+            &mut config,
+        )
+        .await?;
+        let target_delta = config.keys(target_delta);
 
         // Find conflicts: intersection of source and target delta sets.
         let conflicts: Vec<ConflictKey> =
@@ -629,14 +682,33 @@ impl crate::Fluree {
 
         // Acquire target state under the write lock when a manager is
         // available, serializing with regular transactions on the target
-        // branch. Without a manager (embedded use, no shared cache), fall
-        // back to a fresh storage load — there's nothing to protect.
-        let (write_guard, target_state) = self
-            .lock_or_load(&target_id, target_store, target_record.clone())
-            .await?;
+        // branch. Without a manager (embedded use, no shared cache), the
+        // state loaded above serves — there's nothing to protect.
+        let (write_guard, target_state) = match loaded_target {
+            Some(state) => (None, state),
+            None => {
+                self.lock_or_load(&target_id, target_store, target_record.clone())
+                    .await?
+            }
+        };
+        // The diff and the conflicts are the target's as of `target_head`. A
+        // commit that landed since is in neither, so the source's changes
+        // would be staged over it unchecked.
+        if target_state.head_commit_id != target_head {
+            return Err(ApiError::BranchConflict(format!(
+                "merge into {target_id} lost a race: the head moved from t={} to t={} \
+                 while the merge was being prepared — re-run the merge so it \
+                 recomputes against the new head",
+                target_record.commit_t,
+                target_state.t(),
+            )));
+        }
 
         let CollectedCommitData {
-            flakes: source_flakes,
+            net: NetChange {
+                flakes: source_flakes,
+                ..
+            },
             namespace_delta,
             graph_iris,
         } = source_data;
@@ -653,6 +725,7 @@ impl crate::Fluree {
         let (view, outcome) = self
             .stage_merge(
                 target_state,
+                source_branch,
                 source_flakes,
                 &conflicts,
                 &strategy,
@@ -842,15 +915,19 @@ impl crate::Fluree {
 /// carry the source's own changes. A merge on the line keeps only the flakes
 /// that are its resolution; see [`OwnChanges`]. The fold runs oldest-first
 /// so that earlier commits win on namespace and graph delta key collisions.
+/// The flakes and keys name the config graph as `config` does.
 pub(crate) async fn collect_commit_data(
     store: &impl ContentStore,
     cids: &[ContentId],
     own: &[ContentId],
+    config: &mut ConfigGraphs,
 ) -> Result<(CollectedCommitData, FxHashSet<ConflictKey>)> {
     let mut changes = OwnChanges::new(own);
     let mut commits = Vec::with_capacity(cids.len());
     for cid in cids {
         let mut commit = load_commit_by_id(store, cid).await?;
+        config.adopt(&commit.namespace_delta);
+        config.flakes(&mut commit.flakes);
         changes.retain_changes(cid, &mut commit.flakes);
         commits.push(commit);
     }

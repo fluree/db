@@ -221,6 +221,13 @@ fn logical_node(
                 triple_pattern_to_user_object(tp, vars, compactor),
             );
         }
+        Pattern::ListView(lv) => {
+            node.insert("kind".into(), json!("list-view"));
+            node.insert(
+                "pattern".into(),
+                triple_pattern_to_user_object(&lv.triple, vars, compactor),
+            );
+        }
         Pattern::Optional(inner) => {
             node.insert("kind".into(), json!("optional"));
             node.insert("patterns".into(), children(inner));
@@ -782,7 +789,7 @@ pub(crate) fn explain_sparql_for_view(
     params: Option<&fluree_db_sparql::ParamMap>,
     allow_semantic_elision: bool,
 ) -> Result<JsonValue> {
-    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params)?;
+    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params, false)?;
 
     explain_from_parsed(
         snapshot,

@@ -11,6 +11,7 @@ use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
     flake_matches_range_eq, overlay_eq_bounds, range_provider::RangeQuery, Flake, FlakeValue,
@@ -194,6 +195,17 @@ fn range_translation_cache() -> &'static std::sync::Mutex<RangeTranslationLru> {
     &CACHE
 }
 
+/// Every `store_id` that has put an entry in [`range_translation_cache`]. A
+/// test that rules an insertion out reads this, not the LRU: other tests'
+/// insertions can evict the entry before it looks.
+#[cfg(test)]
+fn range_translation_inserted_stores() -> &'static std::sync::Mutex<std::collections::BTreeSet<u64>>
+{
+    static INSERTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    &INSERTED
+}
+
 /// Translate the full (unfiltered) overlay for `(g_id, index, to_t)`, served
 /// from [`range_translation_cache`] when the overlay reports a
 /// [`content_version`](OverlayProvider::content_version). Returns `None`
@@ -261,6 +273,11 @@ fn cached_overlay_translation(
         raw: raw.into(),
         ephemeral_p_id_to_sid: Arc::new(ephemeral_p_id_to_sid),
     });
+    #[cfg(test)]
+    range_translation_inserted_stores()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.store_id);
     range_translation_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1224,15 +1241,13 @@ fn apply_raw_overlay_deltas_to_batched_refs(
             None => {
                 subj_entry.insert(class_sid, (flake.t, flake.op));
             }
-            Some(&(t0, op0)) => {
-                // Newest op wins; at equal `t` the retraction does. Taking
-                // `>` alone let whichever flake the walk happened to yield
-                // first win the tie — and on this lane, which decides
-                // class-based policy grants, the direction it failed was
-                // open: a same-`t` assert+retract of a class left the class
-                // granted. Same rule as `resolve_current_flakes` and
-                // `resolve_overlay_ops`.
-                if flake.t > t0 || (flake.t == t0 && !flake.op && op0) {
+            Some(&cur) => {
+                // Newest op wins; at equal `t` the assertion
+                // (`fluree_db_core::same_t`). Decided by rule, not by which
+                // flake the walk yields first, so this lane answers as
+                // `resolve_current_flakes`, `resolve_overlay_ops` and every
+                // index build do.
+                if supersedes((flake.t, flake.op), cur) {
                     subj_entry.insert(class_sid, (flake.t, flake.op));
                 }
             }
@@ -1847,12 +1862,12 @@ mod tests {
         );
     }
 
-    /// The equal-`t` tie on the policy lane, and the map-shape contract.
+    /// The equal-`t` tie, and the map-shape contract.
     ///
-    /// `t > t0` alone let whichever flake the walk yielded first win a tie,
-    /// and the direction it failed was open: a same-`t` assert+retract left
-    /// the class granted. And a subject whose overlay flakes are all
-    /// retractions must be ABSENT from the map, not present with an empty
+    /// A same-`t` assert+retract of a class resolves by rule, not by which
+    /// flake the walk yields first: the assert holds, as on every other
+    /// lane and in every index build. And a subject whose overlay flakes are
+    /// all retractions must be ABSENT from the map, not present with an empty
     /// vector — `lookup_subject_classes` documents that, and its per-subject
     /// fallback enforces it.
     #[test]
@@ -1881,9 +1896,10 @@ mod tests {
             }
             let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
             apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw, &rdf_type, 10);
-            assert!(
-                !out.contains_key(&s("carol")),
-                "same-t assert+retract must revoke, and leave no empty entry (flip={flip})"
+            assert_eq!(
+                out.get(&s("carol")),
+                Some(&vec![s("Admin")]),
+                "same-t assert+retract holds the class (flip={flip})"
             );
         }
 
@@ -2179,6 +2195,8 @@ mod tests {
     /// leave the process-wide translation LRU alone. `NoOverlay` reports a
     /// content version, so each new `to_t` used to add an empty entry, and
     /// with eight slots a few commits evicted a live query's translation.
+    /// It checks the record of insertions rather than the LRU, which other
+    /// tests' insertions can empty of this store's entries first.
     #[test]
     fn an_empty_overlay_probe_leaves_the_translation_lru_alone() {
         let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
@@ -2199,14 +2217,12 @@ mod tests {
             );
             assert!(out.ops.is_empty() && out.untranslated.is_empty());
         }
-        let entries_for_store = range_translation_cache()
+        let inserted = range_translation_inserted_stores()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(key, _)| key.store_id == store.store_id())
-            .count();
-        assert_eq!(
-            entries_for_store, 0,
+            .contains(&store.store_id());
+        assert!(
+            !inserted,
             "an empty overlay must not occupy translation LRU slots"
         );
     }

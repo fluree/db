@@ -1159,6 +1159,7 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
     };
 
     let mut triples = Vec::new();
+    let mut cells = 0;
 
     for node in &nodes {
         let obj = node
@@ -1204,7 +1205,7 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
             };
 
             for val in &values {
-                if let Some(term) = json_ld_value_to_rdf_term(val, &ctx) {
+                if let Some(term) = json_ld_object(val, &ctx, &mut triples, &mut cells) {
                     triples.push(Triple {
                         subject: subject.clone(),
                         predicate: predicate.clone(),
@@ -1216,6 +1217,45 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
     }
 
     Ok(SparqlResults::Graph(triples))
+}
+
+/// An object value as a term; a `{"@list": [...]}` is its chain of
+/// `rdf:first`/`rdf:rest` cells, fresh blank nodes pushed to `triples`.
+fn json_ld_object(
+    val: &serde_json::Value,
+    ctx: &JsonLdContext,
+    triples: &mut Vec<Triple>,
+    cells: &mut usize,
+) -> Option<RdfTerm> {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let Some(items) = val.get("@list") else {
+        return json_ld_value_to_rdf_term(val, ctx);
+    };
+    let items = match items {
+        serde_json::Value::Array(items) => items.clone(),
+        item => vec![item.clone()],
+    };
+    let mut next = RdfTerm::Iri(format!("{RDF}nil"));
+    for item in items.iter().rev() {
+        let Some(first) = json_ld_object(item, ctx, triples, cells) else {
+            continue;
+        };
+        // A leading `-` no output label has.
+        let cell = RdfTerm::BlankNode(format!("-list{cells}"));
+        *cells += 1;
+        triples.push(Triple {
+            subject: cell.clone(),
+            predicate: RdfTerm::Iri(format!("{RDF}first")),
+            object: first,
+        });
+        triples.push(Triple {
+            subject: cell.clone(),
+            predicate: RdfTerm::Iri(format!("{RDF}rest")),
+            object: next,
+        });
+        next = cell;
+    }
+    Some(next)
 }
 
 /// Convert a JSON-LD value node to an [`RdfTerm`].
@@ -1547,6 +1587,41 @@ ex:bob ex:name "Bob" .
             predicate: RdfTerm::Iri("http://example.org/p".into()),
             object: RdfTerm::Iri("http://example.org/o2".into()),
         }));
+    }
+
+    #[test]
+    fn test_construct_jsonld_list_is_its_cells() {
+        // Fluree writes an RDF collection as `@list`; it reads back as the
+        // collection's cells, nested lists included.
+        let json = serde_json::json!({
+            "@context": { "": "http://example.org/" },
+            "@graph": [{ "@id": ":s", ":p": { "@list": [ { "@id": ":a" }, { "@list": [] } ] } }]
+        });
+        let SparqlResults::Graph(triples) = fluree_construct_to_sparql_results(&json).unwrap()
+        else {
+            panic!("expected Graph");
+        };
+        let rdf = |l: &str| RdfTerm::Iri(format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{l}"));
+        let head = triples
+            .iter()
+            .find(|t| t.subject == RdfTerm::Iri("http://example.org/s".into()))
+            .map(|t| t.object.clone())
+            .expect("owner edge");
+        let object = |s: &RdfTerm, p: &RdfTerm| {
+            triples
+                .iter()
+                .find(|t| &t.subject == s && &t.predicate == p)
+                .map(|t| t.object.clone())
+                .expect("cell triple")
+        };
+        assert_eq!(
+            object(&head, &rdf("first")),
+            RdfTerm::Iri("http://example.org/a".into())
+        );
+        let second = object(&head, &rdf("rest"));
+        assert_eq!(object(&second, &rdf("first")), rdf("nil"));
+        assert_eq!(object(&second, &rdf("rest")), rdf("nil"));
+        assert_eq!(triples.len(), 1 + 4);
     }
 
     #[test]

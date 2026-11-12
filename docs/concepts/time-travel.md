@@ -546,9 +546,9 @@ History queries scan flakes within the specified time range:
 ### Storage Implications
 
 - **Full History**: All transaction history is preserved (immutable append-only)
-- **Index Snapshots**: Periodic snapshots enable efficient historical queries without replaying all transactions
+- **Index Snapshots**: Periodic snapshots enable efficient historical queries without replaying all transactions. A historical query reads history from the current index, so superseded index versions are kept only while queries already running may still read them (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention))
 - **Commit Metadata**: Stored as queryable flakes (~8-9 flakes per commit)
-- **Transaction JSON**: Optionally stored for audit trails (enable with `txn: true`)
+- **Transaction JSON**: Not stored by default. A transaction opts in with `TxnOpts::store_raw_txn` (Rust API) to keep its payload with the commit for audit trails, and a signed transaction always keeps its envelope
 
 ## Practical Applications
 

@@ -11,9 +11,10 @@
 //! A WHERE scoped to one named graph takes the lane too, and its rows are
 //! decoded and retracted in that graph.
 //!
-//! Its own `[[test]]` binary, like `it_upsert_skip_fires`: tracing's
-//! callsite-interest cache is process-global, so a sibling test in a bundled
-//! binary can leave the stamp's callsite disabled.
+//! Its own `[[test]]` binary, like `it_upsert_skip_fires`, which predates the
+//! shared capture helper; with the capture going through
+//! `fluree_test_support::scoped_default`, a sibling can no longer leave the
+//! stamp's callsite disabled.
 
 mod support;
 
@@ -300,7 +301,7 @@ async fn v_values(ledger: &LedgerState, graph: Option<&str>, subject: &str) -> V
         Some(iri) => ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(iri)
+            .assigned_graph_id(iri)
             .expect("graph registered"),
     };
     let s = ledger

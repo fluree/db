@@ -39,9 +39,18 @@ use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, FormatterConfig};
 use serde_json::{json, Value};
 
-const PREFIX: &str = "PREFIX ex: <http://example.org/ns/>\n";
 const SITE: &str = "membership-join";
-const QUERY: &str = "SELECT ?s ?o WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }";
+
+/// JSON-LD reads a list's members as values of its predicate, so list rows
+/// recur as ground triples here. (SPARQL reads them as RDF list cells, which
+/// no two lists share, and never plans list rows into this lane.)
+fn query() -> Value {
+    json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?s", "?o"],
+        "where": [{"@id": "?s", "ex:createdBy": "?o"}, {"@id": "?s", "ex:authoredBy": "?o"}]
+    })
+}
 
 const N_DUP: usize = 128;
 const N_PLAIN: usize = 20;
@@ -120,11 +129,11 @@ async fn setup(alias: &str, data: &Value) -> (tempfile::TempDir, Fluree) {
 }
 
 async fn run_query(fluree: &Fluree, alias: &str) -> Vec<String> {
-    let full = format!("{PREFIX}{QUERY}");
+    let query = query();
     let snapshot = fluree.graph(alias).load().await.expect("load");
     let rows = snapshot
         .query()
-        .sparql(&full)
+        .jsonld(&query)
         .format(FormatterConfig::jsonld())
         .execute_formatted()
         .await

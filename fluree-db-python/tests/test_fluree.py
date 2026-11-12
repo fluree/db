@@ -128,6 +128,37 @@ def test_insert_formats_and_commit_receipt(conn, tmp_path):
     assert total[0].total == 10
 
 
+@pytest.mark.parametrize("empty", [[], {"@graph": []}], ids=["list", "graph"])
+def test_an_empty_insert_has_nothing_to_add(conn, empty):
+    ledger = conn.create("empty")
+    for write in (ledger.insert, ledger.upsert):
+        with pytest.raises(fluree.InvalidRequestError, match="nothing to add"):
+            write(empty)
+
+
+def test_create_from_a_source_on_any_connection(conn, tmp_path):
+    source = tmp_path / "people.ttl"
+    source.write_text(TURTLE)
+    ledger = conn.create("loaded", source=source)
+    assert ledger.query(PREFIX + "SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:name ?name }")[0].n == 3
+
+
+def test_import_graph_adds_a_named_graph_to_a_ledger(people, tmp_path):
+    """On either connection: a file connection asks its background indexer to
+    index the ledger's commits first, a memory one indexes them itself."""
+    source = tmp_path / "products.ttl"
+    source.write_text(f'@prefix ex: <{EX}> .\nex:widget ex:maker ex:alice ; ex:name "Widget" .\n')
+    products = "http://example.org/graph/products"
+    commit = people.import_graph(products, source)
+    assert commit.t == 2 and commit.asserts >= 2
+    assert people.graphs() == [IRI(products)]
+    # The graph's subject is the ledger's own ex:alice.
+    makers = people.query(PREFIX + f"SELECT ?who WHERE {{ GRAPH <{products}> {{ ?w ex:maker ?m }} ?m ex:name ?who }}")
+    assert [row.who for row in makers] == ["Alice"]
+    with pytest.raises(fluree.InvalidRequestError, match="already has the graph"):
+        people.import_graph(products, source)
+
+
 def test_unknown_file_format_needs_format(conn, tmp_path):
     ledger = conn.create("formats")
     data = tmp_path / "data.txt"

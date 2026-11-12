@@ -3846,73 +3846,59 @@ GRAPH <#txn-meta> {
     );
 }
 
-/// Bulk JSON-LD import cannot write graph-scoped statements yet: a node's
-/// graph selector, or a JSON-LD named graph's content, refuses the import
-/// instead of folding the statements into the default graph (the selector
-/// used to be dropped) or dropping them (named-graph content was). The same
-/// data as TriG imports into its graph.
+/// Bulk JSON-LD import writes graph-scoped statements to their graph, as
+/// the TriG spelling of the same data does: a node's graph selector and a
+/// JSON-LD named graph's content both land in `ex:g`. (They used to be
+/// refused, and before that the selector was dropped and the named graph's
+/// content lost.) `it_import_jsonld_graph_scope.rs` covers every form.
 #[tokio::test]
-async fn import_jsonld_graph_scoping_is_refused_not_folded() {
-    for (i, doc) in [
-        r#"{"@context": {"ex": "http://example.org/ns/"},
-            "@graph": [{"@id": "ex:a", "@graph": "ex:g", "ex:p": 1}]}"#,
-        r#"{"@context": {"ex": "http://example.org/ns/"},
-            "@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:p": 1}]}"#,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+async fn import_jsonld_graph_scoping_lands_in_its_graph_like_trig() {
+    let files = [
+        (
+            "scoped.jsonld",
+            r#"{"@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:a", "@graph": "ex:g", "ex:p": 1}]}"#,
+        ),
+        (
+            "scoped.jsonld",
+            r#"{"@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:p": 1}]}"#,
+        ),
+        (
+            "scoped.trig",
+            "GRAPH <http://example.org/ns/g> { <http://example.org/ns/a> <http://example.org/ns/p> 1 . }\n",
+        ),
+    ];
+    for (i, (name, body)) in files.into_iter().enumerate() {
         let db_dir = tempfile::tempdir().expect("db tmpdir");
         let data_dir = tempfile::tempdir().expect("data tmpdir");
-        let file_path = data_dir.path().join("scoped.jsonld");
-        std::fs::write(&file_path, doc).unwrap();
+        let file_path = data_dir.path().join(name);
+        std::fs::write(&file_path, body).unwrap();
         let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
             .build()
             .expect("build file-backed Fluree");
-        let err = fluree
-            .create(&format!("test/import-jsonld-scoped-{i}:main"))
+        let ledger_id = format!("test/import-scoped-{i}:main");
+        fluree
+            .create(&ledger_id)
             .import(&file_path)
             .cleanup(false)
             .execute()
             .await
-            .expect_err("graph-scoped JSON-LD is refused by bulk import");
-        assert!(
-            err.to_string()
-                .contains("graph scoping is not supported by bulk import"),
-            "{err}"
+            .unwrap_or_else(|e| panic!("{name} #{i} imports: {e}"));
+        let ledger = fluree.ledger(&ledger_id).await.expect("load");
+        let rows = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?o WHERE { GRAPH <http://example.org/ns/g> { ?s <http://example.org/ns/p> ?o } }",
+        )
+        .await
+        .expect("query");
+        assert_eq!(
+            rows.as_array().map(Vec::len),
+            Some(1),
+            "{name} #{i}: {rows}"
         );
     }
-
-    let db_dir = tempfile::tempdir().expect("db tmpdir");
-    let data_dir = tempfile::tempdir().expect("data tmpdir");
-    let trig_path = data_dir.path().join("scoped.trig");
-    std::fs::write(
-        &trig_path,
-        "GRAPH <http://example.org/ns/g> { <http://example.org/ns/a> <http://example.org/ns/p> 1 . }\n",
-    )
-    .unwrap();
-    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
-        .build()
-        .expect("build file-backed Fluree");
-    fluree
-        .create("test/import-trig-scoped:main")
-        .import(&trig_path)
-        .cleanup(false)
-        .execute()
-        .await
-        .expect("the TriG spelling imports");
-    let ledger = fluree
-        .ledger("test/import-trig-scoped:main")
-        .await
-        .expect("load");
-    let rows = support::query_sparql_formatted(
-        &fluree,
-        &ledger,
-        "SELECT ?o WHERE { GRAPH <http://example.org/ns/g> { ?s <http://example.org/ns/p> ?o } }",
-    )
-    .await
-    .expect("query");
-    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
 }
 
 /// A bulk-import TriG block named by the ledger's own address, in any
@@ -3998,4 +3984,75 @@ async fn import_trig_blocks_named_by_the_ledger_address() {
         .map(|(_, iri)| iri.to_string())
         .collect();
     assert_eq!(registered, ["http://example.org/g1"]);
+}
+
+/// Two lists on one property stay two lists through bulk import — in one
+/// chunk, and in two chunks parsed by different workers, which share the
+/// owners of the lists stored compactly.
+#[tokio::test]
+async fn import_keeps_two_lists_on_one_property_apart() {
+    use std::fmt::Write as _;
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let small = write_ttl(
+        data_dir.path(),
+        "small.ttl",
+        "@prefix ex: <http://example.org/> .\nex:s ex:p (1 2), (3 4) ; ex:q (1 2), (1 3) .\n",
+    );
+    fluree
+        .create("test/import-lists:main")
+        .import(&small)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger("test/import-lists:main").await.expect("load");
+    let lists = |p: &'static str| {
+        let ledger = &ledger;
+        async move {
+            support::stored_int_lists(
+                ledger,
+                "http://example.org/s",
+                &format!("http://example.org/{p}"),
+            )
+            .await
+        }
+    };
+    assert_eq!(lists("p").await, [[1, 2], [3, 4]]);
+    assert_eq!(lists("q").await, [[1, 2], [1, 3]]);
+
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\nex:s ex:p (1 2) .\n");
+    for i in 0..12_000 {
+        let _ = writeln!(
+            ttl,
+            "ex:filler{i} ex:description \"padding that puts the two lists in different import chunks\" ."
+        );
+    }
+    ttl.push_str("ex:s ex:p (3 4) .\n");
+    let big = write_ttl(data_dir.path(), "big.ttl", &ttl);
+    let result = fluree
+        .create("test/import-lists-chunks:main")
+        .import(&big)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+    let ledger = fluree
+        .ledger("test/import-lists-chunks:main")
+        .await
+        .expect("load");
+    assert_eq!(
+        support::stored_int_lists(&ledger, "http://example.org/s", "http://example.org/p").await,
+        [[1, 2], [3, 4]]
+    );
 }

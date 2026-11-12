@@ -41,6 +41,8 @@ pub mod error;
 pub mod flake_sink;
 pub mod generate;
 pub mod ir;
+mod list_edits;
+pub mod lists;
 pub mod lower_cypher_update;
 pub mod lower_sparql_update;
 pub mod namespace;
@@ -50,6 +52,7 @@ pub mod stage;
 pub mod staged_dicts;
 pub mod template_sink;
 pub mod value_convert;
+pub mod vector_dims;
 
 #[cfg(feature = "import")]
 pub mod import;
@@ -62,19 +65,21 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 // Re-exports
 pub use address::parse_commit_id;
 pub use commit::{
-    build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
+    build_commit, check_index_loaded, commit, CommitOpts, CommitOptsRequest, CommitReceipt,
+    StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{
-    graph_id_in, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey, Origin, Retraction, Slot,
-    StoredFact, DELETE_POINT_READ_SITE,
+    graph_id_in, resolve_same_t_pairs, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey,
+    Origin, Retraction, SameTPair, Slot, StoredFact, DELETE_POINT_READ_SITE,
 };
 pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::FlakeGenerator;
 pub use ir::{
     AddressName, GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues,
-    TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
+    RelationshipDelete, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    WriteGraphs,
 };
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,
@@ -88,17 +93,18 @@ pub use parse::{
     Placement, RdfText, RdfTextSummary,
 };
 pub use parse::{
-    might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
-    parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta,
-    RawTriple, TrigPhase1Result,
+    is_empty_document, might_contain_graph_block, parse_graph_insert, parse_sync_transaction,
+    parse_transaction, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm,
+    RawTrigMeta, RawTriple, TrigPhase1Result,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{
-    generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions,
-    DELETE_WITNESSED_SITE,
+    drop_needs_unrestricted_identity, generate_txn_id, stage, stage_flakes, stage_with_graph_delta,
+    StageOptions, DELETE_WITNESSED_SITE,
 };
 pub use staged_dicts::{
-    attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
+    attach_binary_provider, attach_staged_dicts, detach_binary_provider, graphs_to_hide,
+    hide_dropped_graphs, staged_dicts, store_without_dropped_graphs, StagedDicts,
 };
 pub use template_sink::{RdfTextParts, TemplateSink};
 

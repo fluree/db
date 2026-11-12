@@ -1,323 +1,70 @@
-//! RDF List Traversal Utility
+//! RDF lists in OWL axioms.
 //!
-//! Provides utilities for traversing RDF lists (rdf:first/rdf:rest chains).
-//! Used by OWL2-RL rules that reference list structures:
+//! OWL2-RL rules that reference list structures:
 //! - owl:intersectionOf
 //! - owl:unionOf
 //! - owl:oneOf
 //! - owl:propertyChainAxiom
 //! - owl:hasKey
+//!
+//! A list is read in either stored shape — compact members or an explicit
+//! `rdf:first`/`rdf:rest` chain — by [`fluree_db_core::rdf_list`].
 
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
-use fluree_db_core::namespaces::is_rdf_nil;
 use fluree_db_core::range::{RangeMatch, RangeTest};
+use fluree_db_core::rdf_list::read_lists;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, Sid};
-use fluree_vocab::namespaces::RDF;
-use fluree_vocab::predicates::{RDF_FIRST, RDF_REST};
 
 use crate::error::{ReasonerError, Result};
 use crate::owl;
 use crate::types::{ChainElement, PropertyExpression};
 
-/// Maximum list length to prevent infinite loops on malformed data
-const MAX_LIST_LENGTH: usize = 10_000;
-
-/// Collect all elements from an RDF list starting at the given head node.
+/// The lists among `values`, the flakes of one subject and predicate, each
+/// as its IRI and blank-node members. Literal members are skipped: the list
+/// axioms OWL2-RL reads name classes, properties and individuals.
 ///
-/// Traverses the rdf:first/rdf:rest chain until reaching rdf:nil.
-///
-/// # Arguments
-///
-/// * `db` - Bundled database reference (snapshot, graph, overlay, as-of time)
-/// * `list_head` - The SID of the list head node (blank node or IRI)
-///
-/// # Returns
-///
-/// A vector of SIDs representing the list elements (rdf:first values).
-/// Returns an empty vector if the list is empty or malformed.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Database query fails
-/// - List exceeds MAX_LIST_LENGTH (malformed/cyclic data)
-///
-/// # Example
-///
-/// For an RDF list like:
-/// ```turtle
-/// _:list1 rdf:first ex:A ;
-///         rdf:rest _:list2 .
-/// _:list2 rdf:first ex:B ;
-///         rdf:rest rdf:nil .
-/// ```
-///
-/// `collect_list_elements(db, &_:list1)` returns `[ex:A, ex:B]`
-pub async fn collect_list_elements(db: GraphDbRef<'_>, list_head: &Sid) -> Result<Vec<Sid>> {
-    let mut elements = Vec::new();
-    let mut current_node = list_head.clone();
-
-    // Create SIDs for rdf:first and rdf:rest
-    let rdf_first_sid = Sid::new(RDF, RDF_FIRST);
-    let rdf_rest_sid = Sid::new(RDF, RDF_REST);
-
-    loop {
-        // Check for rdf:nil terminator
-        if is_rdf_nil(&current_node) {
-            break;
-        }
-
-        // Guard against malformed/cyclic lists
-        if elements.len() >= MAX_LIST_LENGTH {
-            return Err(ReasonerError::Internal(format!(
-                "RDF list exceeds maximum length of {MAX_LIST_LENGTH} (possible cycle or malformed data)"
-            )));
-        }
-
-        // Query for rdf:first value at current node
-        // Using SPOT index: subject = current_node, predicate = rdf:first
-        let first_flakes: Vec<Flake> = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch {
-                    s: Some(current_node.clone()),
-                    p: Some(rdf_first_sid.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|f| f.op) // Only assertions, not retractions
-            .collect();
-
-        // Extract the first element (should be exactly one)
-        if let Some(first_flake) = first_flakes.first() {
-            if let FlakeValue::Ref(element_sid) = &first_flake.o {
-                elements.push(element_sid.clone());
-            }
-            // Note: Non-Ref values (literals) are skipped - most OWL list uses expect IRIs/blank nodes
-            // For owl:oneOf with literals, callers may need a variant that returns FlakeValue
-        }
-
-        // Query for rdf:rest to get next node
-        let rest_flakes: Vec<Flake> = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch {
-                    s: Some(current_node.clone()),
-                    p: Some(rdf_rest_sid.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|f| f.op)
-            .collect();
-
-        // Move to next node
-        if let Some(rest_flake) = rest_flakes.first() {
-            if let FlakeValue::Ref(next_node) = &rest_flake.o {
-                current_node = next_node.clone();
-            } else {
-                // rdf:rest must point to another node or rdf:nil
-                break;
-            }
-        } else {
-            // No rdf:rest found - malformed list, stop here
-            break;
-        }
-    }
-
-    Ok(elements)
+/// For a Turtle `ex:C owl:hasKey ( ex:p ex:q )`, or the same list written as
+/// `rdf:first`/`rdf:rest` triples, `values` are `ex:C`'s `owl:hasKey` flakes
+/// and the result is `[[ex:p, ex:q]]`.
+pub async fn collect_list_elements(db: GraphDbRef<'_>, values: &[Flake]) -> Result<Vec<Vec<Sid>>> {
+    Ok(read_lists(db, values)
+        .await?
+        .lists
+        .into_iter()
+        .map(|members| {
+            members
+                .into_iter()
+                .filter_map(|m| match m {
+                    FlakeValue::Ref(sid) => Some(sid),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect())
 }
 
-/// Collect list elements including literal values.
+/// The property chains among `values`, the flakes of one subject's
+/// `owl:propertyChainAxiom`, resolving `owl:inverseOf` members.
 ///
-/// Similar to `collect_list_elements` but returns FlakeValue instead of Sid,
-/// allowing for lists that contain literal values (useful for owl:oneOf with
-/// data values).
-///
-/// # Arguments
-///
-/// * `db` - Bundled database reference (snapshot, graph, overlay, as-of time)
-/// * `list_head` - The SID of the list head node
-///
-/// # Returns
-///
-/// A vector of FlakeValues representing the list elements.
-pub async fn collect_list_values(db: GraphDbRef<'_>, list_head: &Sid) -> Result<Vec<FlakeValue>> {
-    let mut elements = Vec::new();
-    let mut current_node = list_head.clone();
-
-    let rdf_first_sid = Sid::new(RDF, RDF_FIRST);
-    let rdf_rest_sid = Sid::new(RDF, RDF_REST);
-
-    loop {
-        if is_rdf_nil(&current_node) {
-            break;
-        }
-
-        if elements.len() >= MAX_LIST_LENGTH {
-            return Err(ReasonerError::Internal(format!(
-                "RDF list exceeds maximum length of {MAX_LIST_LENGTH} (possible cycle or malformed data)"
-            )));
-        }
-
-        // Query for rdf:first
-        let first_flakes: Vec<Flake> = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch {
-                    s: Some(current_node.clone()),
-                    p: Some(rdf_first_sid.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|f| f.op)
-            .collect();
-
-        if let Some(first_flake) = first_flakes.first() {
-            elements.push(first_flake.o.clone());
-        }
-
-        // Query for rdf:rest
-        let rest_flakes: Vec<Flake> = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch {
-                    s: Some(current_node.clone()),
-                    p: Some(rdf_rest_sid.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|f| f.op)
-            .collect();
-
-        if let Some(rest_flake) = rest_flakes.first() {
-            if let FlakeValue::Ref(next_node) = &rest_flake.o {
-                current_node = next_node.clone();
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-
-    Ok(elements)
-}
-
-/// Collect property chain elements from an RDF list, resolving owl:inverseOf.
-///
-/// This function traverses an RDF list (rdf:first/rdf:rest chain) and converts
-/// each element to a `ChainElement`. Elements can be:
+/// Members can be:
 /// - Direct property references: `ex:hasParent` → `ChainElement::direct(ex:hasParent)`
 /// - Inverse expressions: `_:bnode owl:inverseOf ex:hasChild` → `ChainElement::inverse(ex:hasChild)`
 /// - Nested inverses are normalized: `(P^-1)^-1 = P`
-///
-/// # Arguments
-///
-/// * `db` - Bundled database reference (snapshot, graph, overlay, as-of time)
-/// * `list_head` - The SID of the list head node
-///
-/// # Returns
-///
-/// A vector of `ChainElement` values representing the chain.
-///
-/// # Example
-///
-/// For an RDF list like:
-/// ```turtle
-/// _:list1 rdf:first ex:hasParent ;
-///         rdf:rest _:list2 .
-/// _:list2 rdf:first [ owl:inverseOf ex:hasChild ] ;
-///         rdf:rest rdf:nil .
-/// ```
-///
-/// Returns: `[ChainElement::direct(ex:hasParent), ChainElement::inverse(ex:hasChild)]`
 pub async fn collect_chain_elements(
     db: GraphDbRef<'_>,
-    list_head: &Sid,
-) -> Result<Vec<ChainElement>> {
-    let mut elements = Vec::new();
-    let mut current_node = list_head.clone();
-
-    let rdf_first_sid = Sid::new(RDF, RDF_FIRST);
-    let rdf_rest_sid = Sid::new(RDF, RDF_REST);
-
-    loop {
-        if is_rdf_nil(&current_node) {
-            break;
+    values: &[Flake],
+) -> Result<Vec<Vec<ChainElement>>> {
+    let mut chains = Vec::new();
+    for members in collect_list_elements(db, values).await? {
+        let mut chain = Vec::with_capacity(members.len());
+        for member in &members {
+            chain.push(resolve_chain_element(db, member, 0).await?);
         }
-
-        if elements.len() >= MAX_LIST_LENGTH {
-            return Err(ReasonerError::Internal(format!(
-                "RDF list exceeds maximum length of {MAX_LIST_LENGTH} (possible cycle or malformed data)"
-            )));
-        }
-
-        // Query for rdf:first
-        let first_flakes: Vec<Flake> = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch {
-                    s: Some(current_node.clone()),
-                    p: Some(rdf_first_sid.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|f| f.op)
-            .collect();
-
-        if let Some(first_flake) = first_flakes.first() {
-            if let FlakeValue::Ref(element_sid) = &first_flake.o {
-                // Try to resolve this element - it might be an owl:inverseOf expression
-                let chain_element = resolve_chain_element(db, element_sid, 0).await?;
-                elements.push(chain_element);
-            }
-        }
-
-        // Query for rdf:rest
-        let rest_flakes: Vec<Flake> = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch {
-                    s: Some(current_node.clone()),
-                    p: Some(rdf_rest_sid.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .into_iter()
-            .filter(|f| f.op)
-            .collect();
-
-        if let Some(rest_flake) = rest_flakes.first() {
-            if let FlakeValue::Ref(next_node) = &rest_flake.o {
-                current_node = next_node.clone();
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
+        chains.push(chain);
     }
-
-    Ok(elements)
+    Ok(chains)
 }
 
 /// Resolve a chain element, handling owl:inverseOf expressions.
@@ -450,17 +197,15 @@ fn resolve_property_expression_inner<'a>(
 
         // Check for owl:propertyChainAxiom
         let chain_axiom_sid = owl::property_chain_axiom_sid();
-        for flake in &node_flakes {
-            if flake.p == chain_axiom_sid {
-                if let FlakeValue::Ref(list_head) = &flake.o {
-                    // Parse the chain using collect_chain_elements
-                    let chain_elements = collect_chain_elements(db, list_head).await?;
-                    if chain_elements.len() >= 2 {
-                        return Ok(PropertyExpression::chain(chain_elements));
-                    }
-                    // Invalid chain (less than 2 elements) - fall through to named
-                }
+        let chain_flakes: Vec<Flake> = node_flakes
+            .into_iter()
+            .filter(|f| f.p == chain_axiom_sid)
+            .collect();
+        for chain_elements in collect_chain_elements(db, &chain_flakes).await? {
+            if chain_elements.len() >= 2 {
+                return Ok(PropertyExpression::chain(chain_elements));
             }
+            // Invalid chain (less than 2 elements) - fall through to named
         }
 
         // Not an inverse or chain - treat as named property
@@ -471,7 +216,8 @@ fn resolve_property_expression_inner<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::namespaces::{is_rdf_first, is_rdf_rest};
+    use fluree_db_core::namespaces::{is_rdf_first, is_rdf_nil, is_rdf_rest};
+    use fluree_vocab::namespaces::RDF;
     use fluree_vocab::rdf_names;
 
     #[test]

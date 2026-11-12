@@ -359,7 +359,7 @@ async fn identity_policy_classes_in_model(
         .graph_selector
         .as_deref()
         .unwrap_or(fluree_vocab::config_iris::DEFAULT_GRAPH);
-    let g_id = crate::cross_ledger::resolve_selector_g_id(&view.snapshot, selector)
+    let g_id = crate::cross_ledger::resolve_selector_g_id(&view.snapshot, selector, view.t)
         .map_err(crate::error::ApiError::CrossLedger)?;
     let Some(g_id) = g_id else {
         return Ok(Vec::new());
@@ -420,6 +420,10 @@ async fn identity_policy_classes_in_model(
 /// behavior for unconfigured ledgers. A cross-ledger source always builds a
 /// context (mirroring the read path, where the model ledger's rules apply
 /// regardless of request inputs).
+///
+/// It is the first read of most write lanes (the committers, push, Cypher,
+/// GraphQL), so it first refuses a snapshot whose index this process has
+/// not loaded ([`fluree_db_transact::check_index_loaded`]).
 pub async fn build_transact_policy_context(
     fluree: &crate::Fluree,
     snapshot: &LedgerSnapshot,
@@ -428,6 +432,7 @@ pub async fn build_transact_policy_context(
     to_t: i64,
     opts: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>> {
+    fluree_db_transact::check_index_loaded(snapshot)?;
     let raw_config =
         resolve_ledger_config_cached(fluree, snapshot, overlay, novelty_for_stats, to_t).await?;
     let resolved = raw_config
@@ -512,7 +517,7 @@ pub async fn build_transact_policy_context(
     // unconditionally). Applying the no-inputs shortcut before this would let an
     // invalid config `f:policySource` silently run as root on writes while reads
     // fail closed — the read/write divergence this path exists to eliminate.
-    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot)?;
+    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot, to_t)?;
 
     if !effective_opts.has_any_policy_inputs() {
         return Ok(None);
@@ -659,5 +664,5 @@ pub(crate) async fn resolve_policy_graphs_from_config(
         .policy
         .as_ref()
         .and_then(|p| p.policy_source.as_ref());
-    policy_builder::resolve_policy_source_g_ids(source, snapshot)
+    policy_builder::resolve_policy_source_g_ids(source, snapshot, to_t)
 }

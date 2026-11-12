@@ -306,6 +306,7 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
         for pattern in patterns {
             match pattern {
                 Pattern::Triple(triple) => self.read_triple(triple, graph),
+                Pattern::ListView(lv) => self.read_triple(&lv.triple, graph),
                 Pattern::Filter(expr)
                 | Pattern::Bind { expr, .. }
                 | Pattern::Unwind { list: expr, .. } => self.read_expression(expr, graph),

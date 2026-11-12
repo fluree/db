@@ -30,6 +30,7 @@ use super::format::{
     AnnotationForwardRow, AnnotationReverseBranch, AnnotationReverseBranchEntry,
     AnnotationReverseLeaf, AnnotationReverseRow,
 };
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::{AnnotationStats, ContentId, EdgeKey, Sid};
 use std::collections::HashSet;
 
@@ -72,8 +73,9 @@ pub struct ReverseLeafSummary {
 /// matches the field documentation on [`AnnotationStats`] and gives
 /// the cost-based planner a true "currently attached" snapshot
 /// rather than an over-count of historical churn. Implementation
-/// relies on the `(edge, ann, t, op)` sort: the last row of each
-/// `(edge, ann)` run is the latest event for that pair.
+/// relies on the `(edge, ann)` then
+/// [`op_order`](fluree_db_core::same_t::op_order) sort: the last row of
+/// each `(edge, ann)` run is the event that holds for that pair.
 pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationStats) {
     use fluree_db_core::FlakeValue;
 
@@ -110,9 +112,8 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
             || rows[i].edge != rows[i + 1].edge
             || rows[i].ann != rows[i + 1].ann;
         // The final event in each (edge, ann) run determines whether
-        // the pair is currently live. Sort tie-breaker on `op` is
-        // `false < true`, so an assert at the same `t` as a retract
-        // correctly wins.
+        // the pair is currently live: rows are in `op_order`, so an
+        // assert at the same `t` as a retract holds.
         if !(last_in_group && rows[i].op) {
             continue;
         }
@@ -200,9 +201,9 @@ pub fn build_forward_leaves(
     let target = target_rows_per_leaf.max(1);
     debug_assert!(
         rows.windows(2)
-            .all(|w| (&w[0].edge, &w[0].ann, w[0].t, w[0].op)
-                <= (&w[1].edge, &w[1].ann, w[1].t, w[1].op)),
-        "build_forward_leaves: rows must be sorted by (edge, ann, t, op)"
+            .all(|w| (&w[0].edge, &w[0].ann, op_order(w[0].t, w[0].op))
+                <= (&w[1].edge, &w[1].ann, op_order(w[1].t, w[1].op))),
+        "build_forward_leaves: rows must be sorted by (edge, ann, op_order)"
     );
 
     let mut out: Vec<(ForwardLeafSummary, Vec<u8>)> = Vec::new();
@@ -270,9 +271,9 @@ pub fn build_reverse_leaves(
     let target = target_rows_per_leaf.max(1);
     debug_assert!(
         rows.windows(2)
-            .all(|w| (&w[0].ann, &w[0].edge, w[0].t, w[0].op)
-                <= (&w[1].ann, &w[1].edge, w[1].t, w[1].op)),
-        "build_reverse_leaves: rows must be sorted by (ann, edge, t, op)"
+            .all(|w| (&w[0].ann, &w[0].edge, op_order(w[0].t, w[0].op))
+                <= (&w[1].ann, &w[1].edge, op_order(w[1].t, w[1].op))),
+        "build_reverse_leaves: rows must be sorted by (ann, edge, op_order)"
     );
 
     let mut out: Vec<(ReverseLeafSummary, Vec<u8>)> = Vec::new();
@@ -396,9 +397,8 @@ mod tests {
 
     #[test]
     fn forward_stats_assert_at_same_t_as_retract_wins() {
-        // Same `t`, both ops on the same pair. Sort tie-break on
-        // `op` puts `false` before `true`, so the assert is the
-        // final row → pair is live.
+        // Same `t`, both ops on the same pair. `op_order` puts the
+        // retract first, so the assert is the final row → pair is live.
         let rows = vec![fwd_row(0, "ann_a", 5, false), fwd_row(0, "ann_a", 5, true)];
         let (_, stats) = forward_arena_stats(&rows);
         assert_eq!(stats.distinct_edges, 1);

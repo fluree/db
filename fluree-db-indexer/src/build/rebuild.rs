@@ -222,18 +222,22 @@ where
                 tracing::debug_span!("commit_chain_walk", commits = tracing::field::Empty)
                     .entered();
             let walk_started = std::time::Instant::now();
-            let (commit_cids, ledger_split_mode) = {
+            let (commit_cids, ledger_split_mode, lifecycles) = {
                 // stop_at_t=0 collects all commits (t starts at 1).
-                let (dag, split_mode) = fluree_db_core::collect_first_parent_cids_with_split_mode(
-                    &content_store,
-                    &head_commit_id,
-                    0,
-                )
-                .await?;
+                let (dag, split_mode, lifecycles) =
+                    fluree_db_core::collect_first_parent_cids_with_split_mode(
+                        &content_store,
+                        &head_commit_id,
+                        0,
+                    )
+                    .await?;
 
                 // Sorted by t descending; reverse for chronological (genesis-first).
                 let cids: Vec<ContentId> = dag.into_iter().rev().map(|(_, cid)| cid).collect();
-                (cids, split_mode)
+                // Graph lifecycles, likewise oldest first.
+                let lifecycles: Vec<fluree_db_core::CommitGraphLifecycle> =
+                    lifecycles.into_iter().rev().collect();
+                (cids, split_mode, lifecycles)
             };
             _span_a.record("commits", commit_cids.len());
             tracing::info!(
@@ -304,6 +308,12 @@ where
 
             // Enable schema hierarchy extraction during resolution.
             shared.schema_hook = Some(crate::stats::SchemaExtractor::new());
+
+            // What a graph held before its latest drop is not indexed: the
+            // commits keep it, the index does not (see `Commit::graph_drops`).
+            let graph_floors =
+                crate::run_index::build::incremental_resolve::graph_floors(&lifecycles, &shared);
+            shared.set_graph_floors(graph_floors.clone());
 
             let chunk_max_flakes: u64 = 5_000_000; // ~5M flakes per chunk
             let mut chunk = RebuildChunk::new();
@@ -463,22 +473,35 @@ where
             // Remap spatial entries' chunk-local subject IDs → global sid64.
             // The spatial hook accumulated entries with chunk-local s_id values;
             // spatial_chunk_ranges[ci] = (start, end) into entries for chunk ci.
-            let _spatial_entries: Vec<crate::spatial_hook::SpatialEntry> = {
+            let spatial_entries: Vec<crate::spatial_hook::SpatialEntry> = {
                 let mut all_entries = shared
                     .spatial_hook
                     .take()
                     .map(super::super::spatial_hook::SpatialHook::into_entries)
                     .unwrap_or_default();
 
+                let mut keep = vec![true; all_entries.len()];
                 for (ci, &(start, end)) in spatial_chunk_ranges.iter().enumerate() {
                     let s_remap = &subject_remaps[ci];
-                    for entry in &mut all_entries[start..end] {
+                    for (entry, keep) in all_entries[start..end]
+                        .iter_mut()
+                        .zip(&mut keep[start..end])
+                    {
                         let local_s = entry.subject_id as usize;
                         if let Some(&global_s) = s_remap.get(local_s) {
                             entry.subject_id = global_s;
+                        } else {
+                            tracing::warn!(
+                                chunk = ci,
+                                local_s,
+                                "spatial entry subject_id remap miss; skipping"
+                            );
+                            *keep = false;
                         }
                     }
                 }
+                let mut keep = keep.into_iter();
+                all_entries.retain(|_| keep.next().unwrap_or(true));
 
                 if !all_entries.is_empty() {
                     tracing::info!(
@@ -858,10 +881,15 @@ where
             //
             // Uses two separate passes over the .fsc files:
             //   Pass 1 (HLL): feeds ALL records to IdStatsHook in HLL-only mode
-            //                  (no per-subject maps — bounded memory).
-            //   Pass 2 (class): k-way merges .fsc files, deduplicates, feeds
-            //                   winning assertions to SpotClassStatsCollector
-            //                   (O(1) per-subject, class-level accumulators).
+            //                  (no per-subject maps — bounded memory). It
+            //                  observes them for the sketches only: counts
+            //                  from an op's sign miscount a same-`t` pair or a
+            //                  retraction of a fact never asserted.
+            //   Pass 2 (class + counts): k-way merges .fsc files, deduplicates,
+            //                   feeds winning assertions to
+            //                   SpotClassStatsCollector (O(1) per-subject,
+            //                   class-level accumulators) and counts them, one
+            //                   per fact the index holds, in the IdStatsHook.
             //
             // This replaces the old approach that accumulated ~16 GB of per-subject
             // HashMaps. Total stats-phase memory is now ~200 MB - 1 GB.
@@ -884,21 +912,9 @@ where
                         &record, &registry,
                     );
                     let sr = crate::stats::stats_record_from_v2(&v2, record.op);
-                    stats_hook.on_record(&sr);
+                    stats_hook.observe_record(&sr);
                 }
             }
-
-            // Upload HLL sketches to CAS.
-            let sketch_ref = super::upload::upload_stats_sketch(
-                &content_store,
-                commit_t,
-                stats_hook.properties(),
-            )
-            .await?
-            .map(|(cid, _)| cid);
-
-            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
-            let id_stats_result = stats_hook.finalize();
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
@@ -940,18 +956,33 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
                 // Iterate with dedup: next_deduped() returns the winning record
-                // per identity group (highest t wins). Feed assertions to collector.
+                // per identity group (highest t, and at one t the assert): an
+                // assertion is a fact the index holds. Feed it to the collector
+                // and count it.
                 while let Some((winner, op)) = merge
                     .next_deduped()
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?
                 {
                     if op == 1 {
                         collector.on_record(&winner);
+                        stats_hook.count_present(&crate::stats::stats_record_from_v2(&winner, op));
                     }
                 }
 
                 collector.finish()
             };
+
+            // Upload HLL sketches (counts included) to CAS.
+            let sketch_ref = super::upload::upload_stats_sketch(
+                &content_store,
+                commit_t,
+                stats_hook.properties(),
+            )
+            .await?
+            .map(|(cid, _)| cid);
+
+            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
+            let id_stats_result = stats_hook.finalize();
 
             // ---- Build IndexStats for FIR6 root ----
             let trie_for_stats =
@@ -1082,6 +1113,20 @@ where
                 per_graph.into_iter().collect()
             };
 
+            let spatial_by_graph: std::collections::BTreeMap<
+                fluree_db_core::GraphId,
+                Vec<fluree_db_binary_index::SpatialArenaRef>,
+            > = super::spatial::build_and_upload_spatial_indexes(
+                &spatial_entries,
+                &shared.predicates,
+                &ledger_id,
+                &content_store,
+                |_, _| {},
+            )
+            .await?
+            .into_iter()
+            .collect();
+
             // Datatype and language tag lists for the root. Re-snapshot
             // `language_tags` AFTER the fulltext build so any lang_id
             // allocated by the builder (notably `"en"`) is persisted.
@@ -1099,7 +1144,7 @@ where
                 tags.into_iter().map(|(_, tag)| tag).collect()
             };
 
-            // Graph arenas (numbig, vectors, fulltext) — build from uploaded_dicts CIDs.
+            // Graph arenas (numbig, vectors, spatial, fulltext).
             let graph_arenas: Vec<GraphArenaRefs> = {
                 let mut graph_ids = std::collections::BTreeSet::new();
                 for g_id_str in uploaded_dicts.numbig.keys() {
@@ -1112,7 +1157,7 @@ where
                         graph_ids.insert(g_id);
                     }
                 }
-                for g_id in fulltext_by_graph.keys() {
+                for g_id in fulltext_by_graph.keys().chain(spatial_by_graph.keys()) {
                     graph_ids.insert(*g_id);
                 }
                 graph_ids
@@ -1138,7 +1183,7 @@ where
                             g_id,
                             numbig,
                             vectors,
-                            spatial: Vec::new(),
+                            spatial: spatial_by_graph.get(&g_id).cloned().unwrap_or_default(),
                             fulltext,
                         }
                     })
@@ -1174,6 +1219,16 @@ where
                 sketch_ref,
                 attachment_events: config.attachment_events.clone(),
                 prev_index: prev_index.clone(),
+                graph_floors,
+                graph_drops: {
+                    let mut drops = std::collections::BTreeMap::new();
+                    crate::run_index::build::incremental_resolve::apply_lifecycles(
+                        &mut drops,
+                        &lifecycles,
+                        &shared,
+                    );
+                    drops.into_iter().collect()
+                },
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

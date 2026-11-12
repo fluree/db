@@ -87,6 +87,10 @@ pub struct PropertyPathPattern {
     pub max_hops: Option<u32>,
     /// Object ref (Var or Sid — literals not allowed)
     pub object: Ref,
+    /// SPARQL's view of RDF lists, when the path's predicates can step
+    /// through a list (see [`crate::list_view`]): the path follows a list's
+    /// owner edge and cells rather than its members.
+    pub list_view: Option<std::sync::Arc<crate::list_view::ListView>>,
 }
 
 impl PropertyPathPattern {
@@ -115,6 +119,7 @@ impl PropertyPathPattern {
             min_hops: None,
             max_hops: None,
             object,
+            list_view: None,
         }
     }
 
@@ -139,6 +144,7 @@ impl PropertyPathPattern {
             min_hops,
             max_hops,
             object,
+            list_view: None,
         }
     }
 

@@ -368,7 +368,8 @@ async fn chunked_rows_match_the_full_drain() {
 
 /// A bound object inside an `@list` indexes once per list position, so the
 /// driver revisits subjects after earlier chunks have been emitted. Each
-/// subject must still join once.
+/// subject must still join once. A JSON-LD query: it reads list entries as
+/// values, where SPARQL reads a list's head and cells.
 #[tokio::test]
 async fn driver_revisiting_a_subject_joins_it_once() {
     const TAGGED: usize = 3000;
@@ -394,10 +395,27 @@ async fn driver_revisiting_a_subject_joins_it_once() {
         .expect("reindex");
     let view = fluree.db(ledger_id).await.expect("view");
 
-    let star = "PREFIX ex: <http://example.org/ns/>\n\
-                SELECT ?t ?n WHERE { ?t ex:tags ex:red ; ex:name ?n }";
-    assert_property_join(&fluree, &view, star).await;
-    let mut got = rows(&fluree, &view, star).await;
+    let star = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?t", "?n"],
+        "where": {"@id": "?t", "ex:tags": {"@id": "ex:red"}, "ex:name": "?n"}
+    });
+    let plan = fluree.explain(&view, &star).await.expect("explain");
+    let physical = plan["plan"]["physical"].to_string();
+    assert!(
+        physical.contains("PropertyJoinOperator"),
+        "expected a property join: {physical}"
+    );
+    let result = fluree
+        .query(&view, QueryInput::from(&star))
+        .await
+        .expect("query");
+    let mut got = result
+        .to_jsonld(&view.snapshot)
+        .expect("to_jsonld")
+        .as_array()
+        .expect("rows")
+        .clone();
     got.sort_by_key(ToString::to_string);
     let mut expected: Vec<JsonValue> = (0..TAGGED)
         .map(|i| json!([format!("ex:t{i}"), format!("Tagged {i}")]))

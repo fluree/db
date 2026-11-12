@@ -45,9 +45,13 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
         NameServiceMode::ReadWrite(Arc::new(nameservice.clone())),
     );
 
+    // Every cycle's root is read back after the last build, so none may be
+    // collected: the age guard holds them all for the test's length, and the
+    // version ceiling, which would take the oldest, is removed.
     let indexer_cfg = IndexerConfig::small()
         .with_incremental_enabled(true)
-        .with_incremental_max_commits(10_000);
+        .with_incremental_max_commits(10_000)
+        .with_gc_hard_max_old_indexes(None);
 
     let (local, handle) = support::start_background_indexer_local(
         fluree_db_core::StorageBackend::Managed(Arc::new(storage.clone())),

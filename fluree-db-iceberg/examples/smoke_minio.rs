@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("endpoint={endpoint}  table={table_loc}");
 
+    #[allow(deprecated)] // an SDK example, not a graph-source read
     let storage =
         Arc::new(S3IcebergStorage::from_default_chain(Some(&region), Some(&endpoint), true).await?);
 

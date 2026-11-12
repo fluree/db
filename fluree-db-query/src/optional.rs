@@ -28,7 +28,8 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
-    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
+    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, LaneOutput,
+    ObjectProbeOps, ProbeLanePlan, ProbeOps,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -39,7 +40,7 @@ use crate::join::{
     UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
-use crate::operator::flush::FlushSchedule;
+use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -435,10 +436,12 @@ impl PatternOptionalBuilder {
         let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
             return Ok(None);
         };
-        Ok(match object_probe_lane_plan(ctx, store, &pred_sid)? {
-            ProbeLanePlan::Decline => None,
-            plan => Some((Arc::clone(store), pred_sid, plan)),
-        })
+        Ok(
+            match object_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)? {
+                ProbeLanePlan::Decline => None,
+                plan => Some((Arc::clone(store), pred_sid, plan)),
+            },
+        )
     }
 
     /// The bound-object lane: one sorted OPST pass over every required row's
@@ -494,13 +497,19 @@ impl PatternOptionalBuilder {
         objects.sort_unstable();
         let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
         let mut matched = 0usize;
-        let branch =
-            store.branch_for_order(ctx.binary_g_id, fluree_db_binary_index::RunSortOrder::Opst);
-        if let (Some(p_id), Some(branch)) = (store.sid_to_p_id(&pred_sid), branch) {
+        let merging = matches!(lane_plan, ProbeLanePlan::Merge(_));
+        let branch = branch_or_none(
+            &store,
+            ctx.binary_g_id,
+            fluree_db_binary_index::RunSortOrder::Opst,
+            merging,
+        )?;
+        let p_id = p_id_or_none(&store, &pred_sid, || Ok(merging))?;
+        if let (Some(p_id), Some(branch)) = (p_id, branch) {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();
             let mut probe_ops = match &lane_plan {
-                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(Arc::clone(ops)),
                 _ => None,
             };
             for_each_object_probe_match(
@@ -756,7 +765,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
             return false;
         };
         !matches!(
-            subject_probe_lane_plan(ctx, store, &pred_sid),
+            subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
             Err(_) | Ok(ProbeLanePlan::Decline)
         )
     }
@@ -833,7 +842,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
         // Novelty merges per probed subject; unmergeable overlays fall back
         // to the per-row scan (whose cursor merges the overlay).
-        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
         if matches!(lane_plan, ProbeLanePlan::Decline) {
             return Ok(None);
         }
@@ -1174,7 +1183,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 return false;
             };
             !matches!(
-                subject_probe_lane_plan(ctx, store, &pred_sid),
+                subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
                 Err(_) | Ok(ProbeLanePlan::Decline)
             )
         })
@@ -1222,6 +1231,17 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 predicate_count = self.triples.len(),
                 start_row,
                 reason = "datatype-constraint",
+                "grouped optional builder fallback"
+            );
+            return Ok(None);
+        }
+        // Admission declines this encoded lane for an eager caller at
+        // planning; say so before resolving every row's subject id.
+        if crate::fast_path_common::eager_with_overlay(ctx) {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                reason = "eager-materialization",
                 "grouped optional builder fallback"
             );
             return Ok(None);
@@ -1298,7 +1318,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             };
-            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
             if matches!(lane_plan, ProbeLanePlan::Decline) {
                 tracing::debug!(
                     predicate_count = self.triples.len(),
@@ -2592,40 +2612,14 @@ impl OptionalOperator {
         // as before.
         let exact = window < self.optional_builder.seed_coalesce_cap();
         self.coalesce_schedule.advance();
-        let mut schema: Option<Arc<[VarId]>> = None;
-        let mut columns: Vec<Vec<Binding>> = Vec::new();
-        let mut rows = 0usize;
-        while rows < window {
-            let (batch, start) = match self.required_pending.take() {
-                Some(pending) => pending,
-                None => match self.required.next_batch(ctx).await? {
-                    Some(batch) => (batch, 0),
-                    None => break,
-                },
-            };
-            let end = if exact {
-                batch.len().min(start + window - rows)
-            } else {
-                batch.len()
-            };
-            if schema.is_none() {
-                schema = Some(batch.schema_arc());
-                columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
-            }
-            for (c, col) in columns.iter_mut().enumerate() {
-                let column = batch.column_by_idx(c).expect("column index within schema");
-                col.extend_from_slice(&column[start..end]);
-            }
-            rows += end - start;
-            if end < batch.len() {
-                self.required_pending = Some((batch, end));
-            }
-        }
-        let Some(schema) = schema.filter(|_| rows > 0) else {
-            return Ok(None);
-        };
-        // `from_parts` keeps the row count of a 0-column driving side.
-        Ok(Some(Batch::from_parts(schema, columns, rows)?))
+        pull_window(
+            &mut self.required,
+            &mut self.required_pending,
+            window,
+            exact,
+            ctx,
+        )
+        .await
     }
 
     /// The next required batch, starting with rows a seed left unread.

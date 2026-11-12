@@ -1982,7 +1982,7 @@ async fn test_update_from_named_alias_usable_in_templates() {
                 ledger
                     .snapshot
                     .graph_registry
-                    .graph_id_for_iri("http://example.org/g2")
+                    .assigned_graph_id("http://example.org/g2")
                     .is_some(),
                 "expected g2 IRI to be registered in graph_registry"
             );
@@ -2866,7 +2866,7 @@ INSERT DATA {
         let g2_id = ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(g2)
+            .assigned_graph_id(g2)
             .expect("dest graph registered after transfer");
         let dest_keys =
             support::decode_annotations_for_subject(&ledger, g2_id, "http://example.org/alice")
@@ -2978,8 +2978,8 @@ async fn test_graph_mgmt_honors_modify_policy() {
     let ledger_id = "it/graph-mgmt-policy:main";
     let ledger = genesis_ledger(&fluree, ledger_id);
 
-    // One non-schema flake in the default graph (schema flakes bypass modify
-    // policy via is_schema_flake, so use a plain triple).
+    // One plain triple in the default graph (a schema triple is judged alike:
+    // `test_clear_default_schema_flakes_follow_modify_policy`).
     let ledger = run_sparql_update(
         &fluree,
         ledger,
@@ -3506,6 +3506,21 @@ async fn test_jsonld_update_from_an_unknown_graph_reads_an_empty_default_graph()
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// Whether selecting the named graph registered under exactly `graph` is
+/// refused because the graph was dropped (a dropped graph no longer exists).
+async fn graph_is_dropped(fluree: &fluree_db_api::Fluree, ledger_id: &str, graph: &str) -> bool {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": {"@id": ledger_id, "graph": graph},
+        "select": ["?o"],
+        "where": [{"@id": "?s", "ex:v": "?o"}]
+    });
+    match fluree.query_from().jsonld(&query).execute_formatted().await {
+        Ok(_) => false,
+        Err(e) => e.to_string().contains("was dropped"),
+    }
+}
+
 /// The `ex:v` values in one graph of `ledger_id`, sorted: its default graph,
 /// or the named graph registered under exactly `graph`. The dataset `from`
 /// selects a named graph by registry lookup, so it reaches a graph registered
@@ -4016,10 +4031,9 @@ async fn test_a_graph_registered_under_the_address_migrates_to_the_default_graph
             ["default only", "legacy only", "same"],
             "[{address}] the default graph holds the legacy graph's data"
         );
-        assert_eq!(
-            ex_v_values(&fluree, &branch, Some(&address)).await,
-            Vec::<String>::new(),
-            "[{address}] the legacy graph is empty"
+        assert!(
+            graph_is_dropped(&fluree, &branch, &address).await,
+            "[{address}] the legacy graph is gone"
         );
     }
 }
@@ -4492,7 +4506,12 @@ async fn test_graph_management_reads_a_graph_named_through_the_address() {
         assert_eq!(values(Some(copy)).await, ["legacy"], "{keyword}: COPY");
         update(format!("MOVE GRAPH <{branch}#{legacy}> TO <{moved}>")).await;
         assert_eq!(values(Some(moved)).await, ["legacy"], "{keyword}: MOVE");
-        assert!(values(Some(&legacy)).await.is_empty(), "{keyword}: MOVE");
+        let dropped = |graph: &str| {
+            let graph = graph.to_string();
+            let fluree = &fluree;
+            async move { graph_is_dropped(fluree, branch, &graph).await }
+        };
+        assert!(dropped(&legacy).await, "{keyword}: MOVE drops its source");
         // Back in, naming the legacy graph as the destination.
         update(format!("MOVE GRAPH <{moved}> TO <{branch}#{legacy}>")).await;
         assert_eq!(
@@ -4502,12 +4521,12 @@ async fn test_graph_management_reads_a_graph_named_through_the_address() {
         );
 
         update(format!("DROP GRAPH <{branch}#{legacy}>")).await;
-        assert!(values(Some(&legacy)).await.is_empty(), "{keyword}: DROP");
+        assert!(dropped(&legacy).await, "{keyword}: DROP");
         update(format!("DROP GRAPH <{branch}#{copy}>")).await;
-        assert!(values(Some(copy)).await.is_empty(), "{keyword}: DROP");
+        assert!(dropped(copy).await, "{keyword}: DROP");
         // The address alone: the graph registered under it, not the default graph.
         update(format!("DROP GRAPH <{branch}>")).await;
-        assert!(values(Some(branch)).await.is_empty(), "{keyword}: DROP");
+        assert!(dropped(branch).await, "{keyword}: DROP");
         assert_eq!(values(None).await, ["default", "legacy"], "{keyword}");
     }
 }
@@ -4884,15 +4903,13 @@ WHERE { ?s ex:handle ?h }",
     }
 }
 
-/// N3 contract pin: schema flakes (rdfs:Class / rdfs:subClassOf …) are exempt
-/// from modify policy (`is_schema_flake`), so a view-only, default-deny
-/// identity CAN `CLEAR DEFAULT` a schema-only default graph — the documented
-/// (policy-unblockable) ontology-wipe footgun. The companion test above
-/// proves the SAME identity is rejected for non-schema flakes, so this pins
-/// the boundary rather than a policy hole: if the always-allow schema
-/// exemption is ever narrowed, this test flips and the change is deliberate.
+/// Schema flakes (rdfs:Class / rdfs:subClassOf …) are judged by modify
+/// policy like any other, so a view-only, default-deny identity cannot
+/// `CLEAR DEFAULT` a schema-only default graph, as the companion test above
+/// shows it cannot clear a plain triple. Writing the hierarchy widens what
+/// policies on its classes and properties allow, so it is not exempt.
 #[tokio::test]
-async fn test_clear_default_schema_flakes_bypass_modify_policy() {
+async fn test_clear_default_schema_flakes_follow_modify_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/graph-mgmt-schema-policy:main";
     let ledger = genesis_ledger(&fluree, ledger_id);
@@ -4930,18 +4947,24 @@ INSERT DATA { <http://example.org/MyClass> a rdfs:Class }",
     .await
     .expect("build policy context");
 
-    // CLEAR DEFAULT succeeds — the schema retraction is not policy-blockable.
-    let result = fluree
+    let err = fluree
         .stage_owned(ledger.clone())
         .txn(Txn::clear_default_graph())
         .policy(policy_ctx)
         .execute()
         .await
-        .expect("schema-only CLEAR DEFAULT bypasses modify policy (N3 contract)");
+        .map(|_| ())
+        .expect_err("a view-only identity cleared the ontology");
+    assert_eq!(err.status_code(), 403, "{err}");
+    assert!(
+        err.to_string()
+            .contains("Policy enforcement prevents modification"),
+        "{err}"
+    );
     assert_eq!(
-        count_in_default(&fluree, &result.ledger).await,
-        0,
-        "the ontology was wiped by a view-only identity — the pinned N3 contract"
+        count_in_default(&fluree, &ledger).await,
+        1,
+        "the class declaration survives"
     );
 }
 
@@ -5601,4 +5624,112 @@ async fn a_top_level_values_iri_in_a_new_namespace_writes_and_reads_as_itself() 
     .to_jsonld(&ledger.snapshot)
     .expect("jsonld");
     assert_eq!(rows, json!([["v"]]));
+}
+
+/// A join inside a graph the index has no branch for: a named graph first
+/// written after the last index, and the default graph of a ledger whose
+/// indexed facts are all in named graphs. The join probes that graph by
+/// subject, and the graph holds nothing for the probe, so it answers with no
+/// rows. `ex:sel` is read from novelty, and `ex:v` is known to the index only
+/// from g1, where it has enough rows that the join reads `ex:sel` first.
+///
+/// The per-row path answers the same rows, so the default-graph and `GRAPH`
+/// spellings are pinned to the batched subject probe, the read that needs the
+/// graph's branch. `FROM <urn:g3>` reads g3 as a dataset, where the probe lane
+/// declines today, so only its rows are checked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_join_in_a_graph_written_after_the_index_probes_it_and_finds_nothing() {
+    let id = "probe-branchless-graph:main";
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    fluree
+        .stage_owned(ledger)
+        .insert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             GRAPH <urn:g1> {\n\
+               ex:s ex:sel ex:y0 .\n\
+               ex:y0 ex:v \"x\" . ex:y1 ex:v \"x\" . ex:y2 ex:v \"x\" . ex:y3 ex:v \"x\" .\n\
+               ex:y4 ex:v \"x\" . ex:y5 ex:v \"x\" . ex:y6 ex:v \"x\" . ex:y7 ex:v \"x\" .\n\
+             }",
+        )
+        .execute()
+        .await
+        .expect("seed g1");
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
+    let ledger = fluree.ledger(id).await.expect("load");
+    let ledger = fluree
+        .stage_owned(ledger)
+        .insert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:sel ex:y0 .\n\
+             GRAPH <urn:g3> { ex:b ex:sel ex:y0 . }",
+        )
+        .execute()
+        .await
+        .expect("write the default graph and g3")
+        .ledger;
+
+    let join = "?x ex:sel ?y . ?y ex:v ?o";
+    let sparql = |dataset: &str, body: &str| {
+        format!("PREFIX ex: <http://example.org/>\nSELECT ?x ?o {dataset} WHERE {{ {body} }}")
+    };
+    let default_graph = sparql("", join);
+    let from_g3 = sparql("FROM <urn:g3>", join);
+    let graph_g3 = sparql("", &format!("GRAPH <urn:g3> {{ {join} }}"));
+    let graph_g1 = sparql("", &format!("GRAPH <urn:g1> {{ {join} }}"));
+    let jsonld_graph_g3 = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?x", "?o"],
+        "where": [["graph", "urn:g3", {"@id": "?x", "ex:sel": "?y"}, {"@id": "?y", "ex:v": "?o"}]]
+    });
+    // (spelling, query, rows, pinned to the batched subject probe)
+    let cases: [(&str, fluree_db_api::QueryInput<'_>, usize, bool); 5] = [
+        ("default graph", default_graph.as_str().into(), 0, true),
+        ("FROM <urn:g3>", from_g3.as_str().into(), 0, false),
+        ("GRAPH <urn:g3>", graph_g3.as_str().into(), 0, true),
+        ("JSON-LD graph urn:g3", (&jsonld_graph_g3).into(), 0, true),
+        ("GRAPH <urn:g1>", graph_g1.as_str().into(), 1, true),
+    ];
+
+    let db = support::graphdb_from_ledger(&ledger);
+    let (store, guard) = support::span_capture::init_test_tracing();
+
+    let mut failures = Vec::new();
+    for (label, query, rows, pinned) in cases {
+        let before = store.find_events("nested loop join runtime path").len();
+        let result = match fluree.query(&db, query).await {
+            Ok(result) => result,
+            Err(err) => {
+                failures.push(format!("{label}: {err}"));
+                continue;
+            }
+        };
+        // (use_batched, batched_eligible, batched_object_eligible), read
+        // before formatting, which runs queries of its own.
+        let routes: Vec<[String; 3]> = store.find_events("nested loop join runtime path")[before..]
+            .iter()
+            .map(|e| {
+                ["use_batched", "batched_eligible", "batched_object_eligible"]
+                    .map(|f| e.fields.get(f).cloned().unwrap_or_default())
+            })
+            .collect();
+        let answer = result
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("format");
+        if answer.as_array().map(Vec::len) != Some(rows) {
+            failures.push(format!("{label}: expected {rows} rows, got {answer}"));
+        }
+        let subject_probe = ["true", "true", "false"].map(String::from);
+        if pinned && !routes.contains(&subject_probe) {
+            failures.push(format!(
+                "{label}: must take the batched subject probe, took {routes:?}"
+            ));
+        }
+    }
+    drop(guard);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

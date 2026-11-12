@@ -31,6 +31,16 @@ All `@vector` values are stored as **IEEE-754 binary32 (f32)** arrays. This mean
 
 If you need higher precision (f64) or different vector formats (sparse, integer), store them as a custom RDF datatype string.
 
+### Length
+
+A vector has 1 to 65,535 elements. In each graph, all the vectors a property holds have the same length: the length of the first vector the property received in that graph. Retracting vectors does not reset it, because the ledger keeps their history. A write that breaks either rule is refused with an `Invalid vector` error (HTTP 422, `err:db/InvalidTransaction`) that names the property, and the graph when it is a named graph, and nothing in it is committed.
+
+A bulk import (`fluree create --from`, the server's import upload) stops with the same `Invalid vector` error. Like an import that stops for any other reason, it keeps the commits it published at its last checkpoint, one every 50 chunks by default; an import that stops before its first checkpoint leaves the ledger with no commits.
+
+Pull, clone and restore (from a `.flpack` archive) copy a ledger's commits and index as they are, and do not apply these rules: the copy refuses what its source refuses.
+
+To keep embeddings of two lengths, such as those of two models, put them on two properties or in two graphs.
+
 ### Inserting vectors (JSON-LD)
 
 Use `"@type": "@vector"` to annotate a numeric array as a vector:
@@ -411,7 +421,7 @@ Vector indexes are implemented using embedded [usearch](https://github.com/unum-
 
 ### Creating Vector Indexes
 
-> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the same storage path your Fluree server reads, then run queries normally via `POST /v1/fluree/query`.
+> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the storage your Fluree server reads, then run queries normally via `POST /v1/fluree/query`. On file storage, a directory is used by one process at a time and the server locks it ([One process per directory](../operations/storage.md#one-process-per-directory)), so stop the server while the Rust program creates the index, then start it again.
 
 #### Rust API
 
@@ -540,6 +550,8 @@ println!("Upserted: {}, Removed: {}", sync_result.upserted, sync_result.removed)
 ```
 
 Sync is incremental only when the indexing query's dependencies can be tracked completely; the shape rules are the same as for [BM25 syncing](bm25.md#syncing). Outside that shape every sync re-embeds the whole corpus, and the decline is logged at `warn` with the reason. Within it, a window that touches none of the tracked properties (the embedding property is always one of them) advances the watermark without re-embedding anything.
+
+A sync whose window holds a `DROP` of a graph the indexing query reads re-embeds in full, for the reason and by the rules given under [BM25 syncing](bm25.md#syncing). A vector index keeps only its latest snapshot, so there is no earlier one to retire.
 
 #### Full Resync
 

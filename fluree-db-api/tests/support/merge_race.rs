@@ -1,6 +1,12 @@
-//! A deterministic pause immediately before the merge's ref CAS, an opt-in
-//! listing failure, and an opt-in loss of every commit-head race. All other
-//! operations use the real nameservice, including rollback.
+//! A deterministic pause immediately before the merge's ref CAS, or instead
+//! just after its lookup of the target, an opt-in listing failure, an opt-in
+//! loss of every commit-head race, and an opt-in pause before, or failure of,
+//! an index publish. All other operations use the real nameservice, including
+//! rollback.
+
+// Compiled into more than one test group, each using some of it; `allow`,
+// not `expect`, for the reason `support/mod.rs` gives.
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use fluree_db_core::ContentId;
@@ -22,10 +28,15 @@ use tokio::sync::Notify;
 pub(super) struct PausingNameService {
     inner: Arc<dyn NameServicePublisher>,
     armed: AtomicBool,
+    pausing_lookup: AtomicBool,
     failing_listings: AtomicBool,
     losing_commits: AtomicBool,
+    pausing_index: AtomicBool,
+    failing_index: AtomicBool,
     pub(super) entered: Notify,
     pub(super) resume: Notify,
+    pub(super) index_entered: Notify,
+    pub(super) index_resume: Notify,
 }
 
 impl PausingNameService {
@@ -33,11 +44,34 @@ impl PausingNameService {
         Self {
             inner,
             armed: AtomicBool::new(true),
+            pausing_lookup: AtomicBool::new(false),
             failing_listings: AtomicBool::new(false),
             losing_commits: AtomicBool::new(false),
+            pausing_index: AtomicBool::new(false),
+            failing_index: AtomicBool::new(false),
             entered: Notify::new(),
             resume: Notify::new(),
+            index_entered: Notify::new(),
+            index_resume: Notify::new(),
         }
+    }
+
+    /// Hold the next lookup of `mydb:main` once it has read the record, until
+    /// `resume`, signalling `entered`, instead of the next ref CAS.
+    pub(super) fn pause_after_next_lookup(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        self.pausing_lookup.store(true, Ordering::SeqCst);
+    }
+
+    /// Hold the next index publish until `index_resume`, signalling
+    /// `index_entered` once it is held.
+    pub(super) fn pause_next_index_publish(&self) {
+        self.pausing_index.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every index publish fail from now on.
+    pub(super) fn fail_index_publishes(&self) {
+        self.failing_index.store(true, Ordering::SeqCst);
     }
 
     /// Make every `all_records` call fail from now on.
@@ -94,7 +128,12 @@ impl ConfigLookup for PausingNameService {
 #[async_trait]
 impl NameServiceLookup for PausingNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        self.inner.lookup(ledger_id).await
+        let record = self.inner.lookup(ledger_id).await?;
+        if ledger_id == "mydb:main" && self.pausing_lookup.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(record)
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -104,8 +143,8 @@ impl NameServiceLookup for PausingNameService {
         self.inner.all_records().await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        self.inner.list_branches(ledger_name).await
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        self.inner.branch_records(ledger_name).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
@@ -189,6 +228,15 @@ impl IndexPublisher for PausingNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        if self.pausing_index.swap(false, Ordering::SeqCst) {
+            self.index_entered.notify_one();
+            self.index_resume.notified().await;
+        }
+        if self.failing_index.load(Ordering::SeqCst) {
+            return Err(NameServiceError::Storage(
+                "index publish failed (test)".into(),
+            ));
+        }
         self.inner.publish_index(ledger_id, index_t, index_id).await
     }
 }

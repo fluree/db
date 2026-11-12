@@ -37,12 +37,18 @@
 //! of the key — `Flake` equality ignores `g`, so state is held in a separate map
 //! per `g_id`.
 
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
 use imbl::OrdMap;
 
 /// Fact identity within one graph: `(s, p, o, dt, m)`. Derived `Ord` is
 /// component-wise (s, p, o, dt, m), which equals `same_identity`'s ordering.
 type FactKey = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
+
+#[cfg(test)]
+pub(crate) fn fact_state_key(f: &Flake) -> FactKey {
+    key_of(f)
+}
 
 fn key_of(f: &Flake) -> FactKey {
     (
@@ -58,10 +64,22 @@ fn key_of(f: &Flake) -> FactKey {
 /// window." The stored value is `(t, op)`: the resolved transaction time and
 /// op (`true` = currently asserted, `false` = currently retracted tombstone).
 /// Cheap to clone (persistent map).
+///
+/// Trimming the window ([`Self::trim_through`]) moves a cutoff instead of
+/// rebuilding the maps: an entry at or below it names an op the index now
+/// holds, so it reads as absent, which is what a rebuild from the surviving
+/// flakes would make it. Any op recorded after the trim has a higher `t`, so
+/// it supersedes a stale entry under the same rule. Stale entries are
+/// removed a bounded number at a time by [`Self::sweep`].
 #[derive(Clone, Default)]
 pub(crate) struct NoveltyFactState {
     /// Indexed by `g_id`; `None` for graphs with no novelty yet.
-    graphs: Vec<Option<OrdMap<FactKey, (i64, bool)>>>,
+    pub(crate) graphs: Vec<Option<OrdMap<FactKey, (i64, bool)>>>,
+    /// Entries at or below this `t` are stale.
+    cutoff: i64,
+    /// Per graph, where the sweep of stale entries resumes: `None` when
+    /// there is nothing left to sweep, `Some(None)` from the first key.
+    sweep: Vec<Option<Option<FactKey>>>,
 }
 
 impl NoveltyFactState {
@@ -75,18 +93,110 @@ impl NoveltyFactState {
         self.graphs
             .get(g as usize)
             .and_then(Option::as_ref)
-            .and_then(|m| m.get(&key_of(flake)).map(|&(_, op)| op))
-            .unwrap_or(false)
+            .and_then(|m| m.get(&key_of(flake)))
+            .is_some_and(|&(t, op)| op && t > self.cutoff)
+    }
+
+    /// Forget graph `g`'s window entirely, as dropping the graph does.
+    pub(crate) fn forget_graph(&mut self, g: GraphId) {
+        if let Some(map) = self.graphs.get_mut(g as usize) {
+            *map = None;
+        }
+        if let Some(from) = self.sweep.get_mut(g as usize) {
+            *from = None;
+        }
+    }
+
+    /// Drop the ops at or below `cutoff_t` from the window, as trimming
+    /// novelty through it does. A graph whose remaining flakes `survivors`
+    /// hands over is rebuilt from them now, so a trim that leaves few, or none,
+    /// keeps none of the trimmed window resident on a ledger that goes idle;
+    /// the rest move the cutoff and are swept by later commits (see
+    /// [`NoveltyFactState`]).
+    pub(crate) fn trim_through<'a, I>(
+        &mut self,
+        cutoff_t: i64,
+        mut survivors: impl FnMut(GraphId) -> Option<I>,
+    ) where
+        I: Iterator<Item = &'a Flake>,
+    {
+        self.cutoff = self.cutoff.max(cutoff_t);
+        let mut rebuilt = vec![false; self.graphs.len()];
+        for (g, rebuilt) in rebuilt.iter_mut().enumerate() {
+            if self.graphs[g].is_none() {
+                continue;
+            }
+            let Some(flakes) = survivors(g as GraphId) else {
+                continue;
+            };
+            self.graphs[g] = None;
+            for flake in flakes {
+                self.record(g as GraphId, flake);
+            }
+            *rebuilt = true;
+        }
+        self.sweep = self
+            .graphs
+            .iter()
+            .zip(&rebuilt)
+            .map(|(m, &rebuilt)| (m.is_some() && !rebuilt).then_some(None))
+            .collect();
+    }
+
+    /// Remove up to `budget` stale entries' worth of the maps, examining at
+    /// most `budget` entries, so the cost of trimming spreads over the
+    /// commits that follow it.
+    pub(crate) fn sweep(&mut self, budget: usize) {
+        let mut left = budget;
+        for (g, from) in self.sweep.iter_mut().enumerate() {
+            if left == 0 {
+                return;
+            }
+            let Some(start) = from.as_ref() else {
+                continue;
+            };
+            let Some(Some(m)) = self.graphs.get_mut(g) else {
+                *from = None;
+                continue;
+            };
+            let lower = match start {
+                Some(key) => std::ops::Bound::Excluded(key.clone()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut stale: Vec<FactKey> = Vec::new();
+            let mut last: Option<&FactKey> = None;
+            let mut examined = 0usize;
+            for (key, &(t, _)) in m.range((lower, std::ops::Bound::Unbounded)) {
+                if examined == left {
+                    break;
+                }
+                examined += 1;
+                if t <= self.cutoff {
+                    stale.push(key.clone());
+                }
+                last = Some(key);
+            }
+            let last = last.cloned();
+            for key in &stale {
+                m.remove(key);
+            }
+            left -= examined;
+            *from = if examined == 0 || left > 0 {
+                // Reached the end of this graph's map.
+                None
+            } else {
+                Some(last)
+            };
+        }
     }
 
     /// Record `flake` as an op for its identity in graph `g`. Lifecycle
     /// resolution is **order-independent**: the highest-`t` op wins, and on a
-    /// same-`t` tie the retract wins. This mirrors the query overlay's
-    /// resolution ([`fluree-db-binary-index`] `resolve_overlay_ops`), so
-    /// `fact_state` cannot disagree with what a read would see no matter what
-    /// order records arrive in (commit/batch order, the sorted bulk walk, or the
-    /// `clear_up_to` rebuild) — rather than depending on callers feeding ops in
-    /// ascending-`t`, retract-last order.
+    /// same-`t` tie the assert ([`fluree_db_core::same_t`]). That is the rule
+    /// the query overlay (`resolve_overlay_ops`) and every index build apply,
+    /// so `fact_state` cannot disagree with what a read would see no matter
+    /// what order records arrive in (commit/batch order, the sorted bulk walk,
+    /// or the `clear_up_to` rebuild).
     pub(crate) fn record(&mut self, g: GraphId, flake: &Flake) {
         let idx = g as usize;
         if idx >= self.graphs.len() {
@@ -95,7 +205,7 @@ impl NoveltyFactState {
         let m = self.graphs[idx].get_or_insert_with(OrdMap::new);
         let key = key_of(flake);
         let wins = match m.get(&key) {
-            Some(&(cur_t, cur_op)) => flake.t > cur_t || (flake.t == cur_t && cur_op && !flake.op),
+            Some(&cur) => supersedes((flake.t, flake.op), cur),
             None => true,
         };
         if wins {
@@ -120,6 +230,35 @@ mod tests {
         )
     }
 
+    /// A bounded sweep removes stale entries only, across calls, and none
+    /// of it changes an answer.
+    #[test]
+    fn sweep_removes_only_stale_entries_in_bounded_steps() {
+        let mut fs = NoveltyFactState::new();
+        for s in 0..100u16 {
+            fs.record(0, &mk(s, i64::from(s % 10) + 1, true, None));
+        }
+        fs.trim_through(5, |_| None::<std::iter::Empty<&Flake>>);
+        let live = |fs: &NoveltyFactState| {
+            (0..100u16)
+                .filter(|&s| fs.is_asserted(0, &mk(s, 0, true, None)))
+                .count()
+        };
+        assert_eq!(live(&fs), 50);
+        let mut steps = 0;
+        while fs.sweep.iter().any(Option::is_some) {
+            fs.sweep(7);
+            assert_eq!(live(&fs), 50);
+            steps += 1;
+        }
+        assert!(steps > 10, "the sweep took bounded steps ({steps})");
+        assert_eq!(
+            fs.graphs[0].as_ref().unwrap().len(),
+            50,
+            "only stale entries removed"
+        );
+    }
+
     #[test]
     fn assert_then_retract_then_reassert() {
         // A real lifecycle is a sequence of distinct-`t` commits.
@@ -135,15 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn same_t_retract_wins_order_independent() {
-        // A same-`t` assert+retract of one identity resolves to ABSENT (retract
-        // wins), matching overlay lifecycle resolution — regardless of the order
-        // the two ops are recorded.
+    fn same_t_assert_holds_order_independent() {
+        // A same-`t` assert+retract of one identity resolves to PRESENT (the
+        // assert holds), matching overlay lifecycle resolution and every index
+        // build — regardless of the order the two ops are recorded.
         let mut fs = NoveltyFactState::new();
         fs.record(0, &mk(1, 5, true, None));
         fs.record(0, &mk(1, 5, false, None));
         assert!(
-            !fs.is_asserted(0, &mk(1, 5, true, None)),
+            fs.is_asserted(0, &mk(1, 5, true, None)),
             "assert then retract"
         );
 
@@ -151,7 +290,7 @@ mod tests {
         fs2.record(0, &mk(2, 5, false, None));
         fs2.record(0, &mk(2, 5, true, None));
         assert!(
-            !fs2.is_asserted(0, &mk(2, 5, true, None)),
+            fs2.is_asserted(0, &mk(2, 5, true, None)),
             "retract then assert"
         );
     }

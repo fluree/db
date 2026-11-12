@@ -12,7 +12,8 @@ use std::sync::Arc;
 /// Common XSD and RDF datatype IRIs (re-exported from vocab crate)
 pub mod iri {
     pub use fluree_vocab::rdf::{
-        JSON as RDF_JSON, LANG_STRING as RDF_LANG_STRING, REIFIES as RDF_REIFIES, TYPE as RDF_TYPE,
+        FIRST as RDF_FIRST, JSON as RDF_JSON, LANG_STRING as RDF_LANG_STRING, NIL as RDF_NIL,
+        REIFIES as RDF_REIFIES, REST as RDF_REST, TYPE as RDF_TYPE,
     };
     pub use fluree_vocab::xsd::{
         ANY_URI as XSD_ANY_URI, BOOLEAN as XSD_BOOLEAN, DATE as XSD_DATE,

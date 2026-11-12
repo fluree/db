@@ -70,7 +70,9 @@ pub mod prefix_trie;
 pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
+pub mod rdf_list;
 pub mod runtime_small_dicts;
+pub mod same_t;
 pub mod schema_hierarchy;
 pub mod serde;
 pub mod sid;
@@ -88,6 +90,7 @@ pub mod tracking;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+pub mod vector;
 pub mod verified_identity;
 // moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
 // unit tests. See module docs.
@@ -104,9 +107,9 @@ pub use commit::{
     commit_to_summary, diff_branches, find_common_ancestor, first_t_where_graph_registered,
     load_commit_by_id, load_commit_envelope_by_id, plan_commit_transfer, plan_commit_transfer_page,
     trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id,
-    walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitSummary, CommitTransferPage,
-    CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry, TxnMetaValue,
-    TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitGraphLifecycle, CommitSummary,
+    CommitTransferPage, CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry,
+    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
@@ -133,8 +136,8 @@ pub use error::{Error, Result};
 pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
 pub use graph_registry::{
-    config_graph_iri, txn_meta_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
-    DEFAULT_GRAPH_IRI, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
+    config_graph_iri, txn_meta_graph_iri, GraphDrop, GraphRegistry, CONFIG_GRAPH_ID,
+    DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
 };
 pub use ids::{
     DatatypeDictId, GraphId, LangId, ListIndex, PredicateId, RuntimeDatatypeId, RuntimePredicateId,

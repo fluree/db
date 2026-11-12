@@ -2,9 +2,8 @@ use super::*;
 use crate::ast::pattern::ServiceEndpoint;
 use crate::ast::update::UpdateOperation;
 use crate::ast::{
-    BlankNodeValue, DescribeTarget, GroupCondition, IriValue, LiteralValue, OrderDirection,
-    OrderExpr, PredicateTerm, SelectModifier, SelectVariable, SelectVariables, SubjectTerm, Term,
-    VarOrIri,
+    DescribeTarget, GroupCondition, IriValue, LiteralValue, OrderDirection, OrderExpr,
+    PredicateTerm, SelectModifier, SelectVariable, SelectVariables, SubjectTerm, Term, VarOrIri,
 };
 use crate::diag::Diagnostic;
 
@@ -961,13 +960,45 @@ fn test_literal_lang_tag_complex() {
 }
 
 #[test]
+fn test_anon_blank_node_is_one_node_across_lists() {
+    // A `;` or `,` list copies its `[]` subject into each triple; every copy
+    // must carry one label. Separate `[]`s get separate labels.
+    let ast = assert_parses(
+        "SELECT * WHERE { [] <http://ex/p> ?o ; <http://ex/q> ?z . \
+         [] <http://ex/r> <http://ex/x> , <http://ex/y> . [] <http://ex/s> [] }",
+    );
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("a SELECT");
+    };
+    let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern else {
+        panic!("a BGP: {:?}", q.where_clause.pattern);
+    };
+    let label = |t: &SubjectTerm| match t {
+        SubjectTerm::BlankNode(b) => b.label.clone(),
+        other => panic!("a blank node: {other:?}"),
+    };
+    let subjects: Vec<_> = patterns.iter().map(|tp| label(&tp.subject)).collect();
+    assert_eq!(subjects.len(), 5);
+    assert_eq!(subjects[0], subjects[1], "`;` keeps one node");
+    assert_eq!(subjects[2], subjects[3], "`,` keeps one node");
+    let Term::BlankNode(last_object) = &patterns[4].object else {
+        panic!("a blank-node object");
+    };
+    let distinct: std::collections::HashSet<_> =
+        [&subjects[0], &subjects[2], &subjects[4], &last_object.label]
+            .into_iter()
+            .collect();
+    assert_eq!(distinct.len(), 4, "each `[]` is its own node: {subjects:?}");
+}
+
+#[test]
 fn test_blank_node_labeled() {
     let ast = assert_parses("SELECT * WHERE { _:b1 ?p ?o }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern {
             assert!(matches!(
                 &patterns[0].subject,
-                SubjectTerm::BlankNode(b) if matches!(&b.value, BlankNodeValue::Labeled(l) if l.as_ref() == "b1")
+                SubjectTerm::BlankNode(b) if b.label.as_ref() == "b1"
             ));
         }
     }
@@ -1587,14 +1618,48 @@ fn test_construct_template_blank_node_property_list() {
 
 #[test]
 fn test_blank_node_property_list_label_no_user_collision() {
-    // A user blank node literally named `_:#bnpl0` is impossible (the lexer
-    // rejects `#`), so the synthetic property-list node cannot be addressed or
-    // accidentally joined. A user label like `_b` near a `[ … ]` stays distinct:
-    // `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3 triples, and the
-    // synthetic node is its own variable.
+    // A user blank node literally named `_:-bnpl0` is impossible (a label
+    // can't start with `-`), so the synthetic property-list node cannot be
+    // addressed or accidentally joined. A user label like `_b` near a `[ … ]`
+    // stays distinct: `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3
+    // triples, and the synthetic node is its own variable.
     let ast = assert_parses("SELECT ?o WHERE { ?s :p _:b . ?s :q [ :r ?o ] }");
     if let QueryBody::Select(q) = &ast.body {
         assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+    for synthetic in ["-anon0", "-bnpl0", "-coll0", "-reif0"] {
+        let query = format!("SELECT ?o WHERE {{ _:{synthetic} :p ?o }}");
+        assert!(parse(&query).has_errors(), "{query} must not parse");
+    }
+}
+
+#[test]
+fn test_minted_blank_node_labels_start_with_a_dash() {
+    // The other half of the test above: every label the parser mints for a
+    // `[]`, a `[ … ]`, a `( … )` or a standalone `<< … >>` with no reifier
+    // starts with `-`.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         INSERT { _:b ex:p [ ex:q ?o ] ; ex:list ( ?o ?o ) ; ex:r [] } \
+         WHERE { ?s ex:p ?o . ?s ex:r [ ex:q ?x ] ; ex:list ( ?x ) . << ?s ex:p ?o >> . }",
+    );
+    let debug = format!("{ast:?}");
+    let labels: Vec<&str> = debug
+        .split("BlankNode { label: \"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    for kind in ["anon", "bnpl", "coll", "reif"] {
+        assert!(
+            labels.iter().any(|label| label.contains(kind)),
+            "no {kind} label minted: {labels:?}"
+        );
+    }
+    for label in labels {
+        assert!(
+            label == "b" || label.starts_with('-'),
+            "minted label {label} can lex as a user's label"
+        );
     }
 }
 
@@ -2463,7 +2528,7 @@ fn annotation_block_with_named_blank_reifier() {
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
     match unit(ann).reifier.as_ref().expect("reifier id") {
         crate::ast::ReifierId::BlankNode(b) => {
-            assert!(matches!(b.value, BlankNodeValue::Labeled(ref l) if l.as_ref() == "ann"));
+            assert_eq!(b.label.as_ref(), "ann");
         }
         other => panic!("expected blank-node reifier, got {other:?}"),
     }

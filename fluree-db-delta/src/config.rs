@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
-use fluree_db_iceberg::auth::AuthConfig;
-use fluree_db_iceberg::config::MappingSource;
+use fluree_db_iceberg::auth::{AuthConfig, ConfigValueField, ValueClass};
+use fluree_db_iceberg::config::{DeleteConvention, MappingSource};
 use fluree_db_iceberg::{ConfigValue, SecretResolver};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,18 @@ pub struct DeltaGsConfig {
     /// R2RML mapping source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<MappingSource>,
+
+    /// Materialization: rows a column marks as deleted, as for an Iceberg
+    /// source. Set, or with `order_by`, a key's latest row replaces its subject
+    /// whole; unset, rows are merged into their subjects. A change feed's
+    /// deletes retract either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<DeleteConvention>,
+
+    /// Materialization: the column that orders one key's rows within a version
+    /// of the table, as for an Iceberg source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
 
     /// Model ledger supplying policy and schema for governed reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,6 +172,24 @@ pub enum AzureAuth {
     },
 }
 
+impl AzureAuth {
+    /// Every [`ConfigValue`] this credential holds, with paths relative to
+    /// the `azure` object; see [`fluree_db_iceberg::auth::fields`].
+    pub fn config_values(&self) -> Vec<ConfigValueField<'_>> {
+        match self {
+            AzureAuth::ClientSecret {
+                tenant_id: _,
+                client_id: _,
+                client_secret,
+            } => vec![ConfigValueField::new(
+                "client_secret",
+                client_secret,
+                ValueClass::Secret,
+            )],
+        }
+    }
+}
+
 impl DeltaIoConfig {
     /// Resolve secret references so [`crate::DeltaTable::open`] can read the
     /// config synchronously. Key any cache on the config as stored, not on
@@ -205,6 +235,11 @@ impl DeltaGsConfig {
         }
         for location in self.root.iter().chain(self.tables.values()) {
             validate_location(location)?;
+        }
+        if let Some(delete) = &self.delete {
+            delete
+                .validate()
+                .map_err(|e| DeltaError::Config(format!("delete convention: {e}")))?;
         }
         if let Some(AzureAuth::ClientSecret {
             tenant_id,

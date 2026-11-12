@@ -294,11 +294,22 @@ async fn request_errors() {
             "{base}?graph={}",
             urlencoding::encode("urn:fluree:gsp:main#txn-meta")
         ),
+        format!(
+            "{base}?graph={}",
+            urlencoding::encode("urn:fluree:gsp:main#config")
+        ),
+        // Another ledger's config graph IRI names this ledger's config graph.
+        format!(
+            "{base}?graph={}",
+            urlencoding::encode("urn:fluree:elsewhere:main#config")
+        ),
     ] {
         let (status, body) = send(&app, "GET", &uri, None, "", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
-        let (status, body) = send(&app, "PUT", &uri, TTL, spec, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        for method in ["PUT", "POST"] {
+            let (status, body) = send(&app, method, &uri, TTL, spec, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+        }
     }
 
     let (status, body) = send(
@@ -612,4 +623,37 @@ async fn annotated_graphs_round_trip() {
         let (_, json) = send(&app, "GET", &target, None, "", JSON_LD).await;
         assert!(json.contains("@annotation"), "{target}: {json}");
     }
+}
+
+/// A list comes back from a `GET` as the list — `( … )` in Turtle, `@list` in
+/// JSON-LD — so putting it back unchanged commits nothing.
+#[tokio::test]
+async fn lists_round_trip() {
+    let (_tmp, app) = seeded_app().await;
+    let tools = named(TOOLS);
+    let listed = "@prefix ex: <http://example.org/> .\n\
+                  ex:s ex:items ( 1 \"two\" ex:three ) ; ex:name \"s\" .\n";
+    let (status, body) = send(&app, "PUT", &tools, TTL, listed, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let t1 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+
+    let (status, ttl) = send(&app, "GET", &tools, None, "", TTL).await;
+    assert_eq!(status, StatusCode::OK, "{ttl}");
+    assert!(
+        ttl.contains("( 1 \"two\" <http://example.org/three> )"),
+        "{ttl}"
+    );
+    let (status, body) = send(&app, "PUT", &tools, TTL, &ttl, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let t2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["t"].as_i64();
+    assert_eq!(t1, t2, "the list PUT back must not commit:\n{ttl}");
+
+    let (_, json) = send(&app, "GET", &tools, None, "", JSON_LD).await;
+    assert!(json.contains("@list"), "{json}");
+    let (_, nt) = send(&app, "GET", &tools, None, "", Some("application/n-triples")).await;
+    assert_eq!(
+        nt.lines().count(),
+        2 + 3 * 2,
+        "owner edge, name, cells:\n{nt}"
+    );
 }

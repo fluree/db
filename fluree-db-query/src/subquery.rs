@@ -998,7 +998,7 @@ pub(crate) fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
     let mut produced: HashSet<VarId> = HashSet::new();
     for p in patterns {
         match p {
-            Pattern::Triple(_) | Pattern::PropertyPath(_) => {
+            Pattern::Triple(_) | Pattern::ListView(_) | Pattern::PropertyPath(_) => {
                 produced.extend(p.produced_vars());
             }
             // A nested sub-SELECT binds the SELECT vars its own body always

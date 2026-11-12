@@ -9,9 +9,10 @@
 //! then restored folds to nothing. The netting contract is
 //! [`NetChangeAccumulator`]'s.
 
-use fluree_db_core::{Commit, ConflictKey, ContentId, Flake};
+use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
+use fluree_db_core::{Commit, ConflictKey, ContentId, Flake, Sid};
 use fluree_db_novelty::NetChangeAccumulator;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Which flakes on one side of a branch comparison are that side's own
@@ -65,11 +66,26 @@ pub(crate) fn key_of(flake: &Flake) -> ConflictKey {
     ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())
 }
 
+/// A range's net change: one flake per surviving fact, and for an undo the
+/// facts among them whose deciding commit held a same-`t` pair. The
+/// positions index `flakes`, so the two only travel together.
+#[derive(Default)]
+pub(crate) struct NetChange {
+    /// One flake per surviving fact. Unordered.
+    pub(crate) flakes: Vec<Flake>,
+    /// For an undo, the positions in `flakes` of facts whose deciding commit
+    /// held a same-`t` retraction and assertion of them: what undoing that
+    /// commit leaves depends on the fact's presence before it
+    /// (`branch_validation::undo_same_t_pairs`). Empty for a replay, whose
+    /// pairs resolve to the assertion, the state at the range head.
+    pub(crate) same_t_pairs: Vec<usize>,
+}
+
 /// Flakes and metadata accumulated from a sequence of commits.
 #[derive(Default)]
 pub(crate) struct CollectedCommitData {
-    /// The range's net change, one flake per surviving fact. Unordered.
-    pub(crate) flakes: Vec<Flake>,
+    /// The range's net change.
+    pub(crate) net: NetChange,
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
     /// Named graphs the range's commits list, by IRI. Unioned by IRI: each
@@ -113,9 +129,12 @@ where
     }
 
     // The accumulator wants the range newest-change-first. For a replay
-    // that is the newest commit, last flake first. For an undo the inverse
-    // of the oldest commit is applied last, so the oldest commit's inverse
-    // comes first and each commit's own flakes keep their order.
+    // that is the newest commit first. For an undo the inverse of the
+    // oldest commit is applied last, so the oldest commit's inverse comes
+    // first. Within one commit order does not matter: the accumulator
+    // resolves a same-`t` retraction and assertion of one fact to the
+    // assertion and, for an undo, reports the pair, which the caller
+    // resolves by the fact's presence before that commit.
     let mut acc = NetChangeAccumulator::default();
     match fold {
         Fold::Replay => {
@@ -146,8 +165,108 @@ where
             }
         }
     }
-    data.flakes = acc.finish();
+    data.net = match fold {
+        Fold::Replay => NetChange {
+            flakes: acc.finish(),
+            same_t_pairs: Vec::new(),
+        },
+        Fold::Undo => {
+            let (flakes, same_t_pairs) = acc.finish_with_pairs();
+            NetChange {
+                flakes,
+                same_t_pairs,
+            }
+        }
+    };
     data
+}
+
+/// One graph Sid for the config graph in the flakes and keys a branch
+/// operation folds and compares.
+///
+/// Any ledger's config graph IRI names the config graph, so a history can
+/// hold its config under several (its own, its source branch's, a renamed
+/// ledger's), each a different Sid. Folded or compared by graph, one fact
+/// under two would count as two: a same-`t` retraction under one would win
+/// over the assertion under the other, and a conflict between them would go
+/// unseen. Each takes the Sid the target names its config graph by, which
+/// its state resolves.
+pub(crate) struct ConfigGraphs {
+    ns: fluree_db_transact::NamespaceRegistry,
+    registry: fluree_db_core::GraphRegistry,
+    canonical: Option<Sid>,
+    known: FxHashMap<Sid, bool>,
+}
+
+impl ConfigGraphs {
+    /// For a change staged on `target`.
+    pub(crate) fn for_target(target: &fluree_db_ledger::LedgerState) -> Self {
+        Self::for_snapshot(&target.snapshot)
+    }
+
+    /// For a change staged on a target whose head is `snapshot`.
+    pub(crate) fn for_snapshot(snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+        let ns = fluree_db_transact::NamespaceRegistry::from_db(snapshot);
+        let registry = &snapshot.graph_registry;
+        let canonical = registry
+            .iri_for_graph_id(CONFIG_GRAPH_ID)
+            .into_iter()
+            .chain(registry.iter_aliases().map(|(_, iri)| iri))
+            .find_map(|iri| ns.lookup_sid_for_iri(iri));
+        Self {
+            ns,
+            registry: registry.clone(),
+            canonical,
+            known: FxHashMap::default(),
+        }
+    }
+
+    /// Learn the namespace codes a commit brings in, which its flakes may
+    /// use. One that conflicts with the target's is the operation's to
+    /// refuse; it decodes no graph here.
+    pub(crate) fn adopt(&mut self, namespace_delta: &HashMap<u16, String>) {
+        let _ = self.ns.adopt_delta_for_persistence(namespace_delta);
+    }
+
+    /// Rename the config graph in `flakes`.
+    pub(crate) fn flakes(&mut self, flakes: &mut [Flake]) {
+        for flake in flakes {
+            if let Some(g) = self.renamed(flake.g.as_ref()) {
+                flake.g = Some(g);
+            }
+        }
+    }
+
+    /// Rename the config graph in `keys`.
+    pub(crate) fn keys(&mut self, keys: FxHashSet<ConflictKey>) -> FxHashSet<ConflictKey> {
+        keys.into_iter()
+            .map(|key| match self.renamed(key.g.as_ref()) {
+                Some(g) => ConflictKey { g: Some(g), ..key },
+                None => key,
+            })
+            .collect()
+    }
+
+    /// The config graph's Sid when `g` names it.
+    fn renamed(&mut self, g: Option<&Sid>) -> Option<Sid> {
+        let g = g?;
+        let config = match self.known.get(g) {
+            Some(config) => *config,
+            None => {
+                // As the target's registry reads it: an index built before
+                // config graphs were read across ledgers holds one as an
+                // ordinary graph.
+                let config = self.ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
+                    self.registry
+                        .assigned_graph_id(&format!("{prefix}{}", g.name.as_ref()))
+                        == Some(CONFIG_GRAPH_ID)
+                });
+                self.known.insert(g.clone(), config);
+                config
+            }
+        };
+        config.then(|| self.canonical.get_or_insert_with(|| g.clone()).clone())
+    }
 }
 
 /// A retraction whose shape no stored fact has: an `rdf:langString`
@@ -205,7 +324,7 @@ mod tests {
                 label("c", "HTML", Some("en"), 2, false),
             ],
         );
-        let undone = collect_from_commits([legacy_upsert], Fold::Undo).flakes;
+        let undone = collect_from_commits([legacy_upsert], Fold::Undo).net.flakes;
         assert_eq!(undone.len(), 1, "{undone:?}");
         let f = &undone[0];
         assert!(!f.op, "the assertion of \"b\"@en inverts to its retraction");

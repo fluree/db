@@ -236,6 +236,14 @@ pub enum ApiError {
     #[error("{0}")]
     Iceberg(#[from] fluree_db_iceberg::IcebergError),
 
+    /// A surface's graph-source input (an HTTP body, CLI flags, a Python
+    /// spec) was refused before anything was built: an unknown field, auth
+    /// given two ways or half given, a secret it may not name. A 400 whose
+    /// message names the field.
+    #[cfg(feature = "iceberg")]
+    #[error("{0}")]
+    GraphSourceInput(#[from] crate::graph_source::GraphSourceInputError),
+
     /// Core/Storage errors
     #[error("Core error: {0}")]
     Core(#[from] fluree_db_core::Error),
@@ -757,12 +765,19 @@ impl ApiError {
                 ..
             }) if delta_bytes >= max_bytes => 413,
             ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
-            // Permanent: datatype IDs are never released.
-            ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => 422,
+            // This process has not loaded the ledger's index: its state, not
+            // the request's, and it clears when the index loads.
+            ApiError::Transact(TE::IndexNotLoaded(_)) => 503,
+            // Well-formed, but a value breaks a constraint the ledger holds:
+            // no room for its new datatypes (datatype IDs are never
+            // released), or a vector the index cannot store beside the
+            // property's others. Permanent either way.
+            ApiError::Transact(TE::DatatypeLimitExceeded { .. } | TE::InvalidVector(_)) => 422,
             // The ledger config could not be read: a storage failure, whichever
             // lane read it. Nothing in the request is wrong, and it is not
             // capacity pressure, so not a 503.
             ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => 500,
+            ApiError::Transact(TE::SameTPair { .. }) => 500,
             ApiError::Transact(_) => 400,
 
             ApiError::Indexer(e) => {
@@ -778,8 +793,18 @@ impl ApiError {
             // conflict (unsupported state), not bad input. Other Iceberg
             // errors are configuration the caller supplied.
             #[cfg(feature = "iceberg")]
+            ApiError::GraphSourceInput(_) => 400,
+            #[cfg(feature = "iceberg")]
             ApiError::Iceberg(e) => match e {
                 fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
+                fluree_db_iceberg::IcebergError::GoogleTokenExchange { status, .. } => {
+                    google_token_exchange_status(*status)
+                }
+                fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientBucketRefused { .. }
+                | fluree_db_iceberg::IcebergError::GoogleTokenHostRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientEndpointRefused { .. }
+                | fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => 403,
                 _ => 400,
             },
 
@@ -889,12 +914,25 @@ impl ApiError {
             ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
             ApiError::Query(e) => match e {
                 QE::Cancelled { .. } => errors::QUERY_CANCELLED,
+                QE::GraphDropped { .. } => errors::GRAPH_NOT_FOUND,
                 QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
+                QE::StorageSchemeNotServed { .. } => errors::STORAGE_SCHEME_NOT_SERVED,
                 QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
                 QE::CatalogAccessDenied { .. } => errors::CATALOG_ACCESS_DENIED,
+                QE::CatalogQuotaProjectRequired { .. } => errors::CATALOG_QUOTA_PROJECT_REQUIRED,
+                QE::GoogleTokenExchange { .. } => errors::GOOGLE_TOKEN_EXCHANGE,
+                QE::GoogleCredentialsInvalid(_) => errors::GOOGLE_CREDENTIALS_INVALID,
+                // A host identity's token kept from a host it may not reach:
+                // the same class, and the same code, as the policy refusing it.
+                QE::HostIdentityRefused { .. } | QE::GoogleTokenHostRefused { .. } => {
+                    errors::HOST_IDENTITY_REFUSED
+                }
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                QE::GraphSourceUnmapped { .. } => errors::GRAPH_SOURCE_UNMAPPED,
+                QE::GraphSourceUnsupported { .. } => errors::GRAPH_SOURCE_UNSUPPORTED,
+                QE::GraphSourceNotAGraph { .. } => errors::GRAPH_SOURCE_NOT_A_GRAPH,
                 // Typed as `ApiError::NameService` is: the backend's fault.
                 QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
@@ -923,6 +961,9 @@ impl ApiError {
                 errors::NOVELTY_AT_MAX
             }
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ApiError::Transact(TE::IndexNotLoaded(_)) => errors::INDEX_NOT_LOADED,
+            // The generic code, the one its flattened 422 carries.
+            ApiError::Transact(TE::InvalidVector(_)) => errors::INVALID_TRANSACTION,
             ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => {
                 errors::STORAGE_READ
             }
@@ -941,9 +982,30 @@ impl ApiError {
             #[cfg(feature = "credential")]
             ApiError::Credential(_) => errors::INVALID_CREDENTIAL,
             #[cfg(feature = "iceberg")]
+            ApiError::GraphSourceInput(_) => errors::INVALID_GRAPH_SOURCE_CONFIG,
+            #[cfg(feature = "iceberg")]
             ApiError::Iceberg(e) => match e {
                 fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => {
                     errors::MERGE_ON_READ_DELETES
+                }
+                fluree_db_iceberg::IcebergError::GoogleTokenExchange { .. } => {
+                    errors::GOOGLE_TOKEN_EXCHANGE
+                }
+                fluree_db_iceberg::IcebergError::GoogleCredentialsInvalid(_) => {
+                    errors::GOOGLE_CREDENTIALS_INVALID
+                }
+                fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientBucketRefused { .. }
+                | fluree_db_iceberg::IcebergError::GoogleTokenHostRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientEndpointRefused { .. } => {
+                    errors::HOST_IDENTITY_REFUSED
+                }
+                fluree_db_iceberg::IcebergError::SchemeNotServed { .. }
+                | fluree_db_iceberg::IcebergError::LocalLocationFromCatalog { .. } => {
+                    errors::STORAGE_SCHEME_NOT_SERVED
+                }
+                fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => {
+                    errors::CATALOG_QUOTA_PROJECT_REQUIRED
                 }
                 _ => errors::CONFIG,
             },
@@ -1004,13 +1066,31 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
     use fluree_db_query::QueryError as QE;
     match err {
         QE::Cancelled { .. } => 408,
+        // As a graph the ledger does not have.
+        QE::GraphDropped { .. } => 404,
         // The in-memory join/aggregate budget: distinct from the 408 timeout
         // so the caller degrades on it specifically (too memory-heavy, not
         // too slow).
         QE::MemoryBudgetExceeded { .. } => 507,
         QE::StorageAccessDenied { .. }
         | QE::CatalogCredentialsNotVended { .. }
-        | QE::CatalogAccessDenied { .. } => 403,
+        | QE::CatalogAccessDenied { .. }
+        | QE::CatalogQuotaProjectRequired { .. }
+        | QE::HostIdentityRefused { .. }
+        | QE::GoogleTokenHostRefused { .. } => 403,
+        QE::GoogleTokenExchange { status, .. } => google_token_exchange_status(*status),
+        // Registration-time configuration the caller supplied.
+        QE::GoogleCredentialsInvalid(_) => 400,
+        // The source's storage identity cannot serve the path: its
+        // configuration, not a transient fault.
+        QE::StorageSchemeNotServed { .. } => 400,
+        // The source's stored state, not the query, is what is wrong, and
+        // registering it again with a mapping clears it: a conflict with the
+        // resource, as querying a dropped source is.
+        QE::GraphSourceUnmapped { .. } => 409,
+        // The deployment lacks the reader, and no request can supply it: the
+        // server does not support what the request needs.
+        QE::GraphSourceUnsupported { .. } => 501,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
@@ -1036,11 +1116,25 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::ResourceLimit(_)
         | QE::FuelLimitExceeded(_)
         | QE::R2rmlUnsupportedPattern { .. }
+        // The request names an index where a graph is read; the index is fine.
+        | QE::GraphSourceNotAGraph { .. }
         | QE::UnsupportedMode(_)
         | QE::UnsupportedFeature(_)
         | QE::TimeRangeNotCovered { .. }
         | QE::Arithmetic(_)
         | QE::Comparison(_) => 400,
+    }
+}
+
+/// The status for a refused Google token exchange: Google's 403 stays a 403 (the
+/// identity lacks a grant); a 5xx or no answer at all is an upstream failure
+/// (502); any other refusal means the credential did not authenticate (401).
+fn google_token_exchange_status(google: Option<u16>) -> u16 {
+    match google {
+        Some(403) => 403,
+        Some(status) if status >= 500 => 502,
+        None => 502,
+        Some(_) => 401,
     }
 }
 
@@ -1051,8 +1145,9 @@ impl From<fluree_db_core::TargetError> for ApiError {
     fn from(e: fluree_db_core::TargetError) -> Self {
         match e {
             fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
-            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
-                ApiError::invalid_query(cross.to_string())
+            other @ (fluree_db_core::TargetError::CrossLedger { .. }
+            | fluree_db_core::TargetError::OtherLedgersSystemGraph { .. }) => {
+                ApiError::invalid_query(other.to_string())
             }
         }
     }
@@ -1093,12 +1188,22 @@ mod tests {
     const VARIANTS: usize = 49
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
-        + cfg!(feature = "iceberg") as usize;
+        + 2 * cfg!(feature = "iceberg") as usize;
 
     fn conflict() -> ApiError {
         ApiError::Transact(TE::CommitConflict {
             expected_t: 1,
             head_t: 2,
+        })
+    }
+
+    /// A refused Google token exchange carrying Google's `status`.
+    fn google_exchange(status: Option<u16>) -> ApiError {
+        ApiError::Query(QE::GoogleTokenExchange {
+            stage: "sts".into(),
+            status,
+            reason: None,
+            message: "m".into(),
         })
     }
 
@@ -1186,6 +1291,15 @@ mod tests {
             ),
             #[cfg(feature = "iceberg")]
             (ApiError::Iceberg(IbE::Config("x".into())), 400, CONFIG),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::GraphSourceInput(crate::graph_source::GraphSourceInputError::invalid(
+                    "catalog.uri",
+                    "x",
+                )),
+                400,
+                INVALID_GRAPH_SOURCE_CONFIG,
+            ),
             (ApiError::config("x"), 400, CONFIG),
             (
                 ApiError::Format(FormatError::InvalidBinding("x".into())),
@@ -1222,6 +1336,80 @@ mod tests {
                 }),
                 403,
                 CATALOG_ACCESS_DENIED,
+            ),
+            (
+                ApiError::Query(QE::CatalogQuotaProjectRequired {
+                    table: "t".into(),
+                    message: "m".into(),
+                }),
+                403,
+                CATALOG_QUOTA_PROJECT_REQUIRED,
+            ),
+            (
+                ApiError::Query(QE::HostIdentityRefused {
+                    kind: "google-adc".into(),
+                    message: "m".into(),
+                }),
+                403,
+                HOST_IDENTITY_REFUSED,
+            ),
+            (
+                ApiError::Query(QE::GoogleCredentialsInvalid("token_url".into())),
+                400,
+                GOOGLE_CREDENTIALS_INVALID,
+            ),
+            (google_exchange(Some(403)), 403, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(Some(400)), 401, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(Some(401)), 401, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(Some(503)), 502, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(None), 502, GOOGLE_TOKEN_EXCHANGE),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::HostIdentityRefused {
+                    kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+                }),
+                403,
+                HOST_IDENTITY_REFUSED,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::GoogleCredentialsInvalid("x".into())),
+                400,
+                GOOGLE_CREDENTIALS_INVALID,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::GoogleTokenExchange {
+                    stage: fluree_db_iceberg::GoogleTokenStage::Sts,
+                    status: Some(400),
+                    reason: Some("invalid_grant".into()),
+                }),
+                401,
+                GOOGLE_TOKEN_EXCHANGE,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::CatalogQuotaProjectRequired { table: "t".into() }),
+                403,
+                CATALOG_QUOTA_PROJECT_REQUIRED,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::GoogleTokenHostRefused {
+                    kind: fluree_db_iceberg::HostIdentityKind::GoogleApplicationDefault,
+                    host: "attacker.example".into(),
+                }),
+                403,
+                HOST_IDENTITY_REFUSED,
+            ),
+            (
+                ApiError::Query(QE::GoogleTokenHostRefused {
+                    kind: "google-adc".into(),
+                    host: "attacker.example".into(),
+                    message: "m".into(),
+                }),
+                403,
+                HOST_IDENTITY_REFUSED,
             ),
             (
                 ApiError::Transact(TE::PolicyViolation(PE::modify_denied("no"))),
@@ -1298,6 +1486,32 @@ mod tests {
                 409,
                 GRAPH_SOURCE_RETRACTED,
             ),
+            (
+                ApiError::Query(QE::GraphSourceUnmapped {
+                    graph_source_id: "gs:main".into(),
+                    empty_mapping: true,
+                }),
+                409,
+                GRAPH_SOURCE_UNMAPPED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnsupported {
+                    graph_source_id: "gs:main".into(),
+                    family: "a 'f:FutureSource'".into(),
+                    cause: "it does not recognize that type".into(),
+                }),
+                501,
+                GRAPH_SOURCE_UNSUPPORTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceNotAGraph {
+                    graph_source_id: "search:main".into(),
+                    index: "a BM25 index".into(),
+                    remedy: "r",
+                }),
+                400,
+                GRAPH_SOURCE_NOT_A_GRAPH,
+            ),
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
             (
@@ -1333,6 +1547,11 @@ mod tests {
                 }),
                 422,
                 DATATYPE_LIMIT_EXCEEDED,
+            ),
+            (
+                ApiError::Transact(TE::InvalidVector("x".into())),
+                422,
+                INVALID_TRANSACTION,
             ),
             (
                 ApiError::Connection(ConnectionError::InvalidConfig("x".into())),
@@ -1436,6 +1655,11 @@ mod tests {
                 503,
                 COMMIT_CONTENTION,
             ),
+            (
+                ApiError::Transact(TE::IndexNotLoaded("x".into())),
+                503,
+                INDEX_NOT_LOADED,
+            ),
             (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
             (
                 ApiError::Query(QE::MemoryBudgetExceeded {
@@ -1502,7 +1726,7 @@ mod tests {
                 #[cfg(feature = "credential")]
                 ApiError::Credential(_) => {}
                 #[cfg(feature = "iceberg")]
-                ApiError::Iceberg(_) => {}
+                ApiError::Iceberg(_) | ApiError::GraphSourceInput(_) => {}
             }
         }
         rows
@@ -1559,6 +1783,7 @@ mod tests {
         );
         assert_eq!(
             ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+                scheme: "s3",
                 bucket: "b".into(),
                 key: "k".into(),
                 region: Some("us-east-2".into()),

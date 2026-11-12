@@ -10,8 +10,8 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
-    RowFate,
+    branch_or_none, object_probe_lane_plan, overlay_holds_ops, p_id_or_none,
+    subject_probe_lane_plan, LaneOutput, ObjectProbeOps, ProbeLanePlan, ProbeOps, RowFate,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -40,6 +40,13 @@ use tracing::Instrument;
 /// work; the per-join success path is otherwise far too noisy for perf captures.
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
+/// Entries the decoded-key memo holds before it starts over.
+const BATCHED_KEY_MEMO_CAP: usize = 1 << 18;
+/// Roughly what one per-row scan costs in overlay-flake translations. A cold
+/// eager lane translates its predicate's whole overlay extent up front, so a
+/// final flush with fewer rows than `extent / COLD_LANE_FLAKES_PER_ROW` runs
+/// per-row instead, where each row translates only its own matches.
+const COLD_LANE_FLAKES_PER_ROW: usize = 8;
 
 fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
     count
@@ -372,8 +379,14 @@ fn make_right_scan(
     index_hint: Option<IndexType>,
     _ctx: &ExecutionContext<'_>,
     mode: crate::temporal_mode::TemporalMode,
+    hide_list_members: bool,
 ) -> Box<dyn Operator> {
-    Box::new(crate::dataset_operator::DatasetOperator::scan(
+    let scan = if hide_list_members {
+        crate::dataset_operator::DatasetOperator::scan_hiding_list_members
+    } else {
+        crate::dataset_operator::DatasetOperator::scan
+    };
+    Box::new(scan(
         pattern,
         object_bounds,
         inline_ops,
@@ -793,6 +806,10 @@ pub struct NestedLoopJoinOperator {
     active_right_left_row: usize,
     /// Optional object bounds for range filter pushdown
     object_bounds: Option<ObjectBounds>,
+    /// Scan only the right pattern's rows that are not list members (see
+    /// [`crate::binary_scan::BinaryScanOperator::hiding_list_members`]); the
+    /// batched lanes, which read leaflets directly, are off.
+    hide_list_members: bool,
     /// Whether this join is eligible for batched subject join
     batched_eligible: bool,
     /// Whether this join is eligible for batched object join
@@ -812,6 +829,19 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
+    /// The overlay plan waits for the first flush ([`Self::defers_batched_overlay`]).
+    batched_overlay_deferred: bool,
+    /// `(stored batch, row)` left rows a flush handed to the per-row path;
+    /// drained before any further left row is read.
+    per_row_backlog: VecDeque<(usize, usize)>,
+    /// Decoded left keys (`Sid`/`IriMatch`) resolved to raw `s_id`s, for
+    /// eager callers only: every row of an eager left stream is decoded, its
+    /// subjects repeat across many rows, and each reverse dictionary lookup
+    /// costs microseconds.
+    batched_key_memo: FxHashMap<Sid, Option<u64>>,
+    /// Decoded keys accumulated while the plan was deferred hold no id yet;
+    /// the flush resolves them only once a lane will read them.
+    batched_keys_unresolved: bool,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
     /// doesn't buffer ~100k left rows before producing anything. Each flush
@@ -1057,11 +1087,16 @@ impl NestedLoopJoinOperator {
             batched_eligible,
             batched_object_eligible,
             batched_exists_eligible,
+            hide_list_members: false,
             subject_left_col,
             object_left_col,
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
+            batched_overlay_deferred: false,
+            per_row_backlog: VecDeque::new(),
+            batched_key_memo: FxHashMap::default(),
+            batched_keys_unresolved: false,
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1076,6 +1111,16 @@ impl NestedLoopJoinOperator {
             mode,
             hj_decision: None,
         }
+    }
+
+    /// Join only the right pattern's rows that are not list members (see
+    /// [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self.batched_eligible = false;
+        self.batched_object_eligible = false;
+        self.batched_exists_eligible = false;
+        self
     }
 
     /// Trim output to only the specified downstream variables.
@@ -1316,6 +1361,10 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
+        self.batched_key_memo.clear();
+        self.batched_overlay_deferred = false;
+        self.batched_keys_unresolved = false;
+        self.per_row_backlog.clear();
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1367,18 +1416,19 @@ impl Operator for NestedLoopJoinOperator {
         // the object/exists lanes still require an overlay-free graph and
         // otherwise force the per-row scan path (whose binary cursor merges
         // overlay ops).
-        self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        self.batched_overlay_deferred = self.defers_batched_overlay(ctx);
+        if !self.batched_overlay_deferred {
+            self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        }
         let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
-                && !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline)
-                // The batched path reads binary leaves directly and works in
-                // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
-                // subject vars). Whenever eager materialization is required —
-                // reasoning queries (derived facts in the overlay are `Sid` and
-                // must join with base rows), federated queries, or any other
-                // caller that sets this flag — fall back to the per-row path,
-                // which merges the overlay and honours eager decoding.
-                && !ctx.eager_materialization
+                && (self.batched_overlay_deferred
+                    || !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline))
+                // Under eager materialization (reasoning, datalog rule
+                // bodies) the lanes emit decoded bindings, as the per-row path
+                // does. Multi-ledger eager rows also need `IriMatch`
+                // provenance, which only the per-row path stamps.
+                && !(ctx.eager_materialization && ctx.is_multi_ledger())
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
@@ -1459,6 +1509,13 @@ impl Operator for NestedLoopJoinOperator {
                 }
             }
 
+            // 3b. Left rows a flush handed back to the per-row path.
+            if let Some((batch_idx, left_row)) = self.per_row_backlog.pop_front() {
+                self.open_per_row_scan(ctx, batch_idx, left_row, cached_view.as_ref())
+                    .await?;
+                continue;
+            }
+
             // 4. Need to process more left rows
             if self.current_left_batch.is_none() {
                 ctx.check_cancelled()?;
@@ -1473,7 +1530,7 @@ impl Operator for NestedLoopJoinOperator {
                         // Left exhausted — flush any remaining accumulator
                         if !self.batched_accumulator.is_empty() {
                             ctx.check_cancelled()?;
-                            self.flush_batched_accumulator_for_ctx(ctx).await?;
+                            self.flush_batched_accumulator_for_ctx(ctx, true).await?;
                             ctx.check_cancelled()?;
                             continue;
                         }
@@ -1509,36 +1566,22 @@ impl Operator for NestedLoopJoinOperator {
                 // Batched path: extract the bound key directly to avoid dictionary round-trips.
                 // - Subject-batched: key is subject s_id (bound to right subject).
                 // - Object-batched: key is object s_id (bound to right object).
-                let left_col = if self.batched_object_eligible {
-                    self.object_left_col.unwrap()
-                } else {
-                    self.subject_left_col.unwrap()
-                };
-
+                let left_col = self.batched_left_col();
                 let resolved: Option<u64> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
-                    // A subject minted after the last index resolves to a
-                    // novelty s_id — the same id space the overlay ops are
-                    // translated into — so novelty-only left subjects stay on
-                    // the batched lane (the merge injects their facts) instead
-                    // of each paying a per-row fallback scan. The dictionaries
-                    // are read only for a decoded subject.
-                    let resolve_subject = |sid: &Sid| -> Option<u64> {
-                        TermDicts::of(ctx)?
-                            .subject_id(sid.namespace_code, &sid.name)
-                            .ok()
-                            .flatten()
-                    };
-                    match left_batch.get_by_col(left_row, left_col) {
-                        Binding::EncodedSid { s_id, .. } => Some(*s_id),
-                        Binding::Sid { sid, .. } => resolve_subject(sid),
-                        Binding::IriMatch { primary_sid, .. } => resolve_subject(primary_sid),
-                        Binding::Unbound => None,
-                        _ => {
-                            // For subject/predicate bindings we already screened invalid types.
-                            // For object-batched mode, non-ref objects can't be converted to s_id.
-                            None
-                        }
+                    let binding = left_batch.get_by_col(left_row, left_col);
+                    if self.batched_overlay_deferred
+                        && matches!(binding, Binding::Sid { .. } | Binding::IriMatch { .. })
+                    {
+                        // The deferred plan may send these rows per-row,
+                        // which never reads the id.
+                        self.batched_keys_unresolved = true;
+                        Some(0)
+                    } else {
+                        let memo = ctx
+                            .eager_materialization
+                            .then_some(&mut self.batched_key_memo);
+                        resolve_left_key(ctx, memo, binding)
                     }
                 };
 
@@ -1547,62 +1590,21 @@ impl Operator for NestedLoopJoinOperator {
                     self.batched_accumulator.push((batch_idx, left_row, key));
                     if self.batched_accumulator.len() >= self.flush_schedule.size() {
                         ctx.check_cancelled()?;
-                        self.flush_batched_accumulator_for_ctx(ctx).await?;
+                        self.flush_batched_accumulator_for_ctx(ctx, false).await?;
                         ctx.check_cancelled()?;
                         self.flush_schedule.advance();
                     }
                 } else {
                     // Fall back to per-row scan for unsupported binding types.
                     let batch_idx = self.ensure_current_batch_stored();
-                    let batch_ref = BatchRef::Stored(batch_idx);
-                    let left_batch = self.stored_left_batches.last().unwrap();
-                    let Some(bound_pattern) = self.substitute_pattern_with_store(
-                        left_batch,
-                        left_row,
-                        cached_view.as_ref(),
-                    )?
-                    else {
-                        continue;
-                    };
-                    let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
-                    let mut right_scan = make_right_scan(
-                        bound_pattern,
-                        bounds,
-                        self.right_emit,
-                        self.right_scan_inline_ops.clone(),
-                        self.right_index_hint,
-                        ctx,
-                        self.mode,
-                    );
-                    right_scan.open(ctx).await?;
-                    self.active_right_scan = Some(right_scan);
-                    self.active_right_batch_ref = Some(batch_ref);
-                    self.active_right_left_row = left_row;
+                    self.open_per_row_scan(ctx, batch_idx, left_row, cached_view.as_ref())
+                        .await?;
                 }
             } else {
                 // Non-batched path: existing per-row join
                 let batch_idx = self.ensure_current_batch_stored();
-                let batch_ref = BatchRef::Stored(batch_idx);
-                let left_batch = self.stored_left_batches.last().unwrap();
-                let Some(bound_pattern) =
-                    self.substitute_pattern_with_store(left_batch, left_row, cached_view.as_ref())?
-                else {
-                    continue;
-                };
-                let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
-                let mut right_scan = make_right_scan(
-                    bound_pattern,
-                    bounds,
-                    self.right_emit,
-                    self.right_scan_inline_ops.clone(),
-                    self.right_index_hint,
-                    ctx,
-                    self.mode,
-                );
-                right_scan.open(ctx).await?;
-                self.active_right_scan = Some(right_scan);
-                self.active_right_batch_ref = Some(batch_ref);
-                self.active_right_left_row = left_row;
+                self.open_per_row_scan(ctx, batch_idx, left_row, cached_view.as_ref())
+                    .await?;
             }
         }
     }
@@ -1724,6 +1726,7 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.batched_accumulator.clear();
+        self.per_row_backlog.clear();
         self.stored_left_batches.clear();
         self.batched_output.clear();
         self.count_only = None;
@@ -1854,6 +1857,140 @@ impl NestedLoopJoinOperator {
         self.current_left_batch_stored_idx = Some(idx);
         idx
     }
+
+    /// Open the per-row right scan for one stored left row; a row whose
+    /// bindings can't bind the pattern opens nothing.
+    async fn open_per_row_scan(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        batch_idx: usize,
+        left_row: usize,
+        view: Option<&BinaryGraphView>,
+    ) -> Result<()> {
+        let left_batch = &self.stored_left_batches[batch_idx];
+        let Some(bound_pattern) = self.substitute_pattern_with_store(left_batch, left_row, view)?
+        else {
+            return Ok(());
+        };
+        let bounds = self.bounds_for_row(left_batch, left_row, ctx)?;
+        let mut right_scan = make_right_scan(
+            bound_pattern,
+            bounds,
+            self.right_emit,
+            self.right_scan_inline_ops.clone(),
+            self.right_index_hint,
+            ctx,
+            self.mode,
+            self.hide_list_members,
+        );
+        right_scan.open(ctx).await?;
+        self.active_right_scan = Some(right_scan);
+        self.active_right_batch_ref = Some(BatchRef::Stored(batch_idx));
+        self.active_right_left_row = left_row;
+        Ok(())
+    }
+
+    /// Whether to plan the overlay at the first flush instead of now. A cold
+    /// eager lane translates its predicate's whole overlay extent, which a
+    /// derived extent can make far larger than the left input; at the flush
+    /// the rows are counted ([`Self::per_row_is_cheaper`]). Once translated,
+    /// the ops are cached and later calls plan at once.
+    fn defers_batched_overlay(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if !crate::fast_path_common::eager_with_overlay(ctx)
+            || !(self.batched_eligible
+                || self.batched_object_eligible
+                || self.batched_exists_eligible)
+        {
+            return false;
+        }
+        let (Some(store), Some(pred)) =
+            (ctx.binary_store.as_ref(), self.batched_predicate.as_ref())
+        else {
+            return false;
+        };
+        crate::fast_path_common::probe_lane_admission(ctx, &[pred], self.batched_lane_output())
+            .is_none()
+            && store.sid_to_p_id(pred).is_some()
+            && !crate::fast_path_common::overlay_ops_cached(
+                ctx,
+                store,
+                ctx.binary_g_id,
+                fluree_db_binary_index::RunSortOrder::Psot,
+                pred,
+            )
+    }
+
+    /// Whether the accumulated rows are too few to repay translating the
+    /// predicate's overlay extent. An overlay that can't count says no.
+    fn per_row_is_cheaper(&self, ctx: &ExecutionContext<'_>) -> bool {
+        let Some(pred) = self.batched_predicate.as_ref() else {
+            return false;
+        };
+        crate::fast_path_common::predicate_overlay_extent(ctx, ctx.binary_g_id, pred).is_some_and(
+            |extent| {
+                self.batched_accumulator
+                    .len()
+                    .saturating_mul(COLD_LANE_FLAKES_PER_ROW)
+                    < extent
+            },
+        )
+    }
+
+    /// What this join's batched lane emits. The subject, object and exists
+    /// lanes decode under eager; a lane not listed here is `Encoded`, so
+    /// admission keeps it off reasoning until it decodes too.
+    fn batched_lane_output(&self) -> LaneOutput {
+        if self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible {
+            LaneOutput::DecodesForEager
+        } else {
+            LaneOutput::Encoded
+        }
+    }
+
+    /// The left column the batched lane keys on.
+    fn batched_left_col(&self) -> usize {
+        if self.batched_object_eligible {
+            self.object_left_col.unwrap()
+        } else {
+            self.subject_left_col.unwrap()
+        }
+    }
+
+    /// Resolve keys accumulated unresolved. Rows whose key has no id go to
+    /// the per-row path, as they would have when accumulated.
+    fn resolve_accumulated_keys(&mut self, ctx: &ExecutionContext<'_>) {
+        let left_col = self.batched_left_col();
+        let mut memo = ctx
+            .eager_materialization
+            .then_some(&mut self.batched_key_memo);
+        let batches = &self.stored_left_batches;
+        let backlog = &mut self.per_row_backlog;
+        self.batched_accumulator
+            .retain_mut(|(batch_idx, left_row, key)| {
+                let binding = batches[*batch_idx].get_by_col(*left_row, left_col);
+                match resolve_left_key(ctx, memo.as_deref_mut(), binding) {
+                    Some(s_id) => {
+                        *key = s_id;
+                        true
+                    }
+                    None => {
+                        backlog.push_back((*batch_idx, *left_row));
+                        false
+                    }
+                }
+            });
+    }
+
+    /// Hand the accumulated rows to the per-row path. Their stored batches
+    /// stay: the backlog drains before another flush can clear them.
+    fn reroute_accumulator_per_row(&mut self) {
+        self.batched_keys_unresolved = false;
+        self.per_row_backlog.extend(
+            self.batched_accumulator
+                .drain(..)
+                .map(|(batch_idx, left_row, _)| (batch_idx, left_row)),
+        );
+    }
     /// Flush batched accumulator using the appropriate snapshot/overlay/to_t for the current context.
     ///
     /// - Single-db mode: uses ctx.active_snapshot/ctx.overlay()/ctx.to_t
@@ -1861,6 +1998,7 @@ impl NestedLoopJoinOperator {
     async fn flush_batched_accumulator_for_ctx(
         &mut self,
         ctx: &ExecutionContext<'_>,
+        left_exhausted: bool,
     ) -> Result<()> {
         tracing::debug!(
             input_rows = self.batched_accumulator.len(),
@@ -1870,6 +2008,29 @@ impl NestedLoopJoinOperator {
             return Err(crate::error::QueryError::execution(
                 "binary_store is required for batched joins — no non-binary fallback exists",
             ));
+        }
+        if std::mem::take(&mut self.batched_overlay_deferred) {
+            // Only a final flush knows its input is all there is.
+            if left_exhausted && self.per_row_is_cheaper(ctx) {
+                tracing::debug!(
+                    input_rows = self.batched_accumulator.len(),
+                    "join batched probe: too few rows for the overlay extent; per-row"
+                );
+                self.reroute_accumulator_per_row();
+                return Ok(());
+            }
+            self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        }
+        if matches!(self.batched_overlay_mode, ProbeLanePlan::Decline) {
+            tracing::debug!(
+                input_rows = self.batched_accumulator.len(),
+                "join batched probe: overlay plan declined; per-row"
+            );
+            self.reroute_accumulator_per_row();
+            return Ok(());
+        }
+        if std::mem::take(&mut self.batched_keys_unresolved) {
+            self.resolve_accumulated_keys(ctx);
         }
 
         let accum_len = self.batched_accumulator.len();
@@ -1906,8 +2067,12 @@ impl NestedLoopJoinOperator {
     /// Clear all batched accumulator state after a flush or early return.
     fn clear_batched_state(&mut self) {
         self.batched_accumulator.clear();
-        self.stored_left_batches.clear();
-        self.current_left_batch_stored_idx = None;
+        // Backlog rows still read their stored batches; the backlog drains
+        // before any further left row, so the next flush clears them.
+        if self.per_row_backlog.is_empty() {
+            self.stored_left_batches.clear();
+            self.current_left_batch_stored_idx = None;
+        }
     }
 
     /// Decide how the batched lanes handle the active overlay this call.
@@ -1915,7 +2080,9 @@ impl NestedLoopJoinOperator {
     /// The subject-probe and exists lanes merge overlay ops per probed
     /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
     /// object. Decline cases route to the overlay-correct per-row fallback
-    /// BEFORE any accumulation, so a flush never reroutes mid-stream.
+    /// before any accumulation, except for a plan deferred to the first flush
+    /// ([`Self::defers_batched_overlay`]): that flush hands its rows to the
+    /// per-row path when the plan declines.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
         // The lane planners' own admission, so an overlay-free graph settles
         // as `Clean` without needing a store — and its history and policy
@@ -1926,7 +2093,9 @@ impl NestedLoopJoinOperator {
             Some(pred) => &[pred],
             None => &[],
         };
-        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
+        if let Some(plan) =
+            crate::fast_path_common::probe_lane_admission(ctx, preds, self.batched_lane_output())
+        {
             return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
@@ -1939,18 +2108,21 @@ impl NestedLoopJoinOperator {
             return Ok(ProbeLanePlan::Decline);
         };
         if self.batched_object_eligible {
-            object_probe_lane_plan(ctx, store, pred)
+            object_probe_lane_plan(ctx, store, pred, self.batched_lane_output())
         } else {
-            subject_probe_lane_plan(ctx, store, pred)
+            subject_probe_lane_plan(ctx, store, pred, self.batched_lane_output())
         }
     }
 
     /// Phase 1: Resolve the batched predicate SID to a binary-index p_id.
     ///
-    /// Returns `None` if the predicate is not in the binary index (no results possible).
-    fn resolve_batched_predicate(&self, store: &BinaryIndexStore) -> Option<u32> {
+    /// Returns `None` if the predicate is not in the binary index (no results
+    /// possible), and refuses when the lane merges its novelty
+    /// ([`p_id_or_none`]).
+    fn resolve_batched_predicate(&self, store: &BinaryIndexStore) -> Result<Option<u32>> {
         let pred_sid = self.batched_predicate.as_ref().unwrap();
-        store.sid_to_p_id(pred_sid)
+        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        p_id_or_none(store, pred_sid, || Ok(merging))
     }
 
     /// Phase 2: Group accumulator entries by subject ID.
@@ -2053,8 +2225,6 @@ impl NestedLoopJoinOperator {
         mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
-        use fluree_db_core::o_type::OType;
-
         let scan_start = Instant::now();
 
         let mut leaflets_scanned: u64 = 0;
@@ -2156,24 +2326,16 @@ impl NestedLoopJoinOperator {
                             continue;
                         }
 
-                        let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
-                            || o_type_val == OType::BLANK_NODE.as_u16()
-                        {
-                            Binding::encoded_sid(o_key_val)
-                        } else {
-                            let o_i = batch.o_i.get_or(row, u32::MAX);
-                            let t = batch.t.get_or(row, 0) as i64;
-                            build_probe_object_binding(
-                                ctx,
-                                store,
-                                dict_overlay.as_ref(),
-                                p_id,
-                                o_type_val,
-                                o_key_val,
-                                o_i,
-                                t,
-                            )?
-                        };
+                        let obj_binding = subject_lane_object_binding(
+                            ctx,
+                            store,
+                            dict_overlay.as_ref(),
+                            p_id,
+                            o_type_val,
+                            o_key_val,
+                            batch.o_i.get_or(row, u32::MAX),
+                            batch.t.get_or(row, 0) as i64,
+                        )?;
 
                         on_match(accum_indices, &obj_binding)?;
                     }
@@ -2201,22 +2363,16 @@ impl NestedLoopJoinOperator {
                     )? {
                         return Ok(());
                     }
-                    let obj_binding = if op.o_type == OType::IRI_REF.as_u16()
-                        || op.o_type == OType::BLANK_NODE.as_u16()
-                    {
-                        Binding::encoded_sid(op.o_key)
-                    } else {
-                        build_probe_object_binding(
-                            ctx,
-                            store,
-                            dict_overlay.as_ref(),
-                            p_id,
-                            op.o_type,
-                            op.o_key,
-                            op.o_i,
-                            op.t,
-                        )?
-                    };
+                    let obj_binding = subject_lane_object_binding(
+                        ctx,
+                        store,
+                        dict_overlay.as_ref(),
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                        op.o_i,
+                        op.t,
+                    )?;
                     matched_rows += 1;
                     on_match(accum_indices, &obj_binding)
                 })?;
@@ -2425,7 +2581,7 @@ impl NestedLoopJoinOperator {
         let dict_overlay = make_dict_overlay(ctx, &store);
 
         // Phase 1: Resolve predicate
-        let p_id = match self.resolve_batched_predicate(&store) {
+        let p_id = match self.resolve_batched_predicate(&store)? {
             Some(id) => id,
             None => {
                 self.clear_batched_state();
@@ -2439,9 +2595,14 @@ impl NestedLoopJoinOperator {
             self.clear_batched_state();
             return Ok(());
         }
-        let branch = store
-            .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
-            .ok_or_else(|| QueryError::Internal("PSOT index not found for graph".into()))?;
+        // A graph the index has no PSOT branch for holds nothing for the
+        // probe, so its left rows (from novelty) match nothing.
+        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Psot, merging)?
+        else {
+            self.clear_batched_state();
+            return Ok(());
+        };
         let leaf_range = Self::find_psot_leaf_range(
             branch,
             ctx.binary_g_id,
@@ -2659,7 +2820,7 @@ impl NestedLoopJoinOperator {
         let store = ctx.binary_store.as_ref().unwrap().clone();
 
         // Resolve predicate
-        let p_id = match self.resolve_batched_predicate(&store) {
+        let p_id = match self.resolve_batched_predicate(&store)? {
             Some(id) => id,
             None => {
                 self.clear_batched_state();
@@ -2674,11 +2835,9 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
-            debug_assert!(
-                !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
-                "lane plan must decline branchless graphs"
-            );
+        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Opst, merging)?
+        else {
             self.clear_batched_state();
             return Ok(());
         };
@@ -2686,7 +2845,7 @@ impl NestedLoopJoinOperator {
 
         // One reconciler per flush (see `flush_batched_accumulator_binary`).
         let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(Arc::clone(ops)),
             _ => None,
         };
 
@@ -2701,6 +2860,11 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
         let accums: Vec<&[usize]> = objs.iter().map(|o| o_to_accum[o].as_slice()).collect();
+        let eager_dicts = if ctx.eager_materialization {
+            make_dict_overlay(ctx, &store)
+        } else {
+            None
+        };
 
         let this = &*self;
         for_each_object_probe_match(
@@ -2711,9 +2875,14 @@ impl NestedLoopJoinOperator {
             &objs,
             probe_ops.as_mut(),
             |obj_idx, s_id| {
+                let subject = if ctx.eager_materialization {
+                    Binding::sid(probe_subject_sid(&store, eager_dicts.as_ref(), s_id)?)
+                } else {
+                    Binding::encoded_sid(s_id)
+                };
                 this.emit_object_probe_match(
                     ctx,
-                    s_id,
+                    &subject,
                     accums[obj_idx],
                     &mut scatter,
                     &mut matched_rows,
@@ -2750,7 +2919,7 @@ impl NestedLoopJoinOperator {
     fn emit_object_probe_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        s_id: u64,
+        subject: &Binding,
         accum_idxs: &[usize],
         scatter: &mut [Vec<Vec<Binding>>],
         matched_rows: &mut u64,
@@ -2762,7 +2931,7 @@ impl NestedLoopJoinOperator {
             })?;
             let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
             for _ in &self.right_new_vars {
-                right_bindings.push(Binding::encoded_sid(s_id));
+                right_bindings.push(subject.clone());
             }
             if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
                 continue;
@@ -2907,9 +3076,83 @@ fn term_matches_probe_value(
     }
 }
 
-/// Object binding for a non-ref row matched on a batched lane: the scan's
+/// The raw subject id a batched lane keys a left binding on. Decoded
+/// bindings read the dictionaries (through `memo` when given); a subject
+/// minted after the last index resolves to its novelty id, the id space the
+/// overlay ops are translated into.
+fn resolve_left_key(
+    ctx: &ExecutionContext<'_>,
+    memo: Option<&mut FxHashMap<Sid, Option<u64>>>,
+    binding: &Binding,
+) -> Option<u64> {
+    let sid = match binding {
+        Binding::EncodedSid { s_id, .. } => return Some(*s_id),
+        Binding::Sid { sid, .. } => sid,
+        Binding::IriMatch { primary_sid, .. } => primary_sid,
+        // Object-lane non-ref objects have no subject id.
+        _ => return None,
+    };
+    let lookup = || {
+        TermDicts::of(ctx)?
+            .subject_id(sid.namespace_code, &sid.name)
+            .ok()
+            .flatten()
+    };
+    let Some(memo) = memo else {
+        return lookup();
+    };
+    if let Some(&hit) = memo.get(sid) {
+        return hit;
+    }
+    let s_id = lookup();
+    if memo.len() >= BATCHED_KEY_MEMO_CAP {
+        memo.clear();
+    }
+    memo.insert(sid.clone(), s_id);
+    s_id
+}
+
+/// Object binding for a row of the subject-probe lane. Refs stay raw
+/// subject ids except under eager materialization.
+#[allow(clippy::too_many_arguments)]
+fn subject_lane_object_binding(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+    o_i: u32,
+    t: i64,
+) -> Result<Binding> {
+    use fluree_db_core::o_type::OType;
+    let is_ref = o_type == OType::IRI_REF.as_u16() || o_type == OType::BLANK_NODE.as_u16();
+    if is_ref && !ctx.eager_materialization {
+        return Ok(Binding::encoded_sid(o_key));
+    }
+    build_probe_object_binding(ctx, store, dict_overlay, p_id, o_type, o_key, o_i, t)
+}
+
+/// The `Sid` the per-row scan decodes for `s_id`: through the overlay's
+/// novelty-aware graph view when there is one, else the store's parts.
+fn probe_subject_sid(
+    store: &BinaryIndexStore,
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    s_id: u64,
+) -> Result<Sid> {
+    let sid = match dict_overlay {
+        Some(ov) => ov.resolve_subject_sid(s_id),
+        None => store
+            .resolve_subject_parts(s_id)
+            .and_then(|(ns_code, suffix)| store.subject_sid_of_parts(ns_code, suffix)),
+    };
+    sid.map_err(|e| QueryError::from_io("resolve_subject_sid", e))
+}
+
+/// Object binding for a row matched on a batched lane: the scan's
 /// late-materialized form when it has one, so every lane keys a literal
 /// alike, else the decoded value (novelty ids resolve through `dict_overlay`).
+/// Eager callers always get the decoded form.
 #[allow(clippy::too_many_arguments)]
 fn build_probe_object_binding(
     ctx: &ExecutionContext<'_>,
@@ -2924,7 +3167,19 @@ fn build_probe_object_binding(
     if let Some(binding) =
         late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
     {
-        return Ok(binding);
+        // Eager callers get what the per-row scan emits: a datalog rule head
+        // built from an encoded binding derives nothing.
+        match binding {
+            Binding::EncodedSid { .. } if ctx.eager_materialization => {
+                return Ok(Binding::Sid {
+                    sid: probe_subject_sid(store, dict_overlay, o_key_val)?,
+                    t: Some(t),
+                    op: None,
+                });
+            }
+            Binding::EncodedLit { .. } if ctx.eager_materialization => {}
+            other => return Ok(other),
+        }
     }
 
     let val = decode_overlay_object(ctx, store, dict_overlay, p_id, o_type_val, o_key_val)?;
@@ -3281,20 +3536,18 @@ fn batched_subject_probe_binary_uncharged(
         return Ok(Vec::new());
     }
 
-    let Some(p_id) = store.sid_to_p_id(params.pred_sid) else {
-        // Empty only when no overlay merge is in play — the lane plan
-        // declines novelty-only predicates before reaching here.
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline novelty-only predicates"
-        );
+    // The probe's ops are this predicate's, so a merge holds some of them.
+    let merging = probe_ops.is_some();
+    let Some(p_id) = p_id_or_none(store, params.pred_sid, || Ok(merging))? else {
         return Ok(Vec::new());
     };
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline branchless graphs"
-        );
+    let Some(branch) = branch_or_none(
+        store,
+        ctx.binary_g_id,
+        RunSortOrder::Psot,
+        probe_ops.is_some(),
+    )?
+    else {
         return Ok(Vec::new());
     };
 
@@ -3562,27 +3815,32 @@ fn batched_subject_star_spot_uncharged(
         return Ok(Vec::new());
     }
 
+    // The probe's ops merge every predicate's, so whether one the index
+    // doesn't hold has any is asked of that predicate alone: without ops it
+    // simply reads nothing.
+    let merging = probe_ops.is_some();
     let mut predicates_by_id: FxHashMap<u32, &SpotStarPredicateParams<'_>> =
         FxHashMap::with_capacity_and_hasher(predicates.len(), FxBuildHasher);
     for predicate in predicates {
-        let Some(p_id) = store.sid_to_p_id(&predicate.pred_sid) else {
+        let Some(p_id) = p_id_or_none(store, &predicate.pred_sid, || {
+            Ok(merging && overlay_holds_ops(ctx, store, &predicate.pred_sid)?)
+        })?
+        else {
             continue;
         };
         predicates_by_id.insert(p_id, predicate);
     }
     if predicates_by_id.is_empty() {
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline novelty-only predicates"
-        );
         return Ok(Vec::new());
     }
 
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Spot) else {
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline branchless graphs"
-        );
+    let Some(branch) = branch_or_none(
+        store,
+        ctx.binary_g_id,
+        RunSortOrder::Spot,
+        probe_ops.is_some(),
+    )?
+    else {
         return Ok(Vec::new());
     };
 

@@ -63,12 +63,38 @@ impl OverlayProvider for ReasoningOverlay<'_> {
         self.base.as_any()
     }
 
+    /// The base's: a derived fact carries no list position.
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        self.base.list_predicates()
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }
 
     fn content_version(&self) -> Option<u64> {
         self.content_version
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // The base's whole-graph count bounds its range count.
+        let base = self
+            .base
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+            .or_else(|| self.base.overlay_flake_count(g_id))?;
+        let derived = self
+            .derived
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)?;
+        Some(base + derived)
     }
 
     fn for_each_overlay_flake(
@@ -95,13 +121,11 @@ impl OverlayProvider for ReasoningOverlay<'_> {
                 derived_flakes.push(f.clone());
             });
 
-        // Derived facts carry the query's `t`, and at equal `t` a retraction
-        // wins the tie. When the commit at that `t` retracted the stored copy
-        // of a fact the rules derive again, the retraction would hide a fact
-        // that holds: the rules derived it from the state after that commit.
-        if !derived_flakes.is_empty() && base_flakes.iter().any(|f| !f.op) {
-            base_flakes.retain(|f| f.op || !restated(&derived_flakes, f, index));
-        }
+        // Derived facts carry the query's `t`. When the commit at that `t`
+        // retracted the stored copy of a fact the rules derive again, both
+        // ops reach readers at one `t`, and the assertion holds
+        // (`fluree_db_core::same_t`): the rules derived it from the state
+        // after that commit.
 
         // Linear merge of two sorted sequences - O(n) instead of O(n log n).
         // A base fact the rules also derive appears twice; readers keep one.
@@ -128,16 +152,6 @@ impl OverlayProvider for ReasoningOverlay<'_> {
             }
         }
     }
-}
-
-/// Whether `derived` (sorted in `index` order) asserts `retraction`'s fact at
-/// its `t`.
-fn restated(derived: &[Flake], retraction: &Flake, index: IndexType) -> bool {
-    let mut assertion = retraction.clone();
-    assertion.op = true;
-    derived
-        .binary_search_by(|f| index.compare(f, &assertion))
-        .is_ok()
 }
 
 /// Global reasoning cache for cross-query result reuse.

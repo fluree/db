@@ -33,6 +33,7 @@ use hashbrown::HashMap;
 use crate::error::Result;
 use crate::rdf_list::{collect_list_elements, resolve_property_expression};
 use crate::types::PropertyExpression;
+use fluree_db_core::rdf_list::by_subject;
 
 /// A value that can appear in a hasValue restriction
 ///
@@ -717,52 +718,44 @@ pub async fn extract_restrictions(db: GraphDbRef<'_>) -> Result<RestrictionIndex
     // These don't require owl:Restriction type
     // Note: We reuse int_flakes and union_flakes from the pre-pass above
 
-    for flake in int_flakes {
-        if let FlakeValue::Ref(list_head) = &flake.o {
-            if let Ok(members) = collect_list_elements(db, list_head).await {
-                if !members.is_empty() {
-                    // Use to_class_ref to properly identify nested class expressions
-                    let class_refs: Vec<ClassRef> =
-                        members.into_iter().map(&to_class_ref).collect();
-                    index.add_restriction(ParsedRestriction {
-                        restriction_id: flake.s.clone(),
-                        restriction_type: RestrictionType::IntersectionOf {
-                            members: class_refs,
-                        },
-                    });
-                }
+    for (class_expr, values) in by_subject(int_flakes) {
+        if let Ok(lists) = collect_list_elements(db, &values).await {
+            for members in lists.into_iter().filter(|m| !m.is_empty()) {
+                // Use to_class_ref to properly identify nested class expressions
+                let class_refs: Vec<ClassRef> = members.into_iter().map(&to_class_ref).collect();
+                index.add_restriction(ParsedRestriction {
+                    restriction_id: class_expr.clone(),
+                    restriction_type: RestrictionType::IntersectionOf {
+                        members: class_refs,
+                    },
+                });
             }
         }
     }
 
-    for flake in union_flakes {
-        if let FlakeValue::Ref(list_head) = &flake.o {
-            if let Ok(members) = collect_list_elements(db, list_head).await {
-                if !members.is_empty() {
-                    // Use to_class_ref to properly identify nested class expressions
-                    let class_refs: Vec<ClassRef> =
-                        members.into_iter().map(&to_class_ref).collect();
-                    index.add_restriction(ParsedRestriction {
-                        restriction_id: flake.s.clone(),
-                        restriction_type: RestrictionType::UnionOf {
-                            members: class_refs,
-                        },
-                    });
-                }
+    for (class_expr, values) in by_subject(union_flakes) {
+        if let Ok(lists) = collect_list_elements(db, &values).await {
+            for members in lists.into_iter().filter(|m| !m.is_empty()) {
+                // Use to_class_ref to properly identify nested class expressions
+                let class_refs: Vec<ClassRef> = members.into_iter().map(&to_class_ref).collect();
+                index.add_restriction(ParsedRestriction {
+                    restriction_id: class_expr.clone(),
+                    restriction_type: RestrictionType::UnionOf {
+                        members: class_refs,
+                    },
+                });
             }
         }
     }
 
     // Note: We reuse one_of_flakes_pre from the pre-pass above
-    for flake in one_of_flakes_pre {
-        if let FlakeValue::Ref(list_head) = &flake.o {
-            if let Ok(individuals) = collect_list_elements(db, list_head).await {
-                if !individuals.is_empty() {
-                    index.add_restriction(ParsedRestriction {
-                        restriction_id: flake.s.clone(),
-                        restriction_type: RestrictionType::OneOf { individuals },
-                    });
-                }
+    for (class_expr, values) in by_subject(one_of_flakes_pre) {
+        if let Ok(lists) = collect_list_elements(db, &values).await {
+            for individuals in lists.into_iter().filter(|m| !m.is_empty()) {
+                index.add_restriction(ParsedRestriction {
+                    restriction_id: class_expr.clone(),
+                    restriction_type: RestrictionType::OneOf { individuals },
+                });
             }
         }
     }

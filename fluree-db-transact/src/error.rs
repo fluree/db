@@ -137,6 +137,22 @@ pub enum TransactError {
         max: usize,
     },
 
+    /// An `f:embeddingVector` value the ledger cannot store: empty, longer
+    /// than 65,535 elements, holding a non-finite element, or of a length
+    /// other than the property's other vectors in the same graph
+    /// ([`fluree_db_core::vector`]).
+    #[error("Invalid vector: {0}")]
+    InvalidVector(String),
+
+    /// This process has not loaded the ledger's index, so it cannot stage a
+    /// write against it: no index is attached, or the one attached is older
+    /// than the index the ledger's novelty starts from. Decided before any
+    /// read and before any commit, so nothing is committed, and the same
+    /// write can succeed once the index loads
+    /// ([`crate::check_index_loaded`]).
+    #[error("Index not loaded: {0}")]
+    IndexNotLoaded(String),
+
     /// Whole-graph scan larger than the memory backstop
     #[error(
         "whole-graph operation would materialize more than {limit} currently-asserted flakes; \
@@ -188,6 +204,23 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
+    /// The commit being built would retract and assert one fact at one `t`.
+    /// Staging cancels the two by fact identity, so this is an internal
+    /// error, not a property of the request: the commit is refused rather
+    /// than written with a pair (see `fluree_db_core::same_t`).
+    #[error(
+        "internal error: the commit would retract and assert one fact at one t: \
+         {fact}, retracting {retracted} and asserting {asserted}"
+    )]
+    SameTPair {
+        /// Graph, subject and predicate.
+        fact: String,
+        /// The retracted term.
+        retracted: String,
+        /// The asserted term.
+        asserted: String,
+    },
+
     /// The ledger config, which decides what checks a write gets, could not
     /// be read (a storage or read failure, not anything in the request). The
     /// write is refused rather than admitted unchecked; it can succeed on
@@ -232,6 +265,40 @@ pub enum TransactError {
     )]
     DefaultGraphNameAsGraph,
 
+    /// A write named the config graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own config graph, which a
+    /// write names by the branch's own config graph IRI or `config`. The graph
+    /// registry reads any ledger's config graph IRI as this ledger's config
+    /// graph only so that history written under another name (a branch's
+    /// source, a copy) replays into it.
+    #[error(
+        "<{graph_iri}> is the config graph of '{named}', not of this ledger; \
+         write this ledger's config to <{own}> or the `config` graph"
+    )]
+    OtherLedgersConfigGraph {
+        /// The config graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+        /// This ledger's own config graph IRI.
+        own: String,
+    },
+
+    /// A write named the txn-meta graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own txn-meta graph, which no
+    /// write names: a transaction adds metadata to its own commit in a
+    /// `#txn-meta` block.
+    #[error(
+        "<{graph_iri}> is the txn-meta graph of '{named}', not of this ledger; a \
+         transaction adds metadata to its own commit in a `#txn-meta` block"
+    )]
+    OtherLedgersTxnMetaGraph {
+        /// The txn-meta graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+    },
+
     /// A bulk RDF import (`fluree create --from`, the server's source-import
     /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
     ///
@@ -263,6 +330,15 @@ pub enum TransactError {
     #[error("source graph <{graph_iri}> does not exist for ADD/COPY/MOVE; use SILENT to ignore")]
     SourceGraphNotFound {
         /// The missing source graph IRI the transfer attempted to read.
+        graph_iri: String,
+    },
+
+    /// A `DROP GRAPH` named a graph that does not exist: never registered, or
+    /// dropped already and not written since. An error unless `SILENT`, per
+    /// SPARQL 1.1 Update §3.2.2.
+    #[error("graph <{graph_iri}> does not exist; use DROP SILENT to ignore")]
+    GraphNotFound {
+        /// The graph IRI the drop named.
         graph_iri: String,
     },
 

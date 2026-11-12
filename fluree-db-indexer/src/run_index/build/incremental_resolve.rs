@@ -25,6 +25,7 @@ use fluree_db_binary_index::format::run_record::{cmp_for_order, RunRecord, RunSo
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -69,6 +70,9 @@ pub enum IncrementalResolveError {
     Resolve(ResolverError),
     /// I/O error.
     Io(io::Error),
+    /// The window cannot be folded into the base incrementally; a full
+    /// rebuild can.
+    NeedsRebuild(String),
 }
 
 impl std::fmt::Display for IncrementalResolveError {
@@ -79,6 +83,7 @@ impl std::fmt::Display for IncrementalResolveError {
             Self::CommitChain(msg) => write!(f, "commit chain: {msg}"),
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::NeedsRebuild(msg) => write!(f, "needs a full rebuild: {msg}"),
         }
     }
 }
@@ -124,6 +129,9 @@ impl From<ResolverError> for IncrementalResolveError {
 
 /// Configuration for V6 incremental commit resolution.
 pub struct IncrementalResolveConfig {
+    /// The ledger being built, whose system graph IRIs the new root carries:
+    /// a base root another ledger built (a branch's, adopted) names its own.
+    pub ledger_id: String,
     /// CID of the base FIR6 index root.
     pub base_root_id: ContentId,
     /// CID of the head commit (latest commit to include).
@@ -202,6 +210,12 @@ pub struct IncrementalNovelty {
     pub base_numbig_counts: HashMap<(u16, u32), usize>,
     /// String text bytes for fulltext assertion entries.
     pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
+    /// The graphs a commit in the window dropped. `base_root` holds nothing
+    /// of them, so they merge as graphs the base never indexed.
+    pub purged_graphs: Vec<u16>,
+    /// Artifacts of the original base root the purge left unreferenced:
+    /// garbage of the root built from this.
+    pub purged_cids: Vec<ContentId>,
 }
 
 // ============================================================================
@@ -279,7 +293,7 @@ pub async fn resolve_incremental_commits_v6(
     };
 
     // 4. Seed SharedResolverState from V6 root.
-    let mut shared = SharedResolverState::from_index_root(&root)?;
+    let mut shared = SharedResolverState::from_index_root(&root, &config.ledger_id)?;
 
     // Enable spatial hook for non-POINT geometry detection.
     shared.spatial_hook = Some(crate::spatial_hook::SpatialHook::new());
@@ -488,7 +502,10 @@ pub async fn resolve_incremental_commits_v6(
         "V6 incremental resolve: setup and commit-chain walk finished"
     );
 
-    // 6. Resolve commits into chunk.
+    // 6. Resolve commits into chunk, leaving out what a drop later in the
+    // window took (see `Commit::graph_drops`).
+    let lifecycles = window_lifecycles(&walked_commits)?;
+    shared.set_graph_floors(graph_floors(&lifecycles, &shared));
     let (
         chunk,
         max_t,
@@ -559,6 +576,29 @@ pub async fn resolve_incremental_commits_v6(
         "V6 incremental resolve: commit resolution finished"
     );
 
+    // 6a. Graph drops in the window: what the base holds of a dropped graph,
+    // and what the window wrote to it before its drop, are gone; the root
+    // records the drops (see `Commit::graph_drops`).
+    let mut root = root;
+    let original_root = root.clone();
+    let purged_graphs = purge_dropped_graphs(&lifecycles, &mut root, &shared)?;
+    let purged_cids = if purged_graphs.is_empty() {
+        Vec::new()
+    } else {
+        // The purged graphs' branches, leaves and sidecars, less any a
+        // remaining graph still references. When the expansion cannot be
+        // read they are left unreleased rather than guessed at.
+        match (
+            fluree_db_binary_index::collect_root_cas_ids_expanded(cs.as_ref(), &original_root)
+                .await,
+            fluree_db_binary_index::collect_root_cas_ids_expanded(cs.as_ref(), &root).await,
+        ) {
+            (Ok(old_ids), Ok(new_ids)) => old_ids.difference(&new_ids).cloned().collect(),
+            _ => Vec::new(),
+        }
+    };
+    drop(original_root);
+
     // Cache watermarks before potential root move.
     let base_subject_watermarks = root.subject_watermarks.clone();
     let base_string_watermark = root.string_watermark;
@@ -593,6 +633,8 @@ pub async fn resolve_incremental_commits_v6(
             base_vector_counts,
             base_numbig_counts,
             fulltext_string_bytes: HashMap::new(),
+            purged_graphs,
+            purged_cids,
         });
     }
 
@@ -651,6 +693,23 @@ pub async fn resolve_incremental_commits_v6(
         }
     };
     let t_remap_fulltext_ms = t0.elapsed().as_millis() as u64;
+
+    // 8b. Remap spatial hook entries' chunk-local subject ids.
+    if let Some(ref mut spatial) = shared.spatial_hook {
+        spatial.retain_mut(|entry| {
+            let local_s = entry.subject_id as usize;
+            match reconcile.subject_remap.get(local_s) {
+                Some(&global_s) => {
+                    entry.subject_id = global_s;
+                    true
+                }
+                None => {
+                    tracing::warn!(local_s, "spatial entry subject_id remap miss; skipping");
+                    false
+                }
+            }
+        });
+    }
 
     // 9. Remap all V1 records in-place, then convert to V2.
     let t0 = Instant::now();
@@ -773,6 +832,8 @@ pub async fn resolve_incremental_commits_v6(
         base_vector_counts,
         base_numbig_counts,
         fulltext_string_bytes,
+        purged_graphs,
+        purged_cids,
     })
 }
 
@@ -804,9 +865,9 @@ type ResolvedIdentity = (u16, u32);
 /// - A re-assert of a currently-asserted fact is a no-op: the earlier assert
 ///   (and its `t`) survives, matching `NoveltyFactState`'s skip rule.
 /// - Every other op becomes the identity's winner: a retract after an assert,
-///   an assert after a retract, and a repeat retract at higher `t`.
-/// - An assert at the same `t` as a winning retract loses (same-`t` ties
-///   resolve retract-wins), matching `resolve_overlay_ops`.
+///   an assert after a retract (at a later `t` or the same one: a same-`t`
+///   pair holds the assert, [`fluree_db_core::same_t`]), and a repeat retract
+///   at higher `t`.
 ///
 /// Fact identity is the resolved V2 identity `(o_type, o_i)` within the
 /// sort-prefix group — the identity `merge_novelty`, replay, and the query
@@ -827,8 +888,10 @@ type ResolvedIdentity = (u16, u32);
 /// lifecycle steps the winner stream collapses away; `merge_novelty` turns
 /// the ones that were real state transitions into history-sidecar entries so
 /// index-served time travel can see states a fact held only within this
-/// window. No-op re-asserts and same-`t` losers are discarded outright: they
-/// transition nothing anywhere.
+/// window. A same-`t` pair's retraction is superseded like any other
+/// replaced winner, so the merge walks the same events a full rebuild does
+/// and writes the same row and sidecar. No-op re-asserts are discarded
+/// outright: they transition nothing anywhere.
 pub(crate) fn dedup_fact_lifecycles(
     mut records: Vec<RunRecord>,
     o_types: &OTypeRegistry,
@@ -871,10 +934,10 @@ pub(crate) fn dedup_fact_lifecycles(
 /// in `keyed` in comparator order (`dt`, `t`, `op`) and appending superseded
 /// events to `superseded`.
 ///
-/// The group is keyed by resolved V2 identity and sorted by
-/// `(identity, t, op)` first: the incoming `(g_id, SPOT)` order interleaves
-/// `dt` before `t`, so events of one identity spread across `dt` variants
-/// would otherwise arrive out of chronological order.
+/// The group is keyed by resolved V2 identity and sorted by identity, then
+/// [`op_order`]: the incoming `(g_id, SPOT)` order interleaves `dt` before
+/// `t`, so events of one identity spread across `dt` variants would
+/// otherwise arrive out of chronological order.
 fn dedup_group(
     group: &[RunRecord],
     o_types: &OTypeRegistry,
@@ -894,12 +957,13 @@ fn dedup_group(
     }));
     keyed.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
-            .then(a.1.t.cmp(&b.1.t))
-            .then(a.1.op.cmp(&b.1.op))
+            .then(op_order(a.1.t, a.1.op == 1).cmp(&op_order(b.1.t, b.1.op == 1)))
     });
 
     // Compact each identity run to its winner, in place. Replaced winners
-    // are the identity's intermediate lifecycle steps → superseded.
+    // are the identity's intermediate lifecycle steps → superseded. Walked in
+    // `op_order`, every event replaces the current winner (a same-`t` assert
+    // included) except a re-assert of an asserted fact.
     let mut w = 0;
     for r in 1..keyed.len() {
         if keyed[r].0 != keyed[w].0 {
@@ -911,8 +975,7 @@ fn dedup_group(
         let rec = keyed[r].1;
         let winner = &mut keyed[w].1;
         let noop_reassert = rec.op == 1 && winner.op == 1;
-        let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
-        if !noop_reassert && !same_t_retract_wins {
+        if !noop_reassert {
             superseded.push(*winner);
             *winner = rec;
         }
@@ -925,6 +988,219 @@ fn dedup_group(
             .then(a.1.t.cmp(&b.1.t))
             .then(a.1.op.cmp(&b.1.op))
     });
+}
+
+// ============================================================================
+// Internal: Graph lifecycles (`Commit::graph_drops`)
+// ============================================================================
+
+use fluree_db_core::CommitGraphLifecycle as CommitLifecycle;
+
+/// The graph lifecycles of `walked_commits`, read from their envelopes, in
+/// their order (oldest first).
+fn window_lifecycles(
+    walked_commits: &[WalkedCommit],
+) -> Result<Vec<CommitLifecycle>, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+
+    walked_commits
+        .iter()
+        .map(|walked| {
+            let envelope = read_commit_envelope(&walked.bytes).map_err(|e| {
+                IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", walked.cid))
+            })?;
+            Ok(CommitLifecycle {
+                t: walked.t,
+                drops: envelope.graph_drops,
+                written: envelope.graph_delta.into_values().collect(),
+            })
+        })
+        .collect()
+}
+
+/// Each graph's latest drop among `lifecycles`, by graph IRI: what
+/// [`SharedResolverState::set_graph_floors`] takes. A record naming what
+/// `shared` holds as a system graph drops nothing.
+pub(crate) fn graph_floors(
+    lifecycles: &[CommitLifecycle],
+    shared: &SharedResolverState,
+) -> HashMap<String, i64> {
+    let mut floors = HashMap::new();
+    for lifecycle in lifecycles {
+        let t = lifecycle.t;
+        for iri in lifecycle
+            .drops
+            .iter()
+            .filter(|iri| !names_system_graph(iri, shared))
+        {
+            let floor = floors.entry(iri.clone()).or_insert(t);
+            *floor = (*floor).max(t);
+        }
+    }
+    floors
+}
+
+/// Whether `shared` holds the graph `iri` names as a system graph, which a
+/// drop record never drops, whichever IRI it names it by: another ledger's
+/// config graph IRI, or the ledger's own from a branch that held it as an
+/// ordinary graph ([`fluree_db_core::graph_registry::drop_may_take`]).
+fn names_system_graph(iri: &str, shared: &SharedResolverState) -> bool {
+    iri != fluree_db_core::DEFAULT_GRAPH_IRI
+        && shared
+            .graphs
+            .graph_dict_id(iri)
+            .and_then(|id| u16::try_from(id + 1).ok())
+            .is_some_and(|g_id| !fluree_db_core::graph_registry::drop_may_take(g_id))
+}
+
+/// The drop records `drops` (by this run's graph ids) become once
+/// `lifecycles` apply, oldest first, by the rule a registry applies them by
+/// ([`fluree_db_core::graph_registry::record_graph_drops`]): each commit's
+/// drops, then the dropped graphs it writes again.
+pub(crate) fn apply_lifecycles(
+    drops: &mut std::collections::BTreeMap<u16, fluree_db_core::GraphDrop>,
+    lifecycles: &[CommitLifecycle],
+    shared: &SharedResolverState,
+) {
+    let graph_of = |iri: &str| -> Option<u16> {
+        if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+            Some(fluree_db_core::DEFAULT_GRAPH_ID)
+        } else {
+            shared
+                .graphs
+                .graph_dict_id(iri)
+                .and_then(|id| u16::try_from(id + 1).ok())
+        }
+    };
+    for lifecycle in lifecycles {
+        let dropped = lifecycle.drops.iter().filter_map(|iri| graph_of(iri));
+        fluree_db_core::graph_registry::record_graph_drops(drops, dropped, lifecycle.t);
+        let written = lifecycle.written.iter().filter_map(|iri| graph_of(iri));
+        fluree_db_core::graph_registry::record_graph_writes(drops, written, lifecycle.t);
+    }
+}
+
+/// Apply the window's graph lifecycles (`Commit::graph_drops`) to the base
+/// it merges into, and return the graphs whose index a drop in the window
+/// took.
+///
+/// The root's drop records follow the window's drops and revivals. A graph
+/// whose latest drop is in the window keeps nothing from before that drop
+/// — not the base's routing, statistics or full-text and spatial arenas; the
+/// resolver already left out what the window wrote to it earlier
+/// ([`SharedResolverState::set_graph_floors`]) — so it merges as a graph the
+/// base never held. Its numeric and vector arenas stay: records address them
+/// by position, and values nothing references are harmless.
+///
+/// The ledger-wide class/property hierarchy is not per graph, so a dropped
+/// graph that may have contributed to it needs a full rebuild.
+fn purge_dropped_graphs(
+    lifecycles: &[CommitLifecycle],
+    root: &mut IndexRoot,
+    shared: &SharedResolverState,
+) -> Result<Vec<u16>, IncrementalResolveError> {
+    if root.graph_drops.is_empty()
+        && lifecycles
+            .iter()
+            .all(|lifecycle| lifecycle.drops.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    let mut drops: std::collections::BTreeMap<u16, fluree_db_core::GraphDrop> =
+        root.graph_drops.iter().copied().collect();
+    apply_lifecycles(&mut drops, lifecycles, shared);
+    let mut purged: Vec<u16> = drops
+        .iter()
+        .filter(|(_, drop)| drop.floor > root.index_t)
+        .map(|(g_id, _)| *g_id)
+        .collect();
+    root.graph_drops = drops.into_iter().collect();
+    if purged.is_empty() {
+        return Ok(purged);
+    }
+
+    if let Some(g_id) = purged
+        .iter()
+        .copied()
+        .find(|g_id| graph_may_hold_schema(root, *g_id))
+    {
+        return Err(IncrementalResolveError::NeedsRebuild(format!(
+            "dropped graph {g_id} may have contributed to the class/property hierarchy"
+        )));
+    }
+
+    purged.sort_unstable();
+    if purged.contains(&0) {
+        root.default_graph_orders.clear();
+    }
+    root.named_graphs.retain(|ng| !purged.contains(&ng.g_id));
+    for arenas in &mut root.graph_arenas {
+        if purged.contains(&arenas.g_id) {
+            arenas.fulltext.clear();
+            arenas.spatial.clear();
+        }
+    }
+    root.graph_arenas.retain(|arenas| {
+        !(arenas.numbig.is_empty()
+            && arenas.vectors.is_empty()
+            && arenas.spatial.is_empty()
+            && arenas.fulltext.is_empty())
+    });
+    if let Some(stats) = root.stats.as_mut() {
+        if let Some(graphs) = stats.graphs.as_mut() {
+            let (mut flakes, mut size) = (0u64, 0u64);
+            graphs.retain(|graph| {
+                let dropped = purged.contains(&graph.g_id);
+                if dropped {
+                    flakes += graph.flakes;
+                    size += graph.size;
+                }
+                !dropped
+            });
+            stats.flakes = stats.flakes.saturating_sub(flakes);
+            stats.size = stats.size.saturating_sub(size);
+        }
+    }
+    Ok(purged)
+}
+
+/// Whether graph `g_id` of `root` may hold `rdfs:subClassOf` or
+/// `rdfs:subPropertyOf` facts, which feed the ledger-wide hierarchy. Its
+/// statistics say; without them, any hierarchy at all might be its.
+fn graph_may_hold_schema(root: &IndexRoot, g_id: u16) -> bool {
+    let indexed = if g_id == 0 {
+        !root.default_graph_orders.is_empty()
+    } else {
+        root.named_graphs.iter().any(|ng| ng.g_id == g_id)
+    };
+    if !indexed {
+        return false;
+    }
+    let schema_p_ids: Vec<u32> = root
+        .predicate_sids
+        .iter()
+        .enumerate()
+        .filter(|(_, (ns, name))| {
+            *ns == fluree_vocab::namespaces::RDFS
+                && (name == "subClassOf" || name == "subPropertyOf")
+        })
+        .map(|(p_id, _)| p_id as u32)
+        .collect();
+    if schema_p_ids.is_empty() {
+        return false;
+    }
+    let graph_stats = root
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.graphs.as_ref())
+        .and_then(|graphs| graphs.iter().find(|graph| graph.g_id == g_id));
+    match graph_stats {
+        Some(graph) => graph
+            .properties
+            .iter()
+            .any(|prop| schema_p_ids.contains(&prop.p_id) && prop.count > 0),
+        None => root.schema.is_some(),
+    }
 }
 
 // ============================================================================
@@ -1626,6 +1902,55 @@ mod tests {
     use super::*;
     use fluree_db_core::subject_id::SubjectId;
 
+    /// A drop record naming what this run holds as a system graph drops
+    /// nothing: another ledger's config graph IRI, or the ledger's own system
+    /// graph IRIs, which a record made where they named ordinary graphs can
+    /// carry. A root that held another ledger's config graph IRI as an
+    /// ordinary graph keeps dropping it there.
+    #[test]
+    fn a_drop_record_never_drops_a_system_graph() {
+        use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+        use fluree_db_core::DEFAULT_GRAPH_IRI;
+
+        let g = "http://example.org/g";
+        let source = config_graph_iri("a:main");
+        let lifecycles = vec![CommitLifecycle {
+            t: 5,
+            drops: vec![
+                DEFAULT_GRAPH_IRI.to_string(),
+                source.clone(),
+                config_graph_iri("b:main"),
+                txn_meta_graph_iri("b:main"),
+                g.to_string(),
+            ],
+            written: Vec::new(),
+        }];
+        let dropped = |shared: &SharedResolverState| {
+            let mut floors: Vec<String> = graph_floors(&lifecycles, shared).into_keys().collect();
+            floors.sort();
+            let mut drops = std::collections::BTreeMap::new();
+            apply_lifecycles(&mut drops, &lifecycles, shared);
+            (floors, drops.into_keys().collect::<Vec<u16>>())
+        };
+
+        let mut shared = SharedResolverState::new_for_ledger("b:main");
+        let g_id = u16::try_from(shared.graphs.get_or_insert(g) + 1).unwrap();
+        assert_eq!(
+            dropped(&shared),
+            (
+                vec![g.to_string(), DEFAULT_GRAPH_IRI.to_string()],
+                vec![0, g_id]
+            )
+        );
+
+        let mut legacy = SharedResolverState::new_for_ledger("b:main");
+        let source_id = u16::try_from(legacy.graphs.get_or_insert(&source) + 1).unwrap();
+        let g_id = u16::try_from(legacy.graphs.get_or_insert(g) + 1).unwrap();
+        let mut floors = vec![g.to_string(), source.clone(), DEFAULT_GRAPH_IRI.to_string()];
+        floors.sort();
+        assert_eq!(dropped(&legacy), (floors, vec![0, source_id, g_id]));
+    }
+
     #[test]
     fn custom_datatype_iris_refuses_a_root_past_the_dt_id_width() {
         let reserved = usize::from(DatatypeDictId::RESERVED_COUNT);
@@ -1759,13 +2084,20 @@ mod tests {
         assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
     }
 
-    /// Same-`t` ties resolve retract-wins, matching `resolve_overlay_ops` and
-    /// `NoveltyFactState`. Sorted input puts the retract first (op 0 < 1).
+    /// A same-`t` pair holds the assert ([`fluree_db_core::same_t`]), as
+    /// `resolve_overlay_ops`, `NoveltyFactState` and the full rebuild resolve
+    /// it, whatever the input's order. The losing retract is superseded, so
+    /// the merge walks both events, as a rebuild does.
     #[test]
-    fn same_t_retract_beats_assert() {
-        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)];
-        let out = dedup(records);
-        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    fn same_t_assert_beats_retract() {
+        for records in [
+            vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)],
+            vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 5, OP_RETRACT)],
+        ] {
+            let (out, superseded) = dedup_with_superseded(records);
+            assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+            assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+        }
     }
 
     /// Distinct language tags on `rdf:langString` values are distinct fact

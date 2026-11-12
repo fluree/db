@@ -714,7 +714,11 @@ pub(crate) async fn unenforced_shapes(
             Some(sel) if sel == config_iris::DEFAULT_GRAPH => {
                 Some(fluree_db_core::DEFAULT_GRAPH_ID)
             }
-            Some(sel) => snapshot.graph_registry.graph_id_for_iri(sel),
+            Some(sel) => snapshot
+                .graph_registry
+                .existing_graph_id(sel, to_t)
+                .ok()
+                .flatten(),
         },
         None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
     };
@@ -1267,6 +1271,11 @@ impl MergeableGroup for ShaclDefaults {
         ShaclDefaults {
             enabled: self.enabled.or(base.enabled),
             shapes_source: self.shapes_source.clone().or(base.shapes_source.clone()),
+            additional_data_sources: if self.additional_data_sources.is_empty() {
+                base.additional_data_sources.clone()
+            } else {
+                self.additional_data_sources.clone()
+            },
             validation_mode: self.validation_mode.or(base.validation_mode),
             override_control: base.override_control.effective_min(&self.override_control),
         }
@@ -1583,7 +1592,8 @@ async fn read_iri_field(
 
 /// Read a multi-value IRI list field from a subject at the config graph.
 ///
-/// Each value is an IRI reference (not a string literal). Returns decoded IRI strings.
+/// Each value is an IRI reference (not a string literal), written as
+/// repeated objects or as an RDF list. Returns decoded IRI strings.
 async fn read_iri_list_field(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
@@ -1596,21 +1606,60 @@ async fn read_iri_list_field(
         None => return Ok(None),
     };
 
-    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
-    let mut values = Vec::new();
-    for binding in bindings {
-        if let Some(sid) = binding.as_sid() {
-            if let Some(iri) = snapshot.decode_sid(sid) {
-                values.push(iri);
-            }
-        }
-    }
+    let values: Vec<String> = config_values(snapshot, overlay, to_t, subject_sid, &pred_sid)
+        .await?
+        .into_iter()
+        .filter_map(|value| match value {
+            fluree_db_core::FlakeValue::Ref(sid) => snapshot.decode_sid(&sid),
+            _ => None,
+        })
+        .collect();
 
     if values.is_empty() {
         Ok(None)
     } else {
         Ok(Some(values))
     }
+}
+
+/// The values of `subject_sid`'s `predicate_sid` in the config graph, with
+/// each RDF list among them — compact or an `rdf:first`/`rdf:rest` chain —
+/// replaced by its members.
+async fn config_values(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    predicate_sid: &Sid,
+) -> Result<Vec<fluree_db_core::FlakeValue>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+
+    let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
+    let flakes = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(subject_sid.clone()),
+                p: Some(predicate_sid.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let read = fluree_db_core::rdf_list::read_lists(db, &flakes).await?;
+    if read.malformed > 0 {
+        tracing::warn!(
+            malformed = read.malformed,
+            "config list is not a well-formed RDF collection; ignoring it"
+        );
+    }
+    Ok(read
+        .lists
+        .into_iter()
+        .flatten()
+        .chain(read.values)
+        .collect())
 }
 
 /// Read `f:reasoningModes`, accepting every shape users naturally write:
@@ -1639,27 +1688,15 @@ async fn read_reasoning_modes_field(
         None => return Ok(None),
     };
 
-    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
-    let mut values = Vec::new();
-    for binding in bindings {
-        if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
-            values.push(s.to_string());
-            continue;
-        }
-        let Some(sid) = binding.as_sid() else {
-            continue;
-        };
-        // An object ref is either a mode IRI or the head of an RDF
-        // collection. Distinguish by probing `rdf:first`.
-        match read_rdf_list_values(snapshot, overlay, to_t, sid).await? {
-            Some(items) => values.extend(items),
-            None => {
-                if let Some(iri) = snapshot.decode_sid(sid) {
-                    values.push(iri);
-                }
-            }
-        }
-    }
+    let values: Vec<String> = config_values(snapshot, overlay, to_t, subject_sid, &pred_sid)
+        .await?
+        .into_iter()
+        .filter_map(|value| match value {
+            fluree_db_core::FlakeValue::String(s) => Some(s),
+            fluree_db_core::FlakeValue::Ref(sid) => snapshot.decode_sid(&sid),
+            _ => None,
+        })
+        .collect();
 
     if values.is_empty() {
         Ok(None)
@@ -1667,66 +1704,6 @@ async fn read_reasoning_modes_field(
         Ok(Some(values))
     }
 }
-
-/// Walk an RDF collection (`rdf:first`/`rdf:rest`.. `rdf:nil`) starting at
-/// `head`, returning each element as a string (string literals verbatim,
-/// IRI refs decoded). Returns `Ok(None)` when `head` is not a list node
-/// (no `rdf:first`), so callers can fall back to treating it as a plain
-/// IRI value.
-async fn read_rdf_list_values(
-    snapshot: &LedgerSnapshot,
-    overlay: &dyn OverlayProvider,
-    to_t: i64,
-    head: &Sid,
-) -> Result<Option<Vec<String>>> {
-    use fluree_vocab::rdf;
-
-    let (Some(first_sid), Some(rest_sid)) = (
-        try_encode(snapshot, rdf::FIRST),
-        try_encode(snapshot, rdf::REST),
-    ) else {
-        return Ok(None);
-    };
-
-    let mut node = head.clone();
-    let mut values = Vec::new();
-    let mut is_list = false;
-    // Bounded walk: a malformed cyclic list must not spin forever.
-    for _ in 0..MAX_RDF_LIST_LEN {
-        let firsts = query_config_predicate(snapshot, overlay, to_t, &node, &first_sid).await?;
-        if firsts.is_empty() {
-            return if is_list { Ok(Some(values)) } else { Ok(None) };
-        }
-        is_list = true;
-        for binding in &firsts {
-            if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
-                values.push(s.to_string());
-            } else if let Some(sid) = binding.as_sid() {
-                if let Some(iri) = snapshot.decode_sid(sid) {
-                    values.push(iri);
-                }
-            }
-        }
-        let rests = query_config_predicate(snapshot, overlay, to_t, &node, &rest_sid).await?;
-        let Some(next) = rests.iter().find_map(|b| b.as_sid().cloned()) else {
-            return Ok(Some(values));
-        };
-        if snapshot.decode_sid(&next).as_deref() == Some(rdf::NIL) {
-            return Ok(Some(values));
-        }
-        node = next;
-    }
-    tracing::warn!(
-        "f:reasoningModes RDF collection exceeded {MAX_RDF_LIST_LEN} entries \
-         (malformed or cyclic list?); truncating"
-    );
-    Ok(Some(values))
-}
-
-/// Upper bound on RDF-collection length when walking `f:reasoningModes`
-/// lists; there are only a handful of reasoning modes, so anything near
-/// this is a malformed (likely cyclic) list.
-const MAX_RDF_LIST_LEN: usize = 64;
 
 /// Read an integer field from a subject at the config graph.
 async fn read_i64_field(
@@ -1866,12 +1843,21 @@ async fn read_shacl_fields(
         config_iris::SHAPES_SOURCE,
     )
     .await?;
+    let additional_data_sources = read_graph_source_refs(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::ADDITIONAL_DATA_SOURCE,
+    )
+    .await?;
     let validation_mode = read_validation_mode(snapshot, overlay, to_t, group_sid).await?;
     let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
     Ok(ShaclDefaults {
         enabled,
         shapes_source,
+        additional_data_sources,
         validation_mode,
         override_control,
     })
@@ -2970,6 +2956,7 @@ mod tests {
             shacl: Some(ShaclDefaults {
                 enabled: Some(true),
                 shapes_source: None,
+                additional_data_sources: Vec::new(),
                 validation_mode: Some(ValidationMode::Reject),
                 override_control: control,
             }),
@@ -3002,6 +2989,7 @@ mod tests {
             shacl: Some(ShaclDefaults {
                 enabled: Some(true),
                 shapes_source: None,
+                additional_data_sources: Vec::new(),
                 validation_mode: Some(ValidationMode::Warn),
                 override_control: OverrideControl::None,
             }),

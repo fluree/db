@@ -3272,6 +3272,139 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
     );
 }
 
+/// Each anonymous `[]` in a `DELETE WHERE` with no GRAPH block is one
+/// existential, which its template deletes by: as subject, as object, and
+/// with several in one pattern.
+#[tokio::test]
+async fn sparql_delete_where_anonymous_blank_nodes_without_a_graph_block() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "delwhere-anon:main";
+    fluree.create_ledger(id).await.expect("create ledger");
+    let update = |body: &str| {
+        let text = format!("PREFIX ex: <http://example.org/ns/>\n{body}");
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(id)
+                .transact()
+                .sparql_update(&text)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .receipt
+                .retract_count
+        }
+    };
+    update(
+        r#"INSERT DATA { ex:a ex:p "one" . ex:b ex:p "two" . ex:c ex:q ex:d .
+                         ex:e ex:r ex:f ; ex:mark "m" . ex:g ex:keep "kept" }"#,
+    )
+    .await;
+    assert_eq!(update("DELETE WHERE { [] ex:p ?o }").await, 2, "as subject");
+    assert_eq!(
+        update("DELETE WHERE { ex:c ex:q [] }").await,
+        1,
+        "as object"
+    );
+    assert_eq!(
+        update(r#"DELETE WHERE { [] ex:r [] . [] ex:mark "m" }"#).await,
+        2,
+        "several in one pattern"
+    );
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let left = support::query_sparql_formatted(&fluree, &ledger, "SELECT ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("query");
+    assert_eq!(left, json!([["http://example.org/ns/keep", "kept"]]));
+}
+
+/// A `;` or `,` list copies its `[]` subject into each triple, and every copy
+/// is the one node: `DELETE WHERE` deletes only from a subject that matches
+/// the whole list, with and without a GRAPH block.
+#[tokio::test]
+async fn sparql_delete_where_anonymous_subject_is_one_node_across_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let cases = [
+        // (data, pattern, retracted)
+        (
+            r#"ex:a ex:p "one" . ex:b ex:q "two""#,
+            "[] ex:p ?o ; ex:q ?z",
+            0,
+        ),
+        (r#"ex:a ex:p "one" ; ex:q "two""#, "[] ex:p ?o ; ex:q ?z", 2),
+        ("ex:a ex:p ex:x . ex:b ex:p ex:y", "[] ex:p ex:x , ex:y", 0),
+        ("ex:a ex:p ex:x , ex:y", "[] ex:p ex:x , ex:y", 2),
+    ];
+    let mut n = 0;
+    for (data, pattern, expected) in cases {
+        for in_graph in [false, true] {
+            n += 1;
+            let id = format!("delwhere-anon-list-{n}:main");
+            fluree.create_ledger(&id).await.expect("create ledger");
+            let wrap = |body: &str| {
+                if in_graph {
+                    format!("GRAPH <urn:g1> {{ {body} }}")
+                } else {
+                    body.to_string()
+                }
+            };
+            let update = |body: String| {
+                let fluree = &fluree;
+                let id = id.clone();
+                async move {
+                    let text = format!("PREFIX ex: <http://example.org/ns/>\n{body}");
+                    fluree
+                        .graph(&id)
+                        .transact()
+                        .sparql_update(&text)
+                        .commit()
+                        .await
+                        .unwrap_or_else(|e| panic!("{text}: {e}"))
+                        .receipt
+                        .retract_count
+                }
+            };
+            update(format!("INSERT DATA {{ {} }}", wrap(data))).await;
+            let op = format!("DELETE WHERE {{ {} }}", wrap(pattern));
+            assert_eq!(update(op.clone()).await, expected, "{op} over {data}");
+        }
+    }
+}
+
+/// `INSERT DATA { [] ex:p 1 ; ex:q 2 }` creates one node with both
+/// properties, not one node per triple.
+#[tokio::test]
+async fn sparql_insert_data_anonymous_subject_is_one_node_across_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "insert-anon-list:main";
+    fluree.create_ledger(id).await.expect("create ledger");
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA { [] ex:p 1 ; ex:q 2 . [] ex:r ex:x , ex:y }",
+        )
+        .commit()
+        .await
+        .expect("insert");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let subjects = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "SELECT ?s (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY ?n",
+    )
+    .await
+    .expect("query");
+    let counts: Vec<_> = subjects
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[1].clone())
+        .collect();
+    assert_eq!(counts, vec![json!(2), json!(2)], "{subjects}");
+}
+
 /// An update whose WHERE matches nothing succeeds without a commit on the
 /// tracked path, as it does on the plain one. The tracked path (also the
 /// path every policy-carrying builder write takes) used to commit the empty
@@ -3346,7 +3479,7 @@ async fn no_match_update_naming_a_new_graph_commits_its_registration() {
             .ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(new_graph)
+            .assigned_graph_id(new_graph)
             .is_some(),
         "the named graph is registered"
     );

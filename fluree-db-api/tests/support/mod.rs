@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod hooked_storage;
+pub mod reasoning_lanes;
 pub mod recording_ns;
 pub mod span_capture;
 
@@ -347,7 +348,9 @@ pub async fn seed_user_with_ssn(
 /// Use this in regression tests that need to exercise the FIR6/binary-only
 /// reload path rather than the purely in-memory novelty path. The rebuild
 /// replaces an index already published at the same `t`, so a test that asks
-/// for a full rebuild reads one ([`publish_built_index`]).
+/// for a full rebuild reads one ([`publish_built_index`]). A branch's
+/// pre-fork commits live in its source's namespace, so the rebuild reads
+/// through the branch-aware store.
 pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let record = fluree
         .nameservice()
@@ -356,7 +359,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
@@ -378,7 +381,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
@@ -406,7 +409,7 @@ pub async fn build_incrementally_and_publish_index(
         "an incremental build needs a published index"
     );
     let result = fluree_db_indexer::build_incremental_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
@@ -1085,4 +1088,66 @@ pub async fn run_collector_and_fork_drop_scenario(
     // And the worker still builds once the drop's window has closed.
     round(main_id.clone(), 7).await;
     assert_dicts_present(main_id.clone(), "after a build following the drop").await;
+}
+
+/// The RDF lists `subject predicate` holds in `ledger`'s default graph, each
+/// as its members' integer values, sorted. Read through the shared list
+/// reader, so a list reads the same whether it is stored as positioned
+/// members or as an explicit `rdf:first`/`rdf:rest` chain.
+#[allow(dead_code)]
+pub async fn stored_int_lists(
+    ledger: &LedgerState,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    stored_int_lists_in(ledger, 0, subject, predicate).await
+}
+
+/// [`stored_int_lists`] in graph `g_id`.
+#[allow(dead_code)]
+pub async fn stored_int_lists_in(
+    ledger: &LedgerState,
+    g_id: fluree_db_core::GraphId,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+    use fluree_db_core::FlakeValue;
+    let snapshot = &ledger.snapshot;
+    let (Some(s), Some(p)) = (snapshot.encode_iri(subject), snapshot.encode_iri(predicate)) else {
+        return Vec::new();
+    };
+    let db = ledger.as_graph_db_ref(g_id);
+    let values = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s),
+                p: Some(p),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range");
+    let read = fluree_db_core::rdf_list::read_lists(db, &values)
+        .await
+        .expect("read lists");
+    assert!(read.malformed == 0 && read.values.is_empty(), "{read:?}");
+    let mut lists: Vec<Vec<i64>> = read
+        .lists
+        .into_iter()
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|m| match m {
+                    FlakeValue::Long(n) => n,
+                    other => panic!("integer member expected, got {other:?}"),
+                })
+                .collect()
+        })
+        .collect();
+    lists.sort();
+    lists
 }

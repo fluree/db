@@ -417,7 +417,9 @@ JSON object:
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit. A merge records the merge even when its conflict strategy resolved every flake away.
+- A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
+- A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
@@ -453,6 +455,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
 - `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
@@ -473,7 +476,7 @@ The fields of `POST /push/*ledger`, plus:
 
 - `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
 
-The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit, and none may drop graphs, which a merge cannot bring in. A push that carries any other commit is refused with `422`.
 
 A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
 
@@ -893,12 +896,27 @@ POST /import-upload
   "source_kind": "source",       // default "flpack"
   "filename": "dump.cypher",     // extension drives format detection
   "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
-  "base_iri": "https://kb.example/" } // CSV/Cypher only; format default if omitted
+  "base_iri": "https://kb.example/", // CSV/Cypher only; format default if omitted
+  "skolem_namespace": "urn:kb" } // blank-node salt; needs "source-upload-skolem"
 ```
+
+The file is imported under its own name, so its blank nodes get the ids a direct import of that file would mint. Servers that honor `"skolem_namespace"` (the salt `--skolem-namespace` sets, in place of the ledger id) advertise `"source-upload-skolem"` in `import.modes`.
 
 Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
 
 This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
+A source upload can also fill a **new named graph of an existing ledger**, as [`fluree graph import`](../cli/graph.md#fluree-graph-import) does. Servers that support it add `"source-upload-graph"` to `import.modes`; mint with `"graph"` naming the new graph and `"ledger"` the existing ledger:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",
+  "filename": "products.ttl",
+  "graph": "http://example.org/graph/products" }
+```
+
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh.
 
 ## Storage Proxy Endpoints
 
@@ -1828,7 +1846,7 @@ POST /validate/{ledger...}
 }
 ```
 
-- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `graph` — IRI of the named data graph to validate (default: the default graph). It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graphs the ledger config lists for it, whichever shapes are used.
 - `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
 - `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
 - `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
@@ -1871,6 +1889,7 @@ POST /validate/{ledger...}
 - `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
 - `401 Unauthorized` — authentication required and missing
 - `404 Not Found` — ledger or named graph not found (or not authorized)
+- `500 Internal Server Error` — the ledger config could not be read (`err:storage/ReadFailure`); validation does not run without it
 
 **Examples:**
 
@@ -2399,10 +2418,9 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
 
 ### POST /drop-graph
 
-Drop a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted under that graph IRI. The drop
-runs as a normal commit at `t = current_t + 1` — history at earlier `t`
-values is preserved. Admin-protected.
+Drop a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`. The drop is one commit at `t = current_t + 1` that
+retracts nothing. Admin-protected.
 
 **URL:**
 ```
@@ -2429,7 +2447,7 @@ POST /drop-graph
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -2439,24 +2457,25 @@ POST /drop-graph
 |-------|------|-------------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
 | `graph_iri` | string | Graph IRI that was dropped (echoed) |
-| `retracted` | integer | Number of flakes retracted by the drop commit; `0` for a no-op |
-| `committed` | boolean | `true` when a new commit was produced; `false` for a no-op drop on an empty graph |
-| `t` | integer | Current commit `t` for the branch after the drop |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | boolean | `true`: the drop commits |
+| `t` | integer | Commit `t` of the drop |
 
 **Behavior:**
 
-- **Transactional and history-preserving.** A query `as-of` an earlier `t` still sees the graph populated.
+- **Takes the history.** Nothing the graph held is queryable afterwards, at the head or as of an earlier `t`: a query naming the graph as of a `t` before the drop gets a 404. The commits keep the facts, so a branch created at a `t` before the drop reads them.
+- **The graph no longer exists.** `/info` leaves it out of `named-graphs`, and writing to the same IRI starts it afresh.
+- **Any size.** The drop reads none of the graph's facts, so its cost does not depend on the graph's size; `FLUREE_MAX_GRAPH_SCAN_FLAKES` does not apply.
 - **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
-- **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
-- **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+- **Refuses missing graphs.** Returns 404 when `graph` does not exist in the ledger, a dropped graph included — the call never registers a graph.
 
 **Status codes:**
 
-- `200 OK` - Drop succeeded (commit produced or no-op)
+- `200 OK` - Drop succeeded
 - `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
 - `401`/`403` - Admin token required and absent/invalid
-- `404 Not Found` - Ledger or graph IRI not found
+- `404 Not Found` - Ledger or graph not found
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2819,6 +2838,8 @@ Returns comprehensive ledger metadata including namespace codes, property stats,
 }
 ```
 
+When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
+
 **Response (proxy storage mode):**
 
 Returns simplified nameservice-only metadata:
@@ -3042,51 +3063,126 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 ```json
 {
   "name": "warehouse-orders",
-  "mode": "rest",
-  "catalog_uri": "https://polaris.example.com/api/catalog",
   "table": "sales.orders",
-  "branch": "main",
   "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "r2rml_type": "text/turtle",
-  "warehouse": "prod",
-  "auth_bearer": "…",
-  "oauth2_token_url": "https://idp.example.com/token",
-  "oauth2_client_id": "…",
-  "oauth2_client_secret": "…",
-  "no_vended_credentials": false,
-  "s3_region": "us-east-1",
-  "s3_endpoint": "https://s3.example.com",
-  "s3_path_style": false,
-  "table_location": "s3://bucket/warehouse/sales/orders"
+  "catalog": {
+    "type": "rest",
+    "uri": "https://polaris.example.com/api/catalog",
+    "warehouse": "prod",
+    "auth": {
+      "type": "oauth2_client_credentials",
+      "token_url": "https://idp.example.com/token",
+      "client_id": "fluree",
+      "client_secret": { "env_var": "POLARIS_SECRET" }
+    }
+  },
+  "io": { "s3_region": "us-east-1" }
 }
 ```
+
+The source's own fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
-| `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
-| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
-| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
-| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
-| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
-| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
-| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle (required). A request without it is a 400 and registers nothing. |
 | `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
-| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
-| `auth_bearer_env` | string | In place of `auth_bearer`: the name of an environment variable of the server holding the token, so the token is not stored. The name must be listed in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning); any other is refused with 400 |
-| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes). `oauth2_client_secret_env` names a server environment variable in place of `oauth2_client_secret`, under the same rule as `auth_bearer_env` |
-| `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
-| `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
-| `warehouse` | string | Warehouse identifier |
-| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
-| `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
 | `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
 | `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+Every other field is the source's [connection](#iceberg-connection), which every Iceberg route (`map`, `catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) takes the same way.
+
+#### Iceberg connection
+
+A request gives its connection in one of two forms, never both:
+
+- **Structured** (recommended): `catalog` and `io` objects, exactly as the stored config spells them, so a config read back from a source can be sent again. The catalog's auth is `catalog.auth`, the storage identity is `io.storage_auth`. Every Google identity and storage identity is given this way.
+- **Flat** (legacy): the fields below, kept for existing callers.
+
+The structured `catalog` is one of:
+
+```json
+{ "type": "rest", "uri": "https://…", "warehouse": "prod", "auth": { … } }
+{ "type": "direct", "table_location": "s3://bucket/warehouse/ns/table" }
+{ "type": "glue", "region": "us-east-1", "catalog_id": "123456789012" }
+{ "type": "s3tables", "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics" }
+```
+
+A REST catalog's `auth` is one of:
+
+```json
+{ "type": "none" }
+{ "type": "bearer", "token": <secret> }
+{ "type": "oauth2_client_credentials", "token_url": "https://…", "client_id": "…", "client_secret": <secret>, "scope": "…", "audience": "…" }
+{ "type": "google_metadata", "scopes": "…" }
+{ "type": "google", "credentials": <google>, "scopes": "…", "quota_project": "…" }
+```
+
+where `<google>` is where the Google identity comes from:
+
+```json
+{ "source": "metadata" }
+{ "source": "application_default" }
+{ "source": "service_account", "key": { "env_var": "SA_KEY" } }
+{ "source": "external_account", "config": { …the configuration `gcloud iam workload-identity-pools create-cred-config … --aws` prints… } }
+```
+
+`metadata` is the GCE/GKE metadata server's service account and `application_default` the server's own application-default credentials; both are host identities, which the operator can refuse (see [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)). `quota_project` is the project requests bill to (`x-goog-user-project`). BigLake requires one for every identity (a missing one is `403` `err:catalog/QuotaProjectRequired`); the server infers none, so a request to a BigLake catalog names it (the CLI and the Python package default it to the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names). A catalog auth's quota project bills the catalog only: storage reads never send it. The `external_account` configuration (Workload Identity Federation from AWS) is not a secret.
+
+The structured `io`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `storage_auth` | object | Which identity reads the table's files: `{"type": "vended"}` (the REST catalog's per-table credentials, required), `{"type": "ambient"}` (the server's AWS credential chain), `{"type": "catalog"}` (the REST catalog's own Google identity reads `gs://`; what BigLake federation, `bq://`, needs, since it never vends), or `{"type": "google", "credentials": <google>, "quota_project": "…"}` (a Google identity of the source's own). Absent: what `vended_credentials` says. The server stores exactly what it is sent and never picks one for a warehouse; the CLI and the Python package do (`catalog` for `bq://`, `vended` for `bl://`), so an HTTP client wanting that names it |
+| `vended_credentials` | bool | The older form of `storage_auth` (`true`: `vended`, `false`: `ambient`); default `true` for a REST catalog. Set to agree with `storage_auth` when that is given; a contradicting value is refused |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
+
+An explicit `null` is an absent field, in either form. The legacy untagged catalog a stored record may hold (`{"uri": …, "auth": …}` with no `type`, read as REST) is accepted, so a read-out of an old record can be sent back. A catalog that states its `type` is read as that type only: `{"type": "direct", "uri": …}` is refused for its missing `table_location`, never read as REST.
+
+A `<secret>` is a literal (stored with the source) or `{"env_var": "NAME"}`, an environment variable of the server that the operator lists in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) (the value is not stored). A service-account key is never a literal: it would be stored with the source. `{"secret_ref": …}` is accepted only by an embedded `Fluree` with a secret resolver, and `default_val`, `java_property` and a `google_metadata` `metadata_url` never.
+
+The flat fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
+| `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
+| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
+| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
+| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
+| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
+| `auth_bearer` / `auth_bearer_env` | string | A static bearer token (does not refresh; a Google OAuth token expires after ~1h), or the name of a listed server environment variable holding it |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` / `oauth2_client_secret_env`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client credentials (refreshes). Needs the token URL and the secret; the client id defaults to empty (Snowflake Horizon) |
+| `auth_google_metadata`, `auth_google_scopes` | bool, string | The GCE/GKE metadata server's identity (stored as `google_metadata`) and its scopes (default `cloud-platform`) |
+| `warehouse` | string | Warehouse identifier |
+| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | | As in the structured `io` |
+
+Refused with `400` and `err:api/InvalidGraphSourceConfig`, the message naming the field: an unknown field (also inside `catalog` and `io`); flat and structured fields together; two ways to authenticate at once (a bearer beside OAuth2 or a Google identity, two Google sources); auth given only partly (an OAuth2 token URL without its secret, `auth_google_scopes` without `auth_google_metadata`); a literal and its `_env` together; an environment variable the operator does not list; a REST-only setting (auth, warehouse, vended credentials) in another mode. A storage identity the catalog cannot serve (`catalog` without a Google catalog identity, `vended` outside a REST catalog) and a malformed Google configuration are refused at registration with `400` (`err:system/ConfigError`, `err:auth/GoogleCredentialsInvalid`).
+
+Each Iceberg route ignores the fields that only another Iceberg route takes, so one body can be sent to browse, preview, verify, generate, validate and map in turn: `map`'s `name`, `table`, `r2rml`, `r2rml_type`, `branch`, `model`, `default_allow`, `delete_column`, `delete_values` and `order_by`; browse's `depth`; preview's `namespace` and `tier`; generate's `tables`, `base_namespace`, `per_table_overrides`, `options` and `target_model_ledger_id`; validate's `snapshot`. A route reads the fields it takes itself (preview's `name` is the table's). A field no Iceberg route knows is refused on every route.
+
+BigLake federation with a Workload Identity Federation identity, which needs no stored secret:
+
+```json
+{
+  "name": "orders",
+  "table": "sales.orders",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+    "warehouse": "bq://projects/lake/locations/us/catalogs/sales",
+    "auth": { "type": "google", "credentials": { "source": "external_account", "config": { "type": "external_account", "audience": "//iam.googleapis.com/projects/…", "…": "…" } } }
+  },
+  "io": { "storage_auth": { "type": "catalog" } }
+}
+```
 
 In `glue` and `s3tables` modes the catalog is called through the native AWS SDK, and both the catalog call and the S3 reads use the server's ambient AWS credential chain:
 
@@ -3114,19 +3210,34 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
   "table_identifier": "sales.orders",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "connection_tested": true,
+  "connection_check": {"outcome": "verified"},
   "mapping_source": "r2rml-inline",
   "triples_map_count": 3,
+  "table_count": 1,
+  "table_names": ["sales.orders"],
   "mapping_validated": true
 }
 ```
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields, or an `r2rml` that does not parse or compile
+- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`)
 - `401/403` — admin auth required
+- `403 Forbidden` (`err:auth/HostIdentityRefused`) — a host identity the operator's policy refuses
 - `500 Internal Server Error` — the graph source could not be published
 
-A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
+
+`connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
+
+| `outcome` | Meaning | Other fields |
+|---|---|---|
+| `verified` | Every mapped table loaded | |
+| `table_failed` | `table` did not load: the catalog answered that it has no such table, refused it, or answered with another error status; in `direct` mode, its metadata could not be read. `error` is the reason | `table`, `error` |
+| `catalog_unreachable` | The catalog did not answer for `table`: a refused connection, a timeout, a DNS or TLS failure, or a failure that carries no answer from the catalog. Catalog modes only | `table`, `error` |
+| `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
+| `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
+| `no_tables` | The mapping could not be read, so it named no table to load | |
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
@@ -3134,7 +3245,7 @@ See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 Checks that a catalog connection's credentials (`rest`, `glue` or `s3tables` mode) can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. When the catalog returns no inline table metadata (AWS Glue and S3 Tables never do), the metadata file at `metadata_location` is read from storage first, with the same credentials. It is read-only and admin-protected.
 
-The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
+The body takes the [connection](#iceberg-connection), structured or flat, and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
 
 ### Verify response
 
@@ -3400,9 +3511,13 @@ POST {api_base_url}/delta/map
 | `unity_catalog`, `unity_schema` | string | Complete a mapped table name of fewer than three parts |
 | `oauth2_client_id`, `oauth2_client_secret_env` / `oauth2_client_secret` | string | A Databricks service principal: its application id, and its OAuth secret as the name of a server environment variable (not stored; must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) or a literal (stored) |
 | `auth_bearer_env` / `auth_bearer` | string | A Databricks token in place of a service principal, under the same rule. It does not renew |
-| `oauth2_token_url`, `oauth2_scope` | string | Default to the workspace's own token endpoint and `all-apis` |
+| `oauth2_token_url`, `oauth2_scope`, `oauth2_audience` | string | Default to the workspace's own token endpoint, `all-apis` and none |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+| `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
+| `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version, and the rows the table still holds for a key a delete touched |
+
+The catalog and storage fields may instead be given structured, as the stored config spells them: `unity` (`{"uri", "catalog", "schema", "auth"}`, its `auth` a bearer or OAuth2 client credentials as on [`iceberg/map`](#iceberg-connection), an OAuth2 `auth` with no `scope` asking for `all-apis` as the flat form does) and `io` (`{"s3_region", "s3_endpoint", "s3_path_style", "azure"}`, `azure` being `{"type": "client_secret", "tenant_id", "client_id", "client_secret"}`). Not both forms at once. Every environment variable a request names, `azure_client_secret_env` included, must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. An unknown field, a catalog field without `unity_uri`, a partial Azure principal and two ways to authenticate are refused with `400` (`err:api/InvalidGraphSourceConfig`).
 
 **Response:**
 
@@ -3426,7 +3541,9 @@ See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map
 
 Five read-only endpoints that lead up to `delta/map` on Unity Catalog. None registers anything. All are admin-protected, since each carries a catalog credential and calls out, and are available only when the server is built with the `delta` feature. See [From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
 
-Every body takes the Unity connection fields of `delta/map`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+Every body takes the Unity connection fields of `delta/map`, flat or as a structured `unity`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`, `oauth2_audience`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. `catalog/preview` and `catalog/verify` also take the S3 options (`s3_region`, `s3_endpoint`, `s3_path_style`, or a structured `io`), but no Azure principal: Unity issues the table's credentials. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+
+So that one body can be sent to each route in turn, each Delta route ignores the fields that only another Delta route takes: `delta/map`'s `name`, `root`, `tables`, `r2rml`, `r2rml_type`, `branch`, `model`, `default_allow`, `delete_column`, `delete_values` and `order_by`; browse's `depth`; preview's and verify's `table`; generate's `base_namespace`, `per_table_overrides` and `options`. A route reads the fields it takes itself (generate's `tables` is a list of names, map's an object). `catalog/browse` and `r2rml/generate` read only Unity's record of a table, never its files, so they also ignore the storage options (`s3_*`, `azure_*`, `io`). `catalog/preview` and `catalog/verify` refuse an Azure principal (`400`, naming `azure`), since Unity issues the table's credentials and the principal would not be the identity the table is read as. A field no Delta route knows is refused on every route.
 
 | Endpoint | Further fields | Answer |
 |---|---|---|
@@ -3474,7 +3591,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 
 An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
 
-**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
 See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
 
@@ -3517,8 +3634,9 @@ POST {api_base_url}/sql/map
 | `protocol` | string | `trino` (default, `X-Trino-*` headers) or `presto` |
 | `catalog`, `schema` | string | Defaults for unqualified table names |
 | `user` | string | Protocol user header (default `fluree`) |
-| `auth_bearer` | string | Static bearer token |
-| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes); `oauth2_token_url` is guarded against internal hosts |
+| `auth` | object | The endpoint's auth, structured as on [`iceberg/map`](#iceberg-connection): a bearer, OAuth2 client credentials, or a Google identity (`{"type": "google", …}`). In place of the flat fields below, not beside them |
+| `auth_bearer` / `auth_bearer_env` | string | Static bearer token, or the name of a server environment variable holding it (listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` / `oauth2_client_secret_env`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes): needs the token URL and the secret. `oauth2_token_url` is guarded against internal hosts |
 | `session` | object | Session properties sent as `X-Trino-Session` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
@@ -3544,14 +3662,14 @@ POST {api_base_url}/sql/map
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping
+- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping. Auth given two ways or only partly, an unknown field and an unlisted environment variable are `err:api/InvalidGraphSourceConfig`
 - `401 Unauthorized` — admin token required
 
 ---
 
 ### POST {api_base_url}/iceberg/materialize
 
-Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
+Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). The source may be an Iceberg or a Delta graph source; a Delta source is read through its change data feed (see [Delta → Materialization](../graph-sources/delta.md#materialization)). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
 
 **Request Body:**
 
@@ -3589,7 +3707,7 @@ The source is read with the same credentials a query of it would use, on full an
 
 ### POST {api_base_url}/iceberg/track
 
-Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. Admin-protected; `iceberg` feature only.
+Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. The source may be an Iceberg or a Delta graph source. Admin-protected; `iceberg` feature only.
 
 **Request Body:**
 

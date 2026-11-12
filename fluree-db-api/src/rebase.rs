@@ -4,7 +4,7 @@
 //! of its source branch's current HEAD, bringing the branch up to date with
 //! upstream changes.
 
-use crate::commit_data::{key_of, OwnChanges};
+use crate::commit_data::{key_of, ConfigGraphs, OwnChanges};
 use crate::error::{ApiError, Result};
 use fluree_db_core::LedgerId;
 use fluree_db_core::{BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake};
@@ -367,6 +367,9 @@ impl crate::Fluree {
 
         // Fast-forward: the branch has no commits of its own to replay.
         let is_fast_forward = diff.source.commits.is_empty();
+        if !is_fast_forward {
+            crate::merge::refuse_merging_graph_drops(&diff)?;
+        }
 
         if is_fast_forward {
             // Copy the source index into the branch namespace
@@ -404,8 +407,15 @@ impl crate::Fluree {
             });
         }
 
+        // The replay starts from the source's queryable state, relabeled to
+        // the branch; both sides' keys and flakes name the config graph as
+        // it does.
+        let mut current_state = self.ledger(&source_id).await?;
+        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
+        let mut config = ConfigGraphs::for_target(&current_state);
+
         // The keys the source changed since the two sides diverged.
-        let source_delta = delta_keys_of(&source_store, &diff.target.own).await?;
+        let source_delta = config.keys(delta_keys_of(&source_store, &diff.target.own).await?);
 
         // Pass 1: walk every commit on the branch's line to collect
         // lightweight summaries (CID, t, conflict keys) without retaining
@@ -420,6 +430,7 @@ impl crate::Fluree {
             &diff.source.commits,
             &diff.source.own,
             &source_delta,
+            &mut config,
         )
         .await?;
         let total_commits = summaries.len();
@@ -439,11 +450,6 @@ impl crate::Fluree {
         // available, serializing the entire replay against regular
         // transactions on the same branch.
         let write_guard = self.lock_ledger(&branch_id).await?;
-
-        // Start replay from the source's queryable state, relabeled
-        // to the branch.
-        let mut current_state = self.ledger(&source_id).await?;
-        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
 
         let mut conflicts: Vec<RebaseConflict> = Vec::new();
         let mut skipped = 0;
@@ -466,6 +472,8 @@ impl crate::Fluree {
 
             let mut commit =
                 fluree_db_core::load_commit_by_id(&branch_store, &summary.commit_id).await?;
+            config.adopt(&commit.namespace_delta);
+            config.flakes(&mut commit.flakes);
             if let Some(keys) = &summary.resolution_keys {
                 commit.flakes.retain(|flake| keys.contains(&key_of(flake)));
             }
@@ -665,6 +673,11 @@ impl crate::Fluree {
         flakes: Vec<Flake>,
         original_commit: &Commit,
     ) -> Result<StagedCommit> {
+        // A commit written before the staging fix can hold a retraction and
+        // an assertion of one fact at one `t`. The pair means the fact holds,
+        // and a commit built here may not hold it, so the replay keeps the
+        // assertion alone.
+        let flakes = fluree_db_transact::resolve_same_t_pairs(&state, flakes);
         // A commit that conformed on the branch can violate a shape the
         // source installed since the fork. Each replay is validated against
         // the state it lands on; the first violation aborts the whole rebase,
@@ -889,11 +902,14 @@ async fn scan_branch_commits<C: fluree_db_core::ContentStore + ?Sized>(
     cids: &[ContentId],
     own: &[ContentId],
     source_delta: &FxHashSet<ConflictKey>,
+    config: &mut ConfigGraphs,
 ) -> Result<Vec<CommitSummary>> {
     let mut changes = OwnChanges::new(own);
     let mut summaries = Vec::with_capacity(cids.len());
     for cid in cids {
         let mut commit = fluree_db_core::load_commit_by_id(store, cid).await?;
+        config.adopt(&commit.namespace_delta);
+        config.flakes(&mut commit.flakes);
         let is_own = changes.is_own(cid);
         changes.retain_changes(cid, &mut commit.flakes);
         summaries.push(CommitSummary {
