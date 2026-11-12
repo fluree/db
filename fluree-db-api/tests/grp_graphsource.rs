@@ -39,6 +39,8 @@ mod it_nameservice_graph_source;
 mod it_nameservice_query;
 #[path = "it_ontology_inline.rs"]
 mod it_ontology_inline;
+#[path = "it_shacl_additional_data.rs"]
+mod it_shacl_additional_data;
 #[path = "it_shapes_cross_ledger.rs"]
 mod it_shapes_cross_ledger;
 #[path = "it_shapes_inline.rs"]
