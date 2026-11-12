@@ -20,5 +20,6 @@ pub use triples_map::{
     SQL_QUERY_ALIAS_PREFIX,
 };
 pub use uniqueness::{
-    constant_prefix, templates_provably_disjoint, usable_in_key, KeyColumn, TableKeys,
+    constant_prefix, templates_provably_disjoint, usable_in_key, KeyColumn, SubjectKeyProof,
+    TableKeys,
 };

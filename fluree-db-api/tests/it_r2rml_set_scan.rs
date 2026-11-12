@@ -1601,3 +1601,103 @@ async fn info_counts_are_exact_or_null_with_a_provable_bound() {
         "{same_code}"
     );
 }
+
+/// The maps of `mapping`, registered as `alias`, that registration reports as
+/// keyless (`keylessMap`): each one's IRI and message, in IRI order.
+async fn keyless_at_registration(
+    fluree: &Fluree,
+    alias: &str,
+    mapping: String,
+) -> Vec<(String, String)> {
+    use fluree_db_r2rml::emit::{DiagCode, Severity};
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/sets",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let created = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct(alias, &root, mapping)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create graph source {alias}: {e}"));
+    assert!(created.connection_tested, "{alias}: {created:?}");
+    created
+        .diagnostics
+        .into_iter()
+        .map(|d| {
+            assert_eq!(
+                (d.code, d.severity),
+                (DiagCode::KeylessMap, Severity::Advisory),
+                "{alias}: {d:?}"
+            );
+            let iri = d
+                .message
+                .strip_prefix("TriplesMap <")
+                .and_then(|m| m.split_once('>'))
+                .map(|(iri, _)| iri.to_string())
+                .unwrap_or_else(|| panic!("{alias}: a message naming its map: {}", d.message));
+            (iri, d.message)
+        })
+        .collect()
+}
+
+/// Registration tells the operator which maps no key proves subject-unique,
+/// so their queries take the deduplicating lanes: one advisory per such map,
+/// naming it and the `f:key` that would prove it. A map proven unique by any
+/// route gets none: a declared key, the table's Iceberg identifier fields, a
+/// composite template covering a declared key, or a template whose columns
+/// hold the identifier field beside another column.
+#[tokio::test]
+async fn registration_names_each_map_its_queries_deduplicate() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let iri = |local: &str| format!("http://example.org/mapping#{local}");
+
+    // No key at all: the history table and the orders.
+    let keyless = keyless_at_registration(&fluree, "reg-hist", HIST.mapping()).await;
+    let maps: Vec<&str> = keyless.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(maps, [iri("History"), iri("Order")], "{keyless:?}");
+    let (_, history) = &keyless[0];
+    assert!(
+        history.contains("'sets.customers_history'")
+            && history.contains("it has no known key")
+            && history.contains(r#"declare `f:key ( "customer_id" )` on its logical table"#)
+            && history.contains("or make it the table's identifier field")
+            && history.contains("memory budget"),
+        "{history}"
+    );
+
+    // Proven by every other route: none.
+    for source in [&KEYED, &IDENT, &REGIONS, &LINES_KEYED] {
+        let alias = format!("reg-{}", source.alias);
+        let keyless = keyless_at_registration(&fluree, &alias, source.mapping()).await;
+        assert!(keyless.is_empty(), "{alias}: {keyless:?}");
+    }
+    // A template whose columns hold the identifier field beside another.
+    let wide = CURRENT_MAP.replace(
+        "customer/{customer_id}\"",
+        "customer/{customer_id}/{name}\"",
+    );
+    assert_ne!(wide, CURRENT_MAP);
+    let keyless = keyless_at_registration(&fluree, "reg-wide", format!("{PREFIXES}{wide}")).await;
+    assert!(keyless.is_empty(), "{keyless:?}");
+
+    // A key the subject does not cover: the per-version key under a
+    // per-customer subject. The advisory names the key it has.
+    let versioned = HISTORY_MAP.replace(
+        r#"rr:tableName "sets.customers_history" ]"#,
+        r#"rr:tableName "sets.customers_history" ; f:key ( "customer_id" "valid_from" ) ]"#,
+    );
+    assert_ne!(versioned, HISTORY_MAP);
+    let keyless =
+        keyless_at_registration(&fluree, "reg-versioned", format!("{PREFIXES}{versioned}")).await;
+    assert_eq!(keyless.len(), 1, "{keyless:?}");
+    assert!(
+        keyless[0]
+            .1
+            .contains("its known keys are (customer_id, valid_from)"),
+        "{keyless:?}"
+    );
+}

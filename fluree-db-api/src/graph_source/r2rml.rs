@@ -9,6 +9,7 @@ use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::R2rmlCreateConfig;
 use crate::graph_source::iceberg_catalog::storage_query_error;
+use crate::graph_source::iceberg_validate::{keyless_map_diagnostics, KeyRemedy, QueryTables};
 use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
 use crate::graph_source::storage::{plan_storage, CatalogGrant, StoragePlan};
 use crate::Result;
@@ -1344,10 +1345,31 @@ impl crate::Fluree {
             )
             .await?;
 
+        // One provider for the probe and the key lookups after it, so each
+        // table is resolved once.
+        let provider = FlureeR2rmlProvider::new(self);
         let connection_check = self
-            .probe_tables(&graph_source_id, &table_names, config.iceberg.is_direct())
+            .probe_tables(
+                &provider,
+                &graph_source_id,
+                &table_names,
+                config.iceberg.is_direct(),
+            )
             .await;
         let connection_tested = connection_check.is_verified();
+        let diagnostics = match &registered.compiled {
+            Some(compiled) if connection_tested => {
+                registered_keyless_maps(
+                    &provider,
+                    &graph_source_id,
+                    compiled,
+                    QueryTables::FromTable,
+                    KeyRemedy::DeclareOrIdentifierFields,
+                )
+                .await
+            }
+            _ => Vec::new(),
+        };
 
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
 
@@ -1363,6 +1385,7 @@ impl crate::Fluree {
             connection_tested,
             connection_check,
             mapping_validated,
+            diagnostics,
         })
     }
 
@@ -1413,12 +1436,14 @@ impl crate::Fluree {
     /// registration.
     async fn probe_tables(
         &self,
+        provider: &FlureeR2rmlProvider<'_>,
         graph_source_id: &str,
         table_names: &[String],
         direct: bool,
     ) -> ConnectionCheck {
         let check = self
-            .probe_tables_within(
+            .probe_tables_using(
+                provider,
                 graph_source_id,
                 table_names,
                 direct,
@@ -1481,8 +1506,24 @@ impl crate::Fluree {
     /// file; the first failure ends it, and so does `budget`. A catalog-mode
     /// (`!direct`) table failure with no sign of a catalog answer is
     /// [`ConnectionCheck::CatalogUnreachable`] ([`catalog_answered`]).
+    #[cfg(test)]
     pub(crate) async fn probe_tables_within(
         &self,
+        graph_source_id: &str,
+        table_names: &[String],
+        direct: bool,
+        budget: std::time::Duration,
+    ) -> ConnectionCheck {
+        let provider = FlureeR2rmlProvider::new(self);
+        self.probe_tables_using(&provider, graph_source_id, table_names, direct, budget)
+            .await
+    }
+
+    /// [`Self::probe_tables_within`] through `provider`, whose resolutions a
+    /// caller can reuse after it.
+    async fn probe_tables_using(
+        &self,
+        provider: &FlureeR2rmlProvider<'_>,
         graph_source_id: &str,
         table_names: &[String],
         direct: bool,
@@ -1500,7 +1541,6 @@ impl crate::Fluree {
         if table_names.is_empty() {
             return ConnectionCheck::NoTables;
         }
-        let provider = FlureeR2rmlProvider::new(self);
         let loaded = AtomicUsize::new(0);
         let probe = async {
             // One catalog client for every load below. The client cache does
@@ -1515,7 +1555,7 @@ impl crate::Fluree {
                 })?;
             futures::stream::iter(table_names.iter().map(Ok))
                 .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
-                    let (provider, loaded) = (&provider, &loaded);
+                    let loaded = &loaded;
                     async move {
                         provider
                             .load_table_context(graph_source_id, table)
@@ -1778,6 +1818,56 @@ pub(crate) fn iceberg_flat_type(
         .and_then(fluree_db_iceberg::FieldType::from_iceberg_type)
 }
 
+/// [`keyless_map_diagnostics`] for a published source, with each logical
+/// table's keys learned the way its queries learn them
+/// ([`fluree_db_query::r2rml::effective_table_keys`]) through `provider`,
+/// within [`REGISTRATION_PROBE_BUDGET`]. A table whose keys cannot be learned
+/// (it does not load, or a key the mapping declares on it cannot hold) gets
+/// no advisory: registration reports the first, and its queries refuse the
+/// second. Past the budget, no advisory at all.
+pub(crate) async fn registered_keyless_maps(
+    provider: &FlureeR2rmlProvider<'_>,
+    graph_source_id: &str,
+    compiled: &CompiledR2rmlMapping,
+    queries: QueryTables,
+    remedy: KeyRemedy,
+) -> Vec<fluree_db_r2rml::emit::Diagnostic> {
+    let tables: std::collections::BTreeSet<&str> = compiled
+        .triples_maps
+        .values()
+        .filter_map(|tm| tm.table_name())
+        .collect();
+    let learn = async {
+        let mut keys = std::collections::HashMap::new();
+        for table in tables {
+            match fluree_db_query::r2rml::effective_table_keys(
+                provider,
+                compiled,
+                graph_source_id,
+                table,
+                None,
+            )
+            .await
+            {
+                Ok(found) => {
+                    keys.insert(table.to_string(), found);
+                }
+                Err(error) => {
+                    debug!(graph_source_id = %graph_source_id, table = %table, error = %error, "Could not learn the table's keys at registration");
+                }
+            }
+        }
+        keys
+    };
+    match tokio::time::timeout(REGISTRATION_PROBE_BUDGET, learn).await {
+        Ok(keys) => keyless_map_diagnostics(compiled, &keys, queries, remedy),
+        Err(_elapsed) => {
+            debug!(graph_source_id = %graph_source_id, "Learning the tables' keys ran past the registration budget");
+            Vec::new()
+        }
+    }
+}
+
 /// [`R2rmlTableProvider::table_keys`] for a logical table over an Iceberg
 /// table read under `schema` (the pinned snapshot's, under current names):
 /// refuse a declared key naming a column the schema lacks, one that cannot
@@ -1817,19 +1907,34 @@ fn iceberg_table_keys(
         });
     }
     declared.check_columns(logical_table, column)?;
-    if format_version > 3 || schema.identifier_field_ids.is_empty() {
-        return Ok(None);
-    }
     let names: Option<Vec<String>> = schema
         .identifier_field_ids
         .iter()
         .map(|id| schema.field(*id).map(|field| field.name.clone()))
         .collect();
-    let Some(names) = names else {
-        return Ok(None);
-    };
+    Ok(identifier_fields_key(format_version, names, column))
+}
+
+/// The key an Iceberg table's identifier fields state for a logical table
+/// over it, as [`R2rmlTableProvider::table_keys`] reports it: the
+/// identifier columns (`identifier_columns`, by name; `None` when one of the
+/// ids names no field) as one key, when the format still has readers honor
+/// them (version 3 or older) and `column` says the logical table holds every
+/// one as a column that can identify a row. `None` when it states none.
+///
+/// Shared by the query path and the dry-run (`validate_r2rml`), so a mapping
+/// is told it is keyless exactly when its queries will find it so.
+pub(crate) fn identifier_fields_key(
+    format_version: i32,
+    identifier_columns: Option<Vec<String>>,
+    column: impl FnMut(&str) -> fluree_db_r2rml::mapping::KeyColumn,
+) -> Option<Vec<Vec<String>>> {
+    let names = identifier_columns.filter(|names| !names.is_empty())?;
+    if format_version > 3 {
+        return None;
+    }
     let reported = fluree_db_r2rml::TableKeys::new([names]).retain_usable(column);
-    Ok((!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect()))
+    (!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect())
 }
 
 fn snapshot_cache_key(metadata_location: &str, selected: SelectedSnapshot<'_>) -> String {
