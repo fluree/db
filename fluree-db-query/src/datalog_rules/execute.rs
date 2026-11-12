@@ -969,7 +969,7 @@ impl HeadSink<'_, '_> {
             }
             for head in &self.rule.heads {
                 let Some(mut flake) =
-                    instantiate(head, batch, row, state.snapshot, state.derived_t)
+                    instantiate(head, batch, row, state.snapshot, state.derived_t)?
                 else {
                     continue;
                 };
@@ -1069,18 +1069,26 @@ async fn run_body<'a>(
 
 /// Instantiate one head against one result row. `None` when a position
 /// cannot be filled (an unbound variable, or a literal where a node is
-/// required); the caller counts those.
+/// required); the caller counts those. An encoded binding is an error: the
+/// body runs with eager materialization, so an operator that emits one would
+/// otherwise lose the fact silently.
 pub(super) fn instantiate(
     head: &super::RuleHead,
     batch: &Batch,
     row: usize,
     snapshot: &LedgerSnapshot,
     t: i64,
-) -> Option<Flake> {
-    let s = resolve_node(&head.subject, batch, row, snapshot)?;
-    let p = resolve_node(&head.predicate, batch, row, snapshot)?;
-    let (o, dt, m) = resolve_object(&head.object, batch, row, snapshot)?;
-    Some(Flake::new(s, p, o, dt, t, true, m))
+) -> Result<Option<Flake>> {
+    let Some(s) = resolve_node(&head.subject, batch, row, snapshot)? else {
+        return Ok(None);
+    };
+    let Some(p) = resolve_node(&head.predicate, batch, row, snapshot)? else {
+        return Ok(None);
+    };
+    let Some((o, dt, m)) = resolve_object(&head.object, batch, row, snapshot)? else {
+        return Ok(None);
+    };
+    Ok(Some(Flake::new(s, p, o, dt, t, true, m)))
 }
 
 fn resolve_node(
@@ -1088,20 +1096,26 @@ fn resolve_node(
     batch: &Batch,
     row: usize,
     snapshot: &LedgerSnapshot,
-) -> Option<Sid> {
+) -> Result<Option<Sid>> {
     match term {
-        HeadTerm::Sid(sid) => Some(sid.clone()),
-        HeadTerm::Var(v) => binding_node(batch.get(row, *v)?, snapshot),
-        HeadTerm::Literal { .. } => None,
+        HeadTerm::Sid(sid) => Ok(Some(sid.clone())),
+        HeadTerm::Var(v) => match batch.get(row, *v) {
+            Some(binding) => binding_node(binding, snapshot),
+            None => Ok(None),
+        },
+        HeadTerm::Literal { .. } => Ok(None),
     }
 }
 
-fn binding_node(binding: &Binding, snapshot: &LedgerSnapshot) -> Option<Sid> {
+fn binding_node(binding: &Binding, snapshot: &LedgerSnapshot) -> Result<Option<Sid>> {
     match binding {
-        Binding::Sid { sid, .. } => Some(sid.clone()),
-        Binding::IriMatch { primary_sid, .. } => Some(primary_sid.clone()),
-        Binding::Iri(iri) => IriEncoder::encode_iri(snapshot, iri),
-        _ => None,
+        Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
+        Binding::IriMatch { primary_sid, .. } => Ok(Some(primary_sid.clone())),
+        Binding::Iri(iri) => Ok(IriEncoder::encode_iri(snapshot, iri)),
+        encoded if encoded.is_encoded() => Err(QueryError::Internal(
+            "datalog rule head: the rule body produced an encoded binding".into(),
+        )),
+        _ => Ok(None),
     }
 }
 
@@ -1110,26 +1124,31 @@ fn resolve_object(
     batch: &Batch,
     row: usize,
     snapshot: &LedgerSnapshot,
-) -> Option<(FlakeValue, Sid, Option<FlakeMeta>)> {
+) -> Result<Option<(FlakeValue, Sid, Option<FlakeMeta>)>> {
     match term {
-        HeadTerm::Sid(sid) => Some((FlakeValue::Ref(sid.clone()), id_datatype_sid(), None)),
+        HeadTerm::Sid(sid) => Ok(Some((
+            FlakeValue::Ref(sid.clone()),
+            id_datatype_sid(),
+            None,
+        ))),
         HeadTerm::Literal {
             value,
             datatype,
             lang,
-        } => Some((
+        } => Ok(Some((
             value.clone(),
             datatype.clone(),
             FlakeMeta::from_parts(lang.as_deref(), None),
-        )),
-        HeadTerm::Var(v) => match batch.get(row, *v)? {
-            Binding::Lit { val, dtc, .. } => Some((
+        ))),
+        HeadTerm::Var(v) => match batch.get(row, *v) {
+            None => Ok(None),
+            Some(Binding::Lit { val, dtc, .. }) => Ok(Some((
                 val.clone(),
                 dtc.datatype().clone(),
                 FlakeMeta::from_parts(dtc.lang_tag(), None),
-            )),
-            other => binding_node(other, snapshot)
-                .map(|sid| (FlakeValue::Ref(sid), id_datatype_sid(), None)),
+            ))),
+            Some(other) => Ok(binding_node(other, snapshot)?
+                .map(|sid| (FlakeValue::Ref(sid), id_datatype_sid(), None))),
         },
     }
 }
