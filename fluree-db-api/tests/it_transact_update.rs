@@ -1585,8 +1585,8 @@ async fn str_dt_refuses_a_datatype_that_is_not_an_iri() {
         ("<urn:example:dt>", true),
     ] {
         let query = format!(
-            r#"PREFIX ex: <http://example.com/>
-               SELECT ?b WHERE {{ ex:s ex:text ?t BIND(STRDT(?t, {datatype}) AS ?v) BIND(BOUND(?v) AS ?b) }}"#
+            r"PREFIX ex: <http://example.com/>
+               SELECT ?b WHERE {{ ex:s ex:text ?t BIND(STRDT(?t, {datatype}) AS ?v) BIND(BOUND(?v) AS ?b) }}"
         );
         let json = support::query_sparql(&fluree, &ledger, &query)
             .await
