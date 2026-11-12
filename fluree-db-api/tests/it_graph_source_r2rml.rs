@@ -1552,6 +1552,58 @@ async fn engine_e2e_wildcard_over_a_ledger_holding_a_list() {
     assert_eq!(rows, 12, "3 airlines x (3 predicates + rdf:type)");
 }
 
+/// The same wildcard inside a sub-select inside `GRAPH <source>`: the list
+/// view wraps the pattern in the sub-select's body too, and the source reads
+/// that body without it, so the sub-select scans the source rather than
+/// answering from the ledger's lists.
+#[tokio::test]
+async fn engine_e2e_wildcard_sub_select_over_a_ledger_holding_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "r2rml-wild-lists-sub:main");
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\nex:config ex:order (1 2) .",
+        )
+        .await
+        .expect("insert a list")
+        .ledger;
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Subquery(
+            fluree_db_query::ir::SubqueryPattern::new(
+                vec![s, p, o],
+                vec![Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Var(p),
+                    Term::Var(o),
+                ))],
+            ),
+        )],
+    }];
+    parsed.output = QueryOutput::select_all(vec![s, p, o]);
+    parsed.rdf_list_view = true;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &*ledger.novelty, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("R2RML scan should execute");
+    let rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(rows, 12, "3 airlines x (3 predicates + rdf:type)");
+}
+
 /// Regression (fluree/db#1406 review): a class and a predicate that live in
 /// SEPARATE TriplesMaps sharing a subject template must NOT be fused. Fusing the
 /// class into the predicate star would make TriplesMap resolution require one map

@@ -38,7 +38,8 @@ pub use provider::{
 };
 pub use rewrite::{
     convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,
-    unsupported_outside_graph_scopes, unsupported_subscope_error, R2rmlRewriteResult,
+    unsupported_outside_graph_scopes, unsupported_query_modifiers, unsupported_subscope_error,
+    R2rmlRewriteResult,
 };
 pub use sql_lane::{SqlBlockOperator, SQL_BLOCK_PUSHDOWN_SITE};
 

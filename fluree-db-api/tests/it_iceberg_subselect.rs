@@ -1104,3 +1104,409 @@ async fn scans_per_shape() {
         "a seeded JSON-LD sub-select is evaluated once, whatever the outer rows"
     );
 }
+
+/// A sliced JSON-LD sub-select is seeded per outer row only with the variables
+/// its body binds in every row. One that seeds nothing (it shares no variable
+/// with the rows before it, or binds the shared one only in an `OPTIONAL`)
+/// answers the same rows for every outer row, so it is read once whatever the
+/// outer rows; it used to be read once per outer row. The answers match the
+/// twin: the two largest orders, paired with every customer, and those orders
+/// joined to their own customers only.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slice_that_seeds_nothing_is_read_once() {
+    let fluree = setup().await;
+    let (store, _guard) = span_capture::init_test_tracing();
+    let count = || store.find_spans("r2rml.scan_table").len();
+
+    let before = count();
+    sparql_json(
+        &fluree,
+        &format!("SELECT ?n FROM <{LAKE}> WHERE {{ ?c ex:name ?n }}"),
+    )
+    .await
+    .expect("names");
+    let outer = count() - before;
+
+    let ids: Vec<Value> = (1..=50)
+        .map(|i| json!({"@id": format!("http://example.org/customer/{i}")}))
+        .collect();
+    let top_two = |select: &Value, body: &Value| {
+        json!({
+            "@context": ctx(),
+            "from": "{G}",
+            "select": ["?n", "?o", "?a"],
+            "where": [
+                ["values", ["?c", ids.clone()]],
+                {"@id": "?c", "ex:name": "?n"},
+                ["query", {
+                    "@context": ctx(),
+                    "select": select,
+                    "where": body,
+                    "orderBy": "(desc ?a)",
+                    "limit": 2
+                }]
+            ]
+        })
+    };
+    let mut reads = Vec::new();
+    for (what, select, body, expected) in [
+        (
+            "no shared variable",
+            json!(["?o", "?a"]),
+            json!({"@id": "?o", "ex:amount": "?a"}),
+            100,
+        ),
+        (
+            "shared only through an OPTIONAL",
+            json!(["?c", "?o", "?a"]),
+            json!([
+                {"@id": "?o", "ex:amount": "?a"},
+                ["optional", {"@id": "?o", "ex:customer": "?c"}]
+            ]),
+            2,
+        ),
+    ] {
+        // The body alone, as a query of its own.
+        let before = count();
+        fluree
+            .query_from()
+            .jsonld(&json!({
+                "@context": ctx(),
+                "from": LAKE,
+                "select": select,
+                "where": body,
+                "orderBy": "(desc ?a)",
+                "limit": 2
+            }))
+            .execute_formatted()
+            .await
+            .expect("the body alone");
+        let alone = count() - before;
+
+        let before = count();
+        let started = std::time::Instant::now();
+        let rows = jsonld_agrees(&fluree, what, &top_two(&select, &body)).await;
+        let ms = started.elapsed().as_millis();
+        // The twin reads no table, so every read counted is the source's.
+        reads.push((what, alone, count() - before, ms));
+        assert_eq!(rows.len(), expected, "{what}: {rows:?}");
+    }
+    eprintln!(
+        "slice that seeds nothing: outer = {outer}; \
+         (shape, body alone, under 50 outer rows, ms) = {reads:?}"
+    );
+    assert!(outer > 0, "the scan spans are captured");
+    for (what, alone, under, _) in reads {
+        assert_eq!(
+            under,
+            outer + alone,
+            "{what}: the sub-select is read once, not once per outer row"
+        );
+    }
+
+    // The cost the docs state: a slice seeded with the outer row's key is a
+    // top-k per outer row, and reads its tables once per outer row (each read
+    // whole, with no key pushed into the scan yet).
+    let select = json!(["?c", "?o", "?a"]);
+    let body = json!({"@id": "?o", "ex:customer": "?c", "ex:amount": "?a"});
+    let before = count();
+    let started = std::time::Instant::now();
+    let rows = jsonld_agrees(&fluree, "seeded slice", &top_two(&select, &body)).await;
+    let ms = started.elapsed().as_millis();
+    let seeded = count() - before;
+    eprintln!("slice seeded per outer row: {seeded} reads under 50 outer rows ({ms} ms)");
+    assert_eq!(rows.len(), 100, "the two largest orders of each customer");
+    assert!(
+        seeded >= outer + 50,
+        "a seeded slice reads its table once per outer row ({seeded} reads); \
+         update docs/graph-sources/overview.md when this changes"
+    );
+}
+
+/// An R2RML mapping produces no edge annotations: it has no term map for one,
+/// and a native ledger refuses a user-written `f:reifies*` triple, so a ledger
+/// loaded with the mapping's triples holds none either. An annotation pattern
+/// therefore matches nothing over a graph source, in a sub-select or not,
+/// inside the source's scope or beside the user's own graph block, on both
+/// surfaces, as it matches nothing on the twin. An ungrouped `COUNT` makes
+/// the empty match visible as a 0, and the same count without the annotation
+/// counts every order, so the 0 is the annotation's.
+#[tokio::test]
+async fn annotation_patterns_match_nothing_over_a_graph_source() {
+    let fluree = setup().await;
+    let count_of = |rows: &[String]| -> String {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows[0].clone()
+    };
+
+    // SPARQL: the annotation tail `{| … |}` and the reifier form.
+    for (what, inner, expected) in [
+        ("plain", "?o ex:customer ?c", "k=200"),
+        (
+            "annotation tail",
+            "?o ex:customer ?c {| ex:since ?d |}",
+            "k=0",
+        ),
+        (
+            "reifier",
+            "?r rdf:reifies <<( ?o ex:customer ?c )>> . ?r ex:since ?d",
+            "k=0",
+        ),
+    ] {
+        let rows = sparql_agrees(
+            &fluree,
+            &format!("SPARQL sub-select, {what}"),
+            &format!(
+                "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                 SELECT ?k FROM <{{G}}> WHERE {{ {{ SELECT (COUNT(?o) AS ?k) WHERE {{ {inner} }} }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(count_of(&rows), expected, "SPARQL sub-select, {what}");
+        let rows = sparql_agrees(
+            &fluree,
+            &format!("SPARQL, {what}"),
+            &format!(
+                "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                 SELECT (COUNT(?o) AS ?k) FROM <{{G}}> WHERE {{ {inner} }}"
+            ),
+        )
+        .await;
+        assert_eq!(count_of(&rows), expected, "SPARQL, {what}");
+    }
+
+    // JSON-LD: `@annotation` on the edge, and `@reifies` naming it.
+    let ungrouped = |inner: Value| {
+        json!({
+            "@context": ctx(),
+            "from": "{G}",
+            "select": ["?k"],
+            "where": [["query", {
+                "@context": ctx(),
+                "select": ["(as (count ?o) ?k)"],
+                "where": inner
+            }]]
+        })
+    };
+    for (what, inner, expected) in [
+        ("plain", json!({"@id": "?o", "ex:customer": "?c"}), "[200]"),
+        (
+            "@annotation",
+            json!({"@id": "?o", "ex:customer": {"@id": "?c", "@annotation": {"ex:since": "?d"}}}),
+            "[0]",
+        ),
+        (
+            "@reifies",
+            json!({"@id": "?r", "@reifies": {"@id": "?o", "ex:customer": {"@id": "?c"}}, "ex:since": "?d"}),
+            "[0]",
+        ),
+    ] {
+        let rows = jsonld_agrees(
+            &fluree,
+            &format!("JSON-LD sub-select, {what}"),
+            &ungrouped(inner),
+        )
+        .await;
+        assert_eq!(count_of(&rows), expected, "JSON-LD sub-select, {what}");
+    }
+
+    // Beside the user's own graph block on the source's handle, the body reads
+    // the default view, which holds no annotation either: it is evaluated, not
+    // refused, and counts 0.
+    let graph = fluree.graph(LAKE);
+    let rows = graph
+        .query()
+        .with_r2rml()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?n ?k WHERE {{ GRAPH <{LAKE}> {{ ?c ex:name ?n }} \
+             {{ SELECT (COUNT(?o) AS ?k) WHERE {{ ?o ex:customer ?x {{| ex:since ?d |}} }} }} }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("SPARQL: an annotation body outside the graph block");
+    let rows = rows_of(&rows);
+    assert_eq!(rows.len(), 50, "{rows:?}");
+    assert!(rows.iter().all(|r| r.starts_with("k=0 ")), "{rows:?}");
+    let rows = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&json!({
+            "@context": ctx(),
+            "select": ["?n", "?k"],
+            "where": [
+                ["graph", LAKE, {"@id": "?c", "ex:name": "?n"}],
+                ["query", {
+                    "@context": ctx(),
+                    "select": ["(as (count ?o) ?k)"],
+                    "where": {"@id": "?o", "ex:customer": {"@id": "?x", "@annotation": {"ex:since": "?d"}}}
+                }]
+            ]
+        }))
+        .execute_formatted()
+        .await
+        .expect("JSON-LD: an annotation body outside the graph block");
+    let rows = jsonld_rows(&rows);
+    assert_eq!(rows.len(), 50, "{rows:?}");
+    assert!(rows.iter().all(|r| r.ends_with(",0]")), "{rows:?}");
+}
+
+/// An `EXISTS` inside an expression — `BIND(EXISTS {…})`, `FILTER(EXISTS {…}
+/// || …)`, `NOT EXISTS` in a conjunction, a sub-select's `HAVING` or
+/// `ORDER BY` — reads the source like an `EXISTS` pattern's body, so it is
+/// lowered to scans with the rest of the scope. It used to read the source's
+/// empty native index instead: every `EXISTS` false and every `NOT EXISTS`
+/// true, answered as a success. Each shape is checked against the twin, with
+/// a fixed fact about the fixture so the two cannot agree on the wrong answer.
+#[tokio::test]
+async fn an_exists_inside_an_expression_reads_the_source() {
+    let fluree = setup().await;
+    let customers = |rows: &[String]| {
+        rows.iter()
+            .all(|r| r.contains("http://example.org/customer/"))
+    };
+
+    // Every customer has orders, so every EXISTS is true.
+    let bind = "SELECT ?c ?b FROM <{G}> WHERE { ?c ex:name ?n \
+                BIND(EXISTS { ?o ex:customer ?c } AS ?b) }";
+    let rows = sparql_agrees(&fluree, "BIND(EXISTS)", bind).await;
+    assert_eq!(rows.len(), 50, "{rows:?}");
+    assert!(rows.iter().all(|r| r.starts_with("b=true ")), "{rows:?}");
+
+    let or = "SELECT ?c FROM <{G}> WHERE { ?c ex:name ?n \
+              FILTER(EXISTS { ?o ex:customer ?c } || ?n = \"nobody\") }";
+    let or_rows = sparql_agrees(&fluree, "FILTER(EXISTS || …)", or).await;
+    assert_eq!(or_rows.len(), 50, "{or_rows:?}");
+    assert!(customers(&or_rows));
+
+    // Orders 1..=50 have a customer with their number, so 150 do not.
+    let not = "SELECT ?o FROM <{G}> WHERE { ?o ex:amount ?a \
+               FILTER(NOT EXISTS { ?o ex:numberedLike ?x } && BOUND(?a)) }";
+    let rows = sparql_agrees(&fluree, "FILTER(NOT EXISTS && …)", not).await;
+    assert_eq!(rows.len(), 150, "{rows:?}");
+
+    // A sub-select's HAVING and ORDER BY.
+    let having = "SELECT ?c ?k FROM <{G}> WHERE { { SELECT ?c (COUNT(?o) AS ?k) \
+                  WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING(EXISTS { ?c ex:name ?n }) } }";
+    let rows = sparql_agrees(&fluree, "sub-select HAVING EXISTS", having).await;
+    assert_eq!(rows.len(), 50, "{rows:?}");
+    let order = "SELECT ?o ?a FROM <{G}> WHERE { { SELECT ?o ?a WHERE { ?o ex:amount ?a } \
+                 ORDER BY DESC(EXISTS { ?o ex:numberedLike ?x }) DESC(?a) LIMIT 3 } }";
+    let rows = sparql_agrees(&fluree, "sub-select ORDER BY EXISTS", order).await;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    // The three largest amounts among the orders that have a numbered customer.
+    for row in &rows {
+        let n: u32 = row
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{row}"));
+        assert!((1..=50).contains(&n), "{rows:?}");
+    }
+
+    // The same inside the user's own graph block on the source's handle.
+    let graph = fluree.graph(LAKE);
+    let rows = graph
+        .query()
+        .with_r2rml()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?c WHERE {{ GRAPH <{LAKE}> {{ ?c ex:name ?n \
+             FILTER(EXISTS {{ ?o ex:customer ?c }} || ?n = \"nobody\") }} }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("SPARQL: an EXISTS in a FILTER inside the graph block");
+    assert_eq!(rows_of(&rows), or_rows, "SPARQL graph block");
+
+    // JSON-LD: `exists` / `not-exists` inside a compound filter.
+    let json_or = json!({
+        "@context": ctx(), "from": "{G}", "select": ["?c"],
+        "where": [
+            {"@id": "?c", "ex:name": "?n"},
+            ["filter", ["or", ["exists", {"@id": "?o", "ex:customer": "?c"}], ["=", "?n", "nobody"]]]
+        ]
+    });
+    let json_or_rows = jsonld_agrees(&fluree, "JSON-LD filter(or exists)", &json_or).await;
+    assert_eq!(json_or_rows.len(), 50, "{json_or_rows:?}");
+    let json_not = json!({
+        "@context": ctx(), "from": "{G}", "select": ["?o"],
+        "where": [
+            {"@id": "?o", "ex:amount": "?a"},
+            ["filter", ["and", ["not-exists", {"@id": "?o", "ex:numberedLike": "?x"}], ["bound", "?a"]]]
+        ]
+    });
+    let rows = jsonld_agrees(&fluree, "JSON-LD filter(and not-exists)", &json_not).await;
+    assert_eq!(rows.len(), 150, "{rows:?}");
+    let rows = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&json!({
+            "@context": ctx(), "select": ["?c"],
+            "where": [["graph", LAKE,
+                {"@id": "?c", "ex:name": "?n"},
+                ["filter", ["or", ["exists", {"@id": "?o", "ex:customer": "?c"}], ["=", "?n", "nobody"]]]
+            ]]
+        }))
+        .execute_formatted()
+        .await
+        .expect("JSON-LD: an exists in a filter inside the graph block");
+    assert_eq!(jsonld_rows(&rows), json_or_rows, "JSON-LD graph block");
+}
+
+/// A query's own `HAVING` and `ORDER BY`, and the expressions it evaluates
+/// after a trailing `VALUES`, run after its `WHERE`, outside the graph scope
+/// the `WHERE` is wrapped in, so an `EXISTS` there would read the source's
+/// empty native index. It is refused, with the remedy, whether or
+/// not the query has a graph block of its own; the same condition in the
+/// `WHERE` answers.
+#[tokio::test]
+async fn an_exists_in_the_query_modifiers_refuses() {
+    let fluree = setup().await;
+    let having = "SELECT ?c (COUNT(?o) AS ?k) FROM <{G}> WHERE { ?o ex:customer ?c } \
+                  GROUP BY ?c HAVING(EXISTS { ?c ex:name ?n })";
+    let order = "SELECT ?o ?a FROM <{G}> WHERE { ?o ex:amount ?a } \
+                 ORDER BY DESC(EXISTS { ?o ex:numberedLike ?x }) DESC(?a) LIMIT 3";
+    // A trailing VALUES moves the aggregate's input expression out of the WHERE.
+    let trailing = "SELECT ?c (SUM(IF(EXISTS { ?o ex:customer ?c }, 1, 0)) AS ?k) FROM <{G}> \
+                    WHERE { ?c ex:name ?n } GROUP BY ?c \
+                    VALUES ?c { <http://example.org/customer/1> }";
+    let refused = |e: &str| e.contains("EXISTS outside the WHERE clause") && e.contains("FILTER");
+    for (what, body) in [
+        ("HAVING", having),
+        ("ORDER BY", order),
+        ("after a trailing VALUES", trailing),
+    ] {
+        let twin = sparql_json(&fluree, &body.replace("{G}", TWIN))
+            .await
+            .unwrap_or_else(|e| panic!("{what} on the twin: {e}"));
+        assert!(!rows_of(&twin).is_empty(), "{what}: the twin answers");
+        let err = sparql_json(&fluree, &body.replace("{G}", LAKE))
+            .await
+            .expect_err(what);
+        assert!(refused(&err), "{what}: {err}");
+        // With a graph block of its own, on the source's handle.
+        let scoped = body
+            .replace(" FROM <{G}>", "")
+            .replace("WHERE { ", &format!("WHERE {{ GRAPH <{LAKE}> {{ "))
+            .replace(" } GROUP BY", " } } GROUP BY")
+            .replace(" } ORDER BY", " } } ORDER BY");
+        let err = fluree
+            .graph(LAKE)
+            .query()
+            .with_r2rml()
+            .sparql(&format!("{PREFIX}{scoped}"))
+            .execute_formatted()
+            .await
+            .expect_err(&scoped)
+            .to_string();
+        assert!(refused(&err), "{scoped}: {err}");
+    }
+    // The remedy: the same condition in the WHERE.
+    let rows = sparql_agrees(
+        &fluree,
+        "the condition in the WHERE",
+        "SELECT ?c (COUNT(?o) AS ?k) FROM <{G}> WHERE { ?o ex:customer ?c \
+         FILTER EXISTS { ?c ex:name ?n } } GROUP BY ?c",
+    )
+    .await;
+    assert_eq!(rows.len(), 50, "{rows:?}");
+}
