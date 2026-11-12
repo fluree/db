@@ -11,6 +11,12 @@
 //! Attempts and total waiting are capped, and every wait is reported through
 //! the caller's `on_wait`, so a model starting from cold shows as waiting
 //! rather than as a hang.
+//!
+//! **A refused credential.** A client given a [`Renewal`] (an account
+//! sign-in whose token can be renewed) answers a 401 by renewing once and
+//! resending that call, and only that call: a request whose credential was
+//! refused was not read for, or billed to, that credential. A second 401 is
+//! the caller's error.
 
 use crate::config::ReaderEndpoint;
 use crate::{DocError, Result};
@@ -25,6 +31,10 @@ pub const ATTEMPTS: u32 = 4;
 pub const MAX_WAIT: Duration = Duration::from_secs(300);
 /// The longest single `Retry-After` honoured.
 const MAX_RETRY_AFTER: u64 = 60;
+
+/// Renews a refused credential: run once when a call is answered 401, and
+/// that call resent with the credential it returns.
+pub type Renewal = Box<dyn Fn() -> Result<Credential> + Send + Sync>;
 
 /// Where the credential goes.
 #[derive(Clone)]
@@ -133,7 +143,11 @@ pub struct Answer {
 pub struct ReaderClient {
     agent: ureq::Agent,
     url: String,
-    credential: Option<Credential>,
+    /// Replaceable, for a credential that is renewed during a run (an
+    /// account sign-in's hourly token).
+    credential: std::sync::RwLock<Option<Credential>>,
+    /// How a refused credential is renewed, when it can be.
+    renewal: Option<Renewal>,
 }
 
 impl std::fmt::Debug for ReaderClient {
@@ -164,12 +178,25 @@ impl ReaderClient {
         Self {
             agent,
             url: url.to_string(),
-            credential,
+            credential: std::sync::RwLock::new(credential),
+            renewal: None,
         }
+    }
+
+    /// Renew the credential with `renewal` when a call is refused (401),
+    /// and resend that call once with the renewed one.
+    pub fn with_renewal(mut self, renewal: Renewal) -> Self {
+        self.renewal = Some(renewal);
+        self
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Replace the credential the next calls send.
+    pub fn set_credential(&self, credential: Option<Credential>) {
+        *self.credential.write().expect("credential lock") = credential;
     }
 
     /// Read one request dataset (TriG) with `model`. `on_wait` hears about
@@ -183,6 +210,7 @@ impl ReaderClient {
     ) -> Result<Answer> {
         let mut waited = Duration::ZERO;
         let mut attempt = 1;
+        let mut renewed = false;
         loop {
             let mut req = self
                 .agent
@@ -193,7 +221,8 @@ impl ReaderClient {
             if let Some(c) = cache {
                 req = req.header("X-Fluree-Cache", c);
             }
-            req = match &self.credential {
+            let credential = self.credential.read().expect("credential lock").clone();
+            req = match &credential {
                 Some(Credential::Bearer(t)) => req.header("Authorization", &format!("Bearer {t}")),
                 Some(Credential::Header { name, value }) => {
                     req.header(name.as_str(), value.as_str())
@@ -239,6 +268,13 @@ impl ReaderClient {
                     ontology_notes,
                     resends: attempt - 1,
                 });
+            }
+            if status == 401 && !renewed {
+                if let Some(renew) = &self.renewal {
+                    self.set_credential(Some(renew()?));
+                    renewed = true;
+                    continue;
+                }
             }
             let message = error_message(&text);
             let retry_after = (status == 503)
@@ -400,6 +436,7 @@ mod tests {
             auth_header: Some("X-Api-Key".into()),
             models: vec!["m".into()],
             cache: None,
+            account: false,
         }
     }
 
@@ -548,6 +585,50 @@ mod tests {
             Err(DocError::Endpoint { status: 401, .. }) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A client that can renew its credential renews it once on a 401 and
+    /// resends that call alone; a second 401 is the caller's.
+    #[test]
+    fn a_refused_credential_is_renewed_once_and_the_call_resent() {
+        let refused = || http("401 Unauthorized", &[], r#"{"error":"config_stale"}"#);
+        let client = |url: &str, renewals: &Arc<Mutex<u32>>| {
+            let count = renewals.clone();
+            ReaderClient::with_credential(url, Some(Credential::Bearer("old".into()))).with_renewal(
+                Box::new(move || {
+                    *count.lock().unwrap() += 1;
+                    Ok(Credential::Bearer("new".into()))
+                }),
+            )
+        };
+
+        let (url, seen) = stub(vec![
+            refused(),
+            http("200 OK", &["X-Fluree-Serialized-Tokens: 5"], "[]"),
+        ]);
+        let renewals = Arc::new(Mutex::new(0));
+        let answer = client(&url, &renewals)
+            .read("x", "m", None, &|_| panic!("no wait expected"))
+            .unwrap();
+        assert_eq!(*renewals.lock().unwrap(), 1);
+        assert_eq!(answer.resends, 0, "a renewal is not a wait for capacity");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer old"));
+        assert!(seen[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer new"));
+
+        let (url, seen) = stub(vec![refused(), refused()]);
+        let renewals = Arc::new(Mutex::new(0));
+        match client(&url, &renewals).read("x", "m", None, &|_| {}) {
+            Err(DocError::Endpoint { status: 401, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*renewals.lock().unwrap(), 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]
