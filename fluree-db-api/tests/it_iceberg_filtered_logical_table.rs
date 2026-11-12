@@ -1007,7 +1007,7 @@ async fn a_filtered_map_planned_from_the_kept_file_list_applies_its_filter() {
     let create = |fluree: Fluree| {
         let (location, ttl) = (location.clone(), ttl.clone());
         async move {
-            std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", fixtures_dir());
+            set_local_roots();
             fluree
                 .create_r2rml_graph_source(
                     R2rmlCreateConfig::new_direct("kept", &location, &ttl)
