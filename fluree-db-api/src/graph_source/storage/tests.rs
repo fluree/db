@@ -506,14 +506,15 @@ async fn two_sources_naming_one_gs_path_never_share_cached_metadata_or_manifests
     cache
         .put_metadata(alice.scope(), GS_META, Arc::new(metadata))
         .await;
-    assert!(
+    assert_eq!(
         cache
             .put_scan_files(
                 alice.scope(),
                 GS_META,
                 Arc::new(CachedScanFiles::new(Vec::new(), false)),
             )
-            .await
+            .await,
+        crate::graph_source::cache::ScanFilesKept::Budgeted
     );
     assert!(cache.get_metadata(alice.scope(), GS_META).await.is_some());
     assert!(cache.get_scan_files(alice.scope(), GS_META).await.is_some());

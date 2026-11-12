@@ -1,64 +1,49 @@
-//! A reader's answer turned into nodes for the document's commit.
+//! A reader's answer: a Fluree DB transaction in the extraction vocabulary
+//! (`xt:`, [`XT_NS`]), response layout 2 ([`LAYOUT`]).
 //!
-//! The answer is a JSON-LD dataset: the document graph it was sent, echoed
-//! under the document's IRI, and the reading in graphs of its own. The echo
-//! is dropped (the commit already carries the structure graph), and the
-//! reading is made to fit the rest of the document's commit:
+//! The answer is one run over one document, ready to transact as it is:
 //!
-//! - offsets are moved from the part's text back to the document's, and the
-//!   IRIs a reader mints under the document are kept apart per part, so two
-//!   calls' `…/entity/1` stay two entities;
-//! - every node is stamped `doc:sourceDocument`, which is what re-ingest
-//!   retracts by;
-//! - a reified statement (`rdf:Statement`) is a `doc:Relation`, and is marked
-//!   `doc:asserted` when the reading also asserts its triple with an IRI
-//!   object, so re-ingest can take that edge away with it;
-//! - a reader whose terms are not this pipeline's has its [`Vocabulary`]
-//!   applied, the one place its terms are translated.
+//! - the run (its IRI, the document it read and that text's SHA-256, the
+//!   release) is the commit's metadata, the JSON-LD `txn-meta` object;
+//! - the facts are the default graph's nodes: the triples of the accepted,
+//!   affirmed claims, and each new entity's type and label;
+//! - each claim behind a fact is an annotation of that fact (`@annotation`);
+//!   any other claim states its triple as an `rdf:Statement`;
+//! - the mentions, when asked for, are a named graph (`xt:mentions`) of
+//!   occurrences anchored to the text's offsets.
+//!
+//! The document is not echoed. Nothing here renames the reader's terms: the
+//! transaction is kept as the reader wrote it, with one change, when the
+//! document was read in several calls: the offsets of a later call are moved
+//! from its part of the text into the whole document's. What is read out of
+//! it ([`Reading::mentions`], [`Reading::claims`], the counts) is for
+//! reporting, and [`trig`] / [`turtle`] print the same transaction as RDF.
+//!
+//! An answer in another layout (one that echoes the document graph, or
+//! carries no commit metadata naming layout 2) is refused by name.
 
-use crate::vocab::{DOC_NS, NIF_NS, RDF_NS, XSD_NS};
+use crate::vocab::{FLUREE_NS, NIF_NS, RDF_NS};
 use crate::{DocError, Result};
+use fluree_graph_ir::{Dataset, Graph, GraphCollectorSink, LiteralValue, Term};
+use fluree_graph_json_ld::ParsedContext;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// How a reader's terms translate into this pipeline's. IRIs matching a term
-/// are replaced whole; otherwise the first matching namespace is swapped.
-/// Applied to every IRI: predicates, types, node ids and datatypes.
-#[derive(Debug)]
-pub struct Vocabulary {
-    pub terms: &'static [(&'static str, &'static str)],
-    pub namespaces: &'static [(&'static str, &'static str)],
-}
+/// The extraction vocabulary.
+pub const XT_NS: &str = "https://ns.flur.ee/extract#";
+/// The response layout this reads: a Fluree DB transaction, the run in the
+/// commit metadata, no document echo.
+pub const LAYOUT: &str = "https://ns.flur.ee/extract/response/2";
+/// The graph a TriG transaction writes the commit metadata in.
+pub const TXN_META_GRAPH: &str = "#txn-meta";
+/// The commit metadata's subject, `fluree:commit:this`.
+const COMMIT_THIS: &str = "https://ns.flur.ee/db#commit:this";
+/// What the contract names a run's new entities under (`<prefix><document
+/// key>-<entity key>`): counted as new even when no mention marks them.
+const NEW_ENTITY_PREFIX: &str = "urn:fluree:entity:";
 
-impl Vocabulary {
-    pub fn translate<'a>(&self, iri: &'a str) -> std::borrow::Cow<'a, str> {
-        if let Some((_, to)) = self.terms.iter().find(|(from, _)| *from == iri) {
-            return std::borrow::Cow::Owned((*to).to_string());
-        }
-        for (from, to) in self.namespaces {
-            if let Some(rest) = iri.strip_prefix(from) {
-                return std::borrow::Cow::Owned(format!("{to}{rest}"));
-            }
-        }
-        std::borrow::Cow::Borrowed(iri)
-    }
-}
-
-/// Readers whose output needs translating, by the model ids they serve.
-/// A model with no entry is stored in its own terms.
-#[derive(Debug)]
-pub struct Profile {
-    pub models: &'static [&'static str],
-    pub vocabulary: Vocabulary,
-}
-
-const PROFILES: &[Profile] = &[];
-
-pub fn profile(model: &str) -> Option<&'static Profile> {
-    PROFILES
-        .iter()
-        .find(|p| p.models.iter().any(|m| m.eq_ignore_ascii_case(model)))
-}
+const BEGIN: &str = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#beginIndex";
+const END: &str = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#endIndex";
 
 /// Where a part's answer sits in the whole document.
 #[derive(Debug, Clone, Copy)]
@@ -66,694 +51,828 @@ pub struct Frame<'a> {
     pub doc_iri: &'a str,
     /// The part's first character in the document's text.
     pub offset: usize,
-    /// The part's index, and how many parts the document was read in.
-    pub part: usize,
-    pub parts: usize,
 }
 
-/// One part's reading, ready for the commit.
-#[derive(Debug, Default)]
+/// One span of text the reading found (`xt:Occurrence`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mention {
+    pub id: String,
+    /// The words, `nif:anchorOf`.
+    pub text: Option<String>,
+    /// Offsets in the document's text, end exclusive.
+    pub begin: Option<usize>,
+    pub end: Option<usize>,
+    /// `xt:occurrenceClass`.
+    pub class: Option<String>,
+    /// The catalog record it links to (`xt:entity`), or the entity the run
+    /// minted for it (`xt:localEntity`, and then `new_entity`).
+    pub entity: Option<String>,
+    pub new_entity: bool,
+    /// `xt:linkConfidence` for a link, else `xt:score`.
+    pub confidence: Option<f64>,
+    /// The structure element the span sits in (`doc:sourceElement`'s
+    /// target), when the document's structure was at hand.
+    pub element: Option<String>,
+}
+
+/// One claim (`xt:Claim`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Claim {
+    pub id: String,
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<Term>,
+    /// `xt:assertionStatus`: `xt:affirmed`, `xt:negated`, `xt:hypothetical`.
+    pub status: Option<String>,
+    pub accepted: Option<bool>,
+    pub score: Option<f64>,
+    /// The claim annotates its fact: the triple is in the facts.
+    pub asserted: bool,
+}
+
+/// One call's answer, read.
+#[derive(Debug, Clone)]
 pub struct Reading {
-    /// Expanded JSON-LD nodes.
-    pub nodes: Vec<Value>,
-    pub mentions: usize,
-    pub entities: usize,
-    pub relations: usize,
-    /// Records outside the reading its mentions link to (`nif:entity`):
-    /// the catalog's, as against the entities it minted.
+    /// The answer as the reader wrote it (compact JSON-LD, a Fluree DB
+    /// transaction), offsets in the document's text.
+    pub transaction: Value,
+    /// The same as RDF; the commit metadata in the graph [`TXN_META_GRAPH`].
+    pub dataset: Dataset,
+    /// The run's IRI (`xt:run` in the commit metadata, else the answer's
+    /// `X-Fluree-Run`).
+    pub run: Option<String>,
+    /// The release that answered and the endpoint's ID for the call
+    /// (`X-Fluree-Release`, `X-Fluree-Request-ID`), when the answer came
+    /// over the wire with them.
+    pub release: Option<String>,
+    pub request_id: Option<String>,
+    /// Whether the reading cache answered instead of the reader.
+    pub cached: bool,
+    pub mentions: Vec<Mention>,
+    pub claims: Vec<Claim>,
+    /// Statements in the facts, claims aside.
+    pub facts: usize,
+    /// Entities the run minted, as against catalog records.
+    pub new_entities: BTreeSet<String>,
+    /// Catalog records the mentions link to.
     pub linked: BTreeSet<String>,
+    /// The answer's prefixes, for printing it.
+    prefixes: BTreeMap<String, String>,
 }
 
-const BEGIN: &str = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#beginIndex";
-const END: &str = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#endIndex";
-
-pub fn read_answer(
-    body: &str,
-    frame: &Frame<'_>,
-    vocabulary: Option<&Vocabulary>,
-) -> Result<Reading> {
-    let value: Value = serde_json::from_str(body)
-        .map_err(|e| DocError::Model(format!("reading is not JSON: {e}")))?;
-    let expanded = if has_context(&value) {
-        fluree_graph_json_ld::expand(&value)
-            .map_err(|e| DocError::Model(format!("reading is not JSON-LD: {e}")))?
-    } else {
-        value
+/// Read one answer. `frame.offset` moves its offsets into the document's
+/// text.
+pub fn read_answer(body: &str, frame: &Frame<'_>) -> Result<Reading> {
+    let mut doc: Value = serde_json::from_str(body)
+        .map_err(|e| DocError::Model(format!("the reader's answer is not JSON: {e}")))?;
+    if !doc.is_object() {
+        return Err(not_layout_2("it is not a JSON-LD object"));
+    }
+    let raw_context = doc.get("@context").cloned().unwrap_or_else(|| json!({}));
+    let ctx = fluree_graph_json_ld::parse_context(&raw_context)
+        .map_err(|e| DocError::Model(format!("the reader's answer: @context: {e}")))?;
+    check_layout(&doc, &ctx)?;
+    if frame.offset > 0 {
+        shift_offsets(&mut doc, &ctx, frame.offset as u64);
+    }
+    let dataset = to_dataset(&doc, &raw_context, &ctx)?;
+    let mut reading = Reading {
+        transaction: doc,
+        dataset,
+        run: None,
+        release: None,
+        request_id: None,
+        cached: false,
+        mentions: Vec::new(),
+        claims: Vec::new(),
+        facts: 0,
+        new_entities: BTreeSet::new(),
+        linked: BTreeSet::new(),
+        prefixes: prefixes_of(&raw_context),
     };
+    reading.index();
+    Ok(reading)
+}
+
+fn not_layout_2(why: &str) -> DocError {
+    DocError::Model(format!(
+        "the reader's answer is not in the layout this reads ({why}): expected a Fluree DB \
+         transaction in response layout 2 (<{LAYOUT}>), the run in its `txn-meta` and the \
+         facts in its @graph. An answer that echoes the document graph is the earlier layout; \
+         a reader serving it needs updating"
+    ))
+}
+
+/// The key `key` stands for: an IRI, or a keyword.
+fn key_iri(key: &str, ctx: &ParsedContext) -> String {
+    if key.starts_with('@') || key == ctx.id_key || key == ctx.type_key {
+        return key.to_string();
+    }
+    fluree_graph_json_ld::expand_iri_with_vocab(key, ctx, true)
+}
+
+/// A value's IRI: `{"@id": …}`, or a string where the key coerces to `@id`.
+fn value_iri(value: &Value, ctx: &ParsedContext) -> Option<String> {
+    let s = match value {
+        Value::String(s) => s.as_str(),
+        Value::Object(o) => o.get("@id").or_else(|| o.get(&ctx.id_key))?.as_str()?,
+        _ => return None,
+    };
+    Some(fluree_graph_json_ld::expand_iri_with_vocab(s, ctx, false))
+}
+
+fn check_layout(doc: &Value, ctx: &ParsedContext) -> Result<()> {
+    let Some(meta) = doc.get("txn-meta").and_then(Value::as_object) else {
+        return Err(not_layout_2("it carries no commit metadata, `txn-meta`"));
+    };
+    let layout_key = format!("{XT_NS}responseLayout");
+    let layouts: Vec<String> = meta
+        .iter()
+        .filter(|(k, _)| key_iri(k, ctx) == layout_key)
+        .flat_map(|(_, v)| match v {
+            Value::Array(a) => a.clone(),
+            v => vec![v.clone()],
+        })
+        .filter_map(|v| value_iri(&v, ctx))
+        .collect();
+    if layouts.iter().any(|l| l == LAYOUT) {
+        return Ok(());
+    }
+    Err(not_layout_2(&match layouts.first() {
+        Some(other) => format!("it names layout <{other}>"),
+        None => "its commit metadata names no `xt:responseLayout`".to_string(),
+    }))
+}
+
+/// Add `offset` to every `nif:beginIndex` / `nif:endIndex` in the document,
+/// whatever graph or node it sits in.
+fn shift_offsets(value: &mut Value, ctx: &ParsedContext, offset: u64) {
+    fn shift(v: &mut Value, offset: u64) {
+        match v {
+            Value::Number(n) => {
+                if let Some(n) = n.as_u64() {
+                    *v = json!(n + offset);
+                }
+            }
+            Value::Object(o) => match o.get_mut("@value") {
+                Some(Value::Number(n)) => {
+                    if let Some(n) = n.as_u64() {
+                        o.insert("@value".into(), json!(n + offset));
+                    }
+                }
+                Some(Value::String(s)) => {
+                    if let Ok(n) = s.parse::<u64>() {
+                        *s = (n + offset).to_string();
+                    }
+                }
+                _ => {}
+            },
+            Value::Array(a) => a.iter_mut().for_each(|v| shift(v, offset)),
+            _ => {}
+        }
+    }
+    match value {
+        Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                if k == "@context" {
+                    continue;
+                }
+                let iri = key_iri(k, ctx);
+                if iri == BEGIN || iri == END {
+                    shift(v, offset);
+                } else {
+                    shift_offsets(v, ctx, offset);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|v| shift_offsets(v, ctx, offset)),
+        _ => {}
+    }
+}
+
+/// A fact one of the answer's claims annotates.
+struct Annotated {
+    graph: Option<String>,
+    subject: String,
+    key: String,
+    value: Value,
+    reifier: String,
+}
+
+/// The answer as RDF: every graph, each claim's annotation as a reifier
+/// attachment to its fact, and the commit metadata in [`TXN_META_GRAPH`].
+fn to_dataset(doc: &Value, raw_context: &Value, ctx: &ParsedContext) -> Result<Dataset> {
+    let bad = |e: String| DocError::Model(format!("the reader's answer: {e}"));
+    let mut body = doc.clone();
+    let meta = body
+        .as_object_mut()
+        .and_then(|o| o.remove("txn-meta"))
+        .unwrap_or_else(|| json!({}));
+    let mut annotated = Vec::new();
+    if let Some(items) = body.get_mut("@graph").and_then(Value::as_array_mut) {
+        split_graph(items, None, ctx, &mut annotated);
+    }
+
+    let expanded = fluree_graph_json_ld::expand(&body).map_err(|e| bad(e.to_string()))?;
     let items = match expanded {
         Value::Array(items) => items,
         Value::Object(o) => match o.get("@graph") {
             Some(Value::Array(g)) if !o.contains_key("@id") => g.clone(),
             _ => vec![Value::Object(o)],
         },
-        _ => {
-            return Err(DocError::Model(
-                "reading: expected a JSON-LD dataset".into(),
-            ))
-        }
+        _ => Vec::new(),
     };
-    // Graphs other than the echoed document, and default-graph nodes other
-    // than the document node.
-    let mut nodes = Vec::new();
+    let mut dataset = Dataset::new();
+    let mut default_nodes = Vec::new();
     for item in items {
-        let id = item.get("@id").and_then(Value::as_str);
-        match item.get("@graph") {
-            Some(Value::Array(graph)) => {
-                if id != Some(frame.doc_iri) {
-                    nodes.extend(graph.iter().cloned());
-                }
+        match (item.get("@id").and_then(Value::as_str), item.get("@graph")) {
+            (Some(name), Some(Value::Array(nodes))) => {
+                let graph = to_graph(nodes).map_err(bad)?;
+                let target = dataset.graph_mut(Some(&Term::iri(name)));
+                merge(target, graph);
             }
-            _ if id == Some(frame.doc_iri) => {}
-            _ => nodes.push(item),
+            _ => default_nodes.push(item),
         }
     }
+    merge(&mut dataset.default, to_graph(&default_nodes).map_err(bad)?);
 
-    let rdf_type = format!("{RDF_NS}type");
-    let statement = format!("{RDF_NS}Statement");
-    let mut out = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let Value::Object(node) = node else { continue };
-        out.push(rewrite_node(node, frame, vocabulary, &rdf_type));
-    }
-
-    // Triples the reading asserts with an IRI object, for `doc:asserted`.
-    let mut asserted = BTreeSet::new();
-    for node in &out {
-        let Some(s) = node.get("@id").and_then(Value::as_str) else {
+    for a in annotated {
+        let mini = json!({ "@context": raw_context, "@id": a.subject, a.key: a.value });
+        let expanded = fluree_graph_json_ld::expand(&mini).map_err(|e| bad(e.to_string()))?;
+        let graph = to_graph(&as_array(expanded)).map_err(bad)?;
+        let Some(t) = graph.iter().next() else {
             continue;
         };
-        for (p, values) in node.as_object().into_iter().flatten() {
-            if p.starts_with('@') {
-                continue;
-            }
-            for v in values.as_array().into_iter().flatten() {
-                if let Some(o) = v.get("@id").and_then(Value::as_str) {
-                    asserted.insert((s.to_string(), p.clone(), o.to_string()));
-                }
-            }
+        let reifier = Term::iri(fluree_graph_json_ld::expand_iri_with_vocab(
+            &a.reifier, ctx, false,
+        ));
+        let name = a.graph.as_deref().map(Term::iri);
+        dataset.graph_mut(name.as_ref()).add_reification(
+            t.subject().clone(),
+            t.predicate().clone(),
+            t.object().clone(),
+            reifier,
+        );
+    }
+
+    if let Value::Object(mut meta) = meta {
+        meta.insert("@id".into(), json!(COMMIT_THIS));
+        meta.insert("@context".into(), raw_context.clone());
+        let expanded =
+            fluree_graph_json_ld::expand(&Value::Object(meta)).map_err(|e| bad(e.to_string()))?;
+        let graph = to_graph(&as_array(expanded)).map_err(bad)?;
+        if !graph.is_empty() {
+            merge(dataset.graph_mut(Some(&Term::iri(TXN_META_GRAPH))), graph);
         }
     }
-    let relation = format!("{DOC_NS}Relation");
-    let mut reading = Reading::default();
-    for node in &mut out {
-        let types = types(node);
-        if types.contains(&statement) || types.contains(&relation) {
-            if !types.contains(&relation) {
-                push_type(node, &relation);
-            }
-            let first_iri = |p: &str| {
-                node.get(p)
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                    .and_then(|v| v.get("@id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            };
-            let triple = (
-                first_iri(&format!("{RDF_NS}subject")),
-                first_iri(&format!("{RDF_NS}predicate")),
-                first_iri(&format!("{RDF_NS}object")),
-            );
-            if let (Some(s), Some(p), Some(o)) = triple {
-                if asserted.contains(&(s, p, o)) {
-                    node[format!("{DOC_NS}asserted")] = json!([{ "@value": true }]);
-                }
-            }
-            reading.relations += 1;
-        }
-        if is_occurrence(node) {
-            reading.mentions += 1;
-        }
-        if types.contains(&format!("{DOC_NS}Entity")) {
-            reading.entities += 1;
-        }
-    }
-    let entity_p = format!("{NIF_NS}entity");
-    let minted: BTreeSet<&str> = out
-        .iter()
-        .filter(|n| types(n).contains(&format!("{DOC_NS}Entity")))
-        .filter_map(|n| n.get("@id").and_then(Value::as_str))
-        .collect();
-    reading.linked = out
-        .iter()
-        .filter_map(|n| n.get(&entity_p).and_then(Value::as_array))
-        .flatten()
-        .filter_map(|v| v.get("@id").and_then(Value::as_str))
-        .filter(|iri| !minted.contains(iri))
-        .map(str::to_string)
-        .collect();
-    reading.nodes = out;
-    Ok(reading)
+    Ok(dataset)
 }
 
-fn rewrite_node(
-    node: Map<String, Value>,
-    frame: &Frame<'_>,
-    vocabulary: Option<&Vocabulary>,
-    rdf_type: &str,
-) -> Value {
-    let iri = |s: &str| -> String {
-        let local = scope_iri(s, frame);
-        match vocabulary {
-            Some(v) => v.translate(&local).into_owned(),
-            None => local,
-        }
-    };
-    let mut out = Map::new();
-    let mut types: Vec<Value> = Vec::new();
-    for (key, value) in node {
-        match key.as_str() {
-            "@id" => {
-                let id = value.as_str().map(&iri).map(Value::String).unwrap_or(value);
-                out.insert(key, id);
-            }
-            "@type" => {
-                for t in value
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_else(|| vec![value.clone()])
-                {
-                    if let Some(t) = t.as_str() {
-                        types.push(Value::String(iri(t)));
-                    }
-                }
-            }
-            _ => {
-                let predicate = iri(&key);
-                let shifted = predicate == BEGIN || predicate == END;
-                let values: Vec<Value> = value
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_else(|| vec![value.clone()])
-                    .into_iter()
-                    .map(|v| rewrite_value(v, &iri, shifted.then_some(frame.offset)))
-                    .collect();
-                // `rdf:type` written as a predicate is folded into `@type`.
-                if predicate == rdf_type {
-                    types.extend(values.iter().filter_map(|v| v.get("@id").cloned()));
-                    continue;
-                }
-                match out.get_mut(&predicate) {
-                    Some(Value::Array(existing)) => existing.extend(values),
-                    _ => {
-                        out.insert(predicate, Value::Array(values));
-                    }
-                }
-            }
-        }
-    }
-    if !types.is_empty() {
-        out.insert("@type".into(), Value::Array(types));
-    }
-    let source = format!("{DOC_NS}sourceDocument");
-    out.entry(source)
-        .or_insert_with(|| json!([{ "@id": frame.doc_iri }]));
-    Value::Object(out)
-}
-
-fn rewrite_value(value: Value, iri: &dyn Fn(&str) -> String, shift: Option<usize>) -> Value {
-    let Value::Object(mut v) = value else {
-        return value;
-    };
-    if let Some(Value::String(id)) = v.get("@id") {
-        let id = iri(id);
-        v.insert("@id".into(), Value::String(id));
-        return Value::Object(v);
-    }
-    if let Some(Value::String(dt)) = v.get("@type") {
-        let dt = iri(dt);
-        v.insert("@type".into(), Value::String(dt));
-    }
-    if let Some(offset) = shift.filter(|&o| o > 0) {
-        let n = match v.get("@value") {
-            Some(Value::Number(n)) => n.as_u64(),
-            Some(Value::String(s)) => s.parse().ok(),
-            _ => None,
-        };
-        if let Some(n) = n {
-            v.insert("@value".into(), json!(n + offset as u64));
-            v.insert("@type".into(), json!(format!("{XSD_NS}integer")));
-        }
-    }
-    Value::Object(v)
-}
-
-/// An IRI the reader minted under the document (`<doc>/…`, `<doc>#…`) is
-/// moved under the part it came from when the document took several calls;
-/// every other IRI (catalog records, the ontology, the structure graph's own
-/// `<doc>-element-N`) is left alone.
-fn scope_iri(iri: &str, frame: &Frame<'_>) -> String {
-    if frame.parts <= 1 {
-        return iri.to_string();
-    }
-    match iri.strip_prefix(frame.doc_iri) {
-        Some(rest) if rest.starts_with('/') || rest.starts_with('#') => {
-            format!("{}/part-{}{rest}", frame.doc_iri, frame.part + 1)
-        }
-        _ => iri.to_string(),
-    }
-}
-
-fn has_context(v: &Value) -> bool {
+fn as_array(v: Value) -> Vec<Value> {
     match v {
-        Value::Object(o) => o.contains_key("@context"),
-        Value::Array(a) => a.iter().any(has_context),
-        _ => false,
+        Value::Array(a) => a,
+        v => vec![v],
     }
 }
 
-/// `--relations` applied to a reading. `Direct` keeps it whole; `Reified`
-/// keeps each `doc:Relation` but takes away the edges the reading asserted
-/// for them (and their `doc:asserted`, which records that an edge was
-/// written); `Off` takes away the relations and those edges both. Returns
-/// how many relations remain.
-pub fn apply_relations(nodes: &mut Vec<Value>, mode: crate::extract::RelationMode) -> usize {
-    use crate::extract::RelationMode;
-    let relation = format!("{DOC_NS}Relation");
-    let asserted_p = format!("{DOC_NS}asserted");
-    let is_relation = |n: &Value| types(n).contains(&relation);
-    if mode == RelationMode::Direct {
-        return nodes.iter().filter(|n| is_relation(n)).count();
+fn merge(into: &mut Graph, from: Graph) {
+    for r in from.reifications() {
+        into.add_reification(
+            r.triple.subject().clone(),
+            r.triple.predicate().clone(),
+            r.triple.object().clone(),
+            r.reifier.clone(),
+        );
     }
-    let first_iri = |n: &Value, p: &str| {
-        n.get(format!("{RDF_NS}{p}"))
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(|v| v.get("@id"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
-    // The edges the reading asserted for its relations.
-    let edges: BTreeSet<(String, String, String)> = nodes
-        .iter()
-        .filter(|n| is_relation(n) && n.get(&asserted_p).is_some())
-        .filter_map(|n| {
-            Some((
-                first_iri(n, "subject")?,
-                first_iri(n, "predicate")?,
-                first_iri(n, "object")?,
-            ))
-        })
-        .collect();
-    for node in nodes.iter_mut() {
-        let Some(s) = node.get("@id").and_then(Value::as_str).map(str::to_string) else {
-            continue;
-        };
-        let Some(map) = node.as_object_mut() else {
-            continue;
-        };
-        let predicates: Vec<String> = map
-            .keys()
-            .filter(|k| !k.starts_with('@'))
-            .cloned()
-            .collect();
-        for p in predicates {
-            if let Some(Value::Array(values)) = map.get_mut(&p) {
-                values.retain(|v| {
-                    let o = v.get("@id").and_then(Value::as_str).unwrap_or_default();
-                    !edges.contains(&(s.clone(), p.clone(), o.to_string()))
-                });
-                if values.is_empty() {
-                    map.remove(&p);
-                }
-            }
-        }
-        map.remove(&asserted_p);
-    }
-    if mode == RelationMode::Off {
-        nodes.retain(|n| !is_relation(n));
-    }
-    nodes.iter().filter(|n| is_relation(n)).count()
-}
-
-/// Whether a node is a mention: typed `doc:Mention`, or any NIF string
-/// (`nif:RFC5147String`, `nif:String`, `nif:Phrase`, `nif:Word`) carrying
-/// `nif:beginIndex`, which is how a reader marks a span of the text
-/// whatever else it calls it. Counted and given `doc:sourceElement` the
-/// same way, so a reading in a reader's own terms still says what it found.
-pub fn is_occurrence(node: &Value) -> bool {
-    let types = types(node);
-    if types.iter().any(|t| t == &format!("{DOC_NS}Mention")) {
-        return true;
-    }
-    let nif_string = ["RFC5147String", "String", "Phrase", "Word"]
-        .iter()
-        .any(|local| types.iter().any(|t| *t == format!("{NIF_NS}{local}")));
-    nif_string && node.get(format!("{NIF_NS}beginIndex")).is_some()
-}
-
-fn types(node: &Value) -> Vec<String> {
-    node.get("@type")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn push_type(node: &mut Value, t: &str) {
-    match node.get_mut("@type") {
-        Some(Value::Array(a)) => a.push(Value::String(t.to_string())),
-        _ => node["@type"] = json!([t]),
+    for t in from.iter() {
+        into.add(t.clone());
     }
 }
 
-/// A reading (expanded JSON-LD nodes) as a graph, for printing it as
-/// Turtle or TriG.
-pub fn to_graph(nodes: &[Value]) -> Result<fluree_graph_ir::Graph> {
-    let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+fn to_graph(nodes: &[Value]) -> std::result::Result<Graph, String> {
+    let mut sink = GraphCollectorSink::new();
     fluree_graph_json_ld::adapter::to_graph_events(&Value::Array(nodes.to_vec()), &mut sink)
-        .map_err(|e| DocError::Model(format!("reading: {e}")))?;
+        .map_err(|e| e.to_string())?;
     let mut graph = sink.into_graph();
     super::request::retype_native_literals(&mut graph);
     Ok(graph)
 }
 
-/// The prefixes a printed reading is written with: this pipeline's own.
-pub fn prefixes() -> fluree_graph_format::PrefixMap {
-    fluree_graph_format::PrefixMap::from_context(&crate::vocab::context())
-}
-
-/// The reading as Turtle.
-pub fn turtle(nodes: &[Value]) -> Result<String> {
-    let graph = to_graph(nodes)?;
-    fluree_graph_format::format_turtle(&graph, &prefixes())
-        .map_err(|e| DocError::Model(format!("reading: {e}")))
-}
-
-/// The structure graph and the reading as TriG, each in its own named
-/// graph: `<doc>` and `<doc>/reading`.
-pub fn trig(doc_iri: &str, structure: &fluree_graph_ir::Graph, nodes: &[Value]) -> Result<String> {
-    let mut dataset = fluree_graph_ir::Dataset::new();
-    let doc = fluree_graph_ir::Term::iri(doc_iri);
-    for t in structure.iter() {
-        dataset.graph_mut(Some(&doc)).add(t.clone());
+/// Take each `@annotation` off the values in `items` (one graph's nodes, or
+/// the top level with its named graphs), keeping the annotation as a node
+/// of that graph and a record of the fact it annotates.
+fn split_graph(
+    items: &mut Vec<Value>,
+    graph: Option<String>,
+    ctx: &ParsedContext,
+    out: &mut Vec<Annotated>,
+) {
+    let mut added = Vec::new();
+    for item in items.iter_mut() {
+        let Value::Object(node) = item else { continue };
+        if node.contains_key("@graph") {
+            let name = node
+                .get("@id")
+                .or_else(|| node.get(&ctx.id_key))
+                .and_then(Value::as_str)
+                .map(|s| fluree_graph_json_ld::expand_iri_with_vocab(s, ctx, false));
+            if let Some(Value::Array(inner)) = node.get_mut("@graph") {
+                split_graph(inner, name, ctx, out);
+            }
+            continue;
+        }
+        split_node(node, &graph, ctx, out, &mut added);
     }
-    let reading = fluree_graph_ir::Term::iri(format!("{doc_iri}/reading"));
-    for t in to_graph(nodes)?.iter() {
-        dataset.graph_mut(Some(&reading)).add(t.clone());
-    }
-    fluree_graph_format::format_trig(&dataset, &prefixes())
-        .map_err(|e| DocError::Model(format!("reading: {e}")))
+    items.extend(added);
 }
 
-/// Offsets in a reading, for tests and for `doc read`: every `nif:beginIndex`
-/// in the nodes.
-pub fn begin_offsets(nodes: &[Value]) -> Vec<u64> {
-    let key = format!("{NIF_NS}beginIndex");
-    nodes
-        .iter()
-        .filter_map(|n| n.get(&key))
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|v| v.get("@value"))
-        .filter_map(|v| {
-            v.as_u64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .collect()
+fn split_node(
+    node: &mut Map<String, Value>,
+    graph: &Option<String>,
+    ctx: &ParsedContext,
+    out: &mut Vec<Annotated>,
+    added: &mut Vec<Value>,
+) {
+    let subject = node
+        .get("@id")
+        .or_else(|| node.get(&ctx.id_key))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    for (key, values) in node.iter_mut() {
+        if key.starts_with('@') || *key == ctx.id_key || *key == ctx.type_key {
+            continue;
+        }
+        let list: Vec<&mut Value> = match values {
+            Value::Array(a) => a.iter_mut().collect(),
+            v => vec![v],
+        };
+        for value in list {
+            let Value::Object(v) = value else { continue };
+            if let Some(annotation) = v.remove("@annotation") {
+                let reifier = annotation
+                    .get("@id")
+                    .or_else(|| annotation.get(&ctx.id_key))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let (Some(subject), Some(reifier)) = (&subject, reifier) {
+                    out.push(Annotated {
+                        graph: graph.clone(),
+                        subject: subject.clone(),
+                        key: key.clone(),
+                        value: Value::Object(v.clone()),
+                        reifier,
+                    });
+                }
+                if annotation.is_object() {
+                    added.push(annotation);
+                }
+            } else if !v.contains_key("@value") {
+                // An embedded node: its own values may be annotated too.
+                split_node(v, graph, ctx, out, added);
+            }
+        }
+    }
+}
+
+/// The answer's prefixes: its context's namespaces, and `fluree:` for the
+/// commit metadata.
+fn prefixes_of(raw_context: &Value) -> BTreeMap<String, String> {
+    let absolute =
+        |s: &str| s.starts_with("http://") || s.starts_with("https://") || s.starts_with("urn:");
+    let mut out = BTreeMap::new();
+    if let Some(ctx) = raw_context.as_object() {
+        for (k, v) in ctx {
+            if k.starts_with('@') {
+                continue;
+            }
+            let ns = match v {
+                Value::String(s) if absolute(s) => Some(s.clone()),
+                Value::Object(o) if o.get("@prefix") == Some(&Value::Bool(true)) => o
+                    .get("@id")
+                    .and_then(Value::as_str)
+                    .filter(|s| absolute(s))
+                    .map(str::to_string),
+                _ => None,
+            };
+            if let Some(ns) = ns {
+                out.insert(k.clone(), ns);
+            }
+        }
+    }
+    out.entry("fluree".into())
+        .or_insert_with(|| FLUREE_NS.to_string());
+    out
+}
+
+impl Reading {
+    /// Read the mentions, claims and counts out of the dataset.
+    fn index(&mut self) {
+        let xt = |local: &str| format!("{XT_NS}{local}");
+        let rdf_type = format!("{RDF_NS}type");
+        let meta = Term::iri(TXN_META_GRAPH);
+        let mut props: HashMap<String, Vec<(String, Term)>> = HashMap::new();
+        let mut asserted: HashMap<String, (Term, Term, Term)> = HashMap::new();
+        for (name, graph) in self.dataset.graphs() {
+            if name == Some(&meta) {
+                if self.run.is_none() {
+                    self.run = graph
+                        .iter()
+                        .find(|t| t.predicate().as_iri() == Some(&xt("run")))
+                        .and_then(|t| t.object().as_iri())
+                        .map(str::to_string);
+                }
+                continue;
+            }
+            for t in graph.iter() {
+                let Some(s) = subject_key(t.subject()) else {
+                    continue;
+                };
+                let p = t.predicate().as_iri().unwrap_or_default().to_string();
+                props.entry(s).or_default().push((p, t.object().clone()));
+            }
+            for r in graph.reifications() {
+                if let Some(id) = subject_key(&r.reifier) {
+                    asserted.insert(
+                        id,
+                        (
+                            r.triple.subject().clone(),
+                            r.triple.predicate().clone(),
+                            r.triple.object().clone(),
+                        ),
+                    );
+                }
+            }
+        }
+        let types = |s: &str| -> Vec<&str> {
+            props
+                .get(s)
+                .into_iter()
+                .flatten()
+                .filter(|(p, _)| *p == rdf_type)
+                .filter_map(|(_, o)| o.as_iri())
+                .collect()
+        };
+        let first = |s: &str, p: &str| -> Option<&Term> {
+            props.get(s)?.iter().find(|(q, _)| q == p).map(|(_, o)| o)
+        };
+        let iri = |s: &str, p: &str| first(s, p).and_then(Term::as_iri).map(str::to_string);
+        let number = |s: &str, p: &str| -> Option<f64> {
+            let (v, _, _) = first(s, p)?.as_literal()?;
+            match v {
+                LiteralValue::Double(d) => Some(*d),
+                LiteralValue::Integer(i) => Some(*i as f64),
+                other => other.as_str().and_then(|s| s.parse().ok()),
+            }
+        };
+        let offset = |s: &str, p: &str| -> Option<usize> {
+            let (v, _, _) = first(s, p)?.as_literal()?;
+            match v {
+                LiteralValue::Integer(i) => usize::try_from(*i).ok(),
+                other => other.as_str().and_then(|s| s.parse().ok()),
+            }
+        };
+
+        let mut subjects: Vec<&String> = props.keys().collect();
+        subjects.sort();
+        let claim_types = [xt("Claim"), format!("{RDF_NS}Statement")];
+        let mut claim_nodes = BTreeSet::new();
+        for s in subjects {
+            let ts = types(s);
+            if ts.contains(&xt("Occurrence").as_str()) {
+                let (entity, new_entity) = match iri(s, &xt("entity")) {
+                    Some(e) => (Some(e), false),
+                    None => (iri(s, &xt("localEntity")), true),
+                };
+                let entity_is_some = entity.is_some();
+                self.mentions.push(Mention {
+                    id: s.clone(),
+                    text: first(s, &format!("{NIF_NS}anchorOf"))
+                        .and_then(Term::as_literal)
+                        .map(|(v, _, _)| v.lexical()),
+                    begin: offset(s, BEGIN),
+                    end: offset(s, END),
+                    class: iri(s, &xt("occurrenceClass")),
+                    entity,
+                    new_entity: new_entity && entity_is_some,
+                    confidence: number(s, &xt("linkConfidence"))
+                        .or_else(|| number(s, &xt("score"))),
+                    element: None,
+                });
+            }
+            if ts.contains(&xt("LocalEntity").as_str()) {
+                self.new_entities.insert(s.clone());
+            }
+            if ts.iter().any(|t| claim_types.iter().any(|c| c == t)) {
+                claim_nodes.insert(s.clone());
+            }
+            if ts.contains(&xt("Claim").as_str()) {
+                let triple = asserted.get(s);
+                let (subject, predicate, object) = match triple {
+                    Some((s, p, o)) => (
+                        s.as_iri().map(str::to_string),
+                        p.as_iri().map(str::to_string),
+                        Some(o.clone()),
+                    ),
+                    None => (
+                        iri(s, &format!("{RDF_NS}subject")),
+                        iri(s, &format!("{RDF_NS}predicate")),
+                        first(s, &format!("{RDF_NS}object")).cloned(),
+                    ),
+                };
+                self.claims.push(Claim {
+                    id: s.clone(),
+                    subject,
+                    predicate,
+                    object,
+                    status: iri(s, &xt("assertionStatus")),
+                    accepted: first(s, &xt("accepted"))
+                        .and_then(Term::as_literal)
+                        .and_then(|(v, _, _)| v.as_bool()),
+                    score: number(s, &xt("score")),
+                    asserted: triple.is_some(),
+                });
+            }
+        }
+        self.mentions.sort_by_key(|m| (m.begin, m.end));
+        for m in &self.mentions {
+            match (&m.entity, m.new_entity) {
+                (Some(e), true) => {
+                    self.new_entities.insert(e.clone());
+                }
+                (Some(e), false) => {
+                    self.linked.insert(e.clone());
+                }
+                _ => {}
+            }
+        }
+        for t in self.dataset.default.iter() {
+            let Some(s) = subject_key(t.subject()) else {
+                continue;
+            };
+            if s.starts_with(NEW_ENTITY_PREFIX) {
+                self.new_entities.insert(s.clone());
+            }
+            if !claim_nodes.contains(&s) {
+                self.facts += 1;
+            }
+        }
+        // A catalog record is not new, whatever a mark says.
+        let linked = self.linked.clone();
+        self.new_entities.retain(|e| !linked.contains(e));
+    }
+
+    /// The prefixes the answer was written with.
+    pub fn prefix_map(&self) -> fluree_graph_format::PrefixMap {
+        fluree_graph_format::PrefixMap::from_map(self.prefixes.clone())
+    }
+
+    /// The transaction with every graph's content in the one named graph
+    /// `graph`, its commit metadata kept: what `doc ingest` commits, so a
+    /// re-read can replace the document's reading by clearing that graph.
+    /// The facts and the claims that annotate them move together, so each
+    /// annotation stays on its fact's edge.
+    pub fn in_graph(&self, graph: &str) -> Value {
+        let mut tx = self.transaction.clone();
+        let Some(o) = tx.as_object_mut() else {
+            return tx;
+        };
+        let items = match o.remove("@graph") {
+            Some(Value::Array(items)) => items,
+            Some(other) => vec![other],
+            None => Vec::new(),
+        };
+        let mut nodes = Vec::new();
+        for item in items {
+            match item {
+                Value::Object(mut named) if named.contains_key("@graph") => {
+                    match named.remove("@graph") {
+                        Some(Value::Array(inner)) => nodes.extend(inner),
+                        Some(other) => nodes.push(other),
+                        None => {}
+                    }
+                }
+                other => nodes.push(other),
+            }
+        }
+        o.insert("@graph".into(), json!([{ "@id": graph, "@graph": nodes }]));
+        tx
+    }
+}
+
+fn subject_key(t: &Term) -> Option<String> {
+    match t.as_iri() {
+        Some(iri) => Some(iri.to_string()),
+        None => t.as_blank().map(|b| format!("_:{}", b.as_str())),
+    }
+}
+
+/// Readings as TriG: each a transaction as it would be inserted, the commit
+/// metadata in `<#txn-meta>`, each claim behind a fact as `rdf:reifies`.
+/// Several calls' readings follow one another, each its own transaction.
+pub fn trig(readings: &[Reading]) -> Result<String> {
+    let mut out = String::new();
+    for (i, r) in readings.iter().enumerate() {
+        if readings.len() > 1 {
+            out.push_str(&format!(
+                "{}# call {} of {}: its own transaction{}\n",
+                if i > 0 { "\n" } else { "" },
+                i + 1,
+                readings.len(),
+                r.run
+                    .as_deref()
+                    .map(|run| format!(", run <{run}>"))
+                    .unwrap_or_default()
+            ));
+        }
+        out.push_str(
+            &fluree_graph_format::format_trig(&r.dataset, &r.prefix_map())
+                .map_err(|e| DocError::Model(format!("reading: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Readings as Turtle: every graph's statements together, without the
+/// commit metadata (Turtle has no graphs).
+pub fn turtle(readings: &[Reading]) -> Result<String> {
+    let meta = Term::iri(TXN_META_GRAPH);
+    let mut graph = Graph::new();
+    let mut prefixes = BTreeMap::new();
+    for r in readings {
+        for (name, g) in r.dataset.graphs() {
+            if name != Some(&meta) {
+                merge(&mut graph, g.clone());
+            }
+        }
+        prefixes.extend(r.prefixes.clone());
+    }
+    graph.canonicalize();
+    fluree_graph_format::format_turtle(&graph, &fluree_graph_format::PrefixMap::from_map(prefixes))
+        .map_err(|e| DocError::Model(format!("reading: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const EX: &str = "http://example.org/r#";
+    /// An answer recorded from the reader's service on 2026-11-10 for a
+    /// sample invoice, with `X-Fluree-Include: claims,mentions`: its IRIs
+    /// and release renamed to neutral ones, nothing else changed.
+    const INVOICE: &str = include_str!("../../tests/fixtures/reader/invoice-answer.jsonld");
+    const ENTITY: &str = "urn:fluree:entity:d64n9b-kstx8ha68g50ryhb";
+    const RUN: &str = "urn:fluree:run:01M72WJ0KYFWR6FJA8G14VBS1Y";
 
-    /// A reader's answer in a vocabulary of its own: the echoed document
-    /// graph, a reading graph with one occurrence linked to a catalog
-    /// record, a local entity and two reified claims, one with an IRI object.
-    fn answer() -> String {
-        json!([
-            { "@id": "urn:d", "@graph": [
-                { "@id": "urn:d", "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#isString": [{ "@value": "text" }] }
-            ]},
-            { "@id": "urn:d/reading", "@graph": [
-                { "@id": "urn:d/reading#o4-9",
-                  format!("{RDF_NS}type"): [{ "@id": format!("{EX}Occurrence") }],
-                  BEGIN: [{ "@type": format!("{XSD_NS}integer"), "@value": "4" }],
-                  END: [{ "@type": format!("{XSD_NS}integer"), "@value": "9" }],
-                  format!("{EX}refersTo"): [{ "@id": "urn:catalog:acme" }] },
-                { "@id": "urn:d/entity/1",
-                  format!("{RDF_NS}type"): [{ "@id": format!("{EX}LocalEntity") }],
-                  "urn:onto:supplier": [{ "@id": "urn:catalog:acme" }],
-                  "urn:onto:total": [{ "@value": "10" }] },
-                { "@id": "urn:d/reading#r-0",
-                  format!("{RDF_NS}type"): [{ "@id": format!("{RDF_NS}Statement") }],
-                  format!("{RDF_NS}subject"): [{ "@id": "urn:d/entity/1" }],
-                  format!("{RDF_NS}predicate"): [{ "@id": "urn:onto:supplier" }],
-                  format!("{RDF_NS}object"): [{ "@id": "urn:catalog:acme" }] },
-                { "@id": "urn:d/reading#r-1",
-                  format!("{RDF_NS}type"): [{ "@id": format!("{RDF_NS}Statement") }],
-                  format!("{RDF_NS}subject"): [{ "@id": "urn:d/entity/1" }],
-                  format!("{RDF_NS}predicate"): [{ "@id": "urn:onto:total" }],
-                  format!("{RDF_NS}object"): [{ "@value": "10" }] }
-            ]}
-        ])
-        .to_string()
-    }
-
-    fn node<'a>(r: &'a Reading, id: &str) -> &'a Value {
-        r.nodes
-            .iter()
-            .find(|n| n["@id"] == id)
-            .unwrap_or_else(|| panic!("no node {id} in {:#?}", r.nodes))
-    }
-
-    #[test]
-    fn the_echo_is_dropped_and_every_node_is_stamped() {
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&answer(), &frame, None).unwrap();
-        assert_eq!(r.nodes.len(), 4, "{:#?}", r.nodes);
-        for n in &r.nodes {
-            assert_eq!(n[format!("{DOC_NS}sourceDocument")][0]["@id"], "urn:d");
+    fn frame(offset: usize) -> Frame<'static> {
+        Frame {
+            doc_iri: "urn:example:api:invoice",
+            offset,
         }
-        // `rdf:type` as a predicate became `@type`.
+    }
+
+    #[test]
+    fn a_recorded_answer_reads_as_facts_claims_and_mentions() {
+        let r = read_answer(INVOICE, &frame(0)).unwrap();
+        assert_eq!(r.run.as_deref(), Some(RUN));
+        assert_eq!(r.mentions.len(), 6);
+        let daxin = r
+            .mentions
+            .iter()
+            .find(|m| m.text.as_deref() == Some("Daxin Scientific Supply Co., Ltd."))
+            .unwrap();
+        assert_eq!((daxin.begin, daxin.end), (Some(46), Some(79)));
+        assert_eq!(daxin.entity.as_deref(), Some("urn:example:check:org/daxin"));
+        assert!(!daxin.new_entity);
+        assert!(daxin.confidence.unwrap() > 0.99);
         assert_eq!(
-            node(&r, "urn:d/reading#o4-9")["@type"][0],
-            format!("{EX}Occurrence")
+            daxin.class.as_deref(),
+            Some("urn:example:check:Organization")
+        );
+        let number = r.mentions.iter().find(|m| m.begin == Some(22)).unwrap();
+        assert_eq!(number.entity.as_deref(), Some(ENTITY));
+        assert!(number.new_entity);
+
+        assert_eq!(r.claims.len(), 2);
+        assert!(r.claims.iter().all(|c| c.asserted
+            && c.accepted == Some(true)
+            && c.status.as_deref() == Some("https://ns.flur.ee/extract#affirmed")));
+        let supplier = r
+            .claims
+            .iter()
+            .find(|c| c.predicate.as_deref() == Some("urn:example:check:supplier"))
+            .unwrap();
+        assert_eq!(supplier.subject.as_deref(), Some(ENTITY));
+        assert_eq!(
+            supplier.object.as_ref().and_then(Term::as_iri),
+            Some("urn:example:check:org/daxin")
+        );
+        let total = r
+            .claims
+            .iter()
+            .find(|c| c.predicate.as_deref() == Some("urn:example:check:total"))
+            .unwrap();
+        assert_eq!(
+            total
+                .object
+                .as_ref()
+                .and_then(Term::as_literal)
+                .map(|(v, _, _)| v.lexical()),
+            Some("5170".to_string())
+        );
+
+        // The invoice's type, label, supplier and total.
+        assert_eq!(r.facts, 4);
+        assert_eq!(r.new_entities, BTreeSet::from([ENTITY.to_string()]));
+        assert_eq!(
+            r.linked,
+            BTreeSet::from(["urn:example:check:org/daxin".to_string()])
         );
     }
 
     #[test]
-    fn a_statement_is_a_relation_asserted_only_with_an_iri_object() {
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&answer(), &frame, None).unwrap();
-        assert_eq!(r.relations, 2);
-        let asserted = format!("{DOC_NS}asserted");
-        let r0 = node(&r, "urn:d/reading#r-0");
-        assert!(types(r0).contains(&format!("{DOC_NS}Relation")));
-        assert_eq!(r0[&asserted][0]["@value"], true);
-        assert!(node(&r, "urn:d/reading#r-1").get(&asserted).is_none());
+    fn a_later_part_moves_every_offset_into_the_documents_text() {
+        let r = read_answer(INVOICE, &frame(1000)).unwrap();
+        let daxin = r
+            .mentions
+            .iter()
+            .find(|m| m.entity.as_deref() == Some("urn:example:check:org/daxin"))
+            .unwrap();
+        assert_eq!((daxin.begin, daxin.end), (Some(1046), Some(1079)));
+        // In the transaction too, which is what is stored and printed.
+        let text = r.transaction.to_string();
+        assert!(text.contains("\"beginIndex\":1046"), "{text}");
+        assert!(!text.contains("\"beginIndex\":46,"), "{text}");
     }
 
     #[test]
-    fn a_later_part_moves_offsets_and_keeps_its_minted_iris_apart() {
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 100,
-            part: 1,
-            parts: 2,
-        };
-        let r = read_answer(&answer(), &frame, None).unwrap();
-        let occ = node(&r, "urn:d/part-2/reading#o4-9");
-        assert_eq!(occ[BEGIN][0]["@value"], 104);
-        assert_eq!(occ[END][0]["@value"], 109);
-        // The catalog link is untouched; the local entity moved with its part.
-        assert_eq!(occ[format!("{EX}refersTo")][0]["@id"], "urn:catalog:acme");
-        let r0 = node(&r, "urn:d/part-2/reading#r-0");
-        assert_eq!(
-            r0[format!("{RDF_NS}subject")][0]["@id"],
-            "urn:d/part-2/entity/1"
-        );
-        assert_eq!(r0[format!("{DOC_NS}asserted")][0]["@value"], true);
-    }
-
-    #[test]
-    fn a_vocabulary_translates_terms_and_namespaces_everywhere() {
-        static V: Vocabulary = Vocabulary {
-            terms: &[
-                (
-                    "http://example.org/r#Occurrence",
-                    "https://ns.flur.ee/doc#Mention",
-                ),
-                (
-                    "http://example.org/r#refersTo",
-                    "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#entity",
-                ),
-            ],
-            namespaces: &[("http://example.org/r#", "https://ns.flur.ee/doc#")],
-        };
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&answer(), &frame, Some(&V)).unwrap();
-        let occ = node(&r, "urn:d/reading#o4-9");
-        assert_eq!(occ["@type"][0], "https://ns.flur.ee/doc#Mention");
-        assert_eq!(occ[format!("{NIF_NS}entity")][0]["@id"], "urn:catalog:acme");
-        assert_eq!(
-            node(&r, "urn:d/entity/1")["@type"][0],
-            "https://ns.flur.ee/doc#LocalEntity"
-        );
-        assert_eq!(r.mentions, 1);
-    }
-
-    #[test]
-    fn a_nif_occurrence_in_a_readers_own_terms_counts_as_a_mention() {
-        let answer = json!([{ "@id": "urn:d/reading", "@graph": [
-            { "@id": "urn:d/reading#o1",
-              format!("{RDF_NS}type"): [{ "@id": format!("{EX}Occurrence") }, { "@id": format!("{NIF_NS}RFC5147String") }],
-              BEGIN: [{ "@value": 0 }], END: [{ "@value": 4 }] },
-            { "@id": "urn:d/reading#x",
-              format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }] }
-        ]}])
+    fn an_answer_in_another_layout_is_refused_by_name() {
+        // The earlier layout: the document graph echoed, no commit metadata.
+        let echo = json!([
+            { "@id": "urn:d", "@graph": [{ "@id": "urn:d", format!("{NIF_NS}isString"): [{ "@value": "text" }] }] },
+            { "@id": "urn:d/reading", "@graph": [] }
+        ])
         .to_string();
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&answer, &frame, None).unwrap();
-        // The second has no offsets: not a mention.
-        assert_eq!(r.mentions, 1);
-    }
-
-    #[test]
-    fn relations_off_or_reified_take_away_what_they_should() {
-        use crate::extract::RelationMode;
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let read = || read_answer(&answer(), &frame, None).unwrap().nodes;
-        let edge = |nodes: &[Value]| {
-            node_in(nodes, "urn:d/entity/1")
-                .get("urn:onto:supplier")
-                .is_some()
-        };
-        let mut direct = read();
-        assert_eq!(apply_relations(&mut direct, RelationMode::Direct), 2);
-        assert!(edge(&direct));
-
-        let mut reified = read();
-        assert_eq!(apply_relations(&mut reified, RelationMode::Reified), 2);
-        assert!(!edge(&reified), "the asserted edge goes");
-        assert!(reified
-            .iter()
-            .all(|n| n.get(format!("{DOC_NS}asserted")).is_none()));
-        // A literal value the reading states is not a relation's edge.
-        assert!(node_in(&reified, "urn:d/entity/1")
-            .get("urn:onto:total")
-            .is_some());
-
-        let mut off = read();
-        assert_eq!(apply_relations(&mut off, RelationMode::Off), 0);
-        assert!(!edge(&off));
-        assert!(off
-            .iter()
-            .all(|n| !types(n).contains(&format!("{DOC_NS}Relation"))));
-    }
-
-    fn node_in<'a>(nodes: &'a [Value], id: &str) -> &'a Value {
-        nodes.iter().find(|n| n["@id"] == id).unwrap()
-    }
-
-    #[test]
-    fn a_reading_prints_as_turtle_and_trig() {
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&answer(), &frame, None).unwrap();
-        let ttl = turtle(&r.nodes).unwrap();
+        let err = read_answer(&echo, &frame(0)).unwrap_err().to_string();
+        assert!(err.contains("response layout 2"), "{err}");
+        assert!(err.contains("earlier layout"), "{err}");
+        let other = INVOICE.replace(LAYOUT, "https://ns.flur.ee/extract/response/1");
+        let err = read_answer(&other, &frame(0)).unwrap_err().to_string();
         assert!(
-            ttl.contains("@prefix doc: <https://ns.flur.ee/doc#>"),
+            err.contains("names layout <https://ns.flur.ee/extract/response/1>"),
+            "{err}"
+        );
+        assert!(read_answer("not json", &frame(0)).is_err());
+    }
+
+    #[test]
+    fn the_transaction_in_one_graph_keeps_its_commit_metadata_and_annotations() {
+        let r = read_answer(INVOICE, &frame(0)).unwrap();
+        let tx = r.in_graph("urn:example:api:invoice/reading");
+        assert_eq!(tx["txn-meta"], r.transaction["txn-meta"]);
+        assert_eq!(tx["@context"], r.transaction["@context"]);
+        let graphs = tx["@graph"].as_array().unwrap();
+        assert_eq!(graphs.len(), 1);
+        assert_eq!(graphs[0]["@id"], "urn:example:api:invoice/reading");
+        let nodes = graphs[0]["@graph"].as_array().unwrap();
+        // The mentions graph's seven nodes and the invoice node.
+        assert_eq!(nodes.len(), 8);
+        let invoice = nodes
+            .iter()
+            .find(|n| n["id"] == ENTITY && n.get("label").is_some())
+            .unwrap();
+        assert_eq!(invoice["t:supplier"]["@annotation"]["@id"], "run:r-0");
+        // Read back, it is the same reading in another graph.
+        let again = read_answer(&tx.to_string(), &frame(0)).unwrap();
+        assert_eq!(again.claims, r.claims);
+        assert_eq!(again.mentions.len(), r.mentions.len());
+    }
+
+    #[test]
+    fn a_reading_prints_as_trig_with_its_commit_metadata_and_as_turtle() {
+        let r = read_answer(INVOICE, &frame(0)).unwrap();
+        let trig = trig(std::slice::from_ref(&r)).unwrap();
+        assert!(
+            trig.contains("@prefix xt: <https://ns.flur.ee/extract#>"),
+            "{trig}"
+        );
+        assert!(trig.contains("<#txn-meta>"), "{trig}");
+        assert!(trig.contains("fluree:commit:this"), "{trig}");
+        assert!(
+            trig.contains("rdf:reifies") || trig.contains(" ~ "),
+            "{trig}"
+        );
+        assert!(trig.contains("xt:mentions"), "{trig}");
+        assert!(
+            trig.contains("\"Daxin Scientific Supply Co., Ltd.\""),
+            "{trig}"
+        );
+        // Native JSON numbers stay numbers.
+        assert!(trig.contains("beginIndex 46"), "{trig}");
+        let ttl = turtle(std::slice::from_ref(&r)).unwrap();
+        assert!(!ttl.contains("txn-meta"), "{ttl}");
+        assert!(!ttl.contains("commit:this"), "{ttl}");
+        assert!(
+            ttl.contains("urn:example:check:org/daxin") || ttl.contains("c:daxin"),
             "{ttl}"
-        );
-        assert!(ttl.contains("doc:Relation"), "{ttl}");
-        let mut structure = fluree_graph_ir::Graph::new();
-        structure.add_triple(
-            fluree_graph_ir::Term::iri("urn:d-element-1"),
-            fluree_graph_ir::Term::iri(BEGIN),
-            fluree_graph_ir::Term::integer(0),
-        );
-        let trig = trig("urn:d", &structure, &r.nodes).unwrap();
-        // Each graph holds what it should, not just a header.
-        let block = |name: &str| {
-            let start = trig
-                .find(&format!("{name} {{"))
-                .unwrap_or_else(|| panic!("no {name} graph in {trig}"));
-            let rest = &trig[start..];
-            rest[..rest.find("\n}").unwrap_or(rest.len())].to_string()
-        };
-        let (doc, reading) = (block("<urn:d>"), block("<urn:d/reading>"));
-        assert!(doc.contains("urn:d-element-1"), "{trig}");
-        assert!(!doc.contains("o4-9"), "{trig}");
-        assert!(reading.contains("o4-9"), "{trig}");
-        assert!(!reading.contains("urn:d-element-1"), "{trig}");
-    }
-
-    #[test]
-    fn a_native_json_number_prints_as_a_number() {
-        let answer = json!([{ "@id": "urn:d/reading", "@graph": [{
-            "@id": "urn:d/reading#o0-4",
-            format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }],
-            BEGIN: [{ "@value": 31 }],
-            END: [{ "@value": 35 }],
-            format!("{EX}score"): [{ "@value": 0.5 }]
-        }]}])
-        .to_string();
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&answer, &frame, None).unwrap();
-        let ttl = turtle(&r.nodes).unwrap();
-        assert!(ttl.contains("beginIndex 31"), "{ttl}");
-        assert!(!ttl.contains("beginIndex \"31\""), "{ttl}");
-        assert!(!ttl.contains("\"0.5\""), "{ttl}");
-    }
-
-    #[test]
-    fn a_compacted_answer_is_expanded_first() {
-        let compact = json!({
-            "@context": { "ex": EX },
-            "@graph": [{ "@id": "urn:d/reading", "@graph": [{ "@id": "urn:d/reading#x", "@type": "ex:Occurrence" }] }]
-        })
-        .to_string();
-        let frame = Frame {
-            doc_iri: "urn:d",
-            offset: 0,
-            part: 0,
-            parts: 1,
-        };
-        let r = read_answer(&compact, &frame, None).unwrap();
-        assert_eq!(
-            node(&r, "urn:d/reading#x")["@type"][0],
-            format!("{EX}Occurrence")
         );
     }
 }

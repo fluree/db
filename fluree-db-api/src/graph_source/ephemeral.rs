@@ -38,7 +38,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use fluree_db_iceberg::catalog::{parse_table_identifier, SendCatalogClient};
-use fluree_db_iceberg::io::{ColumnBatch, SendIcebergStorage, SendParquetReader};
+use fluree_db_iceberg::io::{
+    ColumnBatch, FileIcebergStorage, IcebergStorageBackend, SendIcebergStorage, SendParquetReader,
+};
 use fluree_db_iceberg::metadata::TableMetadata;
 use fluree_db_iceberg::scan::{ScanConfig, SendScanPlanner};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
@@ -69,15 +71,30 @@ const PROVISIONAL_GS_ID: &str = "provisional:main";
 /// compiled mapping. Unlike the mock, the scan here reads **live** data driven by
 /// [`IcebergConnectionConfig`].
 pub(crate) struct EphemeralR2rmlProvider {
-    /// Iceberg connection (catalog mode + IO) the scan resolves storage from.
-    conn: IcebergConnectionConfig,
-    /// Catalog client, built once for the whole query so a multi-table join
-    /// does one OAuth exchange, not one per table.
-    catalog: Arc<dyn SendCatalogClient>,
+    /// Where the mapping's tables are loaded from.
+    tables: ProvisionalTables,
     /// The candidate mapping under test, returned to the operator verbatim.
     mapping: Arc<CompiledR2rmlMapping>,
-    /// The instance's identity context, which decides the tables' storage.
-    identity: fluree_db_iceberg::IdentityContext,
+}
+
+/// Where a provisional query loads its tables from.
+enum ProvisionalTables {
+    /// The connection's catalog: every query an embedder runs.
+    Catalog {
+        /// Iceberg connection (catalog mode + IO) the scan resolves storage from.
+        conn: Box<IcebergConnectionConfig>,
+        /// Catalog client, built once for the whole query so a multi-table join
+        /// does one OAuth exchange, not one per table.
+        client: Arc<dyn SendCatalogClient>,
+        /// The instance's identity context, which decides the tables' storage.
+        identity: fluree_db_iceberg::IdentityContext,
+    },
+    /// Local table directories by table name, read under
+    /// `FLUREE_ICEBERG_LOCAL_ROOTS` with no catalog. Only
+    /// [`crate::Fluree::query_provisional_r2rml_over_local_tables_for_test`]
+    /// builds it: a catalog may not place a table on this host's disk, so a
+    /// test could not otherwise reach this lane's scan over a local fixture.
+    Local(std::collections::HashMap<String, String>),
 }
 
 impl std::fmt::Debug for EphemeralR2rmlProvider {
@@ -96,26 +113,49 @@ impl EphemeralR2rmlProvider {
     /// `filters` from the operator are ignored (no pushdown): correctness is
     /// preserved by the in-engine FILTER, and the agent's targeted `LIMIT k`
     /// probes do not need file pruning. Adding pushdown later is a perf-only
-    /// extension.
+    /// extension. A map's own row filter (a restricted `rr:sqlQuery`) is not a
+    /// pushdown: nothing re-checks it, so it is enforced on every row exactly as
+    /// the persisted scan enforces it.
     async fn scan_provisional_table(
         &self,
         table_name: &str,
         projection: &[String],
         order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
-        // The engine passes the mapping's logical table name for every scan.
-        let table_id = parse_table_identifier(table_name).map_err(|e| {
-            QueryError::Internal(format!(
-                "Failed to parse table identifier '{table_name}': {e}"
-            ))
-        })?;
+        // The engine passes the mapping's logical table name for every scan: a
+        // table, or an `rr:sqlQuery` map's alias, which reads its FROM table
+        // narrowed by the query's conditions.
+        let logical = super::row_filter::LogicalScan::resolve(&self.mapping, table_name)
+            .map_err(QueryError::InvalidQuery)?;
+        let table_name = logical.table.as_str();
+        let (storage, metadata) = match &self.tables {
+            ProvisionalTables::Catalog {
+                conn,
+                client,
+                identity,
+            } => load_from_catalog(conn, client.as_ref(), identity, table_name).await?,
+            ProvisionalTables::Local(dirs) => load_local(dirs, table_name).await?,
+        };
+        scan_loaded_table(&logical, storage, &metadata, projection, order).await
+    }
+}
 
-        // Load table metadata via the shared catalog client.
-        let load = SendCatalogClient::load_table(
-            self.catalog.as_ref(),
-            &table_id,
-            self.conn.io.vended_credentials,
-        )
+/// Load `table_name` through the connection's catalog: its storage and table
+/// metadata.
+async fn load_from_catalog(
+    conn: &IcebergConnectionConfig,
+    catalog: &dyn SendCatalogClient,
+    identity: &fluree_db_iceberg::IdentityContext,
+    table_name: &str,
+) -> QueryResult<(IcebergStorageBackend, TableMetadata)> {
+    let table_id = parse_table_identifier(table_name).map_err(|e| {
+        QueryError::Internal(format!(
+            "Failed to parse table identifier '{table_name}': {e}"
+        ))
+    })?;
+
+    // Load table metadata via the shared catalog client.
+    let load = SendCatalogClient::load_table(catalog, &table_id, conn.io.vended_credentials)
         .await
         .map_err(|e| {
             crate::graph_source::iceberg_catalog::storage_query_error(
@@ -124,106 +164,171 @@ impl EphemeralR2rmlProvider {
             )
         })?;
 
-        // Build storage exactly as the preview/sample paths do: the source's
-        // storage decision under the instance's identity context.
-        let storage = build_preview_storage(&self.conn, &load, &self.identity)
-            .await
-            .map_err(|e| match e {
-                crate::ApiError::Query(typed) => typed,
-                other => QueryError::Internal(format!(
-                    "Failed to create storage for '{table_name}': {other}"
-                )),
+    // Build storage exactly as the preview/sample paths do: the source's
+    // storage decision under the instance's identity context.
+    let storage = build_preview_storage(conn, &load, identity)
+        .await
+        .map_err(|e| match e {
+            crate::ApiError::Query(typed) => typed,
+            other => QueryError::Internal(format!(
+                "Failed to create storage for '{table_name}': {other}"
+            )),
+        })?
+        .backend;
+
+    // Prefer the catalog's inline metadata (no extra round-trip); fall back to
+    // reading the metadata file from object storage when it is omitted.
+    let metadata: TableMetadata = match load.metadata {
+        Some(m) => m,
+        None => {
+            let bytes = storage.read(&load.metadata_location).await.map_err(|e| {
+                QueryError::Internal(format!(
+                    "Failed to read table metadata for '{table_name}': {e}"
+                ))
+            })?;
+            TableMetadata::from_json(&bytes).map_err(|e| {
+                QueryError::Internal(format!(
+                    "Failed to parse table metadata for '{table_name}': {e}"
+                ))
             })?
-            .backend;
-
-        // Prefer the catalog's inline metadata (no extra round-trip); fall back to
-        // reading the metadata file from object storage when it is omitted.
-        let metadata: TableMetadata = match load.metadata {
-            Some(m) => m,
-            None => {
-                let bytes = storage.read(&load.metadata_location).await.map_err(|e| {
-                    QueryError::Internal(format!(
-                        "Failed to read table metadata for '{table_name}': {e}"
-                    ))
-                })?;
-                TableMetadata::from_json(&bytes).map_err(|e| {
-                    QueryError::Internal(format!(
-                        "Failed to parse table metadata for '{table_name}': {e}"
-                    ))
-                })?
-            }
-        };
-
-        let schema = metadata.current_schema().ok_or_else(|| {
-            QueryError::Internal(format!("Table '{table_name}' has no current schema"))
-        })?;
-
-        // Resolve projected column names to field IDs (all non-nested columns when
-        // the projection is empty, matching the persisted scan default).
-        let projected_field_ids: Vec<i32> = if projection.is_empty() {
-            schema
-                .fields
-                .iter()
-                .filter(|f| !f.is_nested())
-                .map(|f| f.id)
-                .collect()
-        } else {
-            projection
-                .iter()
-                .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
-                .collect()
-        };
-        if projected_field_ids.is_empty() && !projection.is_empty() {
-            return Err(QueryError::InvalidQuery(format!(
-                "None of the projected columns {:?} exist in table '{table_name}'. Available: {:?}",
-                projection,
-                schema.field_names()
-            )));
         }
+    };
+    Ok((storage, metadata))
+}
 
-        // Plan a projected scan over the current snapshot. Scope the planner so its
-        // borrow of `storage`/`metadata` ends before `storage` is moved into the
-        // streaming closure below.
-        let tasks = {
-            let scan_config = ScanConfig::new().with_projection(projected_field_ids);
-            let planner = SendScanPlanner::new(&storage, &metadata, scan_config);
-            planner
-                .plan_scan()
-                .await
-                .map_err(|e| {
-                    QueryError::Internal(format!("Failed to plan scan for '{table_name}': {e}"))
-                })?
-                .tasks
-        };
+/// Load `table_name` from its local directory in `dirs`: the newest
+/// `metadata/*.metadata.json`, with file references remapped from the
+/// metadata's own `location` to that directory.
+pub(super) async fn load_local(
+    dirs: &std::collections::HashMap<String, String>,
+    table_name: &str,
+) -> QueryResult<(IcebergStorageBackend, TableMetadata)> {
+    let dir = dirs.get(table_name).ok_or_else(|| {
+        QueryError::InvalidQuery(format!("No local directory for table '{table_name}'"))
+    })?;
+    let dir = format!("file://{}", dir.trim_end_matches('/'));
+    let lister = FileIcebergStorage::new();
+    let metadata_file = SendIcebergStorage::list_files(&lister, &format!("{dir}/metadata"))
+        .await
+        .map_err(|e| QueryError::Internal(format!("Failed to list '{dir}/metadata': {e}")))?
+        .into_iter()
+        .filter(|name| name.ends_with(".metadata.json"))
+        .max()
+        .ok_or_else(|| QueryError::Internal(format!("No table metadata under '{dir}'")))?;
+    let bytes = SendIcebergStorage::read(&lister, &format!("{dir}/metadata/{metadata_file}"))
+        .await
+        .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
+    let metadata = TableMetadata::from_json(&bytes)
+        .map_err(|e| QueryError::Internal(format!("Failed to parse table metadata: {e}")))?;
+    let storage = IcebergStorageBackend::File(FileIcebergStorage::with_remap(
+        metadata.location.clone(),
+        dir,
+    ));
+    Ok((storage, metadata))
+}
 
-        if tasks.is_empty() {
-            return Ok(Box::pin(
-                futures::stream::empty::<QueryResult<ColumnBatch>>(),
-            ));
-        }
+/// Plan and stream a scan of a loaded table for `logical`: its projection, plus
+/// the row filter of an `rr:sqlQuery` map, typed against the table's current
+/// schema and enforced by the reader on every row.
+async fn scan_loaded_table(
+    logical: &super::row_filter::LogicalScan,
+    storage: IcebergStorageBackend,
+    metadata: &TableMetadata,
+    projection: &[String],
+    order: ScanOrder,
+) -> QueryResult<ColumnBatchStream> {
+    let table_name = logical.table.as_str();
+    let schema = metadata.current_schema().ok_or_else(|| {
+        QueryError::Internal(format!("Table '{table_name}' has no current schema"))
+    })?;
+    // The map's row filter, refused when the schema cannot decide it: the
+    // schema an unpinned read of the table reads, which registration and the
+    // validate dry-run check it against too.
+    let filter_schema = super::r2rml::unpinned_read_schema(metadata).ok_or_else(|| {
+        QueryError::Internal(format!("Table '{table_name}' has no current schema"))
+    })?;
+    let row_filter = logical
+        .row_filter(&filter_schema)
+        .map_err(|e| QueryError::InvalidQuery(e.message))?;
 
-        // Read data files with bounded parallelism, streaming each file's batches
-        // to the operator in the order the query owes, as the persisted scan does.
-        let storage = Arc::new(storage);
-        let concurrency = tasks.len().clamp(1, 8);
-        Ok(super::r2rml::read_files_in_order(
-            tasks,
-            super::r2rml::EmitOrder::for_query(order),
-            concurrency,
-            move |task| {
-                let storage = Arc::clone(&storage);
-                async move {
-                    let reader = SendParquetReader::new(storage.as_ref());
-                    reader.read_task(&task).await.map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read Parquet file '{}': {e}",
-                            task.data_file.file_path
-                        ))
-                    })
-                }
-            },
-        ))
+    // Resolve projected column names to field IDs (all non-nested columns when
+    // the projection is empty, matching the persisted scan default).
+    let mut projected_field_ids: Vec<i32> = if projection.is_empty() {
+        schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_nested())
+            .map(|f| f.id)
+            .collect()
+    } else {
+        projection
+            .iter()
+            .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
+            .collect()
+    };
+    if projected_field_ids.is_empty() && !projection.is_empty() {
+        return Err(QueryError::InvalidQuery(format!(
+            "None of the projected columns {:?} exist in table '{table_name}'. Available: {:?}",
+            projection,
+            schema.field_names()
+        )));
     }
+    // The reader enforces the row filter on decoded columns, so it decodes
+    // every column the filter tests, whether or not a term map reads it.
+    if let Some(filter) = &row_filter {
+        for id in filter.field_ids() {
+            if !projected_field_ids.contains(&id) {
+                projected_field_ids.push(id);
+            }
+        }
+    }
+
+    // Plan a projected scan over the current snapshot. Scope the planner so its
+    // borrow of `storage`/`metadata` ends before `storage` is moved into the
+    // streaming closure below.
+    let tasks = {
+        let scan_config = ScanConfig::new().with_projection(projected_field_ids);
+        let planner = SendScanPlanner::new(&storage, metadata, scan_config);
+        planner
+            .plan_scan()
+            .await
+            .map_err(|e| {
+                QueryError::Internal(format!("Failed to plan scan for '{table_name}': {e}"))
+            })?
+            .tasks
+    };
+    let tasks = match &row_filter {
+        Some(filter) => super::r2rml::narrow_to_row_filter(tasks, filter, schema),
+        None => tasks,
+    };
+
+    if tasks.is_empty() {
+        return Ok(Box::pin(
+            futures::stream::empty::<QueryResult<ColumnBatch>>(),
+        ));
+    }
+
+    // Read data files with bounded parallelism, streaming each file's batches
+    // to the operator in the order the query owes, as the persisted scan does.
+    let storage = Arc::new(storage);
+    let concurrency = tasks.len().clamp(1, 8);
+    Ok(super::r2rml::read_files_in_order(
+        tasks,
+        super::r2rml::EmitOrder::for_query(order),
+        concurrency,
+        move |task| {
+            let storage = Arc::clone(&storage);
+            async move {
+                let reader = SendParquetReader::new(storage.as_ref());
+                reader.read_task(&task).await.map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to read Parquet file '{}': {e}",
+                        task.data_file.file_path
+                    ))
+                })
+            }
+        },
+    ))
 }
 
 #[async_trait]
@@ -316,12 +421,44 @@ impl crate::Fluree {
             catalog_client(&conn, "provisional R2RML query", self.identity_context()).await?;
 
         let provider = EphemeralR2rmlProvider {
-            conn,
-            catalog,
+            tables: ProvisionalTables::Catalog {
+                conn: Box::new(conn),
+                client: catalog,
+                identity: self.identity_context().clone(),
+            },
             mapping: Arc::new(compiled),
-            identity: self.identity_context().clone(),
         };
+        self.run_provisional_query(provider, sparql).await
+    }
 
+    /// [`Self::query_provisional_r2rml`] over local table directories (by
+    /// table name) instead of a catalog, so a test can drive this lane's own
+    /// scan over a local fixture. Reads only under `FLUREE_ICEBERG_LOCAL_ROOTS`.
+    #[doc(hidden)]
+    pub async fn query_provisional_r2rml_over_local_tables_for_test(
+        &self,
+        tables: std::collections::HashMap<String, String>,
+        mapping_ttl: String,
+        sparql: String,
+    ) -> Result<crate::QueryResult> {
+        let compiled = R2rmlLoader::from_turtle(&mapping_ttl)
+            .and_then(R2rmlLoader::compile)
+            .map_err(|e| {
+                crate::ApiError::config(format!("Failed to compile provisional R2RML mapping: {e}"))
+            })?;
+        let provider = EphemeralR2rmlProvider {
+            tables: ProvisionalTables::Local(tables),
+            mapping: Arc::new(compiled),
+        };
+        self.run_provisional_query(provider, sparql).await
+    }
+
+    /// Run `sparql` over `provider`'s provisional mapping.
+    async fn run_provisional_query(
+        &self,
+        provider: EphemeralR2rmlProvider,
+        sparql: String,
+    ) -> Result<crate::QueryResult> {
         // A minimal genesis view tagged with the synthetic graph-source id, so
         // `maybe_wrap_for_graph_source` auto-wraps the query in
         // `GRAPH <provisional:main> { ... }` and the injected provider resolves it.

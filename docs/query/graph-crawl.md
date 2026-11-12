@@ -2,7 +2,7 @@
 
 Graph crawl enables recursive traversal of relationships — following links between entities to discover connected data. This is built on **property paths**, which provide operators for transitive, inverse, and multi-predicate traversal.
 
-> **Native ledgers only.** Everything on this page evaluates against a ledger's own indexes. A [graph source](../graph-sources/overview.md) — Iceberg/R2RML, BM25, or vector — has no native index, so quantified property paths (`+`, `*`, `?`), `shortestPath`, and subqueries are refused there with HTTP 400 `err:db/InvalidQuery` rather than answered. Fixed-length paths (`ex:knows`, `ex:knows/ex:name`) and unquantified `|` / `^` work against both. See [Query Patterns a Graph Source Cannot Evaluate](../graph-sources/overview.md#query-patterns-a-graph-source-cannot-evaluate) for the bounded-depth workaround and how to crawl a graph source by materializing it into a native ledger first.
+> **Native ledgers only.** Everything on this page evaluates against a ledger's own indexes. A [graph source](../graph-sources/overview.md) — Iceberg/R2RML, BM25, or vector — has no native index, so quantified property paths (`+`, `*`, `?`) and `shortestPath` are refused there with HTTP 400 `err:db/InvalidQuery` rather than answered. Fixed-length paths (`ex:knows`, `ex:knows/ex:name`) and unquantified `|` / `^` work against both, as do [sub-selects](../graph-sources/overview.md#sub-selects-over-a-graph-source). See [Query Patterns a Graph Source Cannot Evaluate](../graph-sources/overview.md#query-patterns-a-graph-source-cannot-evaluate) for the bounded-depth workaround and how to crawl a graph source by materializing it into a native ledger first.
 
 ## Overview
 
