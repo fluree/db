@@ -4455,8 +4455,12 @@ async fn test_proxy_peer_refuses_removed_history() {
     let changed = config(Some(tag.clone())).await.expect("config");
     assert_eq!(changed.status(), reqwest::StatusCode::OK);
     let tag = changed.headers()["etag"].to_str().unwrap().to_string();
-    let (status, json) = query("peerhist:main@t:1", "bob").await;
-    assert_eq!(status, StatusCode::GONE, "{json}");
+    // A peer learns of another process's removal in the background, at most
+    // once a second while it is queried.
+    eventually("the peer refuses the newly removed history", || async {
+        query("peerhist:main@t:1", "bob").await.0 == StatusCode::GONE
+    })
+    .await;
 
     // A partitioned replica still revalidates the journal it holds, with
     // no leader round trip.
