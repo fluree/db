@@ -39,7 +39,7 @@ pub(crate) enum Reads {
 pub(crate) fn reads_of(query: &Query, snapshot: &LedgerSnapshot) -> Reads {
     // Under the RDF list view a pattern over `rdf:first` reads the members
     // of every list, whichever predicate owns it.
-    if query.output.has_hydration() || query.rdf_list_view {
+    if query.output.has_hydration() || query.rdf_list_view || query.lowered_from_cypher() {
         return Reads::Everything;
     }
     let mut facts = Vec::new();

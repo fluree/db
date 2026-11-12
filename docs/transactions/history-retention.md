@@ -102,7 +102,7 @@ The removal is complete when the request returns: the journal records it and the
 After the removal:
 
 - Current queries no longer see the value, because it was retracted.
-- A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`. A read whose pattern has a different constant subject is still answered, as is one that never touches the predicate. This stays true after the occurrence's commit is [permanently erased](permanent-erasure.md), since the journal records the occurrence's subject itself.
+- A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`. A Cypher query, and a query under the RDF list view (`rdfLists`), reads properties its patterns do not name, so at an earlier point either is refused when any removal covers that point. A read whose pattern has a different constant subject is still answered, as is one that never touches the predicate. This stays true after the occurrence's commit is [permanently erased](permanent-erasure.md), since the journal records the occurrence's subject itself.
 - Other occurrences of the fact are unaffected. So is the same value asserted again later: that is a new occurrence.
 
 ## Search indexes and exports

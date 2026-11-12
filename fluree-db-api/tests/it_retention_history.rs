@@ -706,6 +706,76 @@ async fn a_rebase_brings_the_sources_removals() {
     ));
 }
 
+/// A Cypher query reads a node's properties where no pattern says so: in
+/// `properties(n)`, and in the nodes its typed results hydrate. At an
+/// earlier point a removal covers, it is refused.
+#[tokio::test]
+async fn a_cypher_query_of_an_earlier_point_is_refused_past_a_removal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-cypher").await;
+    let t1 = upsert(
+        &fluree,
+        &id,
+        json!({"@id": "alice", "@type": "Person", "email": "a@old"}),
+    )
+    .await;
+    upsert(&fluree, &id, json!({"@id": "alice", "email": "a@new"})).await;
+    let now = fluree.db(&id).await.unwrap();
+    let triples = fluree
+        .query(
+            &now,
+            &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&now.snapshot)
+        .unwrap();
+    let email = triples
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row[2] == json!("a@new"))
+        .expect("the email triple");
+    let term = |i: usize| email[i].as_str().unwrap().to_string();
+    fluree
+        .remove_occurrences(
+            &id,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: term(0),
+                    predicate: term(1),
+                    graph: None,
+                    object: Some(json!("a@old")),
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+    let past = fluree.db_at_t(&id, t1).await.unwrap();
+    for query in [
+        "MATCH (n:Person) RETURN properties(n) AS p",
+        "MATCH (n:Person) RETURN n",
+        "MATCH (n:Person) RETURN n.email",
+    ] {
+        assert!(
+            matches!(
+                fluree.query_cypher(&past, query).await,
+                Err(ApiError::HistoryUnavailable(_))
+            ),
+            "{query}"
+        );
+    }
+    let now = fluree.db(&id).await.unwrap();
+    let rows = fluree
+        .query_cypher(&now, "MATCH (n:Person) RETURN properties(n) AS p")
+        .await
+        .expect("current");
+    let (_, rows) = rows.to_cypher_typed_table(&now).await.unwrap();
+    let text = format!("{rows:?}");
+    assert!(text.contains("a@new") && !text.contains("a@old"), "{text}");
+}
+
 #[tokio::test]
 async fn removing_one_occurrence_preserves_the_others() {
     let fluree = FlureeBuilder::memory().build_memory();
