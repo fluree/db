@@ -76,7 +76,7 @@ def test_select_rows_follow_projection_order(people):
     assert rows[0].name == "Alice"
     assert rows[1].age is None
     assert isinstance(rows[1].s, BlankNode)
-    assert rows.data()[2] == {"name": "Bob", "s": EX + "bob", "age": None}
+    assert rows.data()[2] == {"name": "Bob", "s": IRI(EX + "bob"), "age": None}
 
 
 def test_literals_become_python_values(people):
@@ -90,7 +90,7 @@ def test_literals_become_python_values(people):
     assert row.score == Decimal("1.5")
     assert row.ratio == 2.5 and type(row.ratio) is float
     assert row.active is True
-    assert row.label == "Bonjour" and row.label.language == "fr"
+    assert row.label == LangString("Bonjour", "fr") and str(row.label) == "Bonjour"
     assert isinstance(row.label, LangString)
     assert row.born == dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
     assert row.day == dt.date(2020, 1, 2)

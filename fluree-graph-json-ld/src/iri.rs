@@ -125,25 +125,6 @@ pub fn add_trailing_slash(iri: &str) -> String {
     }
 }
 
-/// Join base IRI with relative IRI
-pub fn join(base: &str, relative: &str) -> String {
-    if relative.starts_with('#') {
-        // Fragment: append to base
-        format!("{}{}", base.trim_end_matches('/'), relative)
-    } else if is_absolute(relative) {
-        // Already absolute
-        relative.to_string()
-    } else {
-        // Relative: ensure base ends with / and append
-        let base = if base.ends_with('/') || base.ends_with('#') {
-            base.to_string()
-        } else {
-            format!("{base}/")
-        };
-        format!("{base}{relative}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,22 +315,6 @@ mod tests {
         assert_eq!(
             check_unresolved_iri("_:genid1"),
             UnresolvedIriDisposition::NoOpinion
-        );
-    }
-
-    #[test]
-    fn test_join() {
-        assert_eq!(
-            join("http://example.org/", "name"),
-            "http://example.org/name"
-        );
-        assert_eq!(
-            join("http://example.org", "name"),
-            "http://example.org/name"
-        );
-        assert_eq!(
-            join("http://example.org/", "#fragment"),
-            "http://example.org#fragment"
         );
     }
 }

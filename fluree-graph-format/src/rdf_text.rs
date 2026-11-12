@@ -76,13 +76,64 @@ pub fn format_ntriples(graph: &Graph) -> Result<String, InvalidLangTag> {
 /// Write `dataset` as N-Quads: N-Triples lines, with the graph name as a
 /// fourth term on each named graph's lines.
 pub fn format_nquads(dataset: &Dataset) -> Result<String, InvalidLangTag> {
+    format_nquads_ordered(dataset, &[])
+}
+
+/// [`format_nquads`], writing the graphs in `graph_order` (see
+/// [`graphs_in_order`]).
+pub fn format_nquads_ordered(
+    dataset: &Dataset,
+    graph_order: &[Option<Term>],
+) -> Result<String, InvalidLangTag> {
     for (_, graph) in dataset.graphs() {
         check_lang_tags(graph)?;
     }
     let mut out = String::with_capacity(dataset.len() * BYTES_PER_TRIPLE);
-    for (name, graph) in dataset.graphs() {
+    for (name, graph) in graphs_in_order(dataset, graph_order) {
         push_nt_graph(&mut out, graph, name);
     }
+    Ok(out)
+}
+
+/// `dataset`'s graphs in `graph_order`, each a graph name or `None` for the
+/// default graph; the graphs it leaves out follow, the default graph first,
+/// and a name it gives that the dataset lacks is skipped.
+pub(crate) fn graphs_in_order<'d>(
+    dataset: &'d Dataset,
+    graph_order: &[Option<Term>],
+) -> Vec<(Option<&'d Term>, &'d Graph)> {
+    let mut placed: HashSet<Option<&Term>> = HashSet::new();
+    let mut graphs = Vec::with_capacity(dataset.named.len() + 1);
+    let named = graph_order.iter().filter_map(|name| match name {
+        None => Some((None, &dataset.default)),
+        Some(name) => dataset
+            .named
+            .get_key_value(name)
+            .map(|(name, graph)| (Some(name), graph)),
+    });
+    for (name, graph) in named.chain(dataset.graphs()) {
+        if placed.insert(name) {
+            graphs.push((name, graph));
+        }
+    }
+    graphs
+}
+
+/// Write one term in N-Triples syntax, as [`format_ntriples`] writes it.
+pub fn format_nt_term(term: &Term) -> Result<String, InvalidLangTag> {
+    fn check(term: &Term) -> Result<(), InvalidLangTag> {
+        match term {
+            Term::Literal {
+                language: Some(lang),
+                ..
+            } if !syntax::is_lang_tag(lang) => Err(InvalidLangTag(lang.to_string())),
+            Term::TripleTerm(t) => t.iter().try_for_each(check),
+            _ => Ok(()),
+        }
+    }
+    check(term)?;
+    let mut out = String::new();
+    push_nt_term(&mut out, term);
     Ok(out)
 }
 
@@ -133,14 +184,31 @@ pub fn format_turtle(graph: &Graph, prefixes: &PrefixMap) -> Result<String, Inva
 /// Write `dataset` as TriG: the default graph as top-level Turtle, then a
 /// `GRAPH <name> { ... }` block per named graph.
 pub fn format_trig(dataset: &Dataset, prefixes: &PrefixMap) -> Result<String, InvalidLangTag> {
+    format_trig_ordered(dataset, &[], prefixes)
+}
+
+/// [`format_trig`], writing the graphs in `graph_order` (see
+/// [`graphs_in_order`]): the default graph's triples stand at top level
+/// wherever it comes.
+pub fn format_trig_ordered(
+    dataset: &Dataset,
+    graph_order: &[Option<Term>],
+    prefixes: &PrefixMap,
+) -> Result<String, InvalidLangTag> {
     for (_, graph) in dataset.graphs() {
         check_lang_tags(graph)?;
     }
     let mut out = String::with_capacity(dataset.len() * BYTES_PER_TRIPLE / 2);
     prefixes.push_declarations(&mut out);
     let shared = blank_nodes_in_several_graphs(dataset);
-    push_turtle_graph(&mut out, &dataset.default, prefixes, &shared, "");
-    for (name, graph) in &dataset.named {
+    for (name, graph) in graphs_in_order(dataset, graph_order) {
+        let Some(name) = name else {
+            if !graph.is_empty() && !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            push_turtle_graph(&mut out, graph, prefixes, &shared, "");
+            continue;
+        };
         if !out.is_empty() && !out.ends_with("\n\n") {
             out.push('\n');
         }

@@ -464,6 +464,34 @@ pub struct GraphCollectorSink {
     /// Reification count at the current statement's start — the rewind
     /// point for reifier attachments, kept alongside `statement_mark`.
     reification_mark: usize,
+    /// Where each statement went, in the order emitted, when recording
+    /// ([`Self::recording_order`]).
+    order: Option<Vec<StatementPosition>>,
+    /// `order`'s length at the current statement's start.
+    order_mark: usize,
+    /// The prefixes declared, in order, when recording.
+    declared_prefixes: Vec<(String, String)>,
+}
+
+/// Where one statement a [`GraphCollectorSink`] collected went: its graph
+/// and its index there, among the graph's triples or its reifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementPosition {
+    /// The named graph, or `None` for the default graph.
+    pub graph: Option<Term>,
+    /// The index among the graph's triples, or its reifications.
+    pub index: usize,
+    /// Whether the statement is a reification rather than a triple.
+    pub reification: bool,
+}
+
+/// A [`GraphCollectorSink`]'s product with the document's order: the
+/// statements as emitted, and the prefixes as declared.
+#[derive(Debug, Clone)]
+pub struct OrderedDataset {
+    pub dataset: Dataset,
+    pub order: Vec<StatementPosition>,
+    pub prefixes: Vec<(String, String)>,
 }
 
 impl GraphCollectorSink {
@@ -480,6 +508,9 @@ impl GraphCollectorSink {
             literal_cursor: 0,
             statement_mark: 0,
             reification_mark: 0,
+            order: None,
+            order_mark: 0,
+            declared_prefixes: Vec::new(),
         }
     }
 
@@ -496,6 +527,9 @@ impl GraphCollectorSink {
             literal_cursor: 0,
             statement_mark: 0,
             reification_mark: 0,
+            order: None,
+            order_mark: 0,
+            declared_prefixes: Vec::new(),
         }
     }
 
@@ -528,12 +562,32 @@ impl GraphCollectorSink {
     /// dataset can be written back in any RDF syntax. While parsing they are
     /// `-bN`, a label no document can write (see [`GraphSink::term_blank`]).
     pub fn into_dataset(self) -> Dataset {
+        self.into_ordered_dataset().dataset
+    }
+
+    /// A sink that also records the order the producer emits statements and
+    /// declares prefixes in, read with [`Self::into_ordered_dataset`].
+    pub fn recording_order(mut self) -> Self {
+        self.order = Some(Vec::new());
+        self
+    }
+
+    /// [`Self::into_dataset`], with the statements in the order emitted and
+    /// the prefixes in the order declared when the sink was
+    /// [recording](Self::recording_order) them (empty otherwise).
+    pub fn into_ordered_dataset(self) -> OrderedDataset {
+        let mut order = self.order.unwrap_or_default();
+        let prefixes = self.declared_prefixes;
         let mut dataset = Dataset {
             default: self.graph,
             named: self.named.unwrap_or_default(),
         };
         if self.blank_counter == 0 {
-            return dataset;
+            return OrderedDataset {
+                dataset,
+                order,
+                prefixes,
+            };
         }
         let names: Vec<BlankId> = (1..=self.blank_counter)
             .map(|n| {
@@ -555,7 +609,48 @@ impl GraphCollectorSink {
                 (name, graph)
             })
             .collect();
-        dataset
+        order
+            .iter_mut()
+            .filter_map(|position| position.graph.as_mut())
+            .for_each(|name| relabel(name, &names));
+        OrderedDataset {
+            dataset,
+            order,
+            prefixes,
+        }
+    }
+
+    /// [`Self::record`] for a statement just added to the named graph
+    /// `graph`.
+    fn record_named(&mut self, graph: TermId, reification: bool) {
+        if self.order.is_some() {
+            let name = self.get_term(graph).clone();
+            self.record(Some(&name), reification);
+        }
+    }
+
+    /// Note where a statement just added went, when recording.
+    fn record(&mut self, graph: Option<&Term>, reification: bool) {
+        let Some(order) = self.order.as_mut() else {
+            return;
+        };
+        let target = match graph {
+            None => Some(&self.graph),
+            Some(name) => self.named.as_ref().and_then(|named| named.get(name)),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let len = if reification {
+            target.reifications_len()
+        } else {
+            target.len()
+        };
+        order.push(StatementPosition {
+            graph: graph.cloned(),
+            index: len - 1,
+            reification,
+        });
     }
 
     /// The named graph `graph`, noting its rewind point the first time the
@@ -684,6 +779,10 @@ impl GraphSink for GraphCollectorSink {
 
     fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) {
         self.graph.add_prefix(prefix, namespace_iri);
+        if self.order.is_some() {
+            self.declared_prefixes
+                .push((prefix.to_string(), namespace_iri.to_string()));
+        }
     }
 
     fn term_iri(&mut self, iri: &str) -> TermId {
@@ -759,6 +858,7 @@ impl GraphSink for GraphCollectorSink {
         self.statement_mark = self.graph.len();
         self.reification_mark = self.graph.reifications_len();
         self.named_marks.clear();
+        self.order_mark = self.order.as_ref().map_or(0, Vec::len);
     }
 
     /// Roll the graph back to the statement's start, so a statement that
@@ -769,6 +869,9 @@ impl GraphSink for GraphCollectorSink {
         self.debug_assert_retiring_slots_are_literals();
         self.graph.truncate(self.statement_mark);
         self.graph.truncate_reifications(self.reification_mark);
+        if let Some(order) = self.order.as_mut() {
+            order.truncate(self.order_mark);
+        }
         if let Some(named) = self.named.as_mut() {
             for (name, mark) in self.named_marks.drain(..) {
                 match mark {
@@ -792,6 +895,7 @@ impl GraphSink for GraphCollectorSink {
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.graph.add(Triple::new(s, p, o));
+        self.record(None, false);
         Ok(())
     }
 
@@ -817,6 +921,7 @@ impl GraphSink for GraphCollectorSink {
         let o = self.get_term(object).clone();
         let r = self.get_term(reifier).clone();
         self.graph.add_reification(s, p, o, r);
+        self.record(None, true);
         Ok(())
     }
 
@@ -831,6 +936,7 @@ impl GraphSink for GraphCollectorSink {
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.graph.add_list_item(s, p, o, index);
+        self.record(None, false);
         Ok(())
     }
 
@@ -851,6 +957,7 @@ impl GraphSink for GraphCollectorSink {
             self.get_term(object).clone(),
         );
         self.named_graph(graph)?.add(triple);
+        self.record_named(graph, false);
         Ok(())
     }
 
@@ -866,6 +973,7 @@ impl GraphSink for GraphCollectorSink {
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.named_graph(graph)?.add_list_item(s, p, o, index);
+        self.record_named(graph, false);
         Ok(())
     }
 
@@ -882,6 +990,7 @@ impl GraphSink for GraphCollectorSink {
         let o = self.get_term(object).clone();
         let r = self.get_term(reifier).clone();
         self.named_graph(graph)?.add_reification(s, p, o, r);
+        self.record_named(graph, true);
         Ok(())
     }
 }

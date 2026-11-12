@@ -193,6 +193,11 @@ async fn current_t_returns_correct_value_after_load() {
 /// Another process drops the ledger and creates a new one under its name,
 /// at a lower t. Refreshing loads the new ledger rather than keep serving
 /// the old; once the name is dropped again, reconciling removes it.
+///
+/// This instance's cache listener may still be handling its own earlier
+/// events when the other process acts; finding the name absent, or taken by
+/// the new ledger, it evicts or reloads the old one before the refresh does.
+/// Whichever gets there, the old ledger is no longer served.
 #[tokio::test]
 async fn refresh_follows_a_ledger_created_under_the_name_elsewhere() {
     use fluree_db_api::ledger_manager::NsNotify;
@@ -232,8 +237,18 @@ async fn refresh_follows_a_ledger_created_under_the_name_elsewhere() {
         .await
         .unwrap()
         .expect("the name resolves");
-    assert_eq!(refreshed.action, NotifyResult::Reloaded);
-    assert_eq!(mgr.current_t(&key).await, Some(1), "the new ledger");
+    match refreshed.action {
+        NotifyResult::Reloaded => assert_eq!(refreshed.t, 1),
+        // The listener evicted it, or reloaded it, first.
+        NotifyResult::NotLoaded | NotifyResult::Current => {}
+        other => panic!("refresh: {other:?}"),
+    }
+    assert_eq!(
+        here.ledger_cached(id).await.unwrap().snapshot().await.t,
+        1,
+        "the new ledger"
+    );
+    assert_eq!(mgr.current_t(&key).await, Some(1));
 
     elsewhere
         .drop_ledger("it/refresh-replaced", DropMode::Soft)
@@ -251,7 +266,9 @@ async fn refresh_follows_a_ledger_created_under_the_name_elsewhere() {
 }
 
 /// The same, with a `min_t` the dropped ledger's cached state already meets:
-/// the cached `t` says nothing about which ledger the name now holds.
+/// the cached `t` says nothing about which ledger the name now holds. (The
+/// cache listener may evict the old ledger first, as above: a refresh then
+/// finds nothing cached, at `t` 0.)
 #[tokio::test]
 async fn refresh_with_min_t_follows_a_ledger_created_under_the_name_elsewhere() {
     use fluree_db_api::{DropMode, LedgerId};
@@ -283,12 +300,16 @@ async fn refresh_with_min_t_follows_a_ledger_created_under_the_name_elsewhere() 
     let ledger = elsewhere.create_ledger(id).await.unwrap();
     elsewhere.insert(ledger, &tx("b1")).await.unwrap();
 
-    let refreshed = here
-        .refresh(id, RefreshOpts { min_t: Some(1) })
-        .await
-        .unwrap()
-        .expect("the name resolves");
-    assert_eq!(refreshed.action, NotifyResult::Reloaded);
-    assert_eq!(refreshed.t, 1);
-    assert_eq!(mgr.current_t(&key).await, Some(1), "the new ledger");
+    match here.refresh(id, RefreshOpts { min_t: Some(1) }).await {
+        Ok(Some(refreshed)) => assert_eq!(refreshed.t, 1, "{refreshed:?}"),
+        Err(fluree_db_api::ApiError::AwaitTNotReached { current: 0, .. }) => {
+            assert_eq!(mgr.current_t(&key).await, None, "evicted by the listener");
+        }
+        other => panic!("refresh: {other:?}"),
+    }
+    assert_eq!(
+        here.ledger_cached(id).await.unwrap().snapshot().await.t,
+        1,
+        "the new ledger"
+    );
 }

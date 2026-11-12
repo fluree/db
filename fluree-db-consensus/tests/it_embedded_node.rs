@@ -542,3 +542,249 @@ async fn a_fast_forward_merge_lands_through_consensus() {
 
     node.shutdown().await;
 }
+
+static WORKER_SPAWNS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Count the supervisor's `commit worker spawned` events per ledger, for
+/// every test in this binary from the first call on.
+fn count_worker_spawns() {
+    static COUNTING: std::sync::Once = std::sync::Once::new();
+    COUNTING.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+        let commit_worker = tracing_subscriber::filter::filter_fn(|meta| {
+            meta.target() == "fluree_db_consensus::raft::commit_worker"
+        });
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(SpawnCounter.with_filter(commit_worker)),
+        )
+        .expect("the only global subscriber");
+    });
+}
+
+fn worker_spawns(ledger: &str) -> usize {
+    WORKER_SPAWNS
+        .lock()
+        .unwrap()
+        .get(ledger)
+        .copied()
+        .unwrap_or(0)
+}
+
+struct SpawnCounter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpawnCounter {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        #[derive(Default)]
+        struct Spawn {
+            spawned: bool,
+            ledger: Option<String>,
+        }
+        impl tracing::field::Visit for Spawn {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "message" => self.spawned = format!("{value:?}") == "commit worker spawned",
+                    "ledger_id" => self.ledger = Some(format!("{value:?}")),
+                    _ => {}
+                }
+            }
+        }
+        let mut spawn = Spawn::default();
+        event.record(&mut spawn);
+        if let (true, Some(ledger)) = (spawn.spawned, spawn.ledger) {
+            *WORKER_SPAWNS.lock().unwrap().entry(ledger).or_default() += 1;
+        }
+    }
+}
+
+/// A branch whose queue each write drains keeps its worker: applying the
+/// `ApplyHead` that pops the last entry removes the queue while the
+/// worker still awaits that propose's response, and tearing the worker
+/// down then would drop the response and skip installing the commit.
+/// Writes spaced past the supervisor's poll each drain the queue, and
+/// one worker stages them all. Kept, it idles until the supervisor wakes
+/// it: left asleep, a write would wait out the worker's idle exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_keeps_its_worker_across_drained_queues() {
+    count_worker_spawns();
+    let (_integration, fluree, node, _dirs) = stand_up(62, |config| config).await;
+    fluree
+        .create_ledger("drained/db")
+        .await
+        .expect("create ledger");
+    for round in 0..4 {
+        let write = node
+            .committer
+            .transact(bulk_request_round("drained/db:main", 1, round));
+        tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("a kept worker is woken for its branch's next write")
+            .expect("transact through consensus");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    assert_eq!(worker_spawns("drained/db"), 1);
+}
+
+/// Identical requests write identical envelopes, and an envelope's address is
+/// the hash of its bytes, so they shared one blob: a release for one deleted
+/// it from under another still queued. Here a finished request's retry under
+/// its key releases the envelope it wrote, while an identical request without
+/// a key waits behind a write the ledger lock holds, its envelope not yet read.
+/// The retry goes through a committer with no cache of its own, as one that
+/// reaches another node, or this one after its cache let the key go, does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identical_queued_request_keeps_its_envelope() {
+    use fluree_db_consensus::raft::queued_transactor::QueuedTransactor;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+    use fluree_db_consensus::{Committer, IdempotencyKey};
+
+    let (integration, fluree, node, _dirs) = stand_up(16, |config| config).await;
+    let ledger_id = "embedded/twice:main";
+    fluree
+        .create_ledger("embedded/twice")
+        .await
+        .expect("create ledger");
+    let request = |key: Option<&str>| TransactionRequest {
+        idempotency_key: key.map(|key| IdempotencyKey::new(key).unwrap()),
+        ..bulk_request_round(ledger_id, 1, 0)
+    };
+    node.committer
+        .transact(request(Some("first")))
+        .await
+        .expect("the first lands");
+
+    let handle = fluree
+        .ledger_manager()
+        .expect("ledger manager")
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load ledger");
+    let guard = handle.lock_for_write().await;
+    let queued = async |len: usize| {
+        integration
+            .shared_state
+            .read()
+            .await
+            .queues
+            .get(&RefKey::new("embedded/twice", "main"))
+            .is_some_and(|queue| queue.len() == len)
+    };
+    let committer = Arc::clone(&node.committer);
+    let blocker = tokio::spawn(async move {
+        committer
+            .transact(bulk_request_round(ledger_id, 1, 1))
+            .await
+    });
+    eventually("the blocker is queued", async || queued(1).await).await;
+    let committer = Arc::clone(&node.committer);
+    let identical = tokio::spawn(async move { committer.transact(request(None)).await });
+    eventually("the identical request is queued", async || queued(2).await).await;
+
+    QueuedTransactor::new(
+        Arc::clone(&integration.raft),
+        Arc::clone(&fluree),
+        Arc::clone(&integration.waiter_map),
+        integration.shared_state.clone(),
+    )
+    .transact(request(Some("first")))
+    .await
+    .expect("the retry is answered from the first's record");
+    drop(guard);
+
+    blocker.await.unwrap().expect("the blocker lands");
+    identical
+        .await
+        .unwrap()
+        .expect("the identical request reads its envelope");
+    node.shutdown().await;
+}
+
+/// A retry under a key whose first submission is still queued joins that
+/// entry, which reads the first's envelope. The retry's own envelope is its
+/// alone, so nothing reads it: it is released, not left behind. Every
+/// submission here carries a key, so the queue keeps each queued entry's
+/// envelope until the key's record is evicted, and the only envelope that
+/// can go is the retry's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_that_joins_a_queued_entry_releases_its_own_envelope() {
+    use fluree_db_consensus::raft::queued_transactor::QueuedTransactor;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+    use fluree_db_consensus::{Committer, IdempotencyKey, QueuedRequest};
+
+    let (integration, fluree, node, dirs) = stand_up(17, |config| config).await;
+    let ledger_id = "embedded/joined:main";
+    fluree
+        .create_ledger("embedded/joined")
+        .await
+        .expect("create ledger");
+    let request = |key: &str, round: usize| TransactionRequest {
+        idempotency_key: Some(IdempotencyKey::new(key).unwrap()),
+        ..bulk_request_round(ledger_id, 1, round)
+    };
+    // The ledger's data sits under its incarnation's `@<id>` directory.
+    let envelopes = || {
+        let incarnation = std::fs::read_dir(dirs.1.path().join("embedded/joined"))
+            .expect("ledger dir")
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .expect("incarnation dir");
+        std::fs::read_dir(incarnation.join("main/txn"))
+            .expect("txn dir")
+            .filter(|file| {
+                let bytes = std::fs::read(file.as_ref().unwrap().path()).unwrap();
+                QueuedRequest::from_bytes(&bytes).is_ok()
+            })
+            .count()
+    };
+
+    let handle = fluree
+        .ledger_manager()
+        .expect("ledger manager")
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load ledger");
+    let guard = handle.lock_for_write().await;
+    let queued = async |len: usize| {
+        integration
+            .shared_state
+            .read()
+            .await
+            .queues
+            .get(&RefKey::new("embedded/joined", "main"))
+            .is_some_and(|queue| queue.len() == len)
+    };
+    let committer = Arc::clone(&node.committer);
+    let blocker = tokio::spawn(async move { committer.transact(request("blocker", 1)).await });
+    eventually("the blocker is queued", async || queued(1).await).await;
+    let committer = Arc::clone(&node.committer);
+    let first = tokio::spawn(async move { committer.transact(request("first", 0)).await });
+    eventually("the first is queued", async || queued(2).await).await;
+
+    let retry = QueuedTransactor::new(
+        Arc::clone(&integration.raft),
+        Arc::clone(&fluree),
+        Arc::clone(&integration.waiter_map),
+        integration.shared_state.clone(),
+    );
+    let retry = tokio::spawn(async move { retry.transact(request("first", 0)).await });
+    // Joining binds the retry to the first's entry, which ends the first's
+    // own wait (`WaiterMap::bind`): its return says the retry has joined.
+    eventually("the retry joins the first's entry", async || {
+        first.is_finished()
+    })
+    .await;
+    drop(guard);
+
+    blocker.await.unwrap().expect("the blocker lands");
+    retry
+        .await
+        .unwrap()
+        .expect("the retry gets the first's outcome");
+    assert_eq!(
+        envelopes(),
+        2,
+        "the blocker's and the first's envelopes stay with their records"
+    );
+    node.shutdown().await;
+}

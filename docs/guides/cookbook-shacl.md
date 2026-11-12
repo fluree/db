@@ -524,8 +524,8 @@ A book whose `ex:author` is `ex:pratchett` conforms — `ex:pratchett` is a `sch
 
 Fluree resolves this in two tiers:
 
-1. **Fast path**: the ledger's indexed schema hierarchy (`SchemaHierarchy`). Expanded at engine build time so same-class and descendant-class matches are O(1) hashmap hits.
-2. **Live fallback**: when the subclass relation was asserted in the current transaction (or any earlier unindexed commit), the fast path misses. The engine then walks `rdfs:subClassOf` via a BFS on the database's SPOT index. This walk is **scoped to the default graph** regardless of the subject's own graph — matching how `SchemaHierarchy` is built and preventing cross-graph issues.
+1. **Fast path**: the ledger's current schema hierarchy (`SchemaHierarchy`), built from the default graph's committed and unindexed state. Expanded at engine build time so same-class and descendant-class matches are O(1) hashmap hits.
+2. **Live fallback**: when the subclass relation was asserted in the current transaction, or lives in a graph other than the default graph, the fast path misses. The engine then walks `rdfs:subClassOf` via a BFS on the database's SPOT index. This walk reads the **default graph**, matching how `SchemaHierarchy` is built, plus the `f:shapesSource` graphs and any [`f:additionalDataSource`](#validating-against-other-graphs) graphs, so a value-set or catalog can carry its own class hierarchy. The record's own named graph is not read automatically: its subclass edges count only when it is itself listed as an `f:additionalDataSource`, as a catalog listed ledger-wide is when a record is written to the catalog.
 
 ## Predicate-target shapes
 
@@ -642,9 +642,38 @@ With `f:shapesSource` pointing at `<http://example.org/shapes>`, a record writte
 
 Semantics and limits:
 
-- **Membership graph = focus data graph ∪ the `f:shapesSource` graph.** A value is an instance of the class if it is typed so in either the record's own graph or the vocabulary graph. When shapes live in the default graph, this is just an ordinary local lookup.
+- **Membership graph = focus data graph ∪ the `f:shapesSource` graph.** A value is an instance of the class if it is typed so in either the record's own graph or the vocabulary graph. When shapes live in the default graph, this is just an ordinary local lookup. To read a value-set kept in a graph of its own, see [Validating against other graphs](#validating-against-other-graphs).
 - **Per-transaction caching.** Repeated references to the same value within one transaction are memoized — bulk-inserting many records that share a state pays the membership lookup once.
 - **Cross-ledger too.** When `f:shapesSource` is cross-ledger (`f:ledger`), the controlled vocabulary lives in the model ledger alongside the shapes, and membership is resolved by querying that model ledger live (pinned at its latest committed state at transaction time). So a shared governance model can hold shapes *and* the value-sets they reference, and many data ledgers can point at it.
+
+## Validating against other graphs
+
+By default a record is checked against the graph it is written to. When the data a shape reads lives elsewhere (a shared catalog, a price list), list those graphs with `f:additionalDataSource` on `f:shaclDefaults`. Each value is an `f:GraphRef`, and the setting is repeatable ([SHACL across named graphs](cookbook-shacl-across-graphs.md) walks through it end to end):
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:shaclDefaults [
+      f:shaclEnabled true ;
+      f:shapesSource [ a f:GraphRef ; f:graphSource [ f:graphSelector <http://example.org/shapes> ] ] ;
+      f:additionalDataSource [ a f:GraphRef ; f:graphSource [ f:graphSelector <http://example.org/catalog> ] ]
+    ] .
+}
+```
+
+A write to `<http://example.org/org-a>` is then checked against `<org-a>` and `<catalog>` read as one graph. Every constraint reads it: `sh:class` finds a commodity typed in the catalog, a path such as `( ex:product ex:price )` steps from an order in `<org-a>` to a price in the catalog, `sh:node` checks the referenced product's own properties there, and an `sh:sparql` query runs with the two as its default graph. Validating a graph through the API reads the same graphs.
+
+Semantics and limits:
+
+- **Added, not substituted.** The graph being written is always read, and the listed graphs are read with it. Shapes still come only from `f:shapesSource`.
+- **Which records are checked does not change.** A transaction checks the records it writes, and which shapes apply to a record is decided from the graph being written: a type, or a `sh:targetSubjectsOf` / `sh:targetObjectsOf` edge, that only a listed graph gives a record does not make a shape apply to it. Nodes in a listed graph are not validated because another graph reads them.
+- **One graph, so a fact counts once.** A triple stored in both graphs is one value. A fact only a listed graph holds counts too, so a listed graph can make a record fail as well as pass: `sh:maxCount` sees its values and `sh:closed` sees its properties.
+- **Checked when written.** Removing an entry from the catalog does not re-check the records that reference it; a record is checked again the next time it is written.
+- **The transaction's own changes count.** A transaction that adds a catalog entry and a record referencing it passes; one that removes an entry and writes a record using it fails. A transaction may create a listed graph.
+- **Per graph.** An entry in `f:graphOverrides` can give a graph its own list, which replaces the ledger-wide list for that graph. List the ledger-wide graphs again if that graph should read them too. A per-graph group that sets no list inherits the ledger-wide one, so to have a graph read no other graph, list the graph itself: it is read anyway, and only its own subclass edges are added.
+- **Full reads.** Checks read the listed graphs whatever the writer's policy lets them read, so a violation can show a writer a value from a graph their policy hides.
+- **Errors, not skips.** A graph the ledger does not know, and the transaction is not creating, fails the write: a mistyped graph would otherwise hide data a shape should see. The config and txn-meta graphs cannot be listed. Only this ledger's graphs can be listed for now, so `f:ledger`, `f:atT`, `f:trustPolicy` and `f:rollbackGuard` are refused. A cross-ledger `f:shapesSource` works with it.
+- **Config only.** No request can change the list.
 
 ## Inline shapes per transaction
 
@@ -879,6 +908,7 @@ Because shapes live as regular RDF in your ledger:
 
 ## Related documentation
 
+- [SHACL across named graphs](cookbook-shacl-across-graphs.md) — Walkthrough: validating records against a shared catalog in another graph
 - [Setting Groups — SHACL](../ledger-config/setting-groups.md#shacl-defaults) — Configuration reference for `f:shaclDefaults`
 - [Override Control](../ledger-config/override-control.md) — Per-graph / query-time override rules
 - [Writing Config Data](../ledger-config/writing-config.md) — How to transact into the config graph

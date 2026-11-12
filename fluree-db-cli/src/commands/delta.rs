@@ -18,8 +18,8 @@ pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<()
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
         let result = run_delta_map_remote(&client, &args).await.map_err(|e| {
-            CliError::Remote(format!(
-                "failed to map Delta graph source on '{remote_name}': {e}"
+            e.context(format!(
+                "failed to map Delta graph source on '{remote_name}'"
             ))
         });
         crate::context::persist_refreshed_tokens(&client, remote_name, dirs).await;
@@ -29,7 +29,7 @@ pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<()
     if let Some(client) = crate::context::local_server_client(dirs) {
         return run_delta_map_remote(&client, &args)
             .await
-            .map_err(|e| CliError::Remote(format!("failed to map Delta graph source: {e}")));
+            .map_err(|e| e.context("failed to map Delta graph source"));
     }
 
     run_delta_map_local(args, dirs).await

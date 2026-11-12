@@ -384,9 +384,13 @@ where
                     for (property, values) in properties {
                         let predicate_id = self.sink.term_iri(property);
                         for node in node_items(values, "a reverse property's value")? {
-                            if let ProcessedValue::Single(node_id) = self.value(node, scope)? {
+                            let mut nested = Vec::new();
+                            if let ProcessedValue::Single(node_id) =
+                                self.value(node, scope, &mut nested)?
+                            {
                                 self.emit(scope, node_id, predicate_id, subject_id, None)?;
                             }
+                            self.nested_nodes(nested, scope)?;
                         }
                     }
                     continue;
@@ -432,7 +436,10 @@ where
             };
 
             for val in values {
-                match self.value(val, scope)? {
+                // A node object a value holds is described after the
+                // statement that points to it, as the document reads.
+                let mut nested = Vec::new();
+                match self.value(val, scope, &mut nested)? {
                     ProcessedValue::Single(object_id) => {
                         self.emit(scope, subject_id, predicate_id, object_id, None)?;
                         self.annotate(val, (subject_id, predicate_id, object_id), scope)?;
@@ -444,6 +451,7 @@ where
                     }
                     ProcessedValue::None => {}
                 }
+                self.nested_nodes(nested, scope)?;
             }
         }
 
@@ -457,8 +465,24 @@ where
         Ok(subject_id)
     }
 
-    /// Process a value, in `scope`, and return the processed result
-    fn value(&mut self, value: &Value, scope: Scope) -> Result<ProcessedValue> {
+    /// Describe the node objects [`Self::value`] named, each under the
+    /// subject it was given.
+    fn nested_nodes(&mut self, nested: Vec<(&Value, TermId)>, scope: Scope) -> Result<()> {
+        for (node, subject) in nested {
+            self.node(node, scope, Some(subject))?;
+        }
+        Ok(())
+    }
+
+    /// Process a value, in `scope`, and return the processed result. A node
+    /// object in it is named here and pushed onto `nested`, to be described
+    /// by [`Self::nested_nodes`] once the statement pointing to it is out.
+    fn value<'v>(
+        &mut self,
+        value: &'v Value,
+        scope: Scope,
+        nested: &mut Vec<(&'v Value, TermId)>,
+    ) -> Result<ProcessedValue> {
         match value {
             Value::Object(obj) => {
                 // A triple term: `{"@id": {"@id": s, p: o}}`.
@@ -479,14 +503,14 @@ where
                     // (JSON-LD embedded-node semantics); recurse so they
                     // aren't silently dropped. A `{"@id": ...}` singleton is
                     // a pure reference.
-                    if obj.keys().any(|k| k != "@id" && k != "@annotation") {
-                        let subject_id = self.node(value, scope, None)?;
-                        return Ok(ProcessedValue::Single(subject_id));
-                    }
                     let id_str = id_val.as_str().ok_or_else(|| {
                         AdapterError::InvalidStructure("@id must be a string".to_string())
                     })?;
-                    return Ok(ProcessedValue::Single(node_term(id_str, self.sink)));
+                    let subject_id = node_term(id_str, self.sink);
+                    if obj.keys().any(|k| k != "@id" && k != "@annotation") {
+                        nested.push((value, subject_id));
+                    }
+                    return Ok(ProcessedValue::Single(subject_id));
                 }
 
                 // Check for @value (literal)
@@ -501,14 +525,14 @@ where
                             "an @annotation names one triple, and a @list is several".to_string(),
                         ));
                     }
-                    return self.list(list_val, scope);
+                    return self.list(list_val, nested);
                 }
 
                 // Nested/embedded node without @id - allocate blank node first,
                 // then process the node using that same blank node as subject.
                 // This ensures the object edge and embedded node triples share identity.
                 let subject_id = self.sink.term_blank(None);
-                self.node(value, scope, Some(subject_id))?;
+                nested.push((value, subject_id));
                 Ok(ProcessedValue::Single(subject_id))
             }
             // Direct scalar values (shouldn't happen in properly expanded JSON-LD)
@@ -540,8 +564,13 @@ where
         }
     }
 
-    /// Process a @list value, in `scope`, and return the list items with indices
-    fn list(&mut self, list_val: &Value, scope: Scope) -> Result<ProcessedValue> {
+    /// Process a @list value and return the list items with indices; a node
+    /// object among them goes onto `nested`, as in [`Self::value`].
+    fn list<'v>(
+        &mut self,
+        list_val: &'v Value,
+        nested: &mut Vec<(&'v Value, TermId)>,
+    ) -> Result<ProcessedValue> {
         let items = match list_val {
             Value::Array(arr) => arr,
             _ => {
@@ -565,7 +594,7 @@ where
             // Process each list item as a single value (lists cannot be nested
             // directly). A skipped null/unsupported item takes no position:
             // positions run from 0 without gaps, and 0 begins a list.
-            if let Some(term_id) = self.list_item(item, scope)? {
+            if let Some(term_id) = self.list_item(item, nested)? {
                 indexed_items.push((indexed_items.len() as i32, term_id));
             }
         }
@@ -576,22 +605,27 @@ where
         Ok(ProcessedValue::List(indexed_items))
     }
 
-    /// Process a single list item, in `scope` (cannot return a list, only
-    /// single values)
-    fn list_item(&mut self, value: &Value, scope: Scope) -> Result<Option<TermId>> {
+    /// Process a single list item (cannot return a list, only single
+    /// values); a node object in it goes onto `nested`, as in [`Self::value`].
+    fn list_item<'v>(
+        &mut self,
+        value: &'v Value,
+        nested: &mut Vec<(&'v Value, TermId)>,
+    ) -> Result<Option<TermId>> {
         match value {
             Value::Object(obj) => {
                 // Check for @id (reference to another node)
                 if let Some(id_val) = obj.get("@id") {
                     // A member carrying more than a bare `@id` asserts its own
                     // triples, as an embedded node does outside a list.
-                    if obj.len() > 1 {
-                        return Ok(Some(self.node(value, scope, None)?));
-                    }
                     let id_str = id_val.as_str().ok_or_else(|| {
                         AdapterError::InvalidStructure("@id must be a string".to_string())
                     })?;
-                    return Ok(Some(node_term(id_str, self.sink)));
+                    let subject_id = node_term(id_str, self.sink);
+                    if obj.len() > 1 {
+                        nested.push((value, subject_id));
+                    }
+                    return Ok(Some(subject_id));
                 }
 
                 // Check for @value (literal)
@@ -611,7 +645,7 @@ where
 
                 // Embedded node in list - allocate blank node and process
                 let subject_id = self.sink.term_blank(None);
-                self.node(value, scope, Some(subject_id))?;
+                nested.push((value, subject_id));
                 Ok(Some(subject_id))
             }
             // Direct scalar values
@@ -676,9 +710,11 @@ where
             .ok_or_else(|| invalid("@id must name the subject"))?;
         let subject = node_term(subject, self.sink);
         let predicate = self.sink.term_iri(parts.predicate);
-        let ProcessedValue::Single(object) = self.value(parts.object, scope)? else {
+        let mut nested = Vec::new();
+        let ProcessedValue::Single(object) = self.value(parts.object, scope, &mut nested)? else {
             return Err(invalid("its object must be a reference or a value"));
         };
+        self.nested_nodes(nested, scope)?;
         Ok((subject, predicate, object))
     }
 
@@ -698,9 +734,11 @@ where
             None => return Err(invalid("@id must name the subject")),
         };
         let predicate = parts.predicate;
-        let ProcessedValue::Single(object) = self.value(parts.object, scope)? else {
+        let mut nested = Vec::new();
+        let ProcessedValue::Single(object) = self.value(parts.object, scope, &mut nested)? else {
             return Err(invalid("its object must be a reference or a value"));
         };
+        self.nested_nodes(nested, scope)?;
         let predicate = self.sink.term_iri(predicate);
         Ok(self.sink.term_triple(subject, predicate, object)?)
     }
@@ -737,15 +775,22 @@ fn process_literal<S: GraphSink>(
     obj: &serde_json::Map<String, Value>,
     sink: &mut S,
 ) -> Result<ProcessedValue> {
-    // Check for @type (datatype). With none, a JSON number or boolean has
-    // the datatype JSON-LD gives it (JSON-LD 1.1 § Object to RDF Conversion):
-    // xsd:integer for a whole number, xsd:double for any other, xsd:boolean.
+    // The datatype: `@type` when given; otherwise, for a native value,
+    // `xsd:boolean` for a boolean, `xsd:integer` for a number that fits an
+    // i64, `xsd:double` for any other number, and `xsd:string` for a
+    // string. So `1.0`, `1e3` and an integer past `i64::MAX` are doubles,
+    // as the value stored for them is, and as a bare number in a list is;
+    // JSON-LD's own RDF conversion would call the first two integers.
+    // (A native number used to be
+    // labelled `xsd:string` here while keeping its numeric value, which a
+    // sink that writes the datatype out, like the graph collector, then
+    // printed as a string: `"0"` for `{"@value": 0}`.)
     let datatype = match obj.get("@type").and_then(Value::as_str) {
         Some(type_iri) => Datatype::from_iri(type_iri),
         None => match val {
-            Value::Number(n) if n.is_i64() || n.is_u64() => Datatype::xsd_integer(),
-            Value::Number(_) => Datatype::xsd_double(),
             Value::Bool(_) => Datatype::xsd_boolean(),
+            Value::Number(n) if n.as_i64().is_some() => Datatype::xsd_integer(),
+            Value::Number(_) => Datatype::xsd_double(),
             _ => Datatype::xsd_string(),
         },
     };
@@ -758,6 +803,17 @@ fn process_literal<S: GraphSink>(
 
     // Handle the actual value
     match val {
+        // A string `@value` holds an already serialized JSON document, and
+        // takes the string path below.
+        Value::Object(_) | Value::Array(_) | Value::Number(_) | Value::Bool(_)
+            if datatype.is_json() =>
+        {
+            let json_str = crate::normalize::normalize(val);
+            Ok(ProcessedValue::Single(sink.term_literal_value(
+                LiteralValue::Json(Arc::from(json_str.as_str())),
+                Datatype::rdf_json(),
+            )))
+        }
         Value::String(s) => {
             if language.is_some() {
                 // Language-tagged string
@@ -818,15 +874,8 @@ fn process_literal<S: GraphSink>(
         Value::Bool(b) => Ok(ProcessedValue::Single(
             sink.term_literal_value(LiteralValue::Boolean(*b), datatype),
         )),
-        // Handle @json typed values
         Value::Object(_) | Value::Array(_) => {
-            if datatype.is_json() {
-                let json_str = crate::normalize::normalize(val);
-                Ok(ProcessedValue::Single(sink.term_literal_value(
-                    LiteralValue::Json(Arc::from(json_str.as_str())),
-                    Datatype::rdf_json(),
-                )))
-            } else if matches!(val, Value::Array(_))
+            if matches!(val, Value::Array(_))
                 && datatype.as_iri() == fluree_vocab::fluree::EMBEDDING_VECTOR
             {
                 // Vector arrays come through here once JSON-LD expansion produces
@@ -884,6 +933,30 @@ mod tests {
         );
     }
 
+    /// A JSON literal whose `@value` is a number or a boolean is a JSON
+    /// document, as an object or array one is, not an `xsd` value.
+    #[test]
+    fn json_literal_of_a_scalar_is_a_json_document() {
+        for (value, document) in [(json!(5), "5"), (json!(true), "true")] {
+            let expanded = json!([{
+                "@id": "http://example.org/s",
+                "http://example.org/p": [{"@value": value, "@type": "@json"}]
+            }]);
+            let mut sink = GraphCollectorSink::new();
+            to_graph_events(&expanded, &mut sink).unwrap();
+            let triple = sink.graph().iter().next().unwrap().clone();
+            assert!(
+                matches!(
+                    &triple.o,
+                    Term::Literal { value: LiteralValue::Json(json), datatype, .. }
+                        if json.as_ref() == document && datatype.is_json()
+                ),
+                "{:?}",
+                triple.o
+            );
+        }
+    }
+
     #[test]
     fn test_typed_literal() {
         let expanded = json!([{
@@ -908,6 +981,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A native value with no `@type` takes the datatype JSON-LD's RDF
+    /// conversion gives it, not `xsd:string`: what expansion makes of a
+    /// bare `0`, `1.5` or `true`.
+    #[test]
+    fn native_values_without_a_type_keep_their_rdf_datatype() {
+        let expanded = json!([{
+            "@id": "http://example.org/row",
+            "http://example.org/int": [{ "@value": 0 }],
+            "http://example.org/double": [{ "@value": 1.5 }],
+            "http://example.org/bool": [{ "@value": true }],
+            "http://example.org/string": [{ "@value": "0" }],
+            "http://example.org/declared": [{ "@value": 7, "@type": "http://www.w3.org/2001/XMLSchema#long" }]
+        }]);
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let datatype_of = |p: &str| {
+            sink.graph()
+                .iter()
+                .find(|t| t.predicate().as_iri() == Some(p))
+                .and_then(|t| {
+                    t.object()
+                        .as_literal()
+                        .map(|(_, dt, _)| dt.as_iri().to_string())
+                })
+                .unwrap()
+        };
+        let xsd = |local: &str| format!("http://www.w3.org/2001/XMLSchema#{local}");
+        assert_eq!(datatype_of("http://example.org/int"), xsd("integer"));
+        assert_eq!(datatype_of("http://example.org/double"), xsd("double"));
+        assert_eq!(datatype_of("http://example.org/bool"), xsd("boolean"));
+        assert_eq!(datatype_of("http://example.org/string"), xsd("string"));
+        assert_eq!(datatype_of("http://example.org/declared"), xsd("long"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ import datetime as _dt
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal as _Literal
 
-from fluree._terms import IRI, BlankNode, _datetime, to_python
+from fluree._terms import IRI, BlankNode, _datetime, to_python, trusted_iri
 
 if TYPE_CHECKING:
     from fluree._results import Result
@@ -210,7 +210,7 @@ class RevertPreview:
 
 
 def _node(iri: str) -> IRI | BlankNode:
-    return BlankNode(iri[2:]) if iri.startswith("_:") else IRI(iri)
+    return BlankNode(iri[2:]) if iri.startswith("_:") else trusted_iri(iri)
 
 
 def _commit(summary: dict[str, Any]) -> Commit:
@@ -225,9 +225,9 @@ def _change(t: int | None, flake: tuple[Any, ...]) -> Change:
         t=t,
         op="assert" if op else "retract",
         subject=_node(s),
-        predicate=IRI(p),
+        predicate=trusted_iri(p),
         value=to_python(o),
-        graph=None if g is None else IRI(g),
+        graph=None if g is None else trusted_iri(g),
     )
 
 
@@ -236,8 +236,8 @@ def _conflict(raw: dict[str, Any]) -> Conflict:
     source, target = ([_change(None, f) for f in flakes] if flakes is not None else None for flakes in side)
     return Conflict(
         subject=_node(raw["subject"]),
-        predicate=IRI(raw["predicate"]),
-        graph=None if raw["graph"] is None else IRI(raw["graph"]),
+        predicate=trusted_iri(raw["predicate"]),
+        graph=None if raw["graph"] is None else trusted_iri(raw["graph"]),
         source=source,
         target=target,
     )
@@ -368,7 +368,10 @@ def _jsonld_term(value: Any) -> Any:
         if "@id" in value:
             return _node(value["@id"])
         if "@language" in value:
-            return to_python(("literal", str(value["@value"]), _RDF_LANG_STRING, value["@language"]))
+            tag = value["@language"]
+            if "@direction" in value:
+                tag = f"{tag}--{value['@direction']}"
+            return to_python(("literal", str(value["@value"]), _RDF_LANG_STRING, tag))
         if "@type" in value:
             return to_python(("literal", str(value["@value"]), value["@type"], None))
         return value.get("@value")
@@ -383,12 +386,12 @@ def _validation_results(raw: list[dict[str, Any]]) -> list[ValidationResult]:
     return [
         ValidationResult(
             focus=_node(r["focus_node"]) if isinstance(r["focus_node"], str) else _jsonld_term(r["focus_node"]),
-            path=None if r.get("result_path") is None else IRI(r["result_path"]),
+            path=None if r.get("result_path") is None else trusted_iri(r["result_path"]),
             message=r["message"],
             severity=r["severity"].removeprefix(_SHACL).lower(),
             value=_jsonld_term(r.get("value")),
             shape=_node(r["source_shape"]),
-            component=IRI(r["constraint_component"]),
+            component=trusted_iri(r["constraint_component"]),
         )
         for r in raw
     ]

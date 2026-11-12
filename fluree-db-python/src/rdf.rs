@@ -6,9 +6,9 @@
 //! reification travels as the quad `(reifier, rdf:reifies, triple term,
 //! graph)`, as RDF 1.2 defines it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfError, RdfFormat, Term};
+use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfError, RdfFormat, Statement, Term};
 use fluree_vocab::rdf::REIFIES;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -17,9 +17,14 @@ use pyo3::types::{PyList, PyString, PyTuple};
 use crate::convert::{ir_term, is_node, is_triple};
 use crate::error::invalid_request;
 
+/// A parsed document as Python takes it: its quads, and its prefixes as
+/// `(prefix, iri)` pairs.
+type ParsedDocument<'py> = (Bound<'py, PyList>, Vec<(String, String)>);
+
 /// The quads of `text`, read as `format`: `"turtle"`, `"trig"`,
-/// `"ntriples"` or `"nquads"`. Turtle and TriG resolve relative IRIs
-/// against `base`.
+/// `"ntriples"` or `"nquads"`, in the order the document writes them, and
+/// the prefixes it declares, as `(prefix, iri)` pairs in order. Turtle and
+/// TriG resolve relative IRIs against `base`.
 ///
 /// Each quad is `(subject, predicate, object, graph)`. An IRI or blank node
 /// is a ready `fluree.IRI` or `fluree.BlankNode`, one object for every use of
@@ -33,31 +38,33 @@ pub(crate) fn parse_rdf<'py>(
     text: &str,
     format: &str,
     base: Option<&str>,
-) -> PyResult<Bound<'py, PyList>> {
+) -> PyResult<ParsedDocument<'py>> {
     let format: RdfFormat = format.parse().map_err(rdf_error)?;
-    let dataset = py
-        .detach(|| rdf::parse(text, format, base))
+    let document = py
+        .detach(|| rdf::parse_document(text, format, base))
         .map_err(rdf_error)?;
     let mut terms = Terms::new(py);
     let reifies = terms.iri(REIFIES)?;
     let quads = PyList::empty(py);
-    for (name, graph) in dataset.graphs() {
-        let name = name.map(|n| terms.term(n)).transpose()?;
-        for t in graph.iter() {
-            let quad = (
-                terms.term(&t.s)?,
-                terms.term(&t.p)?,
-                terms.term(&t.o)?,
-                &name,
-            );
-            quads.append(quad)?;
-        }
-        for r in graph.reifications() {
-            let triple = terms.triple(&r.triple.s, &r.triple.p, &r.triple.o)?;
-            quads.append((terms.term(&r.reifier)?, &reifies, triple, &name))?;
+    for statement in document.statements() {
+        match statement {
+            Statement::Triple(name, t) => {
+                let name = name.map(|n| terms.term(n)).transpose()?;
+                quads.append((
+                    terms.term(&t.s)?,
+                    terms.term(&t.p)?,
+                    terms.term(&t.o)?,
+                    name,
+                ))?;
+            }
+            Statement::Reification(name, r) => {
+                let name = name.map(|n| terms.term(n)).transpose()?;
+                let triple = terms.triple(&r.triple.s, &r.triple.p, &r.triple.o)?;
+                quads.append((terms.term(&r.reifier)?, &reifies, triple, name))?;
+            }
         }
     }
-    Ok(quads)
+    Ok((quads, document.prefixes))
 }
 
 /// Python objects for one dataset's terms. An IRI or blank node label is
@@ -134,24 +141,41 @@ impl<'py> Terms<'py> {
 }
 
 /// `quads`, each a `fluree.Quad`, written as `format`: `"turtle"`, `"trig"`,
-/// `"ntriples"` or `"nquads"`. Turtle and TriG declare `prefixes` and write
-/// with them. A quad `(r, rdf:reifies, triple term)` is written as an
-/// annotation where the format has one.
+/// `"ntriples"` or `"nquads"`, keeping their order: graphs in the order the
+/// quads first name them, and in Turtle and TriG each subject's statements
+/// together, subjects in the order they first appear. Turtle and TriG
+/// declare `prefixes` and write with them. A quad `(r, rdf:reifies, triple
+/// term)` is written as an annotation where the format has one. `expanded`
+/// writes JSON-LD in expanded form.
 #[pyfunction]
-#[pyo3(signature = (quads, format, prefixes = None))]
+#[pyo3(signature = (quads, format, prefixes = None, expanded = false))]
 pub(crate) fn serialize_rdf<'py>(
     py: Python<'py>,
     quads: &Bound<'py, PyAny>,
     format: &str,
     prefixes: Option<BTreeMap<String, String>>,
+    expanded: bool,
 ) -> PyResult<String> {
     let format: RdfFormat = format.parse().map_err(rdf_error)?;
+    if expanded && format != RdfFormat::JsonLd {
+        return Err(invalid_request(format!(
+            "expanded is a form of JSON-LD, not of {format}"
+        )));
+    }
     let mut nodes = Nodes::default();
     let mut dataset = Dataset::new();
+    let mut graph_order: Vec<Option<Term>> = Vec::new();
+    let mut named: HashSet<Term> = HashSet::new();
+    let mut default_seen = false;
     for quad in quads.try_iter()? {
         let quad = quad?;
         let graph = quad.getattr(intern!(py, "graph"))?;
         let graph = (!graph.is_none()).then(|| nodes.term(graph)).transpose()?;
+        match &graph {
+            None if !std::mem::replace(&mut default_seen, true) => graph_order.push(None),
+            Some(name) if named.insert(name.clone()) => graph_order.push(Some(name.clone())),
+            _ => {}
+        }
         dataset.add_quad(
             nodes.term(quad.getattr(intern!(py, "subject"))?)?,
             nodes.term(quad.getattr(intern!(py, "predicate"))?)?,
@@ -160,8 +184,14 @@ pub(crate) fn serialize_rdf<'py>(
         );
     }
     let prefixes = PrefixMap::from_map(prefixes.unwrap_or_default());
-    py.detach(|| rdf::serialize(&dataset, format, &prefixes))
-        .map_err(rdf_error)
+    py.detach(|| {
+        if expanded {
+            rdf::serialize_expanded_jsonld(&dataset, &graph_order)
+        } else {
+            rdf::serialize_ordered(dataset, &graph_order, format, &prefixes)
+        }
+    })
+    .map_err(rdf_error)
 }
 
 /// Graph terms for the IRIs and blank nodes of one serialize call, each
@@ -199,6 +229,14 @@ impl<'py> Nodes<'py> {
             ir_term(&object)
         }
     }
+}
+
+/// `term` in N-Triples syntax: an IRI, blank node, literal (a Python value
+/// included) or `fluree.Triple`.
+#[pyfunction]
+pub(crate) fn term_ntriples(term: &Bound<'_, PyAny>) -> PyResult<String> {
+    let term = Nodes::default().object(term.clone())?;
+    rdf::term_ntriples(&term).map_err(rdf_error)
 }
 
 fn rdf_error(error: RdfError) -> PyErr {

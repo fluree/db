@@ -11,7 +11,7 @@ default = []
 # Enables the Raft-replicated `Committer` implementation. Off by default
 # so that monolithic users don't compile (or link) openraft and its
 # transitive dependencies.
-raft = ["fluree-raft-core/raft", "dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:http-body-util", "dep:futures", "dep:tokio-util"]
+raft = ["fluree-raft-core/raft", "dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:http-body-util", "dep:futures", "dep:tokio-util", "dep:ulid"]
 
 # Runs the bespoke nameservice adapter through `fluree-raft-core`'s
 # shared adapter-conformance fixture. Test-only: it pulls the fixture
@@ -69,6 +69,10 @@ futures = { workspace = true, optional = true }
 # uses it.
 tokio-util = { version = "0.7", optional = true }
 
+# Names each queued submission in its envelope. Gated behind `raft`
+# because only the queued transactor stamps one.
+ulid = { workspace = true, optional = true }
+
 # In-memory concurrent map for the per-process WaiterMap: queue_id →
 # oneshot::Sender. Gated behind `raft` because only the queue-mediated
 # committer / state machine adapter reach for it.
@@ -79,6 +83,8 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # The lifecycle conformance suite, run against a single-node raft.
 fluree-db-nameservice = { path = "../fluree-db-nameservice", features = ["conformance"] }
 tempfile = "3.19"
+# Counts the commit-worker supervisor's spawn events.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
