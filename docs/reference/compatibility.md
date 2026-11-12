@@ -599,6 +599,12 @@ only when a non-root policy context governed the request, so clients that
 ignore unknown fields are unaffected. See
 [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
+#### Bulk import stored wrong `rdf:JSON` and `xsd:duration` values (data integrity)
+
+Every release since 4.0.0 indexed the `rdf:JSON` and `xsd:duration` values of a bulk import (`fluree create --from`, and `fluree graph import` since it was added) under the wrong dictionary entry. A query read back some other text the ledger held instead of the value: a string from another statement, a file name, a hash, different from one import to the next. A JSON-LD or SPARQL result that included such a JSON value could fail with "Invalid JSON in @json value". Ledgers built by transactions were not affected. Imports now store these values as written.
+
+A ledger built or extended by an import in an earlier release, with `rdf:JSON` or `xsd:duration` values, still holds the wrong entries in its index. The ledger's commits hold the values as written, so [`fluree reindex`](../cli/reindex.md), which rebuilds the index from the commits, repairs it; a re-import is not needed. Reindex even if the ledger has been written to since the import. A value an update copied out of such a ledger before the repair (an `INSERT … WHERE` that bound it) was written with the wrong text, and a reindex does not change it.
+
 ## Supported Data Formats
 
 ### JSON-LD

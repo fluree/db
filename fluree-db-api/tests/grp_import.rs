@@ -21,6 +21,8 @@ mod it_import_ns_split_mode;
 mod it_import_remote;
 #[path = "it_import_skolem.rs"]
 mod it_import_skolem;
+#[path = "it_import_string_keyed_values.rs"]
+mod it_import_string_keyed_values;
 #[path = "it_import_turtle_star.rs"]
 mod it_import_turtle_star;
 #[path = "it_import_v3.rs"]
