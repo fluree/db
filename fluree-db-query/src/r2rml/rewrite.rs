@@ -140,9 +140,12 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
 /// - `GRAPH` is its own scope — already covered by the rewrite guard;
 /// - `SERVICE` targets another ledger or endpoint, which may have a native
 ///   index, so refusing on its body would reject a query that works;
-/// - the RDF-star `EdgeAnnotation`/`AnnotationTarget` bodies are left untouched
-///   here exactly as the rewriter leaves them (RDF-star over a graph source is
-///   undefined rather than confirmed silently-empty).
+/// - the RDF-star `EdgeAnnotation`/`AnnotationTarget` patterns are left
+///   untouched here as the rewriter leaves them, and do not count as reading
+///   this view: a mapping produces no annotation, so they match nothing over a
+///   graph source, which is the answer a ledger holding the mapping's triples
+///   gives too (one refuses a user-written `f:reifies*` triple). Refusing a
+///   sub-select whose body is only annotations would refuse a correct answer.
 pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static str> {
     let mut kinds = Vec::new();
     collect_unsupported_outside_graph_scopes(patterns, &mut kinds);
@@ -407,9 +410,12 @@ pub fn rewrite_patterns_for_r2rml(
             // `graph_source_id` and route independently; `R2rml` is already
             // converted; nested `Graph`/`DefaultGraphSource` re-enter routing
             // for their own target; the RDF-star `EdgeAnnotation`/
-            // `AnnotationTarget` are expanded during planning (RDF-star over
-            // R2RML is undefined — left untouched here, not silently-empty in
-            // the confirmed sense).
+            // `AnnotationTarget` are expanded during planning and match
+            // nothing here, which is correct: a mapping produces no annotation,
+            // and a ledger holding its triples holds none either. A `ListView`
+            // never reaches here from a graph-source scope: the callers strip
+            // the list view first (`list_view::without_list_view`), since a
+            // mapping holds no list values.
             Pattern::Filter(_)
             | Pattern::ListView(_)
             | Pattern::Bind { .. }
