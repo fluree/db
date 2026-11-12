@@ -437,10 +437,11 @@ impl SubjectData {
             // Handle rdf:type specially. `@type` holds only IRIs, so an
             // annotated type, or a list, is written as an `rdf:type` property.
             if pred_iri == dt_iri::RDF_TYPE && config.type_handling.use_at_type() {
+                let mut types = HashSet::new();
                 for (_, triple) in &triples {
                     let rs = reifiers.get(triple);
                     if rs.is_none() && !collections.heads.contains_key(&triple.o) {
-                        add_type_value(&mut node, &triple.o, config, bnode_renamer);
+                        add_type_value(&mut node, &triple.o, config, bnode_renamer, &mut types);
                         continue;
                     }
                     let mut obj = collections.object(&triple.o, config, bnode_renamer);
@@ -653,12 +654,15 @@ fn literal_value_to_json(value: &LiteralValue) -> JsonValue {
     }
 }
 
-/// Add a @type value to a node
+/// Add a @type value to a node, once. `seen` holds the node's types once it
+/// has two, so a node with many types costs one lookup per type, not a scan
+/// of the ones before it.
 fn add_type_value(
     node: &mut Map<String, JsonValue>,
     object: &Term,
     config: &JsonLdFormatConfig,
     bnode_renamer: &mut BlankNodeRenamer,
+    seen: &mut HashSet<String>,
 ) {
     // Extract the type IRI
     let type_iri = match object {
@@ -674,15 +678,16 @@ fn add_type_value(
         }
         Some(JsonValue::Array(arr)) => {
             // Already an array: push if not duplicate
-            let val = JsonValue::String(type_iri);
-            if !arr.contains(&val) {
-                arr.push(val);
+            if seen.insert(type_iri.clone()) {
+                arr.push(JsonValue::String(type_iri));
             }
         }
         Some(existing) => {
             // Single value: convert to array if different
             let prev = existing.as_str().unwrap_or_default().to_string();
             if prev != type_iri {
+                seen.insert(prev.clone());
+                seen.insert(type_iri.clone());
                 *existing =
                     JsonValue::Array(vec![JsonValue::String(prev), JsonValue::String(type_iri)]);
             }
@@ -836,6 +841,36 @@ mod tests {
         assert!(types.is_array());
         let arr = types.as_array().unwrap();
         assert_eq!(arr.len(), 2);
+    }
+
+    /// A node's types are written once each, in time linear in their number:
+    /// 200k of them take well under a second, where a scan of the types
+    /// before each one takes minutes.
+    #[test]
+    fn many_types_are_written_once_each_in_linear_time() {
+        const N: usize = 200_000;
+        let limit = std::time::Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let s = || Term::iri("http://example.org/s");
+            let class = |i: usize| Term::iri(format!("http://example.org/C{i}"));
+            let mut graph = Graph::new();
+            for i in 0..N {
+                graph.add_triple(s(), Term::iri(rdf::TYPE), class(i));
+            }
+            // Not canonicalized, so the repeat reaches the writer.
+            graph.add_triple(s(), Term::iri(rdf::TYPE), class(0));
+            let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+            let types = result["@graph"][0]["@type"].as_array().cloned();
+            let _ = tx.send(types);
+        });
+        let types = rx
+            .recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("writing the types ran past {limit:?}"))
+            .expect("an array of types");
+        assert_eq!(types.len(), N);
+        assert_eq!(types[0], "http://example.org/C0");
+        assert_eq!(types[N - 1], format!("http://example.org/C{}", N - 1));
     }
 
     #[test]
