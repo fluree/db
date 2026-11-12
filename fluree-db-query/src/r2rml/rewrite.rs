@@ -90,7 +90,9 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
         .join(", ");
     // Only the out-of-scope guard reports a sub-select (inside a graph scope
     // the rewrite lowers its body), so its advice is to move it into one.
-    let paths = unique.iter().any(|kind| *kind != "subquery");
+    let paths = unique
+        .iter()
+        .any(|kind| *kind != "subquery" && *kind != MODIFIER_EXISTS);
     let mut advice = Vec::with_capacity(2);
     if paths {
         advice.push(
@@ -103,6 +105,13 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
             "A sub-select reads a graph source only from inside that source's graph \
              block; move it there, or drop the explicit graph block so the whole query \
              is scoped to the graph source.",
+        );
+    }
+    if unique.contains(&MODIFIER_EXISTS) {
+        advice.push(
+            "HAVING, ORDER BY, and the expressions a query evaluates after a trailing \
+             VALUES run outside the graph source's scope; move the condition into \
+             WHERE as a FILTER, or BIND it to a variable there and use that variable.",
         );
     }
     crate::error::QueryError::InvalidQuery(format!(
@@ -165,13 +174,19 @@ fn collect_unsupported_outside_graph_scopes(
             // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
-            // A sub-select whose body reads this view, which no rewrite
-            // reaches out here (see above).
+            // A sub-select whose body, or HAVING / ORDER BY, reads this view,
+            // which no rewrite reaches out here (see above).
             Pattern::Subquery(sq) => {
-                if collect_unsupported_outside_graph_scopes(&sq.patterns, kinds) {
+                let body = collect_unsupported_outside_graph_scopes(&sq.patterns, kinds);
+                if body | collect_embedded_outside_graph_scopes(pattern, kinds) {
                     kinds.push("subquery");
                     reads_view = true;
                 }
+            }
+            // An EXISTS (or other pattern) embedded in an expression evaluates
+            // against this view, as an `EXISTS` pattern's body does.
+            Pattern::Filter(_) | Pattern::Bind { .. } | Pattern::Unwind { .. } => {
+                reads_view |= collect_embedded_outside_graph_scopes(pattern, kinds);
             }
             // The leaves that read this view's index.
             Pattern::Triple(_) | Pattern::ListView(_) => reads_view = true,
@@ -192,10 +207,7 @@ fn collect_unsupported_outside_graph_scopes(
             // elsewhere, or its own scope — see the doc comment. Listed
             // exhaustively so a new pattern variant that reads this view's
             // index forces a decision here.
-            Pattern::Filter(_)
-            | Pattern::Bind { .. }
-            | Pattern::Unwind { .. }
-            | Pattern::Values { .. }
+            Pattern::Values { .. }
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
             | Pattern::R2rml(_)
@@ -208,6 +220,109 @@ fn collect_unsupported_outside_graph_scopes(
         }
     }
     reads_view
+}
+
+/// [`collect_unsupported_outside_graph_scopes`] over the patterns embedded in
+/// `pattern`'s own expressions (see [`for_each_own_expression`]); returns
+/// whether any of them reads this view.
+fn collect_embedded_outside_graph_scopes(pattern: &Pattern, kinds: &mut Vec<&'static str>) -> bool {
+    let mut reads_view = false;
+    for_each_own_expression(pattern, &mut |expr| {
+        expr.for_each_embedded_patterns(&mut |inner| {
+            reads_view |= collect_unsupported_outside_graph_scopes(inner, kinds);
+        });
+    });
+    reads_view
+}
+
+/// The kind [`unsupported_query_modifiers`] reports, named in the refusal.
+const MODIFIER_EXISTS: &str = "EXISTS outside the WHERE clause";
+
+/// The kinds of pattern a graph source cannot evaluate in a query's own
+/// `HAVING`, per-group binds and `ORDER BY` expressions, and in the binds it
+/// evaluates after a trailing `VALUES` (`then`: GROUP BY expressions,
+/// aggregate inputs and SELECT expressions, which a trailing `VALUES` moves
+/// out of the `WHERE`), on a query whose default view is a graph source: an
+/// `EXISTS` or other embedded pattern.
+///
+/// Those expressions run after the `WHERE`, outside the graph scope the API
+/// layer wraps the `WHERE` in, so an embedded pattern there reads the graph
+/// source's empty native index whether or not the query wrote a `GRAPH` block
+/// of its own: an `EXISTS` is always false, a `NOT EXISTS` always true. One
+/// that reads the default view is refused, as a sub-select's body is; one that
+/// reads only through a `GRAPH` block of its own, or reads no index, is left
+/// alone, and the paths inside any of them are collected.
+pub fn unsupported_query_modifiers(
+    grouping: Option<&crate::ir::Grouping>,
+    order_binds: &[(VarId, Expression)],
+    then: &[(VarId, Expression)],
+) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    let mut reads_view = false;
+    let mut visit = |expr: &Expression| {
+        expr.for_each_embedded_patterns(&mut |inner| {
+            reads_view |= collect_unsupported_outside_graph_scopes(inner, &mut kinds);
+        });
+    };
+    if let Some(grouping) = grouping {
+        grouping.having().into_iter().for_each(&mut visit);
+        grouping.binds().for_each(|(_, expr)| visit(expr));
+    }
+    order_binds
+        .iter()
+        .chain(then)
+        .for_each(|(_, expr)| visit(expr));
+    if reads_view {
+        kinds.push(MODIFIER_EXISTS);
+    }
+    kinds
+}
+
+/// Visit the expressions `pattern` evaluates itself: a `FILTER`'s, a
+/// `BIND`'s, an `UNWIND`'s list, and a sub-select's `HAVING`, per-group binds
+/// and `ORDER BY` expressions. Not those of the patterns nested inside it; a
+/// caller that walks nested patterns reaches theirs on its own.
+fn for_each_own_expression(pattern: &Pattern, f: &mut dyn FnMut(&Expression)) {
+    match pattern {
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            f(expr);
+        }
+        Pattern::Subquery(sq) => {
+            if let Some(grouping) = &sq.grouping {
+                grouping.having().into_iter().for_each(&mut *f);
+                grouping.binds().for_each(|(_, expr)| f(expr));
+            }
+            sq.order_binds.iter().for_each(|(_, expr)| f(expr));
+        }
+        _ => {}
+    }
+}
+
+/// Replace each pattern list embedded in `pattern`'s own expressions with
+/// `rewrite`'s result for it.
+fn rewrite_embedded_patterns(
+    pattern: &mut Pattern,
+    rewrite: &mut dyn FnMut(&[Pattern]) -> Vec<Pattern>,
+) {
+    for_each_own_expression_mut(pattern, &mut |expr| {
+        expr.for_each_embedded_patterns_mut(&mut |inner| *inner = rewrite(inner));
+    });
+}
+
+/// [`for_each_own_expression`], with each expression given to `f` to change.
+fn for_each_own_expression_mut(pattern: &mut Pattern, f: &mut dyn FnMut(&mut Expression)) {
+    match pattern {
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            f(expr);
+        }
+        Pattern::Subquery(sq) => {
+            if let Some(grouping) = &mut sq.grouping {
+                grouping.for_each_expression_mut(f);
+            }
+            sq.order_binds.iter_mut().for_each(|(_, expr)| f(expr));
+        }
+        _ => {}
+    }
 }
 
 /// The typed refusal for an R2RML graph-source query carrying `unconverted`
@@ -368,9 +483,36 @@ pub fn rewrite_patterns_for_r2rml(
                 if let Some(reads) = written_order_reads(pattern) {
                     barrier_vars.push((i, reads));
                 }
-                let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
+                let mut nested = |inner: &[Pattern]| {
                     let r = rewrite_patterns_for_r2rml(
-                        &inner,
+                        inner,
+                        graph_source_id,
+                        snapshot,
+                        mapping,
+                        reasoning_active,
+                        crawl_active,
+                    );
+                    converted += r.converted_count;
+                    unconverted += r.unconverted_count;
+                    unsupported.extend(r.unsupported);
+                    r.patterns
+                };
+                let mut rewritten = pattern.clone().map_subpatterns(&mut |inner| nested(&inner));
+                // A sub-select's HAVING and ORDER BY can embed an EXISTS.
+                rewrite_embedded_patterns(&mut rewritten, &mut nested);
+                result_patterns.push(rewritten);
+                origins.push(i);
+            }
+            // An EXISTS (or other pattern) embedded in an expression reads
+            // this graph source like an `EXISTS` pattern's body, so it is
+            // lowered as its own scope too; left alone it would read the
+            // source's empty native index (an `EXISTS` always false). An
+            // expression that embeds no pattern is passed through unchanged.
+            Pattern::Filter(_) | Pattern::Bind { .. } | Pattern::Unwind { .. } => {
+                let mut rewritten = pattern.clone();
+                rewrite_embedded_patterns(&mut rewritten, &mut |inner| {
+                    let r = rewrite_patterns_for_r2rml(
+                        inner,
                         graph_source_id,
                         snapshot,
                         mapping,
@@ -405,7 +547,7 @@ pub fn rewrite_patterns_for_r2rml(
                 origins.push(i);
             }
             // Preserve the rest as-is. These do NOT hydrate this graph's index:
-            // Filter/Bind/Unwind/Values transform already-bound solutions;
+            // Values binds constants;
             // IndexSearch/VectorSearch/GeoSearch/S2Search carry their own
             // `graph_source_id` and route independently; `R2rml` is already
             // converted; nested `Graph`/`DefaultGraphSource` re-enter routing
@@ -416,10 +558,7 @@ pub fn rewrite_patterns_for_r2rml(
             // never reaches here from a graph-source scope: the callers strip
             // the list view first (`list_view::without_list_view`), since a
             // mapping holds no list values.
-            Pattern::Filter(_)
-            | Pattern::ListView(_)
-            | Pattern::Bind { .. }
-            | Pattern::Unwind { .. }
+            Pattern::ListView(_)
             | Pattern::Values { .. }
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
@@ -3812,6 +3951,121 @@ mod tests {
             unsupported_outside_graph_scopes(&[sub(vec![path, in_graph(vec![reads()])])]),
             vec!["property path"],
             "a path in the body is still flagged"
+        );
+    }
+
+    /// A pattern embedded in an expression (an `EXISTS`) reads the scope it
+    /// sits in. Inside a graph-source scope the rewrite lowers it with the
+    /// rest; outside every graph scope the guard counts it as reading this
+    /// view (so a sub-select carrying one refuses), flags the paths in it,
+    /// and refuses one in the query's own HAVING / ORDER BY.
+    #[test]
+    fn a_pattern_embedded_in_an_expression_reads_its_scope() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        use crate::ir::GraphName;
+
+        let reads = || triple(0, PRED, Term::Var(VarId(1)));
+        let exists = |patterns: Vec<Pattern>| Expression::Exists {
+            patterns,
+            negated: false,
+        };
+        let in_graph = |patterns: Vec<Pattern>| Pattern::Graph {
+            name: GraphName::Iri("gs:main".into()),
+            patterns,
+        };
+        let path = || {
+            Pattern::PropertyPath(PropertyPathPattern::new(
+                Ref::Var(VarId(0)),
+                Sid::new(100, "edge"),
+                PathModifier::OneOrMore,
+                Ref::Var(VarId(1)),
+            ))
+        };
+        let sub = |patterns: Vec<Pattern>| {
+            Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], patterns))
+        };
+        let bind = |expr| Pattern::Bind {
+            var: VarId(2),
+            expr,
+        };
+
+        // Inside a graph-source scope: lowered, in a FILTER, a BIND and a
+        // sub-select's ORDER BY alike.
+        let lowered = |p: &Pattern| {
+            let mut found = Vec::new();
+            for_each_own_expression(p, &mut |expr| {
+                expr.for_each_embedded_patterns(&mut |inner| {
+                    found.push(inner.iter().all(|q| matches!(q, Pattern::R2rml(_))));
+                });
+            });
+            assert!(!found.is_empty(), "no embedded patterns in {p:?}");
+            found.into_iter().all(|x| x)
+        };
+        let mut ordered = SubqueryPattern::new(vec![VarId(0)], vec![reads()]);
+        ordered.order_binds = vec![(VarId(3), exists(vec![reads()]))];
+        for p in [
+            Pattern::Filter(exists(vec![reads()])),
+            bind(exists(vec![reads()])),
+            Pattern::Subquery(ordered.clone()),
+        ] {
+            let out = rewrite_scope(std::slice::from_ref(&p), false);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(lowered(&out[0]), "{out:?}");
+        }
+        // A path in one still refuses the scope.
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Filter(exists(vec![path()]))],
+            "gs:main",
+            &snapshot,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(r.unsupported, vec!["property path"]);
+
+        // Outside every graph scope.
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![Pattern::Filter(exists(vec![reads()]))])]),
+            vec!["subquery"],
+            "a sub-select whose FILTER EXISTS reads this view"
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[Pattern::Subquery(ordered)]),
+            vec!["subquery"],
+            "a sub-select whose ORDER BY reads this view"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![bind(exists(vec![in_graph(vec![
+                reads()
+            ])]))])])
+            .is_empty(),
+            "an EXISTS that reads only through its own graph block"
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[bind(exists(vec![path()]))]),
+            vec!["property path"],
+            "a path in an embedded EXISTS"
+        );
+
+        // The query's own HAVING / ORDER BY.
+        assert_eq!(
+            unsupported_query_modifiers(None, &[], &[(VarId(3), exists(vec![reads()]))]),
+            vec![MODIFIER_EXISTS]
+        );
+        assert!(
+            unsupported_query_modifiers(
+                None,
+                &[(VarId(3), exists(vec![in_graph(vec![reads()])]))],
+                &[]
+            )
+            .is_empty(),
+            "an EXISTS that reads only through its own graph block"
+        );
+        assert!(
+            unsupported_query_modifiers(None, &[(VarId(3), Expression::Var(VarId(0)))], &[])
+                .is_empty()
         );
     }
 
