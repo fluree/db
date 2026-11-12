@@ -26,9 +26,8 @@ use crate::operator::{BoxedOperator, Operator};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::TermView;
-use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
-};
+use fluree_db_core::range::range_with_overlay_tracked;
+use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
 use fluree_vocab::namespaces::XSD;
 use fluree_vocab::xsd_names;
 use std::collections::{HashMap, HashSet};
@@ -257,7 +256,7 @@ async fn read_held(
     let mut beside = HashSet::new();
     let mut lists = 0;
     for graph in graphs {
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             graph.snapshot,
             graph.g_id,
             graph.overlay,
@@ -267,6 +266,7 @@ async fn read_held(
                 .with_subject(s.clone())
                 .with_predicate(p.clone()),
             RangeOptions::new().with_to_t(graph.to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         let flakes: Vec<_> = flakes.into_iter().filter(|f| f.op).collect();

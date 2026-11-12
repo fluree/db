@@ -32,9 +32,8 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
-};
+use fluree_db_core::range::range_with_overlay_tracked;
+use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -163,7 +162,7 @@ impl ShortestPathOperator {
 
         let mut out = Vec::new();
         for graph in &ctx.path_graphs()? {
-            self.graph_neighbors(graph, node, use_spot, use_post, &mut out)
+            self.graph_neighbors(ctx, graph, node, use_spot, use_post, &mut out)
                 .await?;
         }
         Ok(out)
@@ -172,6 +171,7 @@ impl ShortestPathOperator {
     /// [`Self::neighbors`] within one graph of the path scope.
     async fn graph_neighbors(
         &self,
+        ctx: &ExecutionContext<'_>,
         graph: &PathGraph<'_>,
         node: &Sid,
         use_spot: bool,
@@ -187,7 +187,7 @@ impl ShortestPathOperator {
             if let Some(pred) = &self.pattern.predicate {
                 range_match = range_match.with_predicate(pred.clone());
             }
-            let flakes = range_with_overlay(
+            let flakes = range_with_overlay_tracked(
                 db,
                 graph.g_id,
                 overlay,
@@ -195,6 +195,7 @@ impl ShortestPathOperator {
                 RangeTest::Eq,
                 range_match,
                 RangeOptions::new().with_to_t(to_t),
+                Some(&ctx.tracker),
             )
             .await?;
             for flake in flakes {
@@ -224,7 +225,7 @@ impl ShortestPathOperator {
                     RangeMatch::new().with_object(FlakeValue::Ref(node.clone())),
                 ),
             };
-            let flakes = range_with_overlay(
+            let flakes = range_with_overlay_tracked(
                 db,
                 graph.g_id,
                 overlay,
@@ -232,6 +233,7 @@ impl ShortestPathOperator {
                 RangeTest::Eq,
                 range_match,
                 RangeOptions::new().with_to_t(to_t),
+                Some(&ctx.tracker),
             )
             .await?;
             for flake in flakes {
@@ -256,7 +258,7 @@ impl ShortestPathOperator {
         b: &Sid,
     ) -> Result<Option<Sid>> {
         for graph in ctx.path_graphs()? {
-            let flakes = range_with_overlay(
+            let flakes = range_with_overlay_tracked(
                 graph.snapshot,
                 graph.g_id,
                 graph.overlay,
@@ -264,6 +266,7 @@ impl ShortestPathOperator {
                 RangeTest::Eq,
                 RangeMatch::new().with_subject(a.clone()),
                 RangeOptions::new().with_to_t(graph.to_t),
+                Some(&ctx.tracker),
             )
             .await?;
             for flake in flakes {

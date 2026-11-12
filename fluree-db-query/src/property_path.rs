@@ -43,9 +43,10 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_core::range::range_with_overlay_tracked;
 use fluree_db_core::{
-    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, IndexType, LedgerSnapshot,
-    RangeMatch, RangeOptions, RangeTest, Sid,
+    DatatypeConstraint, Flake, FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeOptions,
+    RangeTest, Sid,
 };
 use rustc_hash::FxHashSet;
 use std::collections::{HashSet, VecDeque};
@@ -451,7 +452,7 @@ impl PropertyPathOperator {
         index: IndexType,
         range_match: RangeMatch,
     ) -> Result<Vec<Flake>> {
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             graph.snapshot,
             graph.g_id,
             graph.overlay,
@@ -459,6 +460,7 @@ impl PropertyPathOperator {
             RangeTest::Eq,
             range_match,
             RangeOptions::new().with_to_t(graph.to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         ctx.tracker.consume_fuel(

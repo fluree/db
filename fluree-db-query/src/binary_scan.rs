@@ -19,14 +19,15 @@ use fluree_db_binary_index::{
     LeafletCache, OverlayOp,
 };
 use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::range::range_with_overlay_tracked;
 use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{
-    range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, IndexType, LedgerSnapshot,
-    NoOverlay, ObjectBounds, OverlayProvider, RangeMatch, RangeOptions, RangeTest,
-    RuntimePredicateId, RuntimeSmallDicts, Sid,
+    Flake, FlakeMeta, FlakeValue, GraphId, IndexType, LedgerSnapshot, NoOverlay, ObjectBounds,
+    OverlayProvider, RangeMatch, RangeOptions, RangeTest, RuntimePredicateId, RuntimeSmallDicts,
+    Sid,
 };
 
 use crate::binding::{Batch, Binding};
@@ -1049,7 +1050,7 @@ impl BinaryScanOperator {
             history_mode: self.mode.is_history(),
             ..Default::default()
         };
-        let mut flakes = range_with_overlay(
+        let mut flakes = range_with_overlay_tracked(
             ctx.active_snapshot,
             self.g_id,
             overlay,
@@ -1057,6 +1058,7 @@ impl BinaryScanOperator {
             RangeTest::Eq,
             match_val,
             opts,
+            Some(&ctx.tracker),
         )
         .await
         .map_err(|e| QueryError::Internal(format!("range_with_overlay: {e}")))?;

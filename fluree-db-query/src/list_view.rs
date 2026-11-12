@@ -30,9 +30,10 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::namespaces::{is_rdf_first, is_rdf_rest};
+use fluree_db_core::range::range_with_overlay_tracked;
 use fluree_db_core::{
-    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, GraphId, IndexType, LedgerSnapshot,
-    OverlayProvider, RangeMatch, RangeOptions, RangeTest, Sid,
+    DatatypeConstraint, Flake, FlakeValue, GraphId, IndexType, LedgerSnapshot, OverlayProvider,
+    RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
@@ -1167,7 +1168,7 @@ async fn read_lists_in(
     let mut by_owner: Vec<List> = Vec::new();
     let mut slot: HashMap<Owner, usize> = HashMap::new();
     for (index, range_match) in reads {
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             graph.snapshot,
             graph.g_id,
             graph.overlay,
@@ -1175,6 +1176,7 @@ async fn read_lists_in(
             RangeTest::Eq,
             range_match,
             RangeOptions::new().with_to_t(graph.to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         let members: Vec<Flake> = flakes
