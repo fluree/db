@@ -8882,8 +8882,9 @@ mod tests {
     /// rows minting a second subject that disagree on the customer (1000 vs 1002). A
     /// key minting two subjects joins a fact row to each (#1583), which a membership
     /// set cannot count, so the fuse declines to the generic path in every arrival
-    /// order, whichever subject sorts first (`o50` after `o10`, `o05` before it). Only
-    /// rows all alike, as in the clean fixture, fuse.
+    /// order, whichever subject sorts first (`o50` after `o10`, `o05` before it), and
+    /// so it does when the second subject's rows agree with `o10`'s on everything
+    /// else. Only rows all alike, as in the clean fixture, fuse.
     #[tokio::test]
     async fn p3_semijoin_decline_does_not_depend_on_row_order() {
         use crate::var_registry::VarRegistry;
@@ -8946,6 +8947,10 @@ mod tests {
             (
                 "second subject before o10",
                 [("o05", 10, 1000), ("o05", 10, 1002), ("o10", 10, 1000)],
+            ),
+            (
+                "second subject agreeing on the customer",
+                [("o50", 10, 1000), ("o50", 10, 1000), ("o10", 10, 1000)],
             ),
         ] {
             for order_batches in orders_of(key10) {
