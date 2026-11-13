@@ -1411,7 +1411,7 @@ curl -X POST http://localhost:8090/v1/fluree/query \
   }'
 ```
 
-### POST /query/{ledger}
+### POST /query/\{ledger\}
 
 Execute a query against a specific ledger (ledger-scoped).
 
@@ -1623,7 +1623,7 @@ WHERE {
 ORDER BY ?t'
 ```
 
-### POST /stream/query and /stream/query/{ledger}
+### POST /stream/query and /stream/query/\{ledger\}
 
 Stream SELECT results incrementally as newline-delimited JSON
 (`application/x-ndjson`) instead of buffering the whole result into one
@@ -1757,7 +1757,7 @@ curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   --data 'MATCH (n:Person {id: 7}) RETURN n'
 ```
 
-### POST/GET /graphql/{ledger...}
+### POST/GET /graphql/\{ledger...\}
 
 Execute a GraphQL request against the schema derived from the ledger's own data.
 There is nothing to register first: any ledger with typed subjects has a schema.
@@ -1821,7 +1821,7 @@ curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
   -d '{"query": "mutation { create_Person(input: {name: \"Alice\"}) { id } }"}'
 ```
 
-### GET /graphql-schema/{ledger...}
+### GET /graphql-schema/\{ledger...\}
 
 The derived schema as GraphQL SDL, including mutations when the ledger's
 `graphql:Schema` enables them.
@@ -1847,7 +1847,7 @@ type Query {
 }
 ```
 
-### GET/POST /validate/{ledger...}
+### GET/POST /validate/\{ledger...\}
 
 Validate the current state of a ledger (or one of its named graphs) against SHACL shapes and return a **validation report** — the HTTP surface of `fluree validate`. Unlike transaction-time enforcement, this never rejects anything; it reports every result it finds. Requires the `shacl` build feature (on by default).
 
@@ -2289,7 +2289,7 @@ POST /dropped/sweep
 - `200 OK` - Swept (or, on a dry run, reported)
 - `400 Bad Request` - Invalid body
 
-### GET /context/{ledger...}
+### GET /context/\{ledger...\}
 
 Get the default JSON-LD context for a ledger.
 
@@ -2327,7 +2327,7 @@ If no default context has been set, `"@context"` is `null`.
 curl http://localhost:8090/v1/fluree/context/mydb:main
 ```
 
-### PUT /context/{ledger...}
+### PUT /context/\{ledger...\}
 
 Replace the default JSON-LD context for a ledger.
 
@@ -2462,7 +2462,7 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
   -d '{"ledger": "mydb", "branch": "q2", "at": "time:2026-07-01T00:00:00Z"}'
 ```
 
-### GET /branch/{ledger-name}
+### GET /branch/\{ledger-name\}
 
 List all non-retracted branches for a ledger.
 
@@ -2830,7 +2830,7 @@ curl -X POST http://localhost:8090/v1/fluree/merge \
   -d '{"ledger": "mydb", "source": "dev", "target": "main", "strategy": "take-source"}'
 ```
 
-### GET /merge-preview/{ledger-name}
+### GET /merge-preview/\{ledger-name\}
 
 Read-only preview of merging a source branch into a target branch. Returns the rich diff — ahead/behind commit summaries, conflict keys, and fast-forward eligibility — without mutating any nameservice or content store state.
 
@@ -2968,7 +2968,7 @@ curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_chan
 curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true&changes_after_subject=http%3A%2F%2Fexample.org%2Fns%2Falice"
 ```
 
-### GET /info/{ledger-id}
+### GET /info/\{ledger-id\}
 
 Get ledger metadata. Used by the CLI for `info`, `push`, `pull`, and `clone`.
 
@@ -3044,7 +3044,7 @@ curl "http://localhost:8090/v1/fluree/info/mydb:main" \
   -H "Authorization: Bearer eyJ..."
 ```
 
-### GET /retention/{ledger-id}
+### GET /retention/\{ledger-id\}
 
 A branch's [TTL](../transactions/ttl.md) retention status: whether it is registered for expiration processing, the commit its retention input is honored from, how far the worker has read its commits, scheduled and expired counts, the next due time, and problems that block or degrade processing.
 
@@ -3084,7 +3084,7 @@ A ledger with [history retention](../transactions/history-retention.md#status) a
 - `401 Unauthorized` - Authentication required
 - `404 Not Found` - Ledger not found
 
-### GET /exists/{ledger-id}
+### GET /exists/\{ledger-id\}
 
 Check if a ledger exists in the nameservice.
 
@@ -4076,7 +4076,7 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 
 When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
 
-### POST /remove/{ledger-id}
+### POST /remove/\{ledger-id\}
 
 Remove selected occurrences of facts from what a ledger serves, now and in history. See [History retention](../transactions/history-retention.md#targeted-removal). Admin-protected; the admin token's identity is recorded with each removal (`requester` in the journal, which only auditors see). In a cluster the request is forwarded to the leader.
 
@@ -4121,7 +4121,7 @@ Either list may be empty. `matching[].graph` names a graph (absent for the defau
 - `401 Unauthorized` - Admin token required
 - `404 Not Found` - Ledger not found, or nothing in its history matches the request
 
-### POST /erase/{ledger-id}
+### POST /erase/\{ledger-id\}
 
 Permanently erase selected occurrences from the commits that hold them, under a zero-knowledge proof. See [Permanent erasure](../transactions/permanent-erasure.md). Admin-protected; the admin token's identity is recorded as the requester. In a cluster the request is forwarded to the leader.
 
