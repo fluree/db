@@ -76,6 +76,8 @@ async fn stream_pack_rejects_empty_want_with_error_frame() {
         include_txns: true,
         want_index_root_id: None,
         have_index_root_id: None,
+        erasures: false,
+        held_erasures: Vec::new(),
     };
 
     let (tx, rx) = mpsc::channel(64);

@@ -189,6 +189,9 @@ async fn import_ledger_from_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &st
                 }
             }
             PackFrame::Error(msg) => panic!("error frame in pack: {msg}"),
+            PackFrame::Erasure(_)
+            | PackFrame::Authorization(_)
+            | PackFrame::ErasureArtifact { .. } => panic!("nothing here is erased"),
             PackFrame::End => break,
         }
     }
@@ -1070,6 +1073,9 @@ async fn flpack_stream_structure_is_valid() {
                 }
             }
             PackFrame::Error(msg) => panic!("unexpected error frame: {msg}"),
+            PackFrame::Erasure(_)
+            | PackFrame::Authorization(_)
+            | PackFrame::ErasureArtifact { .. } => panic!("nothing here is erased"),
             PackFrame::End => {
                 frame_types.push("End".to_string());
                 break;

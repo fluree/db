@@ -67,7 +67,7 @@ pub(crate) fn check_user_predicate(ns: u16, name: &str, shown: &str) -> Result<(
         return Ok(());
     }
     Err(TransactError::Parse(format!(
-        "txn-meta predicate {shown} uses a Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable"
+        "txn-meta predicate {shown} uses a Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable, besides a TTL default (f:ttl or f:expiresAt)"
     )))
 }
 
@@ -175,6 +175,7 @@ pub fn extract_txn_meta(
     }
 
     validate_limits(&entries)?;
+    crate::ttl_input::normalize_txn_meta_ttl(&mut entries).map_err(TransactError::Parse)?;
     Ok(entries)
 }
 
@@ -846,7 +847,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("only f:message and f:author are user-settable"),
+            err.contains("only f:message and f:author are user-settable, besides a TTL default (f:ttl or f:expiresAt)"),
             "unexpected error: {err}"
         );
     }
@@ -1059,7 +1060,7 @@ mod tests {
         let err = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap_err();
         assert!(
             err.to_string()
-                .contains("only f:message and f:author are user-settable"),
+                .contains("only f:message and f:author are user-settable, besides a TTL default (f:ttl or f:expiresAt)"),
             "unexpected error: {err}"
         );
     }

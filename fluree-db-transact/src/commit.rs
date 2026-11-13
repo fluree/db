@@ -25,9 +25,10 @@ use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::Unpublished;
 use fluree_db_core::{
-    ContentId, ContentKind, ContentStore, DictNovelty, Flake, GraphId, LedgerSnapshot, Sid,
-    TXN_META_GRAPH_ID,
+    ContentId, ContentKind, ContentStore, DictNovelty, Flake, GraphId, HashAlgorithm,
+    LedgerSnapshot, Sid, TXN_META_GRAPH_ID,
 };
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
@@ -107,6 +108,10 @@ pub struct StagedCommit {
     /// Tracking accounting from staging if `tracking` was set on the
     /// builder.
     pub tally: Option<fluree_db_core::TrackingTally>,
+    /// Pins on blobs this commit names that were stored ahead of it (the
+    /// raw transaction body): released once it is published, abandoned to
+    /// the collector if it never is.
+    pub pins: Unpublished,
     /// Build-time state needed by [`StagedCommit::apply`] /
     /// [`StagedCommit::finalize_state`] to construct the post-commit
     /// `LedgerState`. Private — callers shouldn't peek inside.
@@ -204,6 +209,12 @@ pub struct CommitOpts {
     /// When `None` on a dual-stamp ledger, defaults to wall clock (clamped
     /// monotonic). Normal ledgers (no event-time use) never emit it.
     pub received_at: Option<String>,
+    /// The hash the commit's CID (and its raw transaction blob's) is minted
+    /// with. The caller applies the deployment's choice; SHA2-256 by default.
+    pub content_hash: HashAlgorithm,
+    /// A system control commit, whose txn-meta is its content: it commits
+    /// with no flakes.
+    pub control: bool,
 }
 
 impl std::fmt::Debug for CommitOpts {
@@ -230,6 +241,8 @@ impl std::fmt::Debug for CommitOpts {
             .field("merge_parents", &self.merge_parents.len())
             .field("timestamp", &self.timestamp)
             .field("received_at", &self.received_at)
+            .field("content_hash", &self.content_hash)
+            .field("control", &self.control)
             .finish()
     }
 }
@@ -253,6 +266,8 @@ impl Clone for CommitOpts {
             merge_parents: self.merge_parents.clone(),
             timestamp: self.timestamp.clone(),
             received_at: self.received_at.clone(),
+            content_hash: self.content_hash,
+            control: self.control,
         }
     }
 }
@@ -281,7 +296,18 @@ impl CommitOpts {
         content_store: Arc<dyn fluree_db_core::ContentStore>,
         txn: serde_json::Value,
     ) -> Self {
-        self.raw_txn_upload = Some(PendingRawTxnUpload::spawn(content_store, txn));
+        self.raw_txn_upload = Some(PendingRawTxnUpload::spawn(
+            content_store,
+            txn,
+            self.content_hash,
+        ));
+        self
+    }
+
+    /// Mint the commit's CID (and its raw transaction blob's) with `alg`.
+    /// Set it before [`Self::with_raw_txn_spawned`], which hashes the blob.
+    pub fn with_content_hash(mut self, alg: HashAlgorithm) -> Self {
+        self.content_hash = alg;
         self
     }
 
@@ -333,6 +359,12 @@ impl CommitOpts {
         self
     }
 
+    /// A system control commit: it commits even with no flakes.
+    pub fn as_control(mut self) -> Self {
+        self.control = true;
+        self
+    }
+
     /// Set additional parent commit IDs for merge commits.
     pub fn with_merge_parents(mut self, parents: Vec<ContentId>) -> Self {
         self.merge_parents = parents;
@@ -340,6 +372,10 @@ impl CommitOpts {
     }
 
     /// Set the commit timestamp (ISO 8601). When not set, `Utc::now()` is used.
+    ///
+    /// A relative TTL counts from the commit's receive time, or from this
+    /// timestamp where the commit records none: a backfill that sets a past
+    /// time here should set [`Self::with_received_at`] too.
     pub fn with_timestamp(mut self, ts: impl Into<String>) -> Self {
         self.timestamp = Some(ts.into());
         self
@@ -416,6 +452,8 @@ impl CommitOptsRequest {
             merge_parents: Vec::new(),
             timestamp: self.timestamp,
             received_at: self.received_at,
+            content_hash: HashAlgorithm::default(),
+            control: false,
         }
     }
 }
@@ -741,6 +779,8 @@ pub async fn build_commit(
     check_no_same_t_pair(&view)?;
 
     // 1. Extract flakes from view
+    let mut view = view;
+    let system_txn_meta = view.take_system_txn_meta();
     let mut graph_drops = view.graph_drops().to_vec();
     let (mut base, flakes) = view.into_parts();
     // The checks below read the base's index; refuse before they fail on one
@@ -761,6 +801,8 @@ pub async fn build_commit(
         merge_parents,
         timestamp: opt_timestamp,
         received_at: opt_received_at,
+        content_hash,
+        control,
         ..
     } = opts;
 
@@ -791,8 +833,10 @@ pub async fn build_commit(
     // (if the ledger dual-stamps) is injected below.
     txn_meta.retain(|entry| {
         !(entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
-            && entry.predicate_name == fluree_vocab::db::RECEIVED_AT)
+            && (entry.predicate_name == fluree_vocab::db::RECEIVED_AT
+                || entry.predicate_name == fluree_vocab::db::RETENTION_CONTROL))
     });
+    txn_meta.extend(system_txn_meta);
 
     // No wrapper span: the caller's ambient span (e.g. `txn_commit`
     // from `commit()`, or whatever the Raft path opens) carries the
@@ -848,6 +892,7 @@ pub async fn build_commit(
         && merge_parents.is_empty()
         && !registers_new_graph
         && graph_drops.is_empty()
+        && !control
     {
         return Err(TransactError::EmptyTransaction);
     }
@@ -1054,7 +1099,7 @@ pub async fn build_commit(
         let _g = span.enter();
         crate::commit_v2::write_commit(&commit_record, true, signing)?
     };
-    let commit_cid = ContentId::new(ContentKind::Commit, &signed.bytes);
+    let commit_cid = ContentId::new_with(content_hash, ContentKind::Commit, &signed.bytes);
     commit_record.id = Some(commit_cid.clone());
 
     Ok(StagedCommit {
@@ -1063,6 +1108,7 @@ pub async fn build_commit(
         expected_head_ref,
         referenced_bytes: HashMap::new(),
         tally: None,
+        pins: Unpublished::new(),
         build_state: BuildState {
             base,
             new_t,
@@ -1085,13 +1131,11 @@ impl StagedCommit {
     /// `ApplyHead` path, rebase's batched replay publish) use
     /// [`Self::finalize_state`] instead.
     ///
-    /// On publish failure the raw-txn blob uploaded during
-    /// [`build_commit`] is deliberately left in place: it is
-    /// content-addressed and may be shared with a commit that did
-    /// publish, so deleting it here could dangle that commit's
-    /// `txn` pointer. The orphan is not reclaimed by anything today —
-    /// see the `raw_txn_upload` module docs for why no collector covers
-    /// txn blobs yet.
+    /// On publish failure the commit blob and the raw-txn blob are never
+    /// deleted here: the raw-txn blob is content-addressed and may be
+    /// shared with a commit that did publish, and an error may hide a
+    /// publish that landed. Both are abandoned to the collector, which
+    /// checks (see the `raw_txn_upload` module docs).
     ///
     /// Durability of the blob and the head ref is the content store's and
     /// nameservice's to provide: S3 acknowledges after replication, and the
@@ -1120,8 +1164,10 @@ impl StagedCommit {
         let StagedCommit {
             commit,
             build_state,
+            pins,
             ..
         } = self;
+        pins.published();
         let BuildState {
             base,
             new_t,
@@ -1148,6 +1194,7 @@ where
         expected_head_ref,
         referenced_bytes,
         tally: _,
+        pins: mut unpublished,
         build_state,
     } = staged;
     let BuildState {
@@ -1164,15 +1211,20 @@ where
 
     let phase = fluree_db_core::clock::Instant::now();
     // 8. Write referenced blobs the build phase deferred (today: none),
-    //    then write the commit blob via put_with_id (idempotent).
+    //    then write the commit blob via put_with_id (idempotent). Each is
+    //    pinned until the head names it, and abandoned to the collector
+    //    if it never does.
+    let pinner = content_store.blob_pinner();
     let write_and_publish = async {
         for (cid, bytes) in &referenced_bytes {
+            unpublished.pin(pinner.as_ref(), cid).await;
             content_store
                 .put_with_id(cid, bytes)
                 .instrument(tracing::debug_span!("commit_write_referenced_blob"))
                 .await?;
             tracing::debug!(%cid, bytes = bytes.len(), "referenced blob stored");
         }
+        unpublished.pin(pinner.as_ref(), &commit_cid).await;
         {
             let span = tracing::debug_span!("commit_write_commit_blob");
             let _g = span.enter();
@@ -1192,7 +1244,7 @@ where
         let publish_result = nameservice
             .compare_and_set_ref_fenced(
                 ledger_id_for_publish.as_str(),
-                base.fence(),
+                base.write_basis(),
                 RefKind::CommitHead,
                 expected_head_ref.as_ref(),
                 &new_head_ref,
@@ -1229,6 +1281,7 @@ where
     };
 
     let (blob_us, publish_us) = write_and_publish.await?;
+    unpublished.published();
     let finalize_started = fluree_db_core::clock::Instant::now();
 
     let finalized = finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base);
@@ -1434,19 +1487,24 @@ where
         }
         let expected_head_ref = current.as_ref().map(commit_head_ref);
 
+        // A transaction body stored but named by no published commit is
+        // abandoned to the collector.
+        let mut txn_pin = Unpublished::new();
         let txn_id = if let Some(pending) = opts.raw_txn_upload.take() {
-            Some(
-                pending
-                    .finish()
-                    .instrument(tracing::debug_span!("commit_write_raw_txn"))
-                    .await?,
-            )
+            let (id, pin) = pending
+                .finish()
+                .instrument(tracing::debug_span!("commit_write_raw_txn"))
+                .await?;
+            if let Some(pin) = pin {
+                txn_pin.push(pin);
+            }
+            Some(id)
         } else {
             opts.raw_txn_id.take()
         };
 
         let phase = fluree_db_core::clock::Instant::now();
-        let staged = build_commit(
+        let mut staged = build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -1455,6 +1513,7 @@ where
             opts,
         )
         .await?;
+        staged.pins = txn_pin;
         tracing::debug!(
             target: "fluree::write_path",
             ns_lookup_us,
@@ -1574,6 +1633,7 @@ mod tests {
         content_store_for, FlakeValue, LedgerSnapshot, MemoryStorage, Sid, CODEC_FLUREE_COMMIT,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::WriteBasis;
     use fluree_db_nameservice::{
         BranchLifecycle, GraphSourceLookup, GraphSourceRecord, NameServiceLookup, NsLookupResult,
         NsRecord, NsRecordSnapshot, RefPublisher,
@@ -1632,11 +1692,11 @@ mod tests {
         async fn reset_head_fenced(
             &self,
             ledger_id: &str,
-            fence: Option<fluree_db_nameservice::Fence>,
+            basis: WriteBasis,
             snapshot: NsRecordSnapshot,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner
-                .reset_head_fenced(ledger_id, fence, snapshot)
+                .reset_head_fenced(ledger_id, basis, snapshot)
                 .await
         }
     }
@@ -1677,7 +1737,7 @@ mod tests {
         async fn compare_and_set_ref_fenced(
             &self,
             ledger_id: &str,
-            fence: Option<fluree_db_nameservice::Fence>,
+            basis: WriteBasis,
             kind: RefKind,
             _expected: Option<&RefValue>,
             new: &RefValue,
@@ -1691,7 +1751,7 @@ mod tests {
                 }),
                 RefKind::IndexHead => {
                     self.inner
-                        .compare_and_set_ref_fenced(ledger_id, fence, kind, None, new)
+                        .compare_and_set_ref_fenced(ledger_id, basis, kind, None, new)
                         .await
                 }
             }
@@ -1703,12 +1763,12 @@ mod tests {
         async fn publish_commit_fenced(
             &self,
             ledger_id: &str,
-            fence: Option<fluree_db_nameservice::Fence>,
+            basis: WriteBasis,
             commit_t: i64,
             commit_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner
-                .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
+                .publish_commit_fenced(ledger_id, basis, commit_t, commit_id)
                 .await
         }
 
@@ -1722,12 +1782,12 @@ mod tests {
         async fn publish_index_fenced(
             &self,
             ledger_id: &str,
-            fence: Option<fluree_db_nameservice::Fence>,
+            basis: WriteBasis,
             index_t: i64,
             index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner
-                .publish_index_fenced(ledger_id, fence, index_t, index_id)
+                .publish_index_fenced(ledger_id, basis, index_t, index_id)
                 .await
         }
     }

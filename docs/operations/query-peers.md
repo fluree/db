@@ -38,11 +38,16 @@ The transaction server exposes a Server-Sent Events (SSE) stream that emits **na
 |-------|-----------|---------|
 | `ns-record` | A ledger or graph source is created, restored or updated, or a branch is created | `kind` (`ledger` or `graph-source`), `resource_id`, `record`, `emitted_at`. A ledger's `record` carries its heads (`commit_head_id`, `commit_t`, `index_head_id`, `index_t`), its `storage_root` and its `instance`. |
 | `ns-retracted` | A ledger branch or graph source is dropped | `kind`, `resource_id`, `emitted_at`, and for a ledger branch, the `instance` it belonged to when the server knows it |
-| `snapshot-complete` | After the snapshot sent on connecting | `records` (how many the snapshot sent), `emitted_at` |
+| `ns-refresh` | A ledger branch's stored history changed without its heads moving: a [permanent erasure](../transactions/permanent-erasure.md) published over its commits, or a purge rewrote its index | `kind` (`ledger`), `resource_id`, `erasures` (the server's erasure generation), `emitted_at` |
+| `snapshot-complete` | After the snapshot sent on connecting | `records` (how many the snapshot sent), `erasures` (the server's erasure generation, when it holds erasures), `emitted_at` |
 
 On connecting, a subscriber first receives an `ns-record` for each resource in scope, then `snapshot-complete`, then live events. The same event may be sent more than once.
 
-A resource the subscriber holds that the snapshot did not name was dropped while it was disconnected, and a peer drops it at `snapshot-complete`. A subscriber that falls too far behind the live events has its stream ended, so it reconnects and receives a fresh snapshot instead of missing events.
+A resource the subscriber holds that the snapshot did not name was dropped while it was disconnected, and a peer drops it at `snapshot-complete`.
+
+A peer evicts a ledger it cached on `ns-refresh`, and reads its erasure map and decoded index leaves again; a browser peer also drops the blocks it holds in memory and in IndexedDB, which are cached under CIDs an erasure does not change. A server's erasure generation at `snapshot-complete` other than the one at the peer's last snapshot means it may have missed a refresh while disconnected, so it evicts every ledger it cached. A ledger record naming another index at the same `index_t` (a reindex, or a purge rewriting the index) makes a peer reload the ledger. Older peers ignore `ns-refresh`, and must restart after an erasure publishes.
+
+A proxy-storage peer reads an erased commit through `GET /storage/objects`, which answers with the commit's erasure: the peer reads the replacement, after checking that the chain is that commit's and names that replacement. It takes the proofs on its server's word, as it takes policy-filtered leaves. A subscriber that falls too far behind the live events has its stream ended, so it reconnects and receives a fresh snapshot instead of missing events.
 
 Every ledger has an **instance** id, fixed when it is created. A ledger dropped and created again under the same name gets a new instance and starts again from `t` 0, so heads compare only within one instance:
 
@@ -143,6 +148,12 @@ Unauthorized requests return **404** (no existence leak).
 Fetch a nameservice record for a ledger ID. Requires storage proxy authorization for that ledger.
 
 The response includes a `serving` array (`"query"`, `"blocks"`) advertising the tiers this server offers for the ledger, computed from the ledger's `f:servingDefaults` setting group (see [setting groups](../ledger-config/setting-groups.md)). Clients use it to negotiate between query-shipping and peer (local compute) modes. A ledger with `f:serveBlocks false` returns 404 from all raw-content endpoints (`/storage/block`, `/storage/objects`, `/commits`, `/pack`); one with `f:serveQuery false` returns 403 from query endpoints on the origin. The server-wide coarse view is advertised unauthenticated in `/.well-known/fluree.json` under `serving`.
+
+#### `GET /v1/fluree/storage/config/{ledger-id}`
+
+Fetch what a reader needs of the ledger's config (`null` when the ledger has no retention registration), with the same authorization as the nameservice record: the registration's activation and its [removal journal](../transactions/history-retention.md), the journal's removals inline, readable without the server's storage. A peer reads it before each time-travel query, so it refuses the history the ledger refuses. The response carries an `ETag`; a request whose `If-None-Match` names the current one is answered `304` with no body, as the peer's repeat reads are. A server without this endpoint answers 404, which a peer reads as no journal; a peer treats any other refusal, such as a 403 from a proxy in front of the server, as an error rather than an empty journal, and fails the query.
+
+A ledger with a removal serves its raw content only to a token with audit access (`fluree.ledger.audit.all`, or `fluree.ledger.audit.ledgers` naming the ledger; see [History retention](../transactions/history-retention.md)): its commits and transactions, and its index (root, branches, leaves, dictionaries, history sidecars, spatial and statistics artifacts), any of which can hold a removed value. Only its config is served without. A peer serving such a ledger therefore needs an audit token; it refuses the removed history at query time from the journal it reads.
 
 #### `GET /v1/fluree/storage/objects/{cid}?ledger={ledger-id}`
 

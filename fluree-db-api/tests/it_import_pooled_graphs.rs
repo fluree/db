@@ -327,7 +327,7 @@ async fn index_and_reload(
         .unwrap()
         .publish_index_fenced(
             ledger_id,
-            support::fence_of(fluree, ledger_id).await,
+            fluree_db_nameservice::WriteBasis::fenced(support::fence_of(fluree, ledger_id).await),
             result.index_t,
             &result.root_id,
         )

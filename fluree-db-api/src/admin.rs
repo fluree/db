@@ -915,6 +915,11 @@ impl crate::Fluree {
             // no drop to resume.
             return Ok(report);
         };
+        // A view of a dropped branch is refused, even on an instance that
+        // follows no event bus.
+        self.retention
+            .watch
+            .dropped(dropped.entry.branches.iter().filter_map(|r| r.fence));
         if let Some(mgr) = &self.ledger_manager {
             for id in &branch_ids {
                 mgr.disconnect(id).await;
@@ -1032,17 +1037,98 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Dropped ledger not found: {instance}")))?
             .value;
-        lifecycle::restore_dropped(store, &instance)
-            .await
-            .map_err(|e| match e {
-                NameServiceError::LedgerAlreadyExists(detail) => ApiError::ledger_exists(detail),
-                NameServiceError::NotFound(_) => {
-                    ApiError::NotFound(format!("Dropped ledger not found: {instance}"))
-                }
-                e => e.into(),
-            })?;
+        // An erasure accepted or published meanwhile would miss the ledger.
+        #[cfg(feature = "native")]
+        let _admission = match self.retention.erasure.get() {
+            Some(erasure) => Some(erasure.admission.read().await),
+            None => None,
+        };
+        let records = lifecycle::restore_dropped_with(store, &instance, |entry, records| {
+            self.prepare_restore(entry, records)
+        })
+        .await
+        .map_err(|e| match e {
+            NameServiceError::LedgerAlreadyExists(detail) => ApiError::ledger_exists(detail),
+            NameServiceError::NotFound(_) => {
+                ApiError::NotFound(format!("Dropped ledger not found: {instance}"))
+            }
+            e => e.into(),
+        })?;
+        self.resume_restored_retention(&records).await?;
+        #[cfg(feature = "native")]
+        self.sweep_after_restore(&entry.name).await;
         info!(ledger_name = %entry.name, %instance, "Dropped ledger restored");
         Ok(DroppedLedgerInfo::from(&entry))
+    }
+
+    /// What a restored ledger must hold before it serves beyond the configs
+    /// its drop kept: what its lineage's checkpoint has removed, including
+    /// on other copies since the drop, merged into each branch's journal and
+    /// retracted where still current. An entry from before drops kept
+    /// configs has only this.
+    pub(crate) async fn prepare_restore(
+        &self,
+        entry: fluree_db_nameservice::DroppedLedger,
+        records: Vec<fluree_db_nameservice::NsRecord>,
+    ) -> std::result::Result<(), NameServiceError> {
+        let failed = |e: ApiError| {
+            NameServiceError::storage(format!("restoring {}'s removal journal: {e}", entry.name))
+        };
+        let records: Vec<_> = records
+            .into_iter()
+            .map(|r| fluree_db_nameservice::NsRecord {
+                storage_root: r.storage_root.clone().or_else(|| Some(entry.root.clone())),
+                ..r
+            })
+            .collect();
+        let live: Vec<_> = records
+            .iter()
+            .filter(|r| !r.frozen && addressable(r))
+            .cloned()
+            .collect();
+        // Branches whose indexes a purge released, rebuilt first: nothing
+        // can load them before.
+        let released = crate::retention::erasure::purge::release::released_branches(&entry);
+        for record in live.iter().filter(|r| released.contains(&r.branch)) {
+            let restored = self.restored_record(record).await.map_err(failed)?;
+            self.rebuild_released_index(&restored, &records)
+                .await
+                .map_err(failed)?;
+        }
+        let Some(lineage) = self
+            .restored_lineage(&live, &entry.root_branch)
+            .await
+            .map_err(failed)?
+        else {
+            return Ok(());
+        };
+        for record in &live {
+            let rebuilt = released.contains(&record.branch);
+            self.restore_retention(record, None, Some(&lineage), &records, rebuilt)
+                .await
+                .map_err(failed)?;
+        }
+        Ok(())
+    }
+
+    /// Hand the restored branches that have a retention registration back to
+    /// the retention worker: their pending work resumes.
+    pub(crate) async fn resume_restored_retention(
+        &self,
+        records: &[fluree_db_nameservice::NsRecord],
+    ) -> Result<()> {
+        let ns = self.publisher()?;
+        for record in records.iter().filter(|r| !r.frozen && addressable(r)) {
+            let id = record.ledger_id.to_string();
+            if crate::retention::registry::read(ns, self.registry_objects(), &id)
+                .await?
+                .1
+                .is_some()
+            {
+                self.retention.mark_active(&id);
+            }
+        }
+        Ok(())
     }
 
     /// Delete a dropped ledger's data and forget it. Resumes a purge left
@@ -1230,6 +1316,16 @@ impl crate::Fluree {
             ..Default::default()
         };
         let store = self.publisher()?;
+        let fence = match resume {
+            Some(fence) => Some(fence),
+            None => store.get_binding(name).await?.and_then(|b| {
+                b.value
+                    .branches
+                    .iter()
+                    .find(|l| l.branch == ledger_id.branch())
+                    .map(|l| l.fence)
+            }),
+        };
         let begun = match resume {
             Some(fence) => {
                 lifecycle::resume_drop_branch(store, name, ledger_id.branch(), fence).await
@@ -1256,6 +1352,7 @@ impl crate::Fluree {
             report.status = DropStatus::NotFound;
             return Ok(report);
         };
+        self.retention.watch.dropped(fence);
         let mut next = match begun {
             BranchDrop::Deferred { already: true } => {
                 report.status = DropStatus::AlreadyRetracted;
@@ -1354,6 +1451,17 @@ impl crate::Fluree {
     /// - `ApiError::NotFound` — the ledger does not exist, or the graph does
     ///   not.
     pub async fn drop_named_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> Result<DropNamedGraphReport> {
+        // Boxed, as `restore_ledger` is.
+        self.write_scope(Box::pin(self.drop_named_graph_scoped(ledger_id, graph_iri)))
+            .await
+    }
+
+    /// [`Self::drop_named_graph`], in its write scope.
+    async fn drop_named_graph_scoped(
         &self,
         ledger_id: &str,
         graph_iri: &str,
@@ -1939,7 +2047,7 @@ impl crate::Fluree {
         };
 
         // Enumerate explicit subprefixes. `TieredStorage` routes by substring
-        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so
+        // (`/commit/`, `/txn/` → commit tier; a ledger's other paths → index tier), so
         // each lists one tier. `index/` covers index roots, garbage,
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,
@@ -2208,7 +2316,7 @@ impl crate::Fluree {
                             let path = fluree_db_core::content_path(
                                 fluree_db_core::ContentKind::GraphSourceMapping,
                                 &record.storage_namespace(),
-                                &cid.digest_hex(),
+                                &cid.address_digest(),
                             );
                             if let Some(storage) = self.admin_storage() {
                                 if let Err(e) = storage.delete(&path).await {
@@ -2591,7 +2699,7 @@ impl crate::Fluree {
                     self.publisher()?
                         .publish_index_allow_equal_fenced(
                             &id,
-                            result.fence,
+                            result.basis,
                             result.index_t,
                             &result.root_id,
                         )
@@ -2645,8 +2753,9 @@ impl crate::Fluree {
             return Ok(PoolCompaction::Deferred);
         }
         let content_store = self.branched_content_store(id.as_str()).await?;
-        let config = fluree_db_indexer::IndexerConfig::default()
+        let mut config = fluree_db_indexer::IndexerConfig::default()
             .with_ledger_config_provider(self.ledger_config_provider());
+        config.history_suppression = self.suppressed_history_for_index(id.as_str()).await?;
         let Some(result) = fluree_db_indexer::compact_pool_deltas_for_record(
             content_store.clone(),
             &record,
@@ -2661,7 +2770,12 @@ impl crate::Fluree {
             .await
             .map_err(|e| ApiError::internal(format!("flush index artifacts: {e}")))?;
         self.publisher()?
-            .publish_index_allow_equal_fenced(id, record.fence, result.index_t, &result.root_id)
+            .publish_index_allow_equal_fenced(
+                id,
+                record.write_basis(),
+                result.index_t,
+                &result.root_id,
+            )
             .await?;
         // Same `t`, new root: the cached state adopts it, keeping its novelty.
         // One left on the old root would read runs the next sweep deletes.
@@ -2695,6 +2809,91 @@ pub(crate) enum PoolCompaction {
 // =============================================================================
 
 impl crate::Fluree {
+    /// `config` for a full rebuild of `ledger_id` from its commits: with the
+    /// full-text properties and graph placement its ledger config names, read
+    /// from `state`, and
+    /// the history retention suppresses, which a rebuild would otherwise
+    /// bring back.
+    pub(crate) async fn rebuild_config(
+        &self,
+        ledger_id: &LedgerId,
+        state: Option<&crate::LedgerState>,
+        mut config: fluree_db_indexer::IndexerConfig,
+    ) -> Result<fluree_db_indexer::IndexerConfig> {
+        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
+        // configured plain-string values into BM25 arena building. Best-effort: if the existing
+        // index can't be loaded (e.g. first-ever reindex of a commits-only
+        // ledger) we fall back to empty — only the `@fulltext` datatype path
+        // will contribute entries, which matches pre-config behavior.
+        //
+        // An index from before config graphs were read across ledgers can
+        // hold one as an ordinary graph, where no config is read. The rebuild
+        // reads it as the config graph, so its full-text settings are read
+        // from the commits as well.
+        let from_commits = match state {
+            Some(state) if state.snapshot.graph_registry.has_config_in_user_slot() => {
+                let loaded = async {
+                    let mut unindexed =
+                        self.nameservice().lookup(ledger_id).await?.ok_or_else(|| {
+                            ApiError::NotFound(format!("Ledger not found: {ledger_id}"))
+                        })?;
+                    unindexed.index_head_id = None;
+                    let store = self.branched_content_store(ledger_id).await?;
+                    fluree_db_ledger::LedgerState::load_with_store(store, unindexed)
+                        .await
+                        .map_err(ApiError::from)
+                }
+                .await;
+                match loaded {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "reindex: failed to load the commits for the config read; configured fulltext properties will be skipped"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(state) = from_commits.as_ref().or(state) {
+            // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
+            // first-ever reindex (no prior index, all config in novelty)
+            // the config query isn't filtered out by
+            // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
+            let to_t = state.t();
+            let snapshot = &state.snapshot;
+            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+            match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
+                Ok(Some(cfg)) => {
+                    let fluree_db_indexer::LedgerIndexingConfig {
+                        fulltext_properties,
+                        graph_placement,
+                    } = crate::config_resolver::indexing_config_for_indexer(&cfg);
+                    config.fulltext_configured_properties = fulltext_properties;
+                    config.graph_placement = graph_placement;
+                }
+                Ok(None) => {
+                    // No LedgerConfig — nothing to seed.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped and graphs placed automatically"
+                    );
+                }
+            }
+        }
+
+        // A rebuild re-derives history from the commit log: it must leave out
+        // what retention suppresses, or reindexing would bring it back.
+        config.history_suppression = self
+            .suppressed_history_for_index(ledger_id.as_str())
+            .await?;
+        Ok(config)
+    }
+
     /// Full offline reindex from commit history
     ///
     /// Rebuilds the binary index by replaying all commits. This operation:
@@ -2737,13 +2936,8 @@ impl crate::Fluree {
         // them. Cancelling and waiting for idle is not enough on its own: a
         // build can start again the moment the wait returns. The guard is
         // held until this function exits.
-        let _maintenance = match &self.indexing_mode {
-            IndexingMode::Background(handle) => {
-                info!(ledger_id = %ledger_id, "Holding ledger for reindex");
-                Some(hold_branch_quiesced(handle, &ledger_id).await?)
-            }
-            IndexingMode::Disabled => None,
-        };
+        info!(ledger_id = %ledger_id, "Holding ledger for reindex");
+        let _maintenance = self.hold_indexers(&ledger_id).await?;
 
         // Re-fetch the record after the background indexer has quiesced: a
         // background build racing this reindex may have published between
@@ -2757,7 +2951,7 @@ impl crate::Fluree {
             .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
 
         // 3. Build binary index from commit chain
-        let mut indexer_config = opts.indexer_config.clone().unwrap_or_default();
+        let indexer_config = opts.indexer_config.clone().unwrap_or_default();
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
         let gc_hard_max_old_indexes = indexer_config.gc_hard_max_old_indexes;
@@ -2773,68 +2967,9 @@ impl crate::Fluree {
             }
         };
 
-        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
-        // configured plain-string values into BM25 arena building. Reuses the
-        // `ledger_state` we already loaded above. Best-effort: if the existing
-        // index can't be loaded (e.g. first-ever reindex of a commits-only
-        // ledger) we fall back to empty — only the `@fulltext` datatype path
-        // will contribute entries, which matches pre-config behavior.
-        //
-        // An index from before config graphs were read across ledgers can
-        // hold one as an ordinary graph, where no config is read. The rebuild
-        // reads it as the config graph, so its full-text settings are read
-        // from the commits as well.
-        let from_commits = match ledger_state.as_ref() {
-            Some(state) if state.snapshot.graph_registry.has_config_in_user_slot() => {
-                let mut unindexed = record.clone();
-                unindexed.index_head_id = None;
-                let loaded = match self.branched_content_store(&ledger_id).await {
-                    Ok(store) => fluree_db_ledger::LedgerState::load_with_store(store, unindexed)
-                        .await
-                        .map_err(ApiError::from),
-                    Err(e) => Err(e),
-                };
-                match loaded {
-                    Ok(state) => Some(state),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "reindex: failed to load the commits for the config read; configured fulltext properties will be skipped"
-                        );
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-        if let Some(state) = from_commits.as_ref().or(ledger_state.as_ref()) {
-            // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
-            // first-ever reindex (no prior index, all config in novelty)
-            // the config query isn't filtered out by
-            // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
-            let to_t = state.t();
-            let snapshot = &state.snapshot;
-            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-            match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
-                Ok(Some(cfg)) => {
-                    let fluree_db_indexer::LedgerIndexingConfig {
-                        fulltext_properties,
-                        graph_placement,
-                    } = crate::config_resolver::indexing_config_for_indexer(&cfg);
-                    indexer_config.fulltext_configured_properties = fulltext_properties;
-                    indexer_config.graph_placement = graph_placement;
-                }
-                Ok(None) => {
-                    // No LedgerConfig — nothing to seed.
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped and graphs placed automatically"
-                    );
-                }
-            }
-        }
+        let indexer_config = self
+            .rebuild_config(&ledger_id, ledger_state.as_ref(), indexer_config)
+            .await?;
 
         // Reindex is a user-triggered API call; create a fuel-enabled,
         // no-limit tracker per request so the response can report total fuel.
@@ -2881,10 +3016,11 @@ impl crate::Fluree {
         }
 
         // 5. Publish new index (allows same t for reindex via AdminPublisher)
+        self.register_built_retention(&index_result).await?;
         self.publisher()?
             .publish_index_allow_equal_fenced(
                 &ledger_id,
-                record.fence,
+                record.write_basis(),
                 index_result.index_t,
                 &index_result.root_id,
             )
@@ -3090,6 +3226,31 @@ mod tests {
     fn test_drop_status_default() {
         assert_eq!(DropStatus::default(), DropStatus::NotFound);
     }
+
+    /// A maintenance hold reaches the indexer a cluster's leader builds
+    /// with while its task lives, and leaves it once the task is gone.
+    #[tokio::test]
+    async fn a_maintenance_hold_reaches_the_leaders_indexer_while_it_lives() {
+        use std::sync::Arc;
+        let fluree = crate::FlureeBuilder::memory().build_client().await.unwrap();
+        let ns: Arc<dyn fluree_db_nameservice::IndexingNameService> =
+            Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+        let (_worker, leader) = fluree_db_indexer::BackgroundIndexerWorker::new(
+            fluree.backend().clone(),
+            ns,
+            fluree_db_indexer::IndexerConfig::default(),
+        );
+        let alive = Arc::new(());
+        fluree.set_leader_indexer(leader.clone(), Arc::downgrade(&alive));
+        let id = LedgerId::parse("held:main").unwrap();
+        let guards = fluree.hold_indexers(&id).await.unwrap();
+        assert!(leader.hold_quiesced(&id).await.is_none(), "held");
+        drop(guards);
+
+        drop(alive);
+        let _guards = fluree.hold_indexers(&id).await.unwrap();
+        assert!(leader.hold_quiesced(&id).await.is_some(), "not held");
+    }
 }
 
 // =============================================================================
@@ -3098,7 +3259,7 @@ mod tests {
 
 /// Take an exclusive maintenance hold on one branch, reporting a conflict
 /// rather than blocking when another operation already holds it.
-async fn hold_branch_quiesced<'a>(
+pub(crate) async fn hold_branch_quiesced<'a>(
     handle: &'a fluree_db_indexer::IndexerHandle,
     ledger_id: &'a LedgerId,
 ) -> Result<MaintenanceGuard> {
@@ -3107,6 +3268,72 @@ async fn hold_branch_quiesced<'a>(
             "another maintenance operation holds {ledger_id}; retry when it completes"
         ))
     })
+}
+
+/// The indexer a cluster's leader builds with, while its task lives.
+#[derive(Default)]
+pub(crate) struct LeaderIndexer(
+    parking_lot::Mutex<Option<(fluree_db_indexer::IndexerHandle, std::sync::Weak<()>)>>,
+);
+
+impl crate::Fluree {
+    /// Build with `handle` as this cluster member's leader, while `alive`
+    /// lives: a maintenance hold on a branch waits for its builds too.
+    pub fn set_leader_indexer(
+        &self,
+        handle: fluree_db_indexer::IndexerHandle,
+        alive: std::sync::Weak<()>,
+    ) {
+        *self.leader_indexer.0.lock() = Some((handle, alive));
+    }
+
+    /// The leader role's indexer, while its task lives.
+    pub(crate) fn leader_indexer(
+        &self,
+    ) -> Option<(fluree_db_indexer::IndexerHandle, std::sync::Weak<()>)> {
+        self.leader_indexer
+            .0
+            .lock()
+            .as_ref()
+            .filter(|(_, alive)| alive.strong_count() > 0)
+            .cloned()
+    }
+
+    /// Hold `ledger_id`'s indexing, quiesced, on this instance's indexer and
+    /// on the leader's while it lives.
+    pub(crate) async fn hold_indexers(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Result<Vec<MaintenanceGuard>> {
+        let mut guards = Vec::new();
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            guards.push(hold_branch_quiesced(handle, ledger_id).await?);
+        }
+        if let Some((handle, alive)) = self.leader_indexer() {
+            if let Some(guard) = while_alive(&alive, hold_branch_quiesced(&handle, ledger_id)).await
+            {
+                guards.push(guard?);
+            }
+        }
+        Ok(guards)
+    }
+}
+
+/// `work`, unless the task `alive` tracks ends first: what `work` waits for
+/// on its indexer, a build or a collection, then never reports done.
+pub(crate) async fn while_alive<T>(
+    alive: &std::sync::Weak<()>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let ended = async {
+        while alive.strong_count() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    };
+    tokio::select! {
+        out = work => Some(out),
+        () = ended => None,
+    }
 }
 
 impl crate::Fluree {
@@ -3154,10 +3381,8 @@ impl crate::Fluree {
         // external one is not covered here either way, which is the
         // single-process caveat documented on `MaintenanceGuard`.
         let mut guards = Vec::with_capacity(records.len());
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            for record in &records {
-                guards.push(hold_branch_quiesced(handle, &record.ledger_id).await?);
-            }
+        for record in &records {
+            guards.extend(self.hold_indexers(&record.ledger_id).await?);
         }
 
         // Re-read after quiescing: a build that published between the
@@ -3227,4 +3452,11 @@ impl crate::Fluree {
         );
         Ok(execute_sweep(&storage, &plan).await)
     }
+}
+
+/// Whether a request can name `record`'s branch. A record kept from before
+/// the id grammar is listed, dropped and restored with its ledger, and
+/// serves nothing: retention, which works by id, has nothing to hold for it.
+fn addressable(record: &fluree_db_nameservice::NsRecord) -> bool {
+    fluree_db_core::LedgerId::parse(record.ledger_id.as_str()).is_ok()
 }

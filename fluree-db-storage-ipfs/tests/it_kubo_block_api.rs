@@ -319,7 +319,8 @@ async fn test_pin_lifecycle_raw_codec() {
 
     // 3. Construct raw-codec CID (same multihash, codec 0x55)
     let raw_cid_str =
-        fluree_db_storage_ipfs::address::hash_hex_to_cid_string(&fluree_cid.digest_hex()).unwrap();
+        fluree_db_storage_ipfs::address::hash_hex_to_cid_string(&fluree_cid.address_digest())
+            .unwrap();
     println!("Raw-codec CID (for pin):     {raw_cid_str}");
 
     // 4. Pin with raw-codec CID — this is what IpfsStorage::maybe_pin does
@@ -357,7 +358,7 @@ async fn test_sha256_digest_matches() {
 
     // Compute locally
     let fluree_cid = ContentId::new(ContentKind::Commit, data);
-    let fluree_digest = fluree_cid.digest_hex();
+    let fluree_digest = fluree_cid.address_digest();
 
     // Put to IPFS and inspect the returned CID
     let put_resp = kubo.block_put(data, None, Some("sha2-256")).await.unwrap();
@@ -367,7 +368,7 @@ async fn test_sha256_digest_matches() {
         .key
         .parse()
         .expect("IPFS CID should be parseable as ContentId");
-    let ipfs_digest = ipfs_cid.digest_hex();
+    let ipfs_digest = ipfs_cid.address_digest();
 
     println!("Fluree digest: {fluree_digest}");
     println!("IPFS digest:   {ipfs_digest}");

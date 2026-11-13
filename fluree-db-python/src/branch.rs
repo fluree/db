@@ -126,7 +126,7 @@ pub(crate) fn merge<'py>(
     merge.set_item("fast_forward", report.fast_forward)?;
     merge.set_item("t", report.new_head_t)?;
     merge.set_item("id", report.new_head_id.to_string())?;
-    merge.set_item("digest", report.new_head_id.digest_hex())?;
+    merge.set_item("digest", report.new_head_id.address_digest())?;
     merge.set_item("conflicts", report.conflict_count)?;
     merge.set_item("strategy", report.strategy.as_deref())?;
     Ok(merge)
@@ -185,7 +185,7 @@ pub(crate) fn revert<'py>(
     revert.set_item("committed", report.wrote_commit)?;
     revert.set_item("t", report.new_head_t)?;
     revert.set_item("id", report.new_head_id.to_string())?;
-    revert.set_item("digest", report.new_head_id.digest_hex())?;
+    revert.set_item("digest", report.new_head_id.address_digest())?;
     let reverted = report
         .reverted_commits
         .iter()

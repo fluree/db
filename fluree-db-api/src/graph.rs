@@ -184,7 +184,7 @@ impl<'a> Graph<'a> {
     /// it is used directly; otherwise it is treated as a hex prefix.
     ///
     /// Hex, not base32: the indexed commit subject is minted from
-    /// `ContentId::digest_hex()`, so the prefix scan is keyed on hex. An
+    /// `ContentId::address_digest()`, so the prefix scan is keyed on hex. An
     /// abbreviated CID cannot be resolved — the first twelve characters of
     /// every commit CID are a constant header — and is rejected saying so.
     ///

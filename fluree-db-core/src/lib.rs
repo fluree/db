@@ -30,6 +30,7 @@ pub mod cancellation;
 pub mod clock;
 pub mod coerce;
 pub mod commit;
+pub mod commit_subject;
 pub mod comparator;
 pub mod conflict_key;
 pub mod content_id;
@@ -70,6 +71,8 @@ pub mod o_type_registry;
 pub mod overlay;
 pub mod pack;
 pub mod prefix_trie;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod process;
 pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
@@ -112,12 +115,12 @@ pub use commit::{
     load_commit_by_id, load_commit_envelope_by_id, plan_commit_transfer, plan_commit_transfer_page,
     trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id,
     walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitGraphLifecycle, CommitSummary,
-    CommitTransferPage, CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry,
-    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    CommitTransferPage, CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, Redaction,
+    TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
-pub use content_id::{CommitId, ContentId, IndexRootId, TxnId};
+pub use content_id::{CommitId, ContentId, HashAlgorithm, IndexRootId, TxnId};
 pub use content_kind::{
     ContentKind, DictKind, CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
     CODEC_FLUREE_ANNOTATION_FORWARD_LEAF, CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
@@ -202,6 +205,11 @@ pub use storage::{
     content_store_for,
     // Helper functions for storage implementations
     sha256_hex,
+    Abandoned,
+    BlobClaim,
+    BlobPin,
+    BlobPinner,
+    BlobPins,
     BranchedContentStore,
     CasAction,
     CasOutcome,
@@ -213,9 +221,12 @@ pub use storage::{
     ListResult,
     MemoryContentStore,
     MemoryStorage,
+    PinWaits,
     RangeSource,
     ReadHint,
     RemoteObject,
+    RootCollection,
+    RootHold,
     Storage,
     StorageBackend,
     StorageCas,
@@ -227,14 +238,15 @@ pub use storage::{
     StorageMethod,
     StorageRead,
     StorageWrite,
+    Unpublished,
     STORAGE_METHOD_IPFS,
     STORAGE_METHOD_MEMORY,
     STORAGE_METHOD_S3,
 };
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use storage::{
-    FileStorage, RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE,
-    STORAGE_METHOD_FILE,
+    DeleteLease, FileStorage, RootLock, RootLockError, StoppedLogs, ALLOW_UNLOCKED_ENV_VAR,
+    ROOT_LOCK_FILE, STORAGE_METHOD_FILE,
 };
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};

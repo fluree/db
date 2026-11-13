@@ -123,7 +123,7 @@ Optional:
 
 - `POST {api_base_url}/push/*ledger`
 - `POST {api_base_url}/push-merges/*ledger` (a push whose history contains a merge)
-- `GET /.well-known/fluree.json` with `"push": {"merged_commits": true}`, if you implement `push-merges`
+- `GET /.well-known/fluree.json` with `"push": {"merged_commits": true}`, if you implement `push-merges`, and `"erasures": true` if a push may carry permanently erased commits
 
 This is not storage-proxy replication; it is a transaction operation and should be authorized like normal transactions.
 
@@ -133,7 +133,9 @@ Merged commits are stored as history and never replayed, so policy and SHACL nev
 
 `push-merges` is a separate endpoint so that a server without it fails with `404`. The same body on `push` would be accepted by such a server with the merged commits dropped. For that reason `push` must refuse a body carrying `merged_commits`.
 
-The CLI sends an `Idempotency-Key` header derived from the pushed commit bytes so servers can safely replay a successful push result if the client retries after a timeout.
+A push also carries the ledger's retention section (`retention`), and, when its history holds permanently erased commits, their erasures (`erasure_frames`) and the erasures of the history the server already has (`base_erasures`). The CLI sends erased history only to a server whose discovery advertises `push.erasures`, and answers a `409` asking for erasures by pushing once more with them. See [`POST /push/*ledger`](../api/endpoints.md#post-pushledger).
+
+The CLI sends an `Idempotency-Key` header derived from the pushed commit bytes (and, when present, the erasures and retention section) so servers can safely replay a successful push result if the client retries after a timeout.
 
 ### `fluree show --remote`
 

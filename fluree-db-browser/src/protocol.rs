@@ -45,6 +45,10 @@ pub enum IoJob {
         bytes: Arc<[u8]>,
         permit: Option<WriteBehindPermit>,
     },
+    /// Drop every block from the persistent cache, after the writes already
+    /// queued: their content changed in place (an erasure, a purge). The
+    /// reply comes once it is done.
+    CacheClear { reply: oneshot::Sender<()> },
     /// Open a fetch-streamed SSE connection. Streaming deliberately does
     /// NOT go through the `HttpTransport` seam (whose contract is
     /// full-body buffering): the JS `ReadableStream` stays inside the

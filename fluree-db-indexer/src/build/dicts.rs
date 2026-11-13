@@ -28,8 +28,15 @@ pub(crate) async fn upload_incremental_reverse_tree_async(
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries, warm_cache)
-        .await
+    upload_incremental_reverse_tree_core(
+        content_store,
+        dict,
+        existing_refs,
+        entries,
+        warm_cache,
+        false,
+    )
+    .await
 }
 
 /// Async version of reverse tree upload for **string** dictionaries.
@@ -55,8 +62,15 @@ pub(crate) async fn upload_incremental_reverse_tree_async_strings(
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries, warm_cache)
-        .await
+    upload_incremental_reverse_tree_core(
+        content_store,
+        dict,
+        existing_refs,
+        entries,
+        warm_cache,
+        false,
+    )
+    .await
 }
 
 /// Core async reverse tree upload: pre-fetch affected leaves, spawn_blocking
@@ -106,16 +120,36 @@ pub(crate) async fn upload_incremental_reverse_tree_async_terms(
         existing_refs,
         entries,
         warm_cache,
+        false,
     )
     .await
 }
 
+/// Remove `keys` (sorted ascending) from a reverse tree, uploading the
+/// leaves it rewrites.
+pub(crate) async fn remove_from_reverse_tree_async(
+    content_store: &dyn ContentStore,
+    dict: fluree_db_core::DictKind,
+    existing_refs: &DictTreeRefs,
+    keys: Vec<Vec<u8>>,
+) -> Result<UpdatedReverseTree> {
+    use fluree_db_binary_index::dict::reverse_leaf::ReverseEntry;
+    let entries = keys
+        .into_iter()
+        .map(|key| ReverseEntry { key, id: 0 })
+        .collect();
+    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries, None, true)
+        .await
+}
+
+/// `remove`: take `entries`' keys out of the tree instead of inserting them.
 async fn upload_incremental_reverse_tree_core(
     content_store: &dyn ContentStore,
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
     entries: Vec<fluree_db_binary_index::dict::reverse_leaf::ReverseEntry>,
     warm_cache: Option<&LeafletCache>,
+    remove: bool,
 ) -> Result<UpdatedReverseTree> {
     let kind = ContentKind::DictBlob { dict };
 
@@ -160,12 +194,21 @@ async fn upload_incremental_reverse_tree_core(
                 .remove(&idx)
                 .ok_or_else(|| std::io::Error::other(format!("reverse leaf {idx} not prefetched")))
         };
-        fluree_db_binary_index::dict::incremental::update_reverse_tree(
-            &existing_branch_owned,
-            &entries,
-            fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES,
-            &mut fetch_leaf,
-        )
+        if remove {
+            let keys: Vec<Vec<u8>> = entries.into_iter().map(|e| e.key).collect();
+            fluree_db_binary_index::dict::incremental::remove_from_reverse_tree(
+                &existing_branch_owned,
+                &keys,
+                &mut fetch_leaf,
+            )
+        } else {
+            fluree_db_binary_index::dict::incremental::update_reverse_tree(
+                &existing_branch_owned,
+                &entries,
+                fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES,
+                &mut fetch_leaf,
+            )
+        }
     })
     .await
     .map_err(|e| IndexerError::from_join("reverse tree task", e))?

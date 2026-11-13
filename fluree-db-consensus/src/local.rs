@@ -118,6 +118,23 @@ impl Committer for LocalCommitter {
             .await
             .map_err(execution_failure)?;
 
+        // A retention batch is exact retractions against one head: it commits
+        // or reports the head moved, and is never re-staged.
+        if let TransactionBody::Retention { batch } = &body {
+            let batch = decode_retention_batch(batch)?;
+            let receipt = self
+                .fluree
+                .commit_retention_batch(ledger_id.as_str(), batch)
+                .await
+                .map_err(execution_failure)?;
+            return Ok(TransactionReceipt {
+                idempotency_key,
+                commit: receipt,
+                tally: None,
+                cypher_return: None,
+            });
+        }
+
         // Bounded reconcile-and-retry around stage + commit. See
         // [`is_retryable_txn_conflict`] for the conflict variants that
         // heal via `refresh()` + re-stage. Each attempt rebuilds the
@@ -190,6 +207,9 @@ impl Committer for LocalCommitter {
                     staged.upsert_turtle(text.as_str())
                 }
                 TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+                TransactionBody::Retention { .. } => {
+                    unreachable!("a retention batch commits before staging")
+                }
                 TransactionBody::Cypher { .. } => {
                     match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
                         CypherWriteUnderLock::Resolved(resolved) => {
@@ -362,7 +382,13 @@ impl Committer for LocalCommitter {
             commits,
             blobs,
             merged_commits,
+            commit_ids,
+            merged_commit_ids,
             governance,
+            erasure_frames,
+            base_erasures,
+            retention,
+            authority,
         } = request;
 
         let payload = PushCommitsRequest {
@@ -375,11 +401,22 @@ impl Committer for LocalCommitter {
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
             merged_commits: merged_commits.into_iter().map(Base64Bytes).collect(),
+            commit_ids,
+            merged_commit_ids,
+            erasure_frames: erasure_frames.into_iter().map(Base64Bytes).collect(),
+            base_erasures,
+            retention,
         };
 
         let response = self
             .fluree
-            .push_commits(&ledger_id, payload, &governance, &self.index_config)
+            .push_commits_with(
+                &ledger_id,
+                payload,
+                &governance,
+                &self.index_config,
+                authority,
+            )
             .await
             .map_err(execution_failure)?;
 
@@ -425,6 +462,19 @@ impl SubmissionLookup for LocalCommitter {
 /// unsettled). A stale writer and a lifecycle conflict keep theirs too,
 /// rather than reading as a retryable commit conflict: 409 + `err:db/Fenced`
 /// or `err:db/LifecycleConflict`.
+/// A [`TransactionBody::Retention`] payload.
+pub(crate) fn decode_retention_batch(
+    hex_batch: &str,
+) -> Result<fluree_db_api::retention::RetentionBatch, SubmissionError> {
+    let malformed = |message: String| SubmissionError::Execution {
+        status: 400,
+        message,
+    };
+    let bytes = hex::decode(hex_batch).map_err(|e| malformed(format!("retention batch: {e}")))?;
+    fluree_db_api::retention::RetentionBatch::decode(&bytes)
+        .map_err(|e| malformed(format!("retention batch: {e}")))
+}
+
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
     use fluree_db_nameservice::NameServiceError;
     match &err {

@@ -29,6 +29,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
+mod collect;
+mod erasure;
+pub use collect::{CollectCommand, CollectState, Intent};
+pub use erasure::{
+    generation, holder_state, view_generation, ActivateErasure, Activation, ActivationRefusal,
+    Cleaned, CleanupState, ErasureCommand, ErasureState, HolderState, Incarnation, Installed,
+};
+
 /// Postcard-friendly mirror of [`TrackingTally`].
 ///
 /// `TrackingTally` uses `#[serde(skip_serializing_if = "Option::is_none")]`
@@ -542,6 +550,18 @@ pub struct NameServiceState {
     pub dropped: HashMap<String, VersionedJson>,
     /// The fence and frozen flag of each branch created under a binding.
     pub fences: HashMap<RefKey, FenceState>,
+    /// Permanent erasure: generations, holds and activations. This field
+    /// and those after it were appended together, after every released
+    /// field, so a snapshot taken before them still decodes through
+    /// [`NameServiceStateV2`].
+    pub erasure: ErasureState,
+    /// Collection's open intents.
+    pub collect: CollectState,
+    /// What members cleaned after a purge; see [`CleanupState`].
+    pub erasure_cleanup: CleanupState,
+    /// The log index of the membership in force: what a check of every
+    /// member, such as collection's enabling, is bound to.
+    pub membership_index: u64,
 }
 
 /// A name binding or dropped-ledger entry: its version, and the value as
@@ -636,6 +656,61 @@ impl From<NameServiceStateV1> for NameServiceState {
             bindings: HashMap::new(),
             dropped: HashMap::new(),
             fences: HashMap::new(),
+            erasure: ErasureState::default(),
+            collect: CollectState::default(),
+            erasure_cleanup: CleanupState::default(),
+            membership_index: 0,
+        }
+    }
+}
+
+/// [`NameServiceState`] as snapshotted before erasure state.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV2 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+    bindings: HashMap<String, VersionedJson>,
+    dropped: HashMap<String, VersionedJson>,
+    fences: HashMap<RefKey, FenceState>,
+}
+
+impl From<NameServiceStateV2> for NameServiceState {
+    fn from(v2: NameServiceStateV2) -> Self {
+        Self {
+            refs: v2.refs,
+            ledgers: v2.ledgers,
+            retracted: v2.retracted,
+            idempotency: v2.idempotency,
+            queues: v2.queues,
+            next_queue_id: v2.next_queue_id,
+            recently_cleared: v2.recently_cleared,
+            evicted_idempotency_count: v2.evicted_idempotency_count,
+            queue_config: v2.queue_config,
+            status: v2.status,
+            config: v2.config,
+            graph_sources: v2.graph_sources,
+            worker_eligible_voters: v2.worker_eligible_voters,
+            configured_voters: v2.configured_voters,
+            bindings: v2.bindings,
+            dropped: v2.dropped,
+            fences: v2.fences,
+            erasure: ErasureState::default(),
+            collect: CollectState::default(),
+            erasure_cleanup: CleanupState::default(),
+            membership_index: 0,
         }
     }
 }
@@ -859,6 +934,51 @@ pub enum Command {
     /// again under its name can publish from `t` 0. A no-op on a live or
     /// missing record.
     ResetGraphSourceIndex { name: String, branch: String },
+    /// Clear a branch's frozen mark if it carries `fence`: a drop that froze
+    /// it and wrote nothing else is undone. (Appended: variants are
+    /// positional in the log.)
+    ThawBranch { key: RefKey, fence: u64 },
+    /// `command` staged on a view of the listed branches at these erasure
+    /// generations: applied only while each branch still holds its
+    /// generation. A write to a branch an erasure has reached must be
+    /// wrapped; see [`erasure`]. Outermost: it may wrap a
+    /// [`Self::Fenced`] write, not the other way round.
+    AtGeneration {
+        generations: Vec<(RefKey, u64)>,
+        command: Box<Command>,
+    },
+    /// Permanent erasure; see [`ErasureCommand`].
+    Erasure(ErasureCommand),
+    /// Collection; see [`CollectCommand`].
+    Collect(CollectCommand),
+    /// `command` from a writer that began having loaded every intent
+    /// numbered below `seen`: refused once an intent from `seen` on is
+    /// deleting, since the writer may have stored one of its addresses
+    /// unchecked. Outermost: it may wrap [`Self::AtGeneration`].
+    Seen { seen: u64, command: Box<Command> },
+    /// Clear the index head of `key`'s branch if it is frozen: a purge
+    /// released its index, and nothing loads a frozen branch.
+    ClearFrozenIndex { key: RefKey },
+    /// [`Self::PublishGraphSourceIndex`], also replacing a head at the same
+    /// `t`: an index rebuilt from the same state, as a purge rebuilds one.
+    RewriteGraphSourceIndex {
+        name: String,
+        branch: String,
+        index_id: ContentId,
+        index_t: i64,
+    },
+}
+
+impl Command {
+    /// The write a wrapper carries, once the state machine has admitted it.
+    pub fn admitted(&self) -> &Command {
+        match self {
+            Command::Seen { command, .. }
+            | Command::AtGeneration { command, .. }
+            | Command::Fenced { command, .. } => command.admitted(),
+            command => command,
+        }
+    }
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1475,6 +1595,62 @@ pub enum Response {
     },
     /// [`Command::ResetGraphSourceIndex`] cleared the index pointer.
     GraphSourceIndexReset,
+    /// A write staged on a view of erasure generation `presented` (`None`:
+    /// presented none) of a branch now at `current`. Nothing applied; the
+    /// writer stages again on a current view.
+    ErasureGenerationMoved {
+        ledger_id: String,
+        current: u64,
+        presented: Option<u64>,
+    },
+    /// A head advance on a branch held while an erasure activation is
+    /// prepared. The queue entry stays at the front.
+    ErasureHeld {
+        ledger_id: String,
+        until_millis: u64,
+    },
+    /// [`ErasureCommand::Hold`] or [`ErasureCommand::Release`] applied.
+    ErasureHoldApplied,
+    /// [`ErasureCommand::Activate`] applied as activation `activation`.
+    ErasureActivated { activation: u64 },
+    /// [`ErasureCommand::Activate`] refused; nothing changed.
+    ErasureActivationRefused { refusal: ActivationRefusal },
+    /// [`ErasureCommand::Ready`] recorded.
+    ErasureReadyRecorded,
+    /// [`ErasureCommand::Ready`] claimed an activation not applied yet.
+    ErasureActivationUnknown { activation: u64 },
+    /// [`ErasureCommand::Track`] applied.
+    ErasureTracking,
+    /// [`CollectCommand::Condemn`] applied, or found the intent open, as
+    /// intent `number`.
+    Condemned { number: u64 },
+    /// [`CollectCommand::Spare`]: the address stays.
+    Spared,
+    /// [`CollectCommand::Spare`] after deletion began; the writer waits for
+    /// the intent to close.
+    SpareRefused { number: u64 },
+    /// Intent `number` is not open: completed, so nothing of it remains to
+    /// be deleted.
+    IntentClosed { number: u64 },
+    /// [`CollectCommand::Delete`] began deletion; `spared` stays.
+    Deleting { spared: Vec<String> },
+    /// A [`Command::Seen`] write began before loading intent `deleting`,
+    /// whose deletion has begun; or, with `None`, a write carried no `Seen`
+    /// once the cluster collects. Nothing applied; the writer stages again.
+    CollectionMoved { deleting: Option<u64> },
+    /// [`CollectCommand::Enable`] applied.
+    CollectionEnabled,
+    /// [`Command::ClearFrozenIndex`]: whether the branch was frozen, and
+    /// its index head cleared.
+    FrozenIndexCleared { cleared: bool },
+    /// [`ErasureCommand::Purged`] recorded, at log index `index` (the first
+    /// such record, for one proposed again).
+    ErasurePurgeRecorded { index: u64 },
+    /// [`ErasureCommand::Cleaned`] recorded.
+    ErasureCleanedRecorded,
+    /// [`CollectCommand::Enable`] checked the members of a membership since
+    /// replaced (`current` is its log index); nothing changed.
+    MembershipMoved { current: u64 },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1542,14 +1718,52 @@ impl NameServiceState {
         Ok(postcard::to_allocvec(self)?)
     }
 
+    /// This state as a snapshot taken before erasure state was appended
+    /// ([`NameServiceStateV2`]), which deployed clusters may hold.
+    #[cfg(test)]
+    pub(crate) fn to_v2_snapshot(&self) -> Vec<u8> {
+        postcard::to_allocvec(&NameServiceStateV2 {
+            refs: self.refs.clone(),
+            ledgers: self.ledgers.clone(),
+            retracted: self.retracted.clone(),
+            idempotency: self.idempotency.clone(),
+            queues: self.queues.clone(),
+            next_queue_id: self.next_queue_id,
+            recently_cleared: self.recently_cleared.clone(),
+            evicted_idempotency_count: self.evicted_idempotency_count,
+            queue_config: self.queue_config,
+            status: self.status.clone(),
+            config: self.config.clone(),
+            graph_sources: self.graph_sources.clone(),
+            worker_eligible_voters: self.worker_eligible_voters.clone(),
+            configured_voters: self.configured_voters.clone(),
+            bindings: self.bindings.clone(),
+            dropped: self.dropped.clone(),
+            fences: self.fences.clone(),
+        })
+        .expect("a state encodes")
+    }
+
     /// Restore state machine state from snapshot bytes produced by
     /// [`Self::to_snapshot`].
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        // Newest layout first: postcard ignores trailing bytes, so an
+        // older layout would decode a newer snapshot and drop its tail.
+        // For the same reason an older layout is taken only when it is the
+        // whole snapshot: a damaged newer one must not restore without
+        // its tail.
+        fn whole<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
+            match postcard::take_from_bytes(bytes) {
+                Ok((value, [])) => Some(value),
+                _ => None,
+            }
+        }
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => postcard::from_bytes::<NameServiceStateV1>(bytes)
+            Err(e) => whole::<NameServiceStateV2>(bytes)
                 .map(Self::from)
-                .map_err(|_| e.into()),
+                .or_else(|| whole::<NameServiceStateV1>(bytes).map(Self::from))
+                .ok_or(e.into()),
         }
     }
 }
@@ -1559,6 +1773,43 @@ impl NameServiceState {
 /// this command, used as a deterministic alternative to wall-clock
 /// time for any state-machine bookkeeping that needs it.
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
+    let command = match command {
+        Command::Seen { seen, command } => match collect::refused_by(state, seen) {
+            Some(deleting) => {
+                return Response::CollectionMoved {
+                    deleting: Some(deleting),
+                }
+            }
+            None => *command,
+        },
+        command if collect::unfenced(state, &command) => {
+            return Response::CollectionMoved { deleting: None }
+        }
+        command => command,
+    };
+    let (command, generations) = match command {
+        Command::AtGeneration {
+            generations,
+            command,
+        } => (*command, Some(generations)),
+        command => (command, None),
+    };
+    if let Some(refused) = erasure::admit(state, &command, generations.as_deref()) {
+        return refused;
+    }
+    let adds_holders = erasure::adds_holders(&command);
+    let importing = erasure::importing(state, &command);
+    let refs = state.refs.len();
+    let response = apply_fenced(state, command, log_index);
+    let imported = importing
+        .is_some_and(|(key, before)| state.refs.get(&key).map(|r| &r.head) != before.as_ref());
+    if state.erasure.tracking && (adds_holders || imported || state.refs.len() > refs) {
+        state.erasure.holder_set += 1;
+    }
+    response
+}
+
+fn apply_fenced(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     let (command, presented) = match command {
         Command::Fenced { fence, command } => (*command, Some(fence)),
         command => (command, None),
@@ -1670,7 +1921,22 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             branch,
             index_id,
             index_t,
-        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t),
+        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t, false),
+        Command::RewriteGraphSourceIndex {
+            name,
+            branch,
+            index_id,
+            index_t,
+        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t, true),
+        Command::ClearFrozenIndex { key } => {
+            let frozen = state.fences.get(&key).is_some_and(|f| f.frozen);
+            if frozen {
+                if let Some(entry) = state.refs.get_mut(&key) {
+                    entry.index = None;
+                }
+            }
+            Response::FrozenIndexCleared { cleared: frozen }
+        }
         Command::RetractGraphSource { name, branch } => {
             apply_retract_graph_source(state, name, branch)
         }
@@ -1706,6 +1972,15 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             applied_at_millis,
         } => delete_branch(state, key, fence, applied_at_millis),
         Command::AdoptBranch { key, fence } => adopt_branch(state, key, fence),
+        Command::ThawBranch { key, fence } => {
+            if let Some(refused) = check_fence(state, &key, fence) {
+                return refused;
+            }
+            if let Some(f) = state.fences.get_mut(&key) {
+                f.frozen = false;
+            }
+            Response::FenceApplied
+        }
         Command::ResetGraphSourceIndex { name, branch } => {
             match state
                 .graph_sources
@@ -1719,8 +1994,12 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
                 _ => Response::NoOp,
             }
         }
+        Command::Erasure(command) => erasure::apply(state, command, log_index),
+        Command::Collect(command) => collect::apply(state, command, log_index),
         // A wrapper nested in a wrapper covers no single branch write.
-        Command::Fenced { .. } => Response::FenceMismatch,
+        Command::Fenced { .. } | Command::AtGeneration { .. } | Command::Seen { .. } => {
+            Response::FenceMismatch
+        }
     }
 }
 
@@ -1791,6 +2070,9 @@ fn insert_branch_record(
         })
         .branches
         .push(key.branch.clone());
+    if let Some(source) = &record.source_branch {
+        erasure::inherit(state, &key, &RefKey::new(&key.ledger_name, source));
+    }
     let born = record.head.is_some();
     match record.head {
         Some((head, t)) => {
@@ -2124,8 +2406,9 @@ fn create_branch(state: &mut NameServiceState, log_index: u64, args: NewBranch) 
         src.branches = src.branches.saturating_add(1);
     }
 
+    let key = RefKey::new(&ledger_id, &branch);
     state.refs.insert(
-        RefKey::new(&ledger_id, &branch),
+        key.clone(),
         RefEntry {
             head: head.clone(),
             t,
@@ -2136,6 +2419,7 @@ fn create_branch(state: &mut NameServiceState, log_index: u64, args: NewBranch) 
             branches: 0,
         },
     );
+    erasure::inherit(state, &key, &source_key);
 
     Response::BranchCreated {
         ledger_id: full,
@@ -2657,18 +2941,21 @@ fn apply_publish_graph_source(
     Response::GraphSourcePublished
 }
 
+/// Publish a graph source's index head at a higher `t`, or at the same `t`
+/// when `allow_equal`.
 fn apply_publish_graph_source_index(
     state: &mut NameServiceState,
     name: String,
     branch: String,
     index_id: ContentId,
     index_t: i64,
+    allow_equal: bool,
 ) -> Response {
     let graph_source_id = format_ledger_id(&name, &branch);
     let Some(record) = state.graph_sources.get_mut(&graph_source_id) else {
         return Response::GraphSourceNotFound { graph_source_id };
     };
-    if index_t <= record.index_t {
+    if index_t < record.index_t || (index_t == record.index_t && !allow_equal) {
         return Response::GraphSourceIndexStale {
             current_t: record.index_t,
         };

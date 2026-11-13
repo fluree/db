@@ -1067,6 +1067,16 @@ impl LeafletCache {
         self.pool().entry_count()
     }
 
+    /// Drop every cached entry, in every pool: what was decoded from an
+    /// index since released can hold a value no longer stored.
+    pub fn clear(&self) {
+        for pool in self.stages.pools.iter().filter_map(OnceLock::get) {
+            pool.invalidate_all();
+        }
+        self.stats_views.invalidate_all();
+        self.fenced_leaves.invalidate_all();
+    }
+
     // ========================================================================
     // Region 1
     // ========================================================================
@@ -1713,6 +1723,22 @@ mod tests {
             );
             assert!(!plain.holds_fences());
         }
+    }
+
+    /// Clearing drops what every pool holds, after a stage move as before.
+    #[test]
+    fn clearing_drops_every_entry_whatever_the_stage() {
+        let mib = 1u64 << 20;
+        let cache = LeafletCache::with_reservable_budget(640 * mib, None);
+        cache.insert_dict_leaf(1, Arc::from(vec![7u8; 1024]));
+        // A stage move carries the entry into another pool.
+        cache.note_promotable_pack(1, 16 * mib);
+        cache.insert_dict_leaf(2, Arc::from(vec![8u8; 1024]));
+        assert!(cache.get_dict_leaf(1).is_some() && cache.get_dict_leaf(2).is_some());
+
+        cache.clear();
+        assert!(cache.get_dict_leaf(1).is_none());
+        assert!(cache.get_dict_leaf(2).is_none());
     }
 
     /// The dictionary allowance starts reserved at its cap. A pack that

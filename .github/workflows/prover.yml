@@ -1,0 +1,38 @@
+name: Prover
+
+# The redaction prover's guest builds in RISC Zero's container, pinned by
+# digest, so its image id depends only on its sources. Fluree accepts proofs
+# only from the ids `fluree-db-erasure` pins (REDACT_IMAGE_IDS): a change that
+# reaches the guest without a new pin would fail every proof's verification.
+# This builds every platform's prover as a release does (prover-build.yml),
+# without publishing.
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - "fluree-db-redaction/src/**"
+      - "fluree-db-redaction/Cargo.toml"
+      - "fluree-prover/**"
+      - "fluree-db-erasure/src/verify.rs"
+      - ".github/workflows/prover.yml"
+      - ".github/workflows/prover-build.yml"
+      - "Dockerfile"
+  push:
+    branches: [main, next]
+    paths:
+      - "fluree-db-redaction/src/**"
+      - "fluree-db-redaction/Cargo.toml"
+      - "fluree-prover/**"
+      - "fluree-db-erasure/src/verify.rs"
+      - ".github/workflows/prover.yml"
+      - ".github/workflows/prover-build.yml"
+      - "Dockerfile"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/prover-build.yml

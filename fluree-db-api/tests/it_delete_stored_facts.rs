@@ -1895,7 +1895,12 @@ async fn rebuild_and_publish_branch_index(fluree: &Fluree, ledger_id: &str) {
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
+        .publish_index_fenced(
+            ledger_id,
+            record.write_basis(),
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 }

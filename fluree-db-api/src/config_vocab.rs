@@ -20,6 +20,7 @@ pub(crate) const GROUP_POINTERS: &[&str] = &[
     config_iris::DATALOG_DEFAULTS,
     config_iris::TRANSACT_DEFAULTS,
     config_iris::FULL_TEXT_DEFAULTS,
+    config_iris::RETENTION_DEFAULTS,
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
     config_iris::INDEXING_DEFAULTS,
@@ -35,6 +36,7 @@ pub(crate) const CONFIG_EDGES: &[&str] = &[
     config_iris::DATALOG_DEFAULTS,
     config_iris::TRANSACT_DEFAULTS,
     config_iris::FULL_TEXT_DEFAULTS,
+    config_iris::RETENTION_DEFAULTS,
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
     config_iris::INDEXING_DEFAULTS,
@@ -62,6 +64,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::DATALOG_DEFAULTS,
     config_iris::TRANSACT_DEFAULTS,
     config_iris::FULL_TEXT_DEFAULTS,
+    config_iris::RETENTION_DEFAULTS,
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
     config_iris::INDEXING_DEFAULTS,
@@ -99,6 +102,8 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::ONTOLOGY_IRI,
     config_iris::GRAPH_REF_PROP,
     config_iris::FULL_TEXT_TARGET,
+    config_iris::NO_HISTORY,
+    config_iris::TTL,
 ];
 
 /// Config predicates the reader takes several values of.
@@ -229,6 +234,7 @@ mod tests {
             datalog,
             transact,
             full_text,
+            retention,
             serving,
             query,
             indexing,
@@ -241,6 +247,7 @@ mod tests {
             (config_iris::DATALOG_DEFAULTS, datalog.is_some()),
             (config_iris::TRANSACT_DEFAULTS, transact.is_some()),
             (config_iris::FULL_TEXT_DEFAULTS, full_text.is_some()),
+            (config_iris::RETENTION_DEFAULTS, retention.is_some()),
             (config_iris::SERVING_DEFAULTS, serving.is_some()),
             (config_iris::QUERY_DEFAULTS, query.is_some()),
             (config_iris::INDEXING_DEFAULTS, indexing.is_some()),
@@ -272,6 +279,8 @@ mod tests {
         config_iris::TRUST_POLICY,
         config_iris::FULL_TEXT_DEFAULTS_CLASS,
         config_iris::FULL_TEXT_PROPERTY_CLASS,
+        config_iris::RETENTION_DEFAULTS_CLASS,
+        config_iris::RETENTION_PROPERTY_CLASS,
         config_iris::VALIDATION_REJECT,
         config_iris::VALIDATION_WARN,
         config_iris::DEFAULT_GRAPH,
@@ -346,7 +355,7 @@ mod tests {
                 f:reasoningDefaults <urn:c:reasoning> ; f:datalogDefaults <urn:c:datalog> ;
                 f:transactDefaults <urn:c:transact> ; f:fullTextDefaults <urn:c:ft> ;
                 f:servingDefaults <urn:c:serving> ; f:queryDefaults <urn:c:query> ;
-                f:indexingDefaults <urn:c:indexing> ;
+                f:retentionDefaults <urn:c:ret> ; f:indexingDefaults <urn:c:indexing> ;
                 f:graphOverrides <urn:c:g1> .
               <urn:c:policy> f:defaultAllow false ; f:policySource <urn:c:ref> ;
                 f:policyClass ex:Reader ; f:overrideControl <urn:c:oc> .
@@ -369,6 +378,8 @@ mod tests {
               <urn:c:transact> f:uniqueEnabled true ; f:constraintsSource <urn:c:ref> .
               <urn:c:ft> f:defaultLanguage \"en\" ; f:property <urn:c:ftp> .
               <urn:c:ftp> f:target ex:title .
+              <urn:c:ret> f:property <urn:c:retp> .
+              <urn:c:retp> f:target ex:counter ; f:ttl 60 ; f:noHistory false .
               <urn:c:serving> f:serveQuery true ; f:serveBlocks true ; f:publicVisibility true .
               <urn:c:query> f:unionDefaultGraph true .
               <urn:c:indexing> f:graphPlacement f:PlacementAuto .

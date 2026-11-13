@@ -431,7 +431,7 @@ async fn verify_reports_a_commit_the_storage_lost_despite_a_cached_copy() {
         storage.storage_method(),
         ContentKind::Commit,
         &namespace,
-        &head.digest_hex(),
+        &head.address_digest(),
     );
     assert!(storage.exists(&address).await.unwrap());
     storage.delete(&address).await.expect("delete");

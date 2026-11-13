@@ -1855,14 +1855,70 @@ pub mod db {
     /// reconstruct revert provenance from the txn-meta graph.
     pub const REVERTS: &str = "reverts";
 
+    /// db:ttl - relative lifetime, whole seconds or a day/time duration,
+    /// from the commit time of the assertion it governs. A TTL instruction on an annotation,
+    /// a transaction default in txn-meta, and a retention property field.
+    pub const TTL: &str = "ttl";
+
+    /// db:expiresAt - absolute expiration instant (`xsd:dateTime` with a
+    /// known offset). A TTL instruction on an annotation, or a transaction
+    /// default in txn-meta.
+    pub const EXPIRES_AT: &str = "expiresAt";
+
+    /// db:retentionControl - system marker on a commit that carries
+    /// retention control input: TTL instructions on annotations or a write to
+    /// the retention config. Per-value TTL instructions are honored only in
+    /// commits that carry it, so annotations written before TTL support do
+    /// not become deletion instructions.
+    pub const RETENTION_CONTROL: &str = "retentionControl";
+
+    /// db:lifetimeStart - on a commit that replays an earlier one (a
+    /// rebase): when the original was written, which its relative lifetimes
+    /// count from.
+    pub const LIFETIME_START: &str = "lifetimeStart";
+
+    /// db:erasureRequest - on the control commit that authorizes a permanent
+    /// erasure: the request's id.
+    pub const ERASURE_REQUEST: &str = "erasureRequest";
+
+    /// db:erasureRequester - the identity that requested the erasure.
+    pub const ERASURE_REQUESTER: &str = "erasureRequester";
+
+    /// db:erasureManifest - SHA-256 (hex) of the erasure's manifest: the
+    /// occurrences it removes, by commit and slot. It names no value.
+    pub const ERASURE_MANIFEST: &str = "erasureManifest";
+
+    /// db:erasureSignatures - how the erasure's proofs handle the original
+    /// commits' signatures: `verify` them inside the proof, or `expose` them
+    /// for the verifier, which reveals a signed body's hash. Absent, from an
+    /// earlier release, is `verify`.
+    pub const ERASURE_SIGNATURES: &str = "erasureSignatures";
+
     /// The local names in this namespace that a user may set in a commit's
-    /// txn-meta: `f:message` and `f:author`.
-    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR];
+    /// txn-meta: `f:message`, `f:author`, and the transaction TTL default
+    /// (`f:ttl` or `f:expiresAt`).
+    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR, TTL, EXPIRES_AT];
 
     /// Every local name in this namespace a commit's txn-meta holds: the user
     /// claims ([`TXN_META_USER`]) and the entries the system writes
-    /// (`f:identity`, `db:receivedAt`, and `f:reverts` on a revert).
-    pub const TXN_META: &[&str] = &[MESSAGE, AUTHOR, IDENTITY, RECEIVED_AT, REVERTS];
+    /// (`f:identity`, `db:receivedAt`, `f:reverts` on a revert,
+    /// `f:retentionControl`, `f:lifetimeStart` on a replay, and an erasure's
+    /// authorization).
+    pub const TXN_META: &[&str] = &[
+        MESSAGE,
+        AUTHOR,
+        TTL,
+        EXPIRES_AT,
+        IDENTITY,
+        RECEIVED_AT,
+        REVERTS,
+        RETENTION_CONTROL,
+        LIFETIME_START,
+        ERASURE_REQUEST,
+        ERASURE_REQUESTER,
+        ERASURE_MANIFEST,
+        ERASURE_SIGNATURES,
+    ];
 
     /// db:txn - transaction address (optional)
     pub const TXN: &str = "txn";
@@ -1978,6 +2034,14 @@ pub mod txn_meta {
         outside_reserved_or_in(ns, name, TXN_META)
     }
 
+    /// Whether this txn-meta predicate is retention input: the marker a
+    /// write carrying lifetimes or retention config gets, or a transaction's
+    /// default lifetime.
+    pub fn is_retention_input(ns: u16, name: &str) -> bool {
+        use crate::db::{EXPIRES_AT, RETENTION_CONTROL, TTL};
+        ns == FLUREE_DB && matches!(name, RETENTION_CONTROL | TTL | EXPIRES_AT)
+    }
+
     fn outside_reserved_or_in(ns: u16, name: &str, fluree_db_names: &[&str]) -> bool {
         !RESERVED_NAMESPACES.contains(&ns) || (ns == FLUREE_DB && fluree_db_names.contains(&name))
     }
@@ -1998,6 +2062,8 @@ pub mod txn_meta {
         fn users_set_only_their_claims_in_reserved_namespaces() {
             assert!(user_may_set(FLUREE_DB, db::MESSAGE));
             assert!(user_may_set(FLUREE_DB, db::AUTHOR));
+            assert!(user_may_set(FLUREE_DB, db::TTL));
+            assert!(user_may_set(FLUREE_DB, db::EXPIRES_AT));
             assert!(!user_may_set(FLUREE_DB, db::IDENTITY));
             assert!(!user_may_set(FLUREE_DB, db::REVERTS));
             assert!(!user_may_set(FLUREE_DB, db::T));
@@ -2045,6 +2111,15 @@ pub mod reifies_iris {
     pub const ALL: [&str; 7] = [
         GRAPH, SUBJECT, PREDICATE, OBJECT, DATATYPE, LANG, LIST_INDEX,
     ];
+}
+
+/// TTL instruction IRIs, as written on an annotation or in txn-meta.
+pub mod retention_iris {
+    /// `f:ttl` — relative lifetime: whole seconds or a day/time duration.
+    pub const TTL: &str = "https://ns.flur.ee/db#ttl";
+
+    /// `f:expiresAt` — absolute expiration instant (`xsd:dateTime`).
+    pub const EXPIRES_AT: &str = "https://ns.flur.ee/db#expiresAt";
 }
 
 /// Fluree DB search query key local names (under `https://ns.flur.ee/db#`)
@@ -2478,6 +2553,28 @@ pub mod config_iris {
 
     /// `f:target` — property IRI that a `FullTextProperty` entry applies to.
     pub const FULL_TEXT_TARGET: &str = "https://ns.flur.ee/db#target";
+
+    // ---- Retention fields ----
+
+    /// `f:retentionDefaults` — retention policy group on LedgerConfig/GraphConfig.
+    /// Durable state policy: no request-time override and no override control.
+    pub const RETENTION_DEFAULTS: &str = "https://ns.flur.ee/db#retentionDefaults";
+
+    /// `f:RetentionDefaults` — class/type for the retention defaults resource.
+    pub const RETENTION_DEFAULTS_CLASS: &str = "https://ns.flur.ee/db#RetentionDefaults";
+
+    /// `f:RetentionProperty` — class/type for one retention property entry
+    /// (reached through `f:property`, keyed by its `f:target`).
+    pub const RETENTION_PROPERTY_CLASS: &str = "https://ns.flur.ee/db#RetentionProperty";
+
+    /// `f:noHistory` — boolean on a retention property entry: obsolete
+    /// assertions/retractions of the target are dropped from index history.
+    pub const NO_HISTORY: &str = "https://ns.flur.ee/db#noHistory";
+
+    /// `f:ttl` — whole seconds or a day/time duration on a retention
+    /// property entry: the lifetime of the target's assertions, from their commit time.
+    /// `0` disables an inherited duration for future assertions.
+    pub const TTL: &str = "https://ns.flur.ee/db#ttl";
 
     // ---- Serving defaults fields (ledger-scoped) ----
 

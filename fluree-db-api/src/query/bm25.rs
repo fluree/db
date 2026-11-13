@@ -41,6 +41,16 @@ impl Fluree {
 
         // Build executable query
         let executable = ExecutableQuery::simple(parsed.clone());
+        for view in dataset.views() {
+            self.refuse_suppressed_view_history(
+                view,
+                &parsed,
+                &executable,
+                dataset.history_time_range(),
+                &primary.snapshot,
+            )
+            .await?;
+        }
 
         // Create index provider for graph source support (implements both BM25 and Vector)
         let provider = FlureeIndexProvider::new(self);

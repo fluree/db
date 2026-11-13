@@ -205,6 +205,7 @@ async fn push(fluree: &Fluree, id: &str, commit: Base64Bytes) {
         blobs: Default::default(),
         missing_blobs: Vec::new(),
         merged_commits: Vec::new(),
+        ..Default::default()
     };
     let accepted = fluree
         .push_commits(id, request, &GovernanceOptions::default(), &config)
@@ -656,7 +657,13 @@ async fn pulled(path: &str, id: &str, commits: Vec<Base64Bytes>) -> fluree_db_co
     let fluree = open(path);
     fluree.create_ledger(id).await.expect("create target");
     let head = fluree
-        .import_commits_incremental(id, commits, Vec::new(), Default::default())
+        .import_commits_incremental(
+            id,
+            fluree_db_api::PushCommitsRequest {
+                commits,
+                ..Default::default()
+            },
+        )
         .await
         .expect("pull")
         .head_commit_id;

@@ -306,7 +306,7 @@ impl CommitResolver {
     /// - **User metadata**: any `txn_meta` entries from the envelope.
     ///
     /// The `commit_hash_hex` parameter is the 64-char SHA-256 hex digest identifying
-    /// the commit (typically from `ContentId::digest_hex()`).
+    /// the commit (typically from `ContentId::address_digest()`).
     ///
     /// Returns the number of records emitted.
     #[allow(clippy::too_many_arguments)]
@@ -331,11 +331,10 @@ impl CommitResolver {
             ResolverError::Resolve(format!("commit t={} does not fit in u32", envelope.t))
         })?;
 
-        // 3. Resolve commit subject: "fluree:commit:sha256:<hex>"
-        let commit_iri = format!("{}{}", fluree::COMMIT, hex);
-        let commit_s_id = dicts
-            .subjects
-            .get_or_insert(&commit_iri, fluree_vocab::namespaces::FLUREE_COMMIT)?;
+        // 3. Resolve commit subject (see `fluree_db_core::commit_subject`).
+        let (commit_ns, commit_name) = commit_subject_parts(hex);
+        let commit_iri = format!("{}{commit_name}", commit_namespace_iri(commit_ns));
+        let commit_s_id = dicts.subjects.get_or_insert(&commit_iri, commit_ns)?;
 
         // 4. Resolve predicate p_ids
         let p_address = dicts
@@ -445,11 +444,10 @@ impl CommitResolver {
 
         // ledger:previous (ID) -- ref to parent commit(s)
         for parent in &envelope.parents {
-            // Use CID digest hex as the subject name in FLUREE_COMMIT namespace
-            let prev_digest = parent.digest_hex();
+            let prev = fluree_db_core::commit_subject::commit_sid(parent);
             let prev_s_id = dicts
                 .subjects
-                .get_or_insert(&prev_digest, fluree_vocab::namespaces::FLUREE_COMMIT)?;
+                .get_or_insert(&prev.name, prev.namespace_code)?;
             push(
                 commit_s_id,
                 p_previous,
@@ -1148,6 +1146,9 @@ pub struct SharedResolverState {
     graph_floors: HashMap<String, i64>,
     /// [`Self::graph_floors`] by this run's graph ids, filled as ops meet them.
     graph_floor_ids: HashMap<GraphId, Option<i64>>,
+    /// The earliest `t` among the resolved commits whose txn-meta carries
+    /// retention input ([`fluree_vocab::txn_meta::is_retention_input`]).
+    pub retention_input_from_t: Option<i64>,
 }
 
 impl SharedResolverState {
@@ -1199,6 +1200,7 @@ impl SharedResolverState {
             link_synth: super::link_synth::LinkSynth::new(),
             graph_floors: HashMap::new(),
             graph_floor_ids: HashMap::new(),
+            retention_input_from_t: None,
         }
     }
 
@@ -1353,6 +1355,7 @@ impl SharedResolverState {
             link_synth: super::link_synth::LinkSynth::new(),
             graph_floors: HashMap::new(),
             graph_floor_ids: HashMap::new(),
+            retention_input_from_t: None,
         })
     }
 
@@ -1401,6 +1404,79 @@ impl SharedResolverState {
     /// `self.fulltext_hook_config` and consulted by
     /// [`FulltextHook::on_op`](crate::fulltext_hook::FulltextHook::on_op)
     /// on every record.
+    /// The history `suppressed` leaves out of graph `g_id`'s index, by this
+    /// build's predicate ids. `None` when nothing applies to the graph.
+    pub fn history_drop_for(
+        &self,
+        suppressed: &[crate::config::SuppressedHistory],
+        g_id: fluree_db_core::GraphId,
+    ) -> Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>> {
+        if suppressed.is_empty() {
+            return None;
+        }
+        let graph_id = |iri: &str| -> Option<fluree_db_core::GraphId> {
+            if iri == fluree_db_core::graph_registry::DEFAULT_GRAPH_IRI {
+                return Some(0);
+            }
+            self.graphs
+                .graph_dict_id(iri)
+                .and_then(|raw| raw.checked_add(1))
+        };
+        let mut drop = fluree_db_binary_index::format::history_sidecar::HistoryDrop::default();
+        for rule in suppressed {
+            let applies = match &rule.graph_iri {
+                Some(iri) => graph_id(iri) == Some(g_id),
+                None => !rule
+                    .except_graph_iris
+                    .iter()
+                    .any(|iri| graph_id(iri) == Some(g_id)),
+            };
+            if !applies {
+                continue;
+            }
+            if let Some(p_id) = self.predicates.get(&rule.predicate_iri) {
+                drop.insert(p_id, rule.from_t, rule.until_t);
+            }
+        }
+        (!drop.is_empty()).then(|| std::sync::Arc::new(drop))
+    }
+
+    /// [`Self::history_drop_for`] the pooled tree, for whichever graphs it
+    /// holds.
+    pub fn pool_history_drop(
+        &self,
+        suppressed: &[crate::config::SuppressedHistory],
+    ) -> Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>> {
+        use fluree_db_binary_index::format::history_sidecar::{Graphs, HistoryDrop};
+        if suppressed.is_empty() {
+            return None;
+        }
+        let graph_id = |iri: &str| -> Option<fluree_db_core::GraphId> {
+            self.graphs
+                .graph_dict_id(iri)
+                .and_then(|raw| raw.checked_add(1))
+        };
+        let mut drop = HistoryDrop::pooled();
+        for rule in suppressed {
+            let graphs = match &rule.graph_iri {
+                Some(iri) => match graph_id(iri) {
+                    Some(g_id) => Graphs::One(g_id),
+                    None => continue,
+                },
+                None => Graphs::AllBut(
+                    rule.except_graph_iris
+                        .iter()
+                        .filter_map(|iri| graph_id(iri))
+                        .collect(),
+                ),
+            };
+            if let Some(p_id) = self.predicates.get(&rule.predicate_iri) {
+                drop.insert_in(graphs, p_id, rule.from_t, rule.until_t);
+            }
+        }
+        (!drop.is_empty()).then(|| std::sync::Arc::new(drop))
+    }
+
     pub fn configure_fulltext_properties(
         &mut self,
         properties: &[crate::config::ConfiguredFulltextProperty],
@@ -1439,6 +1515,11 @@ impl SharedResolverState {
             }
         }
         self.fulltext_hook_config = config;
+    }
+
+    fn note_retention_input(&mut self, t: i64) {
+        self.retention_input_from_t =
+            Some(self.retention_input_from_t.map_or(t, |from| from.min(t)));
     }
 
     /// Skip every op on a graph from before the graph's latest drop among the
@@ -2029,10 +2110,10 @@ impl SharedResolverState {
         })?;
 
         // Resolve commit subject using chunk-local subject dict.
-        let commit_ns_code = fluree_vocab::namespaces::FLUREE_COMMIT;
+        let (commit_ns_code, commit_name) = commit_subject_parts(commit_hash_hex);
         let commit_s_id = chunk
             .subjects
-            .get_or_insert(commit_ns_code, commit_hash_hex.as_bytes());
+            .get_or_insert(commit_ns_code, commit_name.as_bytes());
 
         // Resolve predicate p_ids (global)
         let p_address = self.predicates.get_or_insert_parts(fluree::DB, db::ADDRESS);
@@ -2128,11 +2209,10 @@ impl SharedResolverState {
 
         // ledger:previous (ID) -- ref to parent commit(s) (chunk-local subject)
         for parent in &envelope.parents {
-            let prev_digest = parent.digest_hex();
-            let prev_s_id = chunk.subjects.get_or_insert(
-                fluree_vocab::namespaces::FLUREE_COMMIT,
-                prev_digest.as_bytes(),
-            );
+            let prev = fluree_db_core::commit_subject::commit_sid(parent);
+            let prev_s_id = chunk
+                .subjects
+                .get_or_insert(prev.namespace_code, prev.name.as_bytes());
             push(
                 commit_s_id,
                 p_previous,
@@ -2171,6 +2251,10 @@ impl SharedResolverState {
 
         // User-provided txn_meta entries
         for entry in &envelope.txn_meta {
+            if fluree_vocab::txn_meta::is_retention_input(entry.predicate_ns, &entry.predicate_name)
+            {
+                self.note_retention_input(envelope.t);
+            }
             count += self.emit_txn_meta_entry_chunk(commit_s_id, g_id, t, entry, chunk)?;
         }
 
@@ -2568,6 +2652,34 @@ mod term_remap_tests {
         }
         assert_eq!(remapped(ObjKind::REF_ID, 2), (11, 12));
         assert_eq!(remapped(ObjKind::NUM_INT, 7), (11, 7));
+    }
+}
+
+/// The namespace code and name of the commit subject for an address digest
+/// (see [`fluree_db_core::commit_subject`]); an undecodable digest keeps the
+/// SHA2-256 spelling.
+fn commit_subject_parts(address_digest: &str) -> (u16, String) {
+    match fluree_db_core::ContentId::from_address_digest(
+        fluree_db_core::CODEC_FLUREE_COMMIT,
+        address_digest,
+    ) {
+        Some(id) => {
+            let sid = fluree_db_core::commit_subject::commit_sid(&id);
+            (sid.namespace_code, sid.name.to_string())
+        }
+        None => (
+            fluree_vocab::namespaces::FLUREE_COMMIT,
+            address_digest.to_string(),
+        ),
+    }
+}
+
+/// The IRI prefix of a commit subject's namespace.
+fn commit_namespace_iri(ns_code: u16) -> &'static str {
+    if ns_code == fluree_vocab::namespaces::FLUREE_URN {
+        fluree::URN
+    } else {
+        fluree::COMMIT
     }
 }
 

@@ -129,6 +129,8 @@ sha2.workspace = true
 # `stream` enables streaming a .flpack file body to POST /import without
 # buffering the whole archive; `tokio-util` io gives ReaderStream for it.
 reqwest = { workspace = true, features = ["form", "stream"] }
+# `fluree prover install` unpacks the prover.
+zstd = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes.workspace = true
 urlencoding = { workspace = true }
@@ -144,6 +146,8 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# A native prover with fake receipts, for tests of erased history in transfers.
+fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 # Drive the server's router in-process (behind the `server` feature) so the
 # tracking headers this CLI emits are tested against the parser that consumes
 # them, rather than each side being asserted in isolation.
@@ -153,7 +157,6 @@ http-body-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 # Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
 flate2 = { workspace = true }
-zstd = { workspace = true }
 
 [lints]
 workspace = true

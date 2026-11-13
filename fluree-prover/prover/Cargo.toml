@@ -1,0 +1,11 @@
+[package]
+name = "fluree-prover"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fluree-prover-methods = { path = "../methods" }
+# Proves in-process: no r0vm to install or to outlive a step.
+risc0-zkvm = { version = "=3.0.6", features = ["prove"] }
+fluree-db-redaction = { path = "../../fluree-db-redaction", default-features = false, features = ["host-sha", "c-zstd"] }
+bincode = "1.3"

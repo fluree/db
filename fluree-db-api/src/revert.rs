@@ -242,7 +242,7 @@ impl crate::Fluree {
         let StagedRevert {
             branch_id,
             branch_namespace,
-            branch_fence,
+            branch_basis,
             branch: branch_string,
             reverted_commits,
             conflict_count,
@@ -280,7 +280,7 @@ impl crate::Fluree {
                 );
                 if let Err(rollback_err) = self
                     .branch_admin()?
-                    .reset_head_fenced(&branch_id, branch_fence, snapshot)
+                    .reset_head_fenced(&branch_id, branch_basis, snapshot)
                     .await
                 {
                     tracing::error!(
@@ -471,6 +471,7 @@ impl crate::Fluree {
             net: undo,
             namespace_delta,
             graph_iris,
+            ..
         } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is
@@ -478,7 +479,7 @@ impl crate::Fluree {
         // manager (embedded use with no shared cache), fall back to a
         // fresh storage load — there's nothing to protect against.
         let branch_namespace = branch_record.storage_namespace();
-        let branch_fence = branch_record.fence;
+        let branch_basis = branch_record.write_basis();
         let (write_guard, target_state) = self
             .lock_or_load(&branch_id, branch_store.clone(), branch_record)
             .await?;
@@ -511,7 +512,7 @@ impl crate::Fluree {
             return Ok(StagedRevert {
                 branch_id: branch_id.clone(),
                 branch_namespace,
-                branch_fence,
+                branch_basis,
                 branch: branch.to_string(),
                 reverted_commits,
                 conflict_count,
@@ -562,14 +563,14 @@ impl crate::Fluree {
             expected_head_ref,
             None,
             &self.index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await?;
 
         Ok(StagedRevert {
             branch_id: branch_id.clone(),
             branch_namespace,
-            branch_fence,
+            branch_basis,
             branch: branch.to_string(),
             reverted_commits,
             conflict_count,
@@ -719,9 +720,9 @@ pub struct StagedRevert {
     pub branch_id: LedgerId,
     /// Where the branch's artifacts live.
     pub branch_namespace: StorageNamespace,
-    /// The fence the branch's record carried when the revert was prepared,
+    /// What the branch's record presented when the revert was prepared,
     /// which a rollback of its head presents.
-    pub branch_fence: Option<fluree_db_nameservice::Fence>,
+    pub branch_basis: fluree_db_nameservice::WriteBasis,
     /// Branch name (without ledger prefix) — echoed onto the
     /// resulting receipt.
     pub branch: String,

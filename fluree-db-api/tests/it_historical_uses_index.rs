@@ -301,7 +301,7 @@ async fn assert_historical_publish_keeps_strings(sparql: bool) {
     );
     assert_eq!(read().await, expected, "before publication");
 
-    *storage.hooks().digest.lock().unwrap() = Some(old_root.digest_hex());
+    *storage.hooks().digest.lock().unwrap() = Some(old_root.address_digest());
     let publish = async {
         tokio::time::timeout(Duration::from_secs(60), storage.hooks().parked.notified())
             .await

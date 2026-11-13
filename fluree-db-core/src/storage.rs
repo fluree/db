@@ -121,6 +121,7 @@ mod content_bytes;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
+pub mod pins;
 mod range_source;
 pub mod residency;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -132,8 +133,12 @@ pub use content_bytes::ContentBytes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use content_bytes::DEFAULT_MMAP_MIN_BYTES;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use file::{FileStorage, STORAGE_METHOD_FILE};
+pub use file::{DeleteLease, FileStorage, StoppedLogs, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
+pub use pins::{
+    Abandoned, BlobClaim, BlobPin, BlobPinner, BlobPins, PinWaits, RootCollection, RootHold,
+    Unpublished,
+};
 pub use range_source::RangeSource;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use root_lock::{RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE};
@@ -316,6 +321,20 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// The registry protecting this storage's unpublished commit and
+    /// transaction blobs from a collector, when one collects here.
+    fn blob_pins(&self) -> Option<Arc<pins::BlobPins>> {
+        None
+    }
+
+    /// How many of a cluster's collection intents this member had loaded
+    /// when asked, where its writes are checked against them. A write that
+    /// stores outside the scope publishing it presents this, read before
+    /// it stores.
+    fn intents_loaded(&self) -> Option<u64> {
+        None
+    }
+
     /// Read a byte range from the object at the given address.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
@@ -421,6 +440,19 @@ pub trait StorageWrite: Debug + Send + Sync {
             }
         }
         failures
+    }
+
+    /// Delete an object so that no write-ahead log replay can redo the
+    /// delete: a later write of the same address survives a replay of this
+    /// storage's log. Nothing is deleted if `until` has passed when the
+    /// unlink would begin: `false` then. Durable on return. The default is
+    /// [`Self::delete`], for backends that keep no log of their deletes.
+    async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
+        if std::time::Instant::now() >= until {
+            return Ok(false);
+        }
+        self.delete(address).await?;
+        Ok(true)
     }
 
     /// Make every write this storage reported complete short of the device
@@ -610,6 +642,14 @@ impl StorageRead for Arc<dyn Storage> {
     fn query_guard(&self) -> Option<residency::InFlightGuard> {
         self.as_ref().query_guard()
     }
+
+    fn blob_pins(&self) -> Option<Arc<pins::BlobPins>> {
+        self.as_ref().blob_pins()
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.as_ref().intents_loaded()
+    }
 }
 
 #[async_trait]
@@ -624,6 +664,10 @@ impl StorageWrite for Arc<dyn Storage> {
 
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
         self.as_ref().delete_many(addresses).await
+    }
+
+    async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
+        self.as_ref().delete_unlogged(address, until).await
     }
 
     async fn sync(&self) -> Result<()> {
@@ -656,7 +700,7 @@ impl StorageMethod for Arc<dyn Storage> {
 // ContentStore Trait (CID-first storage abstraction)
 // ============================================================================
 
-use crate::content_id::ContentId;
+use crate::content_id::{ContentId, HashAlgorithm};
 
 /// Content-addressed store operating on `ContentId` (CIDv1).
 ///
@@ -683,8 +727,41 @@ pub trait ContentStore: Debug + Send + Sync {
     /// Implementations MUST call `id.verify(bytes)` and reject mismatches.
     ///
     /// V4 commit blobs can be stored with this method since their CID
-    /// is `SHA-256(full blob)`, matching `id.verify(bytes)`.
+    /// hashes the full blob, matching `id.verify(bytes)`.
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()>;
+
+    /// Store bytes under the CID `alg` mints for them. SHA2-256 is
+    /// [`Self::put`].
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        if alg == HashAlgorithm::Sha2_256 {
+            return self.put(kind, bytes).await;
+        }
+        let id = ContentId::new_with(alg, kind, bytes);
+        self.put_with_id(&id, bytes).await?;
+        Ok(id)
+    }
+
+    /// [`Self::put_with_id`] for an id the caller just minted from `bytes`,
+    /// which a store may skip verifying.
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        self.put_with_id(id, bytes).await
+    }
+
+    /// Where writes to this store are pinned against a collector, when one
+    /// collects here: see [`pins`].
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        None
+    }
+
+    /// See [`Storage::intents_loaded`].
+    fn intents_loaded(&self) -> Option<u64> {
+        None
+    }
 
     /// The object's bytes when this machine already has them, without
     /// fetching: see [`StorageRead::get_local`] for the contract.
@@ -841,8 +918,29 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().put(kind, bytes).await
     }
 
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        self.as_ref().put_hashed(alg, kind, bytes).await
+    }
+
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
         self.as_ref().put_with_id(id, bytes).await
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        self.as_ref().put_minted(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        self.as_ref().blob_pinner()
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.as_ref().intents_loaded()
     }
 
     fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
@@ -1010,7 +1108,7 @@ impl<S: Storage> StorageContentStore<S> {
             &self.method,
             kind,
             &self.namespace,
-            &id.digest_hex(),
+            &id.address_digest(),
         ))
     }
 
@@ -1041,7 +1139,7 @@ pub fn legacy_dict_address(
         return None;
     }
     let prefix = namespace.branch_prefix();
-    let hex = id.digest_hex();
+    let hex = id.address_digest();
     Some(format!(
         "fluree:{method}://{prefix}/index/objects/dicts/{hex}.dict"
     ))
@@ -1059,7 +1157,7 @@ fn legacy_index_root_address(
         return None;
     }
     let prefix = namespace.branch_prefix();
-    let hex = id.digest_hex();
+    let hex = id.address_digest();
     Some(format!("fluree:{method}://{prefix}/index/roots/{hex}.json"))
 }
 
@@ -1082,7 +1180,12 @@ pub fn candidate_addresses(
 ) -> Vec<String> {
     let mut addresses = Vec::new();
     if let Some(kind) = id.content_kind() {
-        addresses.push(content_address(method, kind, namespace, &id.digest_hex()));
+        addresses.push(content_address(
+            method,
+            kind,
+            namespace,
+            &id.address_digest(),
+        ));
     }
     addresses.extend(legacy_dict_address(method, namespace, id));
     addresses.extend(legacy_index_root_address(method, namespace, id));
@@ -1141,10 +1244,18 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
-        let id = ContentId::new(kind, bytes);
-        let hex_digest = id.digest_hex();
+        self.put_hashed(HashAlgorithm::Sha2_256, kind, bytes).await
+    }
+
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        let id = ContentId::new_with(alg, kind, bytes);
         self.storage
-            .content_write_bytes_with_hash(kind, &self.namespace, &hex_digest, bytes)
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
             .await?;
         Ok(id)
     }
@@ -1165,9 +1276,29 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // land on the same answer either way; a path that ingests index blobs
         // by CID would silently start fsyncing them.
         self.storage
-            .content_write_bytes_with_hash(kind, &self.namespace, &id.digest_hex(), bytes)
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
             .await?;
         Ok(())
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        let kind = id.content_kind().ok_or_else(|| {
+            crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
+        })?;
+        self.storage
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
+            .await?;
+        Ok(())
+    }
+
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        self.storage
+            .blob_pins()
+            .map(|pins| pins::BlobPinner::new(pins, self.namespace.clone()))
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.storage.intents_loaded()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -1707,8 +1838,29 @@ impl ContentStore for BranchedContentStore {
         self.branch_store.put(kind, bytes).await
     }
 
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        self.branch_store.put_hashed(alg, kind, bytes).await
+    }
+
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
         self.branch_store.put_with_id(id, bytes).await
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        self.branch_store.put_minted(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        self.branch_store.blob_pinner()
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.branch_store.intents_loaded()
     }
 
     /// Writes land in the branch's own store, so it is the one to keep them.
@@ -1906,6 +2058,7 @@ fn content_path_from_prefixes(
         ContentKind::GraphSourceMapping => {
             format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/mapping/{hash_hex}.ttl")
         }
+        ContentKind::RetentionState => format!("{prefix}/retention/{hash_hex}.frs"),
         // Forward-compatibility: unknown kinds go to a generic blob directory
         #[allow(unreachable_patterns)]
         _ => format!("{prefix}/blob/{hash_hex}.bin"),
@@ -2452,7 +2605,7 @@ mod tests {
             storage.storage_method(),
             ContentKind::IndexLeaf,
             &ledger(),
-            &canonical_id.digest_hex(),
+            &canonical_id.address_digest(),
         );
         storage
             .write_bytes(&canonical, b"leaf bytes")
@@ -2499,7 +2652,7 @@ mod tests {
                     "memory",
                     ContentKind::IndexLeaf,
                     &ledger(),
-                    &id.digest_hex()
+                    &id.address_digest()
                 )
                 .as_str()
             )

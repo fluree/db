@@ -409,7 +409,7 @@ async fn create_branch_at_prefix() {
 
     // An 8-hex-char prefix is plenty to uniquely identify the commit in a
     // tiny test ledger; the resolver requires >= 6 chars.
-    let prefix = t2_commit_id.digest_hex()[..8].to_string();
+    let prefix = t2_commit_id.address_digest()[..8].to_string();
     let record = fluree
         .create_branch("mydb", "historical", None, Some(TimeSpec::AtCommit(prefix)))
         .await

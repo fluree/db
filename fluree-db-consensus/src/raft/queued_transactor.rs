@@ -191,7 +191,19 @@ impl QueuedTransactor {
         envelope: &mut EnvelopeFate,
     ) -> Result<SubmissionOutcome, SubmissionError> {
         let request_cid = args.request_cid.clone();
-        let cmd = SmCommand::EnqueueCommand(args);
+        let collecting = self.shared_state.read().await.collect.enabled;
+        let Some(cmd) = crate::raft::nameservice::by_writer(
+            collecting,
+            SmCommand::EnqueueCommand(args),
+            fluree_db_api::collect::seen(),
+        ) else {
+            envelope.turned_away();
+            return Err(SubmissionError::Execution {
+                status: 500,
+                message: "the submission ran outside a write scope while the cluster collects"
+                    .to_string(),
+            });
+        };
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
         // Arm interest *before* proposing. The queue_id does not exist
         // yet, so the waiter is keyed by request_cid until this node
@@ -290,6 +302,23 @@ impl QueuedTransactor {
                 SmResponse::BodyHashMismatch => {
                     return Err(SubmissionError::KeyCollision);
                 }
+                // Turned away like any rejection: the release hands the
+                // envelope to the collector, which may already have
+                // deleted what the submission stored.
+                SmResponse::CollectionMoved { deleting } => {
+                    return Err(SubmissionError::Execution {
+                        status: 503,
+                        message: match deleting {
+                            Some(deleting) => format!(
+                                "the submission began before collection intent {deleting}, \
+                                 whose deletion has begun; retry"
+                            ),
+                            None => "the submission was built before the cluster began \
+                                     collecting; retry"
+                                .to_string(),
+                        },
+                    });
+                }
                 SmResponse::QueueFull { .. } => {
                     return Err(SubmissionError::Overloaded);
                 }
@@ -382,15 +411,30 @@ impl QueuedTransactor {
         Ok(ContentId::new(ContentKind::Txn, &bytes))
     }
 
-    /// Decrement (or remove) an orphaned envelope's CAS entry. The
-    /// content store's `release` is idempotent, so a double-release
-    /// on the same CID is harmless — log on failure but don't escalate
-    /// to the caller, since the submission has already returned its
-    /// terminal status.
+    /// Release an orphaned envelope, one no queued entry will read. On a
+    /// collecting cluster it is recorded for the collector, which alone
+    /// deletes blobs there; otherwise the content store's `release` drops
+    /// it. Both are idempotent, so a double-release on the same CID is
+    /// harmless — log on failure but don't escalate to the caller, since
+    /// the submission has already returned its terminal status.
     async fn release_envelope(&self, ledger_id: &str, request_cid: &ContentId) {
         let Ok(namespace) = self.namespace_of(ledger_id).await else {
             return;
         };
+        // Once the cluster collects, only its collection deletes a blob:
+        // the envelope is recorded for it instead.
+        match self
+            .fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(request_cid))
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(%ledger_id, cid = %request_cid, error = %err, "could not record an orphaned envelope");
+                return;
+            }
+        }
         if let Err(err) = self
             .fluree
             .content_store(&namespace)
@@ -540,6 +584,44 @@ impl Committer for QueuedTransactor {
         &self,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
+        self.scoped(self.transact_scoped(request)).await
+    }
+
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+        self.scoped(self.revert_scoped(request)).await
+    }
+
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+        self.scoped(self.merge_scoped(request)).await
+    }
+
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+        self.scoped(self.rebase_scoped(request)).await
+    }
+
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+        self.scoped(self.push_scoped(request)).await
+    }
+}
+
+impl QueuedTransactor {
+    /// Run a submission in a write scope: what it stores before its enqueue
+    /// is checked against what collection condemned, and the enqueue
+    /// presents the intents loaded when it began.
+    async fn scoped<F: std::future::Future>(&self, submission: F) -> F::Output {
+        match self.fluree.condemned() {
+            Some(condemned) => {
+                crate::raft::collect::catch_up(&self.fluree, &condemned, &self.shared_state).await;
+                condemned.scoped(submission).await
+            }
+            None => submission.await,
+        }
+    }
+
+    async fn transact_scoped(
+        &self,
+        request: TransactionRequest,
+    ) -> Result<TransactionReceipt, SubmissionError> {
         let TransactionRequest {
             idempotency_key,
             ledger_id,
@@ -558,15 +640,19 @@ impl Committer for QueuedTransactor {
         // means the upload happens once per submission rather than
         // re-running on each worker retry.
         let raw_txn_id = if let Some(pending) = commit_opts.raw_txn_upload.take() {
-            Some(
+            // Stored by a task of its own, outside this submission's scope.
+            if let Some(epoch) = pending.intents_loaded() {
+                fluree_db_api::collect::lower_seen(epoch);
+            }
+            let (id, _unpinned) =
                 pending
                     .finish()
                     .await
                     .map_err(|e| SubmissionError::Execution {
                         status: 500,
                         message: format!("raw_txn upload failed: {e}"),
-                    })?,
-            )
+                    })?;
+            Some(id)
         } else {
             commit_opts.raw_txn_id.take()
         };
@@ -638,7 +724,10 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+    async fn revert_scoped(
+        &self,
+        request: RevertRequest,
+    ) -> Result<RevertReceipt, SubmissionError> {
         let RevertRequest {
             idempotency_key,
             ledger_name,
@@ -682,7 +771,7 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+    async fn merge_scoped(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
         let MergeRequest {
             idempotency_key,
             ledger_name,
@@ -758,7 +847,10 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+    async fn rebase_scoped(
+        &self,
+        request: RebaseRequest,
+    ) -> Result<RebaseReceipt, SubmissionError> {
         let RebaseRequest {
             idempotency_key,
             ledger_name,
@@ -804,15 +896,32 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+    async fn push_scoped(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let PushRequest {
             idempotency_key,
             ledger_id,
             commits,
             blobs,
             merged_commits,
+            commit_ids,
+            merged_commit_ids,
             governance,
+            erasure_frames,
+            base_erasures,
+            // A cluster keeps the removal journal it replicates.
+            retention: _,
+            authority: _,
         } = request;
+        // Nor does it yet check that a pushed history's erasures are the
+        // ones it holds.
+        if !erasure_frames.is_empty() || !base_erasures.is_empty() {
+            return Err(SubmissionError::Execution {
+                status: 501,
+                message: "a cluster does not yet take a push of history holding permanently \
+                          erased commits"
+                    .to_string(),
+            });
+        }
 
         // See the same comment in `transact` — normalize once so
         // the idempotency map and the per-ledger content store
@@ -833,25 +942,66 @@ impl Committer for QueuedTransactor {
         // the worker reads the bytes back when staging.
         let namespace = self.namespace_of(&ledger_id).await?;
         let content_store = self.fluree.content_store(&namespace);
-        let upload = |blobs: Vec<Vec<u8>>| {
+        // A commit the sender named is stored under that CID, checked
+        // against its bytes; one it did not is the SHA2-256 of its bytes.
+        // What the commits reference is checked when they are staged.
+        let fluree = &self.fluree;
+        let upload = |blobs: Vec<Vec<u8>>, named: Vec<ContentId>| {
             let content_store = content_store.clone();
             async move {
+                if !named.is_empty() && named.len() != blobs.len() {
+                    return Err(SubmissionError::Execution {
+                        status: 400,
+                        message: format!(
+                            "push names {} CIDs for {} commits",
+                            named.len(),
+                            blobs.len()
+                        ),
+                    });
+                }
+                if let Some(id) = named.iter().find(|id| !fluree.admits_content_id(id)) {
+                    return Err(SubmissionError::Execution {
+                        status: 422,
+                        message: format!(
+                            "pushed commit {id} is not hashed with SHA2-256, the only hash \
+                             this cluster admits"
+                        ),
+                    });
+                }
+                let write_failed = |e: fluree_db_core::Error| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("push commit CAS write failed: {e}"),
+                };
                 let mut cids = Vec::with_capacity(blobs.len());
-                for bytes in &blobs {
-                    let cid = content_store
-                        .put(ContentKind::Commit, bytes)
-                        .await
-                        .map_err(|e| SubmissionError::Execution {
-                            status: 500,
-                            message: format!("push commit CAS write failed: {e}"),
-                        })?;
+                for (idx, bytes) in blobs.iter().enumerate() {
+                    let cid = match named.get(idx) {
+                        // `put_with_id` checks the digest, hashing once; a
+                        // failure is re-checked to tell a mismatch from a
+                        // write error.
+                        Some(id) => match content_store.put_with_id(id, bytes).await {
+                            Ok(()) => id.clone(),
+                            Err(_) if !id.verify(bytes) => {
+                                return Err(SubmissionError::Execution {
+                                    status: 422,
+                                    message: format!(
+                                        "pushed commit {idx}: the bytes do not match the named CID {id}"
+                                    ),
+                                })
+                            }
+                            Err(e) => return Err(write_failed(e)),
+                        },
+                        None => content_store
+                            .put(ContentKind::Commit, bytes)
+                            .await
+                            .map_err(write_failed)?,
+                    };
                     cids.push(cid);
                 }
                 Ok::<_, SubmissionError>(cids)
             }
         };
-        let commit_cids = upload(commits).await?;
-        let merged_commit_cids = upload(merged_commits).await?;
+        let commit_cids = upload(commits, commit_ids).await?;
+        let merged_commit_cids = upload(merged_commits, merged_commit_ids).await?;
 
         let envelope = QueuedRequest::for_push(
             QueuedPush {

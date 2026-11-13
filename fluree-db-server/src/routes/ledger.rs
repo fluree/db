@@ -1116,6 +1116,104 @@ pub async fn info_ledger_tail(
     info(State(state), headers, bearer, axum::extract::Query(query)).await
 }
 
+/// Remove selected occurrences from what a ledger serves: current and
+/// historical application queries stop returning them, and raw commits that
+/// hold them become audit data. Admin-protected; the admin token's identity
+/// is recorded with each removal. A peer forwards it to the transaction
+/// server.
+///
+/// POST /fluree/remove/<ledger...>
+pub async fn remove_occurrences_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    principal: Option<axum::Extension<crate::routes::admin_auth::AdminPrincipal>>,
+    request: Request,
+) -> Result<Response> {
+    if state.config.server_role == ServerRole::Peer {
+        return Ok(forward_write_request(&state, request).await);
+    }
+    let request: fluree_db_api::retention::RemovalRequest = json_body(request).await?;
+    let cell = Arc::new(std::sync::OnceLock::new());
+    let _ = cell.set(Arc::clone(&state.committer));
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
+    let requester = principal.map(|axum::Extension(p)| p.identity.unwrap_or(p.issuer));
+    let receipt = state
+        .fluree
+        .remove_occurrences_by(&writer, &ledger, request, requester)
+        .await
+        .map_err(ServerError::Api)?;
+    Ok(Json(receipt).into_response())
+}
+
+/// Erase selected occurrences permanently: they are removed from what every
+/// branch holding them serves at once, the request's authorization is
+/// committed, and the affected commits are replaced by proved redactions in
+/// the background (see the retention status). Admin-protected; the admin
+/// token's identity is recorded as the requester. A peer forwards it to the
+/// transaction server.
+///
+/// POST /fluree/erase/<ledger...>
+pub async fn erase_occurrences_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    principal: Option<axum::Extension<crate::routes::admin_auth::AdminPrincipal>>,
+    request: Request,
+) -> Result<Response> {
+    if state.config.server_role == ServerRole::Peer {
+        return Ok(forward_write_request(&state, request).await);
+    }
+    let request: fluree_db_api::retention::erasure::ErasureRequest = json_body(request).await?;
+    let cell = Arc::new(std::sync::OnceLock::new());
+    let _ = cell.set(Arc::clone(&state.committer));
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
+    let requester = principal.map(|axum::Extension(p)| p.identity.unwrap_or(p.issuer));
+    let receipt = state
+        .fluree
+        .erase_occurrences_with(&writer, &ledger, request, requester)
+        .await
+        .map_err(ServerError::Api)?;
+    Ok(Json(receipt).into_response())
+}
+
+/// A branch's retention status: whether it is registered for TTL
+/// processing, its activation boundary and watermark, scheduled and expired
+/// counts, the next due time, problems that block or degrade processing, and
+/// whether this node runs the retention worker. Its removal journal and its
+/// erasures' occurrences and requesters need the audit permission.
+///
+/// GET /fluree/retention/<ledger...>
+pub async fn retention_status_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    bearer: MaybeDataBearer,
+) -> Result<Response> {
+    let data_auth = state.config.data_auth();
+    if data_auth.mode == crate::config::DataAuthMode::Required && bearer.0.is_none() {
+        return Err(ServerError::unauthorized("Bearer token required"));
+    }
+    let scope = crate::error::scope_id(&ledger)?;
+    if let Some(p) = bearer.0.as_ref() {
+        if !p.can_read(&scope) {
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+    if state.fluree.nameservice().lookup(&ledger).await?.is_none() {
+        return Err(ServerError::Api(ApiError::NotFound(ledger)));
+    }
+    let status = state
+        .fluree
+        .retention_status(&ledger)
+        .await
+        .map_err(ServerError::Api)?;
+    let audits = bearer.0.as_ref().is_some_and(|p| p.can_audit(&scope));
+    let status = if audits {
+        status
+    } else {
+        status.without_audit_data()
+    };
+    Ok(Json(status).into_response())
+}
+
 /// Simplified ledger info for proxy storage mode (nameservice lookup only).
 /// Falls back to graph source lookup if ledger is not found.
 async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) -> Result<Response> {
@@ -2414,6 +2512,30 @@ pub async fn merge_preview(
             opts.include_validation = b;
         }
 
+        // Changes and conflict details are commit flakes: audit data on a
+        // branch that suppresses history.
+        if opts.include_changes || opts.include_conflict_details {
+            let name = fluree_db_api::LedgerName::parse(&ledger)?;
+            let source = name.with_branch(&params.source)?;
+            let target = match params.target.as_deref() {
+                Some(t) => Some(name.with_branch(t)?),
+                None => state
+                    .fluree
+                    .nameservice()
+                    .lookup(&source)
+                    .await?
+                    .and_then(|r| r.source_branch)
+                    .map(|b| name.with_branch(&b))
+                    .transpose()?,
+            };
+            for branch in std::iter::once(source).chain(target) {
+                let audit =
+                    |b: &fluree_db_api::LedgerId| bearer.0.as_ref().is_some_and(|p| p.can_audit(b));
+                crate::routes::audit::require_audit(&state, &headers.raw, branch.as_str(), audit)
+                    .await?;
+            }
+        }
+
         let preview = state
             .fluree
             .merge_preview_with(&ledger, &params.source, params.target.as_deref(), opts)
@@ -2600,6 +2722,15 @@ pub async fn revert_preview(
     }
     .instrument(span)
     .await
+}
+
+/// The JSON body of `request`.
+async fn json_body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T> {
+    let bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))
 }
 
 /// Forward a transaction request to the transaction server (peer mode)

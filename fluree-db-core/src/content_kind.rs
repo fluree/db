@@ -67,6 +67,9 @@ pub const CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH: u64 = FLUREE_CODEC_BASE + 19;
 /// Multicodec for edge-annotation reverse arena leaf blobs (EARL1).
 pub const CODEC_FLUREE_ANNOTATION_REVERSE_LEAF: u64 = FLUREE_CODEC_BASE + 20;
 
+/// Retention schedule blob (FRS1): a branch's derived expiry schedule.
+pub const CODEC_FLUREE_RETENTION_STATE: u64 = FLUREE_CODEC_BASE + 21;
+
 // Legacy codec constants (pre-V3 format). Kept for backward-compatible CID
 // resolution — existing ledgers may have index artifacts stored under these
 // codecs in the nameservice.
@@ -162,6 +165,9 @@ pub enum ContentKind {
     AnnotationReverseBranch,
     /// Edge-annotation reverse arena leaf blob (EARL1).
     AnnotationReverseLeaf,
+    /// Retention schedule blob (FRS1): the expiry schedule a branch's
+    /// retention worker derived from its commits, with its watermark.
+    RetentionState,
 }
 
 // ============================================================================
@@ -181,7 +187,8 @@ impl ContentKind {
             ContentKind::Commit
             | ContentKind::Txn
             | ContentKind::LedgerConfig
-            | ContentKind::GraphSourceMapping => false,
+            | ContentKind::GraphSourceMapping
+            | ContentKind::RetentionState => false,
             ContentKind::IndexRoot
             | ContentKind::IndexBranch
             | ContentKind::IndexLeaf
@@ -220,6 +227,7 @@ impl ContentKind {
             ContentKind::AnnotationForwardLeaf => CODEC_FLUREE_ANNOTATION_FORWARD_LEAF,
             ContentKind::AnnotationReverseBranch => CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
             ContentKind::AnnotationReverseLeaf => CODEC_FLUREE_ANNOTATION_REVERSE_LEAF,
+            ContentKind::RetentionState => CODEC_FLUREE_RETENTION_STATE,
         }
     }
 
@@ -249,6 +257,7 @@ impl ContentKind {
             CODEC_FLUREE_ANNOTATION_FORWARD_LEAF => Some(ContentKind::AnnotationForwardLeaf),
             CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH => Some(ContentKind::AnnotationReverseBranch),
             CODEC_FLUREE_ANNOTATION_REVERSE_LEAF => Some(ContentKind::AnnotationReverseLeaf),
+            CODEC_FLUREE_RETENTION_STATE => Some(ContentKind::RetentionState),
             // Legacy codecs (pre-V3 format) — map to current content kinds so
             // CIDs stored by older builds can still be resolved.
             CODEC_LEGACY_INDEX_ROOT => Some(ContentKind::IndexRoot),
@@ -278,6 +287,7 @@ impl ContentKind {
             ContentKind::AnnotationForwardLeaf => "annotation-forward-leaf",
             ContentKind::AnnotationReverseBranch => "annotation-reverse-branch",
             ContentKind::AnnotationReverseLeaf => "annotation-reverse-leaf",
+            ContentKind::RetentionState => "retention-state",
         }
     }
 }

@@ -119,6 +119,7 @@ async fn pushes_to_a_ledger_nothing_queries_stage_on_compacted_novelty() {
             blobs: Default::default(),
             missing_blobs: Vec::new(),
             merged_commits: Vec::new(),
+            ..Default::default()
         };
         let pushed = target
             .push_commits(ledger_id, request, &GovernanceOptions::default(), &config)

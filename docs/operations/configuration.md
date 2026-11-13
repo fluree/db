@@ -538,6 +538,8 @@ Where the tick never runs, nothing is resumed or rolled back on its own: the CLI
 | --------------------------------- | -------------------------------------- | ------- | ----------- |
 | `--indexer-catchup-interval-secs` | `FLUREE_INDEXER_CATCHUP_INTERVAL_SECS` | `300`   | Seconds between ticks. `0` turns the periodic tick off; the sweep for stalled ledgers at start-up still runs |
 | `--orphan-sweep-interval-secs`    | `FLUREE_ORPHAN_SWEEP_INTERVAL_SECS`    | `0`     | Seconds between [orphan sweeps](../cli/dropped.md), which delete storage folders that no ledger or dropped ledger owns. `0` never sweeps. Each sweep lists the whole store, which on a large object store is slow and billed per request. Checked on each tick, and first run one interval after start |
+| `--garbage-reconcile-interval-secs` | `FLUREE_GARBAGE_RECONCILE_INTERVAL_SECS` | `0` | Seconds between background reconciliations of each ledger's commit and transaction files, which record the files no branch references as garbage. `0` never reconciles in the background. A reconciliation lists the ledger's files and reads its references whole, which on a large ledger runs past the garbage pass's 30-second budget. Garbage already recorded is collected either way, and a [permanent erasure](../transactions/permanent-erasure.md)'s purge reconciles what it needs |
+| `--retention-interval-secs`       | `FLUREE_RETENTION_INTERVAL_SECS`       | `15`    | Seconds between retention passes over ledgers that use [TTL](../transactions/ttl.md). Runs on the node that owns background maintenance (the Raft leader in a cluster); ledgers that never wrote a lifetime or configured one are not visited |
 
 Config file equivalent:
 
@@ -545,6 +547,8 @@ Config file equivalent:
 [server.indexing]
 # indexer_catchup_interval_secs = 300
 # orphan_sweep_interval_secs = 86400   # daily; unset or 0 never sweeps
+# garbage_reconcile_interval_secs = 0  # unset or 0 never reconciles in the background
+# retention_interval_secs = 15         # TTL expiration passes
 ```
 
 ## Server Role Configuration

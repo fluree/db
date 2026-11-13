@@ -5,7 +5,7 @@ use crate::context;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_core::commit::codec::{read_commit_envelope, verify_commit_blob};
+use fluree_db_core::commit::codec::{commit_blob_matches, read_commit_envelope};
 use fluree_db_core::pack::{PackRequest, LARGE_TRANSFER_THRESHOLD};
 use fluree_db_core::storage::ContentAddressedWrite;
 use fluree_db_core::ContentKind;
@@ -15,10 +15,476 @@ use fluree_db_nameservice::{
     RemoteName, RemoteTrackingStore,
 };
 use fluree_db_nameservice_sync::{
-    ingest_pack_stream, ingest_pack_stream_with_header, peek_pack_header, FetchResult,
-    HttpRemoteClient, MultiOriginFetcher, RemoteEndpoint, SyncConfigStore, SyncDriver,
+    ingest_pack_stream_into, ingest_pack_stream_with_header_into, peek_pack_header, FetchResult,
+    HttpRemoteClient, MultiOriginFetcher, PackSink, RemoteEndpoint, SyncConfigStore, SyncDriver,
 };
 use std::sync::Arc;
+
+/// Takes a pack's erasure frames and journal as they arrive.
+struct Reception<'a> {
+    fluree: &'a fluree_db_api::Fluree,
+    taken: fluree_db_api::retention::erasure::PackReception,
+}
+
+impl<'a> Reception<'a> {
+    fn new(fluree: &'a fluree_db_api::Fluree) -> Self {
+        Reception {
+            fluree,
+            taken: Default::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PackSink for Reception<'_> {
+    async fn frame(
+        &mut self,
+        frame: fluree_db_core::pack::PackFrame,
+    ) -> std::result::Result<(), String> {
+        self.fluree
+            .receive_pack_frame(&mut self.taken, frame)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Discover changes to already-held history, independently of commit heads.
+/// An object walk cannot establish that no ancestor was erased remotely.
+async fn origin_history_changes(
+    fetcher: &MultiOriginFetcher,
+    ledger_id: &str,
+    head: &fluree_db_core::ContentId,
+    held: Vec<String>,
+) -> CliResult<reqwest::Response> {
+    let request = PackRequest::commits(vec![head.clone()], vec![head.clone()]).with_erasures(held);
+    fetcher.fetch_pack_response(ledger_id, &request).await
+        .map_err(|e| CliError::Config(format!("pull failed (history changes): {e}")))?
+        .ok_or_else(|| CliError::Config(
+            "the origin cannot synchronize erasures and journal changes for commits already held; configure a pack-capable origin before pulling".into()
+        ))
+}
+
+/// Where an origin walk reads objects: an origin's object requests.
+#[async_trait::async_trait]
+trait ObjectSource: Sync {
+    async fn object(
+        &self,
+        cid: &fluree_db_core::ContentId,
+        ledger_id: &str,
+    ) -> fluree_db_nameservice_sync::Result<Vec<u8>>;
+}
+
+#[async_trait::async_trait]
+impl ObjectSource for MultiOriginFetcher {
+    async fn object(
+        &self,
+        cid: &fluree_db_core::ContentId,
+        ledger_id: &str,
+    ) -> fluree_db_nameservice_sync::Result<Vec<u8>> {
+        self.fetch(cid, ledger_id).await
+    }
+}
+
+/// Walk `ledger_id`'s history from `head` object by object, as `fluree
+/// clone --origin` does without a pack, storing it as `local_id`'s: each
+/// commit it does not hold, and its transaction document unless
+/// `no_txns`. An erased commit's answer goes to `reception`. Returns the
+/// commits fetched.
+async fn walk_origin(
+    fluree: &fluree_db_api::Fluree,
+    source: &dyn ObjectSource,
+    (ledger_id, local_id): (&str, &str),
+    (head, stop): (
+        &fluree_db_core::ContentId,
+        Option<&fluree_db_core::ContentId>,
+    ),
+    (storage, namespace): (
+        &Arc<dyn fluree_db_core::storage::Storage>,
+        &fluree_db_core::StorageNamespace,
+    ),
+    no_txns: bool,
+    reception: &mut OriginReception<'_>,
+) -> CliResult<usize> {
+    // If a commit already exists locally (e.g., from a previously interrupted
+    // clone), we skip fetching but still read the local bytes to continue
+    // chain traversal — this ensures all ancestors and txn blobs are present.
+    let content_store = fluree.content_store(namespace);
+    let mut commits_fetched = 0usize;
+    let mut frontier = vec![head.clone()];
+    let mut visited_commits = std::collections::HashSet::new();
+
+    while let Some(cid) = frontier.pop() {
+        if stop == Some(&cid) || !visited_commits.insert(cid.clone()) {
+            continue;
+        }
+        // A read of an erased commit returns its replacement here whether
+        // or not this ledger holds it; one it does not is fetched, for the
+        // erasure that makes it a holder.
+        let held = content_store.has(&cid).await.unwrap_or(false)
+            && fluree
+                .ledger_holds_commit(local_id, &cid)
+                .await
+                .map_err(|e| CliError::Config(format!("clone failed (read local commit): {e}")))?;
+        let commit_bytes = if held {
+            // Already have this commit — read local bytes for chain traversal.
+            content_store
+                .get(&cid)
+                .await
+                .map_err(|e| CliError::Config(format!("clone failed (read local commit): {e}")))?
+                .into_vec()
+        } else {
+            // Fetch commit blob from origin.
+            let bytes = match source.object(&cid, ledger_id).await {
+                // It travels as its erasure; nothing is stored for it.
+                Err(fluree_db_nameservice_sync::SyncError::Erased { frames, .. }) => {
+                    let replacement = reception.take_erased(&cid, &frames).await?;
+                    let envelope = read_commit_envelope(&replacement).map_err(|e| {
+                        CliError::Config(format!("clone failed (read erased commit {cid}): {e}"))
+                    })?;
+                    frontier.extend(envelope.parent_ids().cloned());
+                    continue;
+                }
+                fetched => fetched
+                    .map_err(|e| CliError::Config(format!("clone failed (fetch commit): {e}")))?,
+            };
+
+            if !commit_blob_matches(&cid, &bytes) {
+                return Err(CliError::Config(format!(
+                    "clone failed: commit {cid} does not match its bytes"
+                )));
+            }
+
+            // Store commit blob locally, under its CID's own address.
+            storage
+                .content_write_bytes_with_hash(
+                    ContentKind::Commit,
+                    namespace,
+                    &cid.address_digest(),
+                    &bytes,
+                )
+                .await
+                .map_err(|e| CliError::Config(format!("clone failed (store commit): {e}")))?;
+
+            commits_fetched += 1;
+            eprint!("  fetched {commits_fetched} commit(s)...\r");
+
+            bytes
+        };
+
+        // Parse envelope-only (no flake decode) for parent + txn CID.
+        let envelope = read_commit_envelope(&commit_bytes)
+            .map_err(|e| CliError::Config(format!("clone failed (read envelope): {e}")))?;
+
+        // Fetch + store txn blob (if present and not explicitly skipped). An
+        // erased commit's is not served.
+        let erased = fluree_db_core::commit::codec::replacement::is_replacement(&commit_bytes);
+        if !no_txns && !erased {
+            if let Some(txn_cid) = &envelope.txn {
+                if !content_store.has(txn_cid).await.unwrap_or(false) {
+                    // A txn blob the origin does not HAVE is a provenance
+                    // gap on the source, not a reason to abandon the
+                    // clone — the commit itself carries the flakes. Only
+                    // a genuine all-origins 404 is tolerated: an auth
+                    // failure, a 5xx, a network blip, or an integrity
+                    // failure still aborts, so a transient fault can't
+                    // masquerade as a provenance gap.
+                    match source.object(txn_cid, ledger_id).await {
+                        Ok(txn_bytes) => {
+                            // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
+                            content_store
+                                .put_with_id(txn_cid, &txn_bytes)
+                                .await
+                                .map_err(|e| {
+                                    CliError::Config(format!("clone failed (store txn blob): {e}"))
+                                })?;
+                        }
+                        Err(fluree_db_nameservice_sync::SyncError::NotFound(_)) => {
+                            eprintln!(
+                                "  warning: commit t={} references txn blob {txn_cid} which no origin has; continuing without it",
+                                envelope.t
+                            );
+                        }
+                        Err(e) => {
+                            return Err(CliError::Config(format!(
+                                "clone failed (fetch txn blob {txn_cid}): {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Follow all parents backwards.
+        for parent_id in envelope.parent_ids() {
+            frontier.push(parent_id.clone());
+        }
+    }
+    Ok(commits_fetched)
+}
+
+/// Ready `ledger_id` for the head a pack from `remote` brought: its
+/// erasures, which only an erasure authority's are, and its journal.
+async fn accept_pack(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    reception: Reception<'_>,
+    head: &fluree_db_core::ContentId,
+    remote: &fluree_db_nameservice_sync::RemoteConfig,
+) -> CliResult<fluree_db_api::retention::erasure::AcceptedPack> {
+    fluree
+        .accept_pack(ledger_id, reception.taken, head, remote.erasure_authority)
+        .await
+        .map_err(|e| match e.status_code() {
+            403 => CliError::Config(format!(
+                "{e}: to accept them, designate '{name}' an erasure authority with \
+                 `fluree remote erasure-authority {name} true`",
+                name = remote.name.as_str()
+            )),
+            _ => CliError::Config(format!("the pack's erasures were not accepted: {e}")),
+        })
+}
+
+/// Takes what an origin's transfer brings besides objects: its journal,
+/// and its erasures when the transfer designates the origin an erasure
+/// authority (`--erasure-authority`; no remote setting covers an origin).
+/// Otherwise it refuses them, and remembers that it did: that history must
+/// not then be fetched object by object, past what it erases.
+struct OriginReception<'a> {
+    fluree: &'a fluree_db_api::Fluree,
+    taken: fluree_db_api::retention::erasure::PackReception,
+    authority: bool,
+    refused: bool,
+}
+
+impl<'a> OriginReception<'a> {
+    fn new(fluree: &'a fluree_db_api::Fluree, authority: bool) -> Self {
+        OriginReception {
+            fluree,
+            taken: Default::default(),
+            authority,
+            refused: false,
+        }
+    }
+
+    /// Take an object request's answer for an erased commit: its frames.
+    /// Returns the commit's replacement, whose envelope the walk follows.
+    async fn take_erased(
+        &mut self,
+        cid: &fluree_db_core::ContentId,
+        frames: &[u8],
+    ) -> CliResult<Vec<u8>> {
+        use fluree_db_core::pack::{
+            decode_frame, ErasureArtifactKind, PackFrame, DEFAULT_MAX_PAYLOAD,
+        };
+        let mut replacement = None;
+        let mut pos = 0;
+        while pos < frames.len() {
+            let (frame, used) = decode_frame(&frames[pos..], DEFAULT_MAX_PAYLOAD)
+                .map_err(|e| CliError::Config(format!("the erasure of commit {cid}: {e}")))?;
+            pos += used;
+            if let PackFrame::ErasureArtifact {
+                kind: ErasureArtifactKind::Replacement,
+                payload,
+            } = &frame
+            {
+                replacement = Some(payload.clone());
+            }
+            self.frame(frame).await.map_err(CliError::Config)?;
+        }
+        replacement.ok_or_else(|| {
+            CliError::Config(format!(
+                "the erasure of commit {cid} carries no replacement"
+            ))
+        })
+    }
+
+    /// Ready `ledger_id` for `head`, before it moves there: take the
+    /// erasures, and merge the origin's journal into its own.
+    async fn accept(
+        &mut self,
+        ledger_id: &str,
+        head: &fluree_db_core::ContentId,
+    ) -> CliResult<usize> {
+        self.fluree
+            .accept_pack(
+                ledger_id,
+                std::mem::take(&mut self.taken),
+                head,
+                self.authority,
+            )
+            .await
+            .map(|accepted| accepted.erased_commits)
+            .map_err(|e| CliError::Config(format!("the origin's transfer was not accepted: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl PackSink for OriginReception<'_> {
+    async fn frame(
+        &mut self,
+        frame: fluree_db_core::pack::PackFrame,
+    ) -> std::result::Result<(), String> {
+        if self.authority || matches!(frame, fluree_db_core::pack::PackFrame::Manifest(_)) {
+            return self
+                .fluree
+                .receive_pack_frame(&mut self.taken, frame)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        self.refused = true;
+        Err(
+            "the origin's history holds permanently erased commits; take them with \
+             `--erasure-authority`, which designates the origin an erasure authority for this \
+             transfer, or clone or pull from a remote designated one"
+                .to_string(),
+        )
+    }
+}
+
+/// What `remote`'s history gained, without a commit, since this copy has
+/// all of its commits: erasures, and its journal. A pack of no commits,
+/// whose head is the remote's, which must be in this copy's history.
+/// Returns the erased commits it brought.
+async fn pull_without_commits(
+    fluree: &fluree_db_api::Fluree,
+    client: &crate::remote_client::RemoteLedgerClient,
+    remote_ledger_id: &str,
+    ledger_id: &str,
+    local_head: &fluree_db_nameservice::RefValue,
+    remote: &fluree_db_nameservice_sync::RemoteConfig,
+    (storage, namespace): (
+        &Arc<dyn fluree_db_core::storage::Storage>,
+        &fluree_db_core::StorageNamespace,
+    ),
+) -> CliResult<usize> {
+    let failed = |e: String| CliError::Config(format!("pull failed (journal and erasures): {e}"));
+    let Some(head) = client
+        .fetch_ns_record(remote_ledger_id)
+        .await
+        .map_err(|e| failed(e.to_string()))?
+        .and_then(|ns| ns.commit_head_id)
+    else {
+        return Ok(0);
+    };
+    let held_here = local_head.id.as_ref() == Some(&head)
+        || fluree
+            .ledger_holds_commit(ledger_id, &head)
+            .await
+            .unwrap_or(false);
+    if !held_here {
+        return Ok(0);
+    }
+    let held = fluree
+        .held_erasure_digests()
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let request = PackRequest::commits(vec![head.clone()], vec![head.clone()]).with_erasures(held);
+    // A server without packs has nothing to add.
+    let Some(response) = client
+        .fetch_pack_response(remote_ledger_id, &request)
+        .await
+        .map_err(|e| failed(e.to_string()))?
+    else {
+        return Ok(0);
+    };
+    let mut reception = Reception::new(fluree);
+    ingest_pack_stream_into(response, storage, namespace, Some(&mut reception))
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    Ok(accept_pack(fluree, ledger_id, reception, &head, remote)
+        .await?
+        .erased_commits)
+}
+
+/// Finish what an interrupted clone or pull left of its erasures.
+async fn resume_erasures(fluree: &fluree_db_api::Fluree) {
+    if let Err(e) = fluree.resume_received_erasures().await {
+        eprintln!(
+            "  {} an earlier transfer's erasures were not completed: {e}",
+            "warning:".yellow().bold()
+        );
+    }
+}
+
+/// Passes one pull runs on its erasures' files before leaving the rest to
+/// the next.
+const PURGE_PASSES: usize = 8;
+
+/// What deleting a ledger's erased values from this copy's storage came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Purge {
+    /// No erasure of the ledger had files left to delete.
+    Nothing,
+    /// This many erasures' files are deleted.
+    Done(usize),
+    /// Some are still there, for this reason.
+    Pending(String),
+}
+
+impl Purge {
+    fn print(&self) {
+        match self {
+            Purge::Nothing => {}
+            Purge::Done(requests) => println!(
+                "{} {requests} erasure(s) purged: the erased values are deleted from this copy's \
+                 storage",
+                "✓".green()
+            ),
+            Purge::Pending(why) => eprintln!(
+                "  {} erased values are still in this copy's storage ({why}); the next \
+                 `fluree pull` carries on",
+                "warning:".yellow().bold()
+            ),
+        }
+    }
+}
+
+/// Delete from this copy's storage what `ledger_id`'s erasures still leave
+/// there: the originals of the erased commits, the indexes built from them,
+/// and their transactions. A server first waits for readers of the older
+/// indexes to finish; this process holds the storage and reads none of
+/// them, so it does not.
+async fn purge_received(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Purge {
+    let mut requests = std::collections::BTreeSet::new();
+    for _ in 0..PURGE_PASSES {
+        let report = match fluree
+            .run_purge_pass(ledger_id, std::time::Duration::ZERO)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => return Purge::Pending(e.to_string()),
+        };
+        requests.extend(report.requests);
+        if let Some(why) = report.blocked {
+            return Purge::Pending(why);
+        }
+        if !report.waiting {
+            return match requests.len() {
+                0 => Purge::Nothing,
+                requests => Purge::Done(requests),
+            };
+        }
+    }
+    Purge::Pending(format!("not finished in {PURGE_PASSES} passes"))
+}
+
+/// A received index this copy did not take: its history holds a commit
+/// erased here, which the sender's index may hold the original of.
+fn index_not_set_note() {
+    eprintln!(
+        "  {} the received index was not used: this history holds a commit erased \
+         here, so the ledger indexes its replacements itself",
+        "note:".cyan().bold()
+    );
+}
+
+/// `count` erased commits, as a summary's suffix.
+fn erased_note(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        n => format!(", {n} erased"),
+    }
+}
 
 fn token_has_storage_permissions(token: &str) -> Option<bool> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -114,7 +580,6 @@ fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
     }
 }
 
-/// Build a SyncDriver with all configured remotes
 /// Where the local ledger `ledger_id` stores its artifacts.
 async fn local_namespace(
     fluree: &fluree_db_api::Fluree,
@@ -129,6 +594,19 @@ async fn local_namespace(
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))
 }
 
+/// Keep garbage collection out of `ledger_id` while a transfer stores
+/// commits and transactions before setting a head naming them.
+async fn hold_garbage(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> CliResult<Option<fluree_db_core::RootHold>> {
+    fluree
+        .hold_garbage(ledger_id)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))
+}
+
+/// Build a SyncDriver with all configured remotes
 async fn build_sync_driver(dirs: &FlureeDir) -> CliResult<(SyncDriver, Arc<TomlSyncConfigStore>)> {
     let fluree = context::build_fluree(dirs).await?;
     let config_store = Arc::new(TomlSyncConfigStore::new(dirs.config_dir().to_path_buf()));
@@ -237,10 +715,27 @@ fn print_fetch_result(result: &FetchResult) {
 ///
 /// Falls back to origin-based pull (CID chain walk via LedgerConfig) when
 /// no upstream remote is configured.
-pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) -> CliResult<()> {
+pub async fn run_pull(
+    ledger: Option<&str>,
+    no_indexes: bool,
+    erasure_authority: bool,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(ledger, dirs)?;
     let ledger_id = context::to_ledger_id(&ledger_id)?;
+    let fluree = pull(ledger_id.clone(), no_indexes, erasure_authority, dirs).await?;
+    purge_received(&fluree, &ledger_id).await.print();
+    Ok(())
+}
 
+/// Pull `ledger_id` from its upstream, or else its origins. Returns the
+/// instance it pulled into, its hold on the ledger's garbage released.
+async fn pull(
+    ledger_id: fluree_db_core::LedgerId,
+    no_indexes: bool,
+    erasure_authority: bool,
+    dirs: &FlureeDir,
+) -> CliResult<fluree_db_api::Fluree> {
     let config_store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let upstream = config_store
         .get_upstream(&ledger_id)
@@ -249,8 +744,16 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 
     let Some(upstream) = upstream else {
         // No named upstream — try origin-based pull via LedgerConfig.
-        return run_pull_via_origins(&ledger_id, no_indexes, dirs).await;
+        return run_pull_via_origins(&ledger_id, no_indexes, erasure_authority, dirs).await;
     };
+    if erasure_authority {
+        return Err(CliError::Usage(format!(
+            "--erasure-authority applies to pulls from origins; designate the remote '{}' \
+             with `fluree remote erasure-authority {} true`",
+            upstream.remote.as_str(),
+            upstream.remote.as_str()
+        )));
+    }
 
     // Resolve remote config → build client.
     let remote_cfg = config_store
@@ -294,6 +797,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 
     // Resolve local head.
     let fluree = context::build_fluree(dirs).await?;
+    resume_erasures(&fluree).await;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -305,11 +809,27 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         .map_err(|e| CliError::Config(e.to_string()))?
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
     let namespace = local_namespace(&fluree, &ledger_id).await?;
+    let _garbage_hold = hold_garbage(&fluree, &ledger_id).await?;
 
     if remote_t <= local_ref.t {
-        println!("{} '{}' is already up to date", "✓".green(), ledger_id);
+        let erased = pull_without_commits(
+            &fluree,
+            &client,
+            remote_ledger_id.as_str(),
+            ledger_id.as_str(),
+            &local_ref,
+            &remote_cfg,
+            (&storage, &namespace),
+        )
+        .await?;
+        println!(
+            "{} '{}' is already up to date{}",
+            "✓".green(),
+            ledger_id,
+            erased_note(erased)
+        );
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
-        return Ok(());
+        return Ok(fluree);
     }
 
     println!(
@@ -328,6 +848,10 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                     local_ref.id.clone().into_iter().collect();
 
                 // Build pack request — include indexes by default.
+                let held = fluree
+                    .held_erasure_digests()
+                    .await
+                    .map_err(|e| CliError::Config(e.to_string()))?;
                 let pack_request = if !no_indexes {
                     if let Some(ref remote_index_id) = remote_ns.index_head_id {
                         let local_index_id = fluree
@@ -348,7 +872,9 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                     }
                 } else {
                     PackRequest::commits(vec![remote_head_cid.clone()], have)
-                };
+                }
+                .with_erasures(held.clone());
+                let mut reception = Reception::new(&fluree);
 
                 match client
                     .fetch_pack_response(remote_ledger_id, &pack_request)
@@ -367,12 +893,13 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                 let ingest_result = if wants_indexes && is_large {
                                     if confirm_large_transfer(header.estimated_total_bytes) {
                                         // User confirmed — proceed with indexes.
-                                        ingest_pack_stream_with_header(
+                                        ingest_pack_stream_with_header_into(
                                             &header,
                                             buf_tail,
                                             &mut body_stream,
                                             &storage,
                                             &namespace,
+                                            Some(&mut reception),
                                         )
                                         .await
                                     } else {
@@ -386,7 +913,8 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                         let commits_only = PackRequest::commits(
                                             vec![remote_head_cid.clone()],
                                             have,
-                                        );
+                                        )
+                                        .with_erasures(held.clone());
                                         match client
                                             .fetch_pack_response(
                                                 remote_ledger_id,
@@ -395,10 +923,11 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                             .await
                                         {
                                             Ok(Some(resp2)) => {
-                                                ingest_pack_stream(
+                                                ingest_pack_stream_into(
                                                     resp2,
                                                     &storage,
                                                     &namespace,
+                                                    Some(&mut reception),
                                                 )
                                                 .await
                                             }
@@ -414,12 +943,13 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                     }
                                 } else {
                                     // Small transfer or no indexes — proceed directly.
-                                    ingest_pack_stream_with_header(
+                                    ingest_pack_stream_with_header_into(
                                         &header,
                                         buf_tail,
                                         &mut body_stream,
                                         &storage,
                                         &namespace,
+                                        Some(&mut reception),
                                     )
                                     .await
                                 };
@@ -428,6 +958,16 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                     Ok(result) => {
                                         let count = result.commits_stored;
                                         let idx_count = result.index_artifacts_stored;
+                                        // Before the head moves: what it erases
+                                        // of history held here goes first.
+                                        let accepted = accept_pack(
+                                            &fluree,
+                                            ledger_id.as_str(),
+                                            reception,
+                                            remote_head_cid,
+                                            &remote_cfg,
+                                        )
+                                        .await?;
                                         let handle = fluree
                                             .ledger_cached(&ledger_id)
                                             .await
@@ -453,7 +993,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                             if let Some(ref remote_index_id) =
                                                 remote_ns.index_head_id
                                             {
-                                                fluree
+                                                if !fluree
                                                     .set_index_head(
                                                         &handle,
                                                         remote_index_id,
@@ -464,25 +1004,30 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                                         CliError::Config(format!(
                                                             "pull failed (set index head): {e}"
                                                         ))
-                                                    })?;
+                                                    })?
+                                                {
+                                                    index_not_set_note();
+                                                }
                                             }
                                         }
 
                                         if idx_count > 0 {
                                             println!(
-                                                "{} '{}' pulled {} commit(s) + {} index artifact(s) via pack (new head t={})",
+                                                "{} '{}' pulled {} commit(s) + {} index artifact(s) via pack{} (new head t={})",
                                                 "✓".green(),
                                                 ledger_id,
                                                 count,
                                                 idx_count,
+                                                erased_note(accepted.erased_commits),
                                                 remote_ns.commit_t
                                             );
                                         } else {
                                             println!(
-                                                "{} '{}' pulled {} commit(s) via pack (new head t={})",
+                                                "{} '{}' pulled {} commit(s) via pack{} (new head t={})",
                                                 "✓".green(),
                                                 ledger_id,
                                                 count,
+                                                erased_note(accepted.erased_commits),
                                                 remote_ns.commit_t
                                             );
                                         }
@@ -492,7 +1037,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                             dirs,
                                         )
                                         .await;
-                                        return Ok(());
+                                        return Ok(fluree);
                                     }
                                     Err(e) => {
                                         let msg = e.to_string();
@@ -586,14 +1131,27 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     if to_import.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
-        return Ok(());
+        return Ok(fluree);
     }
 
     let count = to_import.len();
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
+    let (commit_ids, commits) = to_import.into_iter().unzip();
+    let (merged_commit_ids, merged_commits) = merged_commits.into_iter().unzip();
     let result = fluree
-        .import_commits_incremental(&ledger_id, to_import, merged_commits, all_blobs)
+        .import_commits_incremental(
+            &ledger_id,
+            fluree_db_api::PushCommitsRequest {
+                commits,
+                blobs: all_blobs,
+                missing_blobs: Vec::new(),
+                merged_commits,
+                commit_ids,
+                merged_commit_ids,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
@@ -607,7 +1165,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 
     // Persist refreshed token if auto-refresh happened.
     context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
-    Ok(())
+    Ok(fluree)
 }
 
 /// The commits a paginated pull imports: the line oldest first, and the
@@ -619,38 +1177,48 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 fn pull_import_set(
     pages: &[fluree_db_api::ExportCommitsResponse],
     local_t: i64,
-) -> CliResult<(
-    Vec<fluree_db_api::Base64Bytes>,
-    Vec<fluree_db_api::Base64Bytes>,
-)> {
+) -> CliResult<(PulledCommits, PulledCommits)> {
     use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
 
     let lineage = pages.iter().all(|page| page.lineage);
     let mut to_import = Vec::new();
-    for commit in pages.iter().flat_map(|page| &page.commits) {
-        if commit.0.len() < HEADER_LEN {
-            continue;
+    let mut merged_pages = Vec::with_capacity(pages.len());
+    for page in pages {
+        let (line_ids, merged_ids) = page
+            .ids()
+            .map_err(|e| CliError::Config(format!("invalid pull response: {e}")))?;
+        for (id, commit) in line_ids.into_iter().zip(&page.commits) {
+            if commit.0.len() < HEADER_LEN {
+                continue;
+            }
+            let header = CommitHeader::read_from(&commit.0)
+                .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
+            if lineage || header.t > local_t {
+                to_import.push((id, commit.clone()));
+            }
         }
-        let header = CommitHeader::read_from(&commit.0)
-            .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
-        if lineage || header.t > local_t {
-            to_import.push(commit.clone());
-        }
+        merged_pages.push(
+            merged_ids
+                .into_iter()
+                .zip(page.merged_commits.iter().cloned()),
+        );
     }
     to_import.reverse(); // oldest→newest
 
     // Older pages first, so parents stay ahead of children. A commit that
     // merges on two pages brought in arrives twice and is kept once.
     let mut seen = std::collections::HashSet::new();
-    let merged = pages
-        .iter()
+    let merged = merged_pages
+        .into_iter()
         .rev()
-        .flat_map(|page| &page.merged_commits)
-        .filter(|commit| seen.insert(fluree_db_core::sha256_hex(&commit.0)))
-        .cloned()
+        .flatten()
+        .filter(|(id, _)| seen.insert(id.clone()))
         .collect();
     Ok((to_import, merged))
 }
+
+/// Pulled commits with their CIDs, in import order.
+type PulledCommits = Vec<(fluree_db_core::ContentId, fluree_db_api::Base64Bytes)>;
 
 /// The remote head a push plans from, or `None` when the remote has no
 /// commits.
@@ -712,6 +1280,9 @@ async fn build_push_request(
         blobs,
         missing_blobs,
         merged_commits,
+        commit_ids: plan.lineage.clone(),
+        merged_commit_ids: plan.merged.clone(),
+        ..Default::default()
     })
 }
 
@@ -735,9 +1306,11 @@ async fn read_push_commits(
             .into_vec();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| CliError::Config(format!("failed to decode local commit {cid}: {e}")))?;
+        // An erased commit's transaction document holds what was erased.
+        let erased = fluree_db_core::commit::codec::replacement::is_replacement(&bytes);
         commits.push(fluree_db_api::Base64Bytes(bytes));
 
-        if let Some(txn_cid) = &commit.txn {
+        if let Some(txn_cid) = commit.txn.as_ref().filter(|_| !erased) {
             let txn_key = txn_cid.to_string();
             if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
                 match store.get(txn_cid).await {
@@ -763,16 +1336,115 @@ async fn read_push_commits(
     Ok(commits)
 }
 
-/// Send a push to the remote.
+const ERASURES_UNSUPPORTED: &str = "cannot push: this history holds permanently erased \
+     commits, which the remote does not take. It must be a single server on file storage, of a \
+     release that takes them.";
+
+/// The frames a push of erasure chains alone carries: a push body is at
+/// most 50 MB, and base64 adds a third.
+const PUSH_ERASURE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Send a push to the remote, ready for erased history and retention (see
+/// `Fluree::ready_push`); `base` is the remote's head.
 async fn send_push(
+    fluree: &fluree_db_api::Fluree,
     client: &crate::remote_client::RemoteLedgerClient,
-    remote_ledger_id: &str,
-    req: &fluree_db_api::PushCommitsRequest,
+    ids: (&str, &str),
+    mut req: fluree_db_api::PushCommitsRequest,
+    base: Option<&fluree_db_core::ContentId>,
 ) -> CliResult<fluree_db_api::PushCommitsResponse> {
-    client
-        .push_commits(remote_ledger_id, req)
+    let erased = fluree
+        .ready_push(ids.0, &mut req, base)
         .await
-        .map_err(|e| push_failure(e, !req.merged_commits.is_empty()))
+        .map_err(|e| CliError::Config(format!("push failed: {e}")))?;
+    if erased && !client.supports_push_erasures().await {
+        return Err(CliError::Config(ERASURES_UNSUPPORTED.into()));
+    }
+    warn_if_removals_stay(client, &req).await;
+    send_readied(fluree, client, ids, req, base).await
+}
+
+/// Warn when `req` carries removals the remote does not take (a cluster,
+/// which keeps its own journal, or a release before removals): it goes on
+/// serving the history they remove here.
+async fn warn_if_removals_stay(
+    client: &crate::remote_client::RemoteLedgerClient,
+    req: &fluree_db_api::PushCommitsRequest,
+) {
+    if req.carries_removals() && !client.supports_push_retention().await {
+        eprintln!(
+            "  {} the remote does not take this ledger's removal journal from a push: a \
+             removal made only here is not made there, and it goes on serving that \
+             history. Removals made there, or pulled from there, are unaffected.",
+            "warning:".yellow().bold()
+        );
+    }
+}
+
+/// What `ledger_id`'s history up to `head`, which the remote has, gained
+/// without a commit: erasures, and the removal journal. Pushes them, with
+/// no commits, when the remote takes such a push. Returns whether it did.
+async fn push_without_commits(
+    fluree: &fluree_db_api::Fluree,
+    client: &crate::remote_client::RemoteLedgerClient,
+    ids: (&str, &str),
+    head: &fluree_db_core::ContentId,
+) -> CliResult<bool> {
+    let mut req = fluree_db_api::PushCommitsRequest::default();
+    let erased = fluree
+        .ready_push(ids.0, &mut req, Some(head))
+        .await
+        .map_err(|e| CliError::Config(format!("push failed: {e}")))?;
+    if erased && !client.supports_push_erasures().await {
+        return Err(CliError::Config(ERASURES_UNSUPPORTED.into()));
+    }
+    if !erased && (req.retention.is_none() || !client.supports_push_retention().await) {
+        warn_if_removals_stay(client, &req).await;
+        return Ok(false);
+    }
+    send_readied(fluree, client, ids, req, Some(head)).await?;
+    Ok(true)
+}
+
+/// Send `req`, ready. When the remote asks for the erasures of commits it
+/// already has, push them first, in pushes of no commits a body holds,
+/// then `req` again.
+async fn send_readied(
+    fluree: &fluree_db_api::Fluree,
+    client: &crate::remote_client::RemoteLedgerClient,
+    (ledger_id, remote_ledger_id): (&str, &str),
+    req: fluree_db_api::PushCommitsRequest,
+    base: Option<&fluree_db_core::ContentId>,
+) -> CliResult<fluree_db_api::PushCommitsResponse> {
+    match client.push_commits(remote_ledger_id, &req).await {
+        Err(crate::remote_client::RemoteLedgerError::Conflict(msg)) => {
+            let (Some(needed), Some(base)) = (fluree_db_api::erasures_needed(&msg), base) else {
+                return Err(push_failure(
+                    crate::remote_client::RemoteLedgerError::Conflict(msg),
+                    !req.merged_commits.is_empty(),
+                ));
+            };
+            let mut pushes = fluree
+                .erasure_pushes(ledger_id, base, &needed, PUSH_ERASURE_BYTES)
+                .await
+                .map_err(|e| CliError::Config(format!("push failed: {e}")))?;
+            while let Some(erasures) = pushes
+                .next()
+                .await
+                .map_err(|e| CliError::Config(format!("push failed: {e}")))?
+            {
+                client
+                    .push_commits(remote_ledger_id, &erasures)
+                    .await
+                    .map_err(|e| push_failure(e, false))?;
+            }
+            client
+                .push_commits(remote_ledger_id, &req)
+                .await
+                .map_err(|e| push_failure(e, !req.merged_commits.is_empty()))
+        }
+        result => result.map_err(|e| push_failure(e, !req.merged_commits.is_empty())),
+    }
 }
 
 /// The error a failed push reports, naming the cause where an earlier
@@ -913,14 +1585,37 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     })?;
 
     if plan.lineage.is_empty() {
-        println!("{} '{}' is already up to date", "✓".green(), ledger_id);
+        let sent = push_without_commits(
+            &fluree,
+            &client,
+            (ledger_id.as_str(), remote_ledger_id.as_str()),
+            &local_head_cid,
+        )
+        .await?;
+        let note = if sent {
+            " (sent its erasures and removal journal)"
+        } else {
+            ""
+        };
+        println!(
+            "{} '{}' is already up to date{note}",
+            "✓".green(),
+            ledger_id
+        );
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
         return Ok(());
     }
 
     ensure_merges_supported(&client, &plan).await?;
     let req = build_push_request(content_store.as_ref(), &plan).await?;
-    let resp = send_push(&client, remote_ledger_id, &req).await?;
+    let resp = send_push(
+        &fluree,
+        &client,
+        (ledger_id.as_str(), remote_ledger_id.as_str()),
+        req,
+        base.as_ref(),
+    )
+    .await?;
 
     println!(
         "{} '{}' pushed {} commit(s) (new head t={})",
@@ -1009,6 +1704,15 @@ pub async fn run_publish(
         .map_err(|e| CliError::Config(e.to_string()))?
         .expect("every line reaches genesis when there is no base");
     ensure_merges_supported(&client, &plan).await?;
+    let mut req = build_push_request(content_store.as_ref(), &plan).await?;
+    let erased = fluree
+        .ready_push(&ledger_id, &mut req, None)
+        .await
+        .map_err(|e| CliError::Config(format!("publish failed: {e}")))?;
+    if erased && !client.supports_push_erasures().await {
+        return Err(CliError::Config(ERASURES_UNSUPPORTED.into()));
+    }
+    warn_if_removals_stay(&client, &req).await;
 
     // Check if remote ledger already exists.
     let remote_exists = client
@@ -1048,9 +1752,15 @@ pub async fn run_publish(
         );
     }
 
-    let req = build_push_request(content_store.as_ref(), &plan).await?;
     eprint!("  Pushing {} commit(s)...\r", req.commits.len());
-    let resp = send_push(&client, &remote_ledger_id, &req).await?;
+    let resp = send_push(
+        &fluree,
+        &client,
+        (ledger_id.as_str(), remote_ledger_id.as_str()),
+        req,
+        None,
+    )
+    .await?;
 
     // Configure upstream tracking.
     use fluree_db_nameservice_sync::UpstreamConfig;
@@ -1160,6 +1870,7 @@ pub async fn run_clone(
 
     // Create the local ledger.
     let fluree = context::build_fluree(dirs).await?;
+    resume_erasures(&fluree).await;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -1169,6 +1880,7 @@ pub async fn run_clone(
         .await
         .map_err(|e| CliError::Config(format!("failed to create local ledger: {e}")))?;
     let namespace = local_namespace(&fluree, &local_id).await?;
+    let _garbage_hold = hold_garbage(&fluree, &local_id).await?;
 
     // Fetch all commit objects from the remote.
     let mut head_commit_id: Option<fluree_db_core::ContentId> = None;
@@ -1184,6 +1896,7 @@ pub async fn run_clone(
     let mut used_pack = false;
     let mut remote_ns_record: Option<fluree_db_nameservice::NsRecord> = None;
     let mut index_artifacts_stored: usize = 0;
+    let mut erased_commits: usize = 0;
     match client.fetch_ns_record(&ledger_id).await {
         Ok(Some(ns)) => {
             if let Some(ref hcid) = ns.commit_head_id {
@@ -1205,6 +1918,12 @@ pub async fn run_clone(
                 if no_txns {
                     pack_request.include_txns = false;
                 }
+                let held = fluree
+                    .held_erasure_digests()
+                    .await
+                    .map_err(|e| CliError::Config(e.to_string()))?;
+                pack_request = pack_request.with_erasures(held.clone());
+                let mut reception = Reception::new(&fluree);
 
                 match client.fetch_pack_response(&ledger_id, &pack_request).await {
                     Ok(Some(response)) => {
@@ -1218,12 +1937,13 @@ pub async fn run_clone(
 
                                 let ingest_result = if wants_indexes && is_large {
                                     if confirm_large_transfer(header.estimated_total_bytes) {
-                                        ingest_pack_stream_with_header(
+                                        ingest_pack_stream_with_header_into(
                                             &header,
                                             buf_tail,
                                             &mut body_stream,
                                             &storage,
                                             &namespace,
+                                            Some(&mut reception),
                                         )
                                         .await
                                     } else {
@@ -1235,16 +1955,18 @@ pub async fn run_clone(
                                             PackRequest::commits_no_txns(vec![hcid.clone()], vec![])
                                         } else {
                                             PackRequest::commits(vec![hcid.clone()], vec![])
-                                        };
+                                        }
+                                        .with_erasures(held.clone());
                                         match client
                                             .fetch_pack_response(&ledger_id, &commits_only)
                                             .await
                                         {
                                             Ok(Some(resp2)) => {
-                                                ingest_pack_stream(
+                                                ingest_pack_stream_into(
                                                     resp2,
                                                     &storage,
                                                     &namespace,
+                                                    Some(&mut reception),
                                                 )
                                                 .await
                                             }
@@ -1259,18 +1981,30 @@ pub async fn run_clone(
                                         }
                                     }
                                 } else {
-                                    ingest_pack_stream_with_header(
+                                    ingest_pack_stream_with_header_into(
                                         &header,
                                         buf_tail,
                                         &mut body_stream,
                                         &storage,
                                         &namespace,
+                                        Some(&mut reception),
                                     )
                                     .await
                                 };
 
                                 match ingest_result {
                                     Ok(result) => {
+                                        // Before the head is set: its erasures
+                                        // read for the history they erase.
+                                        erased_commits = accept_pack(
+                                            &fluree,
+                                            local_id.as_str(),
+                                            reception,
+                                            hcid,
+                                            &remote_cfg,
+                                        )
+                                        .await?
+                                        .erased_commits;
                                         total_commits = result.commits_stored;
                                         index_artifacts_stored = result.index_artifacts_stored;
                                         head_commit_id = Some(hcid.clone());
@@ -1371,10 +2105,13 @@ pub async fn run_clone(
     if index_artifacts_stored > 0 {
         if let Some(ref ns) = remote_ns_record {
             if let Some(ref remote_index_id) = ns.index_head_id {
-                fluree
+                if !fluree
                     .set_index_head(&handle, remote_index_id, ns.index_t)
                     .await
-                    .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?;
+                    .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?
+                {
+                    index_not_set_note();
+                }
             }
         }
     }
@@ -1394,19 +2131,21 @@ pub async fn run_clone(
 
     if index_artifacts_stored > 0 {
         println!(
-            "{} Cloned '{}' ({} commits + {} index artifacts, head t={})",
+            "{} Cloned '{}' ({} commits + {} index artifacts{}, head t={})",
             "✓".green(),
             local_id,
             total_commits,
             index_artifacts_stored,
+            erased_note(erased_commits),
             head_t
         );
     } else {
         println!(
-            "{} Cloned '{}' ({} commits, head t={})",
+            "{} Cloned '{}' ({} commits{}, head t={})",
             "✓".green(),
             local_id,
             total_commits,
+            erased_note(erased_commits),
             head_t
         );
     }
@@ -1422,6 +2161,15 @@ pub async fn run_clone(
     Ok(())
 }
 
+/// What an origin clone transfers, and whether it designates the origin an
+/// erasure authority.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OriginCloneOptions {
+    pub no_indexes: bool,
+    pub no_txns: bool,
+    pub erasure_authority: bool,
+}
+
 /// Clone a ledger from an origin URI using CID-based chain walking.
 ///
 /// Downloads all commits by following the parent chain from the head
@@ -1433,10 +2181,14 @@ pub async fn run_clone_origin(
     token: Option<&str>,
     ledger: &str,
     alias: Option<&str>,
-    no_indexes: bool,
-    no_txns: bool,
+    options: OriginCloneOptions,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
+    let OriginCloneOptions {
+        no_indexes,
+        no_txns,
+        erasure_authority,
+    } = options;
     let ledger_id = context::to_ledger_id(ledger)?;
     let local_id = alias.map_or_else(|| Ok(ledger_id.clone()), context::to_ledger_id)?;
 
@@ -1488,6 +2240,7 @@ pub async fn run_clone_origin(
         .await
         .map_err(|e| CliError::Config(format!("failed to create local ledger: {e}")))?;
     let namespace = local_namespace(&fluree, &local_id).await?;
+    let _garbage_hold = hold_garbage(&fluree, &local_id).await?;
 
     // Handle empty remote ledger: local ledger created but nothing to fetch.
     let head_cid = match &ns_record.commit_head_id {
@@ -1532,6 +2285,13 @@ pub async fn run_clone_origin(
     if no_txns {
         pack_request.include_txns = false;
     }
+    let held = fluree
+        .held_erasure_digests()
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    let pack_request = pack_request.with_erasures(held.clone());
+    let mut reception = OriginReception::new(&fluree, erasure_authority);
+    let mut erased_commits = 0;
     let used_pack = match fetcher.fetch_pack_response(&ledger_id, &pack_request).await {
         Ok(Some(response)) => {
             let mut body_stream = response.bytes_stream();
@@ -1542,12 +2302,13 @@ pub async fn run_clone_origin(
 
                     let ingest_result = if wants_indexes && is_large {
                         if confirm_large_transfer(header.estimated_total_bytes) {
-                            ingest_pack_stream_with_header(
+                            ingest_pack_stream_with_header_into(
                                 &header,
                                 buf_tail,
                                 &mut body_stream,
                                 &storage,
                                 &namespace,
+                                Some(&mut reception),
                             )
                             .await
                         } else {
@@ -1557,10 +2318,17 @@ pub async fn run_clone_origin(
                                 PackRequest::commits_no_txns(vec![head_cid.clone()], vec![])
                             } else {
                                 PackRequest::commits(vec![head_cid.clone()], vec![])
-                            };
+                            }
+                            .with_erasures(held.clone());
                             match fetcher.fetch_pack_response(&ledger_id, &commits_only).await {
                                 Ok(Some(resp2)) => {
-                                    ingest_pack_stream(resp2, &storage, &namespace).await
+                                    ingest_pack_stream_into(
+                                        resp2,
+                                        &storage,
+                                        &namespace,
+                                        Some(&mut reception),
+                                    )
+                                    .await
                                 }
                                 Ok(None) => {
                                     Err(fluree_db_nameservice_sync::SyncError::PackNotSupported)
@@ -1569,18 +2337,20 @@ pub async fn run_clone_origin(
                             }
                         }
                     } else {
-                        ingest_pack_stream_with_header(
+                        ingest_pack_stream_with_header_into(
                             &header,
                             buf_tail,
                             &mut body_stream,
                             &storage,
                             &namespace,
+                            Some(&mut reception),
                         )
                         .await
                     };
 
                     match ingest_result {
                         Ok(result) => {
+                            erased_commits = reception.accept(local_id.as_str(), &head_cid).await?;
                             commits_fetched = result.commits_stored;
                             index_artifacts_fetched = result.index_artifacts_stored;
                             let objects = result.commits_stored
@@ -1590,6 +2360,9 @@ pub async fn run_clone_origin(
                             true
                         }
                         Err(e) => {
+                            if reception.refused {
+                                return Err(CliError::Config(e.to_string()));
+                            }
                             eprintln!(
                                 "  {} pack import failed: {e}, falling back to object fetch",
                                 "warning:".yellow().bold()
@@ -1618,104 +2391,19 @@ pub async fn run_clone_origin(
     };
 
     if !used_pack {
-        // Walk the commit chain backwards from head, fetching + storing blobs.
-        //
-        // If a commit already exists locally (e.g., from a previously interrupted
-        // clone), we skip fetching but still read the local bytes to continue
-        // chain traversal — this ensures all ancestors and txn blobs are present.
-        let mut frontier = vec![head_cid.clone()];
-        let mut visited_commits = std::collections::HashSet::new();
-
-        while let Some(cid) = frontier.pop() {
-            if !visited_commits.insert(cid.clone()) {
-                continue;
-            }
-            let commit_bytes = if content_store.has(&cid).await.unwrap_or(false) {
-                // Already have this commit — read local bytes for chain traversal.
-                content_store
-                    .get(&cid)
-                    .await
-                    .map_err(|e| {
-                        CliError::Config(format!("clone failed (read local commit): {e}"))
-                    })?
-                    .into_vec()
-            } else {
-                // Fetch commit blob from origin.
-                let bytes = fetcher
-                    .fetch(&cid, &ledger_id)
-                    .await
-                    .map_err(|e| CliError::Config(format!("clone failed (fetch commit): {e}")))?;
-
-                // Verify integrity + derive CID from the commit blob.
-                let derived_id = verify_commit_blob(&bytes).map_err(|e| {
-                    CliError::Config(format!("clone failed (commit integrity): {e}"))
-                })?;
-                if derived_id != cid {
-                    return Err(CliError::Config(format!(
-                        "clone failed: commit CID mismatch (expected {cid}, got {derived_id})"
-                    )));
-                }
-
-                // Store commit blob locally.
-                storage
-                    .content_write_bytes(ContentKind::Commit, &namespace, &bytes)
-                    .await
-                    .map_err(|e| CliError::Config(format!("clone failed (store commit): {e}")))?;
-
-                commits_fetched += 1;
-                eprint!("  fetched {commits_fetched} commit(s)...\r");
-
-                bytes
-            };
-
-            // Parse envelope-only (no flake decode) for parent + txn CID.
-            let envelope = read_commit_envelope(&commit_bytes)
-                .map_err(|e| CliError::Config(format!("clone failed (read envelope): {e}")))?;
-
-            // Fetch + store txn blob (if present and not explicitly skipped).
-            if !no_txns {
-                if let Some(txn_cid) = &envelope.txn {
-                    if !content_store.has(txn_cid).await.unwrap_or(false) {
-                        // A txn blob the origin does not HAVE is a provenance
-                        // gap on the source, not a reason to abandon the
-                        // clone — the commit itself carries the flakes. Only
-                        // a genuine all-origins 404 is tolerated: an auth
-                        // failure, a 5xx, a network blip, or an integrity
-                        // failure still aborts, so a transient fault can't
-                        // masquerade as a provenance gap.
-                        match fetcher.fetch(txn_cid, &ledger_id).await {
-                            Ok(txn_bytes) => {
-                                // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
-                                content_store
-                                    .put_with_id(txn_cid, &txn_bytes)
-                                    .await
-                                    .map_err(|e| {
-                                        CliError::Config(format!(
-                                            "clone failed (store txn blob): {e}"
-                                        ))
-                                    })?;
-                            }
-                            Err(fluree_db_nameservice_sync::SyncError::NotFound(_)) => {
-                                eprintln!(
-                                    "  warning: commit t={} references txn blob {txn_cid} which no origin has; continuing without it",
-                                    envelope.t
-                                );
-                            }
-                            Err(e) => {
-                                return Err(CliError::Config(format!(
-                                    "clone failed (fetch txn blob {txn_cid}): {e}"
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Follow all parents backwards.
-            for parent_id in envelope.parent_ids() {
-                frontier.push(parent_id.clone());
-            }
-        }
+        commits_fetched += walk_origin(
+            &fluree,
+            &fetcher,
+            (ledger_id.as_str(), local_id.as_str()),
+            (&head_cid, None),
+            (&storage, &namespace),
+            no_txns,
+            &mut reception,
+        )
+        .await?;
+        // Before the head is set: its erasures read for the history they
+        // erase, and the journal arrives with them.
+        erased_commits = reception.accept(local_id.as_str(), &head_cid).await?;
     }
 
     eprintln!(); // Clear progress line.
@@ -1734,10 +2422,13 @@ pub async fn run_clone_origin(
     // Set index head if index artifacts were transferred.
     if index_artifacts_fetched > 0 {
         if let Some(ref remote_index_id) = ns_record.index_head_id {
-            fluree
+            if !fluree
                 .set_index_head(&handle, remote_index_id, ns_record.index_t)
                 .await
-                .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?;
+                .map_err(|e| CliError::Config(format!("clone failed (set index head): {e}")))?
+            {
+                index_not_set_note();
+            }
         }
     }
 
@@ -1797,19 +2488,21 @@ pub async fn run_clone_origin(
 
     if index_artifacts_fetched > 0 {
         println!(
-            "{} Cloned '{}' ({} commit(s) + {} index artifact(s), head t={})",
+            "{} Cloned '{}' ({} commit(s) + {} index artifact(s){}, head t={})",
             "✓".green(),
             local_id,
             commits_fetched,
             index_artifacts_fetched,
+            erased_note(erased_commits),
             head_t
         );
     } else {
         println!(
-            "{} Cloned '{}' ({} commit(s), head t={})",
+            "{} Cloned '{}' ({} commit(s){}, head t={})",
             "✓".green(),
             local_id,
             commits_fetched,
+            erased_note(erased_commits),
             head_t
         );
     }
@@ -1825,8 +2518,9 @@ pub async fn run_clone_origin(
 async fn run_pull_via_origins(
     ledger_id: &str,
     no_indexes: bool,
+    erasure_authority: bool,
     dirs: &FlureeDir,
-) -> CliResult<()> {
+) -> CliResult<fluree_db_api::Fluree> {
     let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
@@ -1839,6 +2533,7 @@ async fn run_pull_via_origins(
         .await?
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
     let namespace = ns_record.storage_namespace();
+    let _garbage_hold = hold_garbage(&fluree, ledger_id).await?;
 
     let config_id = ns_record.config_id.ok_or_else(|| {
         CliError::Config(format!(
@@ -1892,8 +2587,27 @@ async fn run_pull_via_origins(
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
 
     if remote_t <= local_ref.t {
+        // Its journal may have changed without a commit: a pack of none.
+        let held_here = local_ref.id.as_ref() == Some(&remote_head_cid)
+            || fluree
+                .ledger_holds_commit(ledger_id, &remote_head_cid)
+                .await
+                .unwrap_or(false);
+        let held = fluree
+            .held_erasure_digests()
+            .await
+            .map_err(|e| CliError::Config(e.to_string()))?;
+        if !held_here {
+            return Err(CliError::Config("the origin's head is not in the local history; reconcile the diverged histories before pulling".into()));
+        }
+        let response = origin_history_changes(&fetcher, ledger_id, &remote_head_cid, held).await?;
+        let mut reception = OriginReception::new(&fluree, erasure_authority);
+        ingest_pack_stream_into(response, &storage, &namespace, Some(&mut reception))
+            .await
+            .map_err(|e| CliError::Config(format!("pull failed (history changes): {e}")))?;
+        reception.accept(ledger_id, &remote_head_cid).await?;
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
-        return Ok(());
+        return Ok(fluree);
     }
 
     println!(
@@ -1904,6 +2618,10 @@ async fn run_pull_via_origins(
     );
 
     // Try pack protocol first (single round-trip).
+    let held = fluree
+        .held_erasure_digests()
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
     let have: Vec<fluree_db_core::ContentId> = local_ref.id.clone().into_iter().collect();
     let pack_request = if !no_indexes {
         if let Some(ref remote_index_id) = remote_ns.index_head_id {
@@ -1925,7 +2643,9 @@ async fn run_pull_via_origins(
         }
     } else {
         PackRequest::commits(vec![remote_head_cid.clone()], have)
-    };
+    }
+    .with_erasures(held.clone());
+    let mut reception = OriginReception::new(&fluree, erasure_authority);
     match fetcher.fetch_pack_response(ledger_id, &pack_request).await {
         Ok(Some(response)) => {
             let mut body_stream = response.bytes_stream();
@@ -1936,12 +2656,13 @@ async fn run_pull_via_origins(
 
                     let ingest_result = if wants_indexes && is_large {
                         if confirm_large_transfer(header.estimated_total_bytes) {
-                            ingest_pack_stream_with_header(
+                            ingest_pack_stream_with_header_into(
                                 &header,
                                 buf_tail,
                                 &mut body_stream,
                                 &storage,
                                 &namespace,
+                                Some(&mut reception),
                             )
                             .await
                         } else {
@@ -1950,10 +2671,17 @@ async fn run_pull_via_origins(
                             let have: Vec<fluree_db_core::ContentId> =
                                 local_ref.id.clone().into_iter().collect();
                             let commits_only =
-                                PackRequest::commits(vec![remote_head_cid.clone()], have);
+                                PackRequest::commits(vec![remote_head_cid.clone()], have)
+                                    .with_erasures(held.clone());
                             match fetcher.fetch_pack_response(ledger_id, &commits_only).await {
                                 Ok(Some(resp2)) => {
-                                    ingest_pack_stream(resp2, &storage, &namespace).await
+                                    ingest_pack_stream_into(
+                                        resp2,
+                                        &storage,
+                                        &namespace,
+                                        Some(&mut reception),
+                                    )
+                                    .await
                                 }
                                 Ok(None) => {
                                     Err(fluree_db_nameservice_sync::SyncError::PackNotSupported)
@@ -1962,18 +2690,20 @@ async fn run_pull_via_origins(
                             }
                         }
                     } else {
-                        ingest_pack_stream_with_header(
+                        ingest_pack_stream_with_header_into(
                             &header,
                             buf_tail,
                             &mut body_stream,
                             &storage,
                             &namespace,
+                            Some(&mut reception),
                         )
                         .await
                     };
 
                     match ingest_result {
                         Ok(result) => {
+                            reception.accept(ledger_id, &remote_head_cid).await?;
                             let count = result.commits_stored;
                             let idx_count = result.index_artifacts_stored;
                             let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
@@ -1988,14 +2718,17 @@ async fn run_pull_via_origins(
 
                             if idx_count > 0 {
                                 if let Some(ref remote_index_id) = remote_ns.index_head_id {
-                                    fluree
+                                    if !fluree
                                         .set_index_head(&handle, remote_index_id, remote_ns.index_t)
                                         .await
                                         .map_err(|e| {
                                             CliError::Config(format!(
                                                 "pull failed (set index head): {e}"
                                             ))
-                                        })?;
+                                        })?
+                                    {
+                                        index_not_set_note();
+                                    }
                                 }
                             }
 
@@ -2017,9 +2750,12 @@ async fn run_pull_via_origins(
                                     remote_t
                                 );
                             }
-                            return Ok(());
+                            return Ok(fluree);
                         }
                         Err(e) => {
+                            if reception.refused {
+                                return Err(CliError::Config(e.to_string()));
+                            }
                             eprintln!(
                                 "  {} pack import failed: {e}, falling back to CID walk",
                                 "warning:".yellow().bold()
@@ -2044,101 +2780,26 @@ async fn run_pull_via_origins(
         }
     }
 
-    // Walk chain from remote head toward local head.
-    struct FetchedCommit {
-        bytes: Vec<u8>,
-        txn: Option<fluree_db_core::ContentId>,
-    }
-    let mut fetched: Vec<FetchedCommit> = Vec::new();
-    let mut frontier = vec![remote_head_cid.clone()];
-    let mut visited_pull = std::collections::HashSet::new();
+    // A CID walk can discover replacements of missing commits, but cannot
+    // discover changes to an ancestor it already holds. Before using it,
+    // require an erasure-aware discovery round over the remote history.
+    let response = origin_history_changes(&fetcher, ledger_id, &remote_head_cid, held).await?;
+    ingest_pack_stream_into(response, &storage, &namespace, Some(&mut reception))
+        .await
+        .map_err(|e| CliError::Config(format!("pull failed (history changes): {e}")))?;
+    // Acceptance waits until the walk has supplied any missing history.
 
-    while let Some(cid) = frontier.pop() {
-        if !visited_pull.insert(cid.clone()) {
-            continue;
-        }
-        // Primary stop: hit local head CID — its ancestry is complete.
-        if local_ref.id.as_ref() == Some(&cid) {
-            continue;
-        }
-
-        // If commit already exists locally (e.g., from an interrupted pull),
-        // read local bytes to continue chain traversal but skip re-fetching.
-        if content_store.has(&cid).await.unwrap_or(false) {
-            let local_bytes = content_store
-                .get(&cid)
-                .await
-                .map_err(|e| CliError::Config(format!("pull failed (read local commit): {e}")))?;
-            let envelope = read_commit_envelope(&local_bytes)
-                .map_err(|e| CliError::Config(format!("pull failed (read envelope): {e}")))?;
-            if envelope.t <= local_ref.t {
-                continue;
-            }
-            for parent_id in envelope.parent_ids() {
-                frontier.push(parent_id.clone());
-            }
-            continue;
-        }
-
-        let commit_bytes = fetcher
-            .fetch(&cid, ledger_id)
-            .await
-            .map_err(|e| CliError::Config(format!("pull failed (fetch commit): {e}")))?;
-
-        // Verify integrity.
-        let derived_id = verify_commit_blob(&commit_bytes)
-            .map_err(|e| CliError::Config(format!("pull failed (commit integrity): {e}")))?;
-        if derived_id != cid {
-            return Err(CliError::Config(format!(
-                "pull failed: commit CID mismatch (expected {cid}, got {derived_id})"
-            )));
-        }
-
-        let envelope = read_commit_envelope(&commit_bytes)
-            .map_err(|e| CliError::Config(format!("pull failed (read envelope): {e}")))?;
-
-        // Secondary stop: t-based early exit (reached or passed local history).
-        if envelope.t <= local_ref.t {
-            continue;
-        }
-
-        for parent_id in envelope.parent_ids() {
-            frontier.push(parent_id.clone());
-        }
-        fetched.push(FetchedCommit {
-            bytes: commit_bytes,
-            txn: envelope.txn,
-        });
-    }
-
-    if fetched.is_empty() {
-        println!("{} '{}' is already up to date", "✓".green(), ledger_id);
-        return Ok(());
-    }
-
-    // Reverse to oldest→newest, store blobs.
-    fetched.reverse();
-    for fc in &fetched {
-        storage
-            .content_write_bytes(ContentKind::Commit, &namespace, &fc.bytes)
-            .await
-            .map_err(|e| CliError::Config(format!("pull failed (store commit): {e}")))?;
-
-        if let Some(txn_cid) = &fc.txn {
-            if !content_store.has(txn_cid).await.unwrap_or(false) {
-                let txn_bytes = fetcher
-                    .fetch(txn_cid, ledger_id)
-                    .await
-                    .map_err(|e| CliError::Config(format!("pull failed (fetch txn blob): {e}")))?;
-                content_store
-                    .put_with_id(txn_cid, &txn_bytes)
-                    .await
-                    .map_err(|e| CliError::Config(format!("pull failed (store txn blob): {e}")))?;
-            }
-        }
-    }
-
-    let count = fetched.len();
+    let count = walk_origin(
+        &fluree,
+        &fetcher,
+        (ledger_id, ledger_id),
+        (&remote_head_cid, local_ref.id.as_ref()),
+        (&storage, &namespace),
+        false,
+        &mut reception,
+    )
+    .await?;
+    reception.accept(ledger_id, &remote_head_cid).await?;
 
     // Set new commit head.
     let handle = fluree
@@ -2158,7 +2819,7 @@ async fn run_pull_via_origins(
         remote_t
     );
 
-    Ok(())
+    Ok(fluree)
 }
 
 #[cfg(test)]
@@ -2198,6 +2859,10 @@ mod tests {
         Base64Bytes(written.bytes)
     }
 
+    fn bytes_of(commits: PulledCommits) -> Vec<Base64Bytes> {
+        commits.into_iter().map(|(_, bytes)| bytes).collect()
+    }
+
     fn page(
         commits: Vec<Base64Bytes>,
         merged_commits: Vec<Base64Bytes>,
@@ -2217,6 +2882,8 @@ mod tests {
             effective_limit: 100,
             lineage,
             merged_commits,
+            commit_ids: Vec::new(),
+            merged_commit_ids: Vec::new(),
         }
     }
 
@@ -2231,9 +2898,9 @@ mod tests {
         ];
 
         let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
-        assert_eq!(to_import, [c2, c3, c4]);
+        assert_eq!(bytes_of(to_import), [c2, c3, c4]);
         // The older page's commits come first, and `b` is kept once.
-        assert_eq!(merged, [a, b]);
+        assert_eq!(bytes_of(merged), [a, b]);
     }
 
     #[test]
@@ -2242,7 +2909,430 @@ mod tests {
         let pages = [page(vec![c3.clone(), c2.clone(), c1], Vec::new(), false)];
 
         let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
-        assert_eq!(to_import, [c2, c3]);
+        assert_eq!(bytes_of(to_import), [c2, c3]);
         assert!(merged.is_empty());
+    }
+
+    /// An origin's pack carries its journal, which the copy takes before its
+    /// head moves: history the origin removed is refused there too. An
+    /// erasure frame is refused, and remembered as refused.
+    #[tokio::test]
+    async fn an_origin_reception_takes_the_journal_and_refuses_erasures() {
+        use fluree_db_api::retention::{FactSelector, RemovalRequest};
+        use fluree_db_api::{ApiError, FlureeBuilder};
+        use fluree_db_core::pack::{decode_frame, read_stream_preamble, PackFrame};
+        use serde_json::json;
+
+        let ctx = json!({"ex": "http://example.org/"});
+        let there = tempfile::tempdir().unwrap();
+        let origin = FlureeBuilder::file(there.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        origin.create_ledger("t/origin").await.unwrap();
+        let id = "t/origin:main";
+        let t1 = origin
+            .graph(id)
+            .transact()
+            .insert(&json!({"@context": ctx, "@id": "ex:alice", "ex:email": "a@old"}))
+            .commit()
+            .await
+            .unwrap()
+            .receipt
+            .t;
+        origin
+            .graph(id)
+            .transact()
+            .upsert(&json!({"@context": ctx, "@id": "ex:alice", "ex:email": "a@new"}))
+            .commit()
+            .await
+            .unwrap();
+        let old = RemovalRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: Some(json!("a@old")),
+            }],
+            ..Default::default()
+        };
+        origin.remove_occurrences(id, old).await.unwrap();
+        let record = origin.nameservice().lookup(id).await.unwrap().unwrap();
+        let head = record.commit_head_id.clone().unwrap();
+        let handle = origin.ledger_cached(id).await.unwrap();
+        let request = PackRequest::commits(vec![head.clone()], vec![]).with_erasures(Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        fluree_db_api::pack::stream_pack(&origin, &handle, &request, tx).await;
+        let mut pack = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            pack.extend(chunk.unwrap());
+        }
+
+        let here = tempfile::tempdir().unwrap();
+        let copy = FlureeBuilder::file(here.path().to_string_lossy().to_string())
+            .without_indexing()
+            .without_ledger_caching()
+            .build()
+            .unwrap();
+        copy.create_ledger("t/origin-copy").await.unwrap();
+        let copy_id = "t/origin-copy:main";
+        let namespace = local_namespace(&copy, copy_id).await.unwrap();
+        let storage = copy.backend().admin_storage_cloned().unwrap();
+        let mut reception = OriginReception::new(&copy, false);
+        let mut pos = read_stream_preamble(&pack).unwrap();
+        loop {
+            let (frame, used) =
+                decode_frame(&pack[pos..], fluree_db_core::pack::DEFAULT_MAX_PAYLOAD).unwrap();
+            pos += used;
+            match frame {
+                PackFrame::End => break,
+                PackFrame::Header(_) => {}
+                PackFrame::Data { cid, payload } => {
+                    fluree_db_nameservice_sync::ingest_pack_frame(
+                        &cid, &payload, &storage, &namespace,
+                    )
+                    .await
+                    .unwrap();
+                }
+                frame => reception.frame(frame).await.unwrap(),
+            }
+        }
+        reception.accept(copy_id, &head).await.unwrap();
+        let handle = copy.ledger_cached(copy_id).await.unwrap();
+        copy.set_commit_head(&handle, &head, record.commit_t)
+            .await
+            .unwrap();
+        let past = copy
+            .query_connection(&json!({
+                "@context": ctx,
+                "from": format!("{copy_id}@t:{t1}"),
+                "select": "?o",
+                "where": {"@id": "ex:alice", "ex:email": "?o"}
+            }))
+            .await;
+        assert!(
+            matches!(past, Err(ApiError::HistoryUnavailable(_))),
+            "{past:?}"
+        );
+
+        assert!(reception
+            .frame(PackFrame::Erasure(json!({})))
+            .await
+            .is_err());
+        assert!(reception.refused);
+    }
+
+    /// An origin answering object requests as a server does: an erased
+    /// commit with its erasure, which it records answering.
+    struct TestOrigin<'a> {
+        fluree: &'a fluree_db_api::Fluree,
+        ledger_id: &'a str,
+        erased: std::sync::Mutex<Vec<ContentId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectSource for TestOrigin<'_> {
+        async fn object(
+            &self,
+            cid: &ContentId,
+            _ledger_id: &str,
+        ) -> fluree_db_nameservice_sync::Result<Vec<u8>> {
+            use fluree_db_api::retention::erasure::ErasedObject;
+            use fluree_db_nameservice_sync::SyncError;
+            match self
+                .fluree
+                .erased_object(self.ledger_id, cid)
+                .await
+                .unwrap()
+            {
+                Some(ErasedObject::Chain(frames)) => {
+                    self.erased.lock().unwrap().push(cid.clone());
+                    Err(SyncError::Erased {
+                        cid: cid.to_string(),
+                        frames,
+                    })
+                }
+                Some(ErasedObject::Withheld) => Err(SyncError::NotFound(cid.to_string())),
+                None => {
+                    let namespace = local_namespace(self.fluree, self.ledger_id).await.unwrap();
+                    match self.fluree.content_store(&namespace).get(cid).await {
+                        Ok(bytes) => Ok(bytes.into_vec()),
+                        Err(_) => Err(SyncError::NotFound(cid.to_string())),
+                    }
+                }
+            }
+        }
+    }
+
+    /// `walk_origin` from `source` into `local_id`, taking erasures with
+    /// `authority` or not.
+    async fn walk_into<'a>(
+        copy: &'a fluree_db_api::Fluree,
+        source: &TestOrigin<'_>,
+        storage: &Arc<dyn fluree_db_core::storage::Storage>,
+        head: &ContentId,
+        local_id: &str,
+        authority: bool,
+    ) -> (CliResult<usize>, OriginReception<'a>) {
+        let mut reception = OriginReception::new(copy, authority);
+        let namespace = local_namespace(copy, local_id).await.unwrap();
+        let walked = walk_origin(
+            copy,
+            source,
+            (source.ledger_id, local_id),
+            (head, None),
+            (storage, &namespace),
+            false,
+            &mut reception,
+        )
+        .await;
+        (walked, reception)
+    }
+
+    /// An origin's erased commit, walked object by object as `fluree clone
+    /// --origin` walks it, is refused unless the clone designates the origin
+    /// an erasure authority; designated, the clone reads as the origin does.
+    /// A second clone on the same storage, which reads the erased commit
+    /// already, fetches its erasure all the same: that makes it a holder,
+    /// which later erasures reach, and brings the journal.
+    #[tokio::test]
+    async fn an_origin_walk_takes_erased_commits_only_from_an_authority() {
+        use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+        use fluree_db_api::retention::FactSelector;
+        use fluree_db_api::{FlureeBuilder, ReindexOptions};
+        use serde_json::json;
+
+        let ctx = json!({"ex": "http://example.org/"});
+        let there = tempfile::tempdir().unwrap();
+        let origin = FlureeBuilder::file(there.path().to_string_lossy().to_string())
+            .without_indexing()
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build()
+            .unwrap();
+        origin.create_ledger("t/walk").await.unwrap();
+        let id = "t/walk:main";
+        for doc in [
+            json!({"@context": ctx, "@graph": [
+                {"@id": "ex:alice", "ex:email": "a@secret"},
+                {"@id": "ex:bob", "ex:email": "b@kept"}
+            ]}),
+            json!({"@context": ctx, "@id": "ex:carol", "ex:email": "c@later"}),
+        ] {
+            origin
+                .graph(id)
+                .transact()
+                .insert(&doc)
+                .commit()
+                .await
+                .unwrap();
+        }
+        let request = ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: Some(json!("a@secret")),
+            }],
+            ..Default::default()
+        };
+        origin.erase_occurrences(id, request, None).await.unwrap();
+        origin.reindex(id, ReindexOptions::default()).await.unwrap();
+        assert_eq!(origin.run_erasure_pass(id).await.unwrap().published, 1);
+        let record = origin.nameservice().lookup(id).await.unwrap().unwrap();
+        let head = record.commit_head_id.clone().unwrap();
+        let source = TestOrigin {
+            fluree: &origin,
+            ledger_id: id,
+            erased: Default::default(),
+        };
+
+        let here = tempfile::tempdir().unwrap();
+        let copy = FlureeBuilder::file(here.path().to_string_lossy().to_string())
+            .without_indexing()
+            .without_ledger_caching()
+            .with_erasure_verifier(Arc::new(Verifier::accepting_dev_receipts()))
+            .build()
+            .unwrap();
+        let storage = copy.backend().admin_storage_cloned().unwrap();
+        for local in ["t/walk-refused", "t/walk-copy", "t/walk-again"] {
+            copy.create_ledger(local).await.unwrap();
+        }
+        let walk = |local_id: &'static str, authority: bool| {
+            walk_into(&copy, &source, &storage, &head, local_id, authority)
+        };
+        let (walked, refusing) = walk("t/walk-refused:main", false).await;
+        assert!(walked.is_err());
+        assert!(refusing.refused);
+        source.erased.lock().unwrap().clear();
+
+        let (walked, mut reception) = walk("t/walk-copy:main", true).await;
+        walked.unwrap();
+        // The assertion, and the removal's retraction.
+        let erased = std::mem::take(&mut *source.erased.lock().unwrap());
+        assert_eq!(erased.len(), 2);
+        let copy_id = "t/walk-copy:main";
+        assert_eq!(reception.accept(copy_id, &head).await.unwrap(), 2);
+        let handle = copy.ledger_cached(copy_id).await.unwrap();
+        copy.set_commit_head(&handle, &head, record.commit_t)
+            .await
+            .unwrap();
+        let emails = copy
+            .query_connection(&json!({
+                "@context": ctx,
+                "from": copy_id,
+                "select": "?o",
+                "where": {"@id": "?s", "ex:email": "?o"}
+            }))
+            .await
+            .unwrap();
+        let ledger = copy.ledger(copy_id).await.unwrap();
+        let mut emails: Vec<String> = emails
+            .to_jsonld(&ledger.snapshot)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        emails.sort();
+        assert_eq!(emails, ["b@kept", "c@later"]);
+
+        // Every folder of this storage reads the erased commits now.
+        let again = "t/walk-again:main";
+        let namespace = local_namespace(&copy, again).await.unwrap();
+        for cid in &erased {
+            assert!(copy.content_store(&namespace).has(cid).await.unwrap());
+            assert!(!copy.ledger_holds_commit(again, cid).await.unwrap());
+        }
+        let (walked, mut reception) = walk(again, true).await;
+        walked.unwrap();
+        assert_eq!(*source.erased.lock().unwrap(), erased);
+        assert_eq!(reception.accept(again, &head).await.unwrap(), 2);
+        for cid in &erased {
+            assert!(copy.ledger_holds_commit(again, cid).await.unwrap());
+        }
+        let status = copy.retention_status(again).await.unwrap();
+        assert!(
+            status
+                .registration
+                .is_some_and(|r| !r.journal.removals.is_empty()),
+            "the journal arrives with the erasures"
+        );
+    }
+
+    /// The files under `root` holding `needle`.
+    fn files_holding(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut next = vec![root.to_path_buf()];
+        while let Some(dir) = next.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    next.push(path);
+                } else if std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// A copy holding a commit an erasure it received erases deletes the
+    /// original from its storage before the pull returns, without waiting as
+    /// a server does for readers of the older indexes; a second pull finds
+    /// nothing left.
+    #[tokio::test]
+    async fn a_pull_deletes_what_a_received_erasure_erases() {
+        use fluree_db_api::retention::erasure::{
+            ErasureConfig, ErasureRequest, ErasureStage, Verifier,
+        };
+        use fluree_db_api::retention::FactSelector;
+        use fluree_db_api::{FlureeBuilder, ReindexOptions};
+        use serde_json::json;
+
+        let there = tempfile::tempdir().unwrap();
+        let origin = FlureeBuilder::file(there.path().to_string_lossy().to_string())
+            .without_indexing()
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build()
+            .unwrap();
+        origin.create_ledger("t/purge").await.unwrap();
+        let id = "t/purge:main";
+        origin
+            .graph(id)
+            .transact()
+            .insert(
+                &json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+                    {"@id": "ex:alice", "ex:email": "a@secret"},
+                    {"@id": "ex:bob", "ex:email": "b@kept"}
+                ]}),
+            )
+            .commit()
+            .await
+            .unwrap();
+        let mut before = Vec::new();
+        origin.archive_ledger(id, false, &mut before).await.unwrap();
+        let request = ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: Some(json!("a@secret")),
+            }],
+            ..Default::default()
+        };
+        origin.erase_occurrences(id, request, None).await.unwrap();
+        origin.reindex(id, ReindexOptions::default()).await.unwrap();
+        assert_eq!(origin.run_erasure_pass(id).await.unwrap().published, 1);
+        let mut after = Vec::new();
+        origin.archive_ledger(id, true, &mut after).await.unwrap();
+
+        let here = tempfile::tempdir().unwrap();
+        let copy = FlureeBuilder::file(here.path().to_string_lossy().to_string())
+            .without_indexing()
+            .without_ledger_caching()
+            .with_erasure_verifier(Arc::new(Verifier::accepting_dev_receipts()))
+            .build()
+            .unwrap();
+        let held = copy
+            .restore_ledger("t/purge-copy", &mut before.as_slice())
+            .await
+            .unwrap()
+            .ledger_id;
+        copy.reindex(&held, ReindexOptions::default())
+            .await
+            .unwrap();
+        copy.restore_ledger("t/purge-again", &mut after.as_slice())
+            .await
+            .unwrap();
+        assert!(!files_holding(here.path(), "a@secret").is_empty());
+
+        let purge = purge_received(&copy, &held).await;
+        assert_eq!(purge, Purge::Done(1));
+        assert_eq!(
+            files_holding(here.path(), "a@secret"),
+            Vec::<std::path::PathBuf>::new()
+        );
+        let jobs = copy
+            .retention_status(&held)
+            .await
+            .unwrap()
+            .registration
+            .unwrap()
+            .erasures;
+        assert_eq!(jobs[0].stage, ErasureStage::Purged);
+        assert_eq!(purge_received(&copy, &held).await, Purge::Nothing);
     }
 }

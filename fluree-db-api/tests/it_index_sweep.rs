@@ -156,7 +156,7 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
             .storage_namespace(ledger_id)
             .await
             .expect("ledger's namespace"),
-        &stray.digest_hex(),
+        &stray.address_digest(),
     );
     storage
         .write_bytes(&stray_addr, b"orphaned leaf bytes")
@@ -367,7 +367,7 @@ async fn sweep_reclaims_leftover_stats_sketches_and_keeps_the_heads() {
         storage.storage_method(),
         ContentKind::StatsSketch,
         &namespace,
-        &leftover.digest_hex(),
+        &leftover.address_digest(),
     );
     storage
         .write_bytes(&leftover_addr, b"{}")

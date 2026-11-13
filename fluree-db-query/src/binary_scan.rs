@@ -4190,6 +4190,19 @@ fn string_not_found_error(value: &str) -> std::io::Error {
     )
 }
 
+/// The index encoding of an object value as `store` holds it: its type tag
+/// and key. `numbig_ctx` names the graph and predicate whose arena holds a
+/// big number.
+pub fn encode_stored_object(
+    val: &FlakeValue,
+    dt_sid: &Sid,
+    lang: Option<&str>,
+    store: &BinaryIndexStore,
+    numbig_ctx: Option<(GraphId, u32)>,
+) -> std::io::Result<(OType, u64)> {
+    value_to_otype_okey(val, dt_sid, lang, store, None, numbig_ctx)
+}
+
 /// Convert a FlakeValue to `(OType, o_key)` in V3 encoding.
 ///
 /// Uses `dt_sid` (the flake's datatype Sid) and `lang` (from FlakeMeta) to derive

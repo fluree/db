@@ -638,6 +638,31 @@ only when a non-root policy context governed the request, so clients that
 ignore unknown fields are unaffected. See
 [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
+#### `f:ttl` and `f:expiresAt` are lifetimes, and are refused where they are not (breaking)
+
+`f:ttl` and `f:expiresAt` now set a value's [lifetime](../transactions/ttl.md). On an annotation of exactly one triple they are an instruction to retract that value when it comes due, and in a transaction's metadata they are a default for every value it writes. Written anywhere else, such as on an ordinary node, they are refused, as are two lifetimes for one value in one transaction. Bulk import refuses data holding them, in an annotation or a TriG `#txn-meta` block: write the values that expire with a transaction. Annotations committed before a ledger's first lifetime-aware write keep their meaning and are never treated as instructions.
+
+#### After a removal, a ledger's raw storage needs audit access
+
+Once a ledger's journal records a [targeted removal](../transactions/history-retention.md#targeted-removal) or a [permanent erasure](../transactions/permanent-erasure.md), its raw content is audit data: commit show, commit export, pack, and storage-proxy reads of everything but its config answer `403` without the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` claim. That includes the storage-proxy reads of a query peer serving the ledger. Give each such peer a token with audit access for the ledger before making a removal there, or the peer stops serving it. See [Audit access](../transactions/history-retention.md#audit-access). Ledgers without a removal are unaffected.
+
+#### On a cluster, a removal reaches each node through replication
+
+A removal or erasure travels to a cluster's members by the normal nameservice replication. Each node serves the journal it has learned, with no leader round trip, so a lagging or partitioned node can serve history removed elsewhere until the change arrives. A removal's receipt lists any replica that had not applied it within 10 seconds (`unacknowledgedReplicas`). A node that has applied an erasure but not yet installed it answers affected reads with a retryable `503` `err:db/ReplicaNotCurrent`. See [History retention on clusters](../transactions/history-retention.md#clusters).
+
+#### Nameservice backends: writes present a `WriteBasis` (Rust)
+
+For implementers of the nameservice traits. The fenced write methods (`publish_commit_fenced`, `publish_index_fenced`, `publish_index_allow_equal_fenced`, `fast_forward_commit_fenced`, `reset_head_fenced` and `compare_and_set_ref_fenced`) now take `basis: WriteBasis`. `WriteBasis` carries the fence, the erasure generation of the view the write was made from, and the source branch's view for a merge or rebase. A backend that keeps no erasure generations, which is every backend but the Raft one, checks `basis.fence` as it checked `fence` and ignores the rest. `NsRecord::write_basis()` builds one from a loaded record.
+
+- `GraphSourcePublisher::publish_graph_source_index` takes a new `sources: &[(String, u64)]` argument, the erasure generation of each source ledger view the index was built from. Backends without generations ignore it.
+- `BranchRecordStore::thaw_record` is new and required: it undoes the freeze of a soft drop whose snapshot could not be recorded.
+- `AdminPublisher::clear_frozen_index` and `GraphSourcePublisher::publish_graph_source_index_allow_equal` are new, with defaults that refuse; implement them to support a purge on that backend.
+- `NsRecord` gains `erasure_generation` (0 outside a cluster).
+
+#### `Fluree::set_index_head` returns whether it set the index (Rust)
+
+`set_index_head`, which points a ledger at an index received by pull or clone, now returns `Result<bool>`. It returns `false`, leaving the index head alone, when this storage holds an erasure of a commit in the ledger's history: the sender may have built its index from the original commit, so the ledger builds its own from the replacements.
+
 ## Supported Data Formats
 
 ### JSON-LD

@@ -15,12 +15,13 @@ use crate::binding::{
     new_instance_id, BindingState, BranchFence, BranchRecordStore, DroppedLedger, DroppedState,
     Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas, Versioned,
 };
-use crate::{NameServiceError, NsRecord, Result};
+use crate::{ConfigCasResult, ConfigPublisher, ConfigValue, NameServiceError, NsRecord, Result};
 use fluree_db_core::{ContentId, InstanceId, LedgerId, LedgerName, StorageRoot};
+use std::collections::BTreeMap;
 
 /// A backend the protocols can drive.
-pub trait LifecycleStore: LedgerRegistry + BranchRecordStore {}
-impl<T: LedgerRegistry + BranchRecordStore + ?Sized> LifecycleStore for T {}
+pub trait LifecycleStore: LedgerRegistry + BranchRecordStore + ConfigPublisher {}
+impl<T: LedgerRegistry + BranchRecordStore + ConfigPublisher + ?Sized> LifecycleStore for T {}
 
 /// Compare-and-swap retries before an operation gives up on a contended
 /// binding.
@@ -359,6 +360,33 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
     source_branch: &str,
     at_commit: Option<(ContentId, i64)>,
 ) -> Result<NsRecord> {
+    create_branch_with(
+        store,
+        name,
+        new_branch,
+        source_branch,
+        at_commit,
+        |_| async { Ok(()) },
+    )
+    .await
+}
+
+/// [`create_branch`], running `prepare` with the new record's fence once the
+/// record is in and before the listing is confirmed: what nothing may read
+/// the branch without. A `prepare` that fails rolls the create back.
+pub async fn create_branch_with<S, F, Fut>(
+    store: &S,
+    name: &LedgerName,
+    new_branch: &str,
+    source_branch: &str,
+    at_commit: Option<(ContentId, i64)>,
+    prepare: F,
+) -> Result<NsRecord>
+where
+    S: LifecycleStore + ?Sized,
+    F: FnOnce(Fence) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let new_id = name.with_branch(new_branch)?;
     let source_id = name.with_branch(source_branch)?;
 
@@ -418,7 +446,10 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
         None => (source.commit_head_id.clone(), source.commit_t),
     };
     let confirmed = match insert_fenced(store, &record).await {
-        Ok(()) => confirm_branch(store, name, new_branch, fence).await,
+        Ok(()) => match prepare(fence).await {
+            Ok(()) => confirm_branch(store, name, new_branch, fence).await,
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     if let Err(e) = confirmed {
@@ -910,20 +941,22 @@ fn check_entry_fits<S: LifecycleStore + ?Sized>(store: &S, entry: &DroppedLedger
         return Ok(());
     }
     Err(NameServiceError::TooLarge(format!(
-        "'{}' has {} branches, and recording it as a dropped ledger takes {bytes} bytes, \
-         more than the {max} this nameservice holds in one entry; drop some of its \
-         branches first",
+        "'{}' has {} branches, and recording it as a dropped ledger, with their configs, \
+         takes {bytes} bytes, more than the {max} this nameservice holds in one entry; \
+         drop some of its branches first",
         entry.name,
         entry.branches.len()
     )))
 }
 
-/// The entry a drop of `binding`'s ledger records, holding `records`.
+/// The entry a drop of `binding`'s ledger records, holding `records` and
+/// `configs`.
 fn dropped_entry(
     name: &LedgerName,
     binding: &NameBinding,
     hard: bool,
     records: Vec<NsRecord>,
+    configs: Option<BTreeMap<String, ConfigValue>>,
 ) -> DroppedLedger {
     DroppedLedger {
         extra: crate::binding::ExtraFields::new(),
@@ -938,6 +971,7 @@ fn dropped_entry(
         root: binding.root.clone(),
         root_branch: binding.root_branch.clone(),
         branches: records,
+        configs,
     }
 }
 
@@ -962,6 +996,46 @@ async fn records_to_copy<S: LifecycleStore + ?Sized>(
         }
     }
     Ok(records)
+}
+
+/// The configs a soft drop of `binding`'s ledger copies into its entry, by
+/// branch: each copied record's, when it has one. A hard drop keeps none,
+/// since nothing restores it, and a branch dropped before its ledger none,
+/// since it comes back still dropped.
+async fn configs_to_copy<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    binding: &NameBinding,
+    hard: bool,
+) -> Result<Option<BTreeMap<String, ConfigValue>>> {
+    if hard {
+        return Ok(None);
+    }
+    let mut configs = BTreeMap::new();
+    for b in binding
+        .branches
+        .iter()
+        .filter(|b| !b.creating && !b.dropped)
+    {
+        let id = name.with_branch(&b.branch)?;
+        let held = store
+            .raw_record(&id)
+            .await?
+            .is_some_and(|r| r.fence == Some(b.fence));
+        // A record kept from before the id grammar: no request can name its
+        // branch, so nothing gave it a config.
+        if !held || LedgerId::parse(id.as_ref()).is_err() {
+            continue;
+        }
+        if let Some(config) = store
+            .get_config(id.as_ref())
+            .await?
+            .filter(|c| c.v > 0 || c.payload.is_some())
+        {
+            configs.insert(b.branch.clone(), config);
+        }
+    }
+    Ok(Some(configs))
 }
 
 /// [`drop_ledger`] with `start: Some(hard)`; [`resume_drop_ledger`] with
@@ -1001,7 +1075,11 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
                     };
                     if store.max_dropped_entry_bytes().is_some() {
                         let records = records_to_copy(store, name, &value).await?;
-                        check_entry_fits(store, &dropped_entry(name, &value, hard, records))?;
+                        let configs = configs_to_copy(store, name, &value, hard).await?;
+                        check_entry_fits(
+                            store,
+                            &dropped_entry(name, &value, hard, records, configs),
+                        )?;
                     }
                     let dropping = NameBinding {
                         state: BindingState::Dropping { hard },
@@ -1022,15 +1100,17 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
         unreachable!("claimed binding is dropping");
     };
 
-    // 2. Freeze every listed branch, and copy its record. A branch still
-    // being created is not copied: its creator was not told it succeeded,
-    // and fails to confirm it. Step 4 deletes its record.
+    // 2. Freeze every listed branch, and copy its record and config, which
+    // the freeze holds still. A branch still being created is not copied:
+    // its creator was not told it succeeded, and fails to confirm it. Step 4
+    // deletes its record.
     for b in binding.branches.iter().filter(|b| !b.creating) {
         store
             .freeze_record(&name.with_branch(&b.branch)?, b.fence)
             .await?;
     }
     let records = records_to_copy(store, name, &binding).await?;
+    let configs = configs_to_copy(store, name, &binding, hard).await?;
 
     // 3. Record the dropped ledger. A dropped or purging entry already there
     // is this drop's own earlier attempt, written before any record was
@@ -1038,7 +1118,22 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     // and stopped before forgetting its entry: its copies predate the
     // restore, and resuming it would bring the ledger back, so it is
     // replaced.
-    let entry = dropped_entry(name, &binding, hard, records);
+    let entry = dropped_entry(name, &binding, hard, records, configs);
+    // The records and configs as frozen can outgrow the claim's check: a
+    // config written between the two. A drop with no entry yet that cannot
+    // hold them is undone; one with an entry keeps it.
+    if let Err(too_large) = check_entry_fits(store, &entry) {
+        let written = store
+            .get_dropped(&binding.instance)
+            .await?
+            .is_some_and(|e| {
+                matches!(e.value.state, DroppedState::Dropped | DroppedState::Purging)
+            });
+        if !written {
+            undo_drop(store, name, &binding, version).await?;
+            return Err(too_large);
+        }
+    }
     let mut expected = None;
     let entry = loop {
         match cas_dropped(store, &binding.instance, expected, Some(&entry)).await? {
@@ -1076,15 +1171,60 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     }))
 }
 
+/// Undo a drop that froze `binding`'s branches and wrote nothing else: thaw
+/// them, then make the binding, at `version`, active again. A branch dropped
+/// before its ledger stays frozen.
+async fn undo_drop<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    binding: &NameBinding,
+    version: u64,
+) -> Result<()> {
+    for b in binding
+        .branches
+        .iter()
+        .filter(|b| !b.creating && !b.dropped)
+    {
+        store
+            .thaw_record(&name.with_branch(&b.branch)?, b.fence)
+            .await?;
+    }
+    let active = NameBinding {
+        state: BindingState::Active,
+        ..binding.clone()
+    };
+    match cas_binding(store, name, Some(version), Some(&active)).await? {
+        RegistryCas::Updated { .. } => Ok(()),
+        RegistryCas::Conflict { .. } => Err(contended(name)),
+    }
+}
+
 /// Restore a soft-dropped ledger under its own name, with a fresh fence on
-/// every branch. Returns its branch records.
+/// every branch and each branch's config as the drop left it. Returns its
+/// branch records.
 ///
 /// Fails with `LedgerAlreadyExists` when another ledger holds the name.
 pub async fn restore_dropped<S: LifecycleStore + ?Sized>(
     store: &S,
     instance: &InstanceId,
 ) -> Result<Vec<NsRecord>> {
-    restore_from(store, instance, true)
+    restore_dropped_with(store, instance, |_, _| async { Ok(()) }).await
+}
+
+/// [`restore_dropped`], running `prepare` with the entry and the reinstated
+/// records once their configs are in and before the ledger is visible. A
+/// `prepare` that fails leaves the restore to be resumed.
+pub async fn restore_dropped_with<S, F, Fut>(
+    store: &S,
+    instance: &InstanceId,
+    prepare: F,
+) -> Result<Vec<NsRecord>>
+where
+    S: LifecycleStore + ?Sized,
+    F: FnOnce(DroppedLedger, Vec<NsRecord>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    restore_from(store, instance, true, prepare)
         .await
         .map(Option::unwrap_or_default)
 }
@@ -1095,16 +1235,36 @@ pub async fn resume_restore<S: LifecycleStore + ?Sized>(
     store: &S,
     instance: &InstanceId,
 ) -> Result<Option<Vec<NsRecord>>> {
-    restore_from(store, instance, false).await
+    resume_restore_with(store, instance, |_, _| async { Ok(()) }).await
 }
 
-/// [`restore_dropped`] with `start`; [`resume_restore`] without, which
-/// begins no restore of its own.
-async fn restore_from<S: LifecycleStore + ?Sized>(
+/// [`resume_restore`], running `prepare` as [`restore_dropped_with`] does.
+pub async fn resume_restore_with<S, F, Fut>(
+    store: &S,
+    instance: &InstanceId,
+    prepare: F,
+) -> Result<Option<Vec<NsRecord>>>
+where
+    S: LifecycleStore + ?Sized,
+    F: FnOnce(DroppedLedger, Vec<NsRecord>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    restore_from(store, instance, false, prepare).await
+}
+
+/// [`restore_dropped_with`] with `start`; [`resume_restore_with`] without,
+/// which begins no restore of its own.
+async fn restore_from<S, F, Fut>(
     store: &S,
     instance: &InstanceId,
     start: bool,
-) -> Result<Option<Vec<NsRecord>>> {
+    prepare: F,
+) -> Result<Option<Vec<NsRecord>>>
+where
+    S: LifecycleStore + ?Sized,
+    F: FnOnce(DroppedLedger, Vec<NsRecord>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     // 1. Mark the entry restoring, recording the fresh fences.
     let Some(Versioned {
         value: entry,
@@ -1207,7 +1367,19 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
         records.push(record);
     }
 
-    // 4. Make it visible, then forget the entry.
+    // 4. Reinstate each branch's config under its fresh fence, then ready
+    // what else the ledger must hold before it serves. A branch restored
+    // still dropped takes no writes.
+    if let Some(configs) = &entry.configs {
+        for record in records.iter().filter(|r| !r.frozen) {
+            if let Some(config) = configs.get(&record.branch) {
+                reinstate_config(store, record, config).await?;
+            }
+        }
+    }
+    prepare(entry.clone(), records.clone()).await?;
+
+    // 5. Make it visible, then forget the entry.
     let active = NameBinding {
         state: BindingState::Active,
         ..binding
@@ -1218,6 +1390,34 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
     }
     cas_dropped(store, instance, Some(version), None).await?;
     Ok(Some(records))
+}
+
+/// Write `config` as the config of `record`, reinstated by a restore and not
+/// yet visible. Only this restore writes it, so a config already there is
+/// from an interrupted attempt, which may have built on it since: it stays.
+async fn reinstate_config<S: LifecycleStore + ?Sized>(
+    store: &S,
+    record: &NsRecord,
+    config: &ConfigValue,
+) -> Result<()> {
+    let id = record.ledger_id.to_string();
+    for _ in 0..MAX_ATTEMPTS {
+        let current = store.get_config(&id).await?;
+        if current
+            .as_ref()
+            .is_some_and(|c| c.v > 0 || c.payload.is_some())
+        {
+            return Ok(());
+        }
+        match store
+            .push_config_fenced(&id, record.fence, current.as_ref(), config)
+            .await?
+        {
+            ConfigCasResult::Updated => return Ok(()),
+            ConfigCasResult::Conflict { .. } => continue,
+        }
+    }
+    Err(contended(&record.name))
 }
 
 /// Undo a restore that cannot finish: free the name, delete the records it
@@ -1541,6 +1741,7 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
                 ..r.clone()
             })
             .collect(),
+        configs: None,
     };
     match cas_dropped(store, &instance, None, Some(&entry)).await? {
         RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: Some(_) } => {}
@@ -1572,6 +1773,32 @@ mod tests {
         inner: MemoryNameService,
         lose_activation: bool,
         max_entry: std::sync::atomic::AtomicUsize,
+        /// Refuse a dropped-ledger entry over `max_entry`, as a store with an
+        /// item limit does.
+        enforce_max_entry: bool,
+        /// Grow every config of the ledger as its drop is claimed: a write
+        /// that lands between the size check and the freeze.
+        grow_configs_on_claim: std::sync::atomic::AtomicBool,
+    }
+
+    impl TestStore {
+        async fn grow_configs(&self, name: &str) -> Result<()> {
+            use crate::ConfigLookup;
+            let binding = self.inner.get_binding(name).await?.unwrap().value;
+            for b in &binding.branches {
+                let id = format!("{name}:{}", b.branch);
+                let current = self.inner.get_config(&id).await?;
+                let mut payload = crate::ConfigPayload::new();
+                payload
+                    .extra
+                    .insert("retention".into(), serde_json::json!("x".repeat(2500)));
+                let next = ConfigValue::new(current.as_ref().map_or(1, |c| c.v + 1), Some(payload));
+                self.inner
+                    .push_config_fenced(&id, Some(b.fence), current.as_ref(), &next)
+                    .await?;
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1586,6 +1813,14 @@ mod tests {
             expected: Option<u64>,
             new: Option<&NameBinding>,
         ) -> Result<RegistryCas<NameBinding>> {
+            let claiming = new.is_some_and(|b| matches!(b.state, BindingState::Dropping { .. }));
+            if claiming
+                && self
+                    .grow_configs_on_claim
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.grow_configs(name).await?;
+            }
             let outcome = self.inner.cas_binding(name, expected, new).await?;
             if self.lose_activation && new.is_some_and(NameBinding::is_active) {
                 return Err(NameServiceError::storage("the response was lost"));
@@ -1610,6 +1845,12 @@ mod tests {
             expected: Option<u64>,
             new: Option<&DroppedLedger>,
         ) -> Result<RegistryCas<DroppedLedger>> {
+            let max = self.max_entry.load(std::sync::atomic::Ordering::SeqCst);
+            if let Some(entry) = new.filter(|_| self.enforce_max_entry && max > 0) {
+                if serde_json::to_vec(entry)?.len() > max {
+                    return Err(NameServiceError::TooLarge("the item limit".into()));
+                }
+            }
             self.inner.cas_dropped(instance, expected, new).await
         }
 
@@ -1647,9 +1888,66 @@ mod tests {
             self.inner.freeze_record(ledger_id, fence).await
         }
 
+        async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+            self.inner.thaw_record(ledger_id, fence).await
+        }
+
         async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
             self.inner.delete_record(ledger_id, fence).await
         }
+    }
+
+    #[async_trait]
+    impl crate::ConfigLookup for TestStore {
+        async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
+            self.inner.get_config(ledger_id).await
+        }
+    }
+
+    #[async_trait]
+    impl ConfigPublisher for TestStore {
+        async fn push_config_fenced(
+            &self,
+            ledger_id: &str,
+            fence: Option<Fence>,
+            expected: Option<&ConfigValue>,
+            new: &ConfigValue,
+        ) -> Result<ConfigCasResult> {
+            self.inner
+                .push_config_fenced(ledger_id, fence, expected, new)
+                .await
+        }
+    }
+
+    /// An activation that landed with its response lost is an activation:
+    /// a caller that rolled back on its error would delete a live ledger.
+    /// And a rollback of a create its claim has moved on from, as after
+    /// such an activation, deletes nothing.
+    #[tokio::test]
+    async fn an_activation_reported_failed_is_kept_when_it_landed() {
+        let store = TestStore {
+            lose_activation: true,
+            ..TestStore::default()
+        };
+        let pending = begin_create(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        activate(&store, &pending)
+            .await
+            .expect("the activation landed");
+
+        assert!(abandon(&store, &pending).await.is_err());
+        assert!(store
+            .get_binding("mydb")
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .is_active());
+        assert_eq!(
+            store.raw_record("mydb:main").await.unwrap().unwrap().fence,
+            pending.record.fence
+        );
     }
 
     /// A write retried after it landed finds its own value at the version it
@@ -1686,37 +1984,6 @@ mod tests {
         ));
     }
 
-    /// An activation that landed with its response lost is an activation:
-    /// a caller that rolled back on its error would delete a live ledger.
-    /// And a rollback of a create its claim has moved on from, as after
-    /// such an activation, deletes nothing.
-    #[tokio::test]
-    async fn an_activation_reported_failed_is_kept_when_it_landed() {
-        let store = TestStore {
-            lose_activation: true,
-            ..TestStore::default()
-        };
-        let pending = begin_create(&store, &LedgerId::parse("mydb:main").unwrap())
-            .await
-            .unwrap();
-        activate(&store, &pending)
-            .await
-            .expect("the activation landed");
-
-        assert!(abandon(&store, &pending).await.is_err());
-        assert!(store
-            .get_binding("mydb")
-            .await
-            .unwrap()
-            .unwrap()
-            .value
-            .is_active());
-        assert_eq!(
-            store.raw_record("mydb:main").await.unwrap().unwrap().fence,
-            pending.record.fence
-        );
-    }
-
     /// A ledger the migration cannot bind is skipped and reported, and every
     /// other is bound, including those after it in name order.
     #[tokio::test]
@@ -1746,6 +2013,125 @@ mod tests {
         assert_eq!(report.quarantined, refused);
         let mydb = store.get_binding("mydb").await.unwrap().unwrap().value;
         assert!(mydb.listing("main").is_some() && mydb.listing("feature#1").is_none());
+    }
+
+    /// What a branch must hold is in before anything reads it: `prepare`
+    /// runs while the branch is not shown, and one that fails rolls the
+    /// create back.
+    #[tokio::test]
+    async fn a_branch_is_prepared_before_it_shows() {
+        let store = MemoryNameService::new();
+        let name = LedgerName::parse("mydb").unwrap();
+        create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        create_branch_with(&store, &name, "dev", "main", None, |fence| {
+            let store = &store;
+            async move {
+                let binding = store.get_binding("mydb").await?.unwrap().value;
+                assert!(!binding.shows("dev"), "shown before it was prepared");
+                let record = store.raw_record("mydb:dev").await?.unwrap();
+                assert_eq!(record.fence, Some(fence));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.shows("dev"));
+
+        let err = create_branch_with(&store, &name, "feature", "main", None, |_| async {
+            Err(NameServiceError::storage("not prepared"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not prepared"), "{err}");
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.listing("feature").is_none());
+        assert!(store.raw_record("mydb:feature").await.unwrap().is_none());
+    }
+
+    /// A soft drop whose branch configs would not fit in its entry is
+    /// refused before it writes anything; a hard drop keeps no configs.
+    #[tokio::test]
+    async fn a_drop_whose_configs_do_not_fit_is_refused_before_any_write() {
+        use crate::ConfigLookup;
+        use std::sync::atomic::Ordering;
+        let store = TestStore::default();
+        let name = LedgerName::parse("mydb").unwrap();
+        let created = create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        let mut payload = crate::ConfigPayload::new();
+        payload
+            .extra
+            .insert("retention".into(), serde_json::json!("x".repeat(8192)));
+        let config = ConfigValue::new(1, Some(payload));
+        let current = store.get_config("mydb:main").await.unwrap();
+        store
+            .push_config_fenced("mydb:main", created.fence, current.as_ref(), &config)
+            .await
+            .unwrap();
+
+        store.max_entry.store(4096, Ordering::SeqCst);
+        let err = drop_ledger(&store, &name, false).await.unwrap_err();
+        assert!(matches!(err, NameServiceError::TooLarge(_)), "{err}");
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.is_active());
+        assert!(!store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+        assert_eq!(store.get_config("mydb:main").await.unwrap(), Some(config));
+
+        let dropped = drop_ledger(&store, &name, true)
+            .await
+            .unwrap()
+            .expect("dropped");
+        assert!(dropped.entry.configs.is_none());
+    }
+
+    /// Configs that grow between a drop's size check and its freeze make an
+    /// entry the store cannot hold: the drop is undone, its branches thawed
+    /// and the ledger live, and a hard drop, which keeps no configs, then
+    /// goes through.
+    #[tokio::test]
+    async fn a_drop_whose_frozen_configs_outgrow_the_store_is_undone() {
+        use crate::ConfigLookup;
+        use std::sync::atomic::Ordering;
+        let store = TestStore {
+            enforce_max_entry: true,
+            ..TestStore::default()
+        };
+        let name = LedgerName::parse("mydb").unwrap();
+        create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        create_branch(&store, &name, "dev", "main", None)
+            .await
+            .unwrap();
+        store.max_entry.store(4096, Ordering::SeqCst);
+        store.grow_configs_on_claim.store(true, Ordering::SeqCst);
+
+        let err = drop_ledger(&store, &name, false).await.unwrap_err();
+        assert!(matches!(err, NameServiceError::TooLarge(_)), "{err}");
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.is_active());
+        for branch in ["mydb:main", "mydb:dev"] {
+            let record = store.raw_record(branch).await.unwrap().unwrap();
+            assert!(!record.frozen, "{branch}");
+            // It takes writes again.
+            let current = store.get_config(branch).await.unwrap().unwrap();
+            let next = ConfigValue::new(current.v + 1, current.payload.clone());
+            store
+                .push_config_fenced(branch, record.fence, Some(&current), &next)
+                .await
+                .unwrap();
+        }
+        assert!(store.list_dropped().await.unwrap().is_empty());
+
+        let dropped = drop_ledger(&store, &name, true)
+            .await
+            .unwrap()
+            .expect("dropped");
+        assert!(dropped.hard);
     }
 
     /// A drop or restore whose dropped-ledger entry the store cannot hold is

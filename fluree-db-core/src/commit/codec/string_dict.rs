@@ -111,6 +111,10 @@ impl StringDict {
         Ok(Self { entries })
     }
 
+    pub(crate) fn from_entries(entries: Vec<String>) -> Self {
+        Self { entries }
+    }
+
     /// Look up a string by local_id. Returns error for local_id 0 (reserved).
     pub fn get(&self, local_id: u32) -> Result<&str, CommitCodecError> {
         if local_id == 0 {

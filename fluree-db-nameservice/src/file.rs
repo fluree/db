@@ -34,8 +34,10 @@ use crate::migration::{
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
-    merge_heads, ns_context, parse_record, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION,
+    merge_heads, ns_context, parse_record, snapshot_index, IndexRef, NsFileV2, NsIndexFileV2,
+    NS_VERSION,
 };
+use crate::WriteBasis;
 use crate::{
     check_cas_expectation, deserialize_json, ref_values_match, serialize_json, AdminPublisher,
     CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
@@ -961,6 +963,19 @@ impl BranchRecordStore for FileNameService {
         .await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (main, index) = Self::record_keys(ledger_id)?;
+        ns_cas::thaw_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let (main, _) = Self::persisted_record_keys(ledger_id)?;
         ns_cas::delete_record(&self.storage, &main, fence).await
@@ -972,11 +987,13 @@ impl crate::BranchLifecycle for FileNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
+        let index = snapshot_index(&snapshot);
 
         let outcome = self
             .storage
@@ -995,10 +1012,25 @@ impl crate::BranchLifecycle for FileNameService {
             .await?;
 
         match outcome {
-            CasOutcome::Written => Ok(()),
-            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
-            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
+            CasOutcome::Written => {}
+            CasOutcome::Aborted(true) => return Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => return Err(NameServiceError::not_found(ledger_id)),
         }
+
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        let index_address = Self::index_address(&ledger_name, &branch);
+        self.storage
+            .compare_and_swap(&index_address, move |bytes| {
+                let Some(data) = bytes else {
+                    return Ok(CasAction::Abort(()));
+                };
+                let mut file: NsIndexFileV2 = deserialize_json(data)?;
+                file.index = index.clone();
+                Ok(CasAction::Write(serialize_json(&file)?))
+            })
+            .await?;
+        Ok(())
     }
 
     async fn pending_commit_cids(
@@ -1101,10 +1133,11 @@ impl CommitPublisher for FileNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
         let cid_str = commit_id.to_string();
@@ -1183,10 +1216,11 @@ impl IndexPublisher for FileNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let address = Self::index_address(&ledger_name, &branch);
@@ -1233,10 +1267,11 @@ impl AdminPublisher for FileNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let address = Self::index_address(&ledger_name, &branch);
@@ -1278,6 +1313,29 @@ impl AdminPublisher for FileNameService {
             }
         })
         .await
+    }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let address = Self::index_address(&ledger_name, &branch);
+        let outcome = self
+            .storage
+            .compare_and_swap(&address, move |bytes| {
+                let Some(data) = bytes else {
+                    return Ok(CasAction::Abort(false));
+                };
+                let mut file: NsIndexFileV2 = deserialize_json(data)?;
+                if !file.frozen {
+                    return Ok(CasAction::Abort(false));
+                }
+                file.index = IndexRef { cid: None, t: 0 };
+                Ok(CasAction::Write(serialize_json(&file)?))
+            })
+            .await?;
+        Ok(match outcome {
+            CasOutcome::Aborted(cleared) => cleared,
+            _ => true,
+        })
     }
 }
 
@@ -1341,6 +1399,7 @@ impl GraphSourcePublisher for FileNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let address = Self::index_address(name, branch);
         let cid_str = index_id.to_string();
@@ -1401,6 +1460,39 @@ impl GraphSourcePublisher for FileNameService {
             fluree_db_core::StorageWrite::delete(&self.storage, &Self::index_address(name, branch))
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        _sources: &[(String, u64)],
+    ) -> Result<()> {
+        let address = Self::index_address(name, branch);
+        let cid_str = index_id.to_string();
+        let id = format_ledger_id(name, branch);
+        self.storage
+            .compare_and_swap(&address, move |bytes| {
+                if let Some(data) = bytes {
+                    let existing: GraphSourceIndexFileV2WithT = deserialize_json(data)?;
+                    if index_t < existing.index_t {
+                        return Ok(CasAction::Abort(()));
+                    }
+                }
+                let file = GraphSourceIndexFileV2WithT {
+                    context: ns_context(),
+                    id: id.clone(),
+                    index: GraphSourceIndexRef {
+                        cid: cid_str.clone(),
+                    },
+                    index_t,
+                };
+                Ok(CasAction::Write(serialize_json(&file)?))
+            })
+            .await?;
         Ok(())
     }
 }
@@ -1541,11 +1633,12 @@ impl RefPublisher for FileNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let expected_clone = expected.cloned();
         let new_clone = new.clone();
@@ -1851,6 +1944,14 @@ mod lifecycle_conformance {
 }
 
 #[cfg(test)]
+mod purge_conformance {
+    crate::purge_conformance_tests!({
+        let dir = tempfile::tempdir().unwrap();
+        (super::FileNameService::new(dir.path()), dir)
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::CurrentFence;
@@ -2044,7 +2145,7 @@ mod tests {
         assert_eq!(
             ns.compare_and_set_ref_fenced(
                 "mydb:main",
-                record.fence,
+                record.write_basis(),
                 crate::RefKind::CommitHead,
                 current.as_ref(),
                 &head
@@ -2344,7 +2445,7 @@ mod tests {
         .unwrap();
 
         let index = ContentId::new(ContentKind::IndexRoot, b"index");
-        ns.publish_index_fenced("mydb:main", record.fence, 5, &index)
+        ns.publish_index_fenced("mydb:main", record.write_basis(), 5, &index)
             .await
             .unwrap();
         let after = ns.lookup("mydb:main").await.unwrap().unwrap();
@@ -2539,7 +2640,7 @@ mod tests {
 
         // Publish graph source index
         let gs_index_cid = ContentId::new(ContentKind::IndexRoot, b"gs-index-1");
-        ns.publish_graph_source_index("my-gs", "main", &gs_index_cid, 42)
+        ns.publish_graph_source_index("my-gs", "main", &gs_index_cid, 42, &[])
             .await
             .unwrap();
 
@@ -2565,12 +2666,12 @@ mod tests {
         let gs_cid_old = ContentId::new(ContentKind::IndexRoot, b"index-old");
         let gs_cid_same = ContentId::new(ContentKind::IndexRoot, b"index-same");
 
-        ns.publish_graph_source_index("gs", "main", &gs_cid_v1, 10)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_v1, 10, &[])
             .await
             .unwrap();
 
         // Higher t should update
-        ns.publish_graph_source_index("gs", "main", &gs_cid_v2, 20)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_v2, 20, &[])
             .await
             .unwrap();
 
@@ -2579,7 +2680,7 @@ mod tests {
         assert_eq!(record.index_t, 20);
 
         // Lower t should be ignored (monotonic rule)
-        ns.publish_graph_source_index("gs", "main", &gs_cid_old, 15)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_old, 15, &[])
             .await
             .unwrap();
 
@@ -2588,7 +2689,7 @@ mod tests {
         assert_eq!(record.index_t, 20);
 
         // Equal t should also be ignored
-        ns.publish_graph_source_index("gs", "main", &gs_cid_same, 20)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_same, 20, &[])
             .await
             .unwrap();
 
@@ -2726,7 +2827,7 @@ mod tests {
 
         // Publish index
         let gs_idx_cid = ContentId::new(ContentKind::IndexRoot, b"gs-index-1");
-        ns.publish_graph_source_index("gs", "main", &gs_idx_cid, 10)
+        ns.publish_graph_source_index("gs", "main", &gs_idx_cid, 10, &[])
             .await
             .unwrap();
 

@@ -671,6 +671,13 @@ impl LedgerHandle {
         Self::new(ledger_id, state, None)
     }
 
+    /// A clone of the cached state, taken under a brief read lock. Mid-commit
+    /// repairs can leave a genesis placeholder showing for a moment, so a
+    /// caller checks the head it gets.
+    pub async fn clone_state(&self) -> LedgerState {
+        self.inner.state.read().await.clone()
+    }
+
     /// Get read-only snapshot for queries (brief lock, clone, release)
     ///
     /// IMPORTANT: Queries must NOT execute while holding the internal lock.
@@ -1368,12 +1375,8 @@ pub(crate) async fn load_and_attach_binary_store(
     root: Option<DecodedIndexRoot<IndexRoot>>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
     let record = match state.ns_record.as_ref() {
-        Some(r) => r,
-        None => return Ok(None),
-    };
-    let index_cid = match record.index_head_id.as_ref() {
-        Some(cid) => cid.clone(),
-        None => return Ok(None),
+        Some(r) if r.index_head_id.is_some() => r,
+        _ => return Ok(None),
     };
 
     // Branch-aware store: walks branch ancestry on read miss so a fresh
@@ -1384,6 +1387,27 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
+    attach_binary_store_from(cs, state, leaflet_cache, prev, root).await
+}
+
+/// [`load_and_attach_binary_store`] reading through `cs`, a store already
+/// built for the state's branch: one not yet visible to lookups, as during a
+/// restore.
+pub(crate) async fn attach_binary_store_from(
+    cs: Arc<dyn ContentStore>,
+    state: &mut LedgerState,
+    leaflet_cache: Option<Arc<LeafletCache>>,
+    prev: Option<&BinaryIndexStore>,
+    root: Option<DecodedIndexRoot<IndexRoot>>,
+) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
+    let record = match state.ns_record.as_ref() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let index_cid = match record.index_head_id.as_ref() {
+        Some(cid) => cid.clone(),
+        None => return Ok(None),
+    };
     let root = match root {
         Some((id, root)) if id == index_cid => root,
         _ => {
@@ -2632,8 +2656,9 @@ impl UpdatePlan {
 /// storage root, so another ledger under the name, or, where both carry one,
 /// another fence, so the same ledger dropped and restored. Heads of two
 /// activations are not comparable. A side that carries neither is taken to
-/// match.
-fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
+/// match. Another erasure generation counts too: the history the cached
+/// state was loaded with has since been erased, and its writes are refused.
+pub(crate) fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
     let Some(cached) = cached else {
         return false;
     };
@@ -2642,7 +2667,7 @@ fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
         (Some(a), Some(b)) if a != b
     );
     let fences = matches!((cached.fence, record.fence), (Some(a), Some(b)) if a != b);
-    roots || fences
+    roots || fences || cached.erasure_generation != record.erasure_generation
 }
 
 /// Input for notify: ledger ID + optional fresh NsRecord
@@ -3263,6 +3288,8 @@ mod tests {
             storage_root: None,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
+            config_version: None,
         }
     }
 

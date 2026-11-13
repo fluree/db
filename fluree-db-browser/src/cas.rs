@@ -105,6 +105,9 @@ struct Inner {
     budget_wait: Duration,
     register: MissRegister,
     counters: Counters,
+    /// Bumped by [`BrowserCasStorage::invalidate`]: a read begun before it
+    /// keeps nothing it brings.
+    epoch: AtomicU64,
 }
 
 /// Engine-facing storage for a browser peer. Cheap to clone; clones share
@@ -143,7 +146,22 @@ impl BrowserCasStorage {
                 budget_wait: config.budget_wait,
                 register: MissRegister::new(),
                 counters: Counters::default(),
+                epoch: AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// Hold no block from here on, in memory or in the persistent cache:
+    /// a ledger's stored history changed in place (an erasure published, or
+    /// a purge rewrote its index), and blocks are cached under CIDs that do
+    /// not change with it. A read already under way serves its caller what
+    /// it brings and keeps none of it.
+    pub async fn invalidate(&self) {
+        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        self.inner.residency.invalidate();
+        let (reply, done) = oneshot::channel();
+        if self.inner.io.send(IoJob::CacheClear { reply }).is_ok() {
+            let _ = done.await;
         }
     }
 
@@ -203,7 +221,7 @@ impl BrowserCasStorage {
             self.storage_method(),
             kind,
             namespace,
-            &cid.digest_hex(),
+            &cid.address_digest(),
         ))
     }
 
@@ -372,6 +390,7 @@ impl BrowserCasStorage {
     }
 
     async fn fetch_into_residency(&self, cid: &ContentId, address: &str) -> Result<Arc<[u8]>> {
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
         if self.inner.cache_enabled {
             if let Some(bytes) = self.cache_get(cid).await {
                 self.inner
@@ -380,7 +399,7 @@ impl BrowserCasStorage {
                     .fetch_add(1, Ordering::Relaxed);
                 let resident: Arc<[u8]> = Arc::from(&bytes[..]);
                 drop(bytes);
-                return self.make_resident(cid, resident, None).await;
+                return self.make_resident(cid, resident, None, epoch).await;
             }
         }
 
@@ -414,7 +433,7 @@ impl BrowserCasStorage {
 
         let resident: Arc<[u8]> = Arc::from(&bytes[..]);
         drop(bytes);
-        self.make_resident(cid, resident, permit).await
+        self.make_resident(cid, resident, permit, epoch).await
     }
 
     /// Insert verified bytes into the residency tier and, for network
@@ -427,7 +446,12 @@ impl BrowserCasStorage {
         cid: &ContentId,
         bytes: Arc<[u8]>,
         permit: Option<WriteBehindPermit>,
+        epoch: u64,
     ) -> Result<Arc<[u8]>> {
+        // Read before an invalidation: served, not kept.
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch {
+            return Ok(bytes);
+        }
         if let Some(permit) = permit {
             // Driver gone → nothing to persist to (the dropped permit
             // credits the gauge); not a read failure.
@@ -701,6 +725,8 @@ pub(crate) mod tests {
         pub sse_script: std::collections::VecDeque<Vec<Vec<u8>>>,
         /// Every SSE connect observed: `(url, headers)`.
         pub sse_log: Vec<(String, Vec<(&'static str, String)>)>,
+        /// Persistent-cache clears observed.
+        pub clears: usize,
     }
 
     fn cid_from_url(url: &str) -> String {
@@ -812,6 +838,12 @@ pub(crate) mod tests {
                             drop(permit);
                         });
                     }
+                    IoJob::CacheClear { reply } => {
+                        let mut s = state.lock().unwrap();
+                        s.cache.clear();
+                        s.clears += 1;
+                        let _ = reply.send(());
+                    }
                     IoJob::Shutdown => break,
                 }
             }
@@ -825,7 +857,7 @@ pub(crate) mod tests {
             "proxy",
             ContentKind::IndexLeaf,
             &ledger_namespace(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
         (id, address, bytes)
     }
@@ -853,6 +885,49 @@ pub(crate) mod tests {
             residency_budget_bytes: 1024,
             ..Default::default()
         }
+    }
+
+    /// A refresh drops every block held, in memory and in the persistent
+    /// cache: a ledger's history changed in place under CIDs that stay. A
+    /// read under way across it serves its caller and keeps nothing.
+    #[tokio::test]
+    async fn invalidating_drops_held_blocks_and_what_reads_under_way_bring() {
+        let (id, address, bytes) = object(1, 16);
+        let (late, late_address, late_bytes) = object(2, 16);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.objects.insert(id.to_string(), (200, bytes.clone()));
+            s.objects
+                .insert(late.to_string(), (200, late_bytes.clone()));
+        }
+        let (storage, io, driver) = storage_with(&state, &config());
+
+        assert_eq!(storage.read_bytes(&address).await.unwrap(), bytes);
+        assert_eq!(storage.read_bytes(&address).await.unwrap(), bytes);
+        assert_eq!(state.lock().unwrap().fetch_log.len(), 1);
+        storage.invalidate().await;
+        assert!(!storage.residency().contains(&id));
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.clears, 1);
+            assert!(s.cache.is_empty());
+        }
+        assert_eq!(storage.read_bytes(&address).await.unwrap(), bytes);
+        assert_eq!(state.lock().unwrap().fetch_log.len(), 2);
+
+        state.lock().unwrap().hold = Some(Duration::from_millis(200));
+        let reading = tokio::spawn({
+            let storage = storage.clone();
+            async move { storage.read_bytes(&late_address).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        storage.invalidate().await;
+        assert_eq!(reading.await.unwrap().unwrap(), late_bytes);
+        assert!(!storage.residency().contains(&late));
+        assert!(!state.lock().unwrap().puts.contains(&late.to_string()));
+        io.shutdown();
+        driver.await.expect("driver exits");
     }
 
     #[tokio::test]
@@ -1038,8 +1113,10 @@ pub(crate) mod tests {
         driver.await.unwrap();
     }
 
+    /// An object the server refuses reads as not found, and is not thereby
+    /// absent: whether it exists is not known.
     #[tokio::test]
-    async fn forbidden_maps_to_not_found_and_exists_is_false() {
+    async fn forbidden_maps_to_not_found_and_exists_is_unknown() {
         let (id, address, _bytes) = object(6, 8);
         let state = Arc::new(Mutex::new(MockState::default()));
         state
@@ -1050,7 +1127,11 @@ pub(crate) mod tests {
         let (storage, io, driver) = storage_with(&state, &config());
         let err = storage.read_bytes(&address).await.expect_err("403");
         assert!(matches!(err, CoreError::NotFound(_)), "got {err:?}");
-        assert!(!storage.exists(&address).await.unwrap());
+        let unknown = storage.exists(&address).await.expect_err("unknown");
+        assert!(
+            !matches!(unknown, CoreError::NotFound(_)),
+            "got {unknown:?}"
+        );
         // Coalesced waiters see the same NotFound class.
         io.shutdown();
         driver.await.unwrap();

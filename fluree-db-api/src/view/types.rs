@@ -122,6 +122,12 @@ pub struct GraphDb {
     /// ([`LedgerState::instance_bits`]), which tells a ledger from one
     /// dropped before it under the same name; `0` when unknown.
     pub(crate) instance_bits: u128,
+    /// The fence of the branch record the view was loaded from: which
+    /// incarnation of the branch it reads.
+    pub(crate) fence: Option<fluree_db_nameservice::Fence>,
+    /// That record's erasure generation: which erasures the view reads
+    /// with. An index built from the view presents it.
+    pub(crate) erasure_generation: u64,
 
     /// Graph ID within the ledger (0 = default graph).
     ///
@@ -259,6 +265,10 @@ pub struct GraphDb {
     /// drops `graph_source_id`), because the view's own id still names the
     /// graph source: see [`Self::member_kind`].
     pub(crate) over_graph_source: bool,
+    /// A view of an earlier point than its ledger's head: built from a
+    /// historical snapshot, or moved back with [`Self::as_of`]. Retention
+    /// checks such reads; a head view is current state.
+    pub(crate) historical: bool,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -280,6 +290,18 @@ impl std::fmt::Debug for GraphDb {
 // ============================================================================
 // Constructors
 // ============================================================================
+
+/// The fence of `state`'s branch record, when that record is the branch's
+/// own: a state built from another branch (a rebase replays onto its
+/// source's) carries the other branch's record.
+fn own_basis(state: &LedgerState) -> fluree_db_nameservice::WriteBasis {
+    state
+        .ns_record
+        .as_ref()
+        .filter(|record| record.ledger_id.as_str() == state.ledger_id())
+        .map(fluree_db_nameservice::NsRecord::write_basis)
+        .unwrap_or_default()
+}
 
 impl GraphDb {
     /// Create a base view from components.
@@ -308,6 +330,8 @@ impl GraphDb {
             t,
             ledger_id: ledger_id.into(),
             instance_bits: 0,
+            fence: None,
+            erasure_generation: 0,
             graph_id: 0,
             policy: None,
             policy_enforcer: None,
@@ -330,6 +354,7 @@ impl GraphDb {
             graph_source_id: None,
             graph_source_time: None,
             over_graph_source: false,
+            historical: false,
         }
     }
 
@@ -355,6 +380,9 @@ impl GraphDb {
             ledger.ledger_id(),
         );
         gdb.instance_bits = ledger.instance_bits();
+        let basis = own_basis(ledger);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
         // Extract binary_store from LedgerState's TypeErasedStore
@@ -392,7 +420,10 @@ impl GraphDb {
             view.snapshot.ledger_id.as_str(),
         );
         gdb.instance_bits = view.instance_bits();
+        gdb.fence = view.fence();
+        gdb.erasure_generation = view.erasure_generation();
         gdb.runtime_small_dicts = view.runtime_small_dicts().cloned();
+        gdb.historical = true;
         gdb
     }
 }
@@ -488,6 +519,9 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
+        let basis = own_basis(base);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.dict_novelty = Some(dict_novelty);
         gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
@@ -522,6 +556,9 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
+        let basis = own_basis(base);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.runtime_small_dicts = Some(base.runtime_small_dicts.clone());
         // Carry binary store from the base ledger state
         gdb.binary_store = base
@@ -552,6 +589,9 @@ impl GraphDb {
     pub fn as_of(mut self, t: i64) -> Self {
         if self.t != t {
             self.clear_config_resolution();
+        }
+        if t < self.t {
+            self.historical = true;
         }
         self.t = t;
         self

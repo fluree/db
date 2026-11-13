@@ -27,6 +27,7 @@ use fluree_db_core::pack::{
 // don't need fluree-db-core as a direct dependency.
 use fluree_db_core::commit::codec::envelope::decode_envelope;
 use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
+use fluree_db_core::commit::codec::read_commit_envelope;
 pub use fluree_db_core::pack::PackRequest;
 use fluree_db_core::{ContentId, ContentStore};
 use std::collections::HashSet;
@@ -56,6 +57,53 @@ pub struct PackStreamResult {
     pub txn_blobs_sent: usize,
     /// Number of index artifact data frames sent.
     pub index_artifacts_sent: usize,
+    /// Number of permanently erased commits sent as their erasures.
+    pub erased_commits_sent: usize,
+    /// Number of files those erasures needed (replacements, receipts,
+    /// control commits).
+    pub erasure_artifacts_sent: usize,
+}
+
+#[cfg(feature = "native")]
+use crate::retention::erasure::transfer::Sender as Erasures;
+
+/// Without file storage nothing is erased.
+#[cfg(not(feature = "native"))]
+struct Erasures;
+
+#[cfg(not(feature = "native"))]
+impl Erasures {
+    async fn of(
+        _: &crate::Fluree,
+        _: &str,
+        _: &dyn ContentStore,
+        _: &[ContentId],
+        _: &[ContentId],
+        _: &[String],
+    ) -> Result<Self> {
+        Ok(Erasures)
+    }
+    fn history_erased(&self) -> bool {
+        false
+    }
+    fn positions(&self) -> usize {
+        0
+    }
+    fn count(&self) -> usize {
+        0
+    }
+    async fn held_frames(&mut self) -> Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
+    }
+    fn artifacts_sent(&self) -> usize {
+        0
+    }
+    fn refuse(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn frames(&mut self, _: &ContentId) -> Result<Option<Vec<Vec<u8>>>> {
+        Ok(None)
+    }
 }
 
 // ============================================================================
@@ -65,16 +113,16 @@ pub struct PackStreamResult {
 /// Walk backward from each `want` CID until hitting a `have` CID or genesis.
 ///
 /// Returns commit CIDs in oldest-first (topo) order, deduplicated. When
-/// multiple `want` heads are provided, they are sorted by `digest_hex()`
+/// multiple `want` heads are provided, they are sorted by `address_digest()`
 /// before walking for deterministic output.
-pub async fn compute_missing_commits<C: ContentStore>(
+pub async fn compute_missing_commits<C: ContentStore + ?Sized>(
     store: &C,
     want: &[ContentId],
     have: &HashSet<ContentId>,
 ) -> Result<Vec<ContentId>> {
     // Sort want heads by digest for deterministic ordering.
     let mut sorted_wants: Vec<&ContentId> = want.iter().collect();
-    sorted_wants.sort_by_key(|a| a.digest_hex());
+    sorted_wants.sort_by_key(|a| a.address_digest());
 
     let mut result = Vec::new();
     let mut seen = HashSet::new();
@@ -90,23 +138,12 @@ pub async fn compute_missing_commits<C: ContentStore>(
             }
             seen.insert(current_id.clone());
 
-            // Load envelope metadata only (no flake decompression).
+            // Load envelope metadata only (no flake decompression); an
+            // erased commit reads as its replacement, which keeps it.
             let raw_bytes = store.get(&current_id).await.map_err(|e| {
                 ApiError::internal(format!("failed to read commit {current_id}: {e}"))
             })?;
-
-            let header = CommitHeader::read_from(&raw_bytes).map_err(|e| {
-                ApiError::internal(format!("invalid commit header for {current_id}: {e}"))
-            })?;
-
-            let envelope_start = HEADER_LEN;
-            let envelope_end = envelope_start + header.envelope_len as usize;
-            if envelope_end > raw_bytes.len() {
-                return Err(ApiError::internal(format!(
-                    "commit envelope extends past blob for {current_id}"
-                )));
-            }
-            let env = decode_envelope(&raw_bytes[envelope_start..envelope_end]).map_err(|e| {
+            let env = read_commit_envelope(&raw_bytes).map_err(|e| {
                 ApiError::internal(format!("failed to decode envelope for {current_id}: {e}"))
             })?;
 
@@ -259,7 +296,38 @@ pub async fn stream_pack(
     request: &PackRequest,
     frame_tx: mpsc::Sender<PackChunk>,
 ) -> PackStreamResult {
-    let result = stream_pack_inner(fluree, handle, request, &frame_tx).await;
+    // The journal travels with the commits, so the copy serves no history
+    // its source no longer serves.
+    let journal = match async {
+        fluree.ensure_read_ready(handle.id()).await?;
+        fluree.retention_archive_section(handle.id()).await
+    }
+    .await
+    {
+        Ok(journal) => journal,
+        Err(e) => {
+            let mut buf = Vec::new();
+            encode_error_frame(&e.to_string(), &mut buf);
+            encode_end_frame(&mut buf);
+            let _ = frame_tx.send(Ok(buf)).await;
+            return PackStreamResult {
+                commits_sent: 0,
+                txn_blobs_sent: 0,
+                index_artifacts_sent: 0,
+                erased_commits_sent: 0,
+                erasure_artifacts_sent: 0,
+            };
+        }
+    };
+    let result = stream_pack_inner(
+        fluree,
+        handle,
+        request,
+        request.erasures,
+        journal,
+        &frame_tx,
+    )
+    .await;
 
     match result {
         Ok(stats) => {
@@ -280,6 +348,8 @@ pub async fn stream_pack(
                 commits_sent: 0,
                 txn_blobs_sent: 0,
                 index_artifacts_sent: 0,
+                erased_commits_sent: 0,
+                erasure_artifacts_sent: 0,
             }
         }
     }
@@ -296,7 +366,9 @@ pub async fn stream_pack(
 /// `nameservice_manifest` should be a JSON object containing at least
 /// `phase: "nameservice"`, `ledger_id`, `name`, `branch`, `commit_head_id`,
 /// and `commit_t`. `index_head_id` / `index_t` should only be included when
-/// the archive actually carries those artifacts.
+/// the archive actually carries those artifacts; they are dropped when the
+/// history holds a permanently erased commit, which an index may still hold
+/// a value of.
 ///
 /// Unlike [`stream_pack`], on producer failure this **does not** emit an
 /// Error frame followed by End. Instead it drops the sender and returns
@@ -307,13 +379,19 @@ pub async fn stream_archive(
     fluree: &crate::Fluree,
     handle: &LedgerHandle,
     request: &PackRequest,
-    nameservice_manifest: serde_json::Value,
+    mut nameservice_manifest: serde_json::Value,
     frame_tx: mpsc::Sender<PackChunk>,
 ) -> std::result::Result<PackStreamResult, String> {
-    let result = stream_pack_inner(fluree, handle, request, &frame_tx).await;
+    let result = stream_pack_inner(fluree, handle, request, true, None, &frame_tx).await;
 
     match result {
         Ok(stats) => {
+            if stats.erased_commits_sent > 0 {
+                if let Some(manifest) = nameservice_manifest.as_object_mut() {
+                    manifest.remove("index_head_id");
+                    manifest.remove("index_t");
+                }
+            }
             // Ship the default-context blob (if the archive carries one) as a
             // data frame before the nameservice manifest, so the importer can
             // restore the ledger's stored default JSON-LD context. The blob is
@@ -367,10 +445,15 @@ pub async fn stream_archive(
     }
 }
 
+/// `send_erasures`: erased commits travel as their erasures; otherwise a
+/// history holding one is refused. `journal`, the ledger's retention
+/// section, follows the header as a `phase: "retention"` manifest.
 async fn stream_pack_inner(
     fluree: &crate::Fluree,
     handle: &LedgerHandle,
     request: &PackRequest,
+    send_erasures: bool,
+    journal: Option<serde_json::Value>,
     frame_tx: &mpsc::Sender<PackChunk>,
 ) -> std::result::Result<PackStreamResult, String> {
     // Guard against silent empty packs and protocol mismatches from
@@ -409,8 +492,26 @@ async fn stream_pack_inner(
         "pack: computed missing commits"
     );
 
+    let mut erasures = Erasures::of(
+        fluree,
+        ledger_id,
+        content_store.as_ref(),
+        &request.want,
+        &missing_commits,
+        &request.held_erasures,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !send_erasures {
+        erasures.refuse().map_err(|e| e.to_string())?;
+    }
+
     // --- Compute missing index artifacts (if requested) ---
-    let include_indexes = request.include_indexes && request.want_index_root_id.is_some();
+    // An index built before a purge may hold an erased value: none travels
+    // with erased history, though the receiver has the erased commits.
+    let include_indexes = request.include_indexes
+        && request.want_index_root_id.is_some()
+        && !erasures.history_erased();
     let missing_artifacts = if include_indexes {
         let want_root_id = request.want_index_root_id.as_ref().unwrap();
         let artifacts = compute_missing_index_artifacts(
@@ -433,25 +534,42 @@ async fn stream_pack_inner(
     };
 
     // --- Build and send header ---
-    let header = if let Some(ref artifacts) = missing_artifacts {
+    let sent_as_data = (missing_commits.len() - erasures.positions()) as u32;
+    let mut header = if let Some(ref artifacts) = missing_artifacts {
         let estimated = estimate_pack_bytes(missing_commits.len() as u32);
         PackHeader::with_indexes(
-            Some(missing_commits.len() as u32),
+            Some(sent_as_data),
             Some(artifacts.len() as u32),
             estimated,
             request.include_txns,
         )
     } else {
-        PackHeader::commits_only(Some(missing_commits.len() as u32), request.include_txns)
+        PackHeader::commits_only(Some(sent_as_data), request.include_txns)
     };
+    if erasures.count() > 0 {
+        header.capabilities.push("erasures".to_string());
+        header.erased_commit_count = Some(erasures.count() as u32);
+    }
 
     let mut preamble_buf = Vec::with_capacity(256);
     write_stream_preamble(&mut preamble_buf);
     encode_header_frame(&header, &mut preamble_buf);
+    if let Some(mut journal) = journal {
+        journal["phase"] = serde_json::Value::from("retention");
+        encode_manifest_frame(&journal, &mut preamble_buf);
+    }
     frame_tx
         .send(Ok(preamble_buf))
         .await
         .map_err(|_| "client disconnected".to_string())?;
+
+    // Erasures of commits the receiver has, before any commit it lacks.
+    for frame in erasures.held_frames().await.map_err(|e| e.to_string())? {
+        frame_tx
+            .send(Ok(frame))
+            .await
+            .map_err(|_| "client disconnected".to_string())?;
+    }
 
     // --- Stream commit + txn data frames ---
     let mut commits_sent = 0;
@@ -459,6 +577,20 @@ async fn stream_pack_inner(
     let mut txn_cids_sent = HashSet::new();
 
     for commit_cid in &missing_commits {
+        if let Some(frames) = erasures
+            .frames(commit_cid)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            for frame in frames {
+                frame_tx
+                    .send(Ok(frame))
+                    .await
+                    .map_err(|_| "client disconnected".to_string())?;
+            }
+            continue;
+        }
+
         // Read raw commit bytes.
         let raw_bytes = content_store
             .get(commit_cid)
@@ -557,6 +689,8 @@ async fn stream_pack_inner(
         commits_sent,
         txn_blobs_sent,
         index_artifacts_sent,
+        erased_commits_sent: erasures.count(),
+        erasure_artifacts_sent: erasures.artifacts_sent(),
     })
 }
 

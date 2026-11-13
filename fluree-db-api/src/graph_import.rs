@@ -54,9 +54,9 @@ pub(crate) struct GraphImportSeed {
     /// The ledger's head, which the import's first commit chains onto.
     pub head_t: i64,
     pub head_commit: ContentId,
-    /// Where the ledger's artifacts live, and the fence its writes present.
+    /// Where the ledger's artifacts live, and the basis its writes present.
     pub namespace: fluree_db_core::StorageNamespace,
-    pub fence: Option<fluree_db_nameservice::Fence>,
+    pub basis: fluree_db_nameservice::WriteBasis,
     /// The ledger's namespaces at the head.
     pub ns_registry: NamespaceRegistry,
     /// The published index root, at `head_t`, and its id.
@@ -558,7 +558,7 @@ pub fn graph_import_target(ledger_id: &str, graph_iri: &str) -> Result<String, I
 async fn index_to_head(
     fluree: &Fluree,
     ledger_id: &str,
-    fence: Option<fluree_db_nameservice::Fence>,
+    basis: fluree_db_nameservice::WriteBasis,
 ) -> Result<(), ImportError> {
     let indexed = fluree
         .build_index(ledger_id)
@@ -566,7 +566,7 @@ async fn index_to_head(
         .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
     fluree
         .publisher()?
-        .publish_index_allow_equal_fenced(ledger_id, fence, indexed.index_t, &indexed.root_id)
+        .publish_index_allow_equal_fenced(ledger_id, basis, indexed.index_t, &indexed.root_id)
         .await
         .map_err(|e| ImportError::Api(e.into()))?;
     Ok(())
@@ -622,22 +622,17 @@ where
                     commit_t = record.commit_t,
                     "indexing the ledger to its head before the graph import"
                 );
-                index_to_head(fluree, &alias, record.fence).await?;
+                index_to_head(fluree, &alias, record.write_basis()).await?;
             }
         }
     }
 
-    // Hold the ledger: no background build, no write, until both heads move.
-    let _maintenance = match &fluree.indexing_mode {
-        IndexingMode::Background(handle) => {
-            Some(handle.hold_quiesced(&ledger).await.ok_or_else(|| {
-                ImportError::Api(ApiError::BranchConflict(format!(
-                    "another maintenance operation holds {alias}; retry when it completes"
-                )))
-            })?)
-        }
-        IndexingMode::Disabled => None,
-    };
+    // Hold the ledger: no index build, no write, until both heads move. Its
+    // indexers' holds also keep a purge's index erasure and sweep out.
+    let _maintenance = fluree
+        .hold_indexers(&ledger)
+        .await
+        .map_err(ImportError::Api)?;
     let handle = match &fluree.ledger_manager {
         Some(_) => Some(fluree.ledger_cached(&alias).await?),
         None => None,
@@ -648,6 +643,13 @@ where
     };
 
     let record = lookup(fluree, &ledger).await?;
+    // Garbage collection stays out of the ledger's storage until the commit
+    // head names the commits the import stores, as for a pull: until then
+    // they are files no branch references.
+    let _uncollected = match storage.blob_pins() {
+        Some(pins) => Some(pins.hold_root(record.storage_namespace().root()).await),
+        None => None,
+    };
     let (Some(head_commit), Some(base_root_id)) =
         (record.commit_head_id.clone(), record.index_head_id.clone())
     else {
@@ -735,7 +737,7 @@ where
     match publisher
         .compare_and_set_ref_fenced(
             &alias,
-            seed.fence,
+            seed.basis.clone(),
             fluree_db_nameservice::RefKind::CommitHead,
             Some(&expected),
             &new_head,
@@ -757,7 +759,7 @@ where
     // covers them; the cached handle keeps the state it had, which the next
     // write reconciles on losing its commit-head CAS.
     publisher
-        .publish_index_fenced(&alias, seed.fence, result.index_t, &root_id)
+        .publish_index_fenced(&alias, seed.basis.clone(), result.index_t, &root_id)
         .await
         .map_err(|e| ImportError::PublishedWithoutIndex {
             t: result.t,
@@ -905,7 +907,7 @@ async fn load_seed(
         head_t: record.commit_t,
         head_commit,
         namespace: record.storage_namespace(),
-        fence: record.fence,
+        basis: record.write_basis(),
         ns_registry,
         base_root,
         base_root_id,
@@ -940,4 +942,148 @@ async fn load_state(
         .await?;
     }
     Ok(state)
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+
+    use crate::import::{ImportError, ImportPhase};
+    use crate::{Fluree, FlureeBuilder};
+
+    const GRAPH: &str = "http://example.org/graph/imported";
+
+    fn source(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("data.ttl");
+        std::fs::write(
+            &path,
+            "@prefix ex: <http://example.org/> .\nex:b ex:name \"B\" .\nex:c ex:name \"C\" .\n",
+        )
+        .unwrap();
+        path
+    }
+
+    /// A locked file instance, which collects its storage's garbage, with
+    /// `t/full` (one commit) and `t/empty` (none).
+    async fn collecting(dir: &tempfile::TempDir) -> Fluree {
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        fluree.create_ledger("t/full").await.unwrap();
+        fluree
+            .graph("t/full:main")
+            .transact()
+            .insert(&json!({"@id": "http://example.org/a", "http://example.org/name": "A"}))
+            .commit()
+            .await
+            .unwrap();
+        fluree.create_ledger("t/empty").await.unwrap();
+        fluree
+    }
+
+    /// While an import has stored commits that no published head names yet,
+    /// no collection pass can begin over the ledger's storage: one would find
+    /// them unreferenced and delete them under the head about to name them.
+    /// Into a graph of a ledger with commits, and into an empty ledger.
+    #[tokio::test]
+    async fn collection_stays_out_of_a_ledger_an_import_is_filling() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let fluree = collecting(&dir).await;
+        let pins = Arc::clone(fluree.blob_pins().expect("a locked instance collects"));
+        for (ledger, into_graph) in [("t/full:main", true), ("t/empty:main", false)] {
+            let root = fluree
+                .storage_namespace(ledger)
+                .await
+                .unwrap()
+                .root()
+                .clone();
+            let collectable = Arc::new(Mutex::new(Vec::new()));
+            let progress = {
+                let (collectable, pins, root) =
+                    (Arc::clone(&collectable), Arc::clone(&pins), root.clone());
+                move |phase: ImportPhase| {
+                    let storing = matches!(
+                        phase,
+                        ImportPhase::Committing { .. }
+                            | ImportPhase::PreparingIndex { .. }
+                            | ImportPhase::Indexing { .. }
+                    );
+                    if storing {
+                        let pass = pins.try_collect_root(&root);
+                        collectable.lock().unwrap().push(pass.is_some());
+                    }
+                }
+            };
+            let imported = if into_graph {
+                fluree
+                    .import_into_graph(ledger, GRAPH)
+                    .import(source(&files))
+                    .on_progress(progress)
+                    .execute()
+                    .await
+            } else {
+                fluree
+                    .create(ledger)
+                    .import(source(&files))
+                    .on_progress(progress)
+                    .execute()
+                    .await
+            };
+            imported.unwrap_or_else(|e| panic!("{ledger}: {e}"));
+            let collectable = collectable.lock().unwrap();
+            assert!(
+                !collectable.is_empty(),
+                "{ledger}: no progress while storing"
+            );
+            assert!(
+                collectable.iter().all(|c| !c),
+                "{ledger}: collection could begin mid-import: {collectable:?}"
+            );
+            assert!(
+                pins.try_collect_root(&root).is_some(),
+                "{ledger}: collection is let back in once the head is published"
+            );
+        }
+    }
+
+    /// A cluster member refuses either import before it stores anything:
+    /// its heads would move outside the cluster's write queue.
+    #[tokio::test]
+    async fn a_cluster_member_refuses_a_bulk_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let fluree = collecting(&dir).await;
+        fluree.set_collector(Arc::new(crate::garbage::tests::cluster::Cluster::default()));
+        let before = fluree.nameservice().lookup("t/full:main").await.unwrap();
+        for refused in [
+            fluree
+                .import_into_graph("t/full:main", GRAPH)
+                .import(source(&files))
+                .execute()
+                .await,
+            fluree
+                .create("t/empty:main")
+                .import(source(&files))
+                .execute()
+                .await,
+        ] {
+            match refused {
+                Err(ImportError::Refused(why)) => {
+                    assert!(why.contains("Raft cluster member"), "{why}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let after = fluree.nameservice().lookup("t/full:main").await.unwrap();
+        assert_eq!(
+            before.map(|r| (r.commit_t, r.commit_head_id)),
+            after.map(|r| (r.commit_t, r.commit_head_id))
+        );
+        let empty = fluree.nameservice().lookup("t/empty:main").await.unwrap();
+        assert_eq!(empty.map(|r| r.commit_t), Some(0));
+    }
 }

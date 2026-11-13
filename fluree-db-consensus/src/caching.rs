@@ -689,6 +689,19 @@ impl<C: Committer> CachingCommitter<C> {
             hasher.update((commit.len() as u64).to_le_bytes());
             hasher.update(commit);
         }
+        hasher.update((request.erasure_frames.len() as u64).to_le_bytes());
+        for frame in &request.erasure_frames {
+            hasher.update((frame.len() as u64).to_le_bytes());
+            hasher.update(frame);
+        }
+        for json in [
+            serde_json::to_vec(&request.base_erasures).unwrap_or_default(),
+            serde_json::to_vec(&request.retention).unwrap_or_default(),
+        ] {
+            hasher.update((json.len() as u64).to_le_bytes());
+            hasher.update(json);
+        }
+        hasher.update([u8::from(request.authority.erasures)]);
         hash_governance(&mut hasher, &request.governance);
         hasher.finalize().into()
     }
@@ -2952,6 +2965,12 @@ ex:alice ex:name "Alice" ."#;
             blobs: std::collections::HashMap::new(),
             merged_commits: Vec::new(),
             governance: GovernanceOptions::default(),
+            commit_ids: Vec::new(),
+            merged_commit_ids: Vec::new(),
+            erasure_frames: Vec::new(),
+            base_erasures: Vec::new(),
+            retention: None,
+            authority: Default::default(),
         }
     }
 

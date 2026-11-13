@@ -32,7 +32,13 @@ pub fn parse_server_sse_event(
     match event_type {
         "ns-record" => parse_ns_record(&event.data),
         "ns-retracted" => parse_ns_retracted(&event.data),
-        "snapshot-complete" => Ok(Some(RemoteEvent::SnapshotComplete)),
+        "ns-refresh" => parse_ns_refresh(&event.data),
+        // The generation is optional: an older server sends none.
+        "snapshot-complete" => Ok(Some(RemoteEvent::SnapshotComplete {
+            erasures: serde_json::from_str::<ErasuresEnvelope>(&event.data)
+                .ok()
+                .and_then(|e| e.erasures),
+        })),
         _ => Ok(None),
     }
 }
@@ -57,6 +63,20 @@ struct NsRetractedEnvelope {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct NsRefreshEnvelope {
+    kind: String,
+    resource_id: String,
+    #[serde(default)]
+    erasures: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ErasuresEnvelope {
+    #[serde(default)]
+    erasures: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct LedgerSseRecord {
     /// Canonical ledger alias, e.g. "books:main"
     ledger_id: String,
@@ -73,6 +93,8 @@ struct LedgerSseRecord {
     branches: u32,
     #[serde(default)]
     storage_root: Option<fluree_db_core::StorageRoot>,
+    #[serde(default)]
+    config_version: Option<i64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -137,6 +159,19 @@ fn parse_ns_retracted(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseE
     }
 }
 
+fn parse_ns_refresh(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseError> {
+    let payload: NsRefreshEnvelope = serde_json::from_str(data)?;
+    if payload.kind != SSE_KIND_LEDGER {
+        return Ok(None);
+    }
+    Ok(
+        parse_event_id(&payload.resource_id).map(|ledger_id| RemoteEvent::LedgerRefresh {
+            ledger_id,
+            erasures: payload.erasures,
+        }),
+    )
+}
+
 /// An id this peer cannot represent is one resource it cannot mirror, not a
 /// schema mismatch: skip the event rather than count it toward the
 /// consecutive-parse-error limit that tears the stream down.
@@ -169,6 +204,8 @@ fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRe
         storage_root: record.storage_root,
         fence: None,
         frozen: false,
+        erasure_generation: 0,
+        config_version: record.config_version,
     }
 }
 
@@ -195,6 +232,19 @@ fn gs_sse_to_graph_source_record(
 mod tests {
     use super::*;
     use fluree_sse::SseEvent;
+
+    #[test]
+    fn a_record_carries_a_config_revision_or_an_explicit_unknown() {
+        for revision in [None, Some(0), Some(9)] {
+            let mut value = serde_json::json!({"ledger_id":"test:main", "commit_t":1, "index_t":0, "retracted":false});
+            if let Some(v) = revision {
+                value["config_version"] = v.into();
+            }
+            let parsed: LedgerSseRecord = serde_json::from_value(value).unwrap();
+            let record = ledger_sse_to_ns_record(LedgerId::parse("test:main").unwrap(), parsed);
+            assert_eq!(record.config_version, revision);
+        }
+    }
 
     #[test]
     fn test_parse_ledger_ns_record_event() {
@@ -460,7 +510,35 @@ mod tests {
         };
         assert!(matches!(
             parse_server_sse_event(&event).unwrap(),
-            Some(RemoteEvent::SnapshotComplete)
+            Some(RemoteEvent::SnapshotComplete { erasures: None })
         ));
+        let event = fluree_sse::SseEvent {
+            data: r#"{"action": "snapshot-complete", "records": 3, "erasures": "g1"}"#.to_string(),
+            ..event
+        };
+        assert!(matches!(
+            parse_server_sse_event(&event).unwrap(),
+            Some(RemoteEvent::SnapshotComplete { erasures: Some(g) }) if g == "g1"
+        ));
+    }
+
+    #[test]
+    fn parse_ns_refresh() {
+        let event = fluree_sse::SseEvent {
+            event_type: Some("ns-refresh".to_string()),
+            data: r#"{"action": "ns-refresh", "kind": "ledger", "resource_id": "books:main", "erasures": "g2"}"#
+                .to_string(),
+            id: None,
+        };
+        match parse_server_sse_event(&event).unwrap() {
+            Some(RemoteEvent::LedgerRefresh {
+                ledger_id,
+                erasures,
+            }) => {
+                assert_eq!(ledger_id.as_str(), "books:main");
+                assert_eq!(erasures.as_deref(), Some("g2"));
+            }
+            other => panic!("expected a refresh: {other:?}"),
+        }
     }
 }

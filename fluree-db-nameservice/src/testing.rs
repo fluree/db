@@ -8,6 +8,7 @@
 
 use crate::lifecycle::{self, LifecycleStore};
 use crate::NsRecord;
+use crate::WriteBasis;
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigPublisher,
     ConfigValue, Fence, IndexPublisher, NameServiceLookup, NsRecordSnapshot, RefKind, RefPublisher,
@@ -65,6 +66,18 @@ pub async fn current_fence<S: NameServiceLookup + ?Sized>(
     Ok(store.lookup(ledger_id).await?.and_then(|r| r.fence))
 }
 
+/// What a write to `ledger_id`'s record as it is now presents.
+pub async fn current_basis<S: NameServiceLookup + ?Sized>(
+    store: &S,
+    ledger_id: &str,
+) -> Result<WriteBasis> {
+    Ok(store
+        .lookup(ledger_id)
+        .await?
+        .map(|r| r.write_basis())
+        .unwrap_or_default())
+}
+
 /// The publisher writes, presenting the record's current fence.
 #[async_trait]
 pub trait CurrentFence: NameServiceLookup {
@@ -72,8 +85,8 @@ pub trait CurrentFence: NameServiceLookup {
     where
         Self: CommitPublisher,
     {
-        let fence = current_fence(self, ledger_id).await?;
-        self.publish_commit_fenced(ledger_id, fence, commit_t, id)
+        let basis = current_basis(self, ledger_id).await?;
+        self.publish_commit_fenced(ledger_id, basis, commit_t, id)
             .await
     }
 
@@ -81,8 +94,8 @@ pub trait CurrentFence: NameServiceLookup {
     where
         Self: IndexPublisher,
     {
-        let fence = current_fence(self, ledger_id).await?;
-        self.publish_index_fenced(ledger_id, fence, index_t, id)
+        let basis = current_basis(self, ledger_id).await?;
+        self.publish_index_fenced(ledger_id, basis, index_t, id)
             .await
     }
 
@@ -95,8 +108,8 @@ pub trait CurrentFence: NameServiceLookup {
     where
         Self: AdminPublisher,
     {
-        let fence = current_fence(self, ledger_id).await?;
-        self.publish_index_allow_equal_fenced(ledger_id, fence, index_t, id)
+        let basis = current_basis(self, ledger_id).await?;
+        self.publish_index_allow_equal_fenced(ledger_id, basis, index_t, id)
             .await
     }
 
@@ -110,8 +123,8 @@ pub trait CurrentFence: NameServiceLookup {
     where
         Self: RefPublisher,
     {
-        let fence = current_fence(self, ledger_id).await?;
-        self.compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
+        let basis = current_basis(self, ledger_id).await?;
+        self.compare_and_set_ref_fenced(ledger_id, basis, kind, expected, new)
             .await
     }
 
@@ -124,8 +137,8 @@ pub trait CurrentFence: NameServiceLookup {
     where
         Self: RefPublisher,
     {
-        let fence = current_fence(self, ledger_id).await?;
-        self.fast_forward_commit_fenced(ledger_id, fence, new, max_retries)
+        let basis = current_basis(self, ledger_id).await?;
+        self.fast_forward_commit_fenced(ledger_id, basis, new, max_retries)
             .await
     }
 
@@ -133,8 +146,8 @@ pub trait CurrentFence: NameServiceLookup {
     where
         Self: BranchLifecycle,
     {
-        let fence = current_fence(self, ledger_id).await?;
-        self.reset_head_fenced(ledger_id, fence, snapshot).await
+        let basis = current_basis(self, ledger_id).await?;
+        self.reset_head_fenced(ledger_id, basis, snapshot).await
     }
 
     async fn push_status(

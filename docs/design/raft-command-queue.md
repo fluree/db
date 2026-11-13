@@ -122,7 +122,7 @@ Two consequences of that shape:
 
 Every submission writes an envelope of its own. `QueuedTransactor` stamps the request with a fresh submission id before encoding it, so `request_cid` is unique per submission even when two requests are byte-identical. `body_hash` is derived from the request with the stamp cleared, so a keyed retry still matches the original's idempotency entry.
 
-The envelope is released in one place, once the propose loop has settled what became of it:
+The envelope is released in one place, once the propose loop has settled what became of it. On a cluster that collects garbage, a release records the envelope for the cluster's collection, which alone deletes blobs there; elsewhere it deletes the envelope directly:
 
 - **Turned away** on every attempt (a state-machine rejection or idempotency answer, or a Raft error before the log) — nothing will read it, so the proposer releases it.
 - **Joined** another submission's in-flight entry under the same key (`InFlight`) — that entry reads its own envelope, so this one is released.

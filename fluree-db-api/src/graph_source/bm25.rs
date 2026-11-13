@@ -3,6 +3,7 @@
 //! This module provides APIs for creating, loading, syncing, and dropping
 //! BM25 full-text search indexes.
 
+use super::helpers::source_view;
 use crate::graph_source::config::Bm25CreateConfig;
 use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map, latest_drop_read};
 use crate::graph_source::result::{
@@ -218,7 +219,7 @@ async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids
             method,
             ContentKind::GraphSourceSnapshot,
             &namespace,
-            &cid.digest_hex(),
+            &cid.address_digest(),
         );
         if let Err(e) = storage.delete(&addr).await {
             warn!(address = %addr, error = %e, "failed to delete old BM25 snapshot");
@@ -376,7 +377,12 @@ impl crate::Fluree {
 
         // 7. Publish manifest to CAS and head pointer to nameservice
         let index_id = self
-            .publish_bm25_manifest(&graph_source_id, &manifest, source_t)
+            .publish_bm25_manifest(
+                &graph_source_id,
+                &manifest,
+                source_t,
+                &[source_view(&ledger)],
+            )
             .await?;
 
         info!(
@@ -593,12 +599,15 @@ impl crate::Fluree {
     /// the graph source head pointer in nameservice.
     ///
     /// The manifest is content-addressed (keyed by `index_t`), so each
-    /// publish creates a new immutable object in storage.
+    /// publish creates a new immutable object in storage. `sources` is the
+    /// erasure generation of each source view the index was built from; see
+    /// [`GraphSourcePublisher::publish_graph_source_index`](fluree_db_nameservice::GraphSourcePublisher::publish_graph_source_index).
     pub(crate) async fn publish_bm25_manifest(
         &self,
         graph_source_id: &str,
         manifest: &Bm25Manifest,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<ContentId> {
         let (name, branch) = split_ledger_id(graph_source_id).map_err(|e| {
             crate::ApiError::config(format!("Invalid graph source ID '{graph_source_id}': {e}"))
@@ -612,11 +621,127 @@ impl crate::Fluree {
             .put(fluree_db_core::ContentKind::IndexRoot, &bytes)
             .await?;
 
+        // Built on a head that since moved, as a purge's rebuild moves it:
+        // publishing would bring back what that head left out.
+        let _heads = self.source_heads_lock().await;
+        if let Some(loaded) = &manifest.loaded_from {
+            let head = self
+                .nameservice()
+                .lookup_graph_source(graph_source_id)
+                .await?
+                .and_then(|r| r.index_id);
+            if head.as_ref() != Some(loaded) {
+                return Err(fluree_db_nameservice::NameServiceError::conflict(format!(
+                    "{graph_source_id}'s index moved during the sync"
+                ))
+                .into());
+            }
+        }
+        let mut written: Vec<&ContentId> =
+            manifest.snapshots.iter().map(|e| &e.snapshot_id).collect();
+        written.push(&index_id);
+        self.still_stored(graph_source_id, &written).await?;
         self.publisher()?
-            .publish_graph_source_index(&name, &branch, &index_id, index_t)
+            .publish_graph_source_index(&name, &branch, &index_id, index_t, sources)
             .await?;
 
         Ok(index_id)
+    }
+
+    /// Refuse to publish a head naming a file of `ids` no longer stored. A
+    /// purge releases a search index's files no head names, as a sync's are
+    /// until it publishes; held under the heads lock, which the release
+    /// takes, so none goes between this and the publish.
+    pub(crate) async fn still_stored(
+        &self,
+        graph_source_id: &str,
+        ids: &[&ContentId],
+    ) -> Result<()> {
+        let store = self.graph_source_store(graph_source_id)?;
+        for id in ids {
+            if !store.has(id).await? {
+                return Err(fluree_db_nameservice::NameServiceError::conflict(format!(
+                    "{graph_source_id}'s file {id} was released during the sync"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl crate::Fluree {
+    /// Rebuild full-text index `graph_source_id` from its ledger's current
+    /// state, as a purge does once that state no longer holds an erased
+    /// value: a fresh index, unlike a resync, which keeps every term it ever
+    /// held, published as the only snapshot of a new manifest and replacing
+    /// the head even at the same `t`. Returns the head it published.
+    #[cfg(feature = "native")]
+    pub(crate) async fn rebuild_full_text_index(&self, graph_source_id: &str) -> Result<ContentId> {
+        let id = crate::LedgerId::parse(graph_source_id)?;
+        let record = self.syncable_graph_source(&id).await?;
+        let config: JsonValue = serde_json::from_str(&record.config)?;
+        let query = config
+            .get("query")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let number = |key: &str, default: f64| {
+            config
+                .get(key)
+                .and_then(JsonValue::as_f64)
+                .unwrap_or(default)
+        };
+        let bm25 = fluree_db_query::bm25::Bm25Config::new(number("k1", 1.2), number("b", 0.75));
+        let ledger_alias = record.dependencies.first().cloned().ok_or_else(|| {
+            crate::ApiError::Config(format!("{graph_source_id} has no source ledger"))
+        })?;
+
+        let ledger = self.ledger(&ledger_alias).await?;
+        let source_t = ledger.t();
+        let results = self.execute_bm25_indexing_query(&ledger, &query).await?;
+        let context = query
+            .get("@context")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let results = expand_ids_in_results(results, &extract_prefix_map(&context));
+        let mut builder = Bm25IndexBuilder::new(ledger_alias.as_str(), bm25)
+            .with_property_deps(PropertyDeps::from_indexing_query(&query))
+            .with_watermark(source_t);
+        builder.add_results(&results)?;
+        let index = builder.build();
+
+        let snapshot_id = self.write_bm25_snapshot(&id, &index).await?;
+        let mut manifest = Bm25Manifest::new(id.as_str());
+        manifest.append(Bm25SnapshotEntry::new(source_t, snapshot_id));
+        let bytes = serde_json::to_vec(&manifest)?;
+        let head = self
+            .graph_source_store(&id)?
+            .put(fluree_db_core::ContentKind::IndexRoot, &bytes)
+            .await?;
+        let (name, branch) = split_ledger_id(&id).map_err(|e| {
+            crate::ApiError::config(format!("Invalid graph source ID '{graph_source_id}': {e}"))
+        })?;
+        let _heads = self.source_heads_lock().await;
+        self.publisher()?
+            .publish_graph_source_index_allow_equal(
+                &name,
+                &branch,
+                &head,
+                source_t,
+                &[source_view(&ledger)],
+            )
+            .await?;
+        Ok(head)
+    }
+
+    /// Held to publish a full-text or vector index's head where a purge may
+    /// rebuild it: see [`crate::retention::erasure::ErasureRuntime`].
+    pub(crate) async fn source_heads_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            return Some(runtime.source_heads.lock().await);
+        }
+        None
     }
 }
 
@@ -652,7 +777,8 @@ impl crate::Fluree {
             Some(index_cid) => {
                 let cs = self.graph_source_store(graph_source_id)?;
                 let bytes = cs.get(index_cid).await?;
-                let manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
+                let mut manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
+                manifest.loaded_from = Some(index_cid.clone());
                 Ok(manifest)
             }
             None => Ok(Bm25Manifest::new(graph_source_id)),
@@ -677,7 +803,8 @@ impl crate::Fluree {
 
         let cs = self.graph_source_store(graph_source_id)?;
         let bytes = cs.get(&index_cid).await?;
-        let manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
+        let mut manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
+        manifest.loaded_from = Some(index_cid);
         Ok(manifest)
     }
 }
@@ -1078,8 +1205,22 @@ impl crate::Fluree {
     /// Sync a BM25 index to catch up with ledger updates.
     ///
     /// This operation performs incremental updates when possible,
-    /// falling back to full resync if needed.
+    /// falling back to full resync if needed. A sync whose head moved
+    /// meanwhile, as a purge's rebuild moves it, starts again from the new
+    /// head.
     pub async fn sync_bm25_index(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
+        let mut attempts = 0;
+        loop {
+            match self.sync_bm25_index_once(graph_source_id).await {
+                Err(crate::ApiError::NameService(
+                    fluree_db_nameservice::NameServiceError::Conflict(_),
+                )) if attempts < 3 => attempts += 1,
+                result => return result,
+            }
+        }
+    }
+
+    async fn sync_bm25_index_once(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
         use fluree_db_core::trace_first_parent_commits_by_id;
         use fluree_db_query::bm25::{CompiledPropertyDeps, IncrementalUpdater};
         use futures::StreamExt;
@@ -1179,7 +1320,7 @@ impl crate::Fluree {
         // read off the snapshot so the verdict and the predicate set come from
         // the same analysis, and so an index built by an older extractor is
         // judged by the current one.
-        let analysis = PropertyDeps::analyze(&query);
+        let analysis = crate::graph_source::helpers::indexed_properties(&record);
         if let Some(reason) = &analysis.incomplete {
             warn!(
                 graph_source_id = %graph_source_id,
@@ -1254,8 +1395,13 @@ impl crate::Fluree {
             let mut manifest = manifest;
             manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
             let removed = manifest.trim(snapshot_retention());
-            self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
-                .await?;
+            self.publish_bm25_manifest(
+                graph_source_id,
+                &manifest,
+                ledger_t,
+                &[source_view(&ledger)],
+            )
+            .await?;
             if let Some(storage) = self.admin_storage() {
                 delete_old_snapshots(storage, graph_source_id, &removed).await;
             }
@@ -1357,8 +1503,13 @@ impl crate::Fluree {
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
         let removed = manifest.trim(snapshot_retention());
-        self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
-            .await?;
+        self.publish_bm25_manifest(
+            graph_source_id,
+            &manifest,
+            ledger_t,
+            &[source_view(&ledger)],
+        )
+        .await?;
 
         // Best-effort cleanup of old snapshot blobs
         if let Some(storage) = self.admin_storage() {
@@ -1471,8 +1622,13 @@ impl crate::Fluree {
             .map(|floor| manifest.retire_before(floor))
             .unwrap_or_default();
         removed.extend(manifest.trim(snapshot_retention()));
-        self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
-            .await?;
+        self.publish_bm25_manifest(
+            graph_source_id,
+            &manifest,
+            ledger_t,
+            &[source_view(&ledger)],
+        )
+        .await?;
 
         // Best-effort cleanup of old snapshot blobs
         if let Some(storage) = self.admin_storage() {
@@ -1690,8 +1846,13 @@ impl crate::Fluree {
             .unwrap_or_default();
         removed.extend(manifest.trim(snapshot_retention()));
         let effective_t = manifest.head().map(|h| h.index_t).unwrap_or(target_t);
-        self.publish_bm25_manifest(graph_source_id, &manifest, effective_t)
-            .await?;
+        self.publish_bm25_manifest(
+            graph_source_id,
+            &manifest,
+            effective_t,
+            &[(view.ledger_id.to_string(), view.erasure_generation)],
+        )
+        .await?;
 
         // Best-effort cleanup of old snapshot blobs
         if let Some(storage) = self.admin_storage() {
@@ -1841,7 +2002,7 @@ where {
                 &method,
                 fluree_db_core::ContentKind::GraphSourceSnapshot,
                 &namespace,
-                &cid.digest_hex(),
+                &cid.address_digest(),
             );
             match storage.delete(&addr).await {
                 Ok(()) => deleted += 1,
@@ -1990,5 +2151,86 @@ mod scope_tests {
             q[clause] = serde_json::json!({ "?x": ["@id", "ex:title"] });
             assert_declines(&q, "`selectOne`");
         }
+    }
+}
+
+#[cfg(test)]
+mod head_tests {
+    use crate::FlureeBuilder;
+
+    /// A manifest read before a purge's rebuild cannot be published over it:
+    /// what the rebuild left out would come back. A sync after it builds on
+    /// the rebuilt head.
+    #[tokio::test]
+    async fn a_manifest_read_before_a_rebuild_is_not_published_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        fluree.create_ledger("docs").await.unwrap();
+        let insert = |name: &str| serde_json::json!({"@id": format!("http://example.org/{name}"), "@type": "http://example.org/Doc", "http://example.org/title": format!("{name} report")});
+        fluree
+            .graph("docs:main")
+            .transact()
+            .insert(&insert("alpha"))
+            .commit()
+            .await
+            .unwrap();
+        fluree
+            .create_full_text_index(crate::Bm25CreateConfig::new(
+                "search",
+                "docs:main",
+                serde_json::json!({
+                    "where": [{"@id": "?x", "@type": "http://example.org/Doc", "http://example.org/title": "?t"}],
+                    "select": {"?x": ["@id", "http://example.org/title"]}
+                }),
+            ))
+            .await
+            .unwrap();
+        let stale = fluree.load_bm25_manifest("search:main").await.unwrap();
+        // Over unchanged data a rebuild may write the very manifest it
+        // replaces, leaving the head where it was; a purge's rebuild leaves
+        // values out.
+        fluree
+            .graph("docs:main")
+            .transact()
+            .insert(&insert("gamma"))
+            .commit()
+            .await
+            .unwrap();
+        let rebuilt = fluree.rebuild_full_text_index("search:main").await.unwrap();
+        assert_ne!(stale.loaded_from.as_ref(), Some(&rebuilt));
+
+        let refused = fluree
+            .publish_bm25_manifest("search:main", &stale, i64::MAX, &[])
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(crate::ApiError::NameService(
+                    fluree_db_nameservice::NameServiceError::Conflict(_)
+                ))
+            ),
+            "{refused:?}"
+        );
+        let head = fluree
+            .nameservice()
+            .lookup_graph_source("search:main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.index_id, Some(rebuilt));
+
+        fluree
+            .graph("docs:main")
+            .transact()
+            .insert(&insert("beta"))
+            .commit()
+            .await
+            .unwrap();
+        fluree.sync_bm25_index("search:main").await.unwrap();
+        let synced = fluree.load_bm25_manifest("search:main").await.unwrap();
+        assert_eq!(synced.snapshots.len(), 2, "{synced:?}");
     }
 }

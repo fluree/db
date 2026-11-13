@@ -2,6 +2,7 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod audit;
 mod bm25;
 mod commits;
 mod context;
@@ -127,6 +128,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Deletes instance folders nothing references: storage-wide.
         .route("/dropped/sweep", post(ledger::sweep_orphans))
         .route("/reindex", post(ledger::reindex))
+        // Targeted query removal: retracts current occurrences through the
+        // ordered write path and publishes the removal journal, both
+        // leader-coordinated.
+        .route("/remove/*ledger", post(ledger::remove_occurrences_tail))
+        // Permanent erasure: the removal on every branch holding the
+        // occurrences, then proofs in the background.
+        .route("/erase/*ledger", post(ledger::erase_occurrences_tail))
         // Indexes pending commits and compacts the pooled delta, for
         // deployments without a long-running indexer.
         .route("/index", post(ledger::index))
@@ -334,6 +342,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Ledger management (read-only)
         .route("/ledgers", get(ledger::list_ledgers))
         .route("/info/*ledger", get(ledger::info_ledger_tail))
+        .route("/retention/*ledger", get(ledger::retention_status_tail))
         .route("/exists/*ledger", get(ledger::exists_ledger_tail))
         .route("/branch/*ledger", get(ledger::list_branches))
         .route("/merge-preview/*ledger", get(ledger::merge_preview))
@@ -398,6 +407,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", get(events::events))
         // Storage proxy endpoints (for peer mode)
         .route("/storage/ns/:alias", get(storage_proxy::get_ns_record))
+        .route(
+            "/storage/config/:alias",
+            get(storage_proxy::get_config_record),
+        )
         .route("/storage/block", post(storage_proxy::get_block))
         .route(
             "/storage/objects/:cid",

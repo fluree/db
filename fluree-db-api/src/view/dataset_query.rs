@@ -644,6 +644,20 @@ impl Fluree {
             }
         }
 
+        // The query was lowered against the primary's namespace table.
+        let history_range = dataset.history_time_range();
+        let encoded_with = dataset.primary().map(|primary| &primary.snapshot);
+        for view in dataset.views() {
+            self.refuse_suppressed_view_history(
+                view,
+                parsed,
+                &executable,
+                history_range,
+                encoded_with.unwrap_or(&view.snapshot),
+            )
+            .await?;
+        }
+
         Ok(executable)
     }
 

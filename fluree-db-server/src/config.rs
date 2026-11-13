@@ -548,6 +548,64 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_ORPHAN_SWEEP_INTERVAL_SECS", default_value_t = 0)]
     pub orphan_sweep_interval_secs: u64,
 
+    /// How often to reconcile each ledger's commit and transaction files in
+    /// the background, recording those no branch references as garbage
+    /// (seconds); `0`, the default, never does
+    ///
+    /// A reconciliation lists the ledger's files and reads its references
+    /// whole, which on a large ledger runs past the garbage pass's time
+    /// budget. Garbage already recorded is collected either way, and an
+    /// erasure's purge reconciles what it needs.
+    #[arg(
+        long,
+        env = "FLUREE_GARBAGE_RECONCILE_INTERVAL_SECS",
+        default_value_t = 0
+    )]
+    pub garbage_reconcile_interval_secs: u64,
+
+    /// How often the retention worker runs a pass over TTL-enabled ledgers
+    /// (seconds)
+    ///
+    /// Runs on the node that owns the indexer's catch-up tick, which also
+    /// wakes it. Expired values are retracted within about one interval of
+    /// their deadline, plus processing time. Ledgers without retention
+    /// config or TTL writes are never visited.
+    #[arg(long, env = "FLUREE_RETENTION_INTERVAL_SECS", default_value_t = 15)]
+    pub retention_interval_secs: u64,
+
+    /// The `fluree-prover` binary that proves permanent erasures (default:
+    /// `fluree-prover` beside this binary, else on the PATH)
+    ///
+    /// File storage (`--storage-path`) only: a single node, or a Raft
+    /// cluster whose members share it. Without a prover of this release,
+    /// erasure requests are refused.
+    #[arg(long, env = "FLUREE_ERASURE_PROVER")]
+    pub erasure_prover: Option<PathBuf>,
+
+    /// Refuse permanent erasure requests even where a prover is installed
+    #[arg(long, env = "FLUREE_DISABLE_ERASURE")]
+    pub disable_erasure: bool,
+
+    /// Directory for the prover's temporary files, which hold the plaintext
+    /// of commits being erased (default: a `fluree-erasure` directory under
+    /// the system temp directory)
+    #[arg(long, env = "FLUREE_ERASURE_SCRATCH_DIR")]
+    pub erasure_scratch_dir: Option<PathBuf>,
+
+    /// Threads the prover uses (default: every core); fewer leave the
+    /// transaction path its cores
+    #[arg(long, env = "FLUREE_ERASURE_PROVER_THREADS")]
+    pub erasure_prover_threads: Option<usize>,
+
+    /// A proving step still running after this long is killed and retried
+    /// (seconds)
+    #[arg(
+        long,
+        env = "FLUREE_ERASURE_PROVER_TIMEOUT_SECS",
+        default_value_t = 14_400
+    )]
+    pub erasure_prover_timeout_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 35% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -981,6 +1039,13 @@ impl Default for ServerConfig {
             gc_hard_max_old_indexes: None,
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             orphan_sweep_interval_secs: 0,
+            garbage_reconcile_interval_secs: 0,
+            retention_interval_secs: 15,
+            erasure_prover: None,
+            disable_erasure: false,
+            erasure_scratch_dir: None,
+            erasure_prover_threads: None,
+            erasure_prover_timeout_secs: 14_400,
             cache_max_mb: None,
             cache_dictionary_max_mb: None,
             disk_cache_max_mb: None,
@@ -1067,10 +1132,65 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The retention worker's settings (`--retention-interval-secs`).
+    pub fn retention_options(&self) -> fluree_db_api::retention::RetentionOptions {
+        fluree_db_api::retention::RetentionOptions {
+            interval: std::time::Duration::from_secs(self.retention_interval_secs.max(1)),
+            ..Default::default()
+        }
+    }
+
+    /// How this server proves permanent erasures, if it does: with the
+    /// prover `--erasure-prover` names, or one beside this binary or on the
+    /// PATH, once it proves an image this release accepts.
+    pub fn erasure_config(&self) -> Option<fluree_db_api::retention::erasure::ErasureConfig> {
+        use fluree_db_api::retention::erasure::{check_prover, find_prover};
+        if self.disable_erasure {
+            tracing::info!("permanent erasure disabled (--disable-erasure)");
+            return None;
+        }
+        let Some(command) = find_prover(self.erasure_prover.as_deref()) else {
+            tracing::info!(
+                "permanent erasure unavailable: no fluree-prover beside this binary or on the \
+                 PATH (install it with `fluree prover install`)"
+            );
+            return None;
+        };
+        if let Err(why) = check_prover(&command) {
+            tracing::warn!("permanent erasure unavailable: {why}");
+            return None;
+        }
+        tracing::info!(prover = %command.display(), "permanent erasure available");
+        Some(
+            fluree_db_api::retention::erasure::ErasureConfig::subprocess(
+                fluree_db_api::retention::erasure::ProverConfig {
+                    command,
+                    scratch_dir: self
+                        .erasure_scratch_dir
+                        .clone()
+                        .unwrap_or_else(|| std::env::temp_dir().join("fluree-erasure")),
+                    threads: self.erasure_prover_threads,
+                    niceness: 10,
+                    timeout: std::time::Duration::from_secs(self.erasure_prover_timeout_secs),
+                },
+            ),
+        )
+    }
+
     /// `--orphan-sweep-interval-secs`, `None` when off.
     pub fn orphan_sweep_interval(&self) -> Option<std::time::Duration> {
         (self.orphan_sweep_interval_secs > 0)
             .then(|| std::time::Duration::from_secs(self.orphan_sweep_interval_secs))
+    }
+
+    /// The background housekeeping these settings ask for.
+    pub fn housekeeping_options(&self) -> fluree_db_api::HousekeepingOptions {
+        fluree_db_api::HousekeepingOptions {
+            orphan_sweep_interval: self.orphan_sweep_interval(),
+            reconcile_interval: (self.garbage_reconcile_interval_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.garbage_reconcile_interval_secs)),
+            ..fluree_db_api::HousekeepingOptions::default()
+        }
     }
 
     /// Create config from CLI args
@@ -1270,6 +1390,19 @@ impl ServerConfig {
                  reads the transaction server's storage"
                     .to_string(),
             );
+        }
+
+        // Permanent erasure: over file storage, a single node's or a cluster's
+        // shared one.
+        if self.erasure_prover.is_some() {
+            if self.memory || self.connection_config.is_some() || self.is_proxy_storage_mode() {
+                return Err(
+                    "--erasure-prover needs file storage named by --storage-path".to_string(),
+                );
+            }
+            if self.server_role == ServerRole::Peer {
+                return Err("--erasure-prover is not available on a query peer".to_string());
+            }
         }
 
         // Warn if both connection_config and storage_path are set
@@ -1496,6 +1629,19 @@ mod raft_validation_tests {
         }
     }
 
+    /// A cluster's members prove erasures over their shared file storage:
+    /// a named prover is taken; one over other storage is not.
+    #[test]
+    fn a_cluster_member_takes_a_named_prover_over_file_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/srv/fluree/data"));
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/fluree/raft"));
+        cfg.erasure_prover = Some(PathBuf::from("/opt/fluree/fluree-prover"));
+        cfg.validate().expect("a named prover on a cluster member");
+        cfg.memory = true;
+        cfg.validate().expect_err("not without file storage");
+    }
+
     #[test]
     fn rejects_equal_raft_and_storage_paths() {
         let mut cfg = raft_enabled_base();
@@ -1553,6 +1699,48 @@ mod raft_validation_tests {
         cfg.storage_path = None;
         cfg.validate()
             .expect("missing storage_path should skip the disjoint check");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod erasure_prover_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// A stand-in prover printing `id` for `--image-id`.
+    fn fake(dir: &std::path::Path, id: &str) -> PathBuf {
+        let path = dir.join("fluree-prover");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{id}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The server proves with a prover of this release, and with none when
+    /// erasure is disabled, the prover is of another release, or missing.
+    #[test]
+    fn the_server_proves_only_with_a_prover_of_this_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = fluree_db_api::retention::erasure::REDACT_IMAGE_IDS[0]
+            .iter()
+            .map(|w| format!("{w:#010x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let config = |prover: PathBuf, disable_erasure| ServerConfig {
+            erasure_prover: Some(prover),
+            disable_erasure,
+            ..Default::default()
+        };
+        let ours = fake(dir.path(), &pinned);
+        assert!(config(ours.clone(), false).erasure_config().is_some());
+        assert!(config(ours, true).erasure_config().is_none());
+        let other = tempfile::tempdir().unwrap();
+        assert!(config(fake(other.path(), "0x00000001"), false)
+            .erasure_config()
+            .is_none());
+        assert!(config(dir.path().join("missing"), false)
+            .erasure_config()
+            .is_none());
     }
 }
 

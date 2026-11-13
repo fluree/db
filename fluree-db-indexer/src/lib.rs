@@ -28,6 +28,7 @@
 //! - [`build::commit_chain`]: Commit chain walking
 
 mod build;
+pub use build::rebuild::clear_rebuild_residue;
 pub mod config;
 pub mod drop;
 pub mod error;
@@ -48,7 +49,7 @@ pub mod stats;
 // Re-export main types
 pub use config::{
     ConfiguredFulltextProperty, ConfiguredFulltextScope, IndexerConfig, LedgerConfigProvider,
-    LedgerIndexingConfig, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
+    LedgerIndexingConfig, SuppressedHistory, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
@@ -62,8 +63,9 @@ pub use gc::{
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
-    GcGuard, Housekeeping, IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation,
-    IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
+    BuildDirectives, BuildObserver, GcGuard, Housekeeping, Housekeepings, IndexCompletion,
+    IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot, IndexerHandle,
+    IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
 };
 #[cfg(feature = "embedded-orchestrator")]
 pub use orchestrator::{
@@ -72,6 +74,9 @@ pub use orchestrator::{
 pub use stats::{IndexStatsHook, NoOpStatsHook, StatsArtifacts, StatsSummary};
 
 // Re-export build pipeline types
+pub use build::incremental::{
+    erase_index_events, incremental_index_erasing, ErasedEvent, IndexErasure,
+};
 pub use build::types::{UploadedDicts, UploadedIndexes};
 
 // Re-export build pipeline types
@@ -80,6 +85,7 @@ pub use run_index::build::build_from_commits::{
     BuildConfig, BuildResult, CommitInput, BUILD_STAGE_LINK_RUNS, BUILD_STAGE_MERGE,
     BUILD_STAGE_REMAP,
 };
+pub use run_index::build::incremental_resolve::pending_covers_range;
 
 use fluree_db_core::ContentStore;
 use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
@@ -101,10 +107,15 @@ pub struct IndexResult {
     /// `None` when the build went through the plain non-tracking API. An
     /// already-current build reports `Some(0.0)` if tracking was enabled.
     pub fuel: Option<f64>,
-    /// The fence of the branch record the build started from, which the
-    /// publication of this root presents: a branch dropped or replaced
-    /// during the build refuses it.
-    pub fence: Option<fluree_db_nameservice::Fence>,
+    /// What the publication of this root presents, from the branch record
+    /// the build started from: a branch dropped or replaced during the
+    /// build, or reached by an erasure, refuses it.
+    pub basis: fluree_db_nameservice::WriteBasis,
+    /// The earliest `t` among the commits this build read whose txn-meta
+    /// carries retention input. Whoever publishes the root registers the
+    /// branch for retention from this `t` first: once published, the index
+    /// covers those commits, and no later build reads them again.
+    pub retention_input_from_t: Option<i64>,
 }
 
 /// Statistics from index building
@@ -215,7 +226,8 @@ pub async fn build_index_for_record_with_tracker(
                     ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
                     stats: IndexStats::default(),
                     fuel,
-                    fence: None,
+                    basis: fluree_db_nameservice::WriteBasis::default(),
+                    retention_input_from_t: None,
                 });
             }
         }
@@ -297,7 +309,7 @@ pub async fn build_index_for_record_with_tracker(
     .instrument(span)
     .await
     .map(|result| IndexResult {
-        fence: record.fence,
+        basis: record.write_basis(),
         ..result
     })
 }
@@ -521,6 +533,7 @@ pub async fn index_novelty(
         novelty,
         config,
         replaced_cids,
+        Default::default(),
     )
     .await
 }
@@ -581,7 +594,7 @@ pub async fn publish_index_result(
     publisher
         .publish_index_fenced(
             &result.ledger_id,
-            result.fence,
+            result.basis.clone(),
             result.index_t,
             &result.root_id,
         )
@@ -623,7 +636,7 @@ mod publish_barrier_tests {
         async fn publish_index_fenced(
             &self,
             _ledger_id: &str,
-            _fence: Option<fluree_db_nameservice::Fence>,
+            _basis: fluree_db_nameservice::WriteBasis,
             _index_t: i64,
             _index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
@@ -659,7 +672,8 @@ mod publish_barrier_tests {
             ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
-            fence: None,
+            retention_input_from_t: None,
+            basis: fluree_db_nameservice::WriteBasis::default(),
         };
         publish_index_result(&store, &publisher, &result)
             .await

@@ -14,18 +14,20 @@ fluree pull [OPTIONS] [LEDGER]
 |----------|-------------|
 | `[LEDGER]` | Ledger name (defaults to active ledger) |
 | `--no-indexes` | Skip pulling binary index data; only transfer new commits and txn blobs (local index may lag until you run `fluree reindex`) |
+| `--erasure-authority` | For a pull from the ledger's origins: accept the permanent erasures they carry, for this pull. With a named upstream it is refused; designate the remote with `fluree remote erasure-authority` instead. |
 
 ## Description
 
 Downloads new commits from the configured upstream and applies them to the local ledger:
 
 1. Queries the remote for its current head (`t` and commit ContentId)
-2. Compares with the local head; exits early if already up to date
+2. Compares with the local head. When the local ledger already has every commit, it still asks the pack protocol for what the remote gained without a commit (its removal journal, and erasures of history the ledger holds), then exits
 3. Attempts bulk download of missing commits (and by default **index artifacts**) via the **pack protocol** (single streaming request)
 4. Falls back to paginated JSON export if the server does not support pack. The export sends the branch's first-parent line and, separately, the commits its merges brought in. A server too old to export that way can still serve a history without merges.
 5. Stores all commit and transaction blobs to local CAS
 6. When index data is requested and transferred, advances the local index head to match the remote
 7. Advances the local commit head to the remote head
+8. Deletes from local storage what the ledger's permanent erasures still leave there (see [Erased history](#erased-history))
 
 ### Index transfer
 
@@ -34,6 +36,32 @@ As with [clone](clone.md#index-transfer), pull uses the pack protocol to request
 ### Transport
 
 Pull uses the same pack protocol as clone -- see [clone: Transport](clone.md#transport) for details.
+
+### Erased history
+
+When the remote's history holds [permanently erased](../transactions/permanent-erasure.md#clones-and-pulls)
+commits, pull goes through the pack protocol only, and only from a remote designated an erasure
+authority (`fluree remote erasure-authority <name> true`). The request lists the erasures the local
+storage already holds; the remote sends every other erasure of the history, including those of
+commits this ledger already has. Before the local head moves, the ledger (and any other ledger here
+holding the originals) reads as the erasures do: the values leave its index and history, with nothing
+committed to it. Before it exits, the pull then deletes from local storage what the ledger's erasures
+leave there: the originals, the indexes built from them, and their transaction documents, and checks
+that the values are gone. It holds the storage, which no other process then reads, so it does not wait
+first, as a server does, for readers of the older indexes. When the deletion cannot finish, the pull
+says why, and the next pull carries on; `fluree info` lists each erasure whose files are still there.
+A pull that stops partway completes at the next clone or pull, or when a server on this storage next
+runs its retention worker. An erasure
+published after the ledger has every commit arrives with the next pull all the same, since a pull with
+no new commits still asks for one. The paginated export and an origin-based pull refuse erased
+history. The ledger's removal journal arrives with any pack, an origin's included; the object-by-object
+fallback of an origin-based pull carries none.
+
+An origin-based pull takes erased history only with `--erasure-authority`, which designates the
+ledger's origins an erasure authority for that pull, and only through the pack: the object-by-object
+fallback walks only the new commits, so it cannot bring the erasures of commits this ledger already
+has, and it refuses an erased commit. With a named upstream, the flag is refused; designate the remote
+instead.
 
 ### Origin-based pull
 

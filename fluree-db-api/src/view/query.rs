@@ -1585,7 +1585,61 @@ impl Fluree {
                 .await?,
         );
 
+        self.refuse_suppressed_view_history(&db, parsed, &executable, None, &db.snapshot)
+            .await?;
+
         Ok(executable)
+    }
+
+    /// Refuse a read of `db` that needs history its ledger's retention
+    /// suppressed. `parsed` holds ids `encoded_with`'s namespace table
+    /// assigned (a dataset's primary's, for each of its ledgers). A read of
+    /// current state costs a lookup in memory, with no I/O or waiting on
+    /// the ledger; see [`Fluree::view_freshness`].
+    pub(crate) async fn refuse_suppressed_view_history(
+        &self,
+        db: &GraphDb,
+        parsed: &fluree_db_query::ir::Query,
+        executable: &ExecutableQuery,
+        history_range: Option<(i64, i64)>,
+        encoded_with: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<()> {
+        use crate::retention::suppression::Freshness;
+        self.ensure_read_ready(&db.ledger_id).await?;
+        let earlier_point = history_range.is_some() || db.historical;
+        let freshness = self.view_freshness(db).await?;
+        self.refuse_stale_search_sources(parsed, earlier_point)
+            .await?;
+        if !earlier_point {
+            match freshness {
+                Freshness::Current => return Ok(()),
+                // Behind, with no removal to refuse a read for.
+                Freshness::Behind {
+                    journal: Some(holds),
+                } if !holds.removals() => return Ok(()),
+                Freshness::Behind { .. } => {}
+            }
+        }
+        let reads = || {
+            if executable.reasoning.modes.has_any_enabled() {
+                crate::retention::suppression::Reads::Everything
+            } else {
+                crate::retention::suppression::reads_of(parsed, encoded_with)
+            }
+        };
+        let (from_t, to_t) = match history_range {
+            Some((from, to)) => (Some(from), to),
+            None => (None, db.t),
+        };
+        self.refuse_suppressed_history(
+            &db.ledger_id,
+            crate::retention::suppression::HistoricalRead {
+                to_t,
+                from_t,
+                reads,
+            },
+        )
+        .await
     }
 
     /// Apply a view's reasoning configuration to an executable.

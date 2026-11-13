@@ -38,7 +38,7 @@ async fn commit_id_has_valid_sha256_format() {
 
     // Verify commit ID is a valid ContentId with SHA-256 digest
     let commit_id_str = result.receipt.commit_id.to_string();
-    let digest_hex = result.receipt.commit_id.digest_hex();
+    let digest_hex = result.receipt.commit_id.address_digest();
 
     // CID string should be non-empty
     assert!(
@@ -98,7 +98,7 @@ async fn sequential_commits_produce_unique_hashes() {
         .iter()
         .enumerate()
     {
-        let digest = id.digest_hex();
+        let digest = id.address_digest();
         assert_eq!(
             digest.len(),
             64,
@@ -135,5 +135,5 @@ async fn commit_id_consistent_within_session() {
     );
 
     // Verify the commit ID format is still valid after reload
-    assert_eq!(commit_id.digest_hex().len(), 64);
+    assert_eq!(commit_id.address_digest().len(), 64);
 }

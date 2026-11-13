@@ -24,6 +24,14 @@ pub struct ProxyNameService {
     transport: Arc<dyn HttpTransport>,
     api_base: String,
     token: String,
+    /// Each ledger's config as last read, with the tag the server gave it,
+    /// revalidated by that tag.
+    #[allow(clippy::type_complexity)]
+    configs: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, (String, Option<fluree_db_nameservice::ConfigValue>)>,
+        >,
+    >,
 }
 
 impl Debug for ProxyNameService {
@@ -67,6 +75,8 @@ struct NsRecordResponse {
     /// when an older server omits the field.
     #[serde(default)]
     storage_root: Option<fluree_db_core::StorageRoot>,
+    #[serde(default)]
+    config_version: Option<i64>,
 }
 
 impl NsRecordResponse {
@@ -102,6 +112,8 @@ impl NsRecordResponse {
             storage_root: self.storage_root,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
+            config_version: self.config_version,
         })
     }
 }
@@ -146,6 +158,7 @@ impl ProxyNameService {
             transport,
             api_base: api_base.trim_end_matches('/').to_string(),
             token,
+            configs: Default::default(),
         }
     }
 
@@ -222,13 +235,71 @@ impl fluree_db_nameservice::StatusLookup for ProxyNameService {
 
 #[async_trait]
 impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
+    /// The server's `/storage/config` answer: what a reader needs of the
+    /// ledger's config, its retention journal readable without the server's
+    /// storage. A config read before is not sent again while the tag the
+    /// server gave it still holds. A server from before the route answers `404`, and holds
+    /// no journal; any other refusal is an error, never an empty journal,
+    /// which would serve history the server refuses.
     async fn get_config(
         &self,
-        _ledger_id: &str,
+        ledger_id: &str,
     ) -> Result<Option<fluree_db_nameservice::ConfigValue>> {
-        Err(NameServiceError::storage(
-            "get_config not supported in proxy mode".to_string(),
-        ))
+        let url = format!(
+            "{}/storage/config/{}",
+            self.api_base,
+            urlencoding::encode(ledger_id)
+        );
+        let held = self
+            .configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(ledger_id)
+            .cloned();
+        let mut request =
+            TransportRequest::get(url).header("authorization", format!("Bearer {}", self.token));
+        if let Some((tag, _)) = &held {
+            request = request.header("if-none-match", tag.clone());
+        }
+        let response =
+            self.transport.execute(request).await.map_err(|e| {
+                NameServiceError::storage(format!("Config proxy request failed: {e}"))
+            })?;
+        let config = match response.status {
+            StatusCode::NOT_MODIFIED if held.is_some() => {
+                return Ok(held.and_then(|(_, config)| config))
+            }
+            StatusCode::OK => {
+                serde_json::from_slice::<Option<fluree_db_nameservice::ConfigValue>>(&response.body)
+                    .map_err(|e| {
+                        NameServiceError::storage(format!("Failed to parse config response: {e}"))
+                    })?
+            }
+            StatusCode::NOT_FOUND => None,
+            StatusCode::UNAUTHORIZED => {
+                return Err(NameServiceError::storage(format!(
+                    "Config proxy authentication failed for {ledger_id}: check token validity"
+                )))
+            }
+            status => {
+                return Err(NameServiceError::storage(format!(
+                    "Config proxy unexpected status {status} for {ledger_id}"
+                )))
+            }
+        };
+        let tag = response
+            .headers
+            .get(http::header::ETAG)
+            .and_then(|tag| tag.to_str().ok());
+        let mut configs = self
+            .configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tag {
+            Some(tag) => configs.insert(ledger_id.to_string(), (tag.to_string(), config.clone())),
+            None => configs.remove(ledger_id),
+        };
+        Ok(config)
     }
 }
 
@@ -326,7 +397,92 @@ impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
 mod tests {
     use super::*;
     use fluree_db_core::{ContentId, ContentKind};
-    use fluree_db_nameservice::{RefKind, RefValue};
+    use fluree_db_nameservice::{ConfigLookup, ConfigPayload, ConfigValue, RefKind, RefValue};
+
+    /// A response's status, entity tag and body.
+    type Canned = (StatusCode, Option<&'static str>, Vec<u8>);
+
+    /// Answers each request with the next of `responses`, recording it.
+    #[derive(Debug)]
+    struct Scripted {
+        requests: std::sync::Mutex<Vec<TransportRequest>>,
+        responses: std::sync::Mutex<Vec<Canned>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for Scripted {
+        async fn execute(
+            &self,
+            req: TransportRequest,
+        ) -> std::result::Result<
+            crate::transport::TransportResponse,
+            crate::transport::TransportError,
+        > {
+            self.requests.lock().unwrap().push(req);
+            let (status, tag, body) = self.responses.lock().unwrap().remove(0);
+            let mut headers = http::HeaderMap::new();
+            if let Some(tag) = tag {
+                headers.insert(http::header::ETAG, tag.parse().unwrap());
+            }
+            Ok(crate::transport::TransportResponse {
+                status,
+                headers,
+                body: bytes::Bytes::from(body),
+            })
+        }
+    }
+
+    fn scripted(responses: Vec<Canned>) -> (Arc<Scripted>, ProxyNameService) {
+        let transport = Arc::new(Scripted {
+            requests: Default::default(),
+            responses: std::sync::Mutex::new(responses),
+        });
+        let ns = ProxyNameService::from_api_base_with_transport(
+            "http://origin.example/v1/fluree".to_string(),
+            "tok".to_string(),
+            transport.clone(),
+        );
+        (transport, ns)
+    }
+
+    /// A refused config read is an error, never an empty journal: that
+    /// would serve history the server refuses.
+    #[tokio::test]
+    async fn a_refused_config_read_is_an_error() {
+        let (_, ns) = scripted(vec![(StatusCode::FORBIDDEN, None, Vec::new())]);
+        assert!(ns.get_config("mydb:main").await.is_err());
+        let (_, ns) = scripted(vec![(StatusCode::NOT_FOUND, None, Vec::new())]);
+        assert_eq!(ns.get_config("mydb:main").await.unwrap(), None);
+    }
+
+    /// A config read again is sent with the tag it was read with, and an
+    /// unchanged one is not sent back.
+    #[tokio::test]
+    async fn a_config_read_again_is_revalidated_by_its_tag() {
+        let mut payload = ConfigPayload::new();
+        payload
+            .extra
+            .insert("retention".into(), serde_json::json!({"activeSinceT": 3}));
+        let config = ConfigValue::new(7, Some(payload));
+        let body = serde_json::to_vec(&Some(&config)).unwrap();
+        let (transport, ns) = scripted(vec![
+            (StatusCode::OK, Some("\"f-7\""), body),
+            (StatusCode::NOT_MODIFIED, Some("\"f-7\""), Vec::new()),
+        ]);
+        assert_eq!(
+            ns.get_config("mydb:main").await.unwrap(),
+            Some(config.clone())
+        );
+        assert_eq!(ns.get_config("mydb:main").await.unwrap(), Some(config));
+        let requests = transport.requests.lock().unwrap();
+        assert!(!requests[0]
+            .headers
+            .iter()
+            .any(|(name, _)| *name == "if-none-match"));
+        assert!(requests[1]
+            .headers
+            .contains(&("if-none-match", "\"f-7\"".to_string())));
+    }
 
     #[test]
     fn test_proxy_nameservice_debug() {
@@ -380,6 +536,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         };
 
         // A branchless lookup still yields a canonical id (#1540): a
@@ -408,6 +565,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         }
         .into_ns_record("books:main")
         .unwrap()
@@ -462,6 +620,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         }
         .into_ns_record("books:main")
         .unwrap();
@@ -489,6 +648,7 @@ mod tests {
             source_branch: Some("main".to_string()),
             branches: 3,
             storage_root: None,
+            config_version: None,
         };
 
         let record = response.into_ns_record("books:feature").unwrap();
@@ -531,6 +691,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         };
 
         let record = response.into_ns_record("books:main").unwrap();
@@ -554,6 +715,7 @@ mod tests {
             source_branch: None,
             branches: 0,
             storage_root: None,
+            config_version: None,
         };
 
         let record = response.into_ns_record("books").unwrap();

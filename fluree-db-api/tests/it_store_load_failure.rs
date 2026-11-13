@@ -55,7 +55,7 @@ impl BrokenStore {
         let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
         let bytes = store.get(root_id).await.unwrap();
         let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
-        let digest = root.dict_refs.subject_reverse.branch.digest_hex();
+        let digest = root.dict_refs.subject_reverse.branch.address_digest();
         let file = file_named(db, &digest).expect("the branch's file");
         let aside = file.with_extension("aside");
         std::fs::rename(&file, &aside).unwrap();

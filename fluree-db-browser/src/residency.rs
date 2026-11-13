@@ -74,6 +74,9 @@ struct Entry {
     bytes: Arc<[u8]>,
     last_use: u64,
     pins: u32,
+    /// Held across an [`invalidate`](ResidencyTier::invalidate): a miss to
+    /// every reader, kept only while a query may still hold it.
+    stale: bool,
 }
 
 struct Inner {
@@ -214,14 +217,14 @@ impl ResidencyTier {
         let mut inner = self.lock();
         inner.clock += 1;
         let tick = inner.clock;
-        let entry = inner.entries.get_mut(id)?;
+        let entry = inner.entries.get_mut(id).filter(|e| !e.stale)?;
         entry.last_use = tick;
         Some(Arc::clone(&entry.bytes))
     }
 
     /// Whether `id` is resident (does not touch LRU order).
     pub fn contains(&self, id: &ContentId) -> bool {
-        self.lock().entries.contains_key(id)
+        self.lock().entries.get(id).is_some_and(|e| !e.stale)
     }
 
     /// Make verified bytes resident, evicting least-recently-used unpinned
@@ -236,7 +239,19 @@ impl ResidencyTier {
 
         if let Some(existing) = inner.entries.get_mut(&id) {
             existing.last_use = tick;
-            return Ok(Arc::clone(&existing.bytes));
+            if !existing.stale {
+                return Ok(Arc::clone(&existing.bytes));
+            }
+            // A pinned stale entry takes the fresh bytes in place, keeping
+            // its pins; an unpinned one goes, and the insert goes on.
+            if existing.pins > 0 {
+                let old = std::mem::replace(&mut existing.bytes, Arc::clone(&bytes)).len();
+                existing.stale = false;
+                inner.total = inner.total - old + size;
+                inner.pinned_total = inner.pinned_total - old + size;
+                return Ok(bytes);
+            }
+            inner.total -= inner.entries.remove(&id).map_or(0, |e| e.bytes.len());
         }
         if size > self.budget {
             return Err(ResidencyError::ObjectExceedsBudget {
@@ -271,6 +286,7 @@ impl ResidencyTier {
                 bytes: Arc::clone(&bytes),
                 last_use: tick,
                 pins: 0,
+                stale: false,
             },
         );
         Ok(bytes)
@@ -363,6 +379,17 @@ impl ResidencyTier {
             self.released.notify_waiters();
         }
         removed
+    }
+
+    /// Hold nothing as resident from here on: the content its CIDs name
+    /// changed in place (an erasure, a purge). Every entry reads as a miss;
+    /// those a query may still hold stay until they can go, or until a
+    /// fresh insert takes their place.
+    pub fn invalidate(&self) {
+        for entry in self.lock().entries.values_mut() {
+            entry.stale = true;
+        }
+        self.clear_unpinned();
     }
 
     /// Drop every entry that is neither pinned nor possibly observed by an
@@ -684,6 +711,37 @@ mod tests {
         assert!(!tier.contains(&b));
         assert_eq!(tier.stats().bytes, 8);
         assert!(!tier.remove(&a), "pinned entries cannot be removed");
+    }
+
+    /// Invalidated entries read as misses at once. One a query pinned stays
+    /// until a fresh insert under its CID takes its place, keeping the pin;
+    /// the rest go.
+    #[test]
+    fn invalidated_entries_are_misses_until_replaced() {
+        let tier = Arc::new(ResidencyTier::new(64));
+        let (a, ab) = blob(1, 8);
+        let (b, bb) = blob(2, 8);
+        tier.insert(a.clone(), ab).unwrap();
+        tier.insert(b.clone(), bb.clone()).unwrap();
+        let pins = tier.pin_set();
+        pins.pin(&a);
+        tier.invalidate();
+        assert!(tier.resolve(&a).is_none() && !tier.contains(&a));
+        assert!(tier.resolve(&b).is_none());
+        assert_eq!(tier.stats().bytes, 8, "only the pinned entry stays");
+
+        // What an erased commit's CID now reads as.
+        let fresh: Arc<[u8]> = Arc::from(vec![9u8; 6]);
+        assert_eq!(
+            &*tier.insert(a.clone(), Arc::clone(&fresh)).unwrap(),
+            &*fresh
+        );
+        assert_eq!(&*tier.resolve(&a).unwrap(), &*fresh);
+        assert_eq!((tier.stats().bytes, tier.stats().pinned_bytes), (6, 6));
+        drop(pins);
+        assert_eq!(tier.stats().pinned_entries, 0);
+        tier.insert(b.clone(), bb).unwrap();
+        assert!(tier.contains(&b));
     }
 
     /// H-1 regression (the bricking scenario): a tier filled to budget by

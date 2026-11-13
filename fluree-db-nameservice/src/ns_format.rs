@@ -214,6 +214,8 @@ impl NsFileV2 {
             storage_root: None,
             fence: self.fence,
             frozen: self.status == STATUS_FROZEN,
+            erasure_generation: 0,
+            config_version: self.config_v,
         };
         // READ-TIME merge rule: the index file wins at equal or higher t.
         if let Some(index_data) = index_file.filter(|f| f.fence == record.fence) {
@@ -284,6 +286,14 @@ impl NsFileV2 {
             cid: Some(id.to_string()),
             t: snapshot.index_t,
         });
+    }
+}
+
+/// The index a reset to `snapshot` leaves, written over a newer one.
+pub(crate) fn snapshot_index(snapshot: &crate::NsRecordSnapshot) -> IndexRef {
+    IndexRef {
+        cid: snapshot.index_head_id.as_ref().map(ToString::to_string),
+        t: snapshot.index_t,
     }
 }
 

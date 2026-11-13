@@ -437,7 +437,7 @@ fn meta_data_rows(
 /// Mirror of the runtime-stats flake filter: commit metadata and txn-meta
 /// graph flakes are not part of the user's property graph.
 fn meta_include(flake: &fluree_db_core::Flake) -> bool {
-    if flake.s.namespace_code == fluree_vocab::namespaces::FLUREE_COMMIT {
+    if fluree_db_core::commit_subject::is_commit_sid(&flake.s) {
         return false;
     }
     if let Some(g) = &flake.g {

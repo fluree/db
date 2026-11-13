@@ -73,6 +73,8 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
                 read_ledgers: [id("allowed:main")].into(),
                 write_all: false,
                 write_ledgers: [id("allowed:main")].into(),
+                audit_all: false,
+                audit_ledgers: Default::default(),
                 expires_unix: u64::MAX,
                 policy_authorization: authorization,
             };
