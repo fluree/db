@@ -4361,9 +4361,9 @@ impl FlureeR2rmlProvider<'_> {
     /// LIST the root once (session-cached, one LIST per build) and match THIS
     /// table's own `<name>.<suffix>/` (or bare `<name>/`) directory beneath it,
     /// case-insensitively on the name part. A root laid out by namespace
-    /// (`<root>/<namespace>/<table>`) is searched there first, so same-named
-    /// tables in different namespaces stay distinct; a root with no directory
-    /// for the namespace is matched flat. Ambiguity or a miss fails loud, naming
+    /// (`<root>/<namespace>/<table>`, or `<namespace>.db/`) is searched there
+    /// and only there, so same-named tables in different namespaces stay
+    /// distinct; a root with no directory for the namespace is matched flat. Ambiguity or a miss fails loud, naming
     /// the candidates. Otherwise (a single-table direct location) returns
     /// `table_location` unchanged, so the caller's resolution is byte-identical.
     ///
