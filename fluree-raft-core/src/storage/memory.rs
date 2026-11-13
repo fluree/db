@@ -233,6 +233,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_purge_drops_exactly_the_purged_entries() {
+        let store = MemoryRaftLogStore::new();
+        assert_eq!(store.seal().await.unwrap(), None);
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        assert_eq!(store.seal().await.unwrap(), Some(3));
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn discard_superseded_keeps_only_the_current_snapshot() {
+        let store = MemoryRaftSnapshotStore::new();
+        for id in ["snap-1", "snap-2"] {
+            let meta = SnapshotMeta {
+                id: SnapshotId::new(id),
+                last_applied: None,
+                membership: vec![],
+            };
+            store.write(&meta, id.as_bytes().to_vec()).await.unwrap();
+        }
+        store.discard_superseded().await.unwrap();
+        assert_eq!(store.read(&SnapshotId::new("snap-1")).await.unwrap(), None);
+        assert_eq!(
+            store.read(&SnapshotId::new("snap-2")).await.unwrap(),
+            Some(b"snap-2".to_vec())
+        );
+    }
+
+    #[tokio::test]
     async fn read_range_past_end_is_partial() {
         let store = MemoryRaftLogStore::new();
         store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();

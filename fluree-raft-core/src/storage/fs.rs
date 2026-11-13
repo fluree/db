@@ -1347,6 +1347,135 @@ mod tests {
             .unwrap()
     }
 
+    const SECRET: &[u8] = b"secret-0b7e41";
+
+    fn secret_entry(term: u64, index: u64) -> LogEntry {
+        LogEntry {
+            log_id: LogId::new(term, index),
+            payload: SECRET.to_vec(),
+        }
+    }
+
+    /// Every file under `root` whose bytes contain `needle`.
+    fn files_holding(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    async fn live_indexes(store: &FsRaftLogStore) -> Vec<u64> {
+        store
+            .read_range(0..u64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.log_id.index)
+            .collect()
+    }
+
+    /// Why `seal` exists: a purge unlinks only whole segments, so the
+    /// segment that took appends past the purge point keeps every entry
+    /// below it on disk.
+    #[tokio::test]
+    async fn a_purge_keeps_the_bytes_of_the_segment_it_lands_in() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[secret_entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+
+        assert_eq!(live_indexes(&store).await, [3]);
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(1));
+        assert!(!files_holding(dir.path(), SECRET).is_empty());
+    }
+
+    /// The same sequence with a seal before the later append.
+    #[tokio::test]
+    async fn a_purge_through_a_sealed_tail_unlinks_its_segment() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[secret_entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        assert_eq!(store.seal().await.unwrap(), Some(2));
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+
+        assert_eq!(live_indexes(&store).await, [3]);
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(3));
+        assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
+    }
+
+    /// A seal is not persisted: the segment after it continues the
+    /// sealed one, so the log reopens whole, and the reopened tail
+    /// takes appends again.
+    #[tokio::test]
+    async fn a_sealed_segment_and_its_successor_reopen_as_one_log() {
+        let (dir, store) = fresh_log_store().await;
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+        store.seal().await.unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 2);
+        drop(store);
+
+        let store = reopen(&dir).await;
+        assert_eq!(live_indexes(&store).await, [1, 2, 3]);
+        store.append(&[entry(1, 4)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sealing_an_empty_log_reports_no_tail() {
+        let (_dir, store) = fresh_log_store().await;
+        assert_eq!(store.seal().await.unwrap(), None);
+        assert_eq!(store.first_retained_index().await.unwrap(), None);
+        store.append(&[entry(1, 1)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 1);
+    }
+
+    /// A truncation into a sealed segment shortens it in place; the
+    /// replacement entries still go to a new segment, which a purge
+    /// through the shortened one leaves alone.
+    #[tokio::test]
+    async fn entries_replacing_a_truncated_sealed_tail_start_a_new_segment() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        store.seal().await.unwrap();
+        store.truncate_from(3).await.unwrap();
+        store.append(&[entry(2, 3)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 2);
+
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(3));
+        drop(store);
+
+        let store = reopen(&dir).await;
+        let live = store.read_range(0..u64::MAX).await.unwrap();
+        assert_eq!(
+            live.iter().map(|e| e.log_id).collect::<Vec<_>>(),
+            [LogId::new(2, 3)]
+        );
+    }
+
     /// Simulates a crash mid-`truncate_from` across segments: the later
     /// segment was removed but the one holding the cut was not yet
     /// shortened. The surviving log must be a contiguous prefix — no
@@ -1945,6 +2074,93 @@ mod tests {
         // The new snapshot itself is intact.
         let (current_meta, _) = store.current().await.unwrap().unwrap();
         assert_eq!(current_meta.id, SnapshotId::new("snap-1"));
+    }
+
+    fn snapshot_meta(id: &str) -> SnapshotMeta {
+        SnapshotMeta {
+            id: SnapshotId::new(id),
+            last_applied: Some(LogId::new(1, 5)),
+            membership: vec![],
+        }
+    }
+
+    fn snapshot_dir_names(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("snapshots"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Orphans a failed reclamation left behind are removed by the
+    /// next `discard_superseded`, and the current snapshot survives.
+    #[tokio::test]
+    async fn discard_superseded_keeps_only_the_current_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .write(&snapshot_meta("snap-2"), vec![2])
+            .await
+            .unwrap();
+        let snapshots = dir.path().join("snapshots");
+        std::fs::write(snapshots.join("snap-1.meta"), b"orphan").unwrap();
+        std::fs::write(snapshots.join("snap-1.data"), b"orphan").unwrap();
+        std::fs::write(snapshots.join("current.tmp"), b"orphan").unwrap();
+
+        store.discard_superseded().await.unwrap();
+
+        assert_eq!(
+            snapshot_dir_names(&dir),
+            ["current", "snap-2.data", "snap-2.meta"]
+        );
+        let (meta, data) = store.current().await.unwrap().unwrap();
+        assert_eq!((meta.id, data), (SnapshotId::new("snap-2"), vec![2]));
+    }
+
+    /// Snapshot files with no `current` pointer are unreachable.
+    #[tokio::test]
+    async fn discard_superseded_without_a_current_snapshot_removes_every_one() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let snapshots = dir.path().join("snapshots");
+        std::fs::write(snapshots.join("snap-9.meta"), b"orphan").unwrap();
+        std::fs::write(snapshots.join("snap-9.data"), b"orphan").unwrap();
+
+        store.discard_superseded().await.unwrap();
+
+        assert_eq!(snapshot_dir_names(&dir), Vec::<String>::new());
+        assert!(store.current().await.unwrap().is_none());
+    }
+
+    /// A removal that fails fails `discard_superseded`, but only warns
+    /// after a write, whose snapshot is already durable and current.
+    #[tokio::test]
+    async fn a_superseded_snapshot_that_cannot_be_removed_fails_only_the_discard() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        std::fs::create_dir(dir.path().join("snapshots").join("snap-1.data")).unwrap();
+
+        store
+            .write(&snapshot_meta("snap-2"), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.current().await.unwrap().unwrap().0.id,
+            SnapshotId::new("snap-2")
+        );
+        let err = store
+            .discard_superseded()
+            .await
+            .expect_err("an unremovable superseded file");
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
     }
 
     #[test]
