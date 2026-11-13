@@ -391,6 +391,7 @@ pub async fn resolve_incremental_commits_v6(
     let (walked_commits, t_walk_chain_ms) = {
         let t0 = Instant::now();
         let commits = walk_commit_chain_since(cs.as_ref(), &config).await?;
+        refuse_base_off_the_line(&commits, &subject_tree)?;
         (commits, t0.elapsed().as_millis() as u64)
     };
 
@@ -1410,6 +1411,54 @@ fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &Con
         .all(|(expected, (t, _))| *t == expected)
 }
 
+/// Refuse to extend a base index that does not hold the commit the walk
+/// starts after: the head's line at the base's `t`. An index of a line a
+/// rebase replaced does not, and extending it would mix the two lines. The
+/// build falls back to a full rebuild, which reads the head's line alone.
+fn refuse_base_off_the_line(
+    walked: &[WalkedCommit],
+    subject_tree: &DictTreeReader,
+) -> Result<(), IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    let Some(oldest) = walked.first() else {
+        return Ok(());
+    };
+    let envelope = read_commit_envelope(&oldest.bytes).map_err(|e| {
+        IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", oldest.cid))
+    })?;
+    let Some(base) = envelope.parents.first() else {
+        return Ok(());
+    };
+    let key = subject_reverse_key(
+        fluree_vocab::namespaces::FLUREE_COMMIT,
+        base.digest_hex().as_bytes(),
+    );
+    match subject_tree.reverse_lookup(&key) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(IncrementalResolveError::CommitChain(format!(
+            "the base index does not hold commit {base}, which the head's line has at \
+             its t: it indexes another line"
+        ))),
+        Err(e) => Err(IncrementalResolveError::Io(e)),
+    }
+}
+
+/// Whether each commit's first parent is the commit before it. The
+/// commit-CID index can hold entries a rebase replaced below its new head, so
+/// a range that covers every `t` up to the head is not yet the head's line.
+fn first_parent_linked(walked: &[WalkedCommit]) -> Result<bool, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    for pair in walked.windows(2) {
+        let envelope = read_commit_envelope(&pair[1].bytes).map_err(|e| {
+            IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", pair[1].cid))
+        })?;
+        if envelope.parents.first() != Some(&pair[0].cid) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 async fn walk_commit_chain_since(
     cs: &dyn ContentStore,
     config: &IncrementalResolveConfig,
@@ -1483,7 +1532,14 @@ async fn walk_commit_chain_since(
                 elapsed_ms = walk_started.elapsed().as_millis() as u64,
                 "V6 incremental resolve: commit-chain walk complete (fast path: commit-index)"
             );
-            return Ok(commits);
+            if first_parent_linked(&commits)? {
+                return Ok(commits);
+            }
+            tracing::debug!(
+                from_t,
+                head = %head_id,
+                "commit-index entries are not one first-parent line; falling back to serial DAG walk"
+            );
         }
 
         tracing::debug!(

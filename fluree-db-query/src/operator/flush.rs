@@ -25,12 +25,19 @@ pub(crate) const FLUSH_GROWTH: usize = 8;
 pub(crate) struct FlushSchedule {
     size: usize,
     cap: usize,
+    /// A first window taken in steps (see [`Self::budgeted_in_steps`]): the
+    /// rows of it left after the current step, and its whole size.
+    stepped_first: Option<(usize, usize)>,
 }
 
 impl FlushSchedule {
     /// Every window at `cap`.
     pub(crate) fn fixed(cap: usize) -> Self {
-        Self { size: cap, cap }
+        Self {
+            size: cap,
+            cap,
+            stepped_first: None,
+        }
     }
 
     /// First window at [`MIN_FLUSH`]. For lanes whose probe costs the same in
@@ -39,6 +46,7 @@ impl FlushSchedule {
         Self {
             size: MIN_FLUSH.min(cap),
             cap,
+            stepped_first: None,
         }
     }
 
@@ -48,6 +56,7 @@ impl FlushSchedule {
         Self {
             size: initial.max(1).min(cap),
             cap,
+            stepped_first: None,
         }
     }
 
@@ -57,6 +66,34 @@ impl FlushSchedule {
         Self {
             size: budget.clamp(MIN_FLUSH.min(cap), cap),
             cap,
+            stepped_first: None,
+        }
+    }
+
+    /// [`Self::budgeted`]'s windows, the first of them taken in steps that
+    /// open at the budget and widen geometrically. For lanes whose probe
+    /// reads only what its inputs match, so a narrow step costs little: a
+    /// `LIMIT` its first few inputs meet stops there, and every window
+    /// `budgeted` would end still ends, so no input is read that `budgeted`
+    /// would have left unread.
+    pub(crate) fn budgeted_in_steps(budget: usize, cap: usize) -> Self {
+        let first = budget.clamp(MIN_FLUSH.min(cap), cap);
+        let size = Self::first_window_step(budget.max(1), first);
+        Self {
+            size,
+            cap,
+            stepped_first: Some((first - size, first)),
+        }
+    }
+
+    /// The next step through the `rest` of a stepped first window: `step`
+    /// rows, or all of `rest` when the tail `step` would leave is under an
+    /// eighth of it and not worth a flush of its own.
+    fn first_window_step(step: usize, rest: usize) -> usize {
+        if rest <= step || rest - step < step / FLUSH_GROWTH {
+            rest
+        } else {
+            step
         }
     }
 
@@ -66,7 +103,17 @@ impl FlushSchedule {
 
     /// Widen the next window; call after each flush.
     pub(crate) fn advance(&mut self) {
-        self.size = self.size.saturating_mul(FLUSH_GROWTH).min(self.cap);
+        let step = self.size.saturating_mul(FLUSH_GROWTH);
+        self.size = match self.stepped_first.take() {
+            Some((rest, first)) if rest > 0 => {
+                let size = Self::first_window_step(step, rest);
+                self.stepped_first = Some((rest - size, first));
+                size
+            }
+            // The stepped first window is spent: go on as `budgeted` would.
+            Some((_, first)) => first.saturating_mul(FLUSH_GROWTH).min(self.cap),
+            None => step.min(self.cap),
+        };
     }
 
     /// Size the next window for a row budget from the yield so far: `seen`
@@ -182,6 +229,40 @@ mod tests {
         assert_eq!(FlushSchedule::budgeted(10, 100_000).size(), MIN_FLUSH);
         assert_eq!(FlushSchedule::budgeted(5000, 100_000).size(), 5000);
         assert_eq!(FlushSchedule::budgeted(usize::MAX, 100_000).size(), 100_000);
+    }
+
+    #[test]
+    fn a_stepped_first_window_ends_where_the_budgeted_one_does() {
+        assert_eq!(
+            sizes(FlushSchedule::budgeted_in_steps(1, 100_000), 8),
+            [1, 8, 64, 512, 439, 8192, 65_536, 100_000]
+        );
+        assert_eq!(
+            sizes(FlushSchedule::budgeted_in_steps(100, 100_000), 5),
+            [100, 800, 124, 8192, 65_536]
+        );
+        assert_eq!(
+            sizes(FlushSchedule::budgeted_in_steps(0, 100_000), 2),
+            [1, 8]
+        );
+        // A step takes a short tail with it.
+        assert_eq!(
+            sizes(FlushSchedule::budgeted_in_steps(113, 100_000), 3),
+            [113, 911, 8192]
+        );
+        // A budget that all but fills the first window leaves nothing to
+        // step through.
+        for budget in [1000, 1024, 5000, usize::MAX] {
+            assert_eq!(
+                sizes(FlushSchedule::budgeted_in_steps(budget, 100_000), 4),
+                sizes(FlushSchedule::budgeted(budget, 100_000), 4),
+                "budget {budget}"
+            );
+        }
+        assert_eq!(
+            sizes(FlushSchedule::budgeted_in_steps(10, 100), 4),
+            [10, 80, 10, 100]
+        );
     }
 
     #[test]

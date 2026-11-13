@@ -9,9 +9,12 @@ use fluree_graph_ir::{Graph, Term, Triple};
 use crate::error::{R2rmlError, R2rmlResult};
 use crate::mapping::{
     ConstantValue, GraphMap, JoinCondition, LogicalTable, ObjectMap, PredicateMap,
-    PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    PredicateObjectMap, RefObjectMap, SubjectMap, TableKeys, TermType, TriplesMap,
 };
 use crate::vocab::R2RML;
+
+/// `f:key`, as the property an error names.
+const F_KEY: &str = "f:key";
 
 /// Extracts R2RML mappings from a Graph IR
 pub struct MappingExtractor<'a> {
@@ -72,7 +75,38 @@ impl<'a> MappingExtractor<'a> {
             }
         }
 
+        self.ensure_keys_on_logical_tables(&triples_maps)?;
+
         Ok(triples_maps)
+    }
+
+    /// Refuse an `f:key` anywhere but on a triples map's logical table: it
+    /// says nothing there, and a key the author meant for a table but wrote
+    /// on its subject map (say) would otherwise be dropped without a word.
+    fn ensure_keys_on_logical_tables(&self, triples_maps: &[TriplesMap]) -> R2rmlResult<()> {
+        let logical_tables: HashSet<&str> = triples_maps
+            .iter()
+            .flat_map(|tm| self.get_triples_for_subject(&tm.iri))
+            .filter(|t| t.p.as_iri() == Some(R2RML::LOGICAL_TABLE))
+            .filter_map(|t| node_key(&t.o))
+            .collect();
+        for triple in self.graph.iter() {
+            if triple.p.as_iri() != Some(fluree_vocab::fluree::KEY) {
+                continue;
+            }
+            if !node_key(&triple.s).is_some_and(|k| logical_tables.contains(k)) {
+                return Err(R2rmlError::InvalidValue {
+                    property: F_KEY.to_string(),
+                    message: format!(
+                        "f:key on {}, which is not the logical table of any triples map. \
+                         Declare a key on the rr:logicalTable node: \
+                         rr:logicalTable [ rr:tableName \"...\" ; f:key ( \"column\" ) ].",
+                        describe_term(&triple.s)
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Reject a TriplesMap IRI that carries more than one logical table or
@@ -116,12 +150,159 @@ impl<'a> MappingExtractor<'a> {
         // Extract predicate-object maps
         let poms = self.extract_predicate_object_maps(&triples)?;
 
+        let declared_keys = self.extract_declared_keys(&triples, &logical_table)?;
+
         Ok(TriplesMap {
             iri: tm_iri.to_string(),
             logical_table,
             subject_map,
             predicate_object_maps: poms,
+            declared_keys,
         })
+    }
+
+    /// The keys declared on a triples map's logical table: each `f:key` an
+    /// `rdf:List` of one or more column-name strings, one list per key.
+    ///
+    /// Refused, rather than read as no key: an `f:key` that is not a list, an
+    /// empty list, an item that is not a plain string, a column named twice
+    /// in one key, and any other predicate in the `f:` namespace on the
+    /// logical table (a misspelled `f:key` would otherwise be ignored, and
+    /// the table read as keyless without a word). Other predicates on the
+    /// logical table are ignored, as always.
+    fn extract_declared_keys(
+        &self,
+        triples: &[&Triple],
+        logical_table: &LogicalTable,
+    ) -> R2rmlResult<TableKeys> {
+        let Some(table_node) = self.find_object_optional(triples, R2RML::LOGICAL_TABLE) else {
+            return Ok(TableKeys::none());
+        };
+        let table = describe_logical_table(logical_table);
+        let invalid = |message: String| R2rmlError::InvalidValue {
+            property: F_KEY.to_string(),
+            message: format!("on the logical table {table}: {message}"),
+        };
+
+        let mut lists: Vec<Vec<Term>> = Vec::new();
+        // The list being read from indexed list items (the parser's default
+        // shape for a collection): its items arrive in order, index 0 first.
+        let mut open: Option<Vec<Term>> = None;
+        for triple in self.get_triples_for_term(&table_node) {
+            let Some(p) = triple.p.as_iri() else { continue };
+            if p != fluree_vocab::fluree::KEY {
+                if p.starts_with(fluree_vocab::fluree::DB) {
+                    return Err(R2rmlError::InvalidValue {
+                        property: p.to_string(),
+                        message: format!(
+                            "unknown Fluree term on the logical table {table}; the only one a \
+                             logical table takes is f:key ({})",
+                            fluree_vocab::fluree::KEY
+                        ),
+                    });
+                }
+                continue;
+            }
+            match triple.list_index {
+                Some(0) => {
+                    lists.extend(open.take());
+                    open = Some(vec![triple.o.clone()]);
+                }
+                Some(i) => {
+                    match open.as_mut() {
+                        Some(items) if usize::try_from(i).ok() == Some(items.len()) => {
+                            items.push(triple.o.clone());
+                        }
+                        _ => return Err(invalid(
+                            "its list items are out of order, so the lists cannot be told apart"
+                                .to_string(),
+                        )),
+                    }
+                }
+                None => {
+                    lists.extend(open.take());
+                    lists.push(self.rdf_list_items(&triple.o).map_err(invalid)?);
+                }
+            }
+        }
+        lists.extend(open);
+
+        let mut keys = Vec::with_capacity(lists.len());
+        for items in lists {
+            if items.is_empty() {
+                return Err(invalid(
+                    "the list is empty; a key names one or more columns".to_string(),
+                ));
+            }
+            let mut columns: Vec<String> = Vec::with_capacity(items.len());
+            for item in &items {
+                let column = match item {
+                    Term::Literal {
+                        value: fluree_graph_ir::LiteralValue::String(s),
+                        datatype,
+                        language: None,
+                    } if datatype.is_xsd_string() && !s.is_empty() => s.to_string(),
+                    other => {
+                        return Err(invalid(format!(
+                            "a key's items are column names as plain strings, got {}",
+                            describe_term(other)
+                        )))
+                    }
+                };
+                if columns.contains(&column) {
+                    return Err(invalid(format!(
+                        "column \"{column}\" appears twice in one key"
+                    )));
+                }
+                columns.push(column);
+            }
+            keys.push(columns);
+        }
+        Ok(TableKeys::new(keys))
+    }
+
+    /// The items of the `rdf:List` whose head is `head`, read off its
+    /// `rdf:first` / `rdf:rest` spine. An error says why `head` is not one.
+    fn rdf_list_items(&self, head: &Term) -> Result<Vec<Term>, String> {
+        let mut items = Vec::new();
+        let mut node = head.clone();
+        let mut visited: HashSet<String> = HashSet::new();
+        loop {
+            if node.as_iri() == Some(fluree_vocab::rdf::NIL) {
+                return Ok(items);
+            }
+            let Term::BlankNode(id) = &node else {
+                return Err(format!(
+                    "expected a list of column names, as in f:key ( \"column\" ), got {}",
+                    describe_term(head)
+                ));
+            };
+            if !visited.insert(id.as_str().to_string()) {
+                return Err("the list does not end (its rdf:rest loops)".to_string());
+            }
+            let spine = self.get_triples_for_term(&node);
+            let firsts = self.find_objects(&spine, fluree_vocab::rdf::FIRST);
+            let rests = self.find_objects(&spine, fluree_vocab::rdf::REST);
+            match (firsts.as_slice(), rests.as_slice()) {
+                ([first], [rest]) => {
+                    items.push(first.clone());
+                    node = rest.clone();
+                }
+                _ if items.is_empty() && firsts.is_empty() && rests.is_empty() => {
+                    return Err(format!(
+                        "expected a list of column names, as in f:key ( \"column\" ), got {}",
+                        describe_term(head)
+                    ));
+                }
+                _ => {
+                    return Err(
+                        "the list is malformed (a node without exactly one rdf:first and one \
+                         rdf:rest)"
+                            .to_string(),
+                    )
+                }
+            }
+        }
     }
 
     /// Extract the logical table from a TriplesMap
@@ -136,12 +317,26 @@ impl<'a> MappingExtractor<'a> {
         if let Some(table_name) = self.find_object_optional(&table_triples, R2RML::TABLE_NAME) {
             if let Some(name) = self.term_to_string(&table_name) {
                 let normalized = LogicalTable::normalize_table_name(&name);
+                // An `rr:sqlQuery` map stands in for its table by an alias with
+                // this prefix, and every reader tells the two apart by it, so a
+                // table named that way would be read as a query's alias.
+                if LogicalTable::is_sql_query_alias(&normalized) {
+                    return Err(R2rmlError::InvalidValue {
+                        property: "rr:tableName".to_string(),
+                        message: format!(
+                            "\"{name}\" begins with \"{}\", which is reserved for the \
+                             aliases of rr:sqlQuery logical tables",
+                            crate::mapping::SQL_QUERY_ALIAS_PREFIX
+                        ),
+                    });
+                }
                 return Ok(LogicalTable::TableName(normalized));
             }
         }
 
-        // rr:sqlQuery — scanned as a derived table by SQL graph sources;
-        // Iceberg-backed sources refuse the alias at registration.
+        // rr:sqlQuery — scanned as a derived table by SQL graph sources, and
+        // evaluated in a restricted form by Iceberg sources; Delta sources
+        // refuse it.
         if let Some(query) = self.find_object_optional(&table_triples, R2RML::SQL_QUERY) {
             if let Some(sql) = self.term_to_string(&query) {
                 if sql.trim().is_empty() {
@@ -666,6 +861,24 @@ fn constant_graph(iri: String) -> Option<GraphMap> {
         None
     } else {
         Some(GraphMap::constant(iri))
+    }
+}
+
+/// The key the subject index files a node under (an IRI, or a blank node's
+/// label), or `None` for a literal, which is never a subject.
+fn node_key(term: &Term) -> Option<&str> {
+    match term {
+        Term::Iri(iri) => Some(iri),
+        Term::BlankNode(blank) => Some(blank.as_str()),
+        Term::Literal { .. } => None,
+    }
+}
+
+/// A logical table, for an error message.
+fn describe_logical_table(table: &LogicalTable) -> String {
+    match table {
+        LogicalTable::TableName(name) => format!("\"{name}\""),
+        LogicalTable::SqlQuery { sql, .. } => format!("rr:sqlQuery \"{}\"", sql.trim()),
     }
 }
 
@@ -1289,5 +1502,233 @@ mod tests {
         let triples_maps = extractor.extract_all().unwrap();
 
         assert_eq!(triples_maps[0].table_name(), Some("namespace.table"));
+    }
+
+    // ------------------------------------------------------------------
+    // f:key: declared keys of a logical table.
+    // ------------------------------------------------------------------
+
+    /// A one-map mapping whose logical table carries `table_extra` after its
+    /// table name, and whose subject map carries `subject_extra`.
+    fn keyed_mapping(table_extra: &str, subject_extra: &str) -> String {
+        format!(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "sets.customers_current" {table_extra} ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{{customer_id}}" {subject_extra} ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        "#
+        )
+    }
+
+    fn declared(tm: &TriplesMap) -> Vec<Vec<String>> {
+        tm.declared_keys.iter().map(<[String]>::to_vec).collect()
+    }
+
+    fn strings(keys: &[&[&str]]) -> Vec<Vec<String>> {
+        keys.iter()
+            .map(|k| k.iter().map(ToString::to_string).collect())
+            .collect()
+    }
+
+    #[test]
+    fn f_key_declares_a_key_of_the_logical_table() {
+        let tms = extract(&keyed_mapping(r#"; f:key ( "customer_id" )"#, "")).unwrap();
+        assert_eq!(declared(&tms[0]), strings(&[&["customer_id"]]));
+    }
+
+    #[test]
+    fn no_f_key_declares_no_key_and_serializes_as_before() {
+        let tms = extract(&keyed_mapping("", "")).unwrap();
+        assert!(tms[0].declared_keys.is_empty());
+        // The field is skipped when empty: a keyless map serializes (and so
+        // hashes for its twin) exactly as before keys could be declared.
+        let json = serde_json::to_value(&tms[0]).unwrap();
+        assert!(json.get("declared_keys").is_none(), "{json}");
+        // ... and a serialized keyed map reads back with its keys.
+        let keyed = extract(&keyed_mapping(r#"; f:key ( "customer_id" )"#, "")).unwrap();
+        let json = serde_json::to_string(&keyed[0]).unwrap();
+        let back: TriplesMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.declared_keys, keyed[0].declared_keys);
+    }
+
+    #[test]
+    fn f_key_lists_are_composite_and_repeatable() {
+        // A composite key is one list; each list is an alternative key.
+        let tms = extract(&keyed_mapping(
+            r#"; f:key ( "valid_from" "customer_id" ), ( "row_id" ) ; f:key ( "email" )"#,
+            "",
+        ))
+        .unwrap();
+        assert_eq!(
+            declared(&tms[0]),
+            strings(&[&["customer_id", "valid_from"], &["email"], &["row_id"]])
+        );
+    }
+
+    #[test]
+    fn f_key_reads_the_same_from_an_rdf_list_spine() {
+        // A graph parsed with collections as rdf:first/rdf:rest spines (what
+        // a conformant parser or another producer hands `from_graph`) holds
+        // the same keys as the indexed list items `from_turtle` reads.
+        let ttl = keyed_mapping(
+            r#"; f:key ( "valid_from" "customer_id" ), ( "row_id" ) ; f:key ( "email" )"#,
+            "",
+        );
+        let mut sink = GraphCollectorSink::new();
+        fluree_graph_turtle::parse_with_options(
+            &ttl,
+            &mut sink,
+            fluree_graph_turtle::ParserOptions::new()
+                .with_collections(fluree_graph_turtle::CollectionStyle::Spine),
+        )
+        .unwrap();
+        let graph = sink.into_graph();
+        let spine = MappingExtractor::new(&graph).extract_all().unwrap();
+        let indexed = extract(&ttl).unwrap();
+        assert_eq!(declared(&spine[0]), declared(&indexed[0]));
+        assert_eq!(declared(&spine[0]).len(), 3);
+    }
+
+    #[test]
+    fn f_key_on_a_query_backed_logical_table_is_accepted() {
+        let tms = extract(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [
+                    rr:sqlQuery "SELECT * FROM sets.customers_history WHERE is_current = 1" ;
+                    f:key ( "customer_id" )
+                ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] .
+        "#,
+        )
+        .unwrap();
+        assert_eq!(declared(&tms[0]), strings(&[&["customer_id"]]));
+        assert!(tms[0].sql_query().is_some());
+    }
+
+    #[test]
+    fn f_key_on_a_shared_logical_table_node_applies_to_every_map_reading_it() {
+        let tms = extract(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/> .
+            <http://example.org/mapping#Customers> rr:tableName "sets.customers_current" ;
+                f:key ( "customer_id" ) .
+            <http://example.org/mapping#A> a rr:TriplesMap ;
+                rr:logicalTable <http://example.org/mapping#Customers> ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] .
+            <http://example.org/mapping#B> a rr:TriplesMap ;
+                rr:logicalTable <http://example.org/mapping#Customers> ;
+                rr:subjectMap [ rr:template "http://example.org/account/{customer_id}" ] .
+        "#,
+        )
+        .unwrap();
+        assert_eq!(tms.len(), 2);
+        for tm in &tms {
+            assert_eq!(declared(tm), strings(&[&["customer_id"]]), "{}", tm.iri);
+        }
+    }
+
+    /// The message of an `f:key` refusal, or panic saying what came back.
+    fn f_key_refusal(r2rml: &str) -> String {
+        let (property, message) = invalid_value(r2rml);
+        assert_eq!(property, "f:key", "{message}");
+        message
+    }
+
+    #[test]
+    fn refuses_an_f_key_that_is_not_a_list() {
+        for (value, shows) in [
+            (r#""customer_id""#, r#"literal "customer_id""#),
+            ("ex:customer_id", "IRI <http://example.org/customer_id>"),
+            ("[ ]", "a blank node"),
+        ] {
+            let msg = f_key_refusal(&keyed_mapping(&format!("; f:key {value}"), ""));
+            assert!(
+                msg.contains("expected a list of column names") && msg.contains(shows),
+                "{value}: {msg}"
+            );
+            assert!(
+                msg.contains("\"sets.customers_current\""),
+                "names the table: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_empty_f_key() {
+        let msg = f_key_refusal(&keyed_mapping("; f:key ( )", ""));
+        assert!(msg.contains("the list is empty"), "{msg}");
+    }
+
+    #[test]
+    fn refuses_an_f_key_item_that_is_not_a_plain_string() {
+        for (item, shows) in [
+            ("1", "literal \"1\""),
+            ("ex:customer_id", "IRI <http://example.org/customer_id>"),
+            (r#""customer_id"@en"#, r#"literal "customer_id""#),
+            (r#""""#, r#"literal """#),
+            (r#"( "customer_id" )"#, "a blank node"),
+        ] {
+            let msg = f_key_refusal(&keyed_mapping(&format!("; f:key ( {item} )"), ""));
+            assert!(
+                msg.contains("column names as plain strings") && msg.contains(shows),
+                "{item}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_column_named_twice_in_one_key() {
+        let msg = f_key_refusal(&keyed_mapping(
+            r#"; f:key ( "customer_id" "customer_id" )"#,
+            "",
+        ));
+        assert!(msg.contains("\"customer_id\" appears twice"), "{msg}");
+    }
+
+    #[test]
+    fn refuses_an_unknown_fluree_term_on_a_logical_table() {
+        // A misspelled f:key would otherwise read as a keyless table.
+        let (property, msg) = invalid_value(&keyed_mapping(r#"; f:keys ( "customer_id" )"#, ""));
+        assert_eq!(property, "https://ns.flur.ee/db#keys");
+        assert!(msg.contains("unknown Fluree term"), "{msg}");
+        // Terms from other namespaces are ignored, as always.
+        let tms = extract(&keyed_mapping(r#"; <http://example.org/note> "x""#, "")).unwrap();
+        assert!(tms[0].declared_keys.is_empty());
+    }
+
+    #[test]
+    fn refuses_f_key_off_a_logical_table() {
+        // On the subject map ...
+        let msg = f_key_refusal(&keyed_mapping("", r#"; f:key ( "customer_id" )"#));
+        assert!(
+            msg.contains("not the logical table of any triples map"),
+            "{msg}"
+        );
+        // ... and on the triples map itself.
+        let msg = f_key_refusal(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                f:key ( "customer_id" ) ;
+                rr:logicalTable [ rr:tableName "sets.customers_current" ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] .
+        "#,
+        );
+        assert!(
+            msg.contains("IRI <http://example.org/mapping#M>")
+                && msg.contains("not the logical table"),
+            "{msg}"
+        );
     }
 }

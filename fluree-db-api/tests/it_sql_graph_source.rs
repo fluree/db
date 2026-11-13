@@ -303,21 +303,38 @@ async fn sql_query_logical_table_is_scanned_as_a_derived_table() {
     );
 }
 
-/// The Iceberg-backed registration path refuses `rr:sqlQuery` up front.
+/// The Iceberg-backed registration path accepts an `rr:sqlQuery` only in the
+/// restricted subset an Iceberg source evaluates itself (one table, a
+/// conjunction of column comparisons), and refuses any other query up front,
+/// where a SQL source would hand it to its engine.
 #[tokio::test]
-async fn iceberg_sources_refuse_sql_query_mappings() {
+async fn iceberg_sources_refuse_sql_queries_outside_the_restricted_subset() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let config = fluree_db_api::R2rmlCreateConfig::new(
-        "ice",
-        "https://polaris.example.invalid",
-        "default.default",
-        ORDERS_SQLQUERY_R2RML,
-    );
-    let err = fluree
-        .create_r2rml_graph_source(config)
+    let config = |name: &str, mapping: String| {
+        fluree_db_api::R2rmlCreateConfig::new(
+            name,
+            "https://polaris.example.invalid",
+            "default.default",
+            mapping,
+        )
+    };
+    fluree
+        .create_r2rml_graph_source(config("ice", ORDERS_SQLQUERY_R2RML.to_string()))
         .await
-        .expect_err("rr:sqlQuery is not for Iceberg");
-    assert!(err.to_string().contains("rr:sqlQuery"), "{err}");
+        .expect("a query in the restricted subset registers");
+    let joined = ORDERS_SQLQUERY_R2RML.replace(
+        "WHERE status = 'open'",
+        "WHERE status = 'open' OR total > 100",
+    );
+    assert!(joined.contains(" OR "));
+    let err = fluree
+        .create_r2rml_graph_source(config("ice-or", joined))
+        .await
+        .expect_err("an OR is outside the subset an Iceberg source evaluates");
+    assert!(
+        err.to_string().contains("rr:sqlQuery") && err.to_string().contains("OR"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

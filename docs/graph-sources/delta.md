@@ -333,7 +333,24 @@ so a commit landing mid-query cannot split the result across two versions. Two
 tables of one source are each consistent, but are not a cross-table snapshot —
 Delta has no such thing.
 
+A query with no `ORDER BY` has no defined row order, and over a Delta source its
+rows arrive as the data files are read, so the order can differ from one run to
+the next even under a `LIMIT` or `OFFSET`. To page a Delta source, order by a
+unique key (`ORDER BY ?id`). (Iceberg sources keep a fixed order under a slice;
+see [Row order and paging](iceberg.md#row-order-and-paging).)
+
 ## Performance
+
+**Declare the table's keys.** A Delta table reports no key of its own, so a
+map is proven to mint each subject from one row only by an `f:key` on its
+logical table (see
+[R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)).
+Without one, queries over the map remove repeated solutions as they read: a
+`COUNT` reads the table rather than the log's row counts, a same-subject star
+runs one scan per predicate, and an `ORDER BY … LIMIT` reads every file.
+`fluree delta map`, `fluree delta validate` and `fluree delta generate` (and
+their HTTP routes) name each such map with a `keylessMap` advisory. See
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade).
 
 Only the columns a query's mapped predicates use are decoded, and a table's
 data files are read in parallel — by default one per core, at most 32; set
@@ -368,8 +385,9 @@ tables filters the table it aggregates over after reading it.
 
 **Counts.** `COUNT` of a whole mapped table, with no filter or grouping, is
 answered from the row counts recorded in the transaction log without opening a
-data file — provided every file records one, no file carries a deletion
-vector, and statistics show no null in the columns the count depends on.
+data file — provided a key proves each row mints its own solution, every file
+records a count, no file carries a deletion vector, and statistics show no
+null in the columns the count depends on.
 Otherwise the table is scanned.
 
 **Footers.** A data file never changes, so its Parquet footer (with its page

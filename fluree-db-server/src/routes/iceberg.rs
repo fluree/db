@@ -81,6 +81,10 @@ pub struct IcebergMapResponse {
     /// evaluate).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_warnings: Vec<String>,
+    /// Advisories about the mapping as queries will read it: a `keylessMap`
+    /// for each map no key proves subject-unique, which queries deduplicate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_api::Diagnostic>,
 }
 
 /// Map an Iceberg table as a graph source
@@ -146,6 +150,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
             table_count: result.table_count,
             table_names: result.table_names,
             mapping_validated: result.mapping_validated,
+            diagnostics: result.diagnostics,
         };
 
         tracing::info!(

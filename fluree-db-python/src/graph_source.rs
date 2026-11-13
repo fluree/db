@@ -134,6 +134,12 @@ fn refused(e: GraphSourceInputError) -> PyErr {
 
 /// The registered source, and whatever the registration noticed but did not
 /// refuse: a table it could not read, an endpoint it could not reach.
+/// A registration's mapping diagnostics, as the warnings a `map_*` call
+/// raises: each names its map and what to do (a `keylessMap` advisory, say).
+fn advisories(diagnostics: Vec<fluree_db_api::Diagnostic>) -> impl Iterator<Item = String> {
+    diagnostics.into_iter().map(|d| d.message)
+}
+
 fn registered<'py>(
     py: Python<'py>,
     id: &str,
@@ -270,6 +276,7 @@ pub(crate) fn map_iceberg<'py>(
         direct,
         &created.catalog_uri,
     ));
+    warnings.extend(advisories(created.diagnostics));
     registered(py, &created.graph_source_id, &created.table_names, warnings)
 }
 
@@ -384,6 +391,7 @@ pub(crate) fn map_delta<'py>(
     let created = block_on(py, fluree.create_delta_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.table_warnings;
     warnings.extend(created.model_warnings);
+    warnings.extend(advisories(created.diagnostics));
     registered(py, &created.graph_source_id, &created.table_names, warnings)
 }
 
@@ -414,6 +422,7 @@ pub(crate) fn map_sql<'py>(
     let created = block_on(py, fluree.create_sql_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.mapping_warnings;
     warnings.extend(created.model_warnings);
+    warnings.extend(advisories(created.diagnostics));
     if !created.connection_tested {
         warnings.push(format!(
             "could not reach {}; the source is registered, and queries will fail until it \
