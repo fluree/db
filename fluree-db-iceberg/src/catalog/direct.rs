@@ -62,9 +62,8 @@ impl<S: IcebergStorage> DirectCatalogClient<S> {
     /// when present, contains the metadata filename
     /// (e.g., `00001-abc-def.metadata.json`) or a full path. Without one
     /// (pyiceberg and most non-Hadoop writers never write it), the highest-
-    /// versioned `*.metadata.json` in `metadata/` is used — only on storage
-    /// backends that support listing (local filesystem); S3 keeps the original
-    /// hint error. SYNC: mirror any change in
+    /// versioned `*.metadata.json` in `metadata/` is used; if the listing
+    /// itself fails, the original hint error is reported. SYNC: mirror any change in
     /// `SendDirectCatalogClient::resolve_metadata_location` below.
     async fn resolve_metadata_location(&self) -> Result<String> {
         let hint_path = format!("{}/metadata/version-hint.text", self.table_location);
@@ -267,9 +266,9 @@ fn resolve_hint_to_metadata_path(hint: &str, table_location: &str) -> String {
 
 /// Shared hint-absent fallback: resolve the current metadata file by listing
 /// the `metadata/` directory. Takes the not-yet-awaited listing future so one
-/// helper serves both the Send and non-Send clients. A storage backend without
-/// listing support (S3) surfaces the ORIGINAL version-hint error, so S3
-/// Direct-mode behavior is unchanged.
+/// helper serves both the Send and non-Send clients. A listing that fails (a
+/// backend without listing, or a role without list permission) surfaces the
+/// ORIGINAL version-hint error.
 async fn fallback_metadata_location(
     list: impl std::future::Future<Output = Result<Vec<String>>>,
     table_location: &str,

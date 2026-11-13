@@ -53,7 +53,7 @@ pub trait IcebergStorage: Debug {
     /// List the immediate child FILE names under `prefix` (no recursion, no
     /// directories). Used by catalog-less Direct mode to discover the current
     /// `*.metadata.json` when `version-hint.text` is absent. Default:
-    /// unsupported — local-filesystem storage overrides it.
+    /// unsupported.
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
         let _ = prefix;
         Err(IcebergError::storage(
@@ -683,6 +683,86 @@ pub(crate) fn parallel_range_gets_enabled() -> bool {
 }
 
 #[cfg(feature = "aws")]
+impl S3IcebergStorage {
+    /// `ListObjectsV2` with a `/` delimiter, paginated → the immediate children
+    /// of `prefix` as `(directory names, file names)`: the response's common
+    /// prefixes and its object keys, each reduced to the child segment.
+    async fn list_children(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>)> {
+        // A bare bucket (`s3://bucket`) lists its top level.
+        let bucket_root;
+        let prefix = match prefix.split_once("://") {
+            Some((_, rest)) if !rest.is_empty() && !rest.contains('/') => {
+                bucket_root = format!("{prefix}/");
+                bucket_root.as_str()
+            }
+            _ => prefix,
+        };
+        let (bucket, key) = self.locate(prefix)?;
+        let scheme = scheme_of(prefix);
+        let list_prefix = if key.is_empty() || key.ends_with('/') {
+            key.to_string()
+        } else {
+            format!("{key}/")
+        };
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&list_prefix)
+                .delimiter("/");
+            if let Some(token) = continuation.take() {
+                req = req.continuation_token(token);
+            }
+            let response = req.send().await.map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "ListObjectsV2",
+                    scheme,
+                    bucket,
+                    &list_prefix,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+            for cp in response.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    let child = p
+                        .strip_prefix(&list_prefix)
+                        .unwrap_or(p)
+                        .trim_end_matches('/');
+                    if !child.is_empty() {
+                        dirs.push(child.to_string());
+                    }
+                }
+            }
+            for object in response.contents() {
+                if let Some(k) = object.key() {
+                    let child = k.strip_prefix(&list_prefix).unwrap_or(k);
+                    // A zero-byte `prefix/` placeholder object lists as itself.
+                    if !child.is_empty() {
+                        files.push(child.to_string());
+                    }
+                }
+            }
+            if response.is_truncated().unwrap_or(false) {
+                continuation = response.next_continuation_token().map(String::from);
+                if continuation.is_some() {
+                    continue;
+                }
+            }
+            break;
+        }
+        Ok((dirs, files))
+    }
+}
+
+#[cfg(feature = "aws")]
 #[async_trait(?Send)]
 impl IcebergStorage for S3IcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
@@ -759,6 +839,10 @@ impl IcebergStorage for S3IcebergStorage {
     /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
     async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
         self.read_ranges_bounded(path, ranges).await
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_children(prefix).await?.1)
     }
 }
 
@@ -841,61 +925,12 @@ impl SendIcebergStorage for S3IcebergStorage {
         self.read_ranges_bounded(path, ranges).await
     }
 
-    /// One `ListObjectsV2` with a `/` delimiter → the immediate child directory
-    /// names under `prefix` (from the response's common prefixes), paginated.
     async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
-        let (bucket, key) = self.locate(prefix)?;
-        let scheme = scheme_of(prefix);
-        let list_prefix = if key.is_empty() || key.ends_with('/') {
-            key.to_string()
-        } else {
-            format!("{key}/")
-        };
-        let mut names = Vec::new();
-        let mut continuation: Option<String> = None;
-        loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(&list_prefix)
-                .delimiter("/");
-            if let Some(token) = continuation.take() {
-                req = req.continuation_token(token);
-            }
-            let response = req.send().await.map_err(|e| {
-                use aws_sdk_s3::error::ProvideErrorMetadata;
-                s3_read_error(
-                    "ListObjectsV2",
-                    scheme,
-                    bucket,
-                    &list_prefix,
-                    self.configured_region(),
-                    e.code(),
-                    e.raw_response().map(|r| r.status().as_u16()),
-                    error_chain(&e),
-                )
-            })?;
-            for cp in response.common_prefixes() {
-                if let Some(p) = cp.prefix() {
-                    let child = p
-                        .strip_prefix(&list_prefix)
-                        .unwrap_or(p)
-                        .trim_end_matches('/');
-                    if !child.is_empty() {
-                        names.push(child.to_string());
-                    }
-                }
-            }
-            if response.is_truncated().unwrap_or(false) {
-                continuation = response.next_continuation_token().map(String::from);
-                if continuation.is_some() {
-                    continue;
-                }
-            }
-            break;
-        }
-        Ok(names)
+        Ok(self.list_children(prefix).await?.0)
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_children(prefix).await?.1)
     }
 }
 
@@ -1585,6 +1620,85 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Storage error: S3 HeadObject failed: chain"
+        );
+    }
+
+    /// One delimited `ListObjectsV2` yields both listings: common prefixes are
+    /// the child directories, object keys the child files. The file listing is
+    /// what resolves a table with no `version-hint.text`.
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn s3_lists_the_child_files_and_directories_of_a_prefix() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>wh/t/metadata/</Prefix><Delimiter>/</Delimiter>
+  <KeyCount>4</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
+  <Contents><Key>wh/t/metadata/</Key><Size>0</Size></Contents>
+  <Contents><Key>wh/t/metadata/00001-aaaa.metadata.json</Key><Size>1</Size></Contents>
+  <Contents><Key>wh/t/metadata/00002-bbbb.metadata.json</Key><Size>1</Size></Contents>
+  <CommonPrefixes><Prefix>wh/t/metadata/stats/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        Mock::given(method("GET"))
+            .and(path("/b/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "wh/t/metadata/"))
+            .and(query_param("delimiter", "/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let storage = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            Some(&server.uri()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            SendIcebergStorage::list_files(&storage, "s3://b/wh/t/metadata")
+                .await
+                .unwrap(),
+            ["00001-aaaa.metadata.json", "00002-bbbb.metadata.json"]
+        );
+        assert_eq!(
+            IcebergStorage::list_files(&storage, "s3://b/wh/t/metadata")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            SendIcebergStorage::list_dir(&storage, "s3://b/wh/t/metadata")
+                .await
+                .unwrap(),
+            ["stats"]
+        );
+
+        // A bare bucket lists its top level.
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>c</Name><Prefix></Prefix><Delimiter>/</Delimiter>
+  <KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
+  <CommonPrefixes><Prefix>orders/</Prefix></CommonPrefixes>
+  <CommonPrefixes><Prefix>people/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        Mock::given(method("GET"))
+            .and(path("/c/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("delimiter", "/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/xml"))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            SendIcebergStorage::list_dir(&storage, "s3://c")
+                .await
+                .unwrap(),
+            ["orders", "people"]
         );
     }
 }
