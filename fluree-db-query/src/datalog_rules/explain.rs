@@ -254,7 +254,9 @@ pub(crate) async fn explain_facts(
         for batch in &batches {
             for row in 0..batch.len() {
                 for head in &heads {
-                    let Some(flake) = instantiate(head, batch, row, view.snapshot, view.t)? else {
+                    let Some(flake) =
+                        instantiate(&rule.name, head, batch, row, view.snapshot, view.t)?
+                    else {
                         continue;
                     };
                     let Some((_, fact)) = facts.iter_mut().find(|(f, _)| same_fact(f, &flake))

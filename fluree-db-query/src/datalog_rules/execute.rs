@@ -968,8 +968,14 @@ impl HeadSink<'_, '_> {
                 }
             }
             for head in &self.rule.heads {
-                let Some(mut flake) =
-                    instantiate(head, batch, row, state.snapshot, state.derived_t)?
+                let Some(mut flake) = instantiate(
+                    &self.rule.name,
+                    head,
+                    batch,
+                    row,
+                    state.snapshot,
+                    state.derived_t,
+                )?
                 else {
                     continue;
                 };
@@ -1073,25 +1079,27 @@ async fn run_body<'a>(
 /// body runs with eager materialization, so an operator that emits one would
 /// otherwise lose the fact silently.
 pub(super) fn instantiate(
+    rule: &str,
     head: &super::RuleHead,
     batch: &Batch,
     row: usize,
     snapshot: &LedgerSnapshot,
     t: i64,
 ) -> Result<Option<Flake>> {
-    let Some(s) = resolve_node(&head.subject, batch, row, snapshot)? else {
+    let Some(s) = resolve_node(rule, &head.subject, batch, row, snapshot)? else {
         return Ok(None);
     };
-    let Some(p) = resolve_node(&head.predicate, batch, row, snapshot)? else {
+    let Some(p) = resolve_node(rule, &head.predicate, batch, row, snapshot)? else {
         return Ok(None);
     };
-    let Some((o, dt, m)) = resolve_object(&head.object, batch, row, snapshot)? else {
+    let Some((o, dt, m)) = resolve_object(rule, &head.object, batch, row, snapshot)? else {
         return Ok(None);
     };
     Ok(Some(Flake::new(s, p, o, dt, t, true, m)))
 }
 
 fn resolve_node(
+    rule: &str,
     term: &HeadTerm,
     batch: &Batch,
     row: usize,
@@ -1100,26 +1108,27 @@ fn resolve_node(
     match term {
         HeadTerm::Sid(sid) => Ok(Some(sid.clone())),
         HeadTerm::Var(v) => match batch.get(row, *v) {
-            Some(binding) => binding_node(binding, snapshot),
+            Some(binding) => binding_node(rule, binding, snapshot),
             None => Ok(None),
         },
         HeadTerm::Literal { .. } => Ok(None),
     }
 }
 
-fn binding_node(binding: &Binding, snapshot: &LedgerSnapshot) -> Result<Option<Sid>> {
+fn binding_node(rule: &str, binding: &Binding, snapshot: &LedgerSnapshot) -> Result<Option<Sid>> {
     match binding {
         Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
         Binding::IriMatch { primary_sid, .. } => Ok(Some(primary_sid.clone())),
         Binding::Iri(iri) => Ok(IriEncoder::encode_iri(snapshot, iri)),
-        encoded if encoded.is_encoded() => Err(QueryError::Internal(
-            "datalog rule head: the rule body produced an encoded binding".into(),
-        )),
+        encoded if encoded.is_encoded() => Err(QueryError::Internal(format!(
+            "datalog rule {rule}: the rule body produced an encoded binding for its head"
+        ))),
         _ => Ok(None),
     }
 }
 
 fn resolve_object(
+    rule: &str,
     term: &HeadTerm,
     batch: &Batch,
     row: usize,
@@ -1147,8 +1156,46 @@ fn resolve_object(
                 dtc.datatype().clone(),
                 FlakeMeta::from_parts(dtc.lang_tag(), None),
             ))),
-            Some(other) => Ok(binding_node(other, snapshot)?
+            Some(other) => Ok(binding_node(rule, other, snapshot)?
                 .map(|sid| (FlakeValue::Ref(sid), id_datatype_sid(), None))),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::var_registry::VarId;
+    use std::sync::Arc;
+
+    /// A rule body that hands its head an encoded binding is an error naming
+    /// the rule, never a silently dropped row.
+    #[test]
+    fn an_encoded_binding_in_a_rule_head_is_an_error_naming_the_rule() {
+        let snapshot = LedgerSnapshot::genesis("rules:main");
+        let x = VarId(0);
+        let head = super::super::RuleHead {
+            subject: super::super::HeadTerm::Var(x),
+            predicate: super::super::HeadTerm::Sid(Sid::new(FLUREE_DB, "p")),
+            object: super::super::HeadTerm::Sid(Sid::new(FLUREE_DB, "o")),
+            graph: None,
+        };
+        let decoded = Batch::new(
+            Arc::from([x]),
+            vec![vec![Binding::Sid {
+                sid: Sid::new(FLUREE_DB, "s"),
+                t: None,
+                op: None,
+            }]],
+        )
+        .unwrap();
+        assert!(instantiate("ex:rule", &head, &decoded, 0, &snapshot, 1)
+            .unwrap()
+            .is_some());
+
+        let encoded = Batch::new(Arc::from([x]), vec![vec![Binding::encoded_sid(7)]]).unwrap();
+        let err = instantiate("ex:rule", &head, &encoded, 0, &snapshot, 1).unwrap_err();
+        assert!(err.to_string().contains("ex:rule"), "{err}");
+        assert!(err.to_string().contains("encoded binding"), "{err}");
     }
 }
