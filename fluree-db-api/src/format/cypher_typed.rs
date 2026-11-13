@@ -644,6 +644,8 @@ impl<'a> NodeHydrator<'a> {
                 g_id,
                 &s_ids,
                 self.view.t,
+                // Formatting is not priced (see the per-flake filter above).
+                &fluree_db_core::Tracker::disabled(),
             )
             .map_err(|e| {
                 FormatError::InvalidBinding(format!("batched subject crawl failed: {e}"))

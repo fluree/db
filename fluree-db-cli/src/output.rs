@@ -249,6 +249,7 @@ fn sparql_table_cell(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => {
             let Some(gv) = gv else {
@@ -257,7 +258,7 @@ fn sparql_table_cell(
                     &format!("o_kind={o_kind} o_key={o_key} p_id={p_id}"),
                 );
             };
-            match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
+            match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id) {
                 Ok(v) => flake_value_to_table_cell(&v, compactor),
                 Err(_) => unresolved_cell(
                     RESOLVER_MISS,
@@ -865,6 +866,7 @@ mod tests {
             lang_id: 0,
             i_val: 0,
             t: 1,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let cases = [
             (&bogus_sid, format!("s_id={}", u64::MAX - 1)),

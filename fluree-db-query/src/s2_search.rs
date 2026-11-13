@@ -103,98 +103,128 @@ impl S2SearchOperator {
         crate::search_readability::search_hit_readable(ctx, &subject_iri, &preds).await
     }
 
-    /// Resolve query geometry from pattern (constant or variable binding).
+    /// Resolve query geometry from pattern (constant or variable binding):
+    /// `None` when the row holds no geometry.
     ///
-    /// For `EncodedLit` bindings, requires `binary_store` in context to decode.
+    /// An `EncodedLit` binding decodes through the scope's terms
+    /// ([`ExecutionContext::term_view`]); one the scope can't decode is an
+    /// error.
     fn resolve_query_geom(
         &self,
         row: Option<&crate::binding::RowView>,
         ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<QueryGeomResolved>> {
+        let var_id = match &self.pattern.query_geom {
+            S2QueryGeom::Wkt(wkt) => return Ok(Some(QueryGeomResolved::Wkt(wkt.clone()))),
+            S2QueryGeom::Point { lat, lng } => {
+                return Ok(Some(QueryGeomResolved::Point(*lat, *lng)))
+            }
+            S2QueryGeom::Var(var_id) => *var_id,
+        };
+        let Some(binding) = row.and_then(|row| row.get(var_id)) else {
+            return Ok(None);
+        };
+        let terms = match binding {
+            Binding::EncodedLit { o_kind, .. }
+                if *o_kind != fluree_db_core::ObjKind::GEO_POINT.as_u8() =>
+            {
+                Some(ctx.term_view().ok_or_else(|| {
+                    QueryError::Internal(
+                        "S2 query geometry is an encoded literal this scope can't decode".into(),
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        Ok(Self::geometry_of(binding, terms.as_ref()))
+    }
+
+    /// The query geometry `binding` holds, if any. `terms` decodes an encoded
+    /// literal other than an inline point.
+    fn geometry_of(
+        binding: &Binding,
+        terms: Option<&fluree_db_binary_index::TermView>,
     ) -> Option<QueryGeomResolved> {
-        match &self.pattern.query_geom {
-            S2QueryGeom::Wkt(wkt) => Some(QueryGeomResolved::Wkt(wkt.clone())),
-            S2QueryGeom::Point { lat, lng } => Some(QueryGeomResolved::Point(*lat, *lng)),
-            S2QueryGeom::Var(var_id) => {
-                // Resolve variable binding to WKT string
-                let row = row?;
-                let binding = row.get(*var_id)?;
-
-                // Extract geometry from the binding
-                match binding {
-                    Binding::Lit { val, dtc, .. } => {
-                        let dt = dtc.datatype();
-                        match val {
-                            fluree_db_core::FlakeValue::String(s) => {
-                                // Check datatype - warn if not geo:wktLiteral
-                                // (geo:wktLiteral uses namespace OGC_GEO=11 with local name "wktLiteral")
-                                if dt.namespace_code != fluree_vocab::namespaces::OGC_GEO {
-                                    tracing::debug!(
-                                        ns = dt.namespace_code,
-                                        name = %dt.name,
-                                        "S2Search: Lit binding has non-geo:wktLiteral datatype, attempting WKT parse anyway"
-                                    );
-                                }
-                                Some(QueryGeomResolved::Wkt(s.to_string()))
-                            }
-                            fluree_db_core::FlakeValue::GeoPoint(bits) => {
-                                // Inline GeoPoint - extract lat/lng directly
-                                let (lat, lng) = fluree_db_core::ObjKey::from_u64(bits.as_u64())
-                                    .decode_geo_point();
-                                Some(QueryGeomResolved::Point(lat, lng))
-                            }
-                            _ => None, // Not a string or GeoPoint literal
+        // Extract geometry from the binding
+        match binding {
+            Binding::Lit { val, dtc, .. } => {
+                let dt = dtc.datatype();
+                match val {
+                    fluree_db_core::FlakeValue::String(s) => {
+                        // Check datatype - warn if not geo:wktLiteral
+                        // (geo:wktLiteral uses namespace OGC_GEO=11 with local name "wktLiteral")
+                        if dt.namespace_code != fluree_vocab::namespaces::OGC_GEO {
+                            tracing::debug!(
+                                ns = dt.namespace_code,
+                                name = %dt.name,
+                                "S2Search: Lit binding has non-geo:wktLiteral datatype, attempting WKT parse anyway"
+                            );
                         }
+                        Some(QueryGeomResolved::Wkt(s.to_string()))
                     }
-                    // Handle encoded literals (late materialization)
-                    Binding::EncodedLit {
-                        o_kind,
-                        o_key,
-                        p_id,
-                        dt_id,
-                        lang_id,
-                        ..
-                    } => {
-                        // Check if it's an inline GeoPoint (ObjKind::GEO_POINT = 0x14)
-                        if *o_kind == fluree_db_core::ObjKind::GEO_POINT.as_u8() {
-                            // Decode GeoPoint directly from o_key
-                            let (lat, lng) =
-                                fluree_db_core::ObjKey::from_u64(*o_key).decode_geo_point();
-                            return Some(QueryGeomResolved::Point(lat, lng));
-                        }
-
-                        // Decode the literal using the binary store
-                        let gv = ctx.graph_view()?;
-                        match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
-                            Ok(fluree_db_core::FlakeValue::String(s)) => {
-                                Some(QueryGeomResolved::Wkt(s.to_string()))
-                            }
-                            Ok(fluree_db_core::FlakeValue::GeoPoint(bits)) => {
-                                // Decoded to GeoPoint
-                                let (lat, lng) = fluree_db_core::ObjKey::from_u64(bits.as_u64())
-                                    .decode_geo_point();
-                                Some(QueryGeomResolved::Point(lat, lng))
-                            }
-                            Ok(_) => {
-                                tracing::debug!(
-                                    o_kind = *o_kind,
-                                    "S2Search: EncodedLit decoded to non-geometry value"
-                                );
-                                None
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    o_kind = *o_kind,
-                                    o_key = *o_key,
-                                    error = %e,
-                                    "S2Search: failed to decode EncodedLit"
-                                );
-                                None
-                            }
-                        }
+                    fluree_db_core::FlakeValue::GeoPoint(bits) => {
+                        // Inline GeoPoint - extract lat/lng directly
+                        let (lat, lng) =
+                            fluree_db_core::ObjKey::from_u64(bits.as_u64()).decode_geo_point();
+                        Some(QueryGeomResolved::Point(lat, lng))
                     }
-                    _ => None, // IRI, Sid, etc. are not valid geometry values
+                    _ => None, // Not a string or GeoPoint literal
                 }
             }
+            // Handle encoded literals (late materialization)
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                arena_g_id,
+                ..
+            } => {
+                // Check if it's an inline GeoPoint (ObjKind::GEO_POINT = 0x14)
+                if *o_kind == fluree_db_core::ObjKind::GEO_POINT.as_u8() {
+                    // Decode GeoPoint directly from o_key
+                    let (lat, lng) = fluree_db_core::ObjKey::from_u64(*o_key).decode_geo_point();
+                    return Some(QueryGeomResolved::Point(lat, lng));
+                }
+
+                // Decode the literal through the scope's terms.
+                match terms?.decode_value_from_kind(
+                    *o_kind,
+                    *o_key,
+                    *p_id,
+                    *dt_id,
+                    *lang_id,
+                    *arena_g_id,
+                ) {
+                    Ok(fluree_db_core::FlakeValue::String(s)) => {
+                        Some(QueryGeomResolved::Wkt(s.to_string()))
+                    }
+                    Ok(fluree_db_core::FlakeValue::GeoPoint(bits)) => {
+                        // Decoded to GeoPoint
+                        let (lat, lng) =
+                            fluree_db_core::ObjKey::from_u64(bits.as_u64()).decode_geo_point();
+                        Some(QueryGeomResolved::Point(lat, lng))
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            o_kind = *o_kind,
+                            "S2Search: EncodedLit decoded to non-geometry value"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            o_kind = *o_kind,
+                            o_key = *o_key,
+                            error = %e,
+                            "S2Search: failed to decode EncodedLit"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None, // IRI, Sid, etc. are not valid geometry values
         }
     }
 }
@@ -398,7 +428,7 @@ impl Operator for S2SearchOperator {
         // We use `enumerate()` to keep `row_idx` for indexing all `child_cols` uniformly.
         for (row_idx, row_view) in input_batch.rows().enumerate() {
             // Resolve query geometry for this row
-            let Some(query_geom) = self.resolve_query_geom(Some(&row_view), ctx) else {
+            let Some(query_geom) = self.resolve_query_geom(Some(&row_view), ctx)? else {
                 continue;
             };
 
@@ -584,6 +614,45 @@ mod tests {
 
     use crate::ir::{S2QueryGeom, S2SearchPattern, S2SpatialOp};
     use crate::var_registry::VarRegistry;
+
+    /// An encoded query geometry decodes through the scope's terms; one the
+    /// scope can't decode fails the query rather than dropping the row. An
+    /// inline point needs no decoder.
+    #[test]
+    fn an_encoded_geometry_the_scope_cannot_decode_is_an_error() {
+        use super::S2SearchOperator;
+        use crate::binding::{Batch, Binding};
+        use crate::context::ExecutionContext;
+        use fluree_db_core::{LedgerSnapshot, ObjKind};
+        use std::sync::Arc;
+
+        let mut reg = VarRegistry::new();
+        let subject = reg.get_or_insert("?place");
+        let geom = reg.get_or_insert("?geom");
+        let op = S2SearchOperator::new(
+            Box::new(crate::seed::EmptyOperator::new()),
+            S2SearchPattern::within(subject, S2QueryGeom::Var(geom)),
+        );
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let ctx = ExecutionContext::new(&snapshot, &reg);
+        let encoded = |o_kind: ObjKind| Binding::EncodedLit {
+            o_kind: o_kind.as_u8(),
+            o_key: 0,
+            p_id: 0,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+            arena_g_id: 0,
+        };
+        let resolve = |binding: Binding| {
+            let batch = Batch::new(Arc::from(vec![geom]), vec![vec![binding]]).unwrap();
+            let row = batch.rows().next().unwrap();
+            op.resolve_query_geom(Some(&row), &ctx).map(|g| g.is_some())
+        };
+        assert!(resolve(encoded(ObjKind::LEX_ID)).is_err());
+        assert!(matches!(resolve(encoded(ObjKind::GEO_POINT)), Ok(true)));
+    }
 
     #[test]
     fn test_s2_search_pattern_variables() {

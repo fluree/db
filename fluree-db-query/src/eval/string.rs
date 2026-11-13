@@ -381,16 +381,11 @@ pub fn eval_concat<R: RowAccess>(
         let Some(val) = arg.eval_to_comparable(row, ctx)? else {
             return Ok(None);
         };
-        // §17.4.3.5: CONCAT accepts only strings — plain, xsd:string, or
-        // language-tagged. An IRI or a foreign-datatype literal (both of which
-        // `as_str()` would expose) is a type error → the whole result is unbound.
-        let s = match &val {
-            ComparableValue::String(s) => s.as_ref(),
-            ComparableValue::TypedLiteral {
-                val: FlakeValue::String(s),
-                dtc,
-            } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => s.as_str(),
-            _ => return Ok(None),
+        // §17.4.3.5: CONCAT accepts only strings (`string_arg`'s accept-set).
+        // An IRI or a literal of another datatype (both of which `as_str()`
+        // would expose) is a type error → the whole result is unbound.
+        let Some(s) = val.string_arg() else {
+            return Ok(None);
         };
         // The language tag can live on the VALUE itself (a constant `"a"@en`,
         // a STRLANG/REPLACE result — both `TypedLiteral{LangTag}`) or only on
@@ -440,19 +435,15 @@ fn str_arg_and_lang<R: RowAccess>(
         // so this is a zero-copy move.
         ComparableValue::String(s) => Some((s, extract_lang_tag(expr, row, ctx))),
         ComparableValue::TypedLiteral {
-            val: FlakeValue::String(s),
+            val: FlakeValue::String(s) | FlakeValue::Json(s),
             dtc,
         } => match dtc {
             Some(UnresolvedDatatypeConstraint::LangTag(tag)) => Some((Arc::from(s), Some(tag))),
-            // A non-string custom datatype (e.g. `STRDT("x","ex:dt")`) is not a
-            // valid STRBEFORE/STRAFTER argument per SPARQL 1.1 — raise a type
-            // error (→ unbound) rather than treating it as a plain string.
-            Some(UnresolvedDatatypeConstraint::Explicit(iri))
-                if iri.as_ref() != fluree_vocab::xsd::STRING =>
-            {
-                None
-            }
-            // Simple literal (no dtc) or explicit `xsd:string`: no language tag.
+            // A datatype that does not read as text (e.g. `STRDT("x","ex:dt")`)
+            // is not a valid STRBEFORE/STRAFTER argument per SPARQL 1.1 — raise
+            // a type error (→ unbound) rather than treating it as a string.
+            dtc if !super::value::reads_as_text(dtc.as_ref()) => None,
+            // Simple literal, `xsd:string`, or a text datatype: no language tag.
             _ => Some((Arc::from(s), extract_lang_tag(expr, row, ctx))),
         },
         _ => None,
@@ -712,9 +703,24 @@ pub fn eval_str_dt<R: RowAccess>(
                     .map(Arc::from),
                 other => other.as_str().map(Arc::from),
             };
+            // Any IRI is a datatype (§17.4.2.9), one in a namespace the ledger
+            // has never seen included, and so is a name with no scheme, which
+            // every write path stores as one. Anything else is a type error:
+            // the value is unbound, and a transaction's strict WHERE refuses
+            // it, since the literal could not be stored.
+            let Some(dt_iri) =
+                dt_iri.filter(|iri| fluree_db_core::graph_registry::is_iri_reference(iri))
+            else {
+                if ctx.is_some_and(|c| c.strict_bind_errors) {
+                    return Err(QueryError::InvalidExpression(format!(
+                        "STRDT's datatype must be an IRI, not {dt_val:?}"
+                    )));
+                }
+                return Ok(None);
+            };
             Ok(Some(ComparableValue::TypedLiteral {
                 val: FlakeValue::String(s.to_string()),
-                dtc: dt_iri.map(UnresolvedDatatypeConstraint::Explicit),
+                dtc: Some(UnresolvedDatatypeConstraint::Explicit(dt_iri)),
             }))
         }
         (Some(_), Some(_)) => Ok(None),

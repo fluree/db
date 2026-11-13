@@ -50,17 +50,14 @@ pub(crate) fn binding_subject_sid(
 ) -> Result<Option<Sid>> {
     match binding {
         Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
-        Binding::EncodedSid { s_id, .. } => {
-            let Some(gv) = ctx.graph_view() else {
-                return Ok(None);
-            };
-            Ok(gv.resolve_subject_sid(*s_id).ok())
-        }
+        Binding::EncodedSid { s_id, .. } => Ok(ctx
+            .with_term_view(|gv| gv.resolve_subject_sid(*s_id).ok())
+            .flatten()),
         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
             if let Some(store) = ctx.binary_store.as_ref() {
                 if let Ok(Some(s_id)) = store.find_subject_id(iri) {
-                    if let Some(gv) = ctx.graph_view() {
-                        return Ok(gv.resolve_subject_sid(s_id).ok());
+                    if let Some(sid) = ctx.with_term_view(|gv| gv.resolve_subject_sid(s_id).ok()) {
+                        return Ok(sid);
                     }
                 }
             }
@@ -258,10 +255,11 @@ fn subject_ref_object_keys_merged(
     subject_s_id: u64,
 ) -> Result<Vec<u64>> {
     let g_id = ctx.binary_g_id;
-    let mut refs = batched_lookup_predicate_refs(store, g_id, p_id, &[subject_s_id], ctx.to_t)
-        .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?
-        .remove(&subject_s_id)
-        .unwrap_or_default();
+    let mut refs =
+        batched_lookup_predicate_refs(store, g_id, p_id, &[subject_s_id], ctx.to_t, &ctx.tracker)
+            .map_err(|e| QueryError::from_io("batched_lookup_predicate_refs", e))?
+            .remove(&subject_s_id)
+            .unwrap_or_default();
 
     if let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? {
         let iri_ref = OType::IRI_REF.as_u16();
@@ -299,7 +297,10 @@ fn lookup_ref_objects(
         );
         return Ok(Vec::new());
     }
-    if let Some(store) = ctx.binary_store.as_ref() {
+    // The batched read takes one graph's refs (`binary_g_id`), so it runs
+    // only where the scope reads exactly that graph through the index; a
+    // default graph of several graphs reads through the range path below.
+    if let Some(store) = ctx.binary_store.as_ref().filter(|_| ctx.has_binary_store()) {
         if let Some(subject_s_id) = binding_subject_s_id(
             &Binding::Sid {
                 sid: subject.clone(),
@@ -322,7 +323,7 @@ fn lookup_ref_objects(
                 subject_ref_object_keys_merged(ctx, store, predicate, p_id, subject_s_id)?;
             let mut out = Vec::with_capacity(ref_s_ids.len());
             for s_id in ref_s_ids {
-                if let Some(gv) = ctx.graph_view() {
+                if let Some(gv) = ctx.one_graph_view() {
                     if let Ok(sid) = gv.resolve_subject_sid(s_id) {
                         out.push(sid);
                     }

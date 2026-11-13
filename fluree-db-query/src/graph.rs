@@ -163,6 +163,9 @@ struct InnerStream {
     parent_row: Option<Vec<Binding>>,
     /// The graph variable bound to `graph_iri` (per-row path, `GRAPH ?g`).
     bind_graph_var: Option<VarId>,
+    /// How the bindings this scope produces leave it for the outer context,
+    /// built once when the subplan opens.
+    crossing: crate::object_binding::ScopeCrossing,
     /// Net bytes the subplan recorded against the query budget during its own
     /// calls, released when it is exhausted: its build tables drop with it.
     /// Measured inside each call, because the operators above run between
@@ -248,11 +251,11 @@ impl GraphOperator {
     fn extract_graph_iri_from_binding(
         ctx: &ExecutionContext<'_>,
         binding: &Binding,
-    ) -> Option<Arc<str>> {
+    ) -> Result<Option<Arc<str>>> {
         if let Some(iri) = binding.get_iri() {
-            return Some(Arc::clone(iri));
+            return Ok(Some(Arc::clone(iri)));
         }
-        match binding {
+        Ok(match binding {
             Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(sid).map(Arc::from),
             Binding::Lit {
                 val: FlakeValue::String(s),
@@ -273,12 +276,14 @@ impl GraphOperator {
             // GRAPH ?g { … }`).
             Binding::EncodedPid { p_id } => ctx
                 .binary_store
-                .as_ref()?
-                .resolve_predicate_iri(*p_id)
+                .as_ref()
+                .and_then(|store| store.resolve_predicate_iri(*p_id))
                 .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
-                let gv = ctx.graph_view()?;
-                match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
+                match crate::group_aggregate::materialize_encoded(
+                    binding,
+                    ctx.term_view().as_ref(),
+                )? {
                     Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(&sid).map(Arc::from),
                     Binding::Lit {
                         val: FlakeValue::String(s),
@@ -288,7 +293,7 @@ impl GraphOperator {
                 }
             }
             _ => None,
-        }
+        })
     }
 
     /// Execute inner patterns in a specific graph, seeded with parent row
@@ -302,6 +307,7 @@ impl GraphOperator {
     ) -> Result<()> {
         // Switch to the named graph context
         let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+        crate::fast_path_outcome::stamp_index_scope("graph", &graph_ctx);
 
         // Cross-ledger provenance for GRAPH patterns.
         //
@@ -403,15 +409,14 @@ impl GraphOperator {
         // narrows the inner scan. All other shapes rely on the merge-time
         // `{?g → graph}` join below.
         //
-        // The seeding row's arena handles (big numbers, vectors) name values
-        // in the outer graph, and the rows leaving carry handles into this
-        // graph's arenas: each is decoded through its own graph on the way.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        // Bindings cross to and from this graph encoded (an arena literal
+        // carries its graph), unless one side cannot decode them.
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, &graph_ctx);
         let mut row: Vec<Binding> = parent_batch
             .row_view(row_idx)
             .expect("row_idx must be valid for batch")
             .to_vec();
-        crossing.enter(&mut row);
+        crossing.enter(&mut row)?;
         let seed = match bind_graph_var {
             Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
                 let mut schema_vec = parent_batch.schema().to_vec();
@@ -474,6 +479,7 @@ impl GraphOperator {
             stamp_ledger_id,
             parent_row: Some(parent_row),
             bind_graph_var,
+            crossing,
             charged,
         });
         Ok(())
@@ -495,6 +501,7 @@ impl GraphOperator {
         graph_iri: Arc<str>,
     ) -> Result<()> {
         let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+        crate::fast_path_outcome::stamp_index_scope("graph", &graph_ctx);
 
         let stamp_ledger_id: Option<Arc<str>> = match &ctx.dataset {
             Some(ds) if ds.spans_multiple_ledgers() => ds
@@ -531,18 +538,11 @@ impl GraphOperator {
             ));
         }
 
-        // The whole parent batch seeds the source undecoded: sound only
-        // because nothing crosses graphs here. This path runs without an
-        // explicit dataset: with none, the source scope inherits the outer
-        // graph id; under an implicit union default graph, the outer context
-        // has no graph view and the source is no member graph, so neither side
-        // has one. Either way the arena crossing is a no-op both ways.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
-        debug_assert!(
-            crossing.is_noop(),
-            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
-        );
-        let seed = BatchSeedOperator::from_batch(parent_batch.clone());
+        // The parent batch seeds the source: encoded, unless the source scope
+        // cannot decode what the outer context binds (an outer union of
+        // graphs over a store the source scope does not read).
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, &graph_ctx);
+        let seed = BatchSeedOperator::from_batch(crossing.enter_batch(parent_batch)?);
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &rewrite_result.patterns,
@@ -575,6 +575,7 @@ impl GraphOperator {
             arm_scan_provenance: false,
             parent_row: None,
             bind_graph_var: None,
+            crossing,
             charged,
         });
         Ok(())
@@ -620,7 +621,7 @@ impl GraphOperator {
             };
             // Only the columns this scope binds leave through the crossing; the
             // parent columns keep the outer graph's handles.
-            let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+            let crossing = &st.crossing;
             let out = match &st.parent_row {
                 // Batched: the inner output already carries the parent columns
                 // (threaded through the multi-row seed) plus the new vars.
@@ -629,16 +630,16 @@ impl GraphOperator {
                     if self.schema.is_empty() {
                         return Ok(Some(Batch::empty_schema_with_len(rows)));
                     }
-                    let columns: Vec<Vec<Binding>> = self
+                    let columns = self
                         .schema
                         .iter()
                         .enumerate()
                         .map(|(i, var)| match batch.column(*var) {
-                            Some(col) if i < parent_len => col.to_vec(),
+                            Some(col) if i < parent_len => Ok(col.to_vec()),
                             Some(col) => col.iter().map(|b| crossing.leave(b.clone())).collect(),
-                            None => vec![Binding::Unbound; rows],
+                            None => Ok(vec![Binding::Unbound; rows]),
                         })
-                        .collect();
+                        .collect::<Result<Vec<Vec<Binding>>>>()?;
                     Batch::new(self.schema.clone(), columns)?
                 }
                 // Per row: each inner solution joins the parent row.
@@ -661,32 +662,31 @@ impl GraphOperator {
                     // joins the IRI-valued enumeration by VALUE across term
                     // kinds where strict SPARQL term-equality would drop it
                     // (kept for pre-IRI-migration data).
-                    let kept: Vec<usize> = (0..batch.len())
-                        .filter(|&row| {
-                            let Some(gvar) = st.bind_graph_var else {
-                                return true;
-                            };
-                            match batch.get(row, gvar) {
-                                Some(Binding::Unbound | Binding::Poisoned) | None => true,
-                                Some(b) => {
-                                    Self::extract_graph_iri_from_binding(&graph_ctx, b).as_deref()
-                                        == Some(st.graph_iri.as_ref())
-                                }
+                    let mut kept: Vec<usize> = Vec::with_capacity(batch.len());
+                    for row in 0..batch.len() {
+                        let keep = match st.bind_graph_var.and_then(|gvar| batch.get(row, gvar)) {
+                            Some(Binding::Unbound | Binding::Poisoned) | None => true,
+                            Some(b) => {
+                                Self::extract_graph_iri_from_binding(&graph_ctx, b)?.as_deref()
+                                    == Some(st.graph_iri.as_ref())
                             }
-                        })
-                        .collect();
+                        };
+                        if keep {
+                            kept.push(row);
+                        }
+                    }
                     if kept.is_empty() {
                         continue;
                     }
                     if self.schema.is_empty() {
                         return Ok(Some(Batch::empty_schema_with_len(kept.len())));
                     }
-                    let columns: Vec<Vec<Binding>> = self
+                    let columns = self
                         .schema
                         .iter()
                         .enumerate()
                         .map(|(i, var)| {
-                            if i < parent_len {
+                            Ok(if i < parent_len {
                                 // Copy the parent binding into every row.
                                 vec![parent_row[i].clone(); kept.len()]
                             } else if st.bind_graph_var == Some(*var) {
@@ -701,12 +701,12 @@ impl GraphOperator {
                                     Some(col) => kept
                                         .iter()
                                         .map(|&row| crossing.leave(col[row].clone()))
-                                        .collect(),
+                                        .collect::<Result<Vec<Binding>>>()?,
                                     None => vec![Binding::Unbound; kept.len()],
                                 }
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<Vec<Binding>>>>()?;
                     Batch::new(self.schema.clone(), columns)?
                 }
             };
@@ -867,7 +867,7 @@ impl Operator for GraphOperator {
                         // Check if ?g is already bound in parent row
                         if let Some(binding) = parent_batch.get(row_idx, *var) {
                             if let Some(bound_iri) =
-                                Self::extract_graph_iri_from_binding(ctx, binding)
+                                Self::extract_graph_iri_from_binding(ctx, binding)?
                             {
                                 // ?g already bound: use only that graph
                                 if let Some(ds) = ctx.explicit_dataset() {
@@ -1144,14 +1144,14 @@ mod tests {
         // Raw IRI binding — the idiomatic `VALUES ?g { <iri> }` form
         let binding = Binding::Iri(Arc::from("urn:probegraph"));
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             Some(Arc::from("urn:probegraph"))
         );
 
         // Cross-ledger IriMatch carries the canonical IRI
         let binding = Binding::iri_match("urn:other", Sid::new(2, "x"), "other:main");
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             Some(Arc::from("urn:other"))
         );
 
@@ -1164,7 +1164,7 @@ mod tests {
             p_id: None,
         };
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             Some(Arc::from("http://example.org/graph1"))
         );
 
@@ -1177,11 +1177,11 @@ mod tests {
             p_id: None,
         };
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             None
         );
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &Binding::Unbound),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &Binding::Unbound).unwrap(),
             None
         );
     }

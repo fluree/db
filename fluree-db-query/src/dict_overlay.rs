@@ -638,8 +638,15 @@ impl DictOverlay {
         // Delegate to novelty-aware graph view for everything else.
         // BinaryGraphView handles watermark routing for IriRef, StringDict,
         // JsonArena internally — no duplication needed here.
-        self.graph_view
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
+        // The overlay decodes rows of its own graph.
+        self.graph_view.decode_value_from_kind(
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            self.graph_view.g_id(),
+        )
     }
 
     /// Decode lang_id and i_val into FlakeMeta.

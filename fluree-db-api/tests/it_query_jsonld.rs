@@ -157,6 +157,11 @@ async fn jsonld_bind_error_invalid_iri_type() {
     );
 }
 
+/// A `str-dt` datatype written as a string goes through the compact-IRI
+/// guard a JSON-LD insert's `@type` goes through: `bad:datatype` looks like a
+/// compact IRI whose prefix the `@context` does not define, so the query is
+/// refused with the insert's error rather than building a literal typed with
+/// the IRI `bad:datatype`.
 #[tokio::test]
 async fn jsonld_bind_error_invalid_datatype_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -173,7 +178,192 @@ async fn jsonld_bind_error_invalid_datatype_iri() {
         "select": "?err"
     });
 
-    assert_query_bind_error(&fluree, &ledger, query, "Unknown datatype IRI").await;
+    assert_query_bind_error(
+        &fluree,
+        &ledger,
+        query,
+        "Unresolved compact IRI 'bad:datatype'",
+    )
+    .await;
+}
+
+/// `"xsd:integer"` in a `str-dt` whose `@context` has no `xsd` prefix is the
+/// usual slip: refused, as the same `@type` in an insert is, instead of a
+/// literal typed with the IRI `xsd:integer`. `opts.strictCompactIri: false`
+/// takes it verbatim, as it does for an insert.
+#[tokio::test]
+async fn jsonld_bind_error_unexpanded_xsd_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "query/bind-error:dt-xsd-slip";
+    let ledger = seed_people_filter_dataset(&fluree, ledger_id).await;
+
+    let query = |opts: serde_json::Value| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+            "where": [
+                {"@id": "ex:alice", "schema:name": "?name"},
+                ["bind", "?lit", "(str-dt ?name \"xsd:integer\")", "?d", "(str (datatype ?lit))"]
+            ],
+            "select": "?d",
+            "opts": opts
+        })
+    };
+
+    assert_query_bind_error(
+        &fluree,
+        &ledger,
+        query(json!({})),
+        "Unresolved compact IRI 'xsd:integer'",
+    )
+    .await;
+    let verbatim = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &query(json!({"strictCompactIri": false})),
+    )
+    .await
+    .expect("strictCompactIri: false");
+    assert_eq!(verbatim, json!(["xsd:integer"]));
+}
+
+/// A constant `iri` argument is expanded as a JSON-LD `@id` is (#1765): a
+/// prefix the `@context` defines gives the expanded IRI, and an undefined
+/// one is the insert's "Unresolved compact IRI" error, unless
+/// `strictCompactIri` is off, which takes it verbatim as an insert does.
+#[tokio::test]
+async fn jsonld_bind_iri_expands_through_the_context() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "query/bind:iri-context";
+    let ledger = seed_people_filter_dataset(&fluree, ledger_id).await;
+
+    let query = |iri: &str, opts: serde_json::Value| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+            "where": [
+                {"@id": "ex:alice", "schema:name": "?name"},
+                ["bind", "?x", format!("(iri \"{iri}\")"), "?s", "(str ?x)"]
+            ],
+            "select": "?s",
+            "opts": opts
+        })
+    };
+
+    let expanded = support::query_jsonld_formatted(&fluree, &ledger, &query("ex:T", json!({})))
+        .await
+        .expect("a defined prefix");
+    assert_eq!(expanded, json!(["http://example.org/ns/T"]));
+    let absolute = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &query("https://ns.example/T", json!({})),
+    )
+    .await
+    .expect("an absolute https IRI");
+    assert_eq!(
+        absolute,
+        json!(["https://ns.example/T"]),
+        "an absolute IRI is itself"
+    );
+    assert_query_bind_error(
+        &fluree,
+        &ledger,
+        query("bad:thing", json!({})),
+        "Unresolved compact IRI 'bad:thing'",
+    )
+    .await;
+    let verbatim = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &query("bad:thing", json!({"strictCompactIri": false})),
+    )
+    .await
+    .expect("strictCompactIri: false");
+    assert_eq!(verbatim, json!(["bad:thing"]));
+
+    // The array form of a filter, whose bare atoms are strings, expands the
+    // same two arguments: an `iri` argument and a `str-dt` datatype.
+    for (what, filter) in [
+        (
+            "iri",
+            json!([
+                "filter",
+                ["=", ["iri", "ex:T"], ["iri", "http://example.org/ns/T"]]
+            ]),
+        ),
+        (
+            "str-dt",
+            json!([
+                "filter",
+                [
+                    "=",
+                    ["datatype", ["str-dt", "?name", "ex:T"]],
+                    ["iri", "http://example.org/ns/T"]
+                ]
+            ]),
+        ),
+    ] {
+        let q = json!({
+            "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+            "where": [{"@id": "ex:alice", "schema:name": "?name"}, filter],
+            "select": "?name"
+        });
+        let rows = support::query_jsonld_formatted(&fluree, &ledger, &q)
+            .await
+            .unwrap_or_else(|e| panic!("array-form {what}: {e}"));
+        assert_eq!(rows, json!(["Alice"]), "array-form {what}");
+    }
+}
+
+/// `str-dt` builds its literal for a datatype in a namespace the ledger has
+/// never registered, as SPARQL's `STRDT` does for any IRI (#1765): an absolute
+/// `urn:` or `http://` IRI, a prefix the `@context` defines, and an IRI bound
+/// to a variable. It used to fail the query with "Unknown datatype IRI".
+#[tokio::test]
+async fn jsonld_bind_str_dt_with_an_unseen_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "query/bind:str-dt-unseen";
+    let ledger = seed_people_filter_dataset(&fluree, ledger_id).await;
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "schema": "http://schema.org/",
+        "nw": "http://nowhere.example/"
+    });
+
+    for (name, datatype, expected) in [
+        ("a urn IRI", "\"urn:example:dt\"", "urn:example:dt"),
+        (
+            "an http IRI",
+            "\"http://nowhere.example/T\"",
+            "http://nowhere.example/T",
+        ),
+        (
+            "a prefix the context defines",
+            "\"nw:U\"",
+            "http://nowhere.example/U",
+        ),
+        (
+            "an IRI bound to a variable",
+            "?dt",
+            "http://nowhere.example/V",
+        ),
+    ] {
+        let query = json!({
+            "@context": ctx,
+            "where": [
+                ["values", ["?dt", [{"@id": "http://nowhere.example/V"}]]],
+                {"@id": "ex:alice", "schema:name": "?name"},
+                ["bind",
+                 "?lit", format!("(str-dt ?name {datatype})"),
+                 "?d", "(str (datatype ?lit))",
+                 "?l", "(str ?lit)"]
+            ],
+            "select": ["?d", "?l"]
+        });
+        let rows = support::query_jsonld_formatted(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(rows, json!([[expected, "Alice"]]), "{name}");
+    }
 }
 
 #[tokio::test]

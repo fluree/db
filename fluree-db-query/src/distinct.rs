@@ -204,9 +204,13 @@ impl Operator for DistinctOperator {
                     // representations of the same value dedup (encoded
                     // bindings pass through untouched, borrowed).
                     scratch.clear();
-                    scratch.extend((0..num_cols).map(|col| {
-                        normalize_for_key_cow(batch.get_by_col(row_idx, col), dicts, gv)
-                    }));
+                    for col in 0..num_cols {
+                        scratch.push(normalize_for_key_cow(
+                            batch.get_by_col(row_idx, col),
+                            dicts,
+                            gv,
+                        )?);
+                    }
                     // `Cow` hashes as the binding it wraps, so this equals the
                     // stored `Vec<Binding>` hash the map recomputes on rehash.
                     let mut h = FxHasher::default();

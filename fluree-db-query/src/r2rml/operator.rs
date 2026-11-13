@@ -35,6 +35,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::flush::{pull_window, FlushSchedule};
@@ -1480,12 +1481,12 @@ impl R2rmlScanOperator {
         child_schema: &[VarId],
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> JoinPlan {
+    ) -> Result<JoinPlan> {
         if join_vars.is_empty() {
-            return JoinPlan::Cross;
+            return Ok(JoinPlan::Cross);
         }
         let dicts = crate::object_binding::TermDicts::of(ctx);
-        let gv = ctx.graph_view();
+        let gv = ctx.term_view();
         let gv = gv.as_ref();
 
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
@@ -1502,7 +1503,7 @@ impl R2rmlScanOperator {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)));
+                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)?));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1519,11 +1520,11 @@ impl R2rmlScanOperator {
                 partial_rows.push((row_idx, key));
             }
         }
-        JoinPlan::Hash {
+        Ok(JoinPlan::Hash {
             join_vars: join_vars.to_vec(),
             full_index,
             partial_rows,
-        }
+        })
     }
 
     /// Buffer one child batch and set up its streaming scan: resolve the matching
@@ -2144,7 +2145,7 @@ impl R2rmlScanOperator {
                 }
             }
 
-            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx);
+            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx)?;
 
             tms.push(TmStream {
                 tm_iri: triples_map.iri.clone(),
@@ -2877,7 +2878,7 @@ fn emit_produced_window(
             partial_rows,
         } => {
             let dicts = crate::object_binding::TermDicts::of(ctx);
-            let gv = ctx.graph_view();
+            let gv = ctx.term_view();
             let gv = gv.as_ref();
             for prod in produced {
                 // A produced row always binds every pattern var, so its join key
@@ -2889,7 +2890,7 @@ fn emit_produced_window(
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
                     })
-                    .collect();
+                    .try_collect_vec()?;
                 if pkey.len() != join_vars.len() {
                     continue;
                 }

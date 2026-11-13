@@ -1783,7 +1783,11 @@ impl Date {
 /// constant, or a typed value against a string constant. The lexical is read
 /// as a value of the held kind, so a dateTime or time is held to the
 /// microsecond like every value. `None` when neither pairing applies or the
-/// string does not parse.
+/// string does not parse. The FILTER evaluator's `<`, `<=`, `>`, `>=` and the
+/// scan's object bounds both order through this, so the pushed and the
+/// evaluated comparison cannot drift apart. Both pass it a string only when the
+/// string is a plain `xsd:string` term: a tagged or otherwise-typed literal is
+/// a term of its own type, not a temporal lexical.
 pub fn cmp_with_lexical(
     a: &crate::value::FlakeValue,
     b: &crate::value::FlakeValue,
@@ -1806,6 +1810,35 @@ pub fn cmp_with_lexical(
         _ => return None,
     };
     Some(if flipped { ord.reverse() } else { ord })
+}
+
+/// `lexical` read as a value of `held`'s temporal kind, by the parse
+/// [`cmp_with_lexical`] uses, for a caller comparing many values against one
+/// lexical: it parses once per kind with this and orders with
+/// `held.temporal_cmp(&parsed)`, the same comparison (pinned by a test).
+/// `cmp_with_lexical` itself parses onto the stack, keeping a one-off
+/// comparison free of this value's allocation. `None` when `held` is not one
+/// of these kinds or the lexical does not parse as it.
+pub fn lexical_as_kind_of(
+    held: &crate::value::FlakeValue,
+    lexical: &str,
+) -> Option<crate::value::FlakeValue> {
+    use crate::value::FlakeValue;
+    Some(match held {
+        FlakeValue::DateTime(_) => FlakeValue::DateTime(Box::new(DateTime::parse(lexical).ok()?)),
+        FlakeValue::Time(_) => FlakeValue::Time(Box::new(Time::parse(lexical).ok()?)),
+        FlakeValue::Date(_) => FlakeValue::Date(Box::new(Date::parse(lexical).ok()?)),
+        FlakeValue::GYear(_) => FlakeValue::GYear(Box::new(GYear::parse(lexical).ok()?)),
+        FlakeValue::GYearMonth(_) => {
+            FlakeValue::GYearMonth(Box::new(GYearMonth::parse(lexical).ok()?))
+        }
+        FlakeValue::GMonth(_) => FlakeValue::GMonth(Box::new(GMonth::parse(lexical).ok()?)),
+        FlakeValue::GDay(_) => FlakeValue::GDay(Box::new(GDay::parse(lexical).ok()?)),
+        FlakeValue::GMonthDay(_) => {
+            FlakeValue::GMonthDay(Box::new(GMonthDay::parse(lexical).ok()?))
+        }
+        _ => return None,
+    })
 }
 
 /// Fold a Cypher temporal constructor with a constant lexical argument into a
@@ -2329,6 +2362,54 @@ mod calendar_field_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `lexical_as_kind_of` then `temporal_cmp` orders every value against a
+    /// lexical exactly as `cmp_with_lexical` does, so the scan's
+    /// parse-once bounds and the one-off comparison cannot drift apart.
+    #[test]
+    fn a_lexical_read_once_orders_as_cmp_with_lexical() {
+        use crate::value::FlakeValue;
+        let held = [
+            FlakeValue::DateTime(Box::new(
+                DateTime::parse("2026-01-01T10:00:00.123456Z").unwrap(),
+            )),
+            FlakeValue::Date(Box::new(Date::parse("2026-01-01").unwrap())),
+            FlakeValue::Time(Box::new(Time::parse("10:00:00").unwrap())),
+            FlakeValue::GYear(Box::new(GYear::parse("2026").unwrap())),
+            FlakeValue::GYearMonth(Box::new(GYearMonth::parse("2026-01").unwrap())),
+            FlakeValue::GMonth(Box::new(GMonth::parse("--01").unwrap())),
+            FlakeValue::GDay(Box::new(GDay::parse("---01").unwrap())),
+            FlakeValue::GMonthDay(Box::new(GMonthDay::parse("--01-01").unwrap())),
+            FlakeValue::Long(7),
+        ];
+        let lexicals = [
+            "2026-01-01T10:00:00Z",
+            "2026-01-01T10:00:00.1234569Z",
+            "2026-01-02",
+            "2025-12-31",
+            "09:59:59",
+            "10:00:00",
+            "2026",
+            "2027",
+            "2026-02",
+            "--02",
+            "---02",
+            "--01-01",
+            "words",
+        ];
+        for h in &held {
+            for l in lexicals {
+                let s = FlakeValue::String(l.to_string());
+                let once = lexical_as_kind_of(h, l).and_then(|parsed| h.temporal_cmp(&parsed));
+                assert_eq!(cmp_with_lexical(h, &s), once, "{h:?} vs {l}");
+                assert_eq!(
+                    cmp_with_lexical(&s, h),
+                    once.map(Ordering::reverse),
+                    "{l} vs {h:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_datetime_parse_rfc3339() {

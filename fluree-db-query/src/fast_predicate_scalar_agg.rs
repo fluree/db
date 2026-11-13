@@ -177,7 +177,7 @@ pub fn predicate_scalar_agg_operator(
             // aggregate over a POST overlay cursor instead.
             let has_overlay = crate::fast_path_common::overlay_has_novelty(ctx);
             let result = if !has_overlay && ctx.to_t == store.max_t() {
-                scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind)?
+                scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind, &ctx.tracker)?
             } else {
                 scan_predicate_scalar_agg_overlay(ctx, store, ctx.binary_g_id, &predicate, kind)?
             };
@@ -390,6 +390,7 @@ pub(crate) fn scan_predicate_scalar_agg(
     g_id: GraphId,
     predicate: &Ref,
     kind: ScalarAggKind,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<AggOutput>> {
     let pred_sid = normalize_pred_sid(store, predicate)?;
     let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
@@ -443,9 +444,13 @@ pub(crate) fn scan_predicate_scalar_agg(
             else {
                 return Ok(None);
             };
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let o_key = batch.o_key.get(row);
                 let o_type = const_otype.unwrap_or_else(|| batch.o_type.get_or(row, 0));
@@ -540,7 +545,7 @@ pub(crate) fn scan_predicate_scalar_agg_overlay(
     let mut state = AggState::new(kind);
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("scalar-agg cursor: {e}")))?
+        .map_err(|e| QueryError::from_io("scalar-agg cursor", e))?
     {
         for row in 0..batch.row_count {
             let o_type = batch.o_type.get_or(row, 0);

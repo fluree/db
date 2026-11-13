@@ -160,10 +160,18 @@ impl Expression {
                     p_id,
                     dt_id,
                     lang_id,
+                    arena_g_id,
                     ..
                 }) => {
                     let Some(decoded) = ctx.and_then(|c| {
-                        c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                        c.decode_encoded_value(
+                            *o_kind,
+                            *o_key,
+                            *p_id,
+                            *dt_id,
+                            *lang_id,
+                            *arena_g_id,
+                        )
                     }) else {
                         return Ok(None);
                     };
@@ -186,6 +194,19 @@ impl Expression {
                         if let FlakeValue::Double(d) = val {
                             return Ok(Some(ComparableValue::Float(d as f32)));
                         }
+                    }
+                    // A stored `@fulltext` literal decodes to a bare string as
+                    // well, so `=` and `<` read it as an `xsd:string` here and
+                    // as `f:fullText` on the Lit path. Re-tag it the same way;
+                    // the string builtins still read it as text
+                    // (`value::reads_as_text`).
+                    if *dt_id == DatatypeDictId::FULL_TEXT.as_u16() {
+                        return Ok(Some(ComparableValue::TypedLiteral {
+                            val,
+                            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                                Arc::from(fluree_vocab::fluree::FULL_TEXT),
+                            )),
+                        }));
                     }
                     // A stored language-tagged literal decodes to a bare string
                     // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
@@ -507,10 +528,11 @@ pub(crate) fn stored_float_f64<R: RowAccess>(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if *dt_id == DatatypeDictId::FLOAT.as_u16() => {
             match ctx?
-                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                 .ok()?
             {
                 FlakeValue::Double(d) => Some(d),
@@ -611,6 +633,7 @@ fn binding_effective_bool(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         }) => {
             // A language-tagged literal has no effective boolean value (§17.2.2),
@@ -622,8 +645,9 @@ fn binding_effective_bool(
             if *lang_id != 0 {
                 return Err(ebv_type_error());
             }
-            let decoded =
-                ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
+            let decoded = ctx.and_then(|c| {
+                c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
+            });
             match decoded {
                 Some(Ok(val)) => match ComparableValue::try_from(&val) {
                     Ok(cv) => comparable_effective_bool(&cv),

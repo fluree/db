@@ -1952,3 +1952,60 @@ async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
         normalize_rows(&json!([[1.5], [2.5], [3.5]]))
     );
 }
+
+/// `DATATYPE(?x)` of a VALUES literal joined against `DATATYPE(STRDT(..))` of
+/// the same literal plans one way whether the datatype's namespace is
+/// registered or not, and over a registered datatype the join finds its row.
+/// So a different answer for the unseen datatype is a difference in the two
+/// terms, not in the plan (#1765). Unindexed and indexed.
+#[tokio::test]
+async fn datatype_values_join_plans_alike_for_registered_and_unseen_datatypes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "query/datatype:values-join-plan";
+    let ledger = genesis_ledger(&fluree, id);
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:s", "ex:p": "a"}),
+        )
+        .await
+        .expect("seed");
+    let join = |dt: &str| {
+        format!(
+            r#"PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+               SELECT ?a WHERE {{ VALUES ?x {{ "a"^^{dt} }} BIND(DATATYPE(?x) AS ?d)
+                 {{ SELECT ?d ?a WHERE {{ BIND(DATATYPE(STRDT("a", {dt})) AS ?d) BIND(1 AS ?a) }} }} }}"#
+        )
+    };
+    let registered = join("xsd:token");
+    let unseen = join("<http://nowhere.example/T>");
+
+    for phase in ["novelty", "indexed"] {
+        if phase == "indexed" {
+            fluree
+                .reindex(id, fluree_db_api::ReindexOptions::default())
+                .await
+                .expect("reindex");
+        }
+        let ledger = fluree.ledger(id).await.expect("ledger");
+        assert_eq!(
+            ledger.snapshot.range_provider.is_some(),
+            phase == "indexed",
+            "{phase}: setup"
+        );
+        assert_eq!(
+            support::query_sparql_formatted(&fluree, &ledger, &registered)
+                .await
+                .expect("registered"),
+            json!([[1]]),
+            "{phase}: the join over a registered datatype"
+        );
+        let db = support::graphdb_from_ledger(&ledger);
+        let mut plans = Vec::new();
+        for q in [&unseen, &registered] {
+            let plan = fluree.explain_sparql(&db, q).await.expect("explain");
+            plans.push(plan["plan"]["physical"].to_string());
+        }
+        assert_eq!(plans[0], plans[1], "{phase}: the two joins plan alike");
+    }
+}

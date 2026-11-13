@@ -22,6 +22,20 @@ pub fn is_reserved_datatype(dt: &Sid) -> bool {
     known.is_some_and(|k| DatatypeDictId::RESERVED_IRIS.contains(&k.canonical_form()))
 }
 
+/// Whether `dt` is `xsd:string`, in any of the forms a datatype `Sid` takes.
+#[inline]
+pub fn is_xsd_string_datatype(dt: &Sid) -> bool {
+    use fluree_vocab::{datatype::KnownDatatype, namespaces, xsd_names};
+    match dt.namespace_code {
+        namespaces::XSD => dt.name_str() == xsd_names::STRING,
+        // The full IRI lives in `name` for these two.
+        namespaces::EMPTY | namespaces::OVERFLOW => {
+            KnownDatatype::from_canonical_form(dt.name_str()) == Some(KnownDatatype::XsdString)
+        }
+        _ => false,
+    }
+}
+
 /// Whether literals of this datatype are interned in the shared **string
 /// dictionary** — `xsd:string`, its XSD subtypes (`xsd:anyURI`, `xsd:token`,
 /// `xsd:normalizedString`, `xsd:language`, `xsd:base64Binary`,

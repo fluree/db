@@ -557,7 +557,8 @@ impl QueryPolicyExecutor<'_> {
             patterns,
             None,
             None,
-            &crate::temporal_mode::PlanningContext::current(),
+            // The ledger's own default graph.
+            &crate::temporal_mode::PlanningContext::current().with_dataset_scope(None),
         )
         .map_err(|e| fluree_db_policy::PolicyError::QueryExecution {
             message: e.to_string(),

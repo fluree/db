@@ -150,6 +150,8 @@ pub(crate) struct FrontierView {
     pub(crate) g_id: GraphId,
     pub(crate) to_t: i64,
     pub(crate) dirty: Arc<DirtyIds>,
+    /// The query's tracker, charged for every leaflet the sweeps read.
+    pub(crate) tracker: fluree_db_core::Tracker,
 }
 
 impl FrontierView {
@@ -198,8 +200,9 @@ impl FrontierView {
             p_id,
             subjects,
             self.to_t,
+            &self.tracker,
         )
-        .map_err(|e| QueryError::Internal(format!("batched out-edges: {e}")))?;
+        .map_err(|e| QueryError::from_io("batched out-edges", e))?;
         for (s_id, targets) in refs {
             for t in targets {
                 out.push((s_id, t));
@@ -221,8 +224,9 @@ impl FrontierView {
             self.g_id,
             subjects,
             self.to_t,
+            &self.tracker,
         )
-        .map_err(|e| QueryError::Internal(format!("batched out-edges: {e}")))?;
+        .map_err(|e| QueryError::from_io("batched out-edges", e))?;
         for (s_id, props) in rows {
             for (p_id, o_type, o_key) in props {
                 if reserved_pids.contains(&p_id) {
@@ -250,8 +254,9 @@ impl FrontierView {
             self.g_id,
             objects,
             self.to_t,
+            &self.tracker,
         )
-        .map_err(|e| QueryError::Internal(format!("batched in-edges: {e}")))?;
+        .map_err(|e| QueryError::from_io("batched in-edges", e))?;
         for (o_key, edges) in inbound {
             for (p_id, s_id) in edges {
                 if keep(p_id) {

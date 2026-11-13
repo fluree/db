@@ -820,9 +820,73 @@ impl Expression {
     /// (< 10 ?x 20)                     -> range-safe (sandwich: const var const)
     /// (< ?x ?y 20)                     -> NOT range-safe (non-sandwich variadic)
     /// ```
+    /// The typed literal this is when it is `STRDT` of two constants
+    /// (a SPARQL `"x"^^ex:T` lowers to one, as does JSON-LD
+    /// `(str-dt "x" "ex:T")`) whose datatype has no value space of its own,
+    /// as `(lexical form, datatype IRI)`. `=` against such a literal is
+    /// identity of terms, so a scan can apply it as that term
+    /// ([`fluree_db_core::ObjectBounds::string_datatype`]).
+    ///
+    /// A datatype whose values are numbers, temporals, booleans or JSON is
+    /// compared by value, so it is not one; nor are `xsd:string` (a plain
+    /// string), `rdf:langString`, and the datatypes the index keys other
+    /// than by their string (WKT geometries, full text).
+    pub fn as_typed_string_literal(&self) -> Option<(&str, &str)> {
+        let Expression::Call {
+            func: Function::StrDt,
+            args,
+        } = self
+        else {
+            return None;
+        };
+        let [Expression::Const(FlakeValue::String(value)), datatype] = args.as_slice() else {
+            return None;
+        };
+        // The datatype is a constant IRI: a string (a typed literal, JSON-LD
+        // `str-dt`) or `IRI(…)` of one (SPARQL's `STRDT(…, ex:T)`).
+        let datatype = match datatype {
+            Expression::Const(FlakeValue::String(iri)) => iri,
+            Expression::Call {
+                func: Function::Iri,
+                args,
+            } => match args.as_slice() {
+                [Expression::Const(FlakeValue::String(iri))] => iri,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let keyed_otherwise = [
+            fluree_vocab::xsd::STRING,
+            fluree_vocab::rdf::LANG_STRING,
+            fluree_vocab::geo::WKT_LITERAL,
+            fluree_vocab::fluree::FULL_TEXT,
+        ];
+        if keyed_otherwise.contains(&datatype.as_str())
+            || !fluree_db_core::graph_registry::is_iri_reference(datatype)
+        {
+            return None;
+        }
+        matches!(
+            fluree_db_core::coerce_value(FlakeValue::String(value.clone()), datatype),
+            Ok(FlakeValue::String(_))
+        )
+        .then_some((value.as_str(), datatype.as_str()))
+    }
+
     pub fn is_range_safe(&self) -> bool {
         match self {
             Expression::Call { func, args } => match func {
+                // `=` against a typed literal it can bound as that term.
+                Function::Eq
+                    if args.len() == 2
+                        && matches!(
+                            (&args[0], &args[1]),
+                            (Expression::Var(_), typed) | (typed, Expression::Var(_))
+                                if typed.as_typed_string_literal().is_some()
+                        ) =>
+                {
+                    true
+                }
                 // Comparison operators (except Ne) are range-safe if var vs const
                 Function::Eq | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
                     // 2-arg: var vs const (either order)
@@ -1405,6 +1469,61 @@ impl Function {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `STRDT` of two constants folds into a typed bound only for a datatype
+    /// whose `=` is identity of terms, its datatype a string or `IRI(…)`.
+    #[test]
+    fn typed_string_literal_folds_only_term_identity_datatypes() {
+        use fluree_vocab::{fluree, geo, rdf, xsd};
+        let c = |s: &str| Expression::Const(FlakeValue::String(s.into()));
+        let strdt = |value: &str, datatype: Expression| Expression::Call {
+            func: Function::StrDt,
+            args: vec![c(value), datatype],
+        };
+        let iri = |s: &str| Expression::Call {
+            func: Function::Iri,
+            args: vec![c(s)],
+        };
+        let custom = "http://example.org/T";
+        assert_eq!(
+            strdt("x", c(custom)).as_typed_string_literal(),
+            Some(("x", custom))
+        );
+        assert_eq!(
+            strdt("x", iri(custom)).as_typed_string_literal(),
+            Some(("x", custom))
+        );
+        for datatype in [xsd::ANY_URI, xsd::TOKEN, "T"] {
+            assert!(
+                strdt("x", c(datatype)).as_typed_string_literal().is_some(),
+                "{datatype}"
+            );
+        }
+        for (value, datatype) in [
+            ("x", xsd::STRING),
+            ("5", xsd::INTEGER),
+            ("5.5", xsd::DECIMAL),
+            ("2026-01-01", xsd::DATE),
+            ("true", xsd::BOOLEAN),
+            ("x", rdf::LANG_STRING),
+            (r#"{"a":1}"#, rdf::JSON),
+            ("POLYGON((0 0, 1 0, 1 1, 0 0))", geo::WKT_LITERAL),
+            ("x", fluree::FULL_TEXT),
+            ("x", "not an iri"),
+        ] {
+            assert_eq!(
+                strdt(value, c(datatype)).as_typed_string_literal(),
+                None,
+                "{datatype}"
+            );
+        }
+        // Not two constants.
+        let var = Expression::Call {
+            func: Function::StrDt,
+            args: vec![Expression::Var(VarId(0)), c(custom)],
+        };
+        assert_eq!(var.as_typed_string_literal(), None);
+    }
 
     #[test]
     fn test_filter_expr_is_range_safe() {

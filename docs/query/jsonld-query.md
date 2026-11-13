@@ -667,18 +667,22 @@ prefix is an error rather than a silent string.
 The distinction lives in the quoting, so it exists only in the s-expression
 string form. In the **array form** every element is a JSON string, with no
 syntax to mark one as unquoted, so `["=", "?p", "ex:knows"]` compares against
-the *string* `"ex:knows"`. Write the s-expression form, or wrap an **absolute**
-IRI in `iri`, when you mean the IRI:
+the *string* `"ex:knows"`. Write the s-expression form, or wrap the IRI in
+`iri`, when you mean the IRI:
 
 ```json
 ["filter", "(= ?p ex:knows)"]
+["filter", ["=", "?p", ["iri", "ex:knows"]]]
 ["filter", ["=", "?p", ["iri", "http://example.org/knows"]]]
 ```
 
-`iri` does not expand prefixes: its argument is used verbatim, so
-`["iri", "ex:knows"]` builds the IRI `ex:knows` and matches nothing. (SPARQL's
-`IRI()` resolves a relative argument against the query's `BASE`; the JSON-LD
-surface has no `BASE`, so nothing is resolved here either.)
+A constant `iri` argument is expanded the way an `@id` is: through the
+`@context`, under the same compact-IRI check. `["iri", "ex:knows"]` with `ex`
+defined is the full IRI, and a prefix the `@context` does not define
+(`["iri", "bad:thing"]`) is an "Unresolved compact IRI" error, unless
+`opts.strictCompactIri` is `false`, which takes it verbatim. A `str-dt`
+datatype written as a string is expanded the same way, in either form. An
+argument computed at run time, such as a variable, is used as it is.
 
 **Complex Filters:**
 
@@ -1223,6 +1227,8 @@ When comparing incomparable types (e.g., a number and a string):
 - `=` yields `false` — values of different types are not equal
 - `!=` yields `true` — values of different types are not equal
 - `<`, `<=`, `>`, `>=` raise an error — ordering between incompatible types is undefined
+
+A string constant is an `xsd:string` term. `(= ?o "a")` is `false` for `"a"@en`, and for a literal of another datatype (`"a"^^ex:T`) both `=` and `!=` raise an error, which drops the row. To compare the text whatever its tag or datatype, use `(= (str ?o) "a")`. An `@fulltext` or `@json` value is its own datatype the same way, while the string functions (`contains`, `regex`, `strStarts`, `subStr`, …) read it as text. (This differs from a bare string as a constant object in `where`, which matches the text under any tag; see [Datatypes](../concepts/datatypes.md).)
 
 ### Logical Functions
 
