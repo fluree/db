@@ -440,14 +440,15 @@ impl Fluree {
         else {
             return Ok(());
         };
-        let held: HashSet<(String, u32)> = registry::read(ns, self.registry_objects(), target_id)
-            .await?
-            .1
-            .map(|r| r.journal.removals)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.commit, r.slot))
-            .collect();
+        let held: std::collections::HashSet<(String, u32)> =
+            registry::read(ns, self.registry_objects(), target_id)
+                .await?
+                .1
+                .map(|r| r.journal.removals)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.commit, r.slot))
+                .collect();
         let missing: Vec<Removal> = source
             .journal
             .removals
