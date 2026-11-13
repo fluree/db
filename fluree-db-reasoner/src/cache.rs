@@ -335,6 +335,16 @@ impl ReasoningCache {
         self.inner.write().put(key, result);
     }
 
+    /// Whether any entry is a materialization of `ledger_id`. Entry counts
+    /// race against the other queries sharing the process-wide cache; this
+    /// reads one ledger's.
+    pub fn holds_ledger(&self, ledger_id: &str) -> bool {
+        self.inner
+            .read()
+            .iter()
+            .any(|(key, _)| key.ledger_id.as_ref() == ledger_id)
+    }
+
     /// Get the number of cached entries
     pub fn len(&self) -> usize {
         self.inner.read().len()
