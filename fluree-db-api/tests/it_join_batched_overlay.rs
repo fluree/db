@@ -20,6 +20,7 @@
 
 use crate::support::{genesis_ledger_for_fluree, normalize_rows, span_capture};
 use fluree_db_api::{FlureeBuilder, QueryInput, ReindexOptions};
+use fluree_db_indexer::IndexerConfig;
 use serde_json::json;
 
 fn ctx() -> serde_json::Value {
@@ -638,8 +639,25 @@ async fn batched_object_join_merges_novelty() {
 /// rows that neither the leaflet's type constant nor its keys describe.
 #[tokio::test]
 async fn batched_object_join_reads_refs_among_literals() {
+    refs_among_literals("it/join-batched-object-mixed:main", ReindexOptions::default).await;
+}
+
+/// The same shapes over an index of two-row leaflets, two to a leaf, so an
+/// object's run spans leaflets and leaves and the walk jumps between leaves.
+#[tokio::test]
+async fn batched_object_join_reads_refs_among_literals_across_small_leaflets() {
+    refs_among_literals("it/join-batched-object-mixed-small:main", || {
+        ReindexOptions::default().with_indexer_config(
+            IndexerConfig::default()
+                .with_leaflet_rows(2)
+                .with_leaflets_per_leaf(2),
+        )
+    })
+    .await;
+}
+
+async fn refs_among_literals(ledger_id: &str, reindex_opts: fn() -> ReindexOptions) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/join-batched-object-mixed:main";
     let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
 
     let lang = |value: &str, language: &str| json!({"@value": value, "@language": language});
@@ -664,7 +682,7 @@ async fn batched_object_join_reads_refs_among_literals() {
     let receipt = fluree.insert(ledger, &base).await.expect("base insert");
     let base_t = receipt.ledger.t();
     fluree
-        .reindex(ledger_id, ReindexOptions::default())
+        .reindex(ledger_id, reindex_opts())
         .await
         .expect("reindex base");
 
@@ -751,7 +769,7 @@ async fn batched_object_join_reads_refs_among_literals() {
     check("novelty", view, at_head()).await;
 
     fluree
-        .reindex(ledger_id, ReindexOptions::default())
+        .reindex(ledger_id, reindex_opts())
         .await
         .expect("reindex head");
     let view = fluree.db(ledger_id).await.expect("reindexed view");
