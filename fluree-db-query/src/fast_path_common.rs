@@ -2328,8 +2328,9 @@ pub fn cached_overlay_ops(
 }
 
 /// The predicate's `IRI_REF` ops sorted by `(o_key, s_id, o_i)`, the order
-/// the OPST object lane reconciles in. Derived from the PSOT ops once and
-/// cached beside them under the OPST key.
+/// the bound-object lane reconciles in. Derived from the PSOT ops once and
+/// cached beside them under the OPST key: no scan reads OPST ops, while the
+/// POST key holds a POST scan's own.
 pub(crate) fn cached_object_probe_ops(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -2552,7 +2553,7 @@ impl ProbeOps {
     }
 }
 
-/// Per-flush reconciler for the OPST bound-object probe lane.
+/// Per-flush reconciler for the bound-object probe lane.
 ///
 /// The lane scans only `IRI_REF` rows of one predicate, keyed by object id,
 /// so it reconciles against [`cached_object_probe_ops`]: that subset of the
@@ -2879,9 +2880,9 @@ pub fn subject_probe_lane_plan(
     Ok(ProbeLanePlan::Merge(ops))
 }
 
-/// Plan an OPST bound-object probe under the active overlay.
+/// Plan a bound-object probe under the active overlay.
 ///
-/// Gates on the predicate's PSOT ops and the OPST branch the scan reads, and
+/// Gates on the predicate's PSOT ops and the POST branch the probe reads, and
 /// merges the ops' `IRI_REF` subset ([`cached_object_probe_ops`]).
 pub fn object_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
@@ -2908,10 +2909,10 @@ pub fn object_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Post)
         .is_none()
     {
-        tracing::debug!("object probe: OPST branch absent with novelty present; declining");
+        tracing::debug!("object probe: POST branch absent with novelty present; declining");
         return Ok(ProbeLanePlan::Decline);
     }
     let Some(ref_ops) = cached_object_probe_ops(ctx, store, pred_sid)? else {
@@ -4632,7 +4633,7 @@ mod tests {
     #[test]
     fn branch_or_none_refuses_a_merge_over_a_graph_with_no_branch() {
         let store = BinaryIndexStore::empty(std::env::temp_dir());
-        for order in [RunSortOrder::Psot, RunSortOrder::Opst, RunSortOrder::Spot] {
+        for order in [RunSortOrder::Psot, RunSortOrder::Post, RunSortOrder::Spot] {
             assert!(
                 matches!(branch_or_none(&store, 3, order, false), Ok(None)),
                 "{order:?}: no merge, no branch: nothing to read"

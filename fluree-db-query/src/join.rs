@@ -677,8 +677,8 @@ fn is_batched_eligible(
 /// - subject is a new unbound variable (no BindInstruction for Subject)
 /// - no object bounds or datatype/language constraints
 ///
-/// This enables scanning OPST in bulk for a set of bound ref objects rather than
-/// opening one scan per left row.
+/// This enables one batched probe of the predicate's POST rows for a set of
+/// bound ref objects rather than opening one scan per left row.
 fn is_batched_object_eligible(
     bind_instructions: &[BindInstruction],
     right_pattern: &TriplePattern,
@@ -2078,7 +2078,7 @@ impl NestedLoopJoinOperator {
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
-    /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
+    /// subject; the bound-object lane merges its `IRI_REF` subset per probed
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// before any accumulation, except for a plan deferred to the first flush
     /// ([`Self::defers_batched_overlay`]): that flush hands its rows to the
@@ -2804,8 +2804,8 @@ impl NestedLoopJoinOperator {
 
     /// Binary-index batched scan for object-bound joins.
     ///
-    /// Scans OPST for `(o_type=IRI_REF, o_key in accumulator set, p_id=fixed)` and
-    /// emits combined rows that bind the right pattern's new subject var.
+    /// Probes POST for `(p_id=fixed, o_type=IRI_REF, o_key in accumulator set)`
+    /// and emits combined rows that bind the right pattern's new subject var.
     async fn flush_batched_object_accumulator_binary(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -2836,7 +2836,7 @@ impl NestedLoopJoinOperator {
         }
 
         let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
-        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Opst, merging)?
+        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Post, merging)?
         else {
             self.clear_batched_state();
             return Ok(());
@@ -3233,15 +3233,82 @@ fn decode_overlay_object(
     )
 }
 
-/// Walk OPST for the `IRI_REF` rows of predicate `p_id` whose object is one of
+/// The `o_key` interval a POST key range `[first, last]` leaves to the rows of
+/// `want = (p_id, o_type)`, or `None` when the range holds none.
+fn post_o_key_bounds(
+    first: &fluree_db_binary_index::format::run_record_v2::RunRecordV2,
+    last: &fluree_db_binary_index::format::run_record_v2::RunRecordV2,
+    want: (u32, u16),
+) -> Option<(u64, u64)> {
+    use std::cmp::Ordering;
+    let lo = match (first.p_id, first.o_type).cmp(&want) {
+        Ordering::Less => 0,
+        Ordering::Equal => first.o_key,
+        Ordering::Greater => return None,
+    };
+    let hi = match (last.p_id, last.o_type).cmp(&want) {
+        Ordering::Less => return None,
+        Ordering::Equal => last.o_key,
+        Ordering::Greater => u64::MAX,
+    };
+    Some((lo, hi))
+}
+
+/// The part of sorted `objs[within]` that falls inside `[lo, hi]`.
+fn objs_within(
+    objs: &[u64],
+    within: std::ops::Range<usize>,
+    (lo, hi): (u64, u64),
+) -> std::ops::Range<usize> {
+    let start = within.start + objs[within.clone()].partition_point(|&o| o < lo);
+    start..start + objs[start..within.end].partition_point(|&o| o <= hi)
+}
+
+/// The rows of a POST-ordered `batch` holding `want = (p_id, o_type)`: one
+/// run, because POST sorts by those two columns first.
+fn post_rows_of(
+    batch: &fluree_db_binary_index::ColumnBatch,
+    want: (u32, u16),
+) -> std::ops::Range<usize> {
+    let key = |row: usize| (batch.p_id.get_or(row, 0), batch.o_type.get_or(row, 0));
+    if batch.row_count == 0 {
+        return 0..0;
+    }
+    if batch.p_id.is_const() && batch.o_type.is_const() {
+        return if key(0) == want {
+            0..batch.row_count
+        } else {
+            0..0
+        };
+    }
+    let partition = |from: usize, pred: &dyn Fn(usize) -> bool| {
+        let (mut lo, mut hi) = (from, batch.row_count);
+        while lo < hi {
+            let mid = usize::midpoint(lo, hi);
+            if pred(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    let start = partition(0, &|row| key(row) < want);
+    start..partition(start, &|row| key(row) == want)
+}
+
+/// Walk `p_id`'s POST partition for the `IRI_REF` rows whose object is one of
 /// `objs` (sorted, deduplicated), calling `visit(obj_idx, s_id)` — `obj_idx`
 /// indexes `objs` — for each live row: base rows the overlay does not retract,
 /// then each novelty-only assert when `probe_ops` merges one.
 ///
-/// Each OPST leaf holding any of the objects is read at most once, and inside a
-/// leaflet the `o_key` column is binary-searched per object, so the work tracks
-/// the matches rather than the leaflet or predicate size. Shared by the
-/// nested-loop join's bound-object lane and OPTIONAL's.
+/// POST keeps a predicate's rows together in `(o_type, o_key)` order, so an
+/// object's run there is its matches and nothing else. Each leaf holding any of
+/// the objects is read at most once and the `o_key` column is binary-searched
+/// per object, so the work tracks the matches — not the leaflet, the predicate,
+/// or the edges the object has under other predicates (which an object-major
+/// OPST walk steps over row by row). Shared by the nested-loop join's
+/// bound-object lane and OPTIONAL's.
 pub(crate) fn for_each_object_probe_match(
     ctx: &ExecutionContext<'_>,
     store: &BinaryIndexStore,
@@ -3254,205 +3321,167 @@ pub(crate) fn for_each_object_probe_match(
     use fluree_db_binary_index::format::run_record_v2::{
         cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
     };
-    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+    use fluree_db_binary_index::read::column_types::{ColumnData, ColumnProjection, ColumnSet};
     use fluree_db_binary_index::RunSortOrder;
     use fluree_db_core::o_type::OType;
 
-    if objs.is_empty() {
+    let (Some(&first_obj), Some(&last_obj)) = (objs.first(), objs.last()) else {
         return Ok(());
-    }
+    };
     let iri_ref = OType::IRI_REF.as_u16();
-    let cmp = cmp_v2_for_order(RunSortOrder::Opst);
-
-    // Collect leaf indices for all object keys.
-    let mut leaf_indices: Vec<usize> = Vec::new();
-    for &o_s_id in objs {
-        let min_key = RunRecordV2 {
-            s_id: SubjectId(0),
-            o_key: o_s_id,
-            p_id,
-            t: 0,
-            o_i: 0,
-            o_type: iri_ref,
-            g_id: ctx.binary_g_id,
-        };
-        let max_key = RunRecordV2 {
-            s_id: SubjectId(u64::MAX),
-            o_key: o_s_id,
-            p_id,
-            t: u32::MAX,
-            o_i: u32::MAX,
-            o_type: iri_ref,
-            g_id: ctx.binary_g_id,
-        };
-        let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
-        leaf_indices.extend(r);
-    }
-    leaf_indices.sort_unstable();
-    leaf_indices.dedup();
+    let want = (p_id, iri_ref);
+    let cmp = cmp_v2_for_order(RunSortOrder::Post);
+    let key = |o_key: u64, o_i: u32, s_id: u64| RunRecordV2 {
+        s_id: SubjectId(s_id),
+        o_key,
+        p_id,
+        t: 0,
+        o_i,
+        o_type: iri_ref,
+        g_id: ctx.binary_g_id,
+    };
+    let leaves = branch.find_leaves_in_range(
+        &key(first_obj, 0, 0),
+        &key(last_obj, u32::MAX, u64::MAX),
+        cmp,
+    );
 
     let need_replay = ctx.to_t < store.max_t();
     let replay_to = need_replay.then_some(ctx.to_t);
     let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
-    for leaf_idx in leaf_indices {
-        ctx.check_cancelled()?;
-        let leaf_entry = &branch.leaves[leaf_idx];
-        let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
+    // The join needs only the core identity columns. A historical snapshot
+    // also needs `T`, so `replay_leaflet_at_t` can detect base rows that
+    // postdate `to_t`. The overlay merge needs `OI`: CORE lacks it, and a fate
+    // check reading `o_i` as a default would mis-reconcile retracts on
+    // multi-entry (`@list`) refs. The leaflet cache keys on the decoded column
+    // set, so the narrow entry never collides with a wider one.
+    let proj = if need_replay {
+        ColumnProjection::all()
+    } else if probe_ops.is_some() {
+        ColumnProjection {
+            output: ColumnSet::CORE.union(ColumnSet::single(
+                fluree_db_binary_index::format::column_block::ColumnId::OI,
+            )),
+            internal: ColumnSet::EMPTY,
+        }
+    } else {
+        ColumnProjection {
+            output: ColumnSet::CORE,
+            internal: ColumnSet::EMPTY,
+        }
+    };
 
+    let mut leaf_idx = leaves.start;
+    while leaf_idx < leaves.end {
+        let leaf_entry = &branch.leaves[leaf_idx];
+        leaf_idx += 1;
+        let Some(leaf_bounds) =
+            post_o_key_bounds(&leaf_entry.first_key, &leaf_entry.last_key, want)
+        else {
+            continue;
+        };
+        let in_leaf = objs_within(objs, 0..objs.len(), leaf_bounds);
+        if in_leaf.is_empty() {
+            // No object routes here: jump to the leaf the next one routes to.
+            let Some(&next) = objs.get(in_leaf.start) else {
+                break;
+            };
+            let next_key = key(next, 0, 0);
+            leaf_idx += branch.leaves[leaf_idx..leaves.end]
+                .partition_point(|leaf| cmp(&leaf.last_key, &next_key).is_lt());
+            continue;
+        }
+
+        ctx.check_cancelled()?;
+        let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
         for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
-            ctx.check_cancelled()?;
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
-            if entry.p_const.is_some() && entry.p_const != Some(p_id) {
+            if entry.p_const.is_some_and(|p| p != p_id) {
                 continue;
             }
-            if entry.o_type_const.is_some() && entry.o_type_const != Some(iri_ref) {
-                continue;
-            }
-
-            // Quick reject based on leaflet key range.
-            let first = read_ordered_key_v2(RunSortOrder::Opst, &entry.first_key);
-            let last = read_ordered_key_v2(RunSortOrder::Opst, &entry.last_key);
-            let first_o = first.o_key;
-            let last_o = last.o_key;
-            if last_o < objs[0] || first_o > *objs.last().unwrap() {
-                continue;
-            }
-            // If no object keys fall within [first_o, last_o], skip.
-            let start = objs.partition_point(|&x| x < first_o);
-            let end = objs.partition_point(|&x| x <= last_o);
-            if start >= end {
-                continue;
-            }
-
-            // We only need core identity columns for this join, but for
-            // historical snapshots we also need `T` so `replay_leaflet_at_t`
-            // can detect base rows that postdate `to_t`. The overlay merge
-            // additionally needs `OI`: CORE lacks it, and a fate check
-            // reading `o_i` as a default would mis-reconcile retracts on
-            // multi-entry (`@list`) refs in BOTH cache configurations.
-            let proj = if need_replay {
-                ColumnProjection::all()
-            } else if probe_ops.is_some() {
-                ColumnProjection {
-                    output: ColumnSet::CORE.union(ColumnSet::single(
-                        fluree_db_binary_index::format::column_block::ColumnId::OI,
-                    )),
-                    internal: ColumnSet::EMPTY,
-                }
+            // `o_type_const` and the leaflet's own keys describe its live
+            // rows; a replay can bring back a retracted ref they do not cover
+            // (a mixed-type predicate whose last ref in the leaflet is gone),
+            // so only the leaf's routing bounds it then.
+            let in_leaflet = if needs_history_replay {
+                in_leaf.clone()
             } else {
-                ColumnProjection {
-                    output: ColumnSet::CORE,
-                    internal: ColumnSet::EMPTY,
-                }
-            };
-            // The cache keys on the decoded column set, so this narrow
-            // entry never collides with a wider one.
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
-            ctx.check_cancelled()?;
-
-            // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
-            // Instead of scanning every row in the leaflet, binary-search the
-            // `o_key` column for just the object IDs we care about and only
-            // visit those row ranges. This keeps work proportional to matches
-            // rather than leaflet size.
-            let fluree_db_binary_index::read::column_types::ColumnData::Block(o_keys) =
-                &batch.o_key
-            else {
-                // o_key is required; AbsentDefault cannot occur here.
-                // Const(o_key) would mean the entire leaflet shares one object key,
-                // which is extremely rare for OPST; fall back to row-scan in that case.
-                for row in 0..batch.row_count {
-                    let ot = batch.o_type.get_or(row, 0);
-                    if ot != iri_ref {
-                        continue;
-                    }
-                    let pid = batch.p_id.get_or(row, 0);
-                    if pid != p_id {
-                        continue;
-                    }
-                    let o_key = batch.o_key.get_or(row, 0);
-                    let Ok(obj_idx) = objs.binary_search(&o_key) else {
-                        continue;
-                    };
-                    let s_id = batch.s_id.get_or(row, 0);
-                    if let Some(probe) = probe_ops.as_mut() {
-                        let win = probe.object_window(o_key);
-                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
-                        if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
-                            continue;
-                        }
-                    }
-                    visit(obj_idx, s_id)?;
-                }
-                continue;
-            };
-
-            // Only consider the subset of objects that intersect this leaflet's object range.
-            let mut obj_idx = start;
-            let o_keys_slice: &[u64] = o_keys.as_ref();
-
-            // Fast path: if o_type/p_id are const and already filtered by leaflet
-            // metadata, we can skip per-row checks.
-            let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == iri_ref;
-            let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
-
-            // Start scanning at the first possible match within this leaflet.
-            let mut row = 0usize;
-            while row < batch.row_count && obj_idx < end {
-                let target = objs[obj_idx];
-
-                // Seek row to the first o_key >= target.
-                if o_keys_slice[row] < target {
-                    let next = o_keys_slice[row..].partition_point(|&x| x < target);
-                    row = row.saturating_add(next);
-                    if row >= batch.row_count {
-                        break;
-                    }
-                }
-
-                let cur = o_keys_slice[row];
-                if cur > target {
-                    obj_idx += 1;
+                if entry.o_type_const.is_some_and(|ot| ot != iri_ref) {
                     continue;
                 }
-                // cur == target: process run [row, run_end).
-                let run_end = row + o_keys_slice[row..].partition_point(|&x| x == target);
+                let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
+                let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
+                match post_o_key_bounds(&first, &last, want) {
+                    Some(bounds) => objs_within(objs, in_leaf.clone(), bounds),
+                    None => continue,
+                }
+            };
+            if in_leaflet.is_empty() {
+                continue;
+            }
 
-                let probe_window = probe_ops
+            ctx.check_cancelled()?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let rows = post_rows_of(&batch, want);
+            if rows.is_empty() {
+                continue;
+            }
+
+            let mut emit = |obj_idx: usize, run: std::ops::Range<usize>| -> Result<()> {
+                let window = probe_ops
                     .as_ref()
-                    .map(|p| p.object_window(target))
-                    .filter(|w| !w.is_empty());
-
-                for r in row..run_end {
-                    if !ot_const_ok {
-                        let ot = batch.o_type.get_or(r, 0);
-                        if ot != iri_ref {
-                            continue;
-                        }
-                    }
-                    if !pid_const_ok {
-                        let pid = batch.p_id.get_or(r, 0);
-                        if pid != p_id {
-                            continue;
-                        }
-                    }
-
-                    let s_id = batch.s_id.get_or(r, 0);
-                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                        let o_i_val = batch.o_i.get_or(r, u32::MAX);
-                        if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
+                    .map(|probe| probe.object_window(objs[obj_idx]))
+                    .filter(|window| !window.is_empty());
+                for row in run {
+                    let s_id = batch.s_id.get_or(row, 0);
+                    if let (Some(probe), Some(window)) = (probe_ops.as_mut(), &window) {
+                        let o_i = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(window, s_id, o_i) == RowFate::Drop {
                             continue;
                         }
                     }
                     visit(obj_idx, s_id)?;
                 }
-
-                row = run_end;
-                obj_idx += 1;
+                Ok(())
+            };
+            match &batch.o_key {
+                // `rows` share `(p_id, o_type)`, so their keys are sorted.
+                ColumnData::Block(keys) => {
+                    let keys = &keys[rows.clone()];
+                    let (mut row, mut obj_idx) = (0usize, in_leaflet.start);
+                    while obj_idx < in_leaflet.end {
+                        let target = objs[obj_idx];
+                        row += keys[row..].partition_point(|&k| k < target);
+                        let Some(&found) = keys.get(row) else {
+                            break;
+                        };
+                        if found > target {
+                            // Skip the objects this leaflet has no rows for.
+                            obj_idx +=
+                                objs[obj_idx..in_leaflet.end].partition_point(|&o| o < found);
+                            continue;
+                        }
+                        let run_end = row + keys[row..].partition_point(|&k| k == target);
+                        emit(obj_idx, rows.start + row..rows.start + run_end)?;
+                        row = run_end;
+                        obj_idx += 1;
+                    }
+                }
+                // One object fills the leaflet.
+                ColumnData::Const(o_key) => {
+                    if let Ok(found) = objs[in_leaflet.clone()].binary_search(o_key) {
+                        emit(in_leaflet.start + found, rows)?;
+                    }
+                }
+                ColumnData::AbsentDefault => {
+                    return Err(QueryError::Internal(
+                        "object probe: leaflet decoded without its o_key column".into(),
+                    ));
+                }
             }
         }
     }

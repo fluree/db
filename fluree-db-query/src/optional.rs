@@ -444,7 +444,7 @@ impl PatternOptionalBuilder {
         )
     }
 
-    /// The bound-object lane: one sorted OPST pass over every required row's
+    /// The bound-object lane: one sorted POST pass over every required row's
     /// object answers the whole batch, binding the optional-only subject.
     /// Without it each row ran its own lookup, and before the substitution
     /// covered encoded objects, its own scan of the whole predicate (#1973).
@@ -452,7 +452,7 @@ impl PatternOptionalBuilder {
     /// Declines — to the per-row path, which handles every form — when the
     /// lane is not admitted. Leaves to the per-row path each row whose object
     /// is not a ref with an id: an unbound object (the triple's object is then
-    /// free), a literal (the OPST ref probe cannot see literal objects), or an
+    /// free), a literal (the probe reads only ref objects), or an
     /// IRI the dictionaries do not hold.
     fn build_object_probe_batch(
         &self,
@@ -501,7 +501,7 @@ impl PatternOptionalBuilder {
         let branch = branch_or_none(
             &store,
             ctx.binary_g_id,
-            fluree_db_binary_index::RunSortOrder::Opst,
+            fluree_db_binary_index::RunSortOrder::Post,
             merging,
         )?;
         let p_id = p_id_or_none(&store, &pred_sid, || Ok(merging))?;
@@ -771,7 +771,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
     }
 
     /// The bound-object lane coalesces at most the window the join's own
-    /// bound-object lane flushes at: the OPST pass costs a seek per distinct
+    /// bound-object lane flushes at: the POST pass costs a seek per distinct
     /// object, so a larger window saves little, while main answered these
     /// OPTIONALs row by row and buffered nothing.
     fn seed_coalesce_cap(&self) -> usize {
