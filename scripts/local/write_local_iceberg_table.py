@@ -22,6 +22,14 @@
   timestamptz, binary, string, and numeric text), in two files, with values whose lexical order
   differs from their natural order, duplicates to group on, and a row that is
   null in every typed column.
+- `silver.customers_history`: a history table for a filtered logical table
+  (`rr:sqlQuery ... WHERE is_current = 1 AND is_deleted = FALSE`), in two
+  files: customer ids repeat across versions, one current row is soft-deleted,
+  one row's `is_current` is null, and a non-current row holds the largest
+  balance, so a reader that ignored the filter would answer differently.
+- `silver.orders`: orders referencing `customers_history.customer_id`,
+  including a current customer, a deleted one, one with no current row, and a
+  dangling id.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -244,3 +252,65 @@ cells.append(cells_batch(cells_rows[:4]))
 cells.append(cells_batch(cells_rows[4:]))
 cells = catalog.load_table("silver.cells")
 print("cells table_location:", cells.location())
+
+# ---------------------------------------------------------------------------
+# silver.customers_history + silver.orders: a filtered logical table and a
+# reference into it.
+# ---------------------------------------------------------------------------
+history_schema = pa.schema([
+    pa.field("customer_id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("valid_from", pa.date32()),
+    pa.field("is_current", pa.int32()),
+    pa.field("is_deleted", pa.bool_()),
+    pa.field("tier", pa.string()),
+    pa.field("balance", pa.decimal128(10, 2)),
+    pa.field("score", pa.float64()),
+])
+history = catalog.create_table("silver.customers_history", schema=history_schema)
+history_rows = [
+    # customer_id, name, valid_from, is_current, is_deleted, tier, balance, score
+    (1, "alice-v1", date(2024, 1, 1), 0, False, "gold", "10.00", 1.5),
+    (1, "alice", date(2024, 6, 1), 1, False, "gold", "25.50", 2.5),
+    (2, "bob-v1", date(2024, 1, 1), 0, False, "silver", "5.00", float("nan")),
+    (3, "carol", date(2024, 2, 1), 1, True, "bronze", "0.00", -0.0),
+    (2, "bob", date(2024, 7, 1), 1, False, "silver", "7.25", 9.0),
+    (4, "dave", date(2024, 3, 1), 1, False, None, "100.00", None),
+    (5, "erin-v1", date(2024, 1, 1), 0, False, "gold", "500.00", 3.0),
+    (5, "erin", date(2024, 8, 1), None, False, "gold", "2.00", 4.0),
+]
+
+def history_batch(rows):
+    col = lambda i: [r[i] for r in rows]
+    return pa.table({
+        "customer_id": pa.array(col(0), pa.int64()),
+        "name": pa.array(col(1)),
+        "valid_from": pa.array(col(2), pa.date32()),
+        "is_current": pa.array(col(3), pa.int32()),
+        "is_deleted": pa.array(col(4)),
+        "tier": pa.array(col(5)),
+        "balance": pa.array([Decimal(v) for v in col(6)], pa.decimal128(10, 2)),
+        "score": pa.array(col(7), pa.float64()),
+    }, schema=history_schema)
+
+history.append(history_batch(history_rows[:4]))
+history.append(history_batch(history_rows[4:]))
+history = catalog.load_table("silver.customers_history")
+print("customers_history table_location:", history.location())
+
+orders_schema = pa.schema([
+    pa.field("order_id", pa.int64()),
+    pa.field("customer_id", pa.int64()),
+    pa.field("total", pa.decimal128(10, 2)),
+])
+orders = catalog.create_table("silver.orders", schema=orders_schema)
+orders.append(pa.table({
+    "order_id": pa.array([100, 101, 102, 103, 104, 105], pa.int64()),
+    # 1, 2: current customers; 3: soft-deleted; 5: no current row; 99: dangling.
+    "customer_id": pa.array([1, 2, 3, 5, 1, 99], pa.int64()),
+    "total": pa.array([Decimal(v) for v in [
+        "9.99", "20.00", "5.00", "1.00", "3.50", "2.00",
+    ]], pa.decimal128(10, 2)),
+}, schema=orders_schema))
+orders = catalog.load_table("silver.orders")
+print("orders table_location:", orders.location())

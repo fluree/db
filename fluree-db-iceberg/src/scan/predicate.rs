@@ -448,6 +448,142 @@ impl std::fmt::Display for Expression {
     }
 }
 
+/// A row filter that is part of what the scanned rows MEAN, not a hint.
+///
+/// A pushed query predicate ([`FileScanTask::residual_filter`](super::FileScanTask))
+/// is advisory: the engine re-checks every row it keeps, so the reader may
+/// skip a comparison it cannot state exactly, a column it did not project, or
+/// the whole filter when pushdown is switched off. A mapping's row filter (an
+/// `rr:sqlQuery` `WHERE` over an Iceberg table) has nothing behind it: a row
+/// it keeps is a row the mapping emits. So the reader enforces this filter on
+/// every row, whatever the pushdown switch says, and fails the read rather than
+/// keep a row it cannot decide.
+///
+/// SQL semantics: a comparison with a null cell is unknown and drops the row;
+/// only `IS NULL` keeps it. A column absent from a data file (added by schema
+/// evolution after the file was written) reads as null in every row.
+///
+/// Built by a caller that has already typed each literal against its column
+/// (see `fluree-db-api`'s mapping filter resolution); an empty filter is
+/// unrepresentable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactRowFilter {
+    predicates: std::sync::Arc<[ExactPredicate]>,
+}
+
+/// One conjunct of an [`ExactRowFilter`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExactPredicate {
+    /// `<column> <op> <value>`, the value typed for the column.
+    Compare {
+        field_id: i32,
+        column: String,
+        op: ComparisonOp,
+        value: LiteralValue,
+    },
+    /// `<column> IS NULL`.
+    IsNull { field_id: i32, column: String },
+    /// `<column> IS NOT NULL`.
+    IsNotNull { field_id: i32, column: String },
+}
+
+impl ExactPredicate {
+    /// The Iceberg field the predicate tests.
+    pub fn field_id(&self) -> i32 {
+        match self {
+            Self::Compare { field_id, .. }
+            | Self::IsNull { field_id, .. }
+            | Self::IsNotNull { field_id, .. } => *field_id,
+        }
+    }
+
+    /// The same test as an [`Expression`], for file and row-group pruning.
+    pub fn to_expression(&self) -> Expression {
+        match self {
+            Self::Compare {
+                field_id,
+                column,
+                op,
+                value,
+            } => Expression::Comparison {
+                field_id: *field_id,
+                column: column.clone(),
+                op: *op,
+                value: value.clone(),
+            },
+            Self::IsNull { field_id, column } => Expression::IsNull {
+                field_id: *field_id,
+                column: column.clone(),
+            },
+            Self::IsNotNull { field_id, column } => Expression::IsNotNull {
+                field_id: *field_id,
+                column: column.clone(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ExactPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compare {
+                column, op, value, ..
+            } => write!(f, "{column} {op} {value}"),
+            Self::IsNull { column, .. } => write!(f, "{column} IS NULL"),
+            Self::IsNotNull { column, .. } => write!(f, "{column} IS NOT NULL"),
+        }
+    }
+}
+
+impl ExactRowFilter {
+    /// The conjunction of `predicates`; `None` when there are none.
+    pub fn new(predicates: Vec<ExactPredicate>) -> Option<Self> {
+        (!predicates.is_empty()).then(|| Self {
+            predicates: predicates.into(),
+        })
+    }
+
+    /// The conjuncts.
+    pub fn predicates(&self) -> &[ExactPredicate] {
+        &self.predicates
+    }
+
+    /// Every field the filter reads; a scan must project them all.
+    pub fn field_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.predicates.iter().map(ExactPredicate::field_id)
+    }
+
+    /// The filter as an [`Expression`] for file and row-group pruning, or
+    /// `None` when no conjunct can prune.
+    ///
+    /// A floating-point comparison is left out: the filter compares floats as
+    /// IEEE numbers (a NaN cell satisfies only `<>`), while column bounds omit
+    /// NaN, so a file whose bounds are both `5.0` may still hold a NaN row that
+    /// `<> 5` keeps. Leaving a conjunct out only prunes less; the reader still
+    /// enforces it on every row.
+    pub fn pruning_expression(&self) -> Option<Expression> {
+        let mut prunable: Vec<Expression> = self
+            .predicates
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    p,
+                    ExactPredicate::Compare {
+                        value: LiteralValue::Float32(_) | LiteralValue::Float64(_),
+                        ..
+                    }
+                )
+            })
+            .map(ExactPredicate::to_expression)
+            .collect();
+        match prunable.len() {
+            0 => None,
+            1 => prunable.pop(),
+            _ => Some(Expression::And(prunable)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
