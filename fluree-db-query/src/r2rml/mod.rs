@@ -33,8 +33,8 @@ pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOpera
 pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
     BatchSchema, ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, PushdownCapabilities,
-    R2rmlProvider, R2rmlTableProvider, RelPlan, RelSource, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue, SourceTime, TableWatermark, TermOrder,
+    R2rmlProvider, R2rmlTableProvider, RelPlan, RelSource, ScanCmpOp, ScanFilter, ScanOrder,
+    ScanTopK, ScanValue, SourceTime, TableWatermark, TermOrder,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,

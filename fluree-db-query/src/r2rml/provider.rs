@@ -333,6 +333,24 @@ pub struct TableWatermark {
     pub sequence_number: Option<i64>,
 }
 
+/// The row order a table scan owes the query above it.
+///
+/// A query with no ORDER BY may return its rows in any order, but a client
+/// paging it with LIMIT/OFFSET needs every execution to return them in the same
+/// order, or the pages skip and repeat rows. A scan therefore emits a fixed
+/// order unless the planner has shown that no slice in the query can observe
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanOrder {
+    /// The same rows in the same order on every execution over one snapshot.
+    /// The default: whatever cannot prove otherwise asks for this.
+    #[default]
+    Deterministic,
+    /// Any order, e.g. as the table's file reads finish. Chosen only for a query
+    /// with no LIMIT or OFFSET anywhere in it.
+    Any,
+}
+
 /// Provider for scanning Iceberg tables underlying R2RML graph sources.
 ///
 /// This trait is separated from `R2rmlProvider` to allow different
@@ -377,6 +395,33 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         topk: Option<&ScanTopK>,
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
+
+    /// [`Self::scan_table`] under an explicit [`ScanOrder`]. `scan_table` owes
+    /// [`ScanOrder::Deterministic`]; a provider that can stream faster in
+    /// [`ScanOrder::Any`] overrides this, and the default ignores the order and
+    /// scans deterministically.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> Result<ColumnBatchStream> {
+        let _ = order;
+        self.scan_table(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+        .await
+    }
 
     /// The table's exact live row count from Iceberg manifest metadata — **when,
     /// and only when, it provably equals a full-scan count** of the rows a bare

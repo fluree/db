@@ -1,17 +1,32 @@
 //! Scan planning for Iceberg tables.
 //!
-//! This module provides the `ScanPlanner` which:
-//! 1. Loads the manifest list for a snapshot
-//! 2. Prunes manifests using partition summaries
-//! 3. Loads manifests and collects data files
-//! 4. Prunes files using column statistics
-//! 5. Builds `FileScanTask`s with projection information
+//! Every planner builds a plan in the same two steps:
+//! 1. Read the snapshot's manifest list, then its data manifests (concurrently,
+//!    in manifest-list order; see [`crate::manifest::reader`]), into the
+//!    snapshot's live data files, sorted into plan order
+//!    ([`sort_into_plan_order`]).
+//! 2. Keep the files the filter may match, judged by each file's column bounds
+//!    and null counts ([`select_files`]), as `FileScanTask`s carrying the
+//!    projection, the schema and the filter as their residual.
+//!
+//! Step 2 needs only the file list, so a caller that kept a snapshot's file
+//! list can plan any filter against it without reading a manifest
+//! (`SendScanPlanner::plan_from_files`).
+//!
+//! Every manifest of the snapshot is read: manifests are not skipped by their
+//! partition summaries, and partition values are not used to prune files.
 
+use std::borrow::Cow;
 use std::sync::Arc;
+
+use futures::{Stream, StreamExt};
 
 use crate::error::{IcebergError, Result};
 use crate::io::IcebergStorage;
-use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes, DataFile};
+use crate::manifest::{
+    parse_manifest_list_with_deletes, read_manifests, DataFile, ManifestEntry, ManifestListEntry,
+    DEFAULT_MANIFEST_READ_CONCURRENCY,
+};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
 use crate::scan::predicate::{ExactRowFilter, Expression};
 use crate::scan::pruning::can_contain_file;
@@ -27,6 +42,9 @@ pub struct ScanConfig {
     pub batch_row_limit: usize,
     /// Optional byte budget for batches (stop when string/bytes exceed this).
     pub batch_byte_budget: Option<usize>,
+    /// How many manifests a plan reads at once (default
+    /// [`DEFAULT_MANIFEST_READ_CONCURRENCY`]; 0 is treated as 1).
+    pub manifest_read_concurrency: usize,
 }
 
 impl Default for ScanConfig {
@@ -36,6 +54,7 @@ impl Default for ScanConfig {
             filter: None,
             batch_row_limit: 1024,
             batch_byte_budget: None,
+            manifest_read_concurrency: DEFAULT_MANIFEST_READ_CONCURRENCY,
         }
     }
 }
@@ -69,6 +88,12 @@ impl ScanConfig {
         self.batch_byte_budget = Some(budget);
         self
     }
+
+    /// Set how many manifests a plan reads at once.
+    pub fn with_manifest_read_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_read_concurrency = concurrency;
+        self
+    }
 }
 
 /// A file scan task representing a single data file to read.
@@ -78,9 +103,10 @@ pub struct FileScanTask {
     pub data_file: DataFile,
     /// Field IDs to project (read only these columns).
     pub projected_field_ids: Vec<i32>,
-    /// Residual filter to apply after reading (predicates not fully evaluated by stats).
+    /// Residual filter to apply after reading (predicates not fully evaluated by
+    /// stats). Shared: every task of a plan holds the same filter.
     /// Advisory: the reader may keep rows it cannot decide (see [`ExactRowFilter`]).
-    pub residual_filter: Option<Expression>,
+    pub residual_filter: Option<Arc<Expression>>,
     /// A row filter the reader must enforce on every row; see [`ExactRowFilter`].
     pub exact_filter: Option<ExactRowFilter>,
     /// Start position for split reading (0 for whole file).
@@ -124,7 +150,7 @@ impl FileScanTask {
     pub fn for_whole_file(
         data_file: DataFile,
         projected_field_ids: Vec<i32>,
-        residual_filter: Option<Expression>,
+        residual_filter: Option<Arc<Expression>>,
     ) -> Self {
         let length = data_file.file_size_in_bytes;
         Self {
@@ -143,7 +169,7 @@ impl FileScanTask {
     pub fn for_whole_file_with_schema(
         data_file: DataFile,
         projected_field_ids: Vec<i32>,
-        residual_filter: Option<Expression>,
+        residual_filter: Option<Arc<Expression>>,
         schema: Arc<Schema>,
     ) -> Self {
         let length = data_file.file_size_in_bytes;
@@ -246,6 +272,252 @@ pub fn effective_sequence_number(
     }
 }
 
+/// The schema a plan of `snapshot` resolves its projection through, tests
+/// files against, and attaches to its tasks: the snapshot's schema under
+/// current column names ([`TableMetadata::read_schema_for_snapshot`]).
+///
+/// Every plan uses this one schema, however it was built (from the manifests,
+/// from a kept file list, incrementally), because a task's schema names the
+/// columns its batches carry: a plan under the snapshot's old names would
+/// hide a column renamed since from a caller that names it as it is now.
+/// Field ids and types are the snapshot's, so file pruning is unaffected.
+pub(crate) fn plan_schema<'m>(
+    metadata: &'m TableMetadata,
+    snapshot: &Snapshot,
+) -> Result<Cow<'m, Schema>> {
+    metadata
+        .read_schema_for_snapshot(snapshot)
+        .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))
+}
+
+/// Resolve a projection (field ids, or `None` for every non-nested field) to
+/// field ids and column names under `schema`.
+pub(crate) fn resolve_projection(
+    projection: Option<&[i32]>,
+    schema: &Schema,
+) -> Result<(Vec<i32>, Vec<String>)> {
+    match projection {
+        Some(field_ids) => {
+            let mut names = Vec::with_capacity(field_ids.len());
+            for &id in field_ids {
+                let field = schema.field(id).ok_or_else(|| {
+                    IcebergError::Scan(format!("Field ID {id} not found in schema"))
+                })?;
+                names.push(field.name.clone());
+            }
+            Ok((field_ids.to_vec(), names))
+        }
+        None => Ok(schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_nested())
+            .map(|f| (f.id, f.name.clone()))
+            .unzip()),
+    }
+}
+
+/// Collect the data files of the manifests `manifests` yields (from
+/// [`read_manifests`]), each with its effective data sequence number, in
+/// manifest order.
+///
+/// The caller picks the manifests (data manifests only; an incremental plan
+/// also drops those older than its window). The reader yields them in
+/// manifest-list order whatever order its reads finish in, so the result and
+/// the first error reported are those of a sequential walk.
+pub(crate) async fn read_data_files<'m>(
+    manifests: impl Stream<Item = Result<(&'m ManifestListEntry, Vec<ManifestEntry>)>>,
+) -> Result<Vec<(DataFile, i64)>> {
+    let mut files = Vec::new();
+    let mut manifests = std::pin::pin!(manifests);
+    while let Some(next) = manifests.next().await {
+        let (manifest, entries) = next?;
+        files.extend(entries.into_iter().map(|entry| {
+            let seq = effective_sequence_number(entry.sequence_number, manifest.sequence_number);
+            (entry.data_file, seq)
+        }));
+    }
+    Ok(files)
+}
+
+/// Sort data files into plan order: commit order (effective data sequence
+/// number), with the path as a deterministic tiebreak inside a commit.
+///
+/// Every full plan is in this order, and so is a file list a caller keeps, so
+/// selecting from a kept list yields what a fresh plan would. See
+/// `SendScanPlanner::plan_incremental` for why the order is a contract.
+pub(crate) fn sort_into_plan_order(files: &mut [(DataFile, i64)]) {
+    files.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.0.file_path.cmp(&b.0.file_path))
+    });
+}
+
+/// A file a plan selects from: borrowed from a kept file list (cloned only if
+/// selected, and carrying no sequence number) or owned from a manifest read
+/// (moved into its task, with its sequence number).
+///
+/// A trait rather than `Cow`: an item is then a reference or the file itself,
+/// never a `DataFile`-sized enum moved through the loop for every file, which
+/// on a warm scan of a large kept list is most of the selection's cost.
+pub(crate) trait PlanFile {
+    /// The file's statistics, for the filter test.
+    fn data_file(&self) -> &DataFile;
+    /// The file's task: the whole file under `schema` and `projection`, with
+    /// `residual` as its row filter and the file's data sequence number when
+    /// known.
+    fn into_task(
+        self,
+        projection: &[i32],
+        residual: Option<&Arc<Expression>>,
+        schema: &Arc<Schema>,
+    ) -> FileScanTask;
+}
+
+impl PlanFile for &DataFile {
+    fn data_file(&self) -> &DataFile {
+        self
+    }
+    #[inline]
+    fn into_task(
+        self,
+        projection: &[i32],
+        residual: Option<&Arc<Expression>>,
+        schema: &Arc<Schema>,
+    ) -> FileScanTask {
+        FileScanTask::for_whole_file_with_schema(
+            self.clone(),
+            projection.to_vec(),
+            residual.cloned(),
+            Arc::clone(schema),
+        )
+    }
+}
+
+impl PlanFile for (DataFile, i64) {
+    fn data_file(&self) -> &DataFile {
+        &self.0
+    }
+    #[inline]
+    fn into_task(
+        self,
+        projection: &[i32],
+        residual: Option<&Arc<Expression>>,
+        schema: &Arc<Schema>,
+    ) -> FileScanTask {
+        let mut task = FileScanTask::for_whole_file_with_schema(
+            self.0,
+            projection.to_vec(),
+            residual.cloned(),
+            Arc::clone(schema),
+        );
+        task.data_sequence_number = Some(self.1);
+        task
+    }
+}
+
+impl PlanFile for &(DataFile, i64) {
+    fn data_file(&self) -> &DataFile {
+        &self.0
+    }
+    #[inline]
+    fn into_task(
+        self,
+        projection: &[i32],
+        residual: Option<&Arc<Expression>>,
+        schema: &Arc<Schema>,
+    ) -> FileScanTask {
+        let mut task = FileScanTask::for_whole_file_with_schema(
+            self.0.clone(),
+            projection.to_vec(),
+            residual.cloned(),
+            Arc::clone(schema),
+        );
+        task.data_sequence_number = Some(self.1);
+        task
+    }
+}
+
+/// The selection step every plan shares: keep the files `filter` may match
+/// (every file without a filter), in the order given, as tasks carrying the
+/// projection, the schema, the filter as their residual, and the file's data
+/// sequence number where it is known.
+///
+/// `files` must already be in plan order ([`sort_into_plan_order`]); selection
+/// only drops files, so the plan keeps that order. A borrowed file is cloned
+/// only if it is selected. Without a filter no file is tested, the tasks are
+/// built in one exact-size pass, and `known_record_count` (the files' total,
+/// when the caller kept it) is the estimate instead of a per-file sum: an
+/// unfiltered plan from a kept list then costs what copying the list does.
+pub(crate) fn select_files<F: PlanFile>(
+    files: impl IntoIterator<Item = F>,
+    filter: Option<&Expression>,
+    schema: &Schema,
+    projected_field_ids: Vec<i32>,
+    projected_columns: Vec<String>,
+    has_delete_manifests: bool,
+    known_record_count: Option<i64>,
+) -> ScanPlan {
+    let schema_arc = Arc::new(schema.clone());
+    // One filter per plan, shared by its tasks as their residual.
+    let residual = filter.map(|f| Arc::new(f.clone()));
+    let mut files_pruned = 0;
+    let mut estimated_row_count = 0i64;
+    let ids = &projected_field_ids;
+    let tasks: Vec<FileScanTask> = match (filter, known_record_count) {
+        (None, Some(total)) => {
+            estimated_row_count = total;
+            files
+                .into_iter()
+                .map(|file| file.into_task(ids, None, &schema_arc))
+                .collect()
+        }
+        (None, None) => files
+            .into_iter()
+            .map(|file| {
+                estimated_row_count += file.data_file().record_count;
+                file.into_task(ids, None, &schema_arc)
+            })
+            .collect(),
+        (Some(filter), _) => files
+            .into_iter()
+            .filter(|file| {
+                let keep = can_contain_file(filter, file.data_file(), schema);
+                files_pruned += usize::from(!keep);
+                keep
+            })
+            .map(|file| {
+                estimated_row_count += file.data_file().record_count;
+                file.into_task(ids, residual.as_ref(), &schema_arc)
+            })
+            .collect(),
+    };
+    ScanPlan {
+        files_selected: tasks.len(),
+        tasks,
+        projected_columns,
+        projected_field_ids,
+        residual_filter: filter.cloned(),
+        estimated_row_count,
+        files_pruned,
+        has_delete_manifests,
+    }
+}
+
+/// A snapshot's complete live data-file list, in plan order, as a plan read
+/// it from the manifests (`SendScanPlanner::plan_scan_for_snapshot_retaining_files`),
+/// with what a plan from it needs besides the files. What
+/// `SendScanPlanner::plan_from_files` plans from.
+#[derive(Debug, Clone, Copy)]
+pub struct KeptFiles<'f> {
+    /// Every live data file of the snapshot, in plan order.
+    pub files: &'f [DataFile],
+    /// The sum of the files' record counts (the unfiltered plan's estimate).
+    pub record_count: i64,
+    /// Whether the snapshot carries merge-on-read delete files, as the plan
+    /// that read the list reported (only ever `true` under the override).
+    pub has_delete_manifests: bool,
+}
+
 /// Scan planner for Iceberg tables.
 pub struct ScanPlanner<'a, S: IcebergStorage> {
     storage: &'a S,
@@ -274,19 +546,14 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
     }
 
     /// Plan a scan for a specific snapshot.
+    ///
+    /// The same plan as `SendScanPlanner::plan_scan_for_snapshot`, through the
+    /// same shared steps; keep the two in sync.
     pub async fn plan_scan_for_snapshot(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
-        // Schema at `snapshot`, not current — mirrors `SendScanPlanner`
-        // (send_planner.rs); keep the two in sync.
-        let schema = self
-            .metadata
-            .schema_for_snapshot(snapshot)
-            .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
-
-        // Clone schema into Arc for sharing with tasks
-        let schema_arc = Arc::new(schema.clone());
-
-        // Determine projection
-        let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
+        // Schema at `snapshot` under current names.
+        let schema = plan_schema(self.metadata, snapshot)?;
+        let (projected_field_ids, projected_columns) =
+            resolve_projection(self.config.projection.as_deref(), &schema)?;
 
         // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads
         // only live data files and never applies deletes, so a MoR snapshot
@@ -321,112 +588,36 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
             "Loaded manifest list"
         );
 
-        // Collect data files from manifests, applying pruning
-        let mut tasks = Vec::new();
-        let mut files_selected = 0;
-        let mut files_pruned = 0;
-        let mut estimated_row_count = 0i64;
-
-        for manifest_entry in &manifest_entries {
-            // Skip delete manifests. Under the guard's default they never reach
-            // here (refused above); under the override they are ignored (the
-            // documented, pre-guard behavior).
-            if manifest_entry.is_deletes() {
-                continue;
-            }
-
-            // Load and parse manifest file
-            let manifest_data = self.storage.read(&manifest_entry.manifest_path).await?;
-            let data_file_entries = parse_manifest(&manifest_data)?;
-
-            for entry in data_file_entries {
-                let data_file = entry.data_file;
-
-                // Apply file-level pruning
-                if let Some(filter) = &self.config.filter {
-                    if !can_contain_file(filter, &data_file, schema) {
-                        files_pruned += 1;
-                        continue;
-                    }
-                }
-
-                files_selected += 1;
-                estimated_row_count += data_file.record_count;
-
-                // Create file scan task with schema for correct field ID mapping
-                let eff_seq = effective_sequence_number(
-                    entry.sequence_number,
-                    manifest_entry.sequence_number,
-                );
-                let task = FileScanTask::for_whole_file_with_schema(
-                    data_file,
-                    projected_field_ids.clone(),
-                    self.config.filter.clone(),
-                    Arc::clone(&schema_arc),
-                )
-                // Same contract as `SendScanPlanner::plan_scan_for_snapshot`: every
-                // task carries its commit sequence, and the plan is in commit order,
-                // so a consumer can checkpoint or resume by sequence from either
-                // planner.
-                .with_data_sequence_number(eff_seq);
-                tasks.push(task);
-            }
-        }
-        tasks.sort_by(|a, b| {
-            a.data_sequence_number
-                .cmp(&b.data_sequence_number)
-                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
-        });
-
-        tracing::info!(
-            files_selected,
-            files_pruned,
-            estimated_row_count,
-            "Scan planning complete"
+        // Delete manifests are skipped. Under the guard's default they never
+        // reach here (refused above); under the override they are ignored (the
+        // documented, pre-guard behavior).
+        let mut files = read_data_files(read_manifests(
+            manifest_entries.iter().filter(|m| !m.is_deletes()),
+            self.config.manifest_read_concurrency,
+            |path| self.storage.read(path),
+        ))
+        .await?;
+        sort_into_plan_order(&mut files);
+        // Every task carries its commit sequence, and the plan is in commit
+        // order, so a consumer can checkpoint or resume by sequence from either
+        // planner.
+        let plan = select_files(
+            files,
+            self.config.filter.as_ref(),
+            &schema,
+            projected_field_ids,
+            projected_columns,
+            has_delete_manifests,
+            None,
         );
 
-        Ok(ScanPlan {
-            tasks,
-            projected_columns,
-            projected_field_ids,
-            residual_filter: self.config.filter.clone(),
-            estimated_row_count,
-            files_selected,
-            files_pruned,
-            has_delete_manifests,
-        })
-    }
-
-    /// Resolve projection to field IDs and column names.
-    fn resolve_projection(&self, schema: &Schema) -> Result<(Vec<i32>, Vec<String>)> {
-        match &self.config.projection {
-            Some(field_ids) => {
-                let mut names = Vec::with_capacity(field_ids.len());
-                for &id in field_ids {
-                    let field = schema.field(id).ok_or_else(|| {
-                        IcebergError::Scan(format!("Field ID {id} not found in schema"))
-                    })?;
-                    names.push(field.name.clone());
-                }
-                Ok((field_ids.clone(), names))
-            }
-            None => {
-                // Project all non-nested fields
-                let field_ids: Vec<i32> = schema
-                    .fields
-                    .iter()
-                    .filter(|f| !f.is_nested())
-                    .map(|f| f.id)
-                    .collect();
-                let names: Vec<String> = schema
-                    .fields
-                    .iter()
-                    .filter(|f| !f.is_nested())
-                    .map(|f| f.name.clone())
-                    .collect();
-                Ok((field_ids, names))
-            }
-        }
+        tracing::info!(
+            files_selected = plan.files_selected,
+            files_pruned = plan.files_pruned,
+            estimated_row_count = plan.estimated_row_count,
+            "Scan planning complete"
+        );
+        Ok(plan)
     }
 }
 
@@ -435,14 +626,11 @@ mod tests {
     use super::*;
 
     /// The sort a resumable consumer depends on: commit order first, path as a
-    /// deterministic tiebreak inside one commit.
-    ///
-    /// This is asserted on the comparator rather than on a planner run because
-    /// the planners need storage; the ordering rule is the part that has to
-    /// hold, and it is what a cursor checkpoints against.
+    /// deterministic tiebreak inside one commit. This is the sort every plan
+    /// (and every kept file list) goes through.
     #[test]
     fn tasks_order_by_commit_then_path() {
-        fn task(path: &str, seq: Option<i64>) -> FileScanTask {
+        fn file(path: &str, seq: i64) -> (DataFile, i64) {
             let df = crate::manifest::DataFile {
                 file_path: path.to_string(),
                 file_format: crate::manifest::FileFormat::Parquet,
@@ -458,29 +646,18 @@ mod tests {
                 split_offsets: None,
                 sort_order_id: None,
             };
-            let t = FileScanTask::for_whole_file(df, vec![], None);
-            match seq {
-                Some(s) => t.with_data_sequence_number(s),
-                None => t,
-            }
+            (df, seq)
         }
 
-        let mut tasks = [
-            task("z-early.parquet", Some(1)),
-            task("a-late.parquet", Some(9)),
-            task("m-mid-b.parquet", Some(5)),
-            task("m-mid-a.parquet", Some(5)),
+        let mut files = [
+            file("z-early.parquet", 1),
+            file("a-late.parquet", 9),
+            file("m-mid-b.parquet", 5),
+            file("m-mid-a.parquet", 5),
         ];
-        tasks.sort_by(|a, b| {
-            a.data_sequence_number
-                .cmp(&b.data_sequence_number)
-                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
-        });
+        sort_into_plan_order(&mut files);
 
-        let order: Vec<&str> = tasks
-            .iter()
-            .map(|t| t.data_file.file_path.as_str())
-            .collect();
+        let order: Vec<&str> = files.iter().map(|f| f.0.file_path.as_str()).collect();
         assert_eq!(
             order,
             vec![

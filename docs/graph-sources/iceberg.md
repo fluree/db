@@ -645,6 +645,30 @@ ORDER BY DESC(?date)
 LIMIT 100
 ```
 
+### Row order and paging
+
+A query with no `ORDER BY` has no defined row order; SPARQL leaves it open. Over
+an Iceberg graph source:
+
+- A query with a `LIMIT` or `OFFSET` anywhere in it, sub-queries included, reads
+  the table's data files in a fixed order: smallest file first, ties in commit
+  order. Run again over the same snapshot, it returns the same rows in the same
+  order, so pages fetched with `LIMIT n OFFSET k×n` partition the answer: no row
+  is skipped or repeated. Subgraph crawls (`"select": {"?s": ["*"]}`) page their
+  subjects the same way.
+- A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
+  its row order can differ from one run to the next. The rows are the same.
+- The fixed order has a cost where the data files differ widely in size: the
+  reads still overlap, but rows are taken in file order, not as each read
+  finishes. It shows most on a query that must read the whole table before its
+  `LIMIT` applies, such as a grouped one: over a table with uneven files, a
+  grouped query with a `LIMIT` measured about 13% slower than reading in
+  completion order. Any `LIMIT` or `OFFSET` takes the fixed order, with or
+  without an `ORDER BY`.
+- Pages hold together only while the table does: an append or compaction between
+  two page requests changes the snapshot, and with it the order. For paging that
+  must survive table changes, order by a unique key (`ORDER BY ?id`).
+
 ## Materialization (into a native ledger)
 
 Querying a graph source reads the Iceberg table on the fly. Native Fluree
@@ -1074,10 +1098,21 @@ Pushed to Iceberg:
   SELECT order_id FROM sales.orders WHERE order_date > '2024-01-01'
   ↓
 Iceberg optimizations:
-  - Partition pruning (only scan 2024 partitions)
-  - File skipping (skip files outside date range)
+  - File skipping (skip files whose order_date bounds lie outside the range)
+  - Row-group skipping and row filtering inside the files read
   - Column pruning (only read order_id, order_date)
 ```
+
+Files are skipped by the column bounds and null counts each manifest records
+per file. Partition values and manifest-list partition summaries are not used
+yet, so every manifest of the snapshot is read; a partitioned table still
+benefits, because its files' bounds on the partition column are narrow.
+
+A snapshot's data-file list never changes, so it is read from the manifests
+once (up to 16 manifests at a time) and kept, in memory
+(`FLUREE_ICEBERG_SCAN_FILES_CACHE_MB`) and in the on-disk catalog cache. Every
+later query against that snapshot selects its files from the kept list in
+memory, whatever its filter: a repeated filtered query reads no manifest.
 
 ### Same-subject stars over several triples maps
 
@@ -1096,17 +1131,19 @@ the type (`?s a ?t`), both are kept unless their class sets are equal.
 
 ### Best Practices
 
-1. **Partition by Common Filters:**
+1. **Partition or Sort by Common Filters:**
    ```sql
    -- Partition Iceberg table by date
    PARTITIONED BY (YEAR(order_date), MONTH(order_date))
    ```
+   Files then hold narrow ranges of the filtered column, so their bounds let
+   a filter skip most of them.
 
 2. **Use Filters:**
    ```json
    {
      "where": [...],
-     "filter": "?date >= '2024-01-01'"  // Enables partition pruning
+     "filter": "?date >= '2024-01-01'"  // Enables file skipping
    }
    ```
 
@@ -1380,6 +1417,7 @@ triples map a scan skipped because its predicates were hidden.
 | `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
 | `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch. A table whose count is not read by then has none; the others keep theirs. `0` returns structure only. |
+| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the whole budget is held in one oversize slot beside it (the latest such list; a second replaces the first). `0` keeps none in memory. |
 
 ## Troubleshooting
 

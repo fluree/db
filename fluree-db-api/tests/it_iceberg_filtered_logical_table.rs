@@ -942,3 +942,139 @@ async fn a_provisional_query_over_a_filtered_map_answers_as_the_registered_sourc
     );
     assert_eq!(provisional, registered);
 }
+
+/// Copy `silver/customers_history` and `silver/orders` under a fresh
+/// directory beneath the fixtures root, so deleting their manifests touches no
+/// other test and their scan-files cache keys are their own.
+fn stage_tables() -> tempfile::TempDir {
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("create staged dir");
+        for entry in std::fs::read_dir(from).expect("read fixture dir") {
+            let entry = entry.expect("fixture entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy fixture file");
+            }
+        }
+    }
+    let staging = tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir");
+    for table in ["customers_history", "orders"] {
+        copy_dir(
+            &std::path::Path::new(&fixtures_dir())
+                .join("silver")
+                .join(table),
+            &staging.path().join("silver").join(table),
+        );
+    }
+    staging
+}
+
+/// Delete every staged table's data manifests (the manifest lists stay), so
+/// a scan that plans by reading manifests fails instead of answering.
+fn delete_staged_manifests(staging: &tempfile::TempDir) {
+    for table in ["customers_history", "orders"] {
+        let metadata = staging.path().join("silver").join(table).join("metadata");
+        let mut deleted = 0;
+        for entry in std::fs::read_dir(&metadata).expect("metadata dir") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.ends_with(".avro") && !name.starts_with("snap-") {
+                std::fs::remove_file(&path).expect("delete a data manifest");
+                deleted += 1;
+            }
+        }
+        assert!(deleted > 0, "{table} has data manifests to delete");
+    }
+}
+
+/// A filtered map planned from a kept file list applies its row filter.
+///
+/// The list is kept by scans of the unfiltered maps over the same tables
+/// (`HistoryRow`, `Order`); then the data manifests are deleted, so every
+/// later scan must plan from the kept list. Every case still answers only the
+/// rows the filters admit, equal to the native oracle on both surfaces: from
+/// the in-memory list, and in a second instance, from the list the first one
+/// wrote to the disk catalog cache.
+#[tokio::test(flavor = "current_thread")]
+async fn a_filtered_map_planned_from_the_kept_file_list_applies_its_filter() {
+    let _serial = SERIAL.lock().await;
+    set_fast_paths_disabled(false);
+    let staging = stage_tables();
+    let location = format!("file://{}/silver", staging.path().display());
+    let ttl = mapping(CURRENT);
+    let create = |fluree: Fluree| {
+        let (location, ttl) = (location.clone(), ttl.clone());
+        async move {
+            set_local_roots();
+            fluree
+                .create_r2rml_graph_source(
+                    R2rmlCreateConfig::new_direct("kept", &location, &ttl)
+                        .with_mapping_media_type("text/turtle"),
+                )
+                .await
+                .expect("create the staged source");
+            create_oracle(&fluree).await;
+            fluree
+        }
+    };
+    let from = "kept:main";
+    let fluree = create(FlureeBuilder::memory().build_memory()).await;
+
+    // Keep both tables' file lists through maps that apply no row filter.
+    let whole = Case {
+        name: "whole-table",
+        vars: &["s"],
+        sparql: "SELECT ?s {FROM} WHERE { { ?s a ex:HistoryRow } UNION { ?s a ex:Order } }",
+        jsonld: json!(null),
+        expected: &[],
+        must_fire: None,
+    };
+    assert_eq!(sparql_rows(&fluree, from, &whole).await.len(), 8 + 6);
+    delete_staged_manifests(&staging);
+
+    let check = |fluree: &Fluree, instance: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            for case in cases() {
+                let expected: Vec<String> = case.expected.iter().map(ToString::to_string).collect();
+                assert_eq!(
+                    sparql_rows(&fluree, from, &case).await,
+                    expected,
+                    "{} (SPARQL, {instance})",
+                    case.name
+                );
+                assert_eq!(
+                    jsonld_rows(&fluree, from, &case).await,
+                    jsonld_rows(&fluree, ORACLE, &case).await,
+                    "{} vs oracle (JSON-LD, {instance})",
+                    case.name
+                );
+            }
+        }
+    };
+    check(&fluree, "in-memory kept list").await;
+
+    // A second instance has an empty in-memory cache; the first wrote the
+    // lists to the disk catalog cache off its query path, so wait for them.
+    let second = create(FlureeBuilder::memory().build_memory()).await;
+    let mut waited = 0;
+    while let Err(e) = second
+        .query_from()
+        .sparql(&format!(
+            "PREFIX ex: <http://example.org/> SELECT ?s FROM <{from}> \
+             WHERE {{ {{ ?s a ex:HistoryRow }} UNION {{ ?s a ex:Order }} }}"
+        ))
+        .execute_formatted()
+        .await
+    {
+        waited += 1;
+        assert!(
+            waited < 100,
+            "the disk catalog cache never held the lists: {e}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    check(&second, "disk kept list").await;
+}

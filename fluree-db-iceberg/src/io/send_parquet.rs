@@ -630,7 +630,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 return crate::io::arrow_reader::decode_batches_arrow(
                     file_bytes,
                     &task.projected_field_ids,
-                    task.residual_filter.as_ref(),
+                    task.residual_filter.as_deref(),
                     task.exact_filter.as_ref(),
                     task.iceberg_schema.as_deref(),
                     None,
@@ -680,7 +680,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         crate::io::arrow_reader::decode_batches_arrow(
             file_bytes,
             &task.projected_field_ids,
-            task.residual_filter.as_ref(),
+            task.residual_filter.as_deref(),
             task.exact_filter.as_ref(),
             task.iceberg_schema.as_deref(),
             None,
@@ -807,7 +807,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         path: String,
         file_size: u64,
         projected_field_ids: Vec<i32>,
-        residual_filter: Option<Expression>,
+        residual_filter: Option<Arc<Expression>>,
         exact_filter: Option<ExactRowFilter>,
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
@@ -852,7 +852,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         crate::io::arrow_reader::decode_batches_arrow(
                             cr,
                             &projected,
-                            residual.as_ref(),
+                            residual.as_deref(),
                             exact.as_ref(),
                             schema.as_deref(),
                             None,
@@ -878,7 +878,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             crate::io::arrow_reader::decode_batches_arrow(
                 chunk_reader,
                 &projected_field_ids,
-                residual_filter.as_ref(),
+                residual_filter.as_deref(),
                 exact_filter.as_ref(),
                 iceberg_schema.as_deref(),
                 max_rows,
@@ -1869,6 +1869,7 @@ mod tests {
             split_offsets: None,
             sort_order_id: None,
         };
+        let residual = residual.map(Arc::new);
         match schema {
             Some(s) => FileScanTask::for_whole_file_with_schema(data_file, vec![], residual, s),
             None => FileScanTask::for_whole_file(data_file, vec![], residual),

@@ -18,6 +18,8 @@
 //! - `people_window` — the same five appends with every snapshot RETAINED: a
 //!   healthy source that got ahead of its job, so the window resolves and is
 //!   read incrementally, and is too large to commit in one pass.
+//! - `people_paged` — the same five appends again, read only by the paging
+//!   test: five data files whose sizes are not in commit order.
 //! - `amounts` — decimal columns for FILTER pushdown: `ratio` is `decimal(38,9)`
 //!   (BigQuery's `NUMERIC`) with values one grid step either side of 0.05 and
 //!   1.05; `price` is `decimal(5,2)`, too narrow to hold a literal like 1000.
@@ -37,9 +39,11 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/people fluree-db-api/tests/fixtures/iceberg/silver/people
 //! cp -r /tmp/fluree-local-iceberg/silver/people_backlog fluree-db-api/tests/fixtures/iceberg/silver/people_backlog
 //! cp -r /tmp/fluree-local-iceberg/silver/people_window fluree-db-api/tests/fixtures/iceberg/silver/people_window
+//! cp -r /tmp/fluree-local-iceberg/silver/people_paged fluree-db-api/tests/fixtures/iceberg/silver/people_paged
 //! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
 //! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
 //! cp -r /tmp/fluree-local-iceberg/silver/versions fluree-db-api/tests/fixtures/iceberg/silver/versions
+//! cp -r /tmp/fluree-local-iceberg/silver/tombstones fluree-db-api/tests/fixtures/iceberg/silver/tombstones
 //! ```
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
@@ -3714,9 +3718,985 @@ async fn a_minus_keeps_the_scans_written_above_it() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Scan planning from the snapshot's kept file list. `people_window` is five
+// appends of 600 rows with disjoint ids (1..=600, 601..=1200, ...), one data
+// file each, so an id range selects whole files.
+// ---------------------------------------------------------------------------
+
+const WINDOW_IDS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#WindowIds>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] .
+"#;
+
+/// A private copy of `people_window` (so deleting its manifests touches no
+/// other test, and its cache keys are its own) behind a graph source `alias`.
+async fn staged_window(alias: &str) -> (fluree_db_api::Fluree, tempfile::TempDir) {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_window");
+    copy_dir_all(&fixtures_dir().join("silver/people_window"), &table_dir);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        alias,
+        format!("file://{}", table_dir.display()),
+        WINDOW_IDS_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create window graph source");
+    (fluree, staging)
+}
+
+/// Delete the staged table's data manifests (the manifest lists stay), so any
+/// later scan that reads a manifest fails.
+fn delete_data_manifests(staging: &tempfile::TempDir) -> usize {
+    let metadata = staging.path().join("people_window/metadata");
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(&metadata).expect("metadata dir") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".avro") && !name.starts_with("snap-") {
+            std::fs::remove_file(&path).expect("delete a data manifest");
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
+/// The ids (sorted) a SPARQL query over `from` returns, with `filter` as the
+/// body of a `FILTER(...)` over `?id` (none when empty).
+async fn sparql_window_ids(fluree: &fluree_db_api::Fluree, from: &str, filter: &str) -> Vec<i64> {
+    let filter = if filter.is_empty() {
+        String::new()
+    } else {
+        format!("FILTER({filter})")
+    };
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?id FROM <{from}> WHERE {{ ?s ex:id ?id {filter} }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The JSON-LD twin of [`sparql_window_ids`]; `filter` is a JSON-LD filter
+/// expression over `?id`.
+async fn jsonld_window_ids(fluree: &fluree_db_api::Fluree, from: &str, filter: &str) -> Vec<i64> {
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?id"],
+        "where": [{"@id": "?s", "ex:id": "?id"}, ["filter", filter]],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut ids: Vec<i64> = result
+        .as_array()
+        .unwrap_or_else(|| panic!("rows for {query}: {result}"))
+        .iter()
+        .map(|row| {
+            let v = if row.is_array() { &row[0] } else { row };
+            v.as_i64().unwrap_or_else(|| panic!("an id in {result}"))
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn id_range(lo: i64, hi: i64) -> Vec<i64> {
+    (lo..=hi).collect()
+}
+
+/// Once a snapshot's file list is kept, a filtered scan plans from it and
+/// reads no manifest: the data manifests are deleted after the first
+/// (unfiltered) scan, and filtered scans on both surfaces still answer
+/// exactly. Before, a filtered scan re-read every manifest on every query.
+#[tokio::test]
+async fn a_filtered_scan_reads_no_manifest_once_the_file_list_is_kept() {
+    let (fluree, staging) = staged_window("kept-list").await;
+    let from = "kept-list:main";
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+    assert_eq!(
+        delete_data_manifests(&staging),
+        5,
+        "one manifest per append"
+    );
+
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id >= 700 && ?id < 1300").await,
+        id_range(700, 1299)
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id IN (5, 2500, 9999)").await,
+        vec![5, 2500]
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id > 2995").await,
+        id_range(2996, 3000)
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(and (>= ?id 700) (< ?id 1300))").await,
+        id_range(700, 1299)
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(= ?id 2500)").await,
+        vec![2500]
+    );
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+}
+
+/// A filtered first scan keeps the WHOLE file list, not its filtered
+/// selection: after it, with the manifests gone, a different filter and an
+/// unfiltered scan both answer from the kept list.
+#[tokio::test]
+async fn a_filtered_first_scan_keeps_the_whole_file_list() {
+    let (fluree, staging) = staged_window("first-filtered").await;
+    let from = "first-filtered:main";
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id >= 2950").await,
+        id_range(2950, 3000)
+    );
+    assert_eq!(delete_data_manifests(&staging), 5);
+
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id < 3").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(< ?id 3)").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "").await,
+        id_range(1, 3000)
+    );
+}
+
+const TOMBSTONES_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Tombstones>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.tombstones" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
+"#;
+
+/// With a delete convention and no ordering column, a materialize pass keeps
+/// the last row it reads for each subject, so it must read the source's files
+/// in commit order. `silver.tombstones` commits 200,000 live revisions of
+/// subjects 1..=10 in one large file, then subject 7's tombstone in a one-row
+/// file. Read in commit order the tombstone is applied last and subject 7 is
+/// retracted; read as the reads finish (the materialize read before this
+/// branch), the small file tends to be read first, and the large file's later
+/// live rows resurrect the subject. Five fresh materializations must all
+/// retract it and keep the other nine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tombstone_committed_after_a_large_file_retracts_its_subject() {
+    allow_fixture_roots();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/tombstones",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("tomb", &location, TOMBSTONES_R2RML)
+                .with_mapping_media_type("text/turtle")
+                .with_delete_convention(fluree_db_api::DeleteConvention {
+                    column: "op".to_string(),
+                    deleted_values: vec![Some("d".to_string())],
+                }),
+        )
+        .await
+        .expect("create the tombstones graph source");
+
+    let mut runs = Vec::new();
+    for run in 0..5 {
+        let target = format!("tomb_native_{run}:main");
+        fluree.create_ledger(&target).await.expect("target ledger");
+        fluree
+            .materialize_r2rml_graph_source("tomb:main", &target, true)
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let result = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s FROM <{target}> WHERE {{ ?s <http://example.org/name> ?n }}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let mut people: Vec<i64> = result["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings: {result}"))
+            .iter()
+            .map(|b| person_number(b["s"]["value"].as_str().expect("an IRI")))
+            .collect();
+        people.sort_unstable();
+        people.dedup();
+        runs.push(people);
+    }
+    let want: Vec<i64> = (1..=10).filter(|&id| id != 7).collect();
+    for (run, people) in runs.iter().enumerate() {
+        assert_eq!(people, &want, "run {run}: subject 7 is retracted");
+    }
+}
+
+/// Every scan records its file selection on `iceberg.scan_plan`, a scan
+/// planned from the kept list included: a warm unfiltered scan reports all
+/// five files (it used to record nothing), and a warm filtered one the files
+/// its filter kept and pruned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_scan_from_the_kept_list_records_its_file_counts() {
+    let (fluree, _staging) = staged_window("kept-counts").await;
+    let from = "kept-counts:main";
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let counts = |seen: usize| {
+        store.find_spans("iceberg.scan_plan")[seen..]
+            .iter()
+            .map(|s| {
+                (
+                    s.fields.get("files_selected").cloned().unwrap_or_default(),
+                    s.fields.get("files_pruned").cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let pair = |selected: &str, pruned: &str| vec![(selected.to_string(), pruned.to_string())];
+
+    // The first scan reads the manifests and keeps the list.
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+    assert_eq!(counts(0), pair("5", "0"));
+
+    for (filter, want, (selected, pruned)) in [
+        ("", 3000, ("5", "0")),
+        ("?id >= 700 && ?id < 1300", 600, ("2", "3")),
+        ("?id IN (5, 2500)", 2, ("2", "3")),
+        ("?id > 99999", 0, ("0", "5")),
+    ] {
+        let seen = store.find_spans("iceberg.scan_plan").len();
+        assert_eq!(
+            sparql_window_ids(&fluree, from, filter).await.len(),
+            want,
+            "{filter}"
+        );
+        assert_eq!(counts(seen), pair(selected, pruned), "{filter:?}");
+    }
+}
+
+/// A pinned scan keeps and plans from its own snapshot's list, apart from the
+/// current snapshot's, filtered or not, in either order.
+#[tokio::test]
+async fn a_pinned_filtered_scan_plans_from_its_own_snapshots_list() {
+    let (fluree, staging) = staged_window("pinned-kept").await;
+    // The second commit (ids 1..=1200), read from the final metadata.
+    let latest = std::fs::read_dir(staging.path().join("people_window/metadata"))
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(latest).expect("read metadata")).unwrap();
+    let second = meta["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sequence-number"] == 2)
+        .expect("a second commit")["snapshot-id"]
+        .as_i64()
+        .unwrap();
+    let current = "pinned-kept:main";
+    let pinned = format!("pinned-kept:main@snapshot:{second}");
+    let window = "?id >= 1100 && ?id < 1300";
+
+    for _ in 0..2 {
+        assert_eq!(
+            sparql_window_ids(&fluree, current, window).await,
+            id_range(1100, 1299)
+        );
+        assert_eq!(
+            sparql_window_ids(&fluree, &pinned, window).await,
+            id_range(1100, 1200)
+        );
+        assert_eq!(
+            jsonld_window_ids(&fluree, &pinned, "(>= ?id 1100)").await,
+            id_range(1100, 1200)
+        );
+        assert_eq!(sparql_window_ids(&fluree, &pinned, "").await.len(), 1200);
+        assert_eq!(sparql_window_ids(&fluree, current, "").await.len(), 3000);
+    }
+}
+
+const RENAMED_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#Renamed>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.renamed" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "full_name" ]
+        ] .
+"#;
+
+/// A private copy of `silver.renamed` behind graph source `alias`, and the id
+/// of its first snapshot (written before the rename).
+async fn staged_renamed(alias: &str) -> (fluree_db_api::Fluree, tempfile::TempDir, i64) {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("renamed");
+    copy_dir_all(&fixtures_dir().join("silver/renamed"), &table_dir);
+    let latest = std::fs::read_dir(table_dir.join("metadata"))
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(latest).expect("read metadata")).unwrap();
+    let first = meta["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sequence-number"] == 1)
+        .expect("a first commit")["snapshot-id"]
+        .as_i64()
+        .unwrap();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        alias,
+        format!("file://{}", table_dir.display()),
+        RENAMED_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create renamed graph source");
+    (fluree, staging, first)
+}
+
+/// `(id, name)` pairs (sorted) a SPARQL query over `from` returns.
+async fn sparql_names(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    filter: &str,
+) -> Vec<(i64, String)> {
+    let filter = if filter.is_empty() {
+        String::new()
+    } else {
+        format!("FILTER({filter})")
+    };
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?id ?name FROM <{from}> \
+         WHERE {{ ?s ex:id ?id ; ex:name ?name {filter} }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut rows: Vec<(i64, String)> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| {
+            (
+                b["id"]["value"].as_str().unwrap().parse().unwrap(),
+                b["name"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The JSON-LD twin of [`sparql_names`] (a filter is required).
+async fn jsonld_names(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    filter: &str,
+) -> Vec<(i64, String)> {
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?id", "?name"],
+        "where": [{"@id": "?s", "ex:id": "?id", "ex:name": "?name"}, ["filter", filter]],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut rows: Vec<(i64, String)> = result
+        .as_array()
+        .unwrap_or_else(|| panic!("rows for {query}: {result}"))
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_i64().unwrap(),
+                row[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn people(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
+    rows.iter().map(|(id, n)| (*id, n.to_string())).collect()
+}
+
+/// A read pinned to a snapshot older than a column rename finds the column
+/// under its current name, whichever way the scan is planned: from the
+/// manifests (the first scan, filtered or not) or from the kept file list
+/// (later scans, filtered or not). Each plan's tasks name their columns by
+/// the schema they carry, and the mapping names columns as they are now.
+#[tokio::test]
+async fn a_pinned_read_finds_a_renamed_column_under_its_current_name() {
+    let early = people(&[(1, "alice"), (2, "bob"), (3, "carol")]);
+    let all = people(&[
+        (1, "alice"),
+        (2, "bob"),
+        (3, "carol"),
+        (4, "dave"),
+        (5, "erin"),
+    ]);
+
+    // Unfiltered first: planned from the manifests, then from the kept list.
+    let (fluree, _staging, first) = staged_renamed("renamed-a").await;
+    let pinned = format!("renamed-a:main@snapshot:{first}");
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "").await,
+        early,
+        "pinned, cold"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "").await,
+        early,
+        "pinned, warm"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "?id >= 2").await,
+        early[1..],
+        "pinned, filtered, warm"
+    );
+    assert_eq!(
+        jsonld_names(&fluree, &pinned, "(>= ?id 2)").await,
+        early[1..],
+        "pinned, filtered, warm (JSON-LD)"
+    );
+    assert_eq!(sparql_names(&fluree, "renamed-a:main", "").await, all);
+
+    // Filtered first: the filtered plan is the one read from the manifests.
+    let (fluree, _staging, first) = staged_renamed("renamed-b").await;
+    let pinned = format!("renamed-b:main@snapshot:{first}");
+    assert_eq!(
+        jsonld_names(&fluree, &pinned, "(<= ?id 2)").await,
+        early[..2],
+        "pinned, filtered, cold (JSON-LD)"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "?id <= 2").await,
+        early[..2],
+        "pinned, filtered, warm"
+    );
+    assert_eq!(
+        sparql_names(&fluree, "renamed-b:main", "?id > 3").await,
+        all[3..],
+        "current, filtered"
+    );
+}
+
+/// A materialize read whose window ends at a snapshot older than a column
+/// rename keeps the column: the projection is resolved, and the batches are
+/// named, under current names, so a twin built from it carries every row's
+/// value. Covers the incremental read and the streaming read pinned to that
+/// snapshot.
+#[tokio::test]
+async fn a_materialize_read_before_a_rename_keeps_the_renamed_column() {
+    let (fluree, _staging, first) = staged_renamed("renamed-m").await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let projection = vec!["id".to_string(), "full_name".to_string()];
+    let names_of = |batches: &[fluree_db_iceberg::ColumnBatch]| {
+        let mut rows: Vec<(i64, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column_by_name("id").expect("an id column");
+                let names = b
+                    .column_by_name("full_name")
+                    .unwrap_or_else(|| panic!("a full_name column in {:?}", b.schema));
+                (0..b.num_rows)
+                    .map(|i| {
+                        (
+                            ids.get_i64(i).expect("an id"),
+                            names.get_string(i).expect("a name").to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let early = people(&[(1, "alice"), (2, "bob"), (3, "carol")]);
+
+    let batches = provider
+        .scan_table_incremental("renamed-m:main", "silver.renamed", &projection, None, first)
+        .await
+        .expect("incremental read to the first snapshot");
+    assert_eq!(names_of(&batches), early, "incremental");
+
+    let scan = provider
+        .scan_for_materialize_stream(
+            "renamed-m:main",
+            "silver.renamed",
+            &projection,
+            None,
+            Some(first),
+            None,
+        )
+        .await
+        .expect("pinned materialize read");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
+    assert_eq!(names_of(&batches), early, "pinned stream");
+}
+
+/// An unsliced answer holds every person exactly once. Its order is open (the
+/// scan streams files as their reads finish), so nothing is asserted about it;
+/// that the unsliced lane streams in completion order is pinned by the routing
+/// test in `it_graph_source_r2rml` and the reader's unit tests.
+fn assert_every_person_once(rows: &[i64], surface: &str) {
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        (1..=3000).collect::<Vec<i64>>(),
+        "{surface}: unsliced, every person once"
+    );
+}
+
+/// The person number at the end of a subject IRI, compacted or not
+/// (`…/person/17` and `ex:person/17` both give 17).
+fn person_number(iri: &str) -> i64 {
+    iri.rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("not a person IRI: {iri}"))
+}
+
+/// A client paging an unordered graph-source query with LIMIT/OFFSET (no ORDER
+/// BY) sees the pages partition the answer: one execution after another, a
+/// sliced query emits the table's files smallest first (ties in commit order),
+/// whatever order the file reads finish in.
+///
+/// `people_paged` is five 600-row commits, one data file each, ids ascending
+/// in commit order, so the deterministic order is each commit's persons in
+/// order, the commits taken by data-file size (read here from the table's own
+/// files, and checked to differ from commit order).
+///
+/// A query with no slice cannot observe its order, so it may stream files as
+/// their reads finish: it is checked for its rows only. A crawl pages subjects
+/// itself (an OFFSET with no LIMIT reaches its flat query as no slice), so it
+/// asks for the deterministic order explicitly. So do the two other prefixes
+/// of an answer: a JSON-LD `selectOne` (the first row, taken when the result
+/// is formatted) and a byte-budgeted AgentJson response (a page its client
+/// continues with OFFSET). The materialize read keeps commit order, persons
+/// 1..=3000.
+#[tokio::test]
+async fn unordered_pages_partition_a_multi_file_answer() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+
+    // Each commit's data file, in commit order: the snapshot with sequence
+    // number n names its manifest list `snap-<id>-<n>-<uuid>.avro`, and
+    // pyiceberg names that commit's data file `<…>-<uuid>.parquet`.
+    let metadata_dir = table_dir.join("metadata");
+    let mut metadata_files: Vec<std::path::PathBuf> = std::fs::read_dir(&metadata_dir)
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    metadata_files.sort();
+    let final_meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(metadata_files.last().expect("metadata files")).expect("read metadata"),
+    )
+    .expect("parse metadata");
+    let mut snapshots: Vec<&serde_json::Value> = final_meta["snapshots"]
+        .as_array()
+        .expect("snapshots")
+        .iter()
+        .collect();
+    snapshots.sort_by_key(|s| s["sequence-number"].as_i64().expect("sequence"));
+    let data_files: Vec<std::path::PathBuf> = std::fs::read_dir(table_dir.join("data"))
+        .expect("data dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    let commit_files: Vec<(String, u64)> = snapshots
+        .iter()
+        .map(|snapshot| {
+            let manifest_list = snapshot["manifest-list"].as_str().expect("manifest list");
+            let uuid = manifest_list
+                .trim_end_matches(".avro")
+                .rsplit('-')
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("-");
+            let file = data_files
+                .iter()
+                .find(|p| p.to_string_lossy().ends_with(&format!("{uuid}.parquet")))
+                .unwrap_or_else(|| panic!("no data file for {uuid}"));
+            let name = file
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string();
+            (name, std::fs::metadata(file).expect("file size").len())
+        })
+        .collect();
+    assert_eq!(commit_files.len(), 5, "five commits: {commit_files:?}");
+    // The query's emit order: commits by data-file size, ties in commit order
+    // (a stable sort over commit order).
+    let mut by_size: Vec<usize> = (0..commit_files.len()).collect();
+    by_size.sort_by_key(|&c| commit_files[c].1);
+    assert_ne!(
+        by_size,
+        (0..commit_files.len()).collect::<Vec<_>>(),
+        "the fixture's sizes must not already be in commit order, or size order and commit \
+         order are indistinguishable: {commit_files:?}"
+    );
+    let everyone: Vec<i64> = by_size
+        .iter()
+        .flat_map(|&c| {
+            let lo = i64::try_from(c).expect("commit") * 600 + 1;
+            lo..lo + 600
+        })
+        .collect();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
+    let location = format!("file://{}", table_dir.display());
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("paged", &location, &mapping)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let fluree = &fluree;
+    const PAGE: usize = 500;
+
+    // SPARQL.
+    let sparql = |page: Option<usize>| async move {
+        let paging = page.map_or(String::new(), |k| {
+            format!(" LIMIT {PAGE} OFFSET {}", k * PAGE)
+        });
+        let rows = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s FROM <paged:main> WHERE {{ ?s <http://example.org/name> ?n }}{paging}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL page {page:?}: {e}"));
+        rows["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings: {rows}"))
+            .iter()
+            .map(|b| person_number(b["s"]["value"].as_str().expect("an IRI")))
+            .collect::<Vec<i64>>()
+    };
+    let pages = || async {
+        let mut paged = Vec::new();
+        for k in 0..everyone.len().div_ceil(PAGE) {
+            paged.extend(sparql(Some(k)).await);
+        }
+        paged
+    };
+    assert_eq!(
+        pages().await,
+        everyone,
+        "SPARQL: the pages partition the answer"
+    );
+    assert_eq!(pages().await, everyone, "SPARQL: a second run agrees");
+    assert_every_person_once(&sparql(None).await, "SPARQL");
+
+    // JSON-LD.
+    let jsonld = |page: Option<usize>| async move {
+        let mut query = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "paged:main",
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:name": "?n"},
+        });
+        if let Some(k) = page {
+            query["limit"] = serde_json::json!(PAGE);
+            query["offset"] = serde_json::json!(k * PAGE);
+        }
+        let rows = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD page {page:?}: {e}"));
+        rows.as_array()
+            .unwrap_or_else(|| panic!("rows: {rows}"))
+            .iter()
+            .map(|row| {
+                let s = row.as_array().map_or(row, |r| &r[0]);
+                person_number(s.as_str().expect("an IRI"))
+            })
+            .collect::<Vec<i64>>()
+    };
+    let mut paged = Vec::new();
+    for k in 0..everyone.len().div_ceil(PAGE) {
+        paged.extend(jsonld(Some(k)).await);
+    }
+    assert_eq!(paged, everyone, "JSON-LD: the pages partition the answer");
+    assert_every_person_once(&jsonld(None).await, "JSON-LD");
+
+    // A crawl with an OFFSET and no LIMIT: the subjects after the first 2,900
+    // in the deterministic order.
+    let crawl = fluree
+        .query_from()
+        .jsonld(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "paged:main",
+            "select": {"?s": ["@id"]},
+            "where": {"@id": "?s", "ex:name": "?n"},
+            "offset": 2900,
+        }))
+        .execute_formatted()
+        .await
+        .expect("crawl");
+    let crawled: Vec<i64> = crawl
+        .as_array()
+        .unwrap_or_else(|| panic!("a crawl answers an array: {crawl}"))
+        .iter()
+        .map(|doc| person_number(doc["@id"].as_str().expect("an @id")))
+        .collect();
+    assert_eq!(
+        crawled,
+        everyone[2900..],
+        "crawl: OFFSET in the fixed order"
+    );
+
+    // A `selectOne` keeps the first row of the answer when it is formatted:
+    // the first person in the fixed order, every time.
+    for run in 0..2 {
+        let one = fluree
+            .query_from()
+            .jsonld(&serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": "paged:main",
+                "selectOne": ["?s"],
+                "where": {"@id": "?s", "ex:name": "?n"},
+            }))
+            .execute_formatted()
+            .await
+            .expect("selectOne");
+        let s = one.as_array().map_or(&one, |row| &row[0]);
+        assert_eq!(
+            person_number(s.as_str().unwrap_or_else(|| panic!("an IRI: {one}"))),
+            everyone[0],
+            "selectOne (run {run}): the first row in the fixed order"
+        );
+    }
+
+    // A byte-budgeted AgentJson response is a page its client continues with
+    // OFFSET (`hasMore`, `resume`): its rows are a prefix of the fixed order,
+    // though the query itself has no slice.
+    let agent_page = fluree
+        .query_from()
+        .sparql("SELECT ?s FROM <paged:main> WHERE { ?s <http://example.org/name> ?n }")
+        .format(fluree_db_api::FormatterConfig::agent_json().with_max_bytes(4_000))
+        .execute_formatted()
+        .await
+        .expect("AgentJson page");
+    assert_eq!(
+        agent_page["hasMore"], true,
+        "a truncated page: {agent_page}"
+    );
+    let page_rows: Vec<i64> = agent_page["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows: {agent_page}"))
+        .iter()
+        .map(|row| person_number(row["?s"].as_str().expect("an IRI")))
+        .collect();
+    assert!(!page_rows.is_empty(), "{agent_page}");
+    assert_eq!(
+        page_rows,
+        everyone[..page_rows.len()],
+        "AgentJson: the page is a prefix of the fixed order"
+    );
+
+    // The materialize read streams the same files the same way.
+    let scan = FlureeR2rmlProvider::new(fluree)
+        .scan_for_materialize_stream("paged:main", "silver.people_paged", &[], None, None, None)
+        .await
+        .expect("materialize read");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = b.column_by_name("id").expect("an id column");
+            (0..b.num_rows)
+                .map(|i| ids.get_i64(i).expect("an id"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=3000).collect::<Vec<i64>>(),
+        "materialize read: commit order"
+    );
+}
+
+/// A GROUP BY with no ORDER BY, paged with LIMIT/OFFSET, returns the same
+/// groups on the same pages in every execution, on SPARQL and JSON-LD: the
+/// sliced scan reads the files in a fixed order and the groups come out of the
+/// fold in a fixed order. `score` takes 100 values over `people_paged`'s 3,000
+/// rows; ten pages of ten partition one 1,000-row page, and two fresh
+/// instances agree page for page.
+#[tokio::test]
+async fn unordered_grouped_pages_are_the_same_on_every_execution() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
+    let location = format!("file://{}", table_dir.display());
+
+    let mut runs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for _ in 0..2 {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct("grouped", &location, &mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+        let fluree = &fluree;
+        let sparql = |limit: usize, offset: usize| async move {
+            let rows = fluree
+                .query_from()
+                .sparql(&format!(
+                    "SELECT ?sc (COUNT(?s) AS ?n) FROM <grouped:main> \
+                     WHERE {{ ?s <http://example.org/score> ?sc }} \
+                     GROUP BY ?sc LIMIT {limit} OFFSET {offset}"
+                ))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("SPARQL page {offset}: {e}"));
+            rows["results"]["bindings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("bindings: {rows}"))
+                .iter()
+                .map(|b| format!("{}={}", b["sc"]["value"], b["n"]["value"]))
+                .collect::<Vec<String>>()
+        };
+        let jsonld = |limit: usize, offset: usize| async move {
+            let rows = fluree
+                .query_from()
+                .jsonld(&serde_json::json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "from": "grouped:main",
+                    "select": ["?sc", "(count ?s)"],
+                    "where": {"@id": "?s", "ex:score": "?sc"},
+                    "groupBy": ["?sc"],
+                    "limit": limit,
+                    "offset": offset,
+                }))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("JSON-LD page {offset}: {e}"));
+            rows.as_array()
+                .unwrap_or_else(|| panic!("rows: {rows}"))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        };
+        let whole = sparql(1000, 0).await;
+        assert_eq!(whole.len(), 100, "SPARQL: one row per score: {whole:?}");
+        let mut paged = Vec::new();
+        for k in 0..10 {
+            paged.extend(sparql(10, k * 10).await);
+        }
+        assert_eq!(paged, whole, "SPARQL: the pages partition the groups");
+        let whole_jsonld = jsonld(1000, 0).await;
+        assert_eq!(whole_jsonld.len(), 100, "JSON-LD: one row per score");
+        let mut paged = Vec::new();
+        for k in 0..10 {
+            paged.extend(jsonld(10, k * 10).await);
+        }
+        assert_eq!(
+            paged, whole_jsonld,
+            "JSON-LD: the pages partition the groups"
+        );
+        runs.push((whole, whole_jsonld));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "two fresh instances page the groups alike"
+    );
+}
+
 /// `people_window` read as five files with disjoint `id` ranges (1..=600,
 /// 601..=1200, …), so a scan-side top-k by `id` can prune files.
-const WINDOW_IDS_R2RML: &str = r#"
+const WINDOW_PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -3878,7 +4858,7 @@ async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
         "file://{}/tests/fixtures/iceberg/silver/people_window",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_IDS_R2RML)
+    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_PEOPLE_R2RML)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
