@@ -2759,6 +2759,9 @@ async fn indexed_ledger_with_rules(
     (fluree, ledger)
 }
 
+/// The rows of `query` under datalog reasoning. Every caller has a cycle in a
+/// rule body or in the query itself, and it has to run as the cyclic join: a
+/// cycle joined one pattern at a time answers the same.
 async fn datalog_rows(
     fluree: &support::MemoryFluree,
     ledger: &support::MemoryLedger,
@@ -2766,11 +2769,19 @@ async fn datalog_rows(
 ) -> Vec<serde_json::Value> {
     query["@context"] = json!({"ex": CYCLIC_NS});
     query["reasoning"] = json!("datalog");
+    let (spans, guard) = support::span_capture::init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
     let rows = support::query_jsonld(fluree, ledger, &query)
         .await
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
+    drop(guard);
+    assert!(
+        spans.has_span("cyclic_enumerate"),
+        "the cycle did not run as the cyclic join; spans: {:?}",
+        spans.span_names()
+    );
     rows.as_array().unwrap().clone()
 }
 
@@ -2847,7 +2858,7 @@ async fn cyclic_rule_body_derives_on_an_indexed_ledger(ledger_id: &str, rule: se
     assert_eq!(json!(rows), both_triangles());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_rule_body_derives_on_an_indexed_ledger() {
     cyclic_rule_body_derives_on_an_indexed_ledger(
         "datalog/cyclic-rule-jsonld:main",
@@ -2856,13 +2867,79 @@ async fn datalog_cyclic_rule_body_derives_on_an_indexed_ledger() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_sparql_rule_body_derives_on_an_indexed_ledger() {
     cyclic_rule_body_derives_on_an_indexed_ledger(
         "datalog/cyclic-rule-sparql:main",
         sparql_triangle_rule(),
     )
     .await;
+}
+
+/// A four-edge cycle has join plans of its own; its rows leave through the
+/// same emit as a triangle's.
+async fn square_rule_body_derives_on_an_indexed_ledger(ledger_id: &str, rule: serde_json::Value) {
+    let knows_square = |a: &str, b: &str, c: &str, d: &str| {
+        json!([
+            {"@id": a, "ex:knows": {"@id": b}},
+            {"@id": b, "ex:knows": {"@id": c}},
+            {"@id": c, "ex:knows": {"@id": d}},
+            {"@id": d, "ex:knows": {"@id": a}}
+        ])
+    };
+    let (fluree, ledger) = indexed_ledger_with_rules(
+        ledger_id,
+        &[rule],
+        knows_square("ex:a", "ex:b", "ex:c", "ex:d"),
+        knows_square("ex:e", "ex:f", "ex:g", "ex:h"),
+    )
+    .await;
+    let rows = datalog_rows(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["?x", "?z"],
+            "where": {"@id": "?x", "ex:acrossSquareFrom": "?z"},
+            "orderBy": ["?x"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        json!(rows),
+        json!([
+            ["ex:a", "ex:c"],
+            ["ex:b", "ex:d"],
+            ["ex:c", "ex:a"],
+            ["ex:d", "ex:b"],
+            ["ex:e", "ex:g"],
+            ["ex:f", "ex:h"],
+            ["ex:g", "ex:e"],
+            ["ex:h", "ex:f"]
+        ])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_square_rule_body_derives_on_an_indexed_ledger() {
+    let rule = jsonld_rule(
+        json!([
+            {"@id": "?x", "ex:knows": {"@id": "?y"}},
+            {"@id": "?y", "ex:knows": {"@id": "?z"}},
+            {"@id": "?z", "ex:knows": {"@id": "?w"}},
+            {"@id": "?w", "ex:knows": {"@id": "?x"}}
+        ]),
+        json!({"@id": "?x", "ex:acrossSquareFrom": {"@id": "?z"}}),
+    );
+    square_rule_body_derives_on_an_indexed_ledger("datalog/square-rule-jsonld:main", rule).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_square_sparql_rule_body_derives_on_an_indexed_ledger() {
+    let rule = sparql_rule(
+        "CONSTRUCT { ?x ex:acrossSquareFrom ?z } \
+         WHERE { ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?w . ?w ex:knows ?x }",
+    );
+    square_rule_body_derives_on_an_indexed_ledger("datalog/square-rule-sparql:main", rule).await;
 }
 
 /// The edge that closes each triangle is itself derived, so the cyclic join
@@ -2886,7 +2963,7 @@ async fn cyclic_rule_body_reads_derived_edges(ledger_id: &str, rules: [serde_jso
     assert_eq!(json!(rows), both_triangles());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_rule_body_reads_derived_edges() {
     let follows_is_knows = jsonld_rule(
         json!({"@id": "?x", "ex:follows": {"@id": "?y"}}),
@@ -2899,7 +2976,7 @@ async fn datalog_cyclic_rule_body_reads_derived_edges() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_sparql_rule_body_reads_derived_edges() {
     let follows_is_knows = sparql_rule("CONSTRUCT { ?x ex:knows ?y } WHERE { ?x ex:follows ?y }");
     cyclic_rule_body_reads_derived_edges(
@@ -2938,7 +3015,7 @@ async fn cyclic_rule_body_binds_a_literal(ledger_id: &str, rule: serde_json::Val
     assert_eq!(json!(rows), json!([["ex:a", "red"], ["ex:c", "green"]]));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_rule_body_binds_a_literal() {
     let rule = jsonld_rule(
         json!([
@@ -2951,7 +3028,7 @@ async fn datalog_cyclic_rule_body_binds_a_literal() {
     cyclic_rule_body_binds_a_literal("datalog/cyclic-literal-jsonld:main", rule).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_sparql_rule_body_binds_a_literal() {
     let rule = sparql_rule(
         "CONSTRUCT { ?x ex:sharedTag ?t } \
@@ -2962,7 +3039,7 @@ async fn datalog_cyclic_sparql_rule_body_binds_a_literal() {
 
 /// A cyclic join in the query itself, joined to a derived fact about the
 /// same node.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn datalog_cyclic_query_joins_derived_facts_on_an_indexed_ledger() {
     let (fluree, ledger) = indexed_ledger_with_rules(
         "datalog/cyclic-query:main",
