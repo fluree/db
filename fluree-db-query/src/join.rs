@@ -3168,7 +3168,7 @@ fn build_probe_object_binding(
         late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
     {
         // Eager callers get what the per-row scan emits: a datalog rule head
-        // built from an encoded binding derives nothing.
+        // rejects an encoded binding.
         match binding {
             Binding::EncodedSid { .. } if ctx.eager_materialization => {
                 return Ok(Binding::Sid {

@@ -2782,8 +2782,7 @@ pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneOutput {
     /// Encoded bindings. Eager callers are owed decoded ones (a datalog rule
-    /// head built from an encoded binding derives nothing), so admission
-    /// declines them.
+    /// head rejects an encoded binding), so admission declines them.
     Encoded,
     /// Decoded bindings under eager materialization, as the per-row scan
     /// emits, or no bindings at all.
