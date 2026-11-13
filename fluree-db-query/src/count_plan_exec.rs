@@ -3700,13 +3700,14 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
 /// - overlay present but a predicate is absent from the base index, or an
 ///   overlay flake failed to translate;
 /// - either predicate fails
-///   [`predicate_unsafe_for_cross_predicate_o_key_join`] (#1652): a
-///   `NUM_BIG_OVERFLOW` object's `o_key` is a per-predicate arena handle, so
-///   cross-predicate `o_key` equality is not value equality — equal big
-///   decimals under the two predicates would never match; list rows join by
-///   rules `SoKey` cannot express. Directory-metadata gate; ledgers without
-///   decimals/overflow-integers/lists under these predicates keep the fast
-///   path;
+///   [`predicate_unsafe_for_cross_predicate_o_key_join`] (#1652): an
+///   arena-backed object's `o_key` (`NUM_BIG_OVERFLOW`, `VECTOR`) is a
+///   per-predicate arena handle, so cross-predicate `o_key` equality is not
+///   value equality — equal values under the two predicates would never
+///   match, and equal handles naming different values would; list rows join
+///   by rules `SoKey` cannot express. Directory-metadata gate; ledgers
+///   without decimals/overflow-integers/vectors/lists under these predicates
+///   keep the fast path;
 /// - a novelty list row surfaced in the overlay lane (`SoRows::declined`).
 fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Result<Option<u64>> {
     for pred in [p1, p2] {

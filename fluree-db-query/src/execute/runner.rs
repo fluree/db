@@ -686,6 +686,8 @@ async fn run_operator_into<S: BatchSink>(
             .instrument(tracing::debug_span!("operator_open"))
             .await?;
         ctx.check_cancelled()?;
+        // An operator may key rows into a hash table while it opens.
+        ctx.check_key_reads()?;
         span.record(
             "open_ms",
             (open_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -700,6 +702,9 @@ async fn run_operator_into<S: BatchSink>(
             let batch_start = Instant::now();
             let next = operator.next_batch(ctx).await?;
             ctx.check_cancelled()?;
+            // Backstop for every operator that keys rows: a batch built
+            // after a key comparison failed to read is not returned.
+            ctx.check_key_reads()?;
             let batch_ms = (batch_start.elapsed().as_secs_f64() * 1000.0) as u64;
             if batch_ms > max_batch_ms {
                 max_batch_ms = batch_ms;

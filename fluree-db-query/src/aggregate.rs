@@ -287,7 +287,12 @@ impl Operator for AggregateOperator {
                                 .unwrap_or_default();
                             (0..batch.len())
                                 .map(|row_idx| {
-                                    let n = distinct_group_rows(&batch, row_idx, cols);
+                                    let n = distinct_group_rows(
+                                        &batch,
+                                        row_idx,
+                                        cols,
+                                        self.graph_view.as_ref(),
+                                    );
                                     Binding::lit(FlakeValue::Long(n), xsd_integer())
                                 })
                                 .collect()
@@ -865,7 +870,17 @@ fn group_concat_expand_iris(
 ///
 /// `cols` restricts the reconstruction to the user-visible columns, matching
 /// what `*` denotes; see [`AggregateFn::CountDistinctAll`].
-fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
+///
+/// An arena-backed literal (a big number or a vector) is compared by its
+/// value, decoded through `gv`: its handle is scoped per predicate, and a
+/// vector's is not its value's only handle.
+fn distinct_group_rows(
+    batch: &Batch,
+    row_idx: usize,
+    cols: &[usize],
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> i64 {
+    use std::borrow::Cow;
     let grouped: Vec<&[Binding]> = cols
         .iter()
         .filter_map(|&col_idx| match batch.get_by_col(row_idx, col_idx) {
@@ -876,9 +891,19 @@ fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
     let Some(group_size) = grouped.iter().map(|col| col.len()).min() else {
         return 1;
     };
-    let mut seen: HashSet<Vec<&Binding>> = HashSet::with_capacity(group_size);
+    fn key<'a>(
+        b: &'a Binding,
+        gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Cow<'a, Binding> {
+        if gv.is_some() && crate::object_binding::is_arena_encoded(b) {
+            Cow::Owned(crate::group_aggregate::materialize_encoded(b, gv))
+        } else {
+            Cow::Borrowed(b)
+        }
+    }
+    let mut seen: HashSet<Vec<Cow<'_, Binding>>> = HashSet::with_capacity(group_size);
     for i in 0..group_size {
-        seen.insert(grouped.iter().map(|col| &col[i]).collect());
+        seen.insert(grouped.iter().map(|col| key(&col[i], gv)).collect());
     }
     seen.len() as i64
 }

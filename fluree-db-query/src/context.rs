@@ -287,6 +287,12 @@ pub struct ExecutionContext<'a> {
     pub tracker: Tracker,
     /// Optional cooperative cancellation handle.
     pub cancellation: QueryCancellation,
+    /// The query's slot for a read failure met while building or comparing
+    /// a hash-table key, which couldn't be returned. Every graph view the query keys
+    /// through records there ([`Self::graph_view`]), the contexts derived
+    /// from this one share it, and [`Self::checkpoint`] fails the query once
+    /// it holds an error.
+    pub key_read_errors: Arc<fluree_db_binary_index::KeyReadErrors>,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
     /// When true, scan operators bypass the variable-predicate filter
@@ -534,6 +540,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -599,6 +606,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -668,6 +676,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -726,6 +735,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -783,6 +793,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -842,6 +853,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -966,6 +978,19 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// Return the read failure recorded while building or comparing a
+    /// hash-table key ([`Self::key_read_errors`]), if any. Such a key or
+    /// comparison stood in for the value, so the rows built since are not an
+    /// answer: an operator that keys rows checks this after each batch it
+    /// keys, before it emits.
+    #[inline]
+    pub fn check_key_reads(&self) -> Result<(), QueryError> {
+        match self.key_read_errors.first() {
+            Some(err) => Err(QueryError::from_io_ref("reading a key's value", err)),
+            None => Ok(()),
+        }
+    }
+
     /// Record `bytes` of retained query memory into the query-scoped counter shared by
     /// this context and every per-graph context derived from it (the derived contexts
     /// clone the same cancellation handle). Called where a buffering post-scan operator
@@ -993,8 +1018,9 @@ impl<'a> ExecutionContext<'a> {
 
     /// Cooperative checkpoint: the single guard the buffering post-scan operators
     /// (hash-join build, GROUP BY fold, fused dim-map build) poll at batch granularity.
-    /// Aborts if the query was cancelled/timed out, or if the recorded retained memory
-    /// has crossed the budget.
+    /// Aborts if the query was cancelled/timed out, if building or comparing a key
+    /// failed to read ([`check_key_reads`](Self::check_key_reads)), or if the
+    /// recorded retained memory has crossed the budget.
     ///
     /// Cancellation is checked first, so an external timeout or RSS-watchdog signal
     /// maps to [`QueryError::Cancelled`] (408 at the API boundary) while an
@@ -1005,6 +1031,7 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn checkpoint(&self) -> Result<(), QueryError> {
         self.check_cancelled()?;
+        self.check_key_reads()?;
         let budget = self
             .cancellation
             .memory_limit()
@@ -1348,7 +1375,8 @@ impl<'a> ExecutionContext<'a> {
         let view = store
             .graph_with_novelty(self.binary_g_id, self.dict_novelty.clone())
             .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
-            .with_tracker(self.tracker.clone());
+            .with_tracker(self.tracker.clone())
+            .with_key_read_errors(Arc::clone(&self.key_read_errors));
         Some(view)
     }
 
@@ -1614,6 +1642,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph,
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
+            key_read_errors: Arc::clone(&self.key_read_errors),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
@@ -1682,6 +1711,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
+            key_read_errors: Arc::clone(&self.key_read_errors),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
@@ -1751,6 +1781,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
+            key_read_errors: Arc::clone(&self.key_read_errors),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),

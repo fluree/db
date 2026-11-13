@@ -1119,9 +1119,7 @@ impl SqlBlockSource {
                     tracing::debug!(var = ?seed.var, "sql pushdown: unbound outer value, no key set");
                     return vec![None];
                 }
-                let materialized = if crate::object_binding::is_numbig_encoded(b)
-                    || matches!(b, Binding::EncodedLit { .. })
-                {
+                let materialized = if matches!(b, Binding::EncodedLit { .. }) {
                     crate::group_aggregate::materialize_encoded(b, gv.as_ref())
                 } else {
                     b.clone()

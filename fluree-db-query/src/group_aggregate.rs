@@ -169,9 +169,29 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
     let Some(gv) = gv else {
         return binding.clone();
     };
+    try_materialize_encoded(binding, gv).unwrap_or_else(|_| binding.clone())
+}
+
+/// [`materialize_encoded`] for an arena literal (a big number or a vector)
+/// that a caller is keying. Its handle names a value only within one
+/// predicate's arena, so keying it by handle after a failed read would split
+/// equal values. The failure is recorded in the view's slot instead, which
+/// fails the query ([`crate::context::ExecutionContext::check_key_reads`]);
+/// the binding comes back as is, keyed by handle only until then.
+pub(crate) fn materialize_arena_key(binding: &Binding, gv: &BinaryGraphView) -> Binding {
+    try_materialize_encoded(binding, gv).unwrap_or_else(|err| {
+        gv.key_read_errors().record(err);
+        binding.clone()
+    })
+}
+
+/// [`materialize_encoded`], with a failed literal read returned. A subject
+/// or predicate id that doesn't resolve comes back as is: its id is a
+/// canonical key on its own.
+fn try_materialize_encoded(binding: &Binding, gv: &BinaryGraphView) -> std::io::Result<Binding> {
     let store = gv.store();
 
-    match binding {
+    Ok(match binding {
         Binding::EncodedLit {
             o_kind,
             o_key,
@@ -202,7 +222,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
                         p_id: Some(*p_id),
                     }
                 }
-                Err(_) => binding.clone(),
+                Err(err) => return Err(err),
             }
         }
         Binding::EncodedSid { s_id, .. } => match gv.resolve_subject_sid(*s_id) {
@@ -214,7 +234,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
             None => binding.clone(),
         },
         _ => binding.clone(),
-    }
+    })
 }
 
 impl AggState {
@@ -418,9 +438,11 @@ pub(crate) enum GroupKeyOwned {
     Lit {
         o_kind: u8,
         o_key: u64,
-        /// `p_id` is only required for NUM_BIG decoding (per-predicate arena).
-        /// For all other literal kinds, it must not affect grouping identity.
-        p_id_for_numbig: Option<u32>,
+        /// `p_id` scopes an arena handle (NUM_BIG, VECTOR_ID: per-predicate
+        /// arenas); for all other literal kinds it must not affect grouping
+        /// identity. The normalized key decodes arena literals, so this only
+        /// keeps an un-normalized key from merging two predicates' handles.
+        p_id_for_arena: Option<u32>,
         dt_id: u16,
         lang_id: u16,
     },
@@ -428,11 +450,181 @@ pub(crate) enum GroupKeyOwned {
     MaterializedSid(u16, Arc<str>),
     /// Materialized literal value
     MaterializedLit(MaterializedLitKey),
+    /// Materialized vector literal: its components, compared bitwise as
+    /// `FlakeValue`'s vector equality does. Shares the decoded value's
+    /// allocation rather than rendering it.
+    MaterializedVector(VectorKey, DatatypeConstraint),
     /// Ordered sequence key — a path's node sequence or a list value, so
     /// `WITH path, collect(...)` / GROUP BY a list groups per distinct sequence.
     Seq(Vec<GroupKeyOwned>),
     /// Unbound/Poisoned
     Absent,
+}
+
+/// A vector as a hash key, by value: two keys are equal iff the vectors are
+/// (bitwise-equal components, as `FlakeValue`'s vector equality has it), in
+/// whichever form each arrives. A stored vector keys by its arena's identity
+/// table when that is built (hash and canonical handle, no shard held), and
+/// otherwise as a zero-copy slice of its arena shard, so keying never decodes
+/// or copies it; a decoded one (novelty, `VALUES`, `BIND`) keys by its
+/// components. All hash with the one canonical function
+/// ([`fluree_db_core::value::vector_value_hash`]), carried in the key so a
+/// table that grows doesn't read the components again.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorKey {
+    hash: u64,
+    repr: VectorRepr,
+}
+
+#[derive(Debug, Clone)]
+enum VectorRepr {
+    Arena(fluree_db_binary_index::ArenaVector),
+    Decoded(Arc<[f64]>),
+}
+
+impl VectorKey {
+    pub(crate) fn decoded(value: &Arc<[f64]>) -> Self {
+        Self {
+            hash: fluree_db_core::value::vector_value_hash(value),
+            repr: VectorRepr::Decoded(Arc::clone(value)),
+        }
+    }
+
+    /// The key of an encoded vector, read from its arena without decoding.
+    /// `Ok(None)` for any other binding, or a handle the arena doesn't hold
+    /// (which the caller decodes instead); an error if the arena read fails.
+    pub(crate) fn try_of_encoded(
+        binding: &Binding,
+        gv: &BinaryGraphView,
+    ) -> std::io::Result<Option<Self>> {
+        let Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            ..
+        } = binding
+        else {
+            return Ok(None);
+        };
+        if *o_kind != fluree_db_core::ObjKind::VECTOR_ID.as_u8() {
+            return Ok(None);
+        }
+        Ok(gv.arena_vector(*p_id, *o_key as u32)?.map(|arena| Self {
+            hash: arena.hash,
+            repr: VectorRepr::Arena(arena),
+        }))
+    }
+
+    /// The key of any vector binding: encoded through its arena (decoding it
+    /// only if the arena doesn't hold the handle), decoded by its
+    /// components. `Ok(None)` for a binding that isn't a vector; an error if
+    /// the arena read fails.
+    pub(crate) fn of_binding(
+        binding: &Binding,
+        gv: Option<&BinaryGraphView>,
+    ) -> std::io::Result<Option<Self>> {
+        match binding {
+            Binding::Lit {
+                val: FlakeValue::Vector(v),
+                ..
+            } => Ok(Some(Self::decoded(v))),
+            Binding::EncodedLit { o_kind, .. }
+                if *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8() =>
+            {
+                let Some(gv) = gv else {
+                    return Ok(None);
+                };
+                if let Some(key) = Self::try_of_encoded(binding, gv)? {
+                    return Ok(Some(key));
+                }
+                Ok(match materialize_encoded(binding, Some(gv)) {
+                    Binding::Lit {
+                        val: FlakeValue::Vector(v),
+                        ..
+                    } => Some(Self::decoded(&v)),
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Whether `binding` is a vector, encoded or decoded.
+pub(crate) fn is_vector_binding(binding: &Binding) -> bool {
+    match binding {
+        Binding::Lit { val, .. } => matches!(val, FlakeValue::Vector(_)),
+        Binding::EncodedLit { o_kind, .. } => *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8(),
+        _ => false,
+    }
+}
+
+impl VectorKey {
+    /// Whether the two keys hold equal vectors. Keys of one arena whose
+    /// identity table is built compare by canonical handle and read nothing;
+    /// otherwise, on a hash match, components are compared, read from the
+    /// arena for a key that holds none.
+    pub(crate) fn same_value(&self, other: &Self) -> std::io::Result<bool> {
+        if self.hash != other.hash {
+            return Ok(false);
+        }
+        match (&self.repr, &other.repr) {
+            (VectorRepr::Arena(a), VectorRepr::Arena(b)) => a.same_value(b),
+            (VectorRepr::Arena(a), VectorRepr::Decoded(d))
+            | (VectorRepr::Decoded(d), VectorRepr::Arena(a)) => {
+                a.same_value_as_decoded(self.hash, d)
+            }
+            (VectorRepr::Decoded(x), VectorRepr::Decoded(y)) => Ok(Arc::ptr_eq(x, y)
+                || x.len() == y.len()
+                    && x.iter()
+                        .zip(y.iter())
+                        .all(|(p, q)| p.to_bits() == q.to_bits())),
+        }
+    }
+}
+
+/// Equality for a hash table, which can't return an error. Only a
+/// comparison that needs components a key doesn't hold reads, on a hash
+/// match, and only a key the identity table resolved holds none. A failed
+/// read is recorded in that key's slot, the query's, and the operator that
+/// owns the table fails the query on its next check
+/// ([`crate::context::ExecutionContext::checkpoint`]): the pair reads as
+/// unequal only until then, and no row built on it is returned.
+impl PartialEq for VectorKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_value(other).unwrap_or_else(|err| {
+            let slot = [self, other].into_iter().find_map(|key| match &key.repr {
+                VectorRepr::Arena(arena) => arena.read_errors(),
+                VectorRepr::Decoded(_) => None,
+            });
+            debug_assert!(slot.is_some(), "a key that holds no components read none");
+            if let Some(slot) = slot {
+                slot.record(err);
+            }
+            false
+        })
+    }
+}
+
+impl Eq for VectorKey {}
+
+impl Hash for VectorKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
+/// The datatype constraint a decoded vector of `dt_id` carries, as
+/// [`materialize_encoded`] gives it, so an encoded vector's key matches a
+/// decoded one's.
+fn vector_dtc(gv: &BinaryGraphView, dt_id: u16) -> DatatypeConstraint {
+    DatatypeConstraint::Explicit(
+        gv.store()
+            .dt_sids()
+            .get(dt_id as usize)
+            .cloned()
+            .unwrap_or_else(|| Sid::new(0, "")),
+    )
 }
 
 /// Hashable key for materialized literals.
@@ -467,8 +659,9 @@ impl Hash for MaterializedLitKey {
 /// mixed-representation streams (encoded scan output meeting decoded
 /// VALUES/UNION/BIND bindings) key identically. Pass the store whenever the
 /// stream may contain late-materialized bindings; pass the graph view so
-/// arena-backed NUM_BIG values key by decoded numeric value (handles are
-/// per-(graph, predicate) and not canonical across representations).
+/// arena-backed literals (NUM_BIG, VECTOR_ID) key by decoded value: handles
+/// are per-(graph, predicate), and the vector arena does not deduplicate, so
+/// a handle is not canonical across predicates, representations or facts.
 pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
     dicts: Option<crate::object_binding::TermDicts<'_>>,
@@ -488,9 +681,25 @@ pub(crate) fn binding_to_group_key_normalized(
     {
         return binding_to_group_key_owned(canonical.as_ref().unwrap_or(binding));
     }
-    if crate::object_binding::is_numbig_encoded(binding) {
+    if crate::object_binding::is_arena_encoded(binding) {
         if let Some(gv) = gv {
-            let materialized = materialize_encoded(binding, Some(gv));
+            // A stored vector keys by its arena entry, undecoded. A failed
+            // read is recorded in the view's slot, which fails the query
+            // (`ExecutionContext::check_key_reads`); the handle keys it only
+            // until then.
+            match VectorKey::try_of_encoded(binding, gv) {
+                Ok(Some(key)) => {
+                    if let Binding::EncodedLit { dt_id, .. } = binding {
+                        return GroupKeyOwned::MaterializedVector(key, vector_dtc(gv, *dt_id));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    gv.key_read_errors().record(err);
+                    return binding_to_group_key_owned(binding);
+                }
+            }
+            let materialized = materialize_arena_key(binding, gv);
             if !matches!(materialized, Binding::EncodedLit { .. }) {
                 return binding_to_group_key_owned(&materialized);
             }
@@ -521,17 +730,20 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
         } => GroupKeyOwned::Lit {
             o_kind: *o_kind,
             o_key: *o_key,
-            p_id_for_numbig: if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                Some(*p_id)
-            } else {
-                None
-            },
+            p_id_for_arena: fluree_db_core::ObjKind::from_u8(*o_kind)
+                .is_arena_handle()
+                .then_some(*p_id),
             dt_id: *dt_id,
             lang_id: *lang_id,
         },
         Binding::Sid { sid, .. } => {
             GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone())
         }
+        Binding::Lit {
+            val: FlakeValue::Vector(v),
+            dtc,
+            ..
+        } => GroupKeyOwned::MaterializedVector(VectorKey::decoded(v), dtc.clone()),
         Binding::Lit { val, dtc, .. } => {
             GroupKeyOwned::MaterializedLit(flake_value_to_key(val, dtc))
         }
@@ -899,6 +1111,89 @@ impl GroupAggregateOperator {
     }
 }
 
+/// `fast-path outcome` site the partitioned GROUP BY lane stamps when its
+/// key column holds a key whose encoding is not one per value and those rows
+/// fold through the hashed groups (see [`folds_by_value`]).
+pub(crate) const PARTITIONED_GROUP_BY_SITE: &str = "partitioned GROUP BY";
+
+/// Why the partitioned lane folds a key by value instead of by run, if it
+/// does: the key is a vector (`"vector-key"`), or a big number while
+/// `legacy_numbig` holds (`"legacy-numbig-key"`). Both cover the encoded
+/// (arena handle) and decoded forms.
+#[inline]
+fn folds_by_value(binding: &Binding, legacy_numbig: bool) -> Option<&'static str> {
+    use fluree_db_core::ObjKind;
+    let (vector, big_number) = match binding {
+        Binding::EncodedLit { o_kind, .. } => (
+            *o_kind == ObjKind::VECTOR_ID.as_u8(),
+            *o_kind == ObjKind::NUM_BIG.as_u8(),
+        ),
+        Binding::Lit { val, .. } => (
+            matches!(val, FlakeValue::Vector(_)),
+            matches!(val, FlakeValue::Decimal(_) | FlakeValue::BigInt(_)),
+        ),
+        _ => return None,
+    };
+    if vector {
+        Some("vector-key")
+    } else if big_number && legacy_numbig {
+        Some("legacy-numbig-key")
+    } else {
+        None
+    }
+}
+
+/// Fold one row into the hashed groups under `group_key` (already filled from
+/// the row): one hash per row, and the key is cloned out of the buffer only
+/// when it opens a new group. Takes the operator's fields rather than `self`
+/// so it runs while `dicts` borrows the operator's normalization.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn fold_row_hashed(
+    groups: &mut hashbrown::HashMap<CompositeGroupKey, GroupState, FxBuildHasher>,
+    group_key_indices: &[usize],
+    agg_specs: &[StreamingAggSpec],
+    gv: Option<&BinaryGraphView>,
+    dicts: Option<crate::object_binding::TermDicts<'_>>,
+    batch: &Batch,
+    row_idx: usize,
+    group_key: &CompositeGroupKey,
+    row_keys: &[Vec<GroupKeyOwned>],
+) {
+    let (_, group_state) = groups
+        .raw_entry_mut()
+        .from_key(group_key)
+        .or_insert_with(|| {
+            let state = GroupState {
+                key_bindings: group_key_indices
+                    .iter()
+                    .map(|&col_idx| batch.get_by_col(row_idx, col_idx).clone())
+                    .collect(),
+                agg_states: agg_specs
+                    .iter()
+                    .map(|spec| AggState::new(&spec.function))
+                    .collect(),
+            };
+            (group_key.clone(), state)
+        });
+
+    // Update each aggregate with this row's values
+    for (agg_idx, spec) in agg_specs.iter().enumerate() {
+        match spec.input_col {
+            Some(col_idx) => {
+                let binding = batch.get_by_col(row_idx, col_idx);
+                group_state.agg_states[agg_idx].update(binding, dicts, gv);
+            }
+            // COUNT(DISTINCT *) - count distinct solutions
+            None if matches!(spec.function, AggregateFn::CountDistinctAll(_)) => {
+                group_state.agg_states[agg_idx].update_distinct_row(&row_keys[agg_idx]);
+            }
+            // COUNT(*) - count all rows
+            None => group_state.agg_states[agg_idx].update_count_all(),
+        }
+    }
+}
+
 #[async_trait]
 impl Operator for GroupAggregateOperator {
     /// Item 11 (F-AUD-7): DECLINE forwarding — a grouped aggregate must consume ALL
@@ -1020,6 +1315,15 @@ impl Operator for GroupAggregateOperator {
                     let key_col = self.group_key_indices[0];
                     let mut current_key: Option<GroupKeyOwned> = None;
                     let mut current_state: Option<GroupState> = None;
+                    // Rows whose key's encoding is not one per value fold into
+                    // the hashed groups (see below); this buffer keys them.
+                    let mut value_key = CompositeGroupKey(Vec::with_capacity(1));
+                    let mut keys_hashed = false;
+                    // Decided once, so a decimal's encoded and decoded forms
+                    // take the same path.
+                    let legacy_numbig = crate::object_binding::EqualityNorm::parts(&self.norm)
+                        .1
+                        .is_some_and(|gv| gv.store().graph_numbig_has_duplicate_handles(gv.g_id()));
 
                     loop {
                         // Per-batch checkpoint (deadline + memory budget; see the
@@ -1040,6 +1344,55 @@ impl Operator for GroupAggregateOperator {
                         for row_idx in 0..batch.len() {
                             input_rows += 1;
                             let key_binding = batch.get_by_col(row_idx, key_col);
+                            // This lane needs one encoded key per value, with
+                            // equal values adjacent. A vector breaks that (its
+                            // arena gives each stored fact its own handle), and
+                            // so does a decimal on a graph whose legacy NumBig
+                            // arena holds scale variants (`1.5`, `1.50`) under
+                            // separate handles. Those rows fold into the hashed
+                            // groups instead, keyed by value. No other term
+                            // equals one of them, so the two sets of groups
+                            // never overlap.
+                            if let Some(reason) = folds_by_value(key_binding, legacy_numbig) {
+                                if !keys_hashed {
+                                    keys_hashed = true;
+                                    tracing::debug!(
+                                        reason,
+                                        "partitioned GROUP BY: keys fold by value"
+                                    );
+                                    crate::fast_path_outcome::stamp_fast_path(
+                                        PARTITIONED_GROUP_BY_SITE,
+                                        crate::fast_path_outcome::FastPathOutcome::Fallback(
+                                            crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                                        ),
+                                    );
+                                }
+                                self.fill_group_key(
+                                    &batch,
+                                    row_idx,
+                                    &mut value_key,
+                                    dicts,
+                                    norm_gv,
+                                );
+                                let row_keys =
+                                    self.extract_row_keys(&batch, row_idx, dicts, norm_gv);
+                                let groups_before = self.groups.len();
+                                fold_row_hashed(
+                                    &mut self.groups,
+                                    &self.group_key_indices,
+                                    &self.agg_specs,
+                                    self.graph_view.as_ref(),
+                                    dicts,
+                                    &batch,
+                                    row_idx,
+                                    &value_key,
+                                    &row_keys,
+                                );
+                                if self.groups.len() > groups_before {
+                                    ctx.record_alloc(crate::context::GROUP_EST_BYTES);
+                                }
+                                continue;
+                            }
                             let key = binding_to_group_key_owned(key_binding);
 
                             let same_group = current_key.as_ref().is_some_and(|k| k == &key);
@@ -1098,6 +1451,9 @@ impl Operator for GroupAggregateOperator {
                         self.partitioned_groups.push(state);
                         ctx.record_alloc(crate::context::GROUP_EST_BYTES);
                     }
+                    // Vector-keyed groups, already accounted as they opened.
+                    self.partitioned_groups
+                        .extend(std::mem::take(&mut self.groups).into_values());
 
                     span.record("input_batches", input_batches);
                     span.record("input_rows", input_rows);
@@ -1153,51 +1509,17 @@ impl Operator for GroupAggregateOperator {
                         // it here too — before the group state is borrowed.
                         let row_keys = self.extract_row_keys(&batch, row_idx, dicts, norm_gv);
 
-                        // One hash per row; the key is cloned out of the
-                        // buffer only when it opens a new group. The closure
-                        // captures fields, not `self`, so it can run while
-                        // `groups` is borrowed.
-                        let (_, group_state) = self
-                            .groups
-                            .raw_entry_mut()
-                            .from_key(&group_key)
-                            .or_insert_with(|| {
-                                let state = GroupState {
-                                    key_bindings: self
-                                        .group_key_indices
-                                        .iter()
-                                        .map(|&col_idx| batch.get_by_col(row_idx, col_idx).clone())
-                                        .collect(),
-                                    agg_states: self
-                                        .agg_specs
-                                        .iter()
-                                        .map(|spec| AggState::new(&spec.function))
-                                        .collect(),
-                                };
-                                (group_key.clone(), state)
-                            });
-
-                        // Update each aggregate with this row's values
-                        let gv_ref = self.graph_view.as_ref();
-                        for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
-                            match spec.input_col {
-                                Some(col_idx) => {
-                                    let binding = batch.get_by_col(row_idx, col_idx);
-                                    group_state.agg_states[agg_idx].update(binding, dicts, gv_ref);
-                                }
-                                // COUNT(DISTINCT *) - count distinct solutions
-                                None if matches!(
-                                    spec.function,
-                                    AggregateFn::CountDistinctAll(_)
-                                ) =>
-                                {
-                                    group_state.agg_states[agg_idx]
-                                        .update_distinct_row(&row_keys[agg_idx]);
-                                }
-                                // COUNT(*) - count all rows
-                                None => group_state.agg_states[agg_idx].update_count_all(),
-                            }
-                        }
+                        fold_row_hashed(
+                            &mut self.groups,
+                            &self.group_key_indices,
+                            &self.agg_specs,
+                            self.graph_view.as_ref(),
+                            dicts,
+                            &batch,
+                            row_idx,
+                            &group_key,
+                            &row_keys,
+                        );
                     }
                     // Account this batch's group growth into the query-scoped counter
                     // (an O(1) len delta); the next iteration's checkpoint enforces the
@@ -1243,6 +1565,9 @@ impl Operator for GroupAggregateOperator {
             }
             .instrument(span)
             .await?;
+            // A key comparison that failed to read split one group in two:
+            // the groups are not an answer.
+            ctx.check_key_reads()?;
         }
 
         // Emit batches from accumulated groups
@@ -1345,6 +1670,100 @@ fn extract_numeric_with_gv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored vector's key: `handle` of a one-shard arena holding
+    /// `vectors`, under `(store_id, p_id)`, without an identity table.
+    fn arena_key(store_id: u64, p_id: u32, vectors: &[&[f32]], handle: u32) -> VectorKey {
+        use fluree_db_binary_index::arena::vector::{VectorShard, VectorSlice};
+        let dims = vectors[0].len();
+        let shard = Arc::new(VectorShard {
+            dims: dims as u16,
+            count: vectors.len() as u32,
+            values: vectors.iter().flat_map(|v| v.iter().copied()).collect(),
+        });
+        let slice = VectorSlice::new(shard, handle).unwrap();
+        let hash = fluree_db_core::value::vector_value_hash_f32(slice.as_f32());
+        VectorKey {
+            hash,
+            repr: VectorRepr::Arena(fluree_db_binary_index::ArenaVector {
+                hash,
+                store_id,
+                g_id: 0,
+                p_id,
+                handle,
+                form: fluree_db_binary_index::ArenaVectorForm::Slice(slice),
+            }),
+        }
+    }
+
+    fn hash_of(key: &VectorKey) -> u64 {
+        use std::hash::BuildHasher;
+        FxBuildHasher.hash_one(key)
+    }
+
+    /// One vector, keyed as an arena slice, as decoded novelty and as a
+    /// `VALUES` literal, is one key; another vector at the same offset of
+    /// another arena is not.
+    #[test]
+    fn vector_keys_agree_across_forms() {
+        let stored = arena_key(1, 7, &[&[0.25, -1.5], &[0.5, 0.5]], 1);
+        let novelty = VectorKey::decoded(&Arc::from(vec![0.5, 0.5]));
+        let values = VectorKey::of_binding(
+            &Binding::lit(
+                FlakeValue::Vector(Arc::from(vec![0.5f64, 0.5])),
+                Sid::new(0, "v"),
+            ),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        for other in [&novelty, &values] {
+            assert_eq!(&stored, other);
+            assert_eq!(hash_of(&stored), hash_of(other));
+        }
+        assert_eq!(novelty, values);
+
+        let elsewhere = arena_key(1, 8, &[&[9.0, 9.0], &[0.75, 0.5]], 1);
+        assert_ne!(stored, elsewhere);
+        // The same value at another offset of another arena is equal.
+        let moved = arena_key(2, 8, &[&[0.5, 0.5]], 0);
+        assert_eq!(stored, moved);
+        assert_eq!(hash_of(&stored), hash_of(&moved));
+    }
+
+    /// Equality is bitwise on the components, as `FlakeValue`'s is: `-0.0`
+    /// and `0.0` differ; a query literal whose component doesn't narrow to
+    /// `f32` equals no stored vector; a NaN equals itself, so a table keyed
+    /// by it stays consistent.
+    #[test]
+    fn vector_key_equality_is_bitwise_and_hash_consistent() {
+        let zero = arena_key(1, 7, &[&[0.0, 1.0]], 0);
+        let neg_zero = VectorKey::decoded(&Arc::from(vec![-0.0, 1.0]));
+        assert_ne!(zero, neg_zero);
+        assert_eq!(zero, VectorKey::decoded(&Arc::from(vec![0.0, 1.0])));
+
+        let stored = arena_key(1, 7, &[&[0.1f32]], 0);
+        let literal = VectorKey::decoded(&Arc::from(vec![0.1f64]));
+        let widened = VectorKey::decoded(&Arc::from(vec![f64::from(0.1f32)]));
+        assert_ne!(stored, literal, "0.1 as f64 is not the stored f32 0.1");
+        assert_eq!(stored, widened);
+        assert_eq!(hash_of(&stored), hash_of(&widened));
+        assert!(
+            FlakeValue::Vector(Arc::from(vec![0.1f64]))
+                != FlakeValue::Vector(Arc::from(vec![f64::from(0.1f32)])),
+            "the decoded values agree"
+        );
+
+        let nan = VectorKey::decoded(&Arc::from(vec![f64::NAN]));
+        let nan_again = VectorKey::decoded(&Arc::from(vec![f64::NAN]));
+        assert_eq!(nan, nan_again);
+        assert_eq!(hash_of(&nan), hash_of(&nan_again));
+        let stored_nan = arena_key(1, 7, &[&[f32::NAN]], 0);
+        assert_eq!(stored_nan == nan, hash_of(&stored_nan) == hash_of(&nan));
+        let mut set = FxHashSet::default();
+        set.insert(nan.clone());
+        assert!(set.contains(&nan_again));
+    }
     use crate::ir::InputSemantics;
     use fluree_db_core::LedgerSnapshot;
     use std::collections::HashMap;
@@ -1855,5 +2274,88 @@ mod tests {
             key(f64::NEG_INFINITY.to_bits())
         );
         assert_ne!(key(f64::INFINITY.to_bits()), nan);
+    }
+
+    /// A legacy pre-normalization NumBig arena holds `1.5` under two handles.
+    /// The partitioned lane groups by run of the encoded key, so it would
+    /// count the value as two groups; on a graph with such an arena it folds
+    /// big numbers by value, wherever their rows fall in the input.
+    #[tokio::test]
+    async fn partitioned_group_by_folds_legacy_numbig_scale_variants_by_value() {
+        use crate::context::ExecutionContext;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_binary_index::arena::numbig::read_numbig_arena_from_bytes;
+        use fluree_db_binary_index::BinaryIndexStore;
+        use fluree_db_core::o_type::OType;
+        use num_bigint::BigInt;
+
+        /// One decimal entry of an NBA1 buffer, as a pre-normalization build
+        /// wrote it: unscaled value and scale as given.
+        fn bigdec_entry(buf: &mut Vec<u8>, unscaled: i64, scale: i64) {
+            let unscaled_bytes = BigInt::from(unscaled).to_signed_bytes_le();
+            buf.push(1);
+            let repr_len = 4 + unscaled_bytes.len() + 8;
+            buf.extend_from_slice(&(repr_len as u32).to_le_bytes());
+            buf.extend_from_slice(&(unscaled_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&unscaled_bytes);
+            buf.extend_from_slice(&scale.to_le_bytes());
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"NBA1");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        bigdec_entry(&mut buf, 150, 2); // handle 0: 1.50
+        bigdec_entry(&mut buf, 15, 1); // handle 1: 1.5, the same value
+        bigdec_entry(&mut buf, 1999, 2); // handle 2: 19.99
+        let arena = read_numbig_arena_from_bytes(&buf).unwrap();
+        assert!(arena.has_duplicate_handles());
+
+        const P_ID: u32 = 7;
+        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
+        store.set_numbig_arena_for_test(0, P_ID, arena);
+        let snapshot = make_test_snapshot();
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_binary_store(Arc::new(store), 0);
+
+        let big = |handle: u64| {
+            crate::object_binding::late_materialized_object_binding(
+                OType::NUM_BIG_OVERFLOW.as_u16(),
+                handle,
+                P_ID,
+                1,
+                u32::MAX,
+                None,
+            )
+            .unwrap()
+        };
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch = Batch::new(schema, vec![vec![big(0), big(2), big(1)]]).unwrap();
+        let agg_specs = vec![StreamingAggSpec {
+            function: AggregateFn::CountAll,
+            input_col: None,
+            output_var: VarId(1),
+        }];
+        let mut op = GroupAggregateOperator::new(
+            Box::new(BatchSeedOperator::from_batch(batch)),
+            vec![VarId(0)],
+            agg_specs,
+            None,
+            true,
+        );
+        op.open(&ctx).await.unwrap();
+        let mut counts = Vec::new();
+        while let Some(out) = op.next_batch(&ctx).await.unwrap() {
+            for row in 0..out.len() {
+                match out.get_by_col(row, 1) {
+                    Binding::Lit {
+                        val: FlakeValue::Long(n),
+                        ..
+                    } => counts.push(*n),
+                    other => panic!("count: {other:?}"),
+                }
+            }
+        }
+        counts.sort_unstable();
+        assert_eq!(counts, [1, 2], "1.5 and 1.50 are one group");
     }
 }

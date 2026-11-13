@@ -983,14 +983,19 @@ impl PartialEq for Binding {
                 // - `t` is metadata and intentionally excluded (see docs above).
                 // - `i_val` is list index metadata and is intentionally excluded from
                 //   term identity (it should not affect DISTINCT/GROUP BY/join unification).
-                // - `p_id` is only required for NUM_BIG decoding (per-predicate arena);
-                //   for other kinds it must NOT affect term identity.
+                // - `p_id` scopes an arena handle (NUM_BIG, VECTOR_ID: per-predicate
+                //   arenas), so it takes part for those kinds; for other kinds it
+                //   must NOT affect term identity. Even with it, equal arena
+                //   handles are one value but unequal ones may be too (the
+                //   vector arena does not deduplicate, and one value under two
+                //   predicates has two handles): equality surfaces compare
+                //   these by decoded value (`object_binding::normalize_for_key`),
+                //   and this structural form can only fail to merge them.
                 if k1 != k2 || ok1 != ok2 || dt1 != dt2 || l1 != l2 {
                     return false;
                 }
 
-                let num_big = fluree_db_core::ObjKind::NUM_BIG.as_u8();
-                if *k1 == num_big {
+                if fluree_db_core::ObjKind::from_u8(*k1).is_arena_handle() {
                     p1 == p2
                 } else {
                     true
@@ -1119,9 +1124,9 @@ impl std::hash::Hash for Binding {
                 o_key.hash(state);
                 dt_id.hash(state);
                 lang_id.hash(state);
-                // `p_id` is only required for NUM_BIG decoding (per-predicate arena).
-                // For all other literal kinds, it must not affect hash identity.
-                if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
+                // `p_id` scopes an arena handle (NUM_BIG, VECTOR_ID); for all
+                // other literal kinds it must not affect hash identity.
+                if fluree_db_core::ObjKind::from_u8(*o_kind).is_arena_handle() {
                     p_id.hash(state);
                 }
             }
