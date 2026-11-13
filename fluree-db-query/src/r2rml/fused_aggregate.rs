@@ -38,7 +38,7 @@ use crate::ir::{Expression, Function, GraphName, Pattern, Query, R2rmlPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::operator::{
     decimal_canonical_of, object_column_is_numeric, rdf_term_eq_object_constant_cached,
-    LiteralEncoder,
+    scan_for_lookup, LiteralEncoder,
 };
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::r2rml::ObjectConstant;
@@ -1332,6 +1332,12 @@ struct KeptChainRow {
     /// The kept row's FK value to the NEXT hop (interior levels only); `None` on the
     /// terminal level or when that FK column is null (a null FK breaks the chain).
     next_fk: Option<Vec<String>>,
+    /// Whether another row with this key and this same subject disagrees with the
+    /// kept row on `passes_own` or `next_fk` (an SCD-2 collision, id=3717339904).
+    /// A smaller subject arriving later replaces the row and clears this, so after
+    /// the whole read it describes the keep-min subject's rows alone, whatever
+    /// order the rows arrived in.
+    conflict: bool,
 }
 
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
@@ -1416,6 +1422,11 @@ pub struct FusedR2rmlAggregateOperator {
     /// K≥2 or ≥2-ref shape declines to the generic pipeline. Rides ON TOP of `multifact`
     /// and `FLUREE_FUSED_R2RML_AGG_JOIN`, which remain independently killable underneath.
     multifact_gen: bool,
+    /// The row order the folded table scan owes the query (see
+    /// [`crate::r2rml::ScanOrder`]): deterministic unless the planner set `Any`
+    /// for a query with no slice, and deterministic whenever the execution
+    /// context requires it.
+    scan_order: crate::r2rml::ScanOrder,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1448,7 +1459,15 @@ impl FusedR2rmlAggregateOperator {
             output_bound: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"),
             multifact: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"),
             multifact_gen: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN"),
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
+    }
+
+    /// Set the row order the folded table scan owes the query (the planner's
+    /// `PlanningContext::scan_order`).
+    pub fn with_scan_order(mut self, order: crate::r2rml::ScanOrder) -> Self {
+        self.scan_order = order;
+        self
     }
 
     /// Resolve the predicate IRI a pattern object variable is bound by.
@@ -1873,14 +1892,20 @@ impl Operator for FusedR2rmlAggregateOperator {
             }
         }
 
+        let scan_order = if ctx.deterministic_scans {
+            crate::r2rml::ScanOrder::Deterministic
+        } else {
+            self.scan_order
+        };
         let mut stream = table_provider
-            .scan_table(
+            .scan_table_ordered(
                 &resolved.pattern.graph_source_id,
                 &resolved.table_name,
                 &resolved.projection,
                 &resolved.scan_filters,
                 None,
                 as_of_t,
+                scan_order,
             )
             .await?;
 
@@ -1903,8 +1928,11 @@ impl Operator for FusedR2rmlAggregateOperator {
         let vfold = self.vector_fold;
         let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
         let mut group_accs: Vec<Vec<Acc>> = Vec::new();
-        let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
-            std::collections::HashMap::new();
+        // Fx, not std's per-instance random hasher: the groups are emitted in
+        // this map's iteration order, which a LIMIT/OFFSET over a GROUP BY with no
+        // ORDER BY pages through, so it must not vary between executions.
+        let mut groups: rustc_hash::FxHashMap<Vec<GKey>, Vec<Acc>> =
+            rustc_hash::FxHashMap::default();
         let mut overflowed = false;
         'scan: while let Some(batch) = stream.next().await {
             // Checkpoint per fused-aggregate scan batch (deadline + memory budget): a
@@ -2774,9 +2802,15 @@ impl FusedR2rmlAggregateOperator {
             let gs = &pattern.graph_source_id;
             let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
-            let mut s = table_provider
-                .scan_table(gs, &parent_table, &parent_proj, &[], None, as_of_t)
-                .await?;
+            let mut s = scan_for_lookup(
+                table_provider,
+                gs,
+                &parent_table,
+                &parent_proj,
+                &[],
+                as_of_t,
+            )
+            .await?;
             while let Some(batch) = s.next().await {
                 ctx.checkpoint()?;
                 let batch = batch?;
@@ -3862,9 +3896,15 @@ impl FusedR2rmlAggregateOperator {
         let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
             std::collections::HashMap::new();
         {
-            let mut s = table_provider
-                .scan_table(gs, &terminal_table, &terminal_proj, &[], None, as_of_t)
-                .await?;
+            let mut s = scan_for_lookup(
+                table_provider,
+                gs,
+                &terminal_table,
+                &terminal_proj,
+                &[],
+                as_of_t,
+            )
+            .await?;
             while let Some(batch) = s.next().await {
                 // Checkpoint the terminal-dim drain (deadline + memory budget): the
                 // FK→GKey `map` is fully retained to probe the fact scan, so a large dim
@@ -3950,9 +3990,8 @@ impl FusedR2rmlAggregateOperator {
             proj.dedup();
             let mut next_map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
-            let mut s = table_provider
-                .scan_table(gs, &inter_table, &proj, &[], None, as_of_t)
-                .await?;
+            let mut s =
+                scan_for_lookup(table_provider, gs, &inter_table, &proj, &[], as_of_t).await?;
             while let Some(batch) = s.next().await {
                 // Checkpoint the interior-dim drain (deadline + memory budget). This is
                 // the loop that builds the potentially multi-million-row interior FK→GKey
@@ -4121,9 +4160,10 @@ impl FusedR2rmlAggregateOperator {
     /// #1583: the membership *set* models an inner join only while each FK is
     /// single-valued (one fact row → at most one branch row per hop). A fan-out
     /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]). Relatedly, the keep-min
-    /// build DECLINES a same-key/same-subject SCD-2 collision whose rows disagree on the
-    /// constraint result or next-hop FK (id=3717339904) — keep-min alone would let scan
-    /// order decide the answer.
+    /// build DECLINES a same-key/same-subject SCD-2 collision on the keep-min subject
+    /// whose rows disagree on the constraint result or next-hop FK (id=3717339904) —
+    /// keep-min alone would let scan order decide the answer. Whether it declines does not
+    /// depend on the order a level's rows arrive in.
     async fn build_semi_join_membership(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -4279,9 +4319,7 @@ impl FusedR2rmlAggregateOperator {
             // key → keep-min(parent subject) row bookkeeping.
             let mut kept: std::collections::HashMap<Vec<String>, KeptChainRow> =
                 std::collections::HashMap::new();
-            let mut s = table_provider
-                .scan_table(gs, &table, &proj, &[], None, as_of_t)
-                .await?;
+            let mut s = scan_for_lookup(table_provider, gs, &table, &proj, &[], as_of_t).await?;
             while let Some(batch) = s.next().await {
                 // Bound the keep-min build: charge each new key + checkpoint per batch,
                 // so an oversized branch aborts typed before OOM (build_parent_lookup
@@ -4314,6 +4352,7 @@ impl FusedR2rmlAggregateOperator {
                                 subject,
                                 passes_own,
                                 next_fk,
+                                conflict: false,
                             });
                         }
                         Entry::Occupied(mut e) => {
@@ -4326,11 +4365,14 @@ impl FusedR2rmlAggregateOperator {
                             // subject, so it would keep whichever row the scan hit first —
                             // a scan-order-dependent ANSWER (the generic chained join
                             // materializes every version's triples; this fold tests one).
-                            // Decline to the generic path. An IDENTICAL duplicate (same
-                            // subject, same constraint result, same next FK) is benign.
+                            // Such a collision on the keep-min subject declines to the
+                            // generic path once the level is read (below); one on a larger
+                            // subject is discarded with that subject. An IDENTICAL
+                            // duplicate (same subject, same constraint result, same next
+                            // FK) is benign.
                             if subject == e.get().subject {
                                 if passes_own != e.get().passes_own || next_fk != e.get().next_fk {
-                                    return Ok(None);
+                                    e.get_mut().conflict = true;
                                 }
                             } else if subject_sort_key(&subject)
                                 < subject_sort_key(&e.get().subject)
@@ -4339,12 +4381,18 @@ impl FusedR2rmlAggregateOperator {
                                     subject,
                                     passes_own,
                                     next_fk,
+                                    conflict: false,
                                 });
                             }
                         }
                     }
                 }
                 ctx.record_alloc((kept.len() - kept_before) * crate::context::GROUP_EST_BYTES);
+            }
+            // Decided on the whole level, so the order its rows arrive in cannot
+            // change whether the fuse declines.
+            if kept.values().any(|k| k.conflict) {
+                return Ok(None);
             }
 
             // Reduce the kept (keep-min) rows to this level's admitted set.
@@ -8293,6 +8341,255 @@ mod tests {
         );
     }
 
+    /// The semi-join build reads each level in no particular order, so whether it
+    /// declines must not depend on the order a level's rows arrive in. `ORDER_KEY` 10
+    /// is held by three `order_t` rows: the keep-min subject `order/o10` (customer
+    /// 1000, Enterprise) and two rows minting `order/o50` that disagree on the
+    /// customer (1000 vs 1002). The collision is on a subject keep-min discards, so in
+    /// every arrival order the fuse keeps `o10` and answers as the clean fixture does;
+    /// when the colliding subject is the keep-min one (`o05`), every order declines.
+    #[tokio::test]
+    async fn p3_semijoin_decline_does_not_depend_on_row_order() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        fn order_t(rows: &[(&str, i64, i64)]) -> ColumnBatch {
+            mk_batch(vec![
+                scol("OID", 1, rows.iter().map(|r| r.0).collect()),
+                icol("ORDER_KEY", 2, rows.iter().map(|r| Some(r.1)).collect()),
+                icol("CUSTOMER_KEY", 3, rows.iter().map(|r| Some(r.2)).collect()),
+            ])
+        }
+        async fn fuses(batches: std::collections::HashMap<String, Vec<ColumnBatch>>) -> bool {
+            let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+            let pats = crt_patterns();
+            let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+            let provider = CrtProvider {
+                mapping: Arc::clone(&mapping),
+                batches,
+            };
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let ctx =
+                ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+            let star =
+                FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+                    .expect("crt_join_reorder must decompose");
+            crt_op()
+                .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+                .await
+                .expect("resolve must not error")
+                .is_some()
+        }
+        let others = [("o11", 11, 1000), ("o12", 12, 1001), ("o13", 13, 1002)];
+        let orders_of = |key10: [(&'static str, i64, i64); 3]| {
+            let mut runs = Vec::new();
+            for perm in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let rows: Vec<(&str, i64, i64)> = perm
+                    .iter()
+                    .map(|&i| key10[i])
+                    .chain(others.iter().copied())
+                    .collect();
+                runs.push(vec![order_t(&rows)]);
+                runs.push(rows.iter().map(|r| order_t(&[*r])).collect());
+            }
+            runs
+        };
+
+        let discarded = [("o50", 10, 1000), ("o50", 10, 1002), ("o10", 10, 1000)];
+        let expected = vec![
+            ("Gadgets".to_string(), long_sum(3)),
+            ("Widgets".to_string(), long_sum(12)),
+        ];
+        for order_batches in orders_of(discarded) {
+            let mut batches = clean_batches();
+            batches.insert("order_t".to_string(), order_batches);
+            let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), batches).await;
+            assert_eq!(out, expected, "a collision on a discarded subject");
+        }
+
+        let kept = [("o05", 10, 1000), ("o05", 10, 1002), ("o10", 10, 1000)];
+        for order_batches in orders_of(kept) {
+            let mut batches = clean_batches();
+            batches.insert("order_t".to_string(), order_batches);
+            assert!(
+                !fuses(batches).await,
+                "a collision on the keep-min subject declines in every order"
+            );
+        }
+    }
+
+    /// A dimension or semi-join level read folds into a map or set whose contents do
+    /// not depend on read order, so it asks for no order; the fact scan keeps the
+    /// order the operator owes. Covers the semi-join levels (`customer`, `order_t`),
+    /// the group-key terminal dimension (`product`) and a single-table ref group key's
+    /// parent (`customer` under `order_customer_mapping`).
+    #[tokio::test]
+    async fn dimension_reads_ask_for_no_order() {
+        use crate::r2rml::ScanOrder;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+
+        #[derive(Debug)]
+        struct Recorder<'p> {
+            inner: &'p CrtProvider,
+            reads: std::sync::Mutex<Vec<(String, Option<ScanOrder>)>>,
+        }
+        #[async_trait]
+        impl crate::r2rml::R2rmlProvider for Recorder<'_> {
+            async fn has_r2rml_mapping(&self, gs: &str) -> crate::error::Result<bool> {
+                self.inner.has_r2rml_mapping(gs).await
+            }
+            async fn compiled_mapping(
+                &self,
+                gs: &str,
+                t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                self.inner.compiled_mapping(gs, t).await
+            }
+        }
+        #[async_trait]
+        impl crate::r2rml::R2rmlTableProvider for Recorder<'_> {
+            async fn scan_table(
+                &self,
+                gs: &str,
+                table: &str,
+                p: &[String],
+                f: &[crate::r2rml::ScanFilter],
+                tk: Option<&crate::r2rml::ScanTopK>,
+                t: Option<i64>,
+            ) -> Result<crate::r2rml::ColumnBatchStream> {
+                self.reads.lock().unwrap().push((table.to_string(), None));
+                self.inner.scan_table(gs, table, p, f, tk, t).await
+            }
+            async fn scan_table_ordered(
+                &self,
+                gs: &str,
+                table: &str,
+                p: &[String],
+                f: &[crate::r2rml::ScanFilter],
+                tk: Option<&crate::r2rml::ScanTopK>,
+                t: Option<i64>,
+                order: ScanOrder,
+            ) -> Result<crate::r2rml::ColumnBatchStream> {
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push((table.to_string(), Some(order)));
+                self.inner.scan_table(gs, table, p, f, tk, t).await
+            }
+        }
+        fn orders_of(reads: &[(String, Option<ScanOrder>)], table: &str) -> Vec<Option<ScanOrder>> {
+            reads
+                .iter()
+                .filter(|(t, _)| t == table)
+                .map(|(_, o)| *o)
+                .collect()
+        }
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+
+        // The branching star: semi-join levels and the group-key dimension.
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let inner = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: clean_batches(),
+        };
+        let recorder = Recorder {
+            inner: &inner,
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&recorder, &recorder);
+        let pats = crt_patterns();
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+            .expect("crt_join_reorder must decompose");
+        let mut op = crt_op();
+        op.resolved = Some(
+            op.resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+                .await
+                .expect("resolve must not error")
+                .expect("crt_join_reorder must fuse"),
+        );
+        while op.next_batch(&ctx).await.expect("next_batch").is_some() {}
+        let reads = recorder.reads.lock().unwrap().clone();
+        for table in ["customer", "order_t", "product"] {
+            assert_eq!(
+                orders_of(&reads, table),
+                vec![Some(ScanOrder::Any)],
+                "{table}: {reads:?}"
+            );
+        }
+        assert_eq!(
+            orders_of(&reads, "order_line"),
+            vec![Some(ScanOrder::Deterministic)],
+            "the fact scan keeps its order: {reads:?}"
+        );
+
+        // A single-table GROUP BY on a reference: its parent's FK -> IRI map.
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            vec![mk_batch(vec![
+                icol("OID", 1, vec![Some(1), Some(2), Some(3)]),
+                icol("CFK", 2, vec![Some(7), Some(8), Some(7)]),
+            ])],
+        );
+        batches.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![icol("CID", 1, vec![Some(7), Some(8)])])],
+        );
+        let inner = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let recorder = Recorder {
+            inner: &inner,
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&recorder, &recorder);
+        let (o, c, cnt) = (VarId(0), VarId(1), VarId(20));
+        let mut fact = R2rmlPattern::new("gs", o, Some(c));
+        fact.triples_map_iri = Some("#Order".to_string());
+        fact.predicate_filter = Some("http://ex/custRef".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![c],
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+        op.open(&ctx).await.expect("open");
+        let mut groups = 0;
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            groups += batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+        }
+        assert_eq!(groups, 2, "one group per customer");
+        let reads = recorder.reads.lock().unwrap().clone();
+        assert_eq!(
+            orders_of(&reads, "customer"),
+            vec![Some(ScanOrder::Any)],
+            "the reference's parent: {reads:?}"
+        );
+        assert_eq!(
+            orders_of(&reads, "order"),
+            vec![Some(ScanOrder::Deterministic)],
+            "the fact scan keeps its order: {reads:?}"
+        );
+    }
+
     /// (a′) VALUE-IDENTITY, Dec i128 path: the same shape with an xsd:decimal measure
     /// folds through the exact i128 → BigDecimal accumulator. Quantities 5.25, 7.25,
     /// 3.50 (scale 2). Widgets = 5.25 + 7.25 = 12.50; Gadgets = 3.50. The reference is
@@ -9498,5 +9795,76 @@ mod tests {
             "two semi-join branches on the SAME dim table enforce independently: buyer=Enterprise \
              drops D4 (SMB buyer), seller=SMB drops D5 (Enterprise seller)"
         );
+    }
+
+    /// A GROUP BY with no ORDER BY emits its groups in the fold map's
+    /// iteration order, which a LIMIT/OFFSET pages through: it must be the same
+    /// on every execution over the same rows, on both fold paths. Fresh
+    /// operators fold the same 200 rows into 50 groups; every run emits the
+    /// groups in one order. (A per-instance random hasher gives a different
+    /// order per run.)
+    #[tokio::test]
+    async fn grouped_output_order_is_the_same_on_every_execution() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::PredicateMap;
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![TriplesMap::new("#T", "t")
+            .with_subject_template("http://ex/t/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/grp"),
+                object_map: ObjectMap::column("G"),
+            })]));
+        let groups: Vec<String> = (0..200).map(|i| format!("g{:02}", (i * 7) % 50)).collect();
+        let mut b = std::collections::HashMap::new();
+        b.insert(
+            "t".to_string(),
+            vec![mk_batch(vec![
+                icol("ID", 1, (0..200).map(Some).collect()),
+                scol("G", 2, groups.iter().map(String::as_str).collect()),
+            ])],
+        );
+        let (s, g, cnt) = (VarId(0), VarId(1), VarId(20));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        for vector_fold in [false, true] {
+            let mut runs: Vec<Vec<String>> = Vec::new();
+            for _ in 0..4 {
+                let mut pat = R2rmlPattern::new("gs", s, Some(g));
+                pat.triples_map_iri = Some("#T".to_string());
+                pat.predicate_filter = Some("http://ex/grp".to_string());
+                let plan = FusedAggregatePlan {
+                    graph_iri: Arc::from("gs"),
+                    inner_patterns: vec![Pattern::R2rml(pat)],
+                    filter: None,
+                    agg_binds: vec![],
+                    group_by: vec![g],
+                    aggregates: vec![(cnt, AggregateFn::CountAll)],
+                };
+                let provider = CrtProvider {
+                    mapping: Arc::clone(&mapping),
+                    batches: b.clone(),
+                };
+                let ctx = ExecutionContext::new(&snapshot, &vars)
+                    .with_r2rml_providers(&provider, &provider);
+                let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+                // Set the field, never the process env (see the bounding test).
+                op.vector_fold = vector_fold;
+                op.open(&ctx).await.expect("open");
+                assert!(!op.use_fallback, "vector_fold={vector_fold}: the fold ran");
+                let mut order = Vec::new();
+                while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+                    for binding in batch.column(g).expect("group column") {
+                        order.push(format!("{binding:?}"));
+                    }
+                }
+                assert_eq!(order.len(), 50, "vector_fold={vector_fold}: 50 groups");
+                runs.push(order);
+            }
+            assert!(
+                runs.windows(2).all(|w| w[0] == w[1]),
+                "vector_fold={vector_fold}: group order differs between runs"
+            );
+        }
     }
 }

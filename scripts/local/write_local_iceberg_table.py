@@ -10,6 +10,8 @@
   RETAINED. This is the shape of a healthy source that got ahead of its
   materialize job: the watermark still resolves, so the window is read
   incrementally, and it is too large to commit in one pass.
+- `silver.people_paged`: the same five 600-row appends again, read only by
+  the paging test, whose expected order is its data files' sizes.
 - `silver.amounts`: one snapshot of decimal columns for FILTER pushdown —
   `ratio` is `decimal(38,9)` (BigQuery's `NUMERIC`), with values on either
   side of 0.05 and 1.05 one grid step apart; `price` is `decimal(5,2)`, the
@@ -22,6 +24,34 @@
   timestamptz, binary, string, and numeric text), in two files, with values whose lexical order
   differs from their natural order, duplicates to group on, and a row that is
   null in every typed column.
+- `silver.versions`: two snapshots (one file each) of rows that do not all
+  yield a solution: the second file holds the top names, among them a row
+  whose `id` (the subject's only column) is null and a row whose `city` is
+  null, so a top-k that counted them would prune the first file, whose
+  `erin` belongs in the answer.
+- `silver.renamed`: two snapshots across a column rename: three rows with
+  `id`, `name`; then `name` renamed to `full_name`; then two more rows. A
+  read pinned to the first snapshot must find its rows under the current
+  name.
+- `silver.customers_history`: a history table for a filtered logical table
+  (`rr:sqlQuery ... WHERE is_current = 1 AND is_deleted = FALSE`), in two
+  files: customer ids repeat across versions, one current row is soft-deleted,
+  one row's `is_current` is null, and a non-current row holds the largest
+  balance, so a reader that ignored the filter would answer differently.
+- `silver.orders`: orders referencing `customers_history.customer_id`,
+  including a current customer, a deleted one, one with no current row, and a
+  dangling id.
+- `silver.versions`: two snapshots (one file each) of rows that do not all
+  yield a solution: the second file holds the top names, among them a row
+  whose `id` (the subject's only column) is null and a row whose `city` is
+  null, so a top-k that counted them would prune the first file, whose
+  `erin` belongs in the answer.
+- `silver.tombstones`: two snapshots for a materialize with a delete
+  convention and no ordering column. The first is a large file of 200,000
+  live revisions of subjects 1..=10 (`op` = "u"); the second a one-row file
+  holding subject 7's tombstone (`op` = "d"). Read in commit order the
+  tombstone comes last and retracts subject 7; read as the reads finish, the
+  small file tends to come first, and a later live row resurrects it.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -130,6 +160,21 @@ print("window snapshots:", [
     (s.snapshot_id, s.sequence_number, s.parent_snapshot_id, s.summary.get("added-records"))
     for s in sorted(window.snapshots(), key=lambda s: s.sequence_number)
 ])
+
+# ---------------------------------------------------------------------------
+# silver.people_paged: the same commits again, for the paging test alone.
+# ---------------------------------------------------------------------------
+paged = catalog.create_table("silver.people_paged", schema=schema)
+for c in range(COMMITS):
+    lo = c * ROWS_PER_COMMIT + 1
+    ids = list(range(lo, lo + ROWS_PER_COMMIT))
+    paged.append(pa.table({
+        "id": pa.array(ids, pa.int64()),
+        "name": pa.array([f"person-{i:04d}" for i in ids]),
+        "score": pa.array([float(i % 100) for i in ids], pa.float64()),
+        "active": pa.array([i % 2 == 0 for i in ids]),
+    }))
+print("paged table_location:", catalog.load_table("silver.people_paged").location())
 
 # ---------------------------------------------------------------------------
 # silver.amounts: decimal columns for FILTER pushdown.
@@ -244,3 +289,135 @@ cells.append(cells_batch(cells_rows[:4]))
 cells.append(cells_batch(cells_rows[4:]))
 cells = catalog.load_table("silver.cells")
 print("cells table_location:", cells.location())
+
+# ---------------------------------------------------------------------------
+# silver.renamed: a column renamed between two snapshots.
+# ---------------------------------------------------------------------------
+renamed = catalog.create_table("silver.renamed", schema=pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+]))
+renamed.append(pa.table({
+    "id": pa.array([1, 2, 3], pa.int64()),
+    "name": pa.array(["alice", "bob", "carol"]),
+}))
+with renamed.update_schema() as update:
+    update.rename_column("name", "full_name")
+renamed = catalog.load_table("silver.renamed")
+renamed.append(pa.table({
+    "id": pa.array([4, 5], pa.int64()),
+    "full_name": pa.array(["dave", "erin"]),
+}))
+renamed = catalog.load_table("silver.renamed")
+print("renamed table_location:", renamed.location())
+print("renamed snapshots:", [
+    (s.snapshot_id, s.sequence_number, s.schema_id)
+    for s in sorted(renamed.snapshots(), key=lambda s: s.sequence_number)
+])
+
+# ---------------------------------------------------------------------------
+# silver.customers_history + silver.orders: a filtered logical table and a
+# reference into it.
+# ---------------------------------------------------------------------------
+history_schema = pa.schema([
+    pa.field("customer_id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("valid_from", pa.date32()),
+    pa.field("is_current", pa.int32()),
+    pa.field("is_deleted", pa.bool_()),
+    pa.field("tier", pa.string()),
+    pa.field("balance", pa.decimal128(10, 2)),
+    pa.field("score", pa.float64()),
+])
+history = catalog.create_table("silver.customers_history", schema=history_schema)
+history_rows = [
+    # customer_id, name, valid_from, is_current, is_deleted, tier, balance, score
+    (1, "alice-v1", date(2024, 1, 1), 0, False, "gold", "10.00", 1.5),
+    (1, "alice", date(2024, 6, 1), 1, False, "gold", "25.50", 2.5),
+    (2, "bob-v1", date(2024, 1, 1), 0, False, "silver", "5.00", float("nan")),
+    (3, "carol", date(2024, 2, 1), 1, True, "bronze", "0.00", -0.0),
+    (2, "bob", date(2024, 7, 1), 1, False, "silver", "7.25", 9.0),
+    (4, "dave", date(2024, 3, 1), 1, False, None, "100.00", None),
+    (5, "erin-v1", date(2024, 1, 1), 0, False, "gold", "500.00", 3.0),
+    (5, "erin", date(2024, 8, 1), None, False, "gold", "2.00", 4.0),
+]
+
+def history_batch(rows):
+    col = lambda i: [r[i] for r in rows]
+    return pa.table({
+        "customer_id": pa.array(col(0), pa.int64()),
+        "name": pa.array(col(1)),
+        "valid_from": pa.array(col(2), pa.date32()),
+        "is_current": pa.array(col(3), pa.int32()),
+        "is_deleted": pa.array(col(4)),
+        "tier": pa.array(col(5)),
+        "balance": pa.array([Decimal(v) for v in col(6)], pa.decimal128(10, 2)),
+        "score": pa.array(col(7), pa.float64()),
+    }, schema=history_schema)
+
+history.append(history_batch(history_rows[:4]))
+history.append(history_batch(history_rows[4:]))
+history = catalog.load_table("silver.customers_history")
+print("customers_history table_location:", history.location())
+
+orders_schema = pa.schema([
+    pa.field("order_id", pa.int64()),
+    pa.field("customer_id", pa.int64()),
+    pa.field("total", pa.decimal128(10, 2)),
+])
+orders = catalog.create_table("silver.orders", schema=orders_schema)
+orders.append(pa.table({
+    "order_id": pa.array([100, 101, 102, 103, 104, 105], pa.int64()),
+    # 1, 2: current customers; 3: soft-deleted; 5: no current row; 99: dangling.
+    "customer_id": pa.array([1, 2, 3, 5, 1, 99], pa.int64()),
+    "total": pa.array([Decimal(v) for v in [
+        "9.99", "20.00", "5.00", "1.00", "3.50", "2.00",
+    ]], pa.decimal128(10, 2)),
+}, schema=orders_schema))
+orders = catalog.load_table("silver.orders")
+print("orders table_location:", orders.location())
+
+# ---------------------------------------------------------------------------
+# silver.versions: rows that yield no solution sorting above rows that do.
+# ---------------------------------------------------------------------------
+versions_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("city", pa.string()),
+])
+versions = catalog.create_table("silver.versions", schema=versions_schema)
+versions.append(pa.table({
+    "id": pa.array([1, 5], pa.int64()),
+    "name": pa.array(["alice", "erin"]),
+    "city": pa.array(["c1", "c5"]),
+}, schema=versions_schema))
+versions.append(pa.table({
+    "id": pa.array([2, 3, None, 6], pa.int64()),
+    "name": pa.array(["hank", "gina", "zed", "ivan"]),
+    "city": pa.array(["c2", "c3", "c0", None]),
+}, schema=versions_schema))
+versions = catalog.load_table("silver.versions")
+print("versions table_location:", versions.location())
+
+# ---------------------------------------------------------------------------
+# silver.tombstones: a tombstone committed after a large file of live rows.
+# ---------------------------------------------------------------------------
+tombstones_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("op", pa.string()),
+])
+tombstones = catalog.create_table("silver.tombstones", schema=tombstones_schema)
+live = 200_000
+tombstones.append(pa.table({
+    "id": pa.array([i % 10 + 1 for i in range(live)], pa.int64()),
+    "name": pa.array([f"name-{i % 1000}" for i in range(live)]),
+    "op": pa.array(["u"] * live),
+}, schema=tombstones_schema))
+tombstones.append(pa.table({
+    "id": pa.array([7], pa.int64()),
+    "name": pa.array([None], pa.string()),
+    "op": pa.array(["d"]),
+}, schema=tombstones_schema))
+tombstones = catalog.load_table("silver.tombstones")
+print("tombstones table_location:", tombstones.location())
