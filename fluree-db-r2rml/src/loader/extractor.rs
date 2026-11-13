@@ -136,12 +136,26 @@ impl<'a> MappingExtractor<'a> {
         if let Some(table_name) = self.find_object_optional(&table_triples, R2RML::TABLE_NAME) {
             if let Some(name) = self.term_to_string(&table_name) {
                 let normalized = LogicalTable::normalize_table_name(&name);
+                // An `rr:sqlQuery` map stands in for its table by an alias with
+                // this prefix, and every reader tells the two apart by it, so a
+                // table named that way would be read as a query's alias.
+                if LogicalTable::is_sql_query_alias(&normalized) {
+                    return Err(R2rmlError::InvalidValue {
+                        property: "rr:tableName".to_string(),
+                        message: format!(
+                            "\"{name}\" begins with \"{}\", which is reserved for the \
+                             aliases of rr:sqlQuery logical tables",
+                            crate::mapping::SQL_QUERY_ALIAS_PREFIX
+                        ),
+                    });
+                }
                 return Ok(LogicalTable::TableName(normalized));
             }
         }
 
-        // rr:sqlQuery — scanned as a derived table by SQL graph sources;
-        // Iceberg-backed sources refuse the alias at registration.
+        // rr:sqlQuery — scanned as a derived table by SQL graph sources, and
+        // evaluated in a restricted form by Iceberg sources; Delta sources
+        // refuse it.
         if let Some(query) = self.find_object_optional(&table_triples, R2RML::SQL_QUERY) {
             if let Some(sql) = self.term_to_string(&query) {
                 if sql.trim().is_empty() {

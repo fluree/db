@@ -623,7 +623,7 @@ pub struct TablePreview {
 
 /// Canonical Iceberg type string for a [`FieldType`], round-trippable through
 /// `FieldType::from_iceberg_type` (used for wire serialization of `field_type`).
-fn field_type_to_iceberg_string(field_type: FieldType) -> String {
+pub(super) fn field_type_to_iceberg_string(field_type: FieldType) -> String {
     match field_type {
         FieldType::Boolean => "boolean".to_string(),
         FieldType::Int32 => "int".to_string(),
@@ -883,6 +883,21 @@ pub(crate) async fn preview_iceberg_table_in(
     identity: &IdentityContext,
     cache: Option<&super::R2rmlCache>,
 ) -> Result<TablePreview> {
+    preview_iceberg_table_and_read_schema_in(conn, table, tier, identity, cache)
+        .await
+        .map(|(preview, _)| preview)
+}
+
+/// [`preview_iceberg_table_in`], with the schema an unpinned read of the
+/// table reads ([`unpinned_read_schema`](super::r2rml::unpinned_read_schema)),
+/// which the validate dry-run checks a row filter against as a read does.
+pub(crate) async fn preview_iceberg_table_and_read_schema_in(
+    conn: IcebergConnectionConfig,
+    table: TableIdentifier,
+    tier: StatsTier,
+    identity: &IdentityContext,
+    cache: Option<&super::R2rmlCache>,
+) -> Result<(TablePreview, Option<Schema>)> {
     let (catalog, _uri, _wh) = catalog_client(&conn, "table preview", identity).await?;
     let table_id = table.to_catalog();
 
@@ -911,6 +926,8 @@ pub(crate) async fn preview_iceberg_table_in(
     let allow_mor = preview_summary_guard_for(tier, metadata, &table_display)?;
 
     let mut schema = table_schema_from_metadata(&table, metadata)?;
+    let read_schema =
+        super::r2rml::unpinned_read_schema(metadata).map(std::borrow::Cow::into_owned);
 
     match tier {
         StatsTier::Schema => {
@@ -938,7 +955,7 @@ pub(crate) async fn preview_iceberg_table_in(
             if has_delete_files {
                 warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
             }
-            Ok(TablePreview {
+            let preview = TablePreview {
                 schema,
                 stats_completeness: StatsCompleteness {
                     tier: "schema".to_string(),
@@ -947,7 +964,8 @@ pub(crate) async fn preview_iceberg_table_in(
                     has_delete_files,
                 },
                 warnings,
-            })
+            };
+            Ok((preview, read_schema))
         }
         StatsTier::Stats => {
             let mut warnings = vec![DISTINCT_COUNT_WARNING.to_string()];
@@ -1032,7 +1050,7 @@ pub(crate) async fn preview_iceberg_table_in(
                 }
             };
 
-            Ok(TablePreview {
+            let preview = TablePreview {
                 schema,
                 stats_completeness: StatsCompleteness {
                     tier: "stats".to_string(),
@@ -1041,7 +1059,8 @@ pub(crate) async fn preview_iceberg_table_in(
                     has_delete_files,
                 },
                 warnings,
-            })
+            };
+            Ok((preview, read_schema))
         }
     }
 }

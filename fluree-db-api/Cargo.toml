@@ -211,6 +211,21 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# A triples map narrowed by a restricted rr:sqlQuery over the local Iceberg
+# fixtures, against a native oracle. Own binary: it flips the fast-path switch
+# and reads span-capture routing stamps.
+[[test]]
+name = "it_iceberg_filtered_logical_table"
+path = "tests/it_iceberg_filtered_logical_table.rs"
+required-features = ["iceberg", "native"]
+
+# Sub-selects over a local two-table Iceberg graph source, checked against a
+# native twin of the same rows. Own binary: it sets FLUREE_ICEBERG_LOCAL_ROOTS.
+[[test]]
+name = "it_iceberg_subselect"
+path = "tests/it_iceberg_subselect.rs"
+required-features = ["iceberg", "native"]
+
 # Routing canary for the fused R2RML aggregate on the local Iceberg fixture.
 # Own binary: it asserts the absence of a span-capture event.
 [[test]]

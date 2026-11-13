@@ -26,8 +26,9 @@ use fluree_db_iceberg::{
     },
     metadata::{SnapshotSelection, TableMetadata, WindowCap},
     scan::{
-        topk::{batch_sort_values, plan_topk_read, TopKBound},
-        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
+        topk::{batch_sort_values_where, plan_topk_read, TopKBound},
+        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan,
+        SendScanPlanner,
     },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
     DeleteConvention, IcebergGsConfig,
@@ -35,11 +36,12 @@ use fluree_db_iceberg::{
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue, SourceTime, TermOrder,
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanOrder,
+    ScanTopK, ScanValue, SourceTime, TermOrder,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn, Instrument};
 
@@ -148,6 +150,62 @@ pub(crate) fn catalog_answered(error: &QueryError) -> bool {
 const TABLE_NOT_FOUND_TEXT: &str = "Table not found: ";
 /// How the REST catalog client renders any other non-success HTTP status.
 const CATALOG_STATUS_TEXT: &str = "Catalog request failed (";
+
+/// A source's configuration as its nameservice record stores it: the JSON,
+/// which keys the shared catalog client and the caches that outlive a query,
+/// and its parsed form. Registration loads a source's tables from the
+/// configuration it is about to publish; a query, from the record.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceConfig<'c> {
+    pub(crate) json: &'c str,
+    pub(crate) iceberg: &'c IcebergGsConfig,
+}
+
+/// What loading a source's tables at registration found: the outcome
+/// reported to the caller, and the metadata of each table that loaded.
+pub(crate) struct TableProbe {
+    pub(crate) check: ConnectionCheck,
+    pub(crate) loaded: HashMap<String, Arc<TableMetadata>>,
+}
+
+/// Refuse a mapping an `rr:sqlQuery` map of which its `FROM` table refuses:
+/// [`check_query_map`](super::row_filter::check_query_map) against the schema
+/// an unpinned read of the table reads now. A table that did not load is
+/// left to the read, which checks again (as it does for every read, since a
+/// table can change after registration).
+fn check_query_maps_against_tables(
+    compiled: &CompiledR2rmlMapping,
+    loaded: &HashMap<String, Arc<TableMetadata>>,
+) -> Result<()> {
+    use super::row_filter::{check_query_map, query_maps};
+    for tm in query_maps(compiled) {
+        // Its checks that need no schema passed before anything was stored.
+        let Ok(Some(select)) = check_query_map(compiled, tm, None) else {
+            continue;
+        };
+        let Some(metadata) = loaded.get(&select.table) else {
+            continue;
+        };
+        let Some(schema) = unpinned_read_schema(metadata) else {
+            continue;
+        };
+        check_query_map(compiled, tm, Some(schema.as_ref()))
+            .map_err(|refusal| crate::ApiError::Config(refusal.message))?;
+    }
+    Ok(())
+}
+
+/// The schema an unpinned read of a table reads: its current snapshot's, under
+/// current column names, or the current schema when it has no snapshot.
+/// Registration and the validate dry-run check a row filter against it.
+pub(crate) fn unpinned_read_schema(
+    metadata: &TableMetadata,
+) -> Option<std::borrow::Cow<'_, fluree_db_iceberg::metadata::Schema>> {
+    match metadata.current_snapshot() {
+        Some(snapshot) => metadata.read_schema_for_snapshot(snapshot),
+        None => metadata.current_schema().map(std::borrow::Cow::Borrowed),
+    }
+}
 
 /// How long registration spends loading a new source's tables. A map request
 /// can sit behind a gateway with its own deadline (API Gateway's is 29 s), and a
@@ -275,13 +333,29 @@ pub(crate) fn source_resolved_config(
     })
 }
 
-/// An Iceberg-backed source scans tables, never queries: refuse a mapping with
+/// What a source family does with an `rr:sqlQuery` logical table, decided at
+/// registration so a mapping it cannot serve fails there, not at first query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlQueryPolicy {
+    /// The source's engine runs the query (a SQL graph source).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    Execute,
+    /// The source evaluates the restricted subset itself (Iceberg): one table
+    /// narrowed by a conjunction of column comparisons; see
+    /// [`super::row_filter`].
+    RestrictedSubset,
+    /// The source reads tables only (Delta).
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
+    Refuse,
+}
+
+/// A Delta-backed source scans tables, never queries: refuse a mapping with
 /// `rr:sqlQuery` at registration rather than at first query.
 pub(crate) fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
     if compiled.has_sql_queries() {
         return Err(crate::ApiError::Config(
-            "rr:sqlQuery logical tables are only supported by SQL graph sources; \
-             use rr:tableName for Iceberg-backed mappings"
+            "rr:sqlQuery logical tables are not supported by Delta graph sources; \
+             use rr:tableName"
                 .to_string(),
         ));
     }
@@ -1304,10 +1378,15 @@ impl crate::Fluree {
                 &graph_source_id,
                 &config.mapping,
                 config.mapping_media_type.as_deref(),
-                false,
+                SqlQueryPolicy::RestrictedSubset,
             )
             .await?;
-        let (triples_map_count, table_names, mapping_validated) = registered.summary();
+        let (triples_map_count, mut table_names, mapping_validated) = registered.summary();
+        // An `rr:sqlQuery` map reads its FROM table: report that, not the
+        // query's alias.
+        if let Some(compiled) = &registered.compiled {
+            table_names = crate::ledger_info::mapping_source_tables(compiled);
+        }
         let mapping_address = registered.address;
         let table_count = table_names.len();
 
@@ -1316,6 +1395,24 @@ impl crate::Fluree {
         let config_json = iceberg_config
             .to_json()
             .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
+
+        // Load the tables before publishing, from the configuration about to
+        // be published, so a row filter the live table refuses refuses the
+        // registration instead of every query's first read.
+        let probe = self
+            .probe_tables(
+                &graph_source_id,
+                SourceConfig {
+                    json: &config_json,
+                    iceberg: &iceberg_config,
+                },
+                &table_names,
+                config.iceberg.is_direct(),
+            )
+            .await;
+        if let Some(compiled) = &registered.compiled {
+            check_query_maps_against_tables(compiled, &probe.loaded)?;
+        }
 
         self.publisher()?
             .publish_graph_source(
@@ -1327,9 +1424,7 @@ impl crate::Fluree {
             )
             .await?;
 
-        let connection_check = self
-            .probe_tables(&graph_source_id, &table_names, config.iceberg.is_direct())
-            .await;
+        let connection_check = probe.check;
         let connection_tested = connection_check.is_verified();
 
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
@@ -1390,25 +1485,28 @@ impl crate::Fluree {
         }
     }
 
-    /// Load each table a just-published source reads, the way its queries do,
-    /// within [`REGISTRATION_PROBE_BUDGET`]. A failure or an expired budget is
-    /// logged and returned as the outcome, never as an error, so it cannot fail
-    /// registration.
+    /// Load each table a source about to be published reads, the way its
+    /// queries will, within [`REGISTRATION_PROBE_BUDGET`]. A failure or an
+    /// expired budget is logged and returned as the outcome, never as an
+    /// error, so it cannot fail registration. What did load is returned for
+    /// the checks that need a table's schema.
     async fn probe_tables(
         &self,
         graph_source_id: &str,
+        config: SourceConfig<'_>,
         table_names: &[String],
         direct: bool,
-    ) -> ConnectionCheck {
-        let check = self
+    ) -> TableProbe {
+        let probe = self
             .probe_tables_within(
                 graph_source_id,
+                config,
                 table_names,
                 direct,
                 REGISTRATION_PROBE_BUDGET,
             )
             .await;
-        match &check {
+        match &probe.check {
             ConnectionCheck::Verified => {}
             ConnectionCheck::NoTables => {
                 debug!(
@@ -1453,7 +1551,7 @@ impl crate::Fluree {
                 );
             }
         }
-        check
+        probe
     }
 
     /// Load each named table the way its queries do (`load_table_context`):
@@ -1467,12 +1565,12 @@ impl crate::Fluree {
     pub(crate) async fn probe_tables_within(
         &self,
         graph_source_id: &str,
+        config: SourceConfig<'_>,
         table_names: &[String],
         direct: bool,
         budget: std::time::Duration,
-    ) -> ConnectionCheck {
+    ) -> TableProbe {
         use futures::TryStreamExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         /// Catalog round trips in flight at once: a mapping over a warehouse
         /// can name dozens of tables, each its own `loadTable`.
         const CONCURRENT_LOADS: usize = 8;
@@ -1481,17 +1579,20 @@ impl crate::Fluree {
         // names one: a catalog source's own `table` is the placeholder that
         // only satisfies the identifier shape, never a table to load.
         if table_names.is_empty() {
-            return ConnectionCheck::NoTables;
+            return TableProbe {
+                check: ConnectionCheck::NoTables,
+                loaded: HashMap::new(),
+            };
         }
         let provider = FlureeR2rmlProvider::new(self);
-        let loaded = AtomicUsize::new(0);
+        let loaded = std::sync::Mutex::new(HashMap::new());
         let probe = async {
             // One catalog client for every load below. The client cache does
             // not coalesce concurrent misses, and each build hydrates the
             // auth's secrets, so loads that each found it cold would build
             // one apiece.
             provider
-                .warm_catalog_client(graph_source_id)
+                .warm_catalog_client(graph_source_id, config)
                 .await
                 .map_err(|error| ConnectionCheck::ClientFailed {
                     error: error.to_string(),
@@ -1500,8 +1601,8 @@ impl crate::Fluree {
                 .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
                     let (provider, loaded) = (&provider, &loaded);
                     async move {
-                        provider
-                            .load_table_context(graph_source_id, table)
+                        let context = provider
+                            .load_table_context_in(graph_source_id, config, table)
                             .await
                             .map_err(|error| {
                                 let (table, answered) = (table.clone(), catalog_answered(&error));
@@ -1512,21 +1613,29 @@ impl crate::Fluree {
                                     ConnectionCheck::CatalogUnreachable { table, error }
                                 }
                             })?;
-                        loaded.fetch_add(1, Ordering::Relaxed);
+                        loaded
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(table.clone(), context.metadata);
                         Ok(())
                     }
                 })
                 .await
         };
-        match tokio::time::timeout(budget, probe).await {
+        let outcome = tokio::time::timeout(budget, probe).await;
+        let loaded = loaded
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let check = match outcome {
             Ok(Ok(())) => ConnectionCheck::Verified,
             Ok(Err(failed)) => failed,
             Err(_elapsed) => ConnectionCheck::TimedOut {
-                loaded: loaded.load(Ordering::Relaxed),
+                loaded: loaded.len(),
                 total: table_names.len(),
                 budget_secs: budget.as_secs(),
             },
-        }
+        };
+        TableProbe { check, loaded }
     }
 
     /// Resolve a registration's mapping input to the address the record stores.
@@ -1534,14 +1643,14 @@ impl crate::Fluree {
     /// Inline content must compile and is written to the source's content
     /// store. An address is read and compiled when the backend can; one that
     /// cannot be read registers unvalidated (`compiled: None`) and fails at
-    /// query time instead. `allow_sql_queries` is false for sources that read
-    /// table files and cannot execute `rr:sqlQuery`.
+    /// query time instead. `sql_queries` says what the source does with an
+    /// `rr:sqlQuery` logical table.
     pub(crate) async fn register_r2rml_mapping(
         &self,
         graph_source_id: &str,
         input: &crate::graph_source::config::R2rmlMappingInput,
         media_type: Option<&str>,
-        allow_sql_queries: bool,
+        sql_queries: SqlQueryPolicy,
     ) -> Result<RegisteredMapping> {
         use crate::graph_source::config::R2rmlMappingInput;
         let check = |compiled: &CompiledR2rmlMapping| {
@@ -1549,10 +1658,13 @@ impl crate::Fluree {
             if compiled.is_empty() {
                 return Err(crate::ApiError::Config(EMPTY_MAPPING.to_string()));
             }
-            if allow_sql_queries {
-                Ok(())
-            } else {
-                reject_sql_queries(compiled)
+            match sql_queries {
+                SqlQueryPolicy::Execute => Ok(()),
+                SqlQueryPolicy::RestrictedSubset => {
+                    super::row_filter::check_restricted_queries(compiled)
+                        .map_err(crate::ApiError::Config)
+                }
+                SqlQueryPolicy::Refuse => reject_sql_queries(compiled),
             }
         };
         match input {
@@ -1694,6 +1806,11 @@ pub struct FlureeR2rmlProvider<'a> {
     /// consulted by every scan and count of the source. See
     /// [`R2rmlTableProvider::pin_source_time`].
     source_times: std::sync::Mutex<std::collections::HashMap<String, SourceTime>>,
+    /// Each `(graph source, logical table name)` this query has resolved to the
+    /// table it scans and the rows it keeps; see [`Self::logical_scan`].
+    logical_scans: std::sync::Mutex<
+        std::collections::HashMap<(String, String), super::row_filter::LogicalScan>,
+    >,
 }
 
 /// The snapshot a query reads for one table, and whether it is the table's
@@ -1735,7 +1852,45 @@ impl<'a> FlureeR2rmlProvider<'a> {
             fluree,
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
             source_times: std::sync::Mutex::new(std::collections::HashMap::new()),
+            logical_scans: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The table a triples map's logical table scans, and the rows of it the
+    /// map keeps: `table_name` is what
+    /// [`TriplesMap::table_name`](fluree_db_r2rml::mapping::TriplesMap::table_name)
+    /// returns, a table or an `rr:sqlQuery` alias. Every Iceberg read of a map's
+    /// rows resolves through here, so the snapshot pin, the caches and the
+    /// watermark are keyed by the real table, and no reader can scan the table
+    /// without the map's filter. Memoized per query.
+    pub(crate) async fn logical_scan(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<super::row_filter::LogicalScan> {
+        use super::row_filter::LogicalScan;
+        if !fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Ok(LogicalScan::table(table_name));
+        }
+        let key = (graph_source_id.to_string(), table_name.to_string());
+        let memoized = self
+            .logical_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        if let Some(scan) = memoized {
+            return Ok(scan);
+        }
+        let mapping = self.compiled_mapping(graph_source_id, None).await?;
+        let scan = LogicalScan::resolve(&mapping, table_name).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+        })?;
+        self.logical_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, scan.clone());
+        Ok(scan)
     }
 
     /// Pins are keyed by the normalized `name:branch` id; the R2RML operator
@@ -1892,6 +2047,15 @@ impl<'a> FlureeR2rmlProvider<'a> {
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<(Arc<IcebergStorageBackend>, Arc<TableMetadata>, String)> {
+        // The materialization reads here apply no row filter, so an
+        // `rr:sqlQuery` logical table must never reach them (the tracking
+        // materializer refuses such a mapping up front).
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::InvalidQuery(format!(
+                "Graph source '{graph_source_id}': rr:sqlQuery logical table '{table_name}' \
+                 cannot be read by an incremental or windowed scan, which applies no row filter"
+            )));
+        }
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -2079,7 +2243,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((storage, metadata, metadata_location))
     }
 
-    /// Stream a set of scan tasks as column batches, with bounded parallelism.
+    /// Stream a set of scan tasks as column batches, with bounded parallelism,
+    /// in the tasks' (commit) order (see [`read_files_in_order`]).
     ///
     /// Only `O(iceberg_scan_concurrency)` file decodes are resident at a time, so a
     /// consumer that processes and drops each batch never holds the whole table.
@@ -2100,30 +2265,19 @@ impl<'a> FlureeR2rmlProvider<'a> {
             concurrency, "streaming Parquet files (bounded parallel)"
         );
         let storage = Arc::clone(storage);
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
-                let storage = Arc::clone(&storage);
-                let footers = Arc::clone(&footers);
-                spawn_file_read(async move {
-                    let reader = SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
-                    reader.read_task(&task).await.map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read Parquet file '{}': {e}",
-                            task.data_file.file_path
-                        ))
-                    })
+        read_files_in_order(tasks, EmitOrder::AsListed, concurrency, move |task| {
+            let storage = Arc::clone(&storage);
+            let footers = Arc::clone(&footers);
+            async move {
+                let reader = SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                reader.read_task(&task).await.map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to read Parquet file '{}': {e}",
+                        task.data_file.file_path
+                    ))
                 })
-            })
-            .buffer_unordered(concurrency)
-            // One file's `Result<Vec<ColumnBatch>>` becomes individual
-            // `Result<ColumnBatch>` items; a read error becomes one error item.
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
-                }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-        Box::pin(stream)
+            }
+        })
     }
 
     /// Read a set of scan tasks into column batches with bounded parallelism.
@@ -2279,10 +2433,13 @@ impl<'a> FlureeR2rmlProvider<'a> {
                     table: snapshot_err_table.to_string(),
                     snapshot_id: to_snapshot_id,
                 })?;
+        // The mapping names columns as they are now: resolve them through the
+        // `to` snapshot's schema under current names, so a column renamed
+        // since `to` is still projected.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -2568,12 +2725,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
         let mut to_snapshot_id = to_snapshot.snapshot_id;
 
         // Schema AT the `to` snapshot (falls back to current when the snapshot
-        // carries no schema-id) — identical to current for an uncapped, unpinned
-        // read.
+        // carries no schema-id), under current column names: the mapping names
+        // columns as they are now, so a column renamed since `to` (a pinned or
+        // capped window) must still be projected. Identical to current for an
+        // uncapped, unpinned read.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -3071,7 +3230,32 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         projection: &[String],
         filters: &[ScanFilter],
         topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scan_table_ordered(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+            ScanOrder::Deterministic,
+        )
+        .await
+    }
+
+    /// [`Self::scan_table`] under `order`: a deterministic scan emits its files
+    /// smallest first; an [`ScanOrder::Any`] scan emits them as their reads
+    /// finish.
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // Time the whole scan SETUP (loadTable + planning) as one span; it closes
         // when the stream is constructed. Per-file Parquet decode happens later,
@@ -3091,6 +3275,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             filters,
             topk,
             _as_of_t,
+            order,
         )
         .instrument(span)
         .await
@@ -3216,11 +3401,18 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         // pinned table would issue a wasted `loadTable` GET. Collect OWNED names:
         // a `Vec<&str>` here makes the `buffered` fan-out closure take a borrowed
         // argument, which trips rustc's "FnOnce is not general enough" HRTB check.
+        // An `rr:sqlQuery` alias warms the table it scans; one that does not
+        // resolve is skipped (the scan reports why).
         let mut seen = std::collections::HashSet::new();
         let mut to_warm: Vec<String> = Vec::new();
         for t in table_names {
-            if seen.insert(t.as_str()) && !self.is_table_pinned(graph_source_id, t) {
-                to_warm.push(t.clone());
+            let Ok(scan) = self.logical_scan(graph_source_id, t).await else {
+                continue;
+            };
+            let t = scan.table;
+            if !seen.contains(&t) && !self.is_table_pinned(graph_source_id, &t) {
+                seen.insert(t.clone());
+                to_warm.push(t);
             }
         }
 
@@ -3424,37 +3616,6 @@ fn cached_metadata_serves_pin(pin: Option<SourceTime>, metadata: &TableMetadata)
     }
 }
 
-/// The schema a read of `snapshot` projects through: the snapshot's own schema,
-/// with every field the table still has carrying its current name. Iceberg
-/// reads by field id while the R2RML mapping names columns as they are now, so
-/// a column renamed since the snapshot still resolves, and one added since
-/// reads as absent, which it was. A field dropped since keeps its old name
-/// unless a current field has taken it.
-fn read_schema<'m>(
-    metadata: &'m TableMetadata,
-    snapshot: &fluree_db_iceberg::metadata::Snapshot,
-) -> Option<std::borrow::Cow<'m, fluree_db_iceberg::metadata::Schema>> {
-    use std::borrow::Cow;
-    let pinned = metadata.schema_for_snapshot(snapshot)?;
-    let Some(current) = metadata
-        .current_schema()
-        .filter(|current| current.schema_id != pinned.schema_id)
-    else {
-        return Some(Cow::Borrowed(pinned));
-    };
-    let mut schema = pinned.clone();
-    schema
-        .fields
-        .retain_mut(|field| match current.field(field.id) {
-            Some(now) => {
-                field.name.clone_from(&now.name);
-                true
-            }
-            None => current.field_by_name(&field.name).is_none(),
-        });
-    Some(Cow::Owned(schema))
-}
-
 /// The deferred builder of a table's store on the pointer rung: the same
 /// session-pin ladder as the eager arm ([`resolve_catalog_load_and_storage`]),
 /// run by the first read that misses every cache. A typed refusal is the
@@ -3631,6 +3792,18 @@ impl FlureeR2rmlProvider<'_> {
                 )
                 .await;
         }
+        // A filtered map counts the rows its filter keeps, which no manifest
+        // statistic knows: decline, and the caller counts them by scanning.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        if logical.is_filtered() {
+            tracing::Span::current().record("fired", false);
+            debug!(
+                table_name = %table_name,
+                "COUNT(*) manifest shortcut declined: the triples map filters its table"
+            );
+            return Ok(None);
+        }
+        let table_name = logical.table.as_str();
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
         // GREP: r2rml-as-of-t — `as_of_t` is a Fluree `t` and is ignored here as in
@@ -3651,10 +3824,15 @@ impl FlureeR2rmlProvider<'_> {
             return Ok(None);
         };
         let snapshot = selected.snapshot;
-        let Some(schema) = read_schema(&metadata, snapshot) else {
+        let Some(schema) = metadata.read_schema_for_snapshot(snapshot) else {
             return Ok(None);
         };
         let schema = schema.as_ref();
+        // An unfiltered `rr:sqlQuery` still names columns; refuse one the table
+        // lacks here as the scan does.
+        logical.row_filter(schema).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+        })?;
         let cache_key = snapshot_cache_key(&metadata_location, selected);
 
         // Manifest-only read (never a Parquet/data file): the live data files, and
@@ -3850,32 +4028,14 @@ impl FlureeR2rmlProvider<'_> {
 
     /// Build (or find cached) the shared catalog client a source's table loads
     /// use, so loads issued together share one. A Direct source has none.
-    async fn warm_catalog_client(&self, graph_source_id: &str) -> QueryResult<()> {
-        let record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
+    async fn warm_catalog_client(
+        &self,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+    ) -> QueryResult<()> {
+        shared_catalog_client(self.fluree, graph_source_id, config.json, config.iceberg)
             .await
-            .map_err(|e| QueryError::Nameservice(e.to_string()))?
-            // A drop leaves the record as a tombstone.
-            .filter(|record| !record.retracted)
-            .ok_or_else(|| {
-                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
-            })?;
-        require_iceberg_backed(&record, graph_source_id)?;
-        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
-            QueryError::Internal(format!(
-                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
-            ))
-        })?;
-        shared_catalog_client(
-            self.fluree,
-            graph_source_id,
-            &record.config,
-            &iceberg_config,
-        )
-        .await
-        .map(drop)
+            .map(drop)
     }
 
     async fn load_table_context(
@@ -3883,12 +4043,6 @@ impl FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<TableContext> {
-        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
-            return Err(QueryError::InvalidQuery(format!(
-                "Graph source '{graph_source_id}': rr:sqlQuery logical tables are only \
-                 supported by SQL graph sources"
-            )));
-        }
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -3909,6 +4063,32 @@ impl FlureeR2rmlProvider<'_> {
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
             ))
         })?;
+        let config = SourceConfig {
+            json: &record.config,
+            iceberg: &iceberg_config,
+        };
+        self.load_table_context_in(graph_source_id, config, table_name)
+            .await
+    }
+
+    /// [`Self::load_table_context`] for a source whose configuration is
+    /// `config`, published or not: registration loads a source's tables
+    /// before publishing it, the way its queries will.
+    async fn load_table_context_in(
+        &self,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+        table_name: &str,
+    ) -> QueryResult<TableContext> {
+        // Callers resolve a logical table first (`logical_scan`): an alias here
+        // would read the table without the map's row filter.
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::Internal(format!(
+                "Graph source '{graph_source_id}': rr:sqlQuery logical table '{table_name}' \
+                 reached the table loader unresolved"
+            )));
+        }
+        let (record_config, iceberg_config) = (config.json, config.iceberg);
 
         // Validate the config
         iceberg_config.validate().map_err(|e| {
@@ -3949,7 +4129,7 @@ impl FlureeR2rmlProvider<'_> {
             &table_id.namespace,
             &table_id.table,
         );
-        let xq_key = cross_query_key(&lt_key, &record.config, self.fluree.identity_context());
+        let xq_key = cross_query_key(&lt_key, record_config, self.fluree.identity_context());
         let disk = self.catalog_disk_cache();
         let source_time = self.source_time(graph_source_id);
         let catalog_label = iceberg_config.catalog.catalog_label().to_string();
@@ -3970,7 +4150,7 @@ impl FlureeR2rmlProvider<'_> {
                 // The storage decision comes first: the policy applies and a
                 // Google identity is proven before anything cached is served, and
                 // its scope is what every cache below is keyed by.
-                let plan = plan_for(self.fluree, &iceberg_config, &loc).await?;
+                let plan = plan_for(self.fluree, iceberg_config, &loc).await?;
                 let cached = self
                     .metadata_from_caches(plan.scope(), &loc)
                     .await
@@ -3992,8 +4172,8 @@ impl FlureeR2rmlProvider<'_> {
                     let catalog = shared_catalog_client(
                         self.fluree,
                         graph_source_id,
-                        &record.config,
-                        &iceberg_config,
+                        record_config,
+                        iceberg_config,
                     )
                     .await?
                     .expect("a non-Direct source has a catalog client");
@@ -4040,8 +4220,8 @@ impl FlureeR2rmlProvider<'_> {
                 let catalog = shared_catalog_client(
                     self.fluree,
                     graph_source_id,
-                    &record.config,
-                    &iceberg_config,
+                    record_config,
+                    iceberg_config,
                 )
                 .await?
                 .expect("a non-Direct source has a catalog client");
@@ -4145,7 +4325,7 @@ impl FlureeR2rmlProvider<'_> {
                 // `session_storage`).
                 let plan = plan_for(
                     self.fluree,
-                    &iceberg_config,
+                    iceberg_config,
                     &load_response.metadata_location,
                 )
                 .await?;
@@ -4168,7 +4348,7 @@ impl FlureeR2rmlProvider<'_> {
 
                 // One storage decision for the whole Direct table (the root and the
                 // table beneath it share a scheme and bucket).
-                let plan = plan_for(self.fluree, &iceberg_config, table_location).await?;
+                let plan = plan_for(self.fluree, iceberg_config, table_location).await?;
 
                 // Warehouse-root resolution: when `table_location` is a warehouse
                 // ROOT (a catalog-less multi-table copy) rather than a single
@@ -4307,6 +4487,7 @@ impl FlureeR2rmlProvider<'_> {
     /// resolution (and its per-query snapshot pin) lives in
     /// [`Self::load_table_context`]; this adds the scan-only concerns — the
     /// scan-start log and the Parquet disk cache — and the streaming scan plan.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_table_inner(
         &self,
         graph_source_id: &str,
@@ -4315,6 +4496,7 @@ impl FlureeR2rmlProvider<'_> {
         filters: &[ScanFilter],
         topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // GREP: r2rml-as-of-t — `_as_of_t` is a Fluree `t`, which names no Iceberg
         // state; it is ignored. A time-pinned read arrives as this query's
@@ -4344,10 +4526,17 @@ impl FlureeR2rmlProvider<'_> {
                 )
                 .await;
         }
+        // An `rr:sqlQuery` logical table scans its FROM table, narrowed by its
+        // WHERE. From here on `table_name` is the real table, so the snapshot
+        // pin, the caches and the build watermark are keyed by it: two maps
+        // over one table read one snapshot.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
         info!(
             graph_source_id = %graph_source_id,
             table_name = %table_name,
             projection = ?projection,
+            filtered = logical.is_filtered(),
             "Starting Iceberg table scan"
         );
 
@@ -4382,8 +4571,16 @@ impl FlureeR2rmlProvider<'_> {
             },
         );
 
-        // A table that has never committed has no files to read.
+        // A table that has never committed has no files to read. Its map's
+        // row filter still has to type against the table, as registration
+        // and the validate dry-run checked it: an empty table is no reason to
+        // accept a filter that every later read would refuse.
         let Some(selected) = selected else {
+            if let Some(schema) = metadata.current_schema() {
+                logical.row_filter(schema).map_err(|e| {
+                    QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+                })?;
+            }
             info!("Table has no snapshots - returning empty result");
             return Ok(empty_batch_stream());
         };
@@ -4403,7 +4600,8 @@ impl FlureeR2rmlProvider<'_> {
 
         // The schema at the snapshot being read (current for an unpinned read),
         // under current column names.
-        let schema = read_schema(&metadata, snapshot)
+        let schema = metadata
+            .read_schema_for_snapshot(snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
         let schema = schema.as_ref();
 
@@ -4414,8 +4612,15 @@ impl FlureeR2rmlProvider<'_> {
             "Parsed table metadata"
         );
 
+        // The map's row filter, typed against the schema of the snapshot being
+        // read. A column or literal it cannot decide exactly is refused, never
+        // skipped: unlike a pushed query FILTER, nothing re-checks these rows.
+        let row_filter = logical.row_filter(schema).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+        })?;
+
         // Resolve column names to field IDs for projection
-        let projected_field_ids: Vec<i32> = if projection.is_empty() {
+        let mut projected_field_ids: Vec<i32> = if projection.is_empty() {
             schema
                 .fields
                 .iter()
@@ -4436,128 +4641,90 @@ impl FlureeR2rmlProvider<'_> {
                 schema.field_names()
             )));
         }
-
-        let schema_arc = Arc::new(schema.clone());
+        // The reader enforces the row filter on decoded columns, so it decodes
+        // every column the filter tests, whether or not a term map reads it.
+        if let Some(filter) = &row_filter {
+            for id in filter.field_ids() {
+                if !projected_field_ids.contains(&id) {
+                    projected_field_ids.push(id);
+                }
+            }
+        }
 
         // Build an Iceberg pushdown predicate for file pruning. Filters resolve
         // to fields by name; unknown fields are skipped (conservative).
         let filter_expr = build_iceberg_filter(filters, schema);
+        let mut scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
+        if let Some(filter) = filter_expr {
+            scan_config = scan_config.with_filter(filter);
+        }
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
 
-        // Reuse manifest-derived file selections across repeated scans of the
-        // same snapshot. Projection still varies per scan, so we rebuild tasks.
-        // The scan-files cache holds one snapshot's unfiltered file list, so it
-        // is bypassed when a pushdown filter is present (different filter → a
-        // different pruned file set).
-        let rebuild_tasks = |files: &CachedScanFiles| {
-            files
-                .data_files
-                .iter()
-                .cloned()
-                .map(|data_file| {
-                    FileScanTask::for_whole_file_with_schema(
-                        data_file,
-                        projected_field_ids.clone(),
-                        None,
-                        Arc::clone(&schema_arc),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let (tasks, files_selected, files_pruned, estimated_row_count) = if let Some(filter) =
-            &filter_expr
-        {
-            let scan_config = ScanConfig::new()
-                .with_projection(projected_field_ids.clone())
-                .with_filter(filter.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan_for_snapshot(snapshot)
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-            (
-                plan.tasks,
-                plan.files_selected,
-                plan.files_pruned,
-                plan.estimated_row_count,
-            )
-        } else if let Some(cached) = cache.get_scan_files(&scope, &cache_key).await {
-            // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
-            // without calling the guarded plan_scan, so re-check the delete flag.
-            guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
+        // A snapshot's live file list never changes, so it is read from the
+        // manifests once and kept: in memory, and in the disk catalog cache for
+        // later processes. Whatever this scan's filter, the list kept is the
+        // whole unfiltered one, and every scan of the snapshot plans from it in
+        // memory (`plan_from_files` prunes it with the same file test the
+        // manifest walk uses, and re-applies the merge-on-read refusal).
+        let plan = if let Some(cached) = cache.get_scan_files(&scope, &cache_key).await {
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = cached.data_files.len(),
                 "Iceberg scan-files cache hit"
             );
-            (
-                rebuild_tasks(&cached),
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
+            planner
+                .plan_from_files(snapshot, cached.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?
         } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&scope, &cache_key) {
-            // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
-            // scan-files entry survives restarts, so a delete-bearing list cached
-            // under the override by an earlier process must be re-checked before it
-            // is served or promoted into the in-memory cache. Pre-guard (v2) entries
-            // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
-            // entry written under the override.
-            guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
             // PR-8 slice 2: in-memory miss, but the persistent disk catalog
-            // cache has this snapshot's (unfiltered) file list — a warm-catalog
-            // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
-            // tasks from the file list exactly as the in-memory-hit arm does, and
-            // populate the in-memory cache for the rest of the process.
+            // cache has this snapshot's file list — a warm-catalog cold process
+            // skips the manifest read. The plan re-applies the merge-on-read
+            // refusal (F-AUD-1, the cross-process case: an entry written under
+            // the override by an earlier process) before the list is promoted
+            // into the in-memory cache.
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = disk.data_files.len(),
                 "Iceberg scan-files disk-cache hit"
             );
-            cache
-                .put_scan_files(&scope, &cache_key, Arc::clone(&disk))
-                .await;
-            (
-                rebuild_tasks(&disk),
-                disk.files_selected,
-                disk.files_pruned,
-                disk.estimated_row_count,
-            )
+            let plan = planner
+                .plan_from_files(snapshot, disk.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            cache.put_scan_files(&scope, &cache_key, disk).await;
+            plan
         } else {
             debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
-
-            // Create scan configuration with projection for the first plan.
-            let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan_for_snapshot(snapshot)
+            let (plan, files) = planner
+                .plan_scan_for_snapshot_retaining_files(snapshot)
                 .await
                 .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            let cached = Arc::new(CachedScanFiles::new(files, plan.has_delete_manifests));
+            // Persist to the disk catalog cache (content-addressed, immutable),
+            // also when the list is too large for the in-memory cache. Written
+            // off this query's path: thousands of files are megabytes of JSON.
+            self.catalog_disk_cache().put_scan_files_in_background(
+                scope.clone(),
+                cache_key.clone(),
+                Arc::clone(&cached),
+            );
+            cache.put_scan_files(&scope, &cache_key, cached).await;
+            plan
+        };
+        let ScanPlan {
+            tasks,
+            files_selected,
+            files_pruned,
+            estimated_row_count,
+            ..
+        } = plan;
 
-            let cached = Arc::new(CachedScanFiles {
-                data_files: Arc::new(
-                    plan.tasks
-                        .iter()
-                        .map(|task| task.data_file.clone())
-                        .collect(),
-                ),
-                estimated_row_count: plan.estimated_row_count,
-                files_selected: plan.files_selected,
-                files_pruned: plan.files_pruned,
-                has_delete_manifests: plan.has_delete_manifests,
-            });
-            // Persist to the disk catalog cache (content-addressed, immutable).
-            self.catalog_disk_cache()
-                .put_scan_files(&scope, &cache_key, &cached);
-            cache
-                .put_scan_files(&scope, &cache_key, Arc::clone(&cached))
-                .await;
-
-            (
-                plan.tasks,
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
+        let (tasks, files_selected, files_pruned) = match &row_filter {
+            None => (tasks, files_selected, files_pruned),
+            Some(filter) => {
+                let tasks = narrow_to_row_filter(tasks, filter, schema);
+                let pruned = files_selected - tasks.len();
+                (tasks, files_selected - pruned, files_pruned + pruned)
+            }
         };
 
         info!(
@@ -4573,7 +4740,9 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         // Read data files with bounded parallelism, streaming each file's batches
-        // to the consumer as the worker completes. Concurrency is capped (see
+        // to the consumer in a fixed order (`read_files_in_order`: an unordered
+        // query answers the same rows in the same order every time, so LIMIT /
+        // OFFSET pages partition its answer). Concurrency is capped (see
         // `iceberg_scan_concurrency`) so only O(concurrency) file decodes are
         // resident — the consumer (R2rmlScanOperator) materializes and aggregates
         // incrementally instead of the whole table being collected here.
@@ -4601,11 +4770,20 @@ impl FlureeR2rmlProvider<'_> {
             // top-k is always correct — the `SortOperator` above is authoritative).
             // The bounds must sort as the terms do: a string column's "9" bound
             // sits above its "100", an integer column's 10 above its 9.
+            // The bound counts only rows that yield a solution: a row with a
+            // NULL in a column the solution needs is dropped after the scan.
+            // A required column this table lacks declines the directive.
+            let required_ids: Option<Vec<i32>> = tk
+                .required_columns
+                .iter()
+                .map(|name| schema.field_by_name(name).map(|f| f.id))
+                .collect();
             let admitted = schema
                 .field_by_name(&tk.sort_column)
                 .filter(|field| !tk.ascending || field.required)
-                .filter(|field| bound_order(field.type_string()) == Some(tk.order));
-            if let Some(field) = admitted {
+                .filter(|field| bound_order(field.type_string()) == Some(tk.order))
+                .zip(required_ids);
+            if let Some((field, required_ids)) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
                 let order = plan_topk_read(
@@ -4655,15 +4833,18 @@ impl FlureeR2rmlProvider<'_> {
                         )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
-                    // rows this scan EMITS — which are the QUALIFYING result rows
-                    // (post any pushed row filter). The directive is declined
-                    // upstream (`resolve_topk_directive`) whenever a RESIDUAL filter
-                    // the operator enforces after this scan is present, because
-                    // feeding pre-filter values would ride the k-th bound too high
-                    // and prune files whose qualifying rows belong in the true
-                    // top-k. Never feed a superset of the qualifying rows here.
+                    // rows this scan EMITS that yield a result row, which must be
+                    // exactly the QUALIFYING result rows. Rows with a NULL in a
+                    // `required_columns` column mint no solution and are not fed.
+                    // The directive is declined upstream whenever a row could
+                    // still be dropped otherwise: a residual filter, a join with
+                    // the child on a shared variable, any pushed filter (which
+                    // this reader may apply only partly), or a star member no
+                    // column decides. Feeding
+                    // those rows would ride the k-th bound too high and prune
+                    // files whose qualifying rows belong in the true top-k.
                     for b in &batches {
-                        bound.observe_all(batch_sort_values(b, sort_field_id));
+                        bound.observe_all(batch_sort_values_where(b, sort_field_id, &required_ids));
                     }
                     collected.extend(batches);
                     reads += 1;
@@ -4704,10 +4885,11 @@ impl FlureeR2rmlProvider<'_> {
                     return Ok(Box::pin(prefix));
                 }
                 // Parallel fallback tail (same bounded-parallel read as the normal
-                // path). The bound still holds; we just stop paying sequentiality.
+                // path, still in best-first order). The bound still holds; we just
+                // stop paying sequentiality.
                 let concurrency = iceberg_scan_concurrency(tail.len());
-                let tail_stream = futures::stream::iter(tail)
-                    .map(move |task| {
+                let tail_stream =
+                    read_files_in_order(tail, EmitOrder::AsListed, concurrency, move |task| {
                         let storage = Arc::clone(&storage);
                         let footers = Arc::clone(&footers);
                         let disk_cache = Arc::clone(&disk_cache);
@@ -4718,7 +4900,7 @@ impl FlureeR2rmlProvider<'_> {
                             path = %task.data_file.file_path,
                             file_size = task.data_file.file_size_in_bytes,
                         );
-                        spawn_file_read(async move {
+                        async move {
                             let reader = SendParquetReader::with_caches(
                                 storage.as_ref(),
                                 footers.as_ref(),
@@ -4739,14 +4921,7 @@ impl FlureeR2rmlProvider<'_> {
                                         e,
                                     )
                                 })
-                        })
-                    })
-                    .buffer_unordered(concurrency)
-                    .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                        Ok(batches) => {
-                            futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
                         }
-                        Err(e) => futures::stream::iter(vec![Err(e)]),
                     });
                 return Ok(Box::pin(prefix.chain(tail_stream)));
             }
@@ -4767,26 +4942,29 @@ impl FlureeR2rmlProvider<'_> {
             concurrency, rowgroup_concurrency, "streaming Parquet files (bounded parallel)"
         );
 
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
+        Ok(read_files_in_order(
+            tasks,
+            EmitOrder::for_query(order),
+            concurrency,
+            move |task| {
                 let storage = Arc::clone(&storage);
                 let footers = Arc::clone(&footers);
                 let disk_cache = Arc::clone(&disk_cache);
                 let cache_dir = cache_dir.clone();
                 let scope = scope.clone();
-                // Create the per-file span HERE, before `tokio::spawn`, so it is
+                // Create the per-file span HERE, before the read is spawned, so it is
                 // parented under the consumer's current span: `tokio::spawn` does
                 // NOT propagate the current span into the spawned task, but a span
                 // records its parent at creation time. Instrumenting the read
                 // future inside the task then times the actual read+decode while
                 // keeping the correct parent (and gives each concurrent read a
-                // distinct span, respecting the `buffer_unordered` fan-out).
+                // distinct span).
                 let read_span = tracing::debug_span!(
                     "iceberg.parquet_read",
                     path = %task.data_file.file_path,
                     file_size = task.data_file.file_size_in_bytes,
                 );
-                spawn_file_read(async move {
+                async move {
                     let reader = SendParquetReader::with_caches(
                         storage.as_ref(),
                         footers.as_ref(),
@@ -4808,20 +4986,35 @@ impl FlureeR2rmlProvider<'_> {
                                 e,
                             )
                         })
-                })
-            })
-            .buffer_unordered(concurrency)
-            // Flatten each file's `Result<Vec<ColumnBatch>>` into individual
-            // `Result<ColumnBatch>` items; a read error becomes one error item.
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
                 }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-
-        Ok(Box::pin(stream))
+            },
+        ))
     }
+}
+
+/// Narrow a planned scan to a triples map's row filter: drop each file whose
+/// statistics prove no row passes, and make the reader enforce the filter on
+/// every row of the rest.
+///
+/// Applied to whatever the planning arms produced, the scan-files cache hits
+/// included, so a filtered map keeps the cached file list (the filter is fixed
+/// per map; re-planning from manifests on every query would cost a manifest
+/// read for no change in the answer).
+pub(crate) fn narrow_to_row_filter(
+    tasks: Vec<FileScanTask>,
+    filter: &fluree_db_iceberg::scan::ExactRowFilter,
+    schema: &fluree_db_iceberg::metadata::Schema,
+) -> Vec<FileScanTask> {
+    let expr = filter.pruning_expression();
+    tasks
+        .into_iter()
+        .filter(|task| {
+            expr.as_ref().is_none_or(|expr| {
+                fluree_db_iceberg::scan::can_contain_file(expr, &task.data_file, schema)
+            })
+        })
+        .map(|task| task.with_exact_filter(Some(filter.clone())))
+        .collect()
 }
 
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
@@ -4829,21 +5022,98 @@ fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
 }
 
-/// Re-apply the fail-closed merge-on-read guard (audit F-AUD-1) to a cached
-/// scan-files selection. A scan-files cache HIT (in-memory or persistent disk)
-/// rebuilds tasks WITHOUT calling the guarded `plan_scan`, so a delete-bearing
-/// file list — which is only ever cacheable when the guard was overridden at plan
-/// time — must be re-checked here in case the override is now off. Cheap: the flag
-/// rides on the cache entry, no manifest re-read. Shared by both hit arms so the
-/// check cannot drift between them.
-fn guard_cached_scan_files(has_delete_manifests: bool, metadata_location: &str) -> QueryResult<()> {
-    let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
-    fluree_db_iceberg::ensure_no_delete_manifests(
-        usize::from(has_delete_manifests),
-        metadata_location,
-        allow_mor,
+/// The order a scan emits its data files in.
+///
+/// `AsListed` and `SmallestFirst` are total orders over one snapshot's plan, so
+/// two executions of one query emit the same rows in the same order whatever
+/// order the reads finish in: a client paging an unordered answer with
+/// LIMIT/OFFSET neither skips nor repeats a row. `Completion` is for a query
+/// with no slice, which cannot observe the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitOrder {
+    /// The order the caller lists the files in: the planner's (commit
+    /// sequence, then path), which a resumable materialize read depends on, or
+    /// the top-k read's best-first order.
+    AsListed,
+    /// Smallest data file first (the manifest's `file_size_in_bytes`), ties in
+    /// listed order: a deterministic query scan. The file at the head of the
+    /// read window is the cheapest to read, so a LIMIT is answered from small
+    /// files and a large file never holds back the files behind it for long.
+    SmallestFirst,
+    /// Each file as its read finishes. Varies from run to run with I/O timing;
+    /// only for a query with no LIMIT or OFFSET (`ScanOrder::Any`).
+    Completion,
+}
+
+impl EmitOrder {
+    /// The order a query scan emits in for the `ScanOrder` the query owes it.
+    pub(crate) fn for_query(order: ScanOrder) -> Self {
+        match order {
+            ScanOrder::Deterministic => Self::SmallestFirst,
+            ScanOrder::Any => Self::Completion,
+        }
+    }
+}
+
+/// Read a scan's data files with up to `concurrency` reads in flight, and emit
+/// each file's batches in `order`.
+///
+/// Every Iceberg scan that emits rows reads its files through here. In a fixed
+/// order (`AsListed`, `SmallestFirst`), a read that finishes ahead of the
+/// earliest pending one holds its slot until that one is emitted (head-of-line
+/// blocking), so resident decodes stay bounded by `concurrency` either way.
+///
+/// `read` builds one file's read; it runs on its own task, so up to
+/// `concurrency` reads progress in parallel while the consumer drains them.
+/// Dropping the stream aborts the reads in flight ([`spawn_file_read`]), so a
+/// scan dropped early (its LIMIT is met, or the query is cancelled) leaves no
+/// read running to the end of its file.
+pub(crate) fn read_files_in_order<R, Fut>(
+    mut tasks: Vec<FileScanTask>,
+    order: EmitOrder,
+    concurrency: usize,
+    read: R,
+) -> ColumnBatchStream
+where
+    R: Fn(FileScanTask) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + 'static,
+{
+    match order {
+        EmitOrder::AsListed | EmitOrder::Completion => {}
+        // Stable: equal sizes keep the listed order.
+        EmitOrder::SmallestFirst => tasks.sort_by_key(|t| t.data_file.file_size_in_bytes),
+    }
+    // Each file's read is built here, when the window admits the file (so its
+    // span is parented under the consumer's), and spawned on its first poll;
+    // both combinators below poll every admitted file, so the reads behind the
+    // earliest one run meanwhile. This is the shape the scan had before it
+    // took an order. (Spawning eagerly as the stream is pulled raised peak RSS
+    // under glibc malloc on a decode-bound COUNT.) The mutex only makes the
+    // pending read `Sync`, as the stream must be; it is never contended.
+    let reads = futures::stream::iter(tasks).map(move |task| {
+        let read = std::sync::Mutex::new(read(task));
+        async move {
+            let read = read
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            spawn_file_read(read).await
+        }
+    });
+    let concurrency = concurrency.max(1);
+    let files: std::pin::Pin<
+        Box<dyn futures::Stream<Item = QueryResult<Vec<ColumnBatch>>> + Send + Sync>,
+    > = match order {
+        EmitOrder::AsListed | EmitOrder::SmallestFirst => Box::pin(reads.buffered(concurrency)),
+        EmitOrder::Completion => Box::pin(reads.buffer_unordered(concurrency)),
+    };
+    // One file's `Result<Vec<ColumnBatch>>` becomes individual
+    // `Result<ColumnBatch>` items; a read error becomes one error item.
+    Box::pin(
+        files.flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+            Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>()),
+            Err(e) => futures::stream::iter(vec![Err(e)]),
+        }),
     )
-    .map_err(|e| storage_query_error("Refusing cached Iceberg scan", e))
 }
 
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
@@ -5257,25 +5527,6 @@ mod tests {
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
-
-    /// F-AUD-1 cache-arm follow-up: the shared guard both scan-files hit arms call
-    /// must refuse a delete-bearing cached entry (guard active by default in the
-    /// test env) and pass a delete-free one — so a cache HIT can never silently
-    /// serve a merge-on-read file list around the plan-time guard.
-    #[test]
-    fn cached_scan_files_guard_refuses_delete_bearing_entry() {
-        assert!(
-            guard_cached_scan_files(false, "s3://b/t/metadata/00001.json").is_ok(),
-            "a delete-free cached entry is served"
-        );
-        let err = guard_cached_scan_files(true, "s3://b/dw.fact_orders/metadata/00007.json")
-            .expect_err("a delete-bearing cached entry must be refused with the guard active");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("FLUREE_ICEBERG_ALLOW_MOR_DELETES"),
-            "the refusal names the override switch: {msg}"
-        );
-    }
 
     fn field(id: i32, name: &str, ty: serde_json::Value) -> SchemaField {
         SchemaField {
@@ -6843,30 +7094,23 @@ mod tests {
             .await;
 
         let fluree = crate::FlureeBuilder::memory().build_memory();
-        let config = R2rmlCreateConfig::new("slow-catalog", server.uri(), "silver.people", "")
+        // Registration probes before it publishes: no record is needed.
+        let iceberg = R2rmlCreateConfig::new("slow-catalog", server.uri(), "silver.people", "")
             .with_vended_credentials(false)
             .with_s3_region("us-east-1")
-            .to_iceberg_gs_config("unused-mapping-address")
-            .to_json()
-            .expect("serialize");
-        fluree
-            .publisher()
-            .unwrap()
-            .publish_graph_source(
-                "slow-catalog",
-                "main",
-                GraphSourceType::Iceberg,
-                &config,
-                &[],
-            )
-            .await
-            .unwrap();
+            .to_iceberg_gs_config("unused-mapping-address");
+        let json = iceberg.to_json().expect("serialize");
+        let config = SourceConfig {
+            json: &json,
+            iceberg: &iceberg,
+        };
         let tables = vec!["silver.people".to_string()];
 
         let started = Instant::now();
         let probe = fluree
             .probe_tables_within(
                 "slow-catalog:main",
+                config,
                 &tables,
                 false,
                 Duration::from_millis(100),
@@ -6874,15 +7118,17 @@ mod tests {
             .await;
         assert!(
             matches!(
-                probe,
+                probe.check,
                 ConnectionCheck::TimedOut {
                     loaded: 0,
                     total: 1,
                     ..
                 }
             ),
-            "{probe:?}"
+            "{:?}",
+            probe.check
         );
+        assert!(probe.loaded.is_empty());
         assert!(
             started.elapsed() < CATALOG_DELAY / 2,
             "the probe returned at its budget, not at the catalog's answer: {:?}",
@@ -6890,9 +7136,21 @@ mod tests {
         );
 
         let probe = fluree
-            .probe_tables_within("slow-catalog:main", &tables, false, Duration::from_secs(10))
+            .probe_tables_within(
+                "slow-catalog:main",
+                config,
+                &tables,
+                false,
+                Duration::from_secs(10),
+            )
             .await;
-        assert!(matches!(probe, ConnectionCheck::Verified), "{probe:?}");
+        assert!(
+            matches!(probe.check, ConnectionCheck::Verified),
+            "{:?}",
+            probe.check
+        );
+        // What loaded is kept for the checks that need its schema.
+        assert!(probe.loaded.contains_key("silver.people"));
     }
 
     // ── ORDERING-TRAP GUARD: catalog_client_cache_key must fingerprint the RAW,
@@ -7534,74 +7792,6 @@ mod tests {
         );
     }
 
-    /// A pinned read resolves the mapping's (current) column names through field
-    /// ids: `name` was renamed `full_name`, `email` was added after snapshot 1,
-    /// and `legacy` was dropped with its name reused by the renamed `old_code`.
-    #[test]
-    fn read_schema_resolves_current_names_by_field_id() {
-        let fields = |fs: &[(i32, &str)]| {
-            fs.iter()
-                .map(|(id, name)| json!({"id": id, "name": name, "required": false, "type": "string"}))
-                .collect::<Vec<_>>()
-        };
-        let metadata = TableMetadata::from_json_str(
-            &json!({
-                "format-version": 2,
-                "location": "s3://b/t",
-                "last-sequence-number": 2,
-                "last-updated-ms": 2000,
-                "last-column-id": 5,
-                "current-schema-id": 1,
-                "schemas": [
-                    {"type": "struct", "schema-id": 0,
-                     "fields": fields(&[(1, "name"), (2, "score"), (3, "legacy"), (4, "old_code")])},
-                    {"type": "struct", "schema-id": 1,
-                     "fields": fields(&[(1, "full_name"), (2, "score"), (4, "legacy"), (5, "email")])},
-                ],
-                "current-snapshot-id": 2,
-                "snapshots": [
-                    {"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 1000, "schema-id": 0,
-                     "manifest-list": "s3://b/t/snap-1.avro", "summary": {"operation": "append"}},
-                    {"snapshot-id": 2, "parent-snapshot-id": 1, "sequence-number": 2,
-                     "timestamp-ms": 2000, "schema-id": 1,
-                     "manifest-list": "s3://b/t/snap-2.avro", "summary": {"operation": "append"}},
-                ],
-                "snapshot-log": [],
-                "default-spec-id": 0,
-                "partition-specs": [],
-                "last-partition-id": 0,
-                "sort-orders": [],
-                "default-sort-order-id": 0,
-                "properties": {}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let ids_by_name = |snapshot_id: i64| {
-            let schema = read_schema(&metadata, metadata.snapshot(snapshot_id).unwrap()).unwrap();
-            schema
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.id))
-                .collect::<Vec<_>>()
-        };
-        let named = |pairs: &[(&str, i32)]| {
-            pairs
-                .iter()
-                .map(|(n, id)| (n.to_string(), *id))
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            ids_by_name(1),
-            named(&[("full_name", 1), ("score", 2), ("legacy", 4)])
-        );
-        assert_eq!(
-            ids_by_name(2),
-            named(&[("full_name", 1), ("score", 2), ("legacy", 4), ("email", 5)])
-        );
-    }
-
     /// A time pin must not be answered from REST cross-query caches that predate
     /// it. Both layers are seeded with metadata whose current snapshot is 1
     /// (committed at 1000 ms) and the catalog is unreachable, so reaching the
@@ -7921,5 +8111,207 @@ mod tests {
             .await
             .expect_err("Bob is not served Alice's count");
         assert!(bobs.contains("Failed to load table from catalog"), "{bobs}");
+    }
+}
+
+#[cfg(test)]
+mod emit_order_tests {
+    use super::*;
+    use fluree_db_iceberg::io::batch::{BatchSchema, Column, FieldInfo, FieldType};
+    use fluree_db_iceberg::manifest::{DataFile, FileFormat, PartitionData};
+    use futures::TryStreamExt;
+
+    fn task(i: usize) -> FileScanTask {
+        sized_task(i, 1000)
+    }
+
+    fn sized_task(i: usize, file_size_in_bytes: i64) -> FileScanTask {
+        FileScanTask::for_whole_file(
+            DataFile {
+                file_path: format!("file:///t/data/{i:05}.parquet"),
+                file_format: FileFormat::Parquet,
+                record_count: 1,
+                file_size_in_bytes,
+                partition: PartitionData::default(),
+                column_sizes: None,
+                value_counts: None,
+                null_value_counts: None,
+                nan_value_counts: None,
+                lower_bounds: None,
+                upper_bounds: None,
+                split_offsets: None,
+                sort_order_id: None,
+            },
+            vec![1],
+            None,
+        )
+    }
+
+    /// One batch holding the file's index, so the output names its file.
+    fn batch_of(i: usize) -> ColumnBatch {
+        let schema = BatchSchema::new(vec![FieldInfo {
+            name: "file".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }]);
+        ColumnBatch::new(
+            Arc::new(schema),
+            vec![Column::Int64(vec![Some(i64::try_from(i).unwrap())])],
+        )
+        .unwrap()
+    }
+
+    fn file_of(batch: &ColumnBatch) -> i64 {
+        match batch.column_by_id(1) {
+            Some(Column::Int64(v)) => v[0].unwrap(),
+            other => panic!("unexpected column {other:?}"),
+        }
+    }
+
+    /// The first listed file finishes LAST (its read waits until the last
+    /// file's read is done), and the files are still emitted in listed order.
+    /// Completion-order emission yields 1, 2, 3, 0 here, every time.
+    #[tokio::test]
+    async fn files_are_emitted_in_listed_order_whatever_order_they_finish_in() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::AsListed, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    /// Smallest file first, equal sizes in listed order: files 0..4 of 3000,
+    /// 1000, 2000 and 1000 bytes are emitted 1, 3, 2, 0. The first to emit
+    /// finishes LAST (file 1's read waits until file 0's is done), so
+    /// completion order would put it at the end, and listed order would start
+    /// with file 0.
+    #[tokio::test]
+    async fn smallest_first_emits_by_size_then_listed_order() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let sizes = [3000, 1000, 2000, 1000];
+        let tasks = (0..4).map(|i| sized_task(i, sizes[i])).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::SmallestFirst, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        1 => last_done.notified().await,
+                        0 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order, vec![1, 3, 2, 0]);
+    }
+
+    /// Completion order: the first listed file's read waits until file 3's is
+    /// done, so it is emitted last; the others come as they finish.
+    #[tokio::test]
+    async fn completion_emits_each_file_as_its_read_finishes() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::Completion, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order.len(), 4, "{order:?}");
+        assert_eq!(order[3], 0, "the held-back file comes last: {order:?}");
+    }
+
+    /// A query owes its scan a `ScanOrder`; both providers emit by it.
+    #[test]
+    fn a_query_scan_emits_by_its_scan_order() {
+        assert_eq!(
+            EmitOrder::for_query(ScanOrder::Deterministic),
+            EmitOrder::SmallestFirst
+        );
+        assert_eq!(EmitOrder::for_query(ScanOrder::Any), EmitOrder::Completion);
+    }
+
+    /// Dropping a scan's stream aborts the reads it has in flight and starts
+    /// no more, in every emit order: `buffered` and `buffer_unordered` alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_scan_stream_aborts_the_reads_in_flight() {
+        use crate::graph_source::file_read::test_reads::{endless_read, wait_for};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for order in [
+            EmitOrder::AsListed,
+            EmitOrder::SmallestFirst,
+            EmitOrder::Completion,
+        ] {
+            let (started, dropped) = (Arc::<AtomicUsize>::default(), Arc::default());
+            let tasks = (0..16).map(task).collect();
+            let mut stream = read_files_in_order(tasks, order, 4, {
+                let (started, dropped) = (Arc::clone(&started), Arc::clone(&dropped));
+                move |_task| endless_read(&started, &dropped)
+            });
+            assert!(futures::poll!(stream.next()).is_pending(), "{order:?}");
+            wait_for(&started, 4).await;
+
+            drop(stream);
+            wait_for(&dropped, 4).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                4,
+                "{order:?}: no read starts after the drop"
+            );
+        }
+    }
+
+    /// A read error is emitted at its file's place in the emit order, after
+    /// the earlier files' rows.
+    #[tokio::test]
+    async fn a_read_error_surfaces_in_emit_order() {
+        let tasks = (0..3).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::AsListed, 3, |task| async move {
+            let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+            if i == 1 {
+                Err(QueryError::Internal("file 1 is unreadable".to_string()))
+            } else {
+                Ok(vec![batch_of(i)])
+            }
+        });
+        let items: Vec<QueryResult<ColumnBatch>> = stream.collect().await;
+        assert_eq!(items.len(), 3);
+        assert_eq!(file_of(items[0].as_ref().unwrap()), 0);
+        assert!(items[1].is_err());
+        assert_eq!(file_of(items[2].as_ref().unwrap()), 2);
     }
 }

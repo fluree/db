@@ -399,6 +399,7 @@ impl Fluree {
                 "Graph source '{source_graph_source_id}' has no R2RML triples maps"
             )));
         }
+        refuse_query_backed_maps(&mapping)?;
         let MaterializeOptions {
             delete: delete_convention,
             order_by,
@@ -2924,6 +2925,38 @@ fn build_live_node(
     Ok(collector.node)
 }
 
+/// Refuse a mapping with an `rr:sqlQuery` logical table.
+///
+/// This materializer retracts a subject only when a row it reads says to (a
+/// tombstone, or a change feed delete). A row that leaves a map's `WHERE` (an
+/// `is_current` flag flipping to 0) is filtered out of every read, incremental
+/// or full, so the subject it produced would never be retracted and the target
+/// would keep it forever. The bulk build (`fluree materialize` into a fresh
+/// ledger) reads each map through the query path's filtered scan and has no
+/// such gap. An unfiltered query (`SELECT ... FROM t` with no `WHERE`) is
+/// refused too: it is `rr:tableName` with more steps, and naming the table is
+/// what this materializer keys its watermarks by.
+fn refuse_query_backed_maps(mapping: &CompiledR2rmlMapping) -> Result<()> {
+    let mut maps: Vec<&str> = mapping
+        .triples_maps
+        .values()
+        .filter(|tm| tm.sql_query().is_some())
+        .map(|tm| tm.iri.as_str())
+        .collect();
+    if maps.is_empty() {
+        return Ok(());
+    }
+    maps.sort_unstable();
+    Err(ApiError::Config(format!(
+        "triples map(s) {} read an rr:sqlQuery logical table, which incremental and tracked \
+         materialization cannot keep in sync: a row that stops matching the query's WHERE is \
+         never read again, so its subject would never be retracted. Build a fresh native copy \
+         with `fluree materialize` (it applies the filter exactly), and rebuild it to refresh; \
+         or map the table with rr:tableName",
+        maps.join(", ")
+    )))
+}
+
 /// The first triples map, by IRI, with an object map that yields blank nodes:
 /// `rr:termType rr:BlankNode`, or a reference to a map whose subjects are.
 fn blank_node_objects(mapping: &CompiledR2rmlMapping) -> Option<&str> {
@@ -3171,6 +3204,33 @@ mod tests {
     }
     /// Fixed target ledger for accumulator tests that don't exercise fan-out.
     const TGT: &str = "t:main";
+
+    /// The tracking materializer cannot retract a subject whose row leaves a
+    /// map's `WHERE`, so it refuses any `rr:sqlQuery` map up front, naming it
+    /// and pointing at the bulk build; a table-only mapping passes.
+    #[test]
+    fn tracking_materialization_refuses_a_query_backed_map() {
+        let compile = |logical: &str| {
+            let ttl = format!(
+                r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
+                <http://ex.org/map/Current> a rr:TriplesMap ;
+                    rr:logicalTable [ {logical} ] ;
+                    rr:subjectMap [ rr:template "http://ex.org/c/{{customer_id}}" ] ."#
+            );
+            fluree_db_r2rml::R2rmlLoader::from_turtle(&ttl)
+                .unwrap()
+                .compile()
+                .unwrap()
+        };
+        assert!(refuse_query_backed_maps(&compile(r#"rr:tableName "crm.customers""#)).is_ok());
+        let err = refuse_query_backed_maps(&compile(
+            r#"rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1""#,
+        ))
+        .expect_err("a filtered map cannot be tracked");
+        let message = err.to_string();
+        assert!(message.contains("http://ex.org/map/Current"), "{message}");
+        assert!(message.contains("fluree materialize"), "{message}");
+    }
 
     /// `CommitConflict`'s fields read the OPPOSITE way to their names, and this pins
     /// that so nobody re-derives it wrongly.
