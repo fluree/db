@@ -415,7 +415,15 @@ warning appears:
 
 - if the host has memory to spare, raise the memory limit;
 - if it doesn't, run fewer distinct reasoning workloads at once;
-- or narrow the rules or queries, so less is derived or translated.
+- or narrow the rules or queries, so less is derived or translated;
+- or register a [reasoning index](materialized-reasoning.md). A query answered
+  from one reads the persisted derived facts and holds no result in memory.
+  Two things it does not change: building a generation, and rebuilding one in
+  full, still computes the closure in memory, so persistence moves that cost
+  to maintenance; and a query no generation can answer reasons in memory as
+  before, unless it sets `reasoningFreshness` to `"strict"`, which fails it
+  instead. Use `strict` where reasoning in memory at query time is not
+  affordable.
 
 ## Performance considerations
 

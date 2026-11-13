@@ -292,8 +292,3 @@ formats a one-graph dataset's result the same way. Prefer
 The incremental reasoner entry points take both the closed state and the
 assertion-only view at the same commit. Pass external schema in the assertion
 view as well; derived schema in the closed state must not become new rules.
-
-When integrating PR #2271, preserve the reasoning pair-probe lane's eager
-materialization admission checks and clear `batched_pair_objects` whenever a
-batch is rerouted to per-row execution. Test both eager and fallback paths
-against the per-row oracle before enabling the combined optimization.
