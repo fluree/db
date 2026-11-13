@@ -10,6 +10,8 @@
 //! - Handles `@type` → `rdf:type` conversion
 //! - Handles language-tagged strings and typed literals
 //! - Handles `@json` typed values with canonical normalization
+//! - Reads a number by its value, as JSON-LD converts it to RDF: `1.0` is
+//!   the integer `1` (see [`fluree_graph_ir::JsonNumber`])
 //! - RDF 1.2: a triple term is `{"@id": {"@id": s, p: o}}`; `@annotation` on
 //!   a value makes each annotation node a reifier of the triple the value
 //!   completes; a node's `@reifies` makes the node a reifier of the triple it
@@ -65,7 +67,7 @@
 
 use crate::graph_shape::{node_graph, NodeGraph};
 use crate::is_keyword_form;
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, JsonNumber, LiteralValue, TermId};
 use fluree_vocab::rdf;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -180,12 +182,44 @@ enum Scope {
 /// assert_eq!(graph.len(), 1);
 /// ```
 pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<()> {
-    to_graph_events_scoped(expanded, sink, |name| match name {
+    convert(expanded, sink, named_graphs_only)
+}
+
+/// The resolver with no ledger behind it: a JSON-LD named graph keeps its
+/// name, and a graph selector is refused.
+fn named_graphs_only(name: GraphNameRef<'_>) -> Result<Option<String>> {
+    match name {
         GraphNameRef::NamedGraph(iri) => Ok(Some(iri.to_string())),
         GraphNameRef::Selector(_) => Err(AdapterError::Unsupported(
             "a JSON-LD `@graph` graph selector is not supported here".to_string(),
         )),
-    })
+    }
+}
+
+/// A JSON number as the literal it is read as: by its value, as JSON-LD
+/// converts it to RDF (see [`JsonNumber`]), so `1.0` is the integer `1`.
+struct Number(JsonNumber);
+
+fn read_number(n: &serde_json::Number) -> Option<Number> {
+    JsonNumber::read(n).map(Number)
+}
+
+impl Number {
+    /// The datatype of the number written with no `@type`.
+    fn datatype(&self) -> Datatype {
+        match self.0 {
+            JsonNumber::Integer(_) | JsonNumber::BigInteger(_) => Datatype::xsd_integer(),
+            JsonNumber::Double(_) => Datatype::xsd_double(),
+        }
+    }
+
+    fn term<S: GraphSink>(self, datatype: Datatype, sink: &mut S) -> TermId {
+        match self.0 {
+            JsonNumber::Integer(i) => sink.term_literal_value(LiteralValue::Integer(i), datatype),
+            JsonNumber::BigInteger(digits) => sink.term_literal(&digits, datatype, None),
+            JsonNumber::Double(f) => sink.term_literal_value(LiteralValue::Double(f), datatype),
+        }
+    }
 }
 
 /// Convert expanded JSON-LD to GraphSink events, writing each statement to
@@ -196,6 +230,14 @@ pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<(
 /// blank node `_:label`), and an error refuses the document. A named graph
 /// needs a sink that supports quads.
 pub fn to_graph_events_scoped<S, F>(expanded: &Value, sink: &mut S, resolve: F) -> Result<()>
+where
+    S: GraphSink,
+    F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
+{
+    convert(expanded, sink, resolve)
+}
+
+fn convert<S, F>(expanded: &Value, sink: &mut S, resolve: F) -> Result<()>
 where
     S: GraphSink,
     F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
@@ -541,21 +583,13 @@ where
                 Datatype::xsd_string(),
                 None,
             ))),
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Ok(ProcessedValue::Single(self.sink.term_literal_value(
-                        LiteralValue::Integer(i),
-                        Datatype::xsd_integer(),
-                    )))
-                } else if let Some(f) = n.as_f64() {
-                    Ok(ProcessedValue::Single(self.sink.term_literal_value(
-                        LiteralValue::Double(f),
-                        Datatype::xsd_double(),
-                    )))
-                } else {
-                    Ok(ProcessedValue::None)
+            Value::Number(n) => Ok(match read_number(n) {
+                Some(number) => {
+                    let datatype = number.datatype();
+                    ProcessedValue::Single(number.term(datatype, self.sink))
                 }
-            }
+                None => ProcessedValue::None,
+            }),
             Value::Bool(b) => Ok(ProcessedValue::Single(
                 self.sink
                     .term_literal_value(LiteralValue::Boolean(*b), Datatype::xsd_boolean()),
@@ -654,21 +688,10 @@ where
                 Datatype::xsd_string(),
                 None,
             ))),
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Ok(Some(self.sink.term_literal_value(
-                        LiteralValue::Integer(i),
-                        Datatype::xsd_integer(),
-                    )))
-                } else if let Some(f) = n.as_f64() {
-                    Ok(Some(self.sink.term_literal_value(
-                        LiteralValue::Double(f),
-                        Datatype::xsd_double(),
-                    )))
-                } else {
-                    Ok(None)
-                }
-            }
+            Value::Number(n) => Ok(read_number(n).map(|number| {
+                let datatype = number.datatype();
+                number.term(datatype, self.sink)
+            })),
             Value::Bool(b) => Ok(Some(
                 self.sink
                     .term_literal_value(LiteralValue::Boolean(*b), Datatype::xsd_boolean()),
@@ -776,11 +799,8 @@ fn process_literal<S: GraphSink>(
     sink: &mut S,
 ) -> Result<ProcessedValue> {
     // The datatype: `@type` when given; otherwise, for a native value,
-    // `xsd:boolean` for a boolean, `xsd:integer` for a number that fits an
-    // i64, `xsd:double` for any other number, and `xsd:string` for a
-    // string. So `1.0`, `1e3` and an integer past `i64::MAX` are doubles,
-    // as the value stored for them is, and as a bare number in a list is;
-    // JSON-LD's own RDF conversion would call the first two integers.
+    // `xsd:boolean` for a boolean, the number's own (see [`JsonNumber`]) for a
+    // number, and `xsd:string` for a string.
     // (A native number used to be
     // labelled `xsd:string` here while keeping its numeric value, which a
     // sink that writes the datatype out, like the graph collector, then
@@ -789,8 +809,10 @@ fn process_literal<S: GraphSink>(
         Some(type_iri) => Datatype::from_iri(type_iri),
         None => match val {
             Value::Bool(_) => Datatype::xsd_boolean(),
-            Value::Number(n) if n.as_i64().is_some() => Datatype::xsd_integer(),
-            Value::Number(_) => Datatype::xsd_double(),
+            Value::Number(n) => match read_number(n) {
+                Some(number) => number.datatype(),
+                None => return Ok(ProcessedValue::None),
+            },
             _ => Datatype::xsd_string(),
         },
     };
@@ -851,25 +873,15 @@ fn process_literal<S: GraphSink>(
                 let iri = datatype.as_iri();
                 iri == fluree_vocab::xsd::DOUBLE || iri == fluree_vocab::xsd::FLOAT
             };
-            if is_float_type {
-                if let Some(f) = n.as_f64() {
-                    Ok(ProcessedValue::Single(
-                        sink.term_literal_value(LiteralValue::Double(f), datatype),
-                    ))
-                } else {
-                    Ok(ProcessedValue::None)
-                }
-            } else if let Some(i) = n.as_i64() {
-                Ok(ProcessedValue::Single(
-                    sink.term_literal_value(LiteralValue::Integer(i), datatype),
-                ))
-            } else if let Some(f) = n.as_f64() {
-                Ok(ProcessedValue::Single(
-                    sink.term_literal_value(LiteralValue::Double(f), datatype),
-                ))
+            let number = if is_float_type {
+                n.as_f64().map(|f| Number(JsonNumber::Double(f)))
             } else {
-                Ok(ProcessedValue::None)
-            }
+                read_number(n)
+            };
+            Ok(match number {
+                Some(number) => ProcessedValue::Single(number.term(datatype, sink)),
+                None => ProcessedValue::None,
+            })
         }
         Value::Bool(b) => Ok(ProcessedValue::Single(
             sink.term_literal_value(LiteralValue::Boolean(*b), datatype),

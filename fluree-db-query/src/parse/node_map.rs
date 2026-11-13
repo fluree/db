@@ -1811,7 +1811,7 @@ fn parse_value_object(
             }
         }
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = fluree_graph_ir::json_integer(n) {
                 UnresolvedTerm::long(i)
             } else if let Some(f) = n.as_f64() {
                 UnresolvedTerm::double(f)
@@ -1958,7 +1958,7 @@ fn parse_json_value(
             }
         }
         JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = fluree_graph_ir::json_integer(n) {
                 Ok(UnresolvedTerm::long(i))
             } else if let Some(f) = n.as_f64() {
                 Ok(UnresolvedTerm::double(f))

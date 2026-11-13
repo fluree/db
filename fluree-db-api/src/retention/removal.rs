@@ -1233,14 +1233,13 @@ fn datatype_iri(dt: &str) -> Result<String> {
     }
 }
 
-/// A JSON boolean or number as a value.
+/// A JSON boolean or number as a value: a number as a transaction reads it,
+/// so an integer past i64 is exact rather than the double it rounds to.
 fn scalar(value: &serde_json::Value) -> Result<FlakeValue> {
     match value {
         serde_json::Value::Bool(b) => Ok(FlakeValue::Boolean(*b)),
-        serde_json::Value::Number(n) => Ok(match n.as_i64() {
-            Some(i) => FlakeValue::Long(i),
-            None => FlakeValue::Double(n.as_f64().unwrap_or_default()),
-        }),
+        serde_json::Value::Number(n) => fluree_db_core::coerce::json_number_value(n)
+            .ok_or_else(|| ApiError::http(400, format!("selector object: unsupported number {n}"))),
         serde_json::Value::String(s) => Ok(FlakeValue::String(s.clone())),
         _ => Err(ApiError::http(
             400,

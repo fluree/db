@@ -21,6 +21,8 @@ mod it_enforce_unique_upsert_indexed;
 mod it_export_lists;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
+#[path = "it_jsonld_number_by_value.rs"]
+mod it_jsonld_number_by_value;
 #[path = "it_jsonld_value_object_coercion.rs"]
 mod it_jsonld_value_object_coercion;
 #[path = "it_list_cell_edits.rs"]

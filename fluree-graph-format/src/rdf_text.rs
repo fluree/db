@@ -28,7 +28,8 @@ use crate::collections::{blank_nodes_in_several_graphs, Collections};
 use crate::PrefixMap;
 use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{
-    push_canonical_xsd_double, syntax, Dataset, Datatype, Graph, LiteralValue, Term, Triple,
+    push_canonical_xsd_double, syntax, Dataset, Datatype, Graph, LiteralValue, Reification,
+    StatementPosition, Term, Triple,
 };
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -137,27 +138,69 @@ pub fn format_nt_term(term: &Term) -> Result<String, InvalidLangTag> {
     Ok(out)
 }
 
-fn push_nt_graph(out: &mut String, graph: &Graph, name: Option<&Term>) {
-    let end_line = |out: &mut String| {
-        if let Some(name) = name {
-            out.push(' ');
-            push_nt_term(out, name);
+/// [`format_nquads`], writing one line per statement of `order`, in that
+/// order: the statements of several graphs interleave as `order` has them,
+/// and a reification stands where `order` puts it rather than after its
+/// graph's triples. Only the statements `order` names are written; a
+/// position the dataset does not hold is skipped.
+pub fn format_nquads_statements(
+    dataset: &Dataset,
+    order: &[StatementPosition],
+) -> Result<String, InvalidLangTag> {
+    for (_, graph) in dataset.graphs() {
+        check_lang_tags(graph)?;
+    }
+    let mut out = String::with_capacity(order.len() * BYTES_PER_TRIPLE);
+    for position in order {
+        let name = position.graph.as_ref();
+        let graph = match name {
+            None => &dataset.default,
+            Some(name) => match dataset.named.get(name) {
+                Some(graph) => graph,
+                None => continue,
+            },
+        };
+        if position.reification {
+            if let Some(r) = graph.reifications().get(position.index) {
+                push_nt_reification_line(&mut out, r, name);
+            }
+        } else if let Some(t) = graph.triples().get(position.index) {
+            push_nt_triple_line(&mut out, t, name);
         }
-        out.push_str(" .\n");
-    };
+    }
+    Ok(out)
+}
+
+fn push_nt_graph(out: &mut String, graph: &Graph, name: Option<&Term>) {
     for t in graph.iter() {
-        push_nt_triple(out, t);
-        end_line(out);
+        push_nt_triple_line(out, t, name);
     }
     for r in graph.reifications() {
-        push_nt_term(out, &r.reifier);
-        out.push(' ');
-        syntax::push_iri_ref(out, dt_iri::RDF_REIFIES);
-        out.push_str(" <<( ");
-        push_nt_triple(out, &r.triple);
-        out.push_str(" )>>");
-        end_line(out);
+        push_nt_reification_line(out, r, name);
     }
+}
+
+fn push_nt_line_end(out: &mut String, name: Option<&Term>) {
+    if let Some(name) = name {
+        out.push(' ');
+        push_nt_term(out, name);
+    }
+    out.push_str(" .\n");
+}
+
+fn push_nt_triple_line(out: &mut String, t: &Triple, name: Option<&Term>) {
+    push_nt_triple(out, t);
+    push_nt_line_end(out, name);
+}
+
+fn push_nt_reification_line(out: &mut String, r: &Reification, name: Option<&Term>) {
+    push_nt_term(out, &r.reifier);
+    out.push(' ');
+    syntax::push_iri_ref(out, dt_iri::RDF_REIFIES);
+    out.push_str(" <<( ");
+    push_nt_triple(out, &r.triple);
+    out.push_str(" )>>");
+    push_nt_line_end(out, name);
 }
 
 fn push_nt_triple(out: &mut String, t: &Triple) {
@@ -742,6 +785,43 @@ mod tests {
             format_turtle(&reified(), &prefixes)
         );
         assert_eq!(format_nquads(&only_default), format_ntriples(&reified()));
+    }
+
+    /// One line per statement, in the order asked for: graphs interleave, a
+    /// reification stands where it is put, and a position the dataset lacks
+    /// is skipped.
+    #[test]
+    fn nquads_statements_follow_the_order_given() {
+        let (g1, g2) = (ex("g1"), ex("g2"));
+        let mut d = Dataset::new();
+        d.graph_mut(Some(&g1)).add_triple(ex("a"), ex("p"), ex("b"));
+        d.graph_mut(Some(&g1)).add_triple(ex("c"), ex("p"), ex("d"));
+        d.graph_mut(Some(&g1))
+            .add_reification(ex("a"), ex("p"), ex("b"), ex("r"));
+        d.graph_mut(None).add_triple(ex("e"), ex("p"), ex("f"));
+        let at = |graph: Option<&Term>, index, reification| StatementPosition {
+            graph: graph.cloned(),
+            index,
+            reification,
+        };
+        let order = [
+            at(Some(&g1), 1, false),
+            at(None, 0, false),
+            at(Some(&g1), 0, true),
+            at(Some(&g2), 0, false),
+            at(None, 7, false),
+            at(Some(&g1), 0, false),
+        ];
+        assert_eq!(
+            format_nquads_statements(&d, &order).unwrap(),
+            format!(
+                "<{EX}c> <{EX}p> <{EX}d> <{EX}g1> .\n\
+                 <{EX}e> <{EX}p> <{EX}f> .\n\
+                 <{EX}r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> \
+                 <<( <{EX}a> <{EX}p> <{EX}b> )>> <{EX}g1> .\n\
+                 <{EX}a> <{EX}p> <{EX}b> <{EX}g1> .\n"
+            )
+        );
     }
 
     /// `holder p ( items )` as its `rdf:first`/`rdf:rest` triples, with

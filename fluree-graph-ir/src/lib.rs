@@ -41,6 +41,7 @@ mod dataset;
 pub mod datatype;
 mod graph;
 pub mod json_canonical;
+mod json_number;
 mod sink;
 pub mod syntax;
 mod term;
@@ -51,6 +52,7 @@ pub use dataset::Dataset;
 pub use datatype::Datatype;
 pub use graph::{Graph, Reification};
 pub use json_canonical::{canonicalize_json, canonicalize_json_value};
+pub use json_number::{json_integer, JsonNumber};
 pub use sink::{
     GraphCollectorSink, GraphSink, OrderedDataset, SinkError, SinkResult, StatementPosition, TermId,
 };

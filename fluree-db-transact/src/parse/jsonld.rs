@@ -1651,10 +1651,8 @@ fn parse_values_cell(
         )),
         Value::Bool(b) => Ok(TemplateTerm::Value(FlakeValue::Boolean(*b))),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(TemplateTerm::Value(FlakeValue::Long(i)))
-            } else if let Some(f) = n.as_f64() {
-                Ok(TemplateTerm::Value(FlakeValue::Double(f)))
+            if let Some(value) = fluree_db_core::coerce::json_number_value(n) {
+                Ok(TemplateTerm::Value(value))
             } else {
                 Err(TransactError::Parse(format!(
                     "Unsupported number type in values: {n}"
@@ -1705,10 +1703,8 @@ fn parse_values_cell(
             match value_val {
                 Value::String(s) => Ok(TemplateTerm::Value(FlakeValue::String(s.clone()))),
                 Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Ok(TemplateTerm::Value(FlakeValue::Long(i)))
-                    } else if let Some(f) = n.as_f64() {
-                        Ok(TemplateTerm::Value(FlakeValue::Double(f)))
+                    if let Some(value) = fluree_db_core::coerce::json_number_value(n) {
+                        Ok(TemplateTerm::Value(value))
                     } else {
                         Err(TransactError::Parse(format!(
                             "Unsupported number type in values: {n}"
@@ -2239,10 +2235,8 @@ fn parse_expanded_value_with_ctx(
             }
         }
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::Long(i))))
-            } else if let Some(f) = n.as_f64() {
-                Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::Double(f))))
+            if let Some(value) = fluree_db_core::coerce::json_number_value(n) {
+                Ok(ParsedValue::new(TemplateTerm::Value(value)))
             } else {
                 Err(TransactError::Parse(format!(
                     "Unsupported number format: {n}"
@@ -2427,10 +2421,8 @@ fn parse_literal_value_with_meta(
         }
         Value::Number(n) => {
             // No explicit type - infer from JSON number
-            if let Some(i) = n.as_i64() {
-                Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::Long(i))))
-            } else if let Some(f) = n.as_f64() {
-                Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::Double(f))))
+            if let Some(value) = fluree_db_core::coerce::json_number_value(n) {
+                Ok(ParsedValue::new(TemplateTerm::Value(value)))
             } else {
                 Err(TransactError::Parse(format!(
                     "Unsupported number in @value: {n}"
@@ -2650,10 +2642,8 @@ fn parse_single_list_item_with_ctx(
             }
         }
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::Long(i))))
-            } else if let Some(f) = n.as_f64() {
-                Ok(ParsedValue::new(TemplateTerm::Value(FlakeValue::Double(f))))
+            if let Some(value) = fluree_db_core::coerce::json_number_value(n) {
+                Ok(ParsedValue::new(TemplateTerm::Value(value)))
             } else {
                 Err(TransactError::Parse(format!(
                     "Unsupported number in list: {n}"

@@ -778,7 +778,7 @@ async fn inner_filter_not_exists_vs_minus_behavior() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(r1, json!([["ex:b", 3.0]]));
+    assert_eq!(r1, json!([["ex:b", 3]]));
 
     let q_minus = json!({
         "@context": ctx,
@@ -798,7 +798,7 @@ async fn inner_filter_not_exists_vs_minus_behavior() {
         .unwrap();
     assert_eq!(
         normalize_rows(&r2),
-        normalize_rows(&json!([["ex:a", 1], ["ex:b", 3.0]]))
+        normalize_rows(&json!([["ex:a", 1], ["ex:b", 3]]))
     );
 }
 

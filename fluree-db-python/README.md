@@ -419,9 +419,10 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
   identity (dedup, diff, sort), parse with `literals="lexical"`.
 - Quads come in the order the document writes them, and the list `parse`
   returns has the `prefixes` a Turtle or TriG document declares.
-  `serialize` keeps the quads' order: graphs in the order they first appear,
-  and in Turtle and TriG each subject's statements together. `expanded=True`
-  writes expanded JSON-LD.
+  `serialize` keeps the quads' order: N-Triples and N-Quads are a line per
+  quad in the order given, and the other formats write graphs in the order
+  they first appear, and in Turtle and TriG each subject's statements
+  together. `expanded=True` writes expanded JSON-LD.
 - RDF 1.2 is read whole. A triple term is a `fluree.Triple`, and an
   annotation or a reified triple is the quad `(reifier, rdf:reifies,
   Triple(...))`, the annotated triple being a quad of its own. `serialize`
@@ -435,8 +436,14 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
   form (`0.9957`). `literals="lexical"` keeps every typed literal but a plain
   string as a `fluree.Literal` with its spelling and datatype, so a document
   read and written back keeps its literals exactly.
-- Blank nodes keep the document's labels; an anonymous one gets a fresh
-  label.
+- A JSON-LD number takes its datatype from its value, as JSON-LD defines:
+  `xsd:double` with a fractional part, `xsd:integer` otherwise, so `1.0`
+  reads as the integer `1`. Give a value its `@type` for a double
+  (`{"@value": 1.0, "@type": "xsd:double"}`); `serialize` writes every
+  `float` with its type.
+- Blank nodes keep the document's labels; an anonymous one is labeled `b1`,
+  `b2`, … in every parse. Before putting the quads of two parses together,
+  give each its own `blank_prefix=` so their anonymous nodes stay apart.
 - JSON-LD contexts must be given inline: a `@context` URL is not fetched,
   and a string context is taken as the vocabulary IRI (`"https://schema.org/"`
   makes `name` `https://schema.org/name`). A property with no context entry is
