@@ -3002,7 +3002,22 @@ const MYSQL: LiveBackend = LiveBackend {
         "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
         "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
-    declines: &[],
+    // A union entity's statement needs a `SELECT DISTINCT` over string
+    // columns to answer with set semantics (its maps can mint one subject).
+    // MySQL's default collations fold case and accents, so that DISTINCT
+    // could merge two distinct values ('Ada' and 'ada'): the lane declines to
+    // the per-scan lane ("repeated solutions the statement cannot remove
+    // exactly"), whose rows these cases still check. The same rule as the
+    // live case "DISTINCT over strings runs in the engine where the database
+    // folds case".
+    declines: &[
+        "a predicate two maps provide unions the resolutions at the node",
+        "maps with different subjects providing a predicate union their accesses",
+        "a filter on a union variable pushes on the union's column",
+        "a top-k on a union variable pushes its LIMIT",
+        "a foreign key into a union entity joins the parent's columns",
+        "a foreign key into a partitioned union entity keeps its other parts",
+    ],
 };
 
 /// Maps over the dialect tables, appended to the shop mapping for live runs.
