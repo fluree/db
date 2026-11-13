@@ -57,27 +57,37 @@ pub(crate) struct ScheduleCache {
 struct CachedSchedule {
     /// The persisted blob the schedule extends (what the registration names).
     blob: Option<String>,
+    /// The activation boundary it was discovered from: one lowered since
+    /// uncovers commits it never saw.
+    since_t: i64,
     schedule: Schedule,
     /// When the schedule was last persisted (epoch ms).
     persisted_ms: i64,
 }
 
 impl ScheduleCache {
-    fn take(&self, ledger_id: &str, blob: Option<&str>) -> Option<(Schedule, i64)> {
+    fn take(&self, ledger_id: &str, blob: Option<&str>, since_t: i64) -> Option<(Schedule, i64)> {
         let mut map = self.schedules.lock();
         match map.remove(ledger_id) {
-            Some(cached) if cached.blob.as_deref() == blob => {
+            Some(cached) if cached.blob.as_deref() == blob && cached.since_t == since_t => {
                 Some((cached.schedule, cached.persisted_ms))
             }
             _ => None,
         }
     }
 
-    fn put(&self, ledger_id: &str, blob: Option<String>, schedule: Schedule, persisted_ms: i64) {
+    fn put(
+        &self,
+        ledger_id: &str,
+        (blob, since_t): (Option<String>, i64),
+        schedule: Schedule,
+        persisted_ms: i64,
+    ) {
         self.schedules.lock().insert(
             ledger_id.to_string(),
             CachedSchedule {
                 blob,
+                since_t,
                 schedule,
                 persisted_ms,
             },
@@ -89,7 +99,7 @@ impl ScheduleCache {
     fn idle(
         &self,
         ledger_id: &str,
-        blob: Option<&str>,
+        (blob, since_t): (Option<&str>, i64),
         head: (i64, Option<&ContentId>),
         now_ms: i64,
     ) -> Option<(i64, usize)> {
@@ -97,6 +107,7 @@ impl ScheduleCache {
         let cached = map.get(ledger_id)?;
         let s = &cached.schedule;
         (cached.blob.as_deref() == blob
+            && cached.since_t == since_t
             && s.watermark_t == head.0
             && (s.watermark_id.is_none() || s.watermark_id.as_ref() == head.1)
             && s.retire.is_empty()
@@ -876,7 +887,7 @@ impl Fluree {
         if !heartbeat_due && published {
             if let Some((watermark_t, pending)) = cache.idle(
                 ledger_id,
-                shell.schedule.as_deref(),
+                (shell.schedule.as_deref(), shell.active_since_t),
                 (record.commit_t, record.commit_head_id.as_ref()),
                 now_ms,
             ) {
@@ -900,11 +911,14 @@ impl Fluree {
             .to_ledger_state();
         let head_t = state.t();
 
-        let (mut schedule, persisted_ms) =
-            match cache.take(ledger_id, registration.schedule.as_deref()) {
-                Some(cached) => cached,
-                None => (load_schedule(store.as_ref(), &registration).await, now_ms),
-            };
+        let (mut schedule, persisted_ms) = match cache.take(
+            ledger_id,
+            registration.schedule.as_deref(),
+            registration.active_since_t,
+        ) {
+            Some(cached) => cached,
+            None => (load_schedule(store.as_ref(), &registration).await, now_ms),
+        };
         let loaded_blob = registration.schedule.clone();
         let before = schedule_fingerprint(&schedule);
         let mut report = PassReport::default();
@@ -1091,7 +1105,12 @@ impl Fluree {
                 }
             }
         }
-        cache.put(ledger_id, blob, schedule, persisted_at);
+        cache.put(
+            ledger_id,
+            (blob, registration.active_since_t),
+            schedule,
+            persisted_at,
+        );
         let current = registry::read(ns, self.registry_objects(), ledger_id)
             .await?
             .1;
@@ -1268,6 +1287,20 @@ impl Fluree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cached schedule discovered from one boundary is not used once the
+    /// registration's is lower: it never saw the commits in between.
+    #[test]
+    fn a_cached_schedule_is_not_reused_past_a_lowered_boundary() {
+        let cache = ScheduleCache::default();
+        let put = || cache.put("l:main", (None, 50), Schedule::starting_after(60), 0);
+        put();
+        assert!(cache.idle("l:main", (None, 50), (60, None), 0).is_some());
+        assert!(cache.idle("l:main", (None, 5), (60, None), 0).is_none());
+        assert!(cache.take("l:main", None, 5).is_none());
+        put();
+        assert!(cache.take("l:main", None, 50).is_some());
+    }
 
     #[test]
     fn relative_lifetimes_start_at_the_commit_time() {

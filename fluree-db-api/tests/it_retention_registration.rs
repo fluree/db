@@ -52,6 +52,51 @@ async fn build_and_publish(fluree: &Fluree, ledger_id: &str) {
     support::publish_built_index(fluree, ledger_id, built.index_t, &built.root_id).await;
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A branch registered from a later commit than its first lifetime, as one
+/// whose first index was built with no retention hook is, takes the earlier
+/// boundary when a build next reads those commits: the schedule is then
+/// discovered again from there.
+#[tokio::test]
+async fn a_lowered_boundary_schedules_the_commits_it_uncovers() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("it/reg-lowered").await.unwrap();
+    let id = "it/reg-lowered:main";
+    insert(&fluree, id, lifetime("ex:early")).await;
+    let store = fluree.branched_content_store(id).await.unwrap();
+    let unhooked = fluree_db_indexer::build_index_for_ledger(
+        store,
+        fluree.nameservice(),
+        id,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("build");
+    support::publish_built_index(&fluree, id, unhooked.index_t, &unhooked.root_id).await;
+    assert!(!registered(&fluree, id).await);
+
+    insert(&fluree, id, lifetime("ex:late")).await;
+    build_and_publish(&fluree, id).await;
+    let pass = fluree.run_retention_at(id, now_ms()).await.expect("pass");
+    assert_eq!(
+        pass.pending, 1,
+        "registered from the later commit: {pass:?}"
+    );
+
+    fluree
+        .reindex(id, Default::default())
+        .await
+        .expect("reindex");
+    let pass = fluree.run_retention_at(id, now_ms()).await.expect("pass");
+    assert_eq!(pass.pending, 2, "{pass:?}");
+}
+
 /// A full rebuild (reindex) and an incremental build over the commits since
 /// an index both register the branch for the retention input they read,
 /// before the caller publishes.

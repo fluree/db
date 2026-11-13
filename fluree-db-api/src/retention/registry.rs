@@ -789,8 +789,10 @@ pub(crate) async fn activate(
         Some(r) if r.active_since_t <= since_t => None,
         Some(r) => Some(Registration {
             active_since_t: since_t,
-            // An earlier boundary means commits the schedule never saw.
+            // An earlier boundary means commits the schedule never saw: it
+            // is discovered again from there.
             watermark_t: r.watermark_t.min(since_t - 1),
+            schedule: None,
             ..r.clone()
         }),
         None => Some(Registration {
