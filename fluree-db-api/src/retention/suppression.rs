@@ -27,11 +27,19 @@ use crate::{ApiError, Fluree, Result};
 /// What a read can touch.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reads {
-    /// Any predicate (a variable predicate, a wildcard path or crawl,
-    /// reasoning).
+    /// Any predicate of any subject (a variable predicate with a variable
+    /// subject, a wildcard path or crawl, reasoning).
     Everything,
-    /// These `(subject, predicate)` IRIs; a variable subject is `None`.
-    Facts(Vec<(Option<String>, String)>),
+    Facts(Vec<Fact>),
+}
+
+/// What one pattern reads, in IRIs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Fact {
+    /// One predicate, of one subject or (`None`) of any.
+    Of(Option<String>, String),
+    /// Every predicate of one subject.
+    About(String),
 }
 
 /// What `query` reads, in IRIs: every pattern it evaluates, those in its
@@ -54,6 +62,41 @@ pub(crate) fn reads_of(query: &Query, snapshot: &LedgerSnapshot) -> Reads {
     }
 }
 
+/// `reads` with what `policy`'s view policies read as they decide each row:
+/// a condition's (`f:query`) patterns, and a class policy's subjects'
+/// `rdf:type`. Both run as of the read's point, so they read history as the
+/// query's own patterns do. A condition whose patterns cannot be told reads
+/// everything.
+pub(crate) fn with_policy_reads(
+    reads: Reads,
+    policy: Option<&fluree_db_policy::PolicyContext>,
+    snapshot: &LedgerSnapshot,
+) -> Reads {
+    let Reads::Facts(mut facts) = reads else {
+        return reads;
+    };
+    let Some(policy) = policy.filter(|p| !p.wrapper.is_root()) else {
+        return Reads::Facts(facts);
+    };
+    for restriction in &policy.wrapper.view().restrictions {
+        if restriction.class_policy {
+            facts.push(Fact::Of(None, fluree_vocab::rdf::TYPE.to_string()));
+        }
+        if let fluree_db_policy::PolicyValue::Query(condition) = &restriction.value {
+            let mut bounded = true;
+            let told = fluree_db_query::policy::for_each_condition_pattern(
+                condition,
+                snapshot,
+                &mut |pattern| bounded &= read_by(pattern, snapshot, &mut facts),
+            );
+            if !(told && bounded) {
+                return Reads::Everything;
+            }
+        }
+    }
+    Reads::Facts(facts)
+}
+
 fn iri(r: &Ref, snapshot: &LedgerSnapshot) -> Option<String> {
     match r {
         Ref::Var(_) => None,
@@ -64,23 +107,23 @@ fn iri(r: &Ref, snapshot: &LedgerSnapshot) -> Option<String> {
 
 /// Collect the facts `pattern` itself reads, not those of the patterns
 /// nested in it; `false` when it can read anything.
-fn read_by(
-    pattern: &Pattern,
-    snapshot: &LedgerSnapshot,
-    out: &mut Vec<(Option<String>, String)>,
-) -> bool {
+fn read_by(pattern: &Pattern, snapshot: &LedgerSnapshot, out: &mut Vec<Fact>) -> bool {
     match pattern {
-        Pattern::Triple(tp) => match iri(&tp.p, snapshot) {
-            Some(p) => {
-                out.push((iri(&tp.s, snapshot), p));
+        Pattern::Triple(tp) => match (iri(&tp.s, snapshot), iri(&tp.p, snapshot)) {
+            (s, Some(p)) => {
+                out.push(Fact::Of(s, p));
                 true
             }
-            None => false,
+            (Some(s), None) => {
+                out.push(Fact::About(s));
+                true
+            }
+            (None, None) => false,
         },
         Pattern::EdgeAnnotation { edge, .. } => match iri(&edge.p, snapshot) {
             Some(p) => {
-                out.push((iri(&edge.s, snapshot), p));
-                out.push((None, fluree_vocab::rdf::REIFIES.to_string()));
+                out.push(Fact::Of(iri(&edge.s, snapshot), p));
+                out.push(Fact::Of(None, fluree_vocab::rdf::REIFIES.to_string()));
                 true
             }
             None => false,
@@ -88,9 +131,9 @@ fn read_by(
         // Its values may be a list's members, read through the list's cells.
         Pattern::ListView(lv) => match iri(&lv.triple.p, snapshot) {
             Some(p) => {
-                out.push((iri(&lv.triple.s, snapshot), p));
-                out.push((None, fluree_vocab::rdf::FIRST.to_string()));
-                out.push((None, fluree_vocab::rdf::REST.to_string()));
+                out.push(Fact::Of(iri(&lv.triple.s, snapshot), p));
+                out.push(Fact::Of(None, fluree_vocab::rdf::FIRST.to_string()));
+                out.push(Fact::Of(None, fluree_vocab::rdf::REST.to_string()));
                 true
             }
             None => false,
@@ -106,7 +149,7 @@ fn read_by(
                     .iter()
                     .all(|p| match snapshot.decode_sid(p) {
                         Some(p) => {
-                            out.push((None, p));
+                            out.push(Fact::Of(None, p));
                             true
                         }
                         None => false,
@@ -246,9 +289,18 @@ impl Suppression {
         self.applies.iter().any(|a| !a)
     }
 
-    /// The predicate of a removal that a read of `reads`, as of `to` (or
-    /// over `[from, to]` when not a `point`), could need.
-    fn removal_needed(&self, reads: &Reads, from: i64, to: i64, point: bool) -> Option<&str> {
+    /// Whether a read of `reads`, as of `to` (or over `[from, to]` when not a
+    /// `point`), could need a removed occurrence: `Some`, with the removal's
+    /// predicate when the read named that predicate itself. Which property of
+    /// a subject was removed is audit data, so a read of every property is
+    /// not told.
+    fn removal_needed(
+        &self,
+        reads: &Reads,
+        from: i64,
+        to: i64,
+        point: bool,
+    ) -> Option<Option<&str>> {
         let covered = |i: &usize| {
             let removal = &self.journal.removals[*i];
             if point {
@@ -260,25 +312,29 @@ impl Suppression {
         let any = |of: &RemovedOf| {
             of.any_subject.iter().any(covered) || of.by_subject.values().flatten().any(covered)
         };
+        let about = |of: &RemovedOf, subject: &str| {
+            of.any_subject.iter().any(covered)
+                || of
+                    .by_subject
+                    .get(&super::journal::subject_fingerprint(subject))
+                    .is_some_and(|spans| spans.iter().any(covered))
+        };
         match reads {
-            Reads::Everything => self
-                .removed
-                .iter()
-                .find(|(_, of)| any(of))
-                .map(|(p, _)| p.as_str()),
-            Reads::Facts(facts) => facts.iter().find_map(|(subject, predicate)| {
-                let (predicate, of) = self.removed.get_key_value(predicate)?;
-                let needed = match subject {
-                    None => any(of),
-                    Some(iri) => {
-                        of.any_subject.iter().any(covered)
-                            || of
-                                .by_subject
-                                .get(&super::journal::subject_fingerprint(iri))
-                                .is_some_and(|spans| spans.iter().any(covered))
-                    }
-                };
-                needed.then_some(predicate.as_str())
+            Reads::Everything => self.removed.values().any(any).then_some(None),
+            Reads::Facts(facts) => facts.iter().find_map(|fact| match fact {
+                Fact::Of(None, predicate) => {
+                    let (predicate, of) = self.removed.get_key_value(predicate)?;
+                    any(of).then_some(Some(predicate.as_str()))
+                }
+                Fact::Of(Some(subject), predicate) => {
+                    let (predicate, of) = self.removed.get_key_value(predicate)?;
+                    about(of, subject).then_some(Some(predicate.as_str()))
+                }
+                Fact::About(subject) => self
+                    .removed
+                    .values()
+                    .any(|of| about(of, subject))
+                    .then_some(None),
             }),
         }
     }
@@ -859,12 +915,16 @@ impl Fluree {
         }
         let (from, to) = (read.from_t.unwrap_or(read.to_t), read.to_t);
         let point = read.from_t.is_none();
-        if let Some(predicate) = suppression.removal_needed(&(read.reads)(), from, to, point) {
-            return Err(ApiError::HistoryUnavailable(format!(
+        match suppression.removal_needed(&(read.reads)(), from, to, point) {
+            Some(Some(predicate)) => Err(ApiError::HistoryUnavailable(format!(
                 "a removed occurrence of <{predicate}> on {ledger_id} falls in the requested range"
-            )));
+            ))),
+            Some(None) => Err(ApiError::HistoryUnavailable(format!(
+                "a removed occurrence this read could reach on {ledger_id} falls in the \
+                 requested range"
+            ))),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -920,14 +980,14 @@ mod tests {
         Reads::Facts(
             facts
                 .iter()
-                .map(|(s, p)| (s.map(str::to_string), p.to_string()))
+                .map(|(s, p)| Fact::Of(s.map(str::to_string), p.to_string()))
                 .collect(),
         )
     }
 
     /// A removal whose subject is recorded refuses only reads that name it,
     /// or no subject; one whose subject is not recorded refuses every read
-    /// of its predicate; one that does not apply refuses none.
+    /// that could reach its predicate; one that does not apply refuses none.
     #[test]
     fn a_removals_subject_narrows_the_reads_it_refuses() {
         let journal = |removals| Journal {
@@ -957,6 +1017,10 @@ mod tests {
             30
         ));
         assert!(refuses(&carol, Reads::Everything, 30));
+        let about = |subject: &str| Reads::Facts(vec![Fact::About(subject.to_string())]);
+        assert!(refuses(&carol, about("ex:carol"), 30));
+        assert!(!refuses(&carol, about("ex:erin"), 30));
+        assert!(!refuses(&carol, about("ex:carol"), 50));
         // The span is half-open for a point read.
         assert!(!refuses(
             &carol,
@@ -979,9 +1043,35 @@ mod tests {
             reads(&[(Some("ex:erin"), "ex:likes")]),
             30
         ));
+        assert!(refuses(&unknown, about("ex:erin"), 30));
 
         let elsewhere =
             Suppression::new(journal(vec![removal(None, "c1")]), String::new(), &[false]);
         assert!(!refuses(&elsewhere, Reads::Everything, 30));
+    }
+
+    /// A refusal names the removed predicate only to a read that named it:
+    /// which property of a subject was removed is audit data.
+    #[test]
+    fn a_refusal_names_only_the_predicate_the_read_named() {
+        let carol = Suppression::new(
+            Journal {
+                removals: vec![removal(Some("ex:carol"), "c1")],
+                ..Default::default()
+            },
+            String::new(),
+            &[true],
+        );
+        let needed = |r: Reads| carol.removal_needed(&r, 30, 30, true);
+        assert_eq!(
+            needed(reads(&[(Some("ex:carol"), "ex:likes")])),
+            Some(Some("ex:likes"))
+        );
+        assert_eq!(needed(reads(&[(None, "ex:likes")])), Some(Some("ex:likes")));
+        assert_eq!(
+            needed(Reads::Facts(vec![Fact::About("ex:carol".to_string())])),
+            Some(None)
+        );
+        assert_eq!(needed(Reads::Everything), Some(None));
     }
 }

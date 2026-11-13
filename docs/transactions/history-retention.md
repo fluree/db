@@ -124,7 +124,9 @@ After the removal:
 
 - Current queries no longer see the value, because it was retracted.
 - A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`: a read as of an earlier point, or a history range, that falls in the occurrence's span and whose patterns could touch it. This stays true after the occurrence's commit is [permanently erased](permanent-erasure.md), since the journal records the occurrence's subject itself.
-- A historical read that cannot be tied to named predicates is refused whenever any removal covers its point or range, whatever subject it asks about. That is a pattern with a variable predicate (`?s ?p ?o`), a graph crawl (`select {"?s": ["*"]}`), a wildcard or multi-step property path, a Cypher query, a query under the RDF list view (`rdfLists`), and a query under reasoning. `fluree history <entity>` without `-p` is such a read.
+- A historical read that cannot be tied to named predicates or to one subject is refused whenever any removal covers its point or range, whatever subject it asks about. That is a pattern whose subject and predicate are both variables (`?s ?p ?o`), a graph crawl (`select {"?s": ["*"]}`, with a constant subject too), a wildcard or multi-step property path, a Cypher query, a query under the RDF list view (`rdfLists`), and a query under reasoning.
+- A pattern with a variable predicate and a constant subject (`ex:alice ?p ?o`) reads every property of that subject. It is refused when a removal of any of that subject's properties covers its point or range, and answered for another subject. `fluree history <entity>` without `-p` is such a read. The refusal does not say which property was removed: a `410` names the removed property only to a read whose own pattern named it.
+- A view policy decides each row as of the read's point too, so what it reads counts toward the read: a policy condition's (`f:query`) patterns, as a query's own would, and `rdf:type` for a class policy (`f:onClass`). A read of an innocent property under a condition that reads a removed one is refused, as reading that one directly is. A Cypher condition, or one that cannot be parsed, counts as reading everything.
 - A historical read whose patterns name their predicates is still answered when none of them is a removed predicate, or when the pattern's subject is a constant other than the removed occurrence's. So is every read as of the head, and every read at a point outside the removed occurrences' spans.
 - Other occurrences of the fact are unaffected. So is the same value asserted again later: that is a new occurrence.
 
@@ -205,7 +207,7 @@ An unacknowledged replica may continue serving its earlier journal until it catc
 }
 ```
 
-A history rule that has been turned off carries `untilT`, the config commit that ended it. The journal records predicates, transaction ranges and occurrence positions, and for each removed occurrence a `subject`: a SHA-256 fingerprint of its subject's IRI, which reads are matched against. It never records the removed values. A fingerprint identifies the subject without spelling out its IRI, but anyone can hash a guessed IRI and compare.
+A history rule that has been turned off carries `untilT`, the config commit that ended it. The journal records predicates, transaction ranges and occurrence positions, and for each removed occurrence a `subject`: a SHA-256 fingerprint of its subject's IRI, which reads are matched against. It never records the removed values. A fingerprint identifies the subject without spelling out its IRI, but anyone can hash a guessed IRI and compare. A refused read of a subject's every property likewise confirms, to any reader, that a removal covers that subject at that point.
 
 ## Limits
 

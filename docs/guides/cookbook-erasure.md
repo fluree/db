@@ -78,7 +78,7 @@ fluree history https://example.org/user-8f3a -l people:main
 
 Here the email has had two values. To erase both, select the property and leave the value out.
 
-Do this step before the request, not after: accepting the request removes the history you are reading. If the ledger already has a removal or an erasure, this entity-wide form is refused with `410`, because it reads every predicate; name the property instead (`-p https://example.org/email`).
+Do this step before the request, not after: accepting the request removes the history you are reading. If an earlier removal or erasure already covers this subject, the entity-wide form is refused with `410`, because it reads every property of the subject; name the property instead (`-p https://example.org/email`).
 
 ### 4. Send the request
 
@@ -139,7 +139,15 @@ A job moves through these stages:
 | `purged` | Nothing this server's storage holds contains the erased values | Done |
 | `failed` | A commit could not be proved. Nothing of the job was published | See [Troubleshooting](#troubleshooting) |
 
-The requester, the affected commits and `lastError` are audit data. They appear only when the request carries a token with the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [claim](../security/authentication.md#scope-claims), even on a server that does not require authentication. Any other reader sees stages, retries and timings. `fluree token create` has no flag for the audit claims: issue the token from your identity provider or your own signer.
+The requester, the affected commits and `lastError` are audit data. They appear only when the request carries a token with the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [claim](../security/authentication.md#scope-claims), even on a server that does not require authentication. Any other reader sees stages, retries and timings.
+
+Mint one with [`fluree token create`](../cli/token.md):
+
+```bash
+fluree token create --private-key @~/.fluree/key --read-ledger people:main --audit-ledger people:main
+```
+
+The server must trust the token's issuer. A server that runs without data authentication reads the token only for its audit grant, and still needs the issuer listed: start it with `--data-auth-trusted-issuer <did:key>`.
 
 Treat `published` as "no reader can get the value from this server" and `purged` as "this server's disk no longer has it".
 
@@ -188,7 +196,7 @@ fluree query people:main --format json '{
 }' > predicates.json
 ```
 
-This query has a variable predicate, so a ledger that already has a removal or an erasure refuses it (`410`). There, list the subject's current properties with the same pattern and no `from`/`to` (a query at the head is always answered), and add the properties it used to have from your data model. A history query that names one predicate confirms each.
+This query reads every property of the subject, so the ledger refuses it (`410`) when an earlier removal or erasure already covers one of that subject's properties. There, list the subject's current properties with the same pattern and no `from`/`to` (a query at the head is always answered), and add the properties it used to have from your data model. A history query that names one predicate confirms each.
 
 Turn the list into a request, review it, and send it:
 
@@ -317,7 +325,7 @@ The instance must be file-backed, built with `FlureeBuilder::with_erasure(Erasur
 | Stays at `purging` with `purge.blocked` | A full-text or vector index over a dropped ledger reads an erased property; another process holds the storage; on a cluster, a member is offline | Follow the message. The pass retries an hour later |
 | `lastError` never appears | The request's token has no audit claim | See [Follow the job](#5-follow-the-job) |
 | `failed` | The prover refused a commit, or timed out three times | Fix the cause in `lastError`, then send the same request again: it resumes where it stopped |
-| A historical query on unrelated data now answers `410` | It reads properties its patterns do not name: a variable predicate, a graph crawl, a Cypher query, reasoning. Such a read is refused at any earlier point a removal covers, for every subject | Name the predicates in the query's patterns. See [what still works in history](cookbook-retention.md#what-still-works-in-history-afterwards) |
+| A historical query on unrelated data now answers `410` | It names neither its predicates nor one subject: `?s ?p ?o`, a graph crawl, a Cypher query, reasoning. Such a read is refused at any earlier point a removal covers, for every subject | Name the predicates in the query's patterns, or a constant subject. See [what still works in history](cookbook-retention.md#what-still-works-in-history-afterwards) |
 
 ## Related documentation
 
