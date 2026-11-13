@@ -1245,3 +1245,56 @@ async fn a_warm_cache_reloads_across_another_instances_rebase() {
     );
     assert_eq!(query_cached_names(&warm, "rb:dev").await, EVERY_NAME);
 }
+
+async fn dev_record(fluree: &fluree_db_api::Fluree) -> fluree_db_nameservice::NsRecord {
+    fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Whether the indexer refuses to publish a build of `built` on `rb:dev`.
+async fn refused(fluree: &fluree_db_api::Fluree, built: &fluree_db_nameservice::NsRecord) -> bool {
+    let store = fluree.branched_content_store("rb:dev").await.unwrap();
+    fluree_db_indexer::refuse_build_off_the_line(fluree.nameservice(), store.as_ref(), built)
+        .await
+        .is_err()
+}
+
+/// A build from the branch's record before a rebase is not published after
+/// it: its head is no longer on the branch's line. A build of the head's
+/// line is published, including one that commits have since moved past.
+#[tokio::test]
+async fn a_build_of_the_replaced_line_is_not_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    let before = dev_record(&fluree).await;
+    assert!(!refused(&fluree, &before).await, "a build of the head");
+
+    fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(
+        refused(&fluree, &before).await,
+        "a build of the replaced line"
+    );
+
+    let rebased = dev_record(&fluree).await;
+    let dev = fluree.ledger("rb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/ns/"},
+                    "@id": "ex:erin", "ex:name": "erin"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !refused(&fluree, &rebased).await,
+        "a build of the head's line, behind the head"
+    );
+}
