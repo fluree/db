@@ -181,14 +181,17 @@ fn sparql_cases() -> Vec<Case> {
     ]
 }
 
-/// JSON-LD twins over `?s ex:p ?o`: (name, filter, answer, pushed, seek).
-fn jsonld_cases() -> Vec<(
+/// A JSON-LD twin: (name, filter, answer, pushed, seek).
+type JsonLdCase = (
     &'static str,
     Value,
     &'static [&'static str],
     bool,
     Option<bool>,
-)> {
+);
+
+/// JSON-LD twins over `?s ex:p ?o`.
+fn jsonld_cases() -> Vec<JsonLdCase> {
     vec![
         (
             "str-dt",
