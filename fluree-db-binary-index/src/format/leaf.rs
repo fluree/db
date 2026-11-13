@@ -878,6 +878,37 @@ pub struct LeafletDirEntryV3 {
     pub history_max_t: u32,
 }
 
+impl LeafletDirEntryV3 {
+    /// Whether a read replaying to `replay_to` takes rows from this leaflet's
+    /// history sidecar, which holds events newer than that `t`. `None` is a
+    /// read at the index's own `t`, which replays nothing.
+    ///
+    /// Such a read cannot go by what the directory says of the rows alone:
+    /// their count, their key range, or their type constant.
+    #[inline]
+    pub fn replays_history(&self, replay_to: Option<i64>) -> bool {
+        replay_to.is_some_and(|to_t| {
+            self.history_len > 0 && self.history_max_t > u32::try_from(to_t).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// `o_type_const` as far as a reader may apply it to the rows it reads.
+    ///
+    /// The constant is taken over the leaflet's rows alone, and a retracted
+    /// fact keeps its own type in the history sidecar: once every ref of a
+    /// predicate is retracted, its POST/PSOT leaflet reports the type of the
+    /// literals left behind. A reader that also takes rows from the sidecar
+    /// (`reads_history`) therefore has no constant to skip or label by.
+    #[inline]
+    pub fn o_type_const_for(&self, reads_history: bool) -> Option<u16> {
+        if reads_history {
+            None
+        } else {
+            self.o_type_const
+        }
+    }
+}
+
 /// Decode a V3 leaf header. Validates magic bytes.
 pub fn decode_leaf_header_v3(data: &[u8]) -> io::Result<LeafHeaderV3> {
     if data.len() < LEAF_V3_HEADER_SIZE {

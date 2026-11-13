@@ -1398,3 +1398,221 @@ async fn time_travel_fully_retracted_subject_survives_later_incremental() {
         "the deleted entity must still be reachable at t=1 after an incremental"
     );
 }
+
+/// Seed predicates whose leaflets lose a whole object type to a retraction.
+///
+/// At t=1 `ns:tag` holds two refs among six strings and `ns:val` an integer
+/// beside a string. t=2 retracts the refs and the integer, so the rows left
+/// in each predicate's POST/PSOT leaflet share one type and the leaflet's
+/// type constant names it, while the retracted facts, of another type, live
+/// on in the history sidecar. A read at t=1 has to get them from there.
+async fn seed_retracted_type_ledger(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    strategy: IndexStrategy,
+) {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let tx1 = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ns:alice",
+             "ns:knows": [{"@id": "ns:bob"}, {"@id": "ns:carol"}],
+             "ns:reads": [{"@id": "ns:d1"}, {"@id": "ns:d2"}, {"@id": "ns:d4"}]},
+            {"@id": "ns:d1", "ns:tag": {"@id": "ns:bob"}, "ns:val": 7},
+            {"@id": "ns:d2", "ns:tag": {"@id": "ns:carol"}, "ns:val": "seven"},
+            {"@id": "ns:d4", "ns:tag": ["bob", "carol", "dave", "erin", "frank", "grace"]}
+        ]
+    });
+    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    strategy.publish(fluree, ledger_id).await;
+    let l1 = fluree.ledger(ledger_id).await.expect("reload after t=1");
+
+    let tx2 = json!({
+        "@context": ctx(),
+        "delete": [
+            {"@id": "ns:d1", "ns:tag": {"@id": "ns:bob"}, "ns:val": 7},
+            {"@id": "ns:d2", "ns:tag": {"@id": "ns:carol"}}
+        ]
+    });
+    let _ = fluree.update(l1, &tx2).await.expect("tx2");
+    strategy.publish(fluree, ledger_id).await;
+    fluree.ledger(ledger_id).await.expect("reload after t=2");
+}
+
+async fn run_jsonld_rows(fluree: &fluree_db_api::Fluree, query: &JsonValue) -> JsonValue {
+    fluree
+        .query_from()
+        .jsonld(query)
+        .format(fluree_db_api::FormatterConfig::jsonld())
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("jsonld should succeed: {e}\n{query}"))
+}
+
+/// Which lane a shape must answer through on an indexed ledger, so it cannot
+/// pass by way of a reader the shape was not written for.
+#[derive(Clone, Copy)]
+enum Lane {
+    Any,
+    BatchedSubjectJoin,
+    BatchedOptionalProbe,
+}
+
+/// Every shape here reads `ns:tag` or `ns:val` at t=1 for a fact whose type
+/// its leaflet's rows no longer hold. Each is paired with the reader it goes
+/// through: a scan that skips leaflets by the type constant returns nothing,
+/// and a lane that labels rows by it returns the ref as a string.
+async fn assert_retracted_type_shapes(strategy: IndexStrategy, ledger_id: &str) {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_retracted_type_ledger(&fluree, ledger_id, strategy).await;
+    let indexed = strategy != IndexStrategy::NoveltyOnly;
+
+    let sparql = |from: &str, select: &str, body: &str| {
+        format!(
+            "PREFIX ns: <http://example.org/ns#>\n\
+             SELECT {select} {from} WHERE {{ {body} }} ORDER BY {select}"
+        )
+    };
+    let at_t1 = format!("FROM <{ledger_id}@t:1>");
+    let at_t2 = format!("FROM <{ledger_id}@t:2>");
+    let tags_at_t1 = json!([
+        ["ns:d1", "ns:bob"],
+        ["ns:d2", "ns:carol"],
+        ["ns:d4", "bob"],
+        ["ns:d4", "carol"],
+        ["ns:d4", "dave"],
+        ["ns:d4", "erin"],
+        ["ns:d4", "frank"],
+        ["ns:d4", "grace"]
+    ]);
+    let shapes = [
+        (
+            "bound ref",
+            "?x",
+            "?x ns:tag ns:bob",
+            json!([["ns:d1"]]),
+            Lane::Any,
+        ),
+        (
+            "bound integer",
+            "?x",
+            "?x ns:val 7",
+            json!([["ns:d1"]]),
+            Lane::Any,
+        ),
+        (
+            "bound ref from a join",
+            "?b ?x",
+            "ns:alice ns:knows ?b . ?x ns:tag ?b",
+            json!([["ns:bob", "ns:d1"], ["ns:carol", "ns:d2"]]),
+            Lane::Any,
+        ),
+        (
+            "subject join",
+            "?d ?o",
+            "ns:alice ns:reads ?d . ?d ns:tag ?o",
+            tags_at_t1.clone(),
+            Lane::BatchedSubjectJoin,
+        ),
+        (
+            "optional",
+            "?d ?o",
+            "ns:alice ns:reads ?d OPTIONAL { ?d ns:tag ?o }",
+            tags_at_t1,
+            Lane::BatchedOptionalProbe,
+        ),
+    ];
+    for (name, select, body, expected, lane) in shapes {
+        let (spans, guard) = support::span_capture::init_test_tracing();
+        let rows = run_rows(&fluree, &sparql(&at_t1, select, body)).await;
+        drop(guard);
+        assert_eq!(
+            JsonValue::Array(rows),
+            expected,
+            "{strategy:?}: {name} at t=1"
+        );
+        let engaged = match lane {
+            Lane::Any => true,
+            Lane::BatchedSubjectJoin => spans.has_span("join_flush_batched_binary"),
+            Lane::BatchedOptionalProbe => spans.has_event("optional batched probe complete"),
+        };
+        assert!(
+            engaged || !indexed,
+            "{strategy:?}: {name} should answer through its batched lane; spans: {:?}",
+            spans.span_names()
+        );
+    }
+
+    let count_t1 = format!(
+        "PREFIX ns: <http://example.org/ns#>\n\
+         SELECT (COUNT(*) AS ?c) {at_t1} WHERE {{ ?x ns:tag ns:bob }}"
+    );
+    assert_eq!(
+        run_count_sparql(&fluree, &count_t1).await,
+        1,
+        "{strategy:?}: COUNT of the bound ref at t=1"
+    );
+    let jsonld_t1 = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "select": ["?x"],
+        "where": [{"@id": "?x", "ns:tag": {"@id": "ns:bob"}}]
+    });
+    assert_eq!(
+        run_jsonld_rows(&fluree, &jsonld_t1).await,
+        json!([["ns:d1"]]),
+        "{strategy:?}: JSON-LD bound ref at t=1"
+    );
+
+    // Control: the retraction still holds at t=2.
+    for (name, body) in [
+        ("bound ref", "?x ns:tag ns:bob"),
+        ("bound integer", "?x ns:val 7"),
+    ] {
+        assert!(
+            run_rows(&fluree, &sparql(&at_t2, "?x", body))
+                .await
+                .is_empty(),
+            "{strategy:?}: {name} is retracted at t=2"
+        );
+    }
+
+    // Control: a history range takes its events from the same sidecar and
+    // filters on the object after the scan. The ref's assert at t=1 and its
+    // retract at t=2.
+    let range = format!("FROM <{ledger_id}@t:1> TO <{ledger_id}@t:latest>");
+    let events = json!([["ns:d1"], ["ns:d1"]]);
+    assert_eq!(
+        JsonValue::Array(run_rows(&fluree, &sparql(&range, "?x", "?x ns:tag ns:bob")).await),
+        events,
+        "{strategy:?}: history of the bound ref"
+    );
+    let jsonld_range = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to": format!("{ledger_id}@t:latest"),
+        "select": ["?x"],
+        "where": [{"@id": "?x", "ns:tag": {"@id": "ns:bob"}}]
+    });
+    assert_eq!(
+        run_jsonld_rows(&fluree, &jsonld_range).await,
+        events,
+        "{strategy:?}: JSON-LD history of the bound ref"
+    );
+}
+
+#[tokio::test]
+async fn retracted_type_shapes_full_rebuild() {
+    assert_retracted_type_shapes(IndexStrategy::FullRebuild, "tt-type-full:main").await;
+}
+
+#[tokio::test]
+async fn retracted_type_shapes_incremental() {
+    assert_retracted_type_shapes(IndexStrategy::Incremental, "tt-type-incr:main").await;
+}
+
+#[tokio::test]
+async fn retracted_type_shapes_novelty_only() {
+    assert_retracted_type_shapes(IndexStrategy::NoveltyOnly, "tt-type-novelty:main").await;
+}
