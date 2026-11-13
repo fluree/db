@@ -3453,7 +3453,8 @@ pub struct TokenCreateArgs {
     #[arg(long, requires = "audiences")]
     pub policy_select: bool,
 
-    /// Grant access to all ledgers (fluree.events.all=true, fluree.storage.all=true)
+    /// Grant events, storage, read and write access to all ledgers. Audit
+    /// access is separate: add --audit-all
     #[arg(long)]
     pub all: bool,
 
@@ -3480,6 +3481,16 @@ pub struct TokenCreateArgs {
     /// Grant data API write access to a specific ledger (repeatable)
     #[arg(long = "write-ledger")]
     pub write_ledgers: Vec<String>,
+
+    /// Grant audit access to all ledgers (fluree.ledger.audit.all=true): raw
+    /// commits and removal and erasure details of a ledger with a removal.
+    /// Adds to read, write or storage access
+    #[arg(long)]
+    pub audit_all: bool,
+
+    /// Grant audit access to a specific ledger (repeatable)
+    #[arg(long = "audit-ledger")]
+    pub audit_ledgers: Vec<String>,
 
     /// Grant access to specific graph source (repeatable)
     #[arg(long = "graph-source")]

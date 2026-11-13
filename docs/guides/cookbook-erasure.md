@@ -139,7 +139,15 @@ A job moves through these stages:
 | `purged` | Nothing this server's storage holds contains the erased values | Done |
 | `failed` | A commit could not be proved. Nothing of the job was published | See [Troubleshooting](#troubleshooting) |
 
-The requester, the affected commits and `lastError` are audit data. They appear only when the request carries a token with the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [claim](../security/authentication.md#scope-claims), even on a server that does not require authentication. Any other reader sees stages, retries and timings. `fluree token create` has no flag for the audit claims: issue the token from your identity provider or your own signer.
+The requester, the affected commits and `lastError` are audit data. They appear only when the request carries a token with the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [claim](../security/authentication.md#scope-claims), even on a server that does not require authentication. Any other reader sees stages, retries and timings.
+
+Mint one with [`fluree token create`](../cli/token.md):
+
+```bash
+fluree token create --private-key @~/.fluree/key --read-ledger people:main --audit-ledger people:main
+```
+
+The server must trust the token's issuer. A server that runs without data authentication reads the token only for its audit grant, and still needs the issuer listed: start it with `--data-auth-trusted-issuer <did:key>`.
 
 Treat `published` as "no reader can get the value from this server" and `purged` as "this server's disk no longer has it".
 

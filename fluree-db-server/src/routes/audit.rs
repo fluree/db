@@ -40,6 +40,35 @@ pub(crate) async fn require_audit_of_every_branch(
     require_audit_reaching(state, headers, ledger, granted, true).await
 }
 
+/// The principal of the request's bearer token, when it verifies, whether or
+/// not the route's extractor read it.
+async fn presented_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<crate::extract::DataPrincipal> {
+    let token = crate::extract::extract_bearer_token(headers)?;
+    crate::extract::verify_data_principal(&token, state)
+        .await
+        .ok()
+}
+
+/// Whether the caller may see `ledger`'s audit data in a status answer.
+/// `principal` is the route's own; without one, a bearer token its extractor
+/// ignored (data auth off) counts, as in [`require_audit`].
+pub(crate) async fn may_audit(
+    state: &AppState,
+    headers: &HeaderMap,
+    principal: Option<&crate::extract::DataPrincipal>,
+    ledger: &LedgerId,
+) -> bool {
+    match principal {
+        Some(principal) => principal.can_audit(ledger),
+        None => presented_principal(state, headers)
+            .await
+            .is_some_and(|principal| principal.can_audit(ledger)),
+    }
+}
+
 async fn require_audit_reaching(
     state: &AppState,
     headers: &HeaderMap,
@@ -57,12 +86,7 @@ async fn require_audit_reaching(
             continue;
         }
         if bearer.is_none() {
-            bearer = Some(match crate::extract::extract_bearer_token(headers) {
-                Some(token) => crate::extract::verify_data_principal(&token, state)
-                    .await
-                    .ok(),
-                None => None,
-            });
+            bearer = Some(presented_principal(state, headers).await);
         }
         if bearer
             .as_ref()

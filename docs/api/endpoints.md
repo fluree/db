@@ -3077,7 +3077,7 @@ GET /retention/{ledger-id}
 
 `active` is `false` (and `registration` absent) for a ledger that never wrote a lifetime or configured one. `maintenanceRunning` and `overdue` describe the node that answers: in a cluster, ask the leader.
 
-A ledger with [history retention](../transactions/history-retention.md#status) also reports `registration.journal`: its `f:noHistory` rules and removals, never the removed values. `removals` counts the journal's removals. The removals themselves, and each [erasure](../transactions/permanent-erasure.md#status) job's requester, commits, properties and last error, are audit data: they are shown only to a token with the `fluree.ledger.audit.*` permission for the ledger. Other readers get the counts, stages and timings.
+A ledger with [history retention](../transactions/history-retention.md#status) also reports `registration.journal`: its `f:noHistory` rules and removals, never the removed values. `removals` counts the journal's removals. The removals themselves, and each [erasure](../transactions/permanent-erasure.md#status) job's requester, commits, properties and last error, are audit data: they are shown only to a token with the `fluree.ledger.audit.*` permission for the ledger, on a server without data authentication too (see [audit scopes](../security/authentication.md#scope-claims)). Other readers get the counts, stages and timings.
 
 **Status Codes:**
 - `200 OK` - Ledger found

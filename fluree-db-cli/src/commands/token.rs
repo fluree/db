@@ -40,6 +40,10 @@ struct TokenPermissions<'a> {
     write_all: bool,
     /// Ledgers for data API write access.
     write_ledgers: &'a [String],
+    /// Audit access to all ledgers.
+    audit_all: bool,
+    /// Ledgers for audit access.
+    audit_ledgers: &'a [String],
     /// Graph sources for access.
     graph_sources: &'a [String],
 }
@@ -61,6 +65,8 @@ pub fn run(action: TokenAction) -> CliResult<()> {
                 read_ledgers: &args.read_ledgers,
                 write_all: args.write_all,
                 write_ledgers: &args.write_ledgers,
+                audit_all: args.audit_all,
+                audit_ledgers: &args.audit_ledgers,
                 graph_sources: &args.graph_sources,
             };
             run_create(
@@ -103,6 +109,20 @@ fn run_create(
             "no permissions granted; use --all, --events-ledger, --storage-ledger, --read-ledger/--read-all, --write-ledger/--write-all, or --graph-source".into(),
         ));
     }
+    // A server refuses a token with no data access before it reads an audit
+    // grant.
+    if (permissions.audit_all || !permissions.audit_ledgers.is_empty())
+        && !permissions.all
+        && permissions.storage_ledgers.is_empty()
+        && !permissions.read_all
+        && permissions.read_ledgers.is_empty()
+        && !permissions.write_all
+        && permissions.write_ledgers.is_empty()
+    {
+        return Err(CliError::Usage(
+            "an audit grant adds to data access; also use --read-ledger/--read-all, --write-ledger/--write-all, --storage-ledger, or --all".into(),
+        ));
+    }
     // Verification drops a scope that is not a ledger id, so it would grant
     // nothing; refuse it now rather than mint a token that silently lacks it.
     for scope in permissions
@@ -111,6 +131,7 @@ fn run_create(
         .chain(permissions.storage_ledgers)
         .chain(permissions.read_ledgers)
         .chain(permissions.write_ledgers)
+        .chain(permissions.audit_ledgers)
         .chain(permissions.graph_sources)
     {
         fluree_db_api::LedgerId::parse(scope).map_err(|e| CliError::Usage(e.to_string()))?;
@@ -162,43 +183,7 @@ fn run_create(
         claims["fluree.identity"] = json!(id);
     }
 
-    if permissions.policy_select {
-        claims["fluree.policy"] = json!("request");
-    }
-
-    // Events permissions
-    if permissions.all {
-        claims["fluree.events.all"] = json!(true);
-        claims["fluree.storage.all"] = json!(true);
-        claims["fluree.ledger.read.all"] = json!(true);
-        claims["fluree.ledger.write.all"] = json!(true);
-    }
-
-    if !permissions.events_ledgers.is_empty() {
-        claims["fluree.events.ledgers"] = json!(permissions.events_ledgers);
-    }
-
-    if !permissions.storage_ledgers.is_empty() {
-        claims["fluree.storage.ledgers"] = json!(permissions.storage_ledgers);
-    }
-
-    // Data API permissions
-    if permissions.read_all {
-        claims["fluree.ledger.read.all"] = json!(true);
-    }
-    if !permissions.read_ledgers.is_empty() {
-        claims["fluree.ledger.read.ledgers"] = json!(permissions.read_ledgers);
-    }
-    if permissions.write_all {
-        claims["fluree.ledger.write.all"] = json!(true);
-    }
-    if !permissions.write_ledgers.is_empty() {
-        claims["fluree.ledger.write.ledgers"] = json!(permissions.write_ledgers);
-    }
-
-    if !permissions.graph_sources.is_empty() {
-        claims["fluree.events.graph_sources"] = json!(permissions.graph_sources);
-    }
+    grant(&mut claims, &permissions);
 
     // Create JWS
     let token = create_jws(&claims, &signing_key)?;
@@ -238,6 +223,53 @@ fn run_create(
     }
 
     Ok(())
+}
+
+/// Write the claims `permissions` grants into `claims`.
+fn grant(claims: &mut serde_json::Value, permissions: &TokenPermissions<'_>) {
+    if permissions.policy_select {
+        claims["fluree.policy"] = json!("request");
+    }
+
+    // Events permissions
+    if permissions.all {
+        claims["fluree.events.all"] = json!(true);
+        claims["fluree.storage.all"] = json!(true);
+        claims["fluree.ledger.read.all"] = json!(true);
+        claims["fluree.ledger.write.all"] = json!(true);
+    }
+
+    if !permissions.events_ledgers.is_empty() {
+        claims["fluree.events.ledgers"] = json!(permissions.events_ledgers);
+    }
+
+    if !permissions.storage_ledgers.is_empty() {
+        claims["fluree.storage.ledgers"] = json!(permissions.storage_ledgers);
+    }
+
+    // Data API permissions
+    if permissions.read_all {
+        claims["fluree.ledger.read.all"] = json!(true);
+    }
+    if !permissions.read_ledgers.is_empty() {
+        claims["fluree.ledger.read.ledgers"] = json!(permissions.read_ledgers);
+    }
+    if permissions.write_all {
+        claims["fluree.ledger.write.all"] = json!(true);
+    }
+    if !permissions.write_ledgers.is_empty() {
+        claims["fluree.ledger.write.ledgers"] = json!(permissions.write_ledgers);
+    }
+    if permissions.audit_all {
+        claims["fluree.ledger.audit.all"] = json!(true);
+    }
+    if !permissions.audit_ledgers.is_empty() {
+        claims["fluree.ledger.audit.ledgers"] = json!(permissions.audit_ledgers);
+    }
+
+    if !permissions.graph_sources.is_empty() {
+        claims["fluree.events.graph_sources"] = json!(permissions.graph_sources);
+    }
 }
 
 fn run_keygen(format: KeyFormat, output_path: Option<PathBuf>) -> CliResult<()> {
@@ -696,6 +728,14 @@ fn print_pretty_inspect(
         println!("Storage ledgers: {ledgers}");
     }
 
+    for (scope, label) in [("read", "Read"), ("write", "Write"), ("audit", "Audit")] {
+        if payload.get(format!("fluree.ledger.{scope}.all")) == Some(&json!(true)) {
+            println!("{:<16}{} (all)", format!("{label}:"), "✓".green());
+        } else if let Some(ledgers) = payload.get(format!("fluree.ledger.{scope}.ledgers")) {
+            println!("{label} ledgers: {ledgers}");
+        }
+    }
+
     println!("\n{}", "=== Verification ===".bold());
     if verify_requested {
         if verified {
@@ -850,6 +890,8 @@ mod tests {
                 read_ledgers: &read,
                 write_all: false,
                 write_ledgers: &[],
+                audit_all: false,
+                audit_ledgers: &[],
                 graph_sources: &[],
             },
             TokenOutputFormat::Token,
@@ -857,6 +899,81 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("'mydb@t:5'"), "{err}");
+    }
+
+    fn permissions<'a>(read: &'a [String], audit: &'a [String]) -> TokenPermissions<'a> {
+        TokenPermissions {
+            policy_select: false,
+            all: false,
+            events_ledgers: &[],
+            storage_ledgers: &[],
+            read_all: false,
+            read_ledgers: read,
+            write_all: false,
+            write_ledgers: &[],
+            audit_all: false,
+            audit_ledgers: audit,
+            graph_sources: &[],
+        }
+    }
+
+    #[test]
+    fn an_audit_grant_is_written_only_when_asked_for() {
+        let ledger = ["mydb:main".to_string()];
+        let mut claims = json!({});
+        grant(&mut claims, &permissions(&ledger, &ledger));
+        assert_eq!(claims["fluree.ledger.audit.ledgers"], json!(ledger));
+        assert!(claims.get("fluree.ledger.audit.all").is_none(), "{claims}");
+
+        let mut claims = json!({});
+        grant(
+            &mut claims,
+            &TokenPermissions {
+                audit_all: true,
+                ..permissions(&ledger, &[])
+            },
+        );
+        assert_eq!(claims["fluree.ledger.audit.all"], json!(true));
+
+        let mut claims = json!({});
+        grant(
+            &mut claims,
+            &TokenPermissions {
+                all: true,
+                ..permissions(&[], &[])
+            },
+        );
+        assert_eq!(claims["fluree.ledger.read.all"], json!(true));
+        assert!(
+            claims
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|claim| !claim.starts_with("fluree.ledger.audit")),
+            "--all leaves audit access out: {claims}"
+        );
+    }
+
+    #[test]
+    fn an_audit_grant_without_data_access_is_refused_at_mint() {
+        let ledger = ["mydb:main".to_string()];
+        let err = run_create(
+            "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "1h",
+            TokenClaims {
+                subject: None,
+                audiences: &[],
+                identity: None,
+            },
+            TokenPermissions {
+                events_ledgers: &ledger,
+                ..permissions(&[], &ledger)
+            },
+            TokenOutputFormat::Token,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("adds to data access"), "{err}");
     }
 
     #[test]

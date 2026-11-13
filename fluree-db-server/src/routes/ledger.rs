@@ -9,7 +9,7 @@ use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, set_span_error_code,
 };
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::wire::{
@@ -1185,6 +1185,7 @@ pub async fn erase_occurrences_tail(
 pub async fn retention_status_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
+    headers: HeaderMap,
     bearer: MaybeDataBearer,
 ) -> Result<Response> {
     let data_auth = state.config.data_auth();
@@ -1205,7 +1206,7 @@ pub async fn retention_status_tail(
         .retention_status(&ledger)
         .await
         .map_err(ServerError::Api)?;
-    let audits = bearer.0.as_ref().is_some_and(|p| p.can_audit(&scope));
+    let audits = crate::routes::audit::may_audit(&state, &headers, bearer.0.as_ref(), &scope).await;
     let status = if audits {
         status
     } else {
