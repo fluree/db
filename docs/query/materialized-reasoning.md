@@ -189,7 +189,7 @@ what may answer:
 | `default` | An index whose head is at exactly the queried commit; query-time reasoning otherwise. |
 | `exact` | As `default`, but a query-time run that hits a budget, or whose OWL 2 RL pass fails, is an error rather than an incomplete result. |
 | `strict` | Only an index whose head is at exactly the queried commit. Waits briefly for one, then fails (408). Never reasons at query time. |
-| `asOf` | For a query of the branch's current state, the newest retained generation at or before its commit, computed before no graph drop since (a drop takes a graph out as of every earlier `t`, and a generation holds what the graph held). The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none, and for a policy-restricted caller when the newest is older than its commit. |
+| `asOf` | For a query of the branch's current state, the newest retained generation at or before its commit, computed before no graph drop since (a drop takes a graph out as of every earlier `t`, and a generation holds what the graph held) and at no commit a [targeted removal](../transactions/history-retention.md#targeted-removal) covers. The **whole query** reads that generation's commit, and the response reports it (`basisT`, `basisCommit`). Falls back to `default` when there is none, and for a policy-restricted caller when the newest is older than its commit. |
 
 ## Storage and retention
 
@@ -249,7 +249,10 @@ that branch reason at query time.
 A [targeted removal](../transactions/history-retention.md#targeted-removal)
 discards nothing. A reasoning query of an earlier point counts as reading
 every property, so it is refused when a removal covers that point, whichever
-generation would have answered it.
+generation would have answered it. A query of the current state under `asOf`
+is not answered from a generation built at a commit a removal covers, since
+the generation holds the removed value as current: it reasons at query time
+until a refresh publishes a generation after the removal.
 
 Engine semantics version 4 rebuilds generations from earlier engines, including
 ones whose incremental closure could have treated derived schema as new rules.

@@ -1120,6 +1120,68 @@ async fn as_of_reads_the_whole_query_at_the_generation_basis() {
     );
 }
 
+/// A generation holds every fact its basis held, so `asOf` does not answer
+/// from one built while an occurrence since removed was current: that would
+/// read the removed value back as current state. It reasons at query time
+/// until a generation after the removal is published.
+#[tokio::test]
+async fn as_of_does_not_answer_from_a_generation_a_removal_reaches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "reasoning-indexes/as-of-removal:main";
+    let ledger = school(&fluree, id).await;
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+        )
+        .await
+        .unwrap();
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    let emails = with(
+        json!({"@context": ctx(), "select": "?e", "reasoning": "owl2rl",
+            "where": {"@id": "ex:alice", "ex:email": "?e"}}),
+        "reasoningFreshness",
+        json!("asOf"),
+    );
+    let (before, served) = rows(&fluree, id, &emails).await;
+    assert!(served.is_some());
+    assert_eq!(before, vec![json!("a@secret")]);
+
+    fluree
+        .remove_occurrences(
+            id,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let (after, served) = rows(&fluree, id, &emails).await;
+    assert_eq!(after, Vec::<JsonValue>::new());
+    assert!(served.is_none(), "{served:?}");
+
+    // The people query reads nothing removed, but a generation is not
+    // known by what a query reads of it.
+    let as_of = with(people_query(), "reasoningFreshness", json!("asOf"));
+    let (_, served) = rows(&fluree, id, &as_of).await;
+    assert!(served.is_none(), "{served:?}");
+
+    published(fluree.refresh_reasoning_index(id, &index).await.unwrap());
+    let (after, served) = rows(&fluree, id, &emails).await;
+    assert_eq!(after, Vec::<JsonValue>::new());
+    assert_eq!(served.map(|s| s.basis_t), Some(3));
+}
+
 /// The SPARQL pragma carries freshness as the JSON-LD key does.
 #[tokio::test]
 async fn the_sparql_freshness_pragma_is_honored() {

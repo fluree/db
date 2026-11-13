@@ -242,8 +242,10 @@ impl Fluree {
 
     /// The newest retained generation of an index whose basis is on the line
     /// of the view's commit at or before `db`'s `t`, computed under `settled`,
-    /// and before no drop `db` records: a generation holds what a graph held
-    /// at its basis, which a later drop takes out as of every `t`.
+    /// before no drop `db` records, and at no point a removal took an
+    /// occurrence out of: a generation holds what a graph held at its basis,
+    /// which a later drop takes out as of every `t`, and a removal out of
+    /// every read as of a `t` the occurrence was current at.
     #[cfg(not(target_arch = "wasm32"))]
     async fn as_of_generation(
         &self,
@@ -274,20 +276,36 @@ impl Fluree {
         )
         .await?;
         let line = super::build::Line::walk(branch_store.as_ref(), view_commit, oldest_t).await?;
-        Ok(generations
-            .into_iter()
-            .find(|g| {
-                g.manifest.basis.t <= db.t
-                    && g.manifest.basis.epoch >= entry.floor
-                    && &g.manifest.settled == settled
-                    && line.on_line(&g.manifest.basis)
-                    && db
-                        .snapshot
-                        .graph_registry
-                        .dropped_after(g.manifest.basis.t)
-                        .is_empty()
-            })
-            .map(|g| (g.manifest_id, g.manifest.basis.t)))
+        for g in generations {
+            let basis = &g.manifest.basis;
+            let eligible = basis.t <= db.t
+                && basis.epoch >= entry.floor
+                && &g.manifest.settled == settled
+                && line.on_line(basis)
+                && db.snapshot.graph_registry.dropped_after(basis.t).is_empty();
+            if eligible && !self.removed_as_of(&db.ledger_id, basis.t).await? {
+                return Ok(Some((g.manifest_id, basis.t)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether a read of everything on `ledger_id` as of `t` would need an
+    /// occurrence a removal took out. A generation holds every fact of its
+    /// basis, so answering from one is such a read.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn removed_as_of(&self, ledger_id: &str, t: i64) -> Result<bool> {
+        use crate::retention::suppression::{HistoricalRead, Reads};
+        let read = HistoricalRead {
+            to_t: t,
+            from_t: None,
+            reads: || Reads::Everything,
+        };
+        match self.refuse_suppressed_history(ledger_id, read).await {
+            Ok(()) => Ok(false),
+            Err(ApiError::HistoryUnavailable(_)) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     /// Walking an index's generations needs the native indexer: a wasm build
