@@ -76,7 +76,11 @@ fluree iceberg map orders \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
-For a catalog-backed source, `info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. The count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`, and its class and property counts are `null`. A count that metadata cannot give exactly but can bound is `null`, with a `count-upper-bound` beside it: the true count is at most that. A triples map narrowed by a [row filter](#row-filters-rrsqlquery) keeps only some of its table's rows, so each class and property it contributes to reports the sum of the contributing tables' row counts as the bound (absent when one of them is unknown), and its per-datatype counts are `null`.
+`info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. For a catalog-backed source the count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A Direct (`--table-location`) source reads each table's metadata file and reports its summary's `total-records`, or no count when the writer left it out. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`.
+
+A class or property `count` for a graph source means one thing: the exact number, as a native ledger loaded with the mapping's triples would report it. Where the metadata cannot prove the number, `count` is `null`, and `count-upper-bound` beside it gives the most it can be when that is provable. A class count is exact when every triples map minting the class reads its whole table (no [row filter](#row-filters-rrsqlquery)) under a row count that is not a merge-on-read bound, mints one distinct subject per row (its subject is built from a [key](r2rml.md#declaring-a-tables-keys-fkey) of the table, and no subject column can be null), and the maps provably mint different subjects (of any two subject templates, neither one's text before its first placeholder begins the other's). A property count is exact under the same conditions, when also no row mints one value of the property twice and the object column can never be null. "Can never be null" means the column is `required` in the table's schema, for format version 2 or older tables (from version 3 a required column can be added with a default that older files do not store). Otherwise the bound is the sum of the contributing tables' row counts, absent when one of them is unknown. A reference (`rr:parentTriplesMap`) is never counted exactly, because a child key may match no parent row: it is bounded by the child's rows when one join key value can match at most one parent subject (the parent's subject is built from the join columns, or they hold a key of the parent's table), and has no bound when one value can match several parents. Its `ref-classes` entries are `null`, with the bound under `ref-classes-upper-bound`. Per-datatype counts are the exact count or `null`.
+
+**Reading a virtual count.** Earlier releases reported the contributing tables' row counts as `count`. Now most classes and properties of a mapping that declares no key have `count: null`, since a count is exact only for maps whose subjects a key proves unique. A client that displays a count shows `count` when it is a number, else `count-upper-bound` as "at most N", else "not counted"; it never reads a `null` as 0. A `ref-classes` entry reads the same way, with its bound under `ref-classes-upper-bound`. Fluree's own MCP data-model summary does this. Declaring the tables' keys ([`f:key`](r2rml.md#declaring-a-tables-keys-fkey)) makes the counts of maps over unfiltered tables exact again.
 
 #### Warehouse-root `--table-location` (multi-table, catalog-less)
 
@@ -583,7 +587,7 @@ What else changes for a filtered map:
 
 - A `COUNT` over it scans the data files, because the manifest row-count shortcut cannot know which rows a filter keeps.
 - A reference into it (`rr:parentTriplesMap`) joins the rows the filter keeps. A child row whose key names an excluded row has no reference, in the browse crawl too.
-- In `info` / `/info`, its class and property counts are `null`, with `count-upper-bound` reporting the most they can be.
+- In `info` / `/info`, its class and property counts are `null`, with `count-upper-bound` reporting the most they can be, even when the map declares a key: no metadata knows how many rows the filter keeps.
 - [Tracking materialization](#tracking-keep-the-target-fresh-automatically) (`/iceberg/materialize`, `/iceberg/track`) refuses a mapping with any `rr:sqlQuery` logical table. A row that stops matching the `WHERE` (say, `is_current` going from 1 to 0) is never read again, so the subject it produced would never be retracted. Build a [native twin](#materializing-a-native-twin) with `fluree materialize` instead, and rebuild it to refresh.
 - Delta sources refuse `rr:sqlQuery`; [SQL sources](sql.md#rrsqlquery) hand any query to their engine.
 
@@ -1453,6 +1457,10 @@ Mapping a source compiles the R2RML mapping (a mapping that does not parse or co
 | `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
 | `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
 | `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
+| `columnNotFound` | `error` | `f:key on 'sales.orders' names column 'order_key', which the table does not have.` A declared key's column, checked as a query checks it (see [R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)). |
+| `casingMismatch` | `error` | `f:key on 'sales.orders' names column 'ORDER_ID', which the schema spells 'order_id'; a key column must match exactly.` |
+| `nonKeyTypeSkipped` | `error` | `f:key on 'sales.orders' names column 'score' of type Float64; a floating-point value cannot identify a row (NaN is unequal to itself).` Also for a nested column. |
+| `keylessMap` | `advisory` | `TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, so queries over it remove repeated solutions as they run. …` One per map that neither an `f:key` nor the table's identifier fields prove subject-unique; it names the `f:key` that would. Informational: queries answer correctly, but more slowly (see [R2RML → Slow Queries](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Registration (`POST /iceberg/map`, `fluree iceberg map`) reports the same advisories in its `diagnostics`. |
 
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 
@@ -1463,6 +1471,15 @@ At query time a column the table does not have is read like a NULL: the triples 
 Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
+
+**After an upgrade, a `COUNT`, a same-subject star or an `ORDER BY … LIMIT`
+got slower, or a query now fails with `MemoryBudgetExceeded`.** The most
+likely cause is a map with no key: neither an `f:key` nor the table's
+identifier fields prove its subjects unique, so its queries remove repeated
+solutions as they read. Registration and `POST /iceberg/r2rml/validate` name
+each such map (`keylessMap`). See
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)
+for how to confirm it per query and how to declare the key.
 
 **Causes:**
 - Large result sets

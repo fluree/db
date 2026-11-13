@@ -43,6 +43,7 @@ use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use fluree_db_r2rml::TableKeys;
 
 use lower::{block_is_admissible, literal_len, lower_block, Decline, LowerInput, Lowered};
 use terms::{seed_values, Materializer};
@@ -55,7 +56,7 @@ use union::{UnionLayout, UNION_ALIAS};
 /// as one key. That is exactly right here: the set exists to avoid sending the
 /// same key twice, and two keys that render identically are the same key.
 #[derive(Clone)]
-struct SeedKey(Vec<Literal>);
+pub(super) struct SeedKey(pub(super) Vec<Literal>);
 
 impl SeedKey {
     fn hash_literal<H: std::hash::Hasher>(l: &Literal, state: &mut H) {
@@ -333,10 +334,30 @@ pub(super) async fn resolve_block(
             })
         };
     let mut schemas: HashMap<RelSource, Arc<BatchSchema>> = HashMap::new();
-    for src in lower::candidate_sources(patterns, ctx.active_snapshot, &mapping) {
-        if let Some(schema) = table_provider.source_schema(iri, &src).await? {
-            schemas.insert(src, schema);
+    let sources = lower::candidate_sources(patterns, ctx.active_snapshot, &mapping);
+    for src in &sources {
+        if let Some(schema) = table_provider.source_schema(iri, src).await? {
+            schemas.insert(src.clone(), schema);
         }
+    }
+    // What proves a map's rows cannot repeat a subject: each reachable
+    // table's keys, declared and reported. A key the source refuses (one its
+    // table cannot hold) fails the query rather than being trusted.
+    let mut keys: HashMap<String, TableKeys> = HashMap::new();
+    let mut maps: Vec<&fluree_db_r2rml::mapping::TriplesMap> =
+        mapping.triples_maps.values().collect();
+    maps.sort_by(|a, b| a.iri.cmp(&b.iri));
+    for tm in maps {
+        let Some(table) = tm.table_name() else {
+            continue;
+        };
+        if keys.contains_key(table) || !sources.contains(&lower::source_of_tm(tm)) {
+            continue;
+        }
+        let table_keys =
+            crate::r2rml::effective_table_keys(table_provider, &mapping, iri, table, as_of_t)
+                .await?;
+        keys.insert(table.to_string(), table_keys);
     }
     let lowered = lower_block(LowerInput {
         patterns,
@@ -347,6 +368,7 @@ pub(super) async fn resolve_block(
         policy: verdicts.is_some().then_some(&mut verdict),
         schemas: &schemas,
         projection,
+        keys: &keys,
     })?;
     let lowered = match lowered {
         Err(Decline(why)) => {
@@ -758,7 +780,13 @@ impl SqlBlockSource {
                             Some((key, s.ascending()))
                         })
                         .collect();
-                    if let Some(keys) = keys {
+                    // A statement removing repeated solutions is a SELECT
+                    // DISTINCT, which orders only by what it selects.
+                    let selected = |keys: &[(OrderKey, bool)]| {
+                        !lowered.dedupes
+                            || !keys.iter().any(|(k, _)| matches!(k, OrderKey::Expr(_)))
+                    };
+                    if let Some(keys) = keys.filter(|k| selected(k)) {
                         order_by = keys;
                         limit = Some(*k as u64);
                     }

@@ -1030,17 +1030,11 @@ pub(crate) async fn eval_metadata_call_async<R: RowAccess>(
 }
 
 /// True for the metadata functions that read graph flakes and so must be
-/// policy-filtered (`labels`/`keys`/`properties`/`type`/`startNode`/`endNode`).
+/// policy-filtered (`labels`/`keys`/`properties`/`type`/`startNode`/`endNode`):
+/// the functions that read the dataset, less full-text scoring and the
+/// unknown function.
 pub(crate) fn is_metadata_function(func: &Function) -> bool {
-    matches!(
-        func,
-        Function::Labels
-            | Function::Keys
-            | Function::Properties
-            | Function::RelType
-            | Function::StartNode
-            | Function::EndNode
-    )
+    func.reads_dataset() && !matches!(func, Function::Fulltext | Function::Custom(_))
 }
 
 fn comparable_opt_to_binding(v: Option<ComparableValue>) -> Result<Binding> {

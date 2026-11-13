@@ -404,17 +404,22 @@ impl EncObj {
     /// `Sid`, built by the same `materialized_object_binding` the fallback
     /// scan uses for these rows. The decode runs once per row that
     /// *survives* the join, not per row scanned.
+    ///
+    /// Under eager materialization (`emit.decoded`) it is always the decoded
+    /// binding.
     fn to_binding(self, emit: &Emit) -> Result<Binding> {
-        if let Some(binding) = late_materialized_object_binding(
-            self.o_type,
-            self.o_key,
-            self.p_id,
-            0,
-            u32::MAX,
-            None,
-            emit.arena_graph,
-        ) {
-            return Ok(binding);
+        if !emit.decoded {
+            if let Some(binding) = late_materialized_object_binding(
+                self.o_type,
+                self.o_key,
+                self.p_id,
+                0,
+                u32::MAX,
+                None,
+                emit.arena_graph,
+            ) {
+                return Ok(binding);
+            }
         }
         let Some(view) = emit.view.as_ref() else {
             return Err(QueryError::Internal(
@@ -509,14 +514,18 @@ impl<'c, 'a> MemberRead<'c, 'a> {
 /// over one graph or several (a union's term view decodes them later).
 struct Emit {
     /// Decodes the string-dictionary objects that have no encoded form
-    /// (EncodedObject mode only). Strings are ledger-wide, so any member's
-    /// view serves a union.
+    /// (EncodedObject mode), and every binding under eager materialization.
+    /// Strings and subject ids are ledger-wide, so any member's view serves
+    /// a union.
     view: Option<BinaryGraphView>,
     /// The graph an arena handle (a big number, a vector) is numbered in:
     /// the one graph's, and none over several graphs, which decline arena
     /// objects while loading; one that reached emit would fail to decode
     /// rather than read another member's arena.
     arena_graph: GraphId,
+    /// The caller asked for eager materialization: every binding leaves
+    /// decoded, as the scan emits them.
+    decoded: bool,
 }
 
 impl Emit {
@@ -524,6 +533,7 @@ impl Emit {
         Self {
             view: None,
             arena_graph: fluree_db_core::NO_ARENA_GRAPH,
+            decoded: false,
         }
     }
 }
@@ -1462,23 +1472,26 @@ impl CyclicBgpOperator {
         ctx: &ExecutionContext<'_>,
         reads: &mut [MemberRead<'_, '_>],
     ) -> Result<bool> {
+        // Emit-side decoder: same view construction as
+        // `ExecutionContext::one_graph_view`, against the first graph the
+        // relation scans below read (strings and subject ids are
+        // ledger-wide). The encoded mode decodes string-dictionary objects
+        // through it, and an eager caller is owed every binding decoded, as
+        // the scan emits them.
+        self.emit.decoded = ctx.eager_materialization;
+        if self.emit.decoded || matches!(self.join_mode, CyclicJoinMode::EncodedObject) {
+            let member = &reads[0].member;
+            self.emit.view = Some(
+                member
+                    .store()
+                    .graph_with_novelty(member.g_id(), ctx.dict_novelty.clone())
+                    .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                    .with_tracker(ctx.tracker.clone()),
+            );
+        }
         match self.join_mode {
             CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx, reads),
-            CyclicJoinMode::EncodedObject => {
-                // Emit-side decoder for string-dictionary objects: same view
-                // construction as `ExecutionContext::one_graph_view`, against
-                // the first graph the relation scans below read (strings are
-                // ledger-wide).
-                let member = &reads[0].member;
-                self.emit.view = Some(
-                    member
-                        .store()
-                        .graph_with_novelty(member.g_id(), ctx.dict_novelty.clone())
-                        .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-                        .with_tracker(ctx.tracker.clone()),
-                );
-                self.open_encoded_fast_path(ctx, reads)
-            }
+            CyclicJoinMode::EncodedObject => self.open_encoded_fast_path(ctx, reads),
         }
     }
 
@@ -1537,9 +1550,10 @@ impl CyclicBgpOperator {
     /// every edge). With novelty present, probing stays allowed when every
     /// edge's resolved ops are mergeable (empty → `None`, non-empty →
     /// `Some(ops)` merged per probed subject); any unmergeable edge
-    /// (translation failure, novelty-only predicate), or eager materialization,
-    /// disables probes for the cascade — full scans, which merge through the
-    /// overlay cursor, are unaffected. Historical snapshots keep probes off:
+    /// (translation failure, novelty-only predicate) disables probes for the
+    /// cascade — full scans, which merge through the overlay cursor, are
+    /// unaffected. An eager caller is admitted like any other: every row the
+    /// operator emits is decoded for it at emit. Historical snapshots keep probes off:
     /// the seek reads latest base state with no replay.
     fn compute_probe_overlay_state(
         &self,
@@ -1556,7 +1570,8 @@ impl CyclicBgpOperator {
         let mut ops_per_edge = Vec::with_capacity(n);
         for edge in self.plan.edges.iter() {
             let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-            match subject_probe_lane_plan(read.ctx, store, &pred_sid, LaneOutput::Encoded)? {
+            match subject_probe_lane_plan(read.ctx, store, &pred_sid, LaneOutput::DecodesForEager)?
+            {
                 ProbeLanePlan::Clean => ops_per_edge.push(None),
                 ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
                 ProbeLanePlan::Decline => {
@@ -2656,7 +2671,7 @@ impl CyclicBgpOperator {
     /// appear in subject position bind as plain `EncodedSid` (matching the
     /// scan path); object-only vars rebuild the late-materialized binding
     /// (decoding non-reserved string-dict values through the emit view).
-    /// Over several graphs both decode, as the members' scans do there.
+    /// Under eager materialization every var binds decoded.
     fn assignment_to_columns(
         &self,
         assignment: &[EncObj],
@@ -2666,10 +2681,11 @@ impl CyclicBgpOperator {
             let var = self.plan.vars[var_idx];
             let value = assignment[var_idx];
             let binding = if self.var_is_subject(var) {
-                let s_id = value
-                    .ref_s_id()
-                    .expect("subject-positioned cyclic vars only bind refs");
-                Binding::encoded_sid(s_id)
+                self.ref_binding(
+                    value
+                        .ref_s_id()
+                        .expect("subject-positioned cyclic vars only bind refs"),
+                )?
             } else {
                 value.to_binding(&self.emit)?
             };
@@ -2809,10 +2825,23 @@ impl CyclicBgpOperator {
         cols: &mut [Vec<Binding>],
     ) -> Result<()> {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
-            let s_id = assignment[var_idx];
-            cols[out_idx].push(Binding::encoded_sid(s_id));
+            cols[out_idx].push(self.ref_binding(assignment[var_idx])?);
         }
         Ok(())
+    }
+
+    fn ref_binding(&self, s_id: u64) -> Result<Binding> {
+        if !self.emit.decoded {
+            return Ok(Binding::encoded_sid(s_id));
+        }
+        let Some(view) = self.emit.view.as_ref() else {
+            return Err(QueryError::Internal(
+                "cyclic bgp emit: a decoded ref binding requires a graph view".into(),
+            ));
+        };
+        view.resolve_subject_sid(s_id)
+            .map(Binding::sid)
+            .map_err(|e| QueryError::from_io("cyclic bgp emit: resolve_subject_sid", e))
     }
 
     fn next_ref_batch(&mut self) -> Result<Option<Batch>> {

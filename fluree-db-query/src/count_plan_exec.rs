@@ -3817,6 +3817,7 @@ fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Resul
                 ec.store,
                 ec.g_id,
                 p_id,
+                (ec.ctx.to_t < ec.store.max_t()).then_some(ec.ctx.to_t),
                 &ec.ctx.tracker,
             )? {
                 return Ok(None);
