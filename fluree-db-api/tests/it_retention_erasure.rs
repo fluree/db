@@ -3522,6 +3522,237 @@ async fn an_erased_geometry_is_purged_by_a_rebuild() {
     );
 }
 
+/// The `t` of each commit `ledger_id`'s head reaches, through every parent,
+/// that still states `value`.
+async fn commits_stating(fluree: &Fluree, ledger_id: &str, value: &str) -> Vec<i64> {
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut next: Vec<ContentId> = record.commit_head_id.iter().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut stating = Vec::new();
+    while let Some(cid) = next.pop() {
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
+        let commit = load_commit_by_id(store.as_ref(), &cid).await.unwrap();
+        if commit
+            .flakes
+            .iter()
+            .any(|f| f.o == FlakeValue::String(value.into()))
+        {
+            stating.push(commit.t);
+        }
+        next.extend(commit.parents);
+    }
+    stating.sort_unstable();
+    stating
+}
+
+/// `name` with a branch that wrote `ex:alice`'s email `a@secret`, in a
+/// signed commit when `key` is given; merged into `main` without
+/// fast-forwarding, and dropped. With `kept`, `main` wrote an email of its
+/// own and the merge kept that one: nothing on its line states the secret.
+async fn merged_from_a_dropped_branch(
+    fluree: &Fluree,
+    name: &str,
+    kept: bool,
+    key: Option<Arc<ed25519_dalek::SigningKey>>,
+) -> String {
+    let main = ledger(fluree, name).await;
+    let feature = format!("{name}:feature");
+    insert(
+        fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:base", "ex:n": 0}),
+    )
+    .await;
+    fluree
+        .create_branch(name, "feature", None, None)
+        .await
+        .unwrap();
+    let mut opts = fluree_db_api::CommitOpts::default();
+    if let Some(key) = key {
+        opts = opts.with_signing_key(key);
+    }
+    fluree
+        .graph(&feature)
+        .transact()
+        .insert(&json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}))
+        .commit_opts(opts)
+        .commit()
+        .await
+        .expect("insert");
+    let on_main = match kept {
+        true => json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@kept"}),
+        false => json!({"@context": ctx(), "@id": "ex:m", "ex:n": 1}),
+    };
+    insert(fluree, &main, on_main).await;
+    let strategy = match kept {
+        true => ConflictStrategy::TakeBranch,
+        false => ConflictStrategy::default(),
+    };
+    let merged = fluree
+        .merge_branch(name, "feature", Some("main"), strategy)
+        .await
+        .expect("merge");
+    assert!(!merged.fast_forward);
+    fluree.drop_branch(name, "feature").await.expect("drop");
+    main
+}
+
+/// How many operations on `ledger_id`'s own line state `value`.
+async fn stated_on_the_line(fluree: &Fluree, ledger_id: &str, value: &str) -> usize {
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let mut stated = 0;
+    for (_, cid) in chain(fluree, ledger_id).await {
+        let commit = load_commit_by_id(store.as_ref(), &cid).await.unwrap();
+        stated += commit
+            .flakes
+            .iter()
+            .filter(|f| f.o == FlakeValue::String(value.into()))
+            .count();
+    }
+    stated
+}
+
+/// A merge that does not fast-forward leaves the merged branch's commits in
+/// the target's folder, off its own line, and they stay when that branch is
+/// dropped. An erasure of a fact on the target redacts them too, whether
+/// the merge brought the value onto the target's line or kept the target's
+/// own.
+#[tokio::test]
+async fn an_erasure_reaches_the_commits_a_merge_left_of_a_dropped_branch() {
+    use std::time::Duration;
+
+    for (name, kept) in [("it/erase-merged", false), ("it/erase-merged-kept", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+        let main = merged_from_a_dropped_branch(&fluree, name, kept, None).await;
+        assert!(
+            !commits_stating(&fluree, &main, "a@secret").await.is_empty(),
+            "{name}: fixture"
+        );
+        assert_eq!(
+            stated_on_the_line(&fluree, &main, "a@secret").await == 0,
+            kept,
+            "{name}: fixture"
+        );
+
+        publish_erasure(&fluree, &main, email("alice", "a@secret")).await;
+        assert_eq!(
+            commits_stating(&fluree, &main, "a@secret").await,
+            Vec::<i64>::new(),
+            "{name}"
+        );
+        let report = fluree.run_purge_pass(&main, Duration::ZERO).await.unwrap();
+        assert_eq!(report.purged, 1, "{name}: {report:?}");
+        assert_eq!(
+            files_holding(dir.path(), "a@secret"),
+            Vec::<std::path::PathBuf>::new(),
+            "{name}"
+        );
+        assert_eq!(
+            objects(&fluree, &main, "ex:base", "ex:n").await,
+            vec![json!(0)],
+            "{name}"
+        );
+    }
+}
+
+/// A commit's signature is made for the branch it was written on. Once that
+/// branch is dropped its id is not known, the signature cannot be checked,
+/// and the erasure is refused, not left half done. A branch made again
+/// under the name lets it through.
+#[tokio::test]
+async fn an_erasure_of_a_dropped_branchs_signed_commit_needs_the_branchs_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let name = "it/erase-merged-signed";
+    let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+    let main = merged_from_a_dropped_branch(&fluree, name, false, Some(key)).await;
+    let refused = fluree
+        .erase_occurrences(&main, email("alice", "a@secret"), None)
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.status_code(), 422, "{refused}");
+    assert!(refused.to_string().contains("signature"), "{refused}");
+
+    fluree
+        .create_branch(name, "feature", None, None)
+        .await
+        .expect("the name again");
+    let feature = format!("{name}:feature");
+    fluree
+        .erase_occurrences(&main, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    for branch in [&main, &feature] {
+        reindex(&fluree, branch).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&main).await.unwrap().published, 1);
+    assert_eq!(
+        commits_stating(&fluree, &main, "a@secret").await,
+        Vec::<i64>::new()
+    );
+}
+
+/// The same through a second merge: a branch merged into one that is then
+/// merged on, with both its merges off the last target's line.
+#[tokio::test]
+async fn an_erasure_reaches_commits_two_merges_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let name = "it/erase-merged-twice";
+    let main = ledger(&fluree, name).await;
+    let (dev, feature) = (format!("{name}:dev"), format!("{name}:feature"));
+    let plain = |id: &str| json!({"@context": ctx(), "@id": id, "ex:n": 1});
+    insert(&fluree, &main, plain("ex:base")).await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    insert(&fluree, &dev, plain("ex:dev")).await;
+    fluree
+        .create_branch(name, "feature", Some("dev"), None)
+        .await
+        .unwrap();
+    insert(
+        &fluree,
+        &feature,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    insert(&fluree, &dev, plain("ex:dev-again")).await;
+    fluree
+        .merge_branch(name, "feature", Some("dev"), ConflictStrategy::default())
+        .await
+        .expect("merge into dev");
+    fluree.drop_branch(name, "feature").await.expect("drop");
+    insert(&fluree, &main, plain("ex:main")).await;
+    fluree
+        .merge_branch(name, "dev", Some("main"), ConflictStrategy::default())
+        .await
+        .expect("merge into main");
+
+    fluree
+        .erase_occurrences(&main, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    for branch in [&main, &dev] {
+        reindex(&fluree, branch).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&main).await.unwrap().published, 1);
+    for branch in [&main, &dev] {
+        assert_eq!(
+            commits_stating(&fluree, branch, "a@secret").await,
+            Vec::<i64>::new(),
+            "{branch}"
+        );
+    }
+}
+
 /// A rebase begun after an erasure is accepted would write the occurrence
 /// again in commits the erasure does not name: it is refused, and the
 /// erasure publishes against the branch's own line.

@@ -88,6 +88,13 @@ Accepting a request does the following, in order:
    assertion takes the retraction that ended it, and a retraction takes the assertion it ended. Both
    carry the value. The removal's own retraction commits contain the value too, so they are erased as
    well.
+   A merge that does not fast-forward leaves the merged branch's commits in the target's folder, off
+   the target's own line, and they stay there when that branch is dropped. A fact selected with
+   `matching` is erased from those commits too, on every branch that reaches them. An occurrence named
+   by commit and slot is that operation alone, and must be on the branch's own line: select the fact
+   to reach a merged branch's commits. A signed commit of a branch dropped since cannot have its
+   signature checked, because the signature was made for that branch's id; the request is refused
+   with `422` after the removal, and goes through once a branch exists under that name again.
 2. **An authorization commit.** A control commit records the request ID, the requester, a SHA-256 of
    the manifest and the [signature mode](#signatures) in its txn-meta (`f:erasureRequest`,
    `f:erasureRequester`, `f:erasureManifest`, `f:erasureSignatures`). It records no value, and anchors

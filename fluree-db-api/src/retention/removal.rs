@@ -561,6 +561,17 @@ impl Fluree {
     }
 }
 
+/// An operation a request selects in a commit off a branch's own line: see
+/// [`Fluree::located_off_the_line`].
+#[cfg(feature = "native")]
+pub(crate) struct OffTheLine {
+    pub(crate) occurrence: OccurrenceRef,
+    /// Its commit's `t`, on the line it was written on.
+    pub(crate) t: i64,
+    /// Its property's IRI, where the branch decodes it.
+    pub(crate) property: Option<String>,
+}
+
 /// A ledger's history as a removal reads it, as of its head.
 struct History {
     ledger_id: String,
@@ -935,6 +946,76 @@ impl Fluree {
             };
             let found = locate(&read, request, widening)?;
             return Ok(found.located.into_iter().map(|l| l.occurrence).collect());
+        }
+        Err(ApiError::commit_contention(
+            ATTEMPTS,
+            ApiError::internal("the head kept moving while the erasure was checked"),
+        ))
+    }
+
+    /// The operations `request`'s selectors match in the commits
+    /// `ledger_id` reaches only through a merge's other parent: a merged
+    /// branch's, which a merge copies into its folder and which stay there
+    /// when that branch is dropped. They are no part of the branch's own
+    /// line, so no removal covers them and nothing it serves reads them;
+    /// an erasure still has to redact them.
+    pub(crate) async fn located_off_the_line(
+        &self,
+        ledger_id: &str,
+        request: &RemovalRequest,
+    ) -> Result<Vec<OffTheLine>> {
+        if request.matching.is_empty() {
+            return Ok(Vec::new());
+        }
+        for _ in 0..ATTEMPTS {
+            let Some(read) = self.read_history(ledger_id, None).await? else {
+                continue;
+            };
+            // A selector naming an IRI this branch never saw matches
+            // nothing it holds.
+            let selectors: Vec<_> = request
+                .matching
+                .iter()
+                .filter_map(|sel| selector_terms(&read.state.snapshot, sel).ok())
+                .collect();
+            if selectors.is_empty() {
+                return Ok(Vec::new());
+            }
+            let on_the_line: HashSet<&ContentId> =
+                read.commits.iter().map(|(_, cid, _)| cid).collect();
+            let mut next: Vec<ContentId> = read
+                .commits
+                .iter()
+                .flat_map(|(_, _, commit)| commit.parents.iter().skip(1).cloned())
+                .collect();
+            let mut seen: HashSet<ContentId> = HashSet::new();
+            let mut found = Vec::new();
+            while let Some(cid) = next.pop() {
+                if on_the_line.contains(&cid) || !seen.insert(cid.clone()) {
+                    continue;
+                }
+                let commit = load_commit_by_id(read.store.as_ref(), &cid).await?;
+                for (slot, flake) in commit.occurrences() {
+                    let selected = selectors.iter().any(|(g, s, p, o)| {
+                        flake.g == *g
+                            && flake.s == *s
+                            && flake.p == *p
+                            && o.as_ref().is_none_or(|o| o.matches(flake))
+                    });
+                    if selected {
+                        found.push(OffTheLine {
+                            occurrence: OccurrenceRef {
+                                commit: cid.to_string(),
+                                slot,
+                            },
+                            t: commit.t,
+                            property: read.state.snapshot.decode_sid(&flake.p),
+                        });
+                    }
+                }
+                next.extend(commit.parents);
+            }
+            return Ok(found);
         }
         Err(ApiError::commit_contention(
             ATTEMPTS,

@@ -17,7 +17,7 @@ use fluree_db_nameservice::{DroppedLedger, DroppedState, NsRecord, Versioned};
 use super::{CommitErasure, ErasureJob, ErasureStage, SignatureMode};
 use crate::retention::registry;
 use crate::retention::removal::{
-    FactSelector, OccurrenceRef, RemovalReceipt, RemovalRequest, Widening,
+    FactSelector, OccurrenceRef, OffTheLine, RemovalReceipt, RemovalRequest, Widening,
 };
 use crate::retention::writer::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
 use crate::{ApiError, Fluree, Result};
@@ -116,9 +116,15 @@ impl Fluree {
         // No branch is made while a request is accepted: one made before is
         // removed from, one made after inherits the removal.
         let _admission = runtime.admission.write().await;
-        let mut branches: Vec<String> = ns
-            .branch_records(ledger_id.name())
-            .await?
+        let records = ns.branch_records(ledger_id.name()).await?;
+        // A dropped branch's commits may be among those a merge left in
+        // another's folder, signed for the dropped branch's id.
+        let dropped: Vec<String> = records
+            .iter()
+            .filter(|r| r.retracted)
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        let mut branches: Vec<String> = records
             .into_iter()
             .filter(|r| !r.retracted && r.ledger_id != ledger_id)
             .map(|r| r.ledger_id.to_string())
@@ -130,10 +136,23 @@ impl Fluree {
             occurrences: request.occurrences.clone(),
             matching: request.matching.clone(),
         };
+        // What the requested branch reaches off its own line. Facts it
+        // holds only there (written and retracted on a branch merged in
+        // since) are no part of what it serves, and are erased all the same.
+        let off_the_line = self
+            .located_off_the_line(ledger_id.as_str(), &removal_request)
+            .await?;
+        let only_off_the_line = !off_the_line.is_empty() && removal_request.occurrences.is_empty();
         // Before anything is removed: a triple term spelling a value would
         // keep it readable, on any ledger holding its commits.
-        self.refuse_spelled(&ledger_id, &branches, &removal_request)
-            .await?;
+        self.refuse_spelled(
+            &ledger_id,
+            &branches,
+            &removal_request,
+            &off_the_line,
+            only_off_the_line,
+        )
+        .await?;
         // A cluster erases once every member runs a release that reads
         // erasure's commands and checks its writes against collection, which
         // purges what it publishes. Collection is for good, so only a
@@ -152,7 +171,7 @@ impl Fluree {
             &branches,
             &removal_request,
             requester.as_deref(),
-            true,
+            (true, only_off_the_line),
             &mut removed,
         )
         .await?;
@@ -190,7 +209,7 @@ impl Fluree {
                     &copies,
                     &named,
                     requester.as_deref(),
-                    false,
+                    (false, false),
                     &mut removed,
                 )
                 .await?;
@@ -236,11 +255,34 @@ impl Fluree {
                 &appeared,
                 &removal_request,
                 requester.as_deref(),
-                false,
+                (false, false),
                 &mut removed,
             )
             .await?;
             branches.extend(appeared);
+        }
+        // The same facts in commits each branch reaches only through a
+        // merge's other parent: a merged branch's commits, kept in the
+        // branch's folder after that branch is dropped. A removal reads a
+        // branch's own line and never meets them.
+        let mut off_the_line = Some(off_the_line);
+        for branch in &branches {
+            let located = match off_the_line.take() {
+                Some(of_the_requested) => of_the_requested,
+                None => self.located_off_the_line(branch, &removal_request).await?,
+            };
+            for found in located {
+                let entry = removed
+                    .found
+                    .entry((found.occurrence.commit, found.occurrence.slot))
+                    .or_insert((found.t, Vec::new()));
+                if !entry.1.contains(branch) {
+                    entry.1.push(branch.clone());
+                }
+                removed
+                    .properties
+                    .insert(found.property.unwrap_or_default());
+            }
         }
         let Accepted {
             found,
@@ -290,7 +332,11 @@ impl Fluree {
             return Ok(receipt_of(&job, manifest, removals));
         }
 
-        let commits = self.commits_to_erase(&ledger_id, &found, &branches).await?;
+        let mut signed_for = branches.clone();
+        signed_for.extend(dropped);
+        let commits = self
+            .commits_to_erase(&ledger_id, &found, &signed_for)
+            .await?;
         let (authorized_t, authorized_commit) = self
             .authorize_erasure(
                 writer,
@@ -348,14 +394,16 @@ impl Fluree {
     }
 
     /// Remove `request` on each of `branches`, the first of them the
-    /// requested one when `requested`, recording what each removed.
+    /// requested one when `requested`, recording what each removed. The
+    /// requested one may hold nothing of it on its own line when
+    /// `may_hold_nothing`.
     async fn remove_on(
         &self,
         writer: &dyn RetentionWriter,
         branches: &[String],
         request: &RemovalRequest,
         requester: Option<&str>,
-        requested: bool,
+        (requested, may_hold_nothing): (bool, bool),
         into: &mut Accepted,
     ) -> Result<()> {
         let Accepted {
@@ -376,7 +424,12 @@ impl Fluree {
             {
                 Ok(removed) => removed,
                 // Nothing of the request on this other branch.
-                Err(e) if !requested && (e.is_not_found() || e.status_code() == 404) => continue,
+                Err(e)
+                    if (!requested || may_hold_nothing)
+                        && (e.is_not_found() || e.status_code() == 404) =>
+                {
+                    continue
+                }
                 Err(e) => return Err(e),
             };
             for (occ, t) in removed.receipt.manifest.iter().zip(&removed.manifest_t) {
@@ -407,8 +460,11 @@ impl Fluree {
         ledger_id: &LedgerId,
         branches: &[String],
         request: &RemovalRequest,
+        off_the_line: &[OffTheLine],
+        only_off_the_line: bool,
     ) -> Result<()> {
-        let mut occurrences: Vec<OccurrenceRef> = Vec::new();
+        let mut occurrences: Vec<OccurrenceRef> =
+            off_the_line.iter().map(|o| o.occurrence.clone()).collect();
         for (i, branch) in branches.iter().enumerate() {
             let widening = Widening {
                 pair_spans: true,
@@ -417,7 +473,9 @@ impl Fluree {
             };
             match self.located_occurrences(branch, request, widening).await {
                 Ok(found) => occurrences.extend(found),
-                Err(e) if i > 0 && (e.is_not_found() || e.status_code() == 404) => {}
+                Err(e)
+                    if (i > 0 || only_off_the_line)
+                        && (e.is_not_found() || e.status_code() == 404) => {}
                 Err(e) => return Err(e),
             }
         }
