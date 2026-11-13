@@ -770,19 +770,55 @@ impl Fluree {
     /// The config a governed virtual source presents to `wrap_policy` (see
     /// `graph_source::r2rml::source_resolved_config`); `None` when the record
     /// sets neither a model ledger nor a `default-allow`.
-    pub(crate) fn graph_source_model_config(
+    ///
+    /// A governed source honors its model's override control: the model
+    /// ledger's own resolved `f:overrideControl` for its policy defaults
+    /// governs whether a request may replace the source's policy defaults, as
+    /// a native ledger's does for it. A model that sets none leaves the
+    /// default (overrides allowed). No other model setting is taken.
+    pub(crate) async fn graph_source_model_config(
+        &self,
         record: &fluree_db_nameservice::GraphSourceRecord,
-    ) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
+    ) -> Result<Option<fluree_db_core::ledger_config::ResolvedConfig>> {
         #[cfg(feature = "iceberg")]
         {
             let (model, default_allow) = crate::graph_source::r2rml::policy_config_of(record);
-            crate::graph_source::r2rml::source_resolved_config(model.as_deref(), default_allow)
+            let mut config =
+                crate::graph_source::r2rml::source_resolved_config(model.as_deref(), default_allow);
+            if let (Some(model), Some(policy)) = (
+                model.as_deref(),
+                config.as_mut().and_then(|c| c.policy.as_mut()),
+            ) {
+                policy.override_control = Box::pin(self.model_override_control(model)).await?;
+            }
+            Ok(config)
         }
         #[cfg(not(feature = "iceberg"))]
         {
             let _ = record;
-            None
+            Ok(None)
         }
+    }
+
+    /// The override control the model ledger `model` configures for its
+    /// policy defaults, resolved at its head as for any query of it. A model
+    /// that is not a ledger yet resolves to the default: the source's policy
+    /// cannot be read from it either, so a governed request fails there.
+    #[cfg(feature = "iceberg")]
+    async fn model_override_control(
+        &self,
+        model: &str,
+    ) -> Result<fluree_db_core::ledger_config::OverrideControl> {
+        let view = match self.db(model).await {
+            Ok(view) => view,
+            Err(e) if e.is_not_found() => return Ok(Default::default()),
+            Err(e) => return Err(e),
+        };
+        Ok(view
+            .resolved_config()
+            .and_then(|config| config.policy.as_ref())
+            .map(|policy| policy.override_control.clone())
+            .unwrap_or_default())
     }
 
     /// Validate a graph source's `--model` reference at registration and
@@ -949,7 +985,7 @@ impl Fluree {
         // The default graph routes to the virtual provider and uses its model
         // configuration. Shared graph selection removes both when selecting an
         // empty system graph, for fragments and explicit dataset selectors alike.
-        db.resolved_config = Self::graph_source_model_config(&record);
+        db.resolved_config = self.graph_source_model_config(&record).await?;
         db.graph_source_id = Some(gs_id.to_string().into());
         db.graph_source_time = graph_source_time;
         db.over_graph_source = true;
