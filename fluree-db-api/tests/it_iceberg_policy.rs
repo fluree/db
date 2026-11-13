@@ -2146,10 +2146,10 @@ async fn override_surfaces(
 ) -> Vec<(&'static str, Result<usize, String>)> {
     use fluree_db_api::{GovernanceOptions, PolicyContext, PolicyWrapper, QueryExecutionOptions};
     let pattern = json!({ "@id": "?s", "ex:name": "?n" });
-    let execution = QueryExecutionOptions {
-        server_identity: caller.server.map(fluree_db_api::VerifiedIdentity::new),
-        ..Default::default()
-    };
+    let mut execution = QueryExecutionOptions::default();
+    if let Some(server) = caller.server {
+        execution = execution.with_server_identity(fluree_db_api::VerifiedIdentity::new(server));
+    }
     let jsonld = |mut q: Value| {
         let execution = execution.clone();
         async move {
