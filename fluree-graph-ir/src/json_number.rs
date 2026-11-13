@@ -31,8 +31,8 @@ impl JsonNumber {
         let f = n.as_f64()?;
         Some(if f.fract() != 0.0 || f.abs() >= 1e21 {
             JsonNumber::Double(f)
-        } else if f.abs() < 9_223_372_036_854_775_808.0 {
-            // Exact: an integral double below 2^63. `-0.0` is `0`.
+        } else if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
+            // Exact: an integral double in i64's range. `-0.0` is `0`.
             JsonNumber::Integer(f as i64)
         } else {
             JsonNumber::BigInteger(format!("{f:.0}"))
@@ -66,6 +66,11 @@ mod tests {
         assert_eq!(read("1e3"), Integer(1000));
         assert_eq!(read("-0e0"), Integer(0));
         assert_eq!(read("-9223372036854775808"), Integer(i64::MIN));
+        assert_eq!(read("-9223372036854775808.0"), Integer(i64::MIN));
+        assert_eq!(
+            read("9223372036854775808.0"),
+            BigInteger("9223372036854775808".into())
+        );
         assert_eq!(read("2.5"), Double(2.5));
         assert_eq!(read("1e21"), Double(1e21));
         assert_eq!(
