@@ -169,7 +169,14 @@ struct RefShortcut {
 ///   a composite render could transpose columns. Refused for the MVP (auto-
 ///   generated Iceberg mappings are single-column FK → PK); composite falls back
 ///   to the scan, which stays authoritative.
+/// - the parent's logical table is an `rr:sqlQuery`, which may keep only some of
+///   its table's rows: a FK to a row the query excludes is not "dangling" (the
+///   relaxation above), it names a subject the mapping does not emit, and only
+///   the parent scan knows which rows those are.
 fn build_ref_shortcut(parent_tm: &TriplesMap, rom: &RefObjectMap) -> Option<RefShortcut> {
+    if parent_tm.sql_query().is_some() {
+        return None;
+    }
     let sm = &parent_tm.subject_map;
     if sm.column.is_some() || sm.constant.is_some() || !sm.generates_iri() {
         return None;
@@ -4198,6 +4205,18 @@ mod tests {
         assert!(
             build_ref_shortcut(&parent_bnode, &rom).is_none(),
             "blank-node subject must be refused"
+        );
+
+        // Reject: a parent over an `rr:sqlQuery`, whose WHERE may exclude the row
+        // a child's FK names.
+        let mut parent_query =
+            TriplesMap::new("#Account", "accounts").with_subject_template("http://ex/account/{id}");
+        parent_query.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(
+            "SELECT * FROM accounts WHERE is_current = 1",
+        );
+        assert!(
+            build_ref_shortcut(&parent_query, &rom).is_none(),
+            "a query-backed parent must keep the parent scan"
         );
     }
 
