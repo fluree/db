@@ -958,7 +958,9 @@ impl Fluree {
     /// branch's, which a merge copies into its folder and which stay there
     /// when that branch is dropped. They are no part of the branch's own
     /// line, so no removal covers them and nothing it serves reads them;
-    /// an erasure still has to redact them.
+    /// an erasure still has to redact them. Their terms read as the
+    /// branch's own do: a merge is refused when the two sides' namespace
+    /// allocations conflict.
     pub(crate) async fn located_off_the_line(
         &self,
         ledger_id: &str,

@@ -128,6 +128,8 @@ On a ledger whose journal records a removal, raw content is audit data: its comm
 
 Ordinary read, history, export and storage scopes do not imply audit access. On ledgers without a removal, these reads keep their usual permissions; an `f:noHistory` rule alone does not change them.
 
+A query peer that reads through the storage proxy therefore needs an audit claim on its token once a ledger it serves has a removal. Until it has one, it refuses the removed history like any other reader, from the journal alone, and any query that needs a blob it has not cached fails with an error that names the refused read. Give its token the claim to restore service.
+
 ## Clusters
 
 The journal travels through the normal nameservice replication channel. Configuration revisions accompany record updates and reconnect snapshots, including changes that do not move a commit head. A node serves the journal it has learned: current queries, historical queries, packs, exports and storage-proxy reads make no leader round trip. A partitioned or lagging node may therefore serve history removed elsewhere until replication delivers the change.

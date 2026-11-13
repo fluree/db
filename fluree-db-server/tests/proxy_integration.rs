@@ -4295,6 +4295,127 @@ async fn test_proxy_peer_forwards_removal_and_erasure() {
     server_handle.abort();
 }
 
+/// A peer that was serving a ledger before its first removal holds no audit
+/// access yet: the server refuses it the removal's commit. That tells the
+/// peer nothing of whether the ledger holds the commit, so the removal
+/// applies, and the history its caches hold is refused as soon as it
+/// learns of the journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_without_audit_access_refuses_removed_history() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let post = |path: &'static str, body: serde_json::Value| {
+        let request = client
+            .post(format!("{server_url}/v1/fluree/{path}"))
+            .header("content-type", "application/json")
+            .body(body.to_string());
+        async move { request.send().await.expect("request").status() }
+    };
+    let email = |value: &str| serde_json::json!({"@id": "http://example.org/alice", "http://example.org/email": value});
+    assert_eq!(
+        post("create", serde_json::json!({"ledger": "peerlate:main"})).await,
+        reqwest::StatusCode::CREATED
+    );
+    assert!(post("insert/peerlate:main", email("a@x"))
+        .await
+        .is_success());
+    assert!(post("upsert/peerlate:main", email("a@y"))
+        .await
+        .is_success());
+    // Indexed, so the peer answers from what it has cached, with no
+    // commit to fetch.
+    let reindexed = post("reindex", serde_json::json!({"ledger": "peerlate:main"})).await;
+    assert!(reindexed.is_success(), "{reindexed}");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+    let at_t1 = || {
+        let app = peer_app.clone();
+        async move {
+            let body = serde_json::json!({
+                "from": "peerlate:main@t:1",
+                "select": ["?o"],
+                "where": {
+                    "@id": "http://example.org/alice",
+                    "http://example.org/email": "?o"
+                }
+            });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/fluree/query")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+    let (status, json) = at_t1().await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, serde_json::json!([["a@x"]]));
+
+    // The value is no longer current: the removal commits nothing, and the
+    // peer has every commit it needs already.
+    let remove = serde_json::json!({"matching": [{
+        "subject": "http://example.org/alice",
+        "predicate": "http://example.org/email",
+        "object": "a@x"
+    }]});
+    assert!(post("remove/peerlate:main", remove).await.is_success());
+
+    // Within the peer's refresh interval, not for as long as the ledger
+    // stays quiet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (status, json) = at_t1().await;
+        if status != StatusCode::OK {
+            assert_eq!(status, StatusCode::GONE, "{json}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer kept serving the removed value: {json}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    server_handle.abort();
+}
+
 /// A peer reads a ledger's removal journal through the storage proxy: a
 /// time-travel query that could see a removed value is refused there as on
 /// the server, and every other one answers. Without the journal the peer

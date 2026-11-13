@@ -233,8 +233,20 @@ enum FetchOutcome {
     Success(Vec<u8>),
     /// Server returned 406 Not Acceptable (format not available)
     NotAcceptable,
+    /// Server returned 403: this token may not read the object. A read
+    /// reports it as absent; whether it exists is not known.
+    Refused,
     /// Fetch failed with an error
     Error(CoreError),
+}
+
+/// What the server answered for an object asked for whole.
+enum Object {
+    Found(Bytes),
+    Absent,
+    /// 403: this token may not read it. A read reports it as absent;
+    /// whether it exists is not known.
+    Refused,
 }
 
 impl ProxyStorage {
@@ -380,6 +392,24 @@ impl ProxyStorage {
     /// `Vec<u8>` convert at their own boundary — a cache layer that keeps
     /// the bytes resident (the browser peer) takes the [`Bytes`] directly.
     pub async fn read_object_bytes(&self, address: &str) -> Result<Bytes> {
+        match self.object(address).await? {
+            Object::Found(bytes) => Ok(bytes),
+            Object::Absent => Err(CoreError::not_found(address)),
+            Object::Refused => Err(Self::refused_read(address)),
+        }
+    }
+
+    /// A read the server refused: not found, as an object outside the
+    /// token's scope reads (no existence leak), and saying why, since the
+    /// usual cause is one an operator fixes.
+    fn refused_read(address: &str) -> CoreError {
+        CoreError::not_found(format!(
+            "{address} (the server refused it to this peer's token; a ledger with removed \
+             history serves its storage only to a token with audit access)"
+        ))
+    }
+
+    async fn object(&self, address: &str) -> Result<Object> {
         let (cid, ledger) = cid_and_ledger_from_address(address).ok_or_else(|| {
             CoreError::storage(format!("Cannot derive CID from address: {address}"))
         })?;
@@ -395,9 +425,9 @@ impl ProxyStorage {
 
         let status = response.status;
         match status {
-            StatusCode::OK => Self::verified(address, &cid, &response),
-            // 403 → NotFound parity with the server's no-existence-leak behavior
-            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Err(CoreError::not_found(address)),
+            StatusCode::OK => Self::verified(address, &cid, &response).map(Object::Found),
+            StatusCode::NOT_FOUND => Ok(Object::Absent),
+            StatusCode::FORBIDDEN => Ok(Object::Refused),
             StatusCode::UNAUTHORIZED => Err(CoreError::storage(format!(
                 "Storage proxy authentication failed for {address}: check token validity"
             ))),
@@ -415,12 +445,22 @@ impl ProxyStorage {
     /// Tries `application/x-fluree-flakes` first. If the server returns 406
     /// (format not available for this block type), falls back to raw bytes.
     async fn fetch_prefer_flakes(&self, address: &str) -> Result<Vec<u8>> {
+        match self.fetch_negotiated(address).await {
+            FetchOutcome::Success(bytes) => Ok(bytes),
+            FetchOutcome::Refused => Err(Self::refused_read(address)),
+            FetchOutcome::NotAcceptable => Err(CoreError::storage(format!(
+                "Storage proxy: octet-stream also rejected for {address}"
+            ))),
+            FetchOutcome::Error(e) => Err(e),
+        }
+    }
+
+    async fn fetch_negotiated(&self, address: &str) -> FetchOutcome {
         // Try flakes format first
         match self
             .fetch_with_accept(address, "application/x-fluree-flakes")
             .await
         {
-            FetchOutcome::Success(bytes) => Ok(bytes),
             FetchOutcome::NotAcceptable => {
                 // 406 = not a leaf or policy filtering not applicable
                 // Fall back to raw bytes
@@ -428,21 +468,11 @@ impl ProxyStorage {
                     address = %address,
                     "Flakes format not available, falling back to raw bytes"
                 );
-                match self
-                    .fetch_with_accept(address, "application/octet-stream")
+                // Should not happen for octet-stream; the caller reports it.
+                self.fetch_with_accept(address, "application/octet-stream")
                     .await
-                {
-                    FetchOutcome::Success(bytes) => Ok(bytes),
-                    FetchOutcome::NotAcceptable => {
-                        // Should not happen for octet-stream, but handle anyway
-                        Err(CoreError::storage(format!(
-                            "Storage proxy: octet-stream also rejected for {address}"
-                        )))
-                    }
-                    FetchOutcome::Error(e) => Err(e),
-                }
             }
-            FetchOutcome::Error(e) => Err(e),
+            other => other,
         }
     }
 
@@ -500,10 +530,7 @@ impl ProxyStorage {
             StatusCode::UNAUTHORIZED => FetchOutcome::Error(CoreError::storage(format!(
                 "Storage proxy authentication failed for {address}: check token validity"
             ))),
-            StatusCode::FORBIDDEN => {
-                // Address not in token scope - treat as not found (no existence leak)
-                FetchOutcome::Error(CoreError::not_found(address))
-            }
+            StatusCode::FORBIDDEN => FetchOutcome::Refused,
             s if s.is_server_error() => FetchOutcome::Error(CoreError::io(format!(
                 "Storage proxy server error for {address}: {status}"
             ))),
@@ -635,14 +662,32 @@ impl StorageRead for ProxyStorage {
         }
     }
 
+    /// A try-read. An object this token may not read is not thereby
+    /// absent, though a read reports it so: the server refuses a ledger's
+    /// commits to a token without audit access once it has removed history,
+    /// and a caller asking whether the ledger holds a commit must not be
+    /// told it does not.
     async fn exists(&self, address: &str) -> Result<bool> {
-        // In v1, implement exists as try-read
-        // This is correct but slightly less efficient than a HEAD request
-        // The server currently only supports POST for blocks anyway
-        match self.read_bytes(address).await {
-            Ok(_) => Ok(true),
-            Err(CoreError::NotFound(_)) => Ok(false),
-            Err(e) => Err(e),
+        let refused = || {
+            CoreError::storage(format!(
+                "Storage proxy refused {address} to this token; whether it exists is not known"
+            ))
+        };
+        match self.mode {
+            ProxyReadMode::Raw => match self.object(address).await? {
+                Object::Found(_) => Ok(true),
+                Object::Absent => Ok(false),
+                Object::Refused => Err(refused()),
+            },
+            ProxyReadMode::Filtered => match self.fetch_negotiated(address).await {
+                FetchOutcome::Success(_) => Ok(true),
+                FetchOutcome::Refused => Err(refused()),
+                FetchOutcome::Error(CoreError::NotFound(_)) => Ok(false),
+                FetchOutcome::Error(e) => Err(e),
+                FetchOutcome::NotAcceptable => Err(CoreError::storage(format!(
+                    "Storage proxy: octet-stream also rejected for {address}"
+                ))),
+            },
         }
     }
 
@@ -824,6 +869,40 @@ mod tests {
             err.to_string().contains("Integrity verification failed"),
             "got: {err}"
         );
+    }
+
+    /// A refused object is absent to a read and unknown to an existence
+    /// check, in either read mode; one the server does not have is absent
+    /// to both.
+    #[tokio::test]
+    async fn a_refused_object_is_not_reported_as_absent() {
+        let payload = b"x".to_vec();
+        let id = ContentId::new(ContentKind::Txn, &payload);
+        let address = fluree_db_core::content_address(
+            "file",
+            ContentKind::Txn,
+            &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+            &id.address_digest(),
+        );
+        for mode in [ProxyReadMode::Raw, ProxyReadMode::Filtered] {
+            let answering = |status| {
+                ProxyStorage::from_api_base_with_transport(
+                    "http://origin.example/v1/fluree".to_string(),
+                    "tok".to_string(),
+                    mode,
+                    CannedTransport::new(status, Vec::new()),
+                )
+            };
+            let refused = answering(StatusCode::FORBIDDEN);
+            assert!(matches!(
+                refused.read_bytes(&address).await,
+                Err(CoreError::NotFound(_))
+            ));
+            let unknown = refused.exists(&address).await.expect_err("unknown");
+            assert!(!matches!(unknown, CoreError::NotFound(_)), "{unknown:?}");
+            let absent = answering(StatusCode::NOT_FOUND);
+            assert!(!absent.exists(&address).await.expect("absent"));
+        }
     }
 
     /// 403 maps to NotFound (no existence leak) through any transport.
