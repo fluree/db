@@ -3678,6 +3678,14 @@ pub(crate) fn for_each_object_probe_match(
     use fluree_db_binary_index::RunSortOrder;
     use std::ops::ControlFlow;
 
+    // The walk reads POST keys; a branch of another order would hand it
+    // wrong rows with no error.
+    debug_assert!(
+        store
+            .branch_for_order(ctx.binary_g_id, RunSortOrder::Post)
+            .is_some_and(|post| std::ptr::eq(&**post, branch)),
+        "bound-object probe walk handed a branch that is not the graph's POST branch"
+    );
     let (Some(&first_obj), Some(&last_obj)) = (objs.first(), objs.last()) else {
         return Ok(0);
     };
@@ -3763,22 +3771,20 @@ pub(crate) fn for_each_object_probe_match(
             if entry.p_const.is_some_and(|p| p != p_id) {
                 continue;
             }
-            // `o_type_const` and the leaflet's own keys describe its live
-            // rows; a replay can bring back a retracted row they do not cover
-            // (a mixed-type predicate whose last row of that type in the
-            // leaflet is gone), so only the leaf's routing bounds it then.
-            let in_leaflet = if needs_history_replay {
-                in_leaf.clone()
-            } else {
-                if entry.o_type_const.is_some_and(|ot| ot != o_type) {
-                    continue;
-                }
-                let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
-                let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
-                match post_o_key_bounds(&first, &last, want) {
-                    Some(bounds) => objs_within(objs, in_leaf.clone(), bounds),
-                    None => continue,
-                }
+            // `o_type_const` describes the leaflet's live rows, so a replay
+            // cannot skip by it: a retracted row keeps its own type in the
+            // sidecar (a mixed-type predicate whose last row of that type in
+            // the leaflet is gone). The leaflet's own keys span the history
+            // it keeps (both writers widen them over it, #1624), so they
+            // bound a replay as they bound a live read.
+            if !needs_history_replay && entry.o_type_const.is_some_and(|ot| ot != o_type) {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
+            let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
+            let in_leaflet = match post_o_key_bounds(&first, &last, want) {
+                Some(bounds) => objs_within(objs, in_leaf.clone(), bounds),
+                None => continue,
             };
             if in_leaflet.is_empty() || closed.all(in_leaflet.clone()) {
                 continue;
