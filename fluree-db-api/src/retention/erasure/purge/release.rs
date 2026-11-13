@@ -41,15 +41,19 @@ impl Fluree {
             .await
     }
 
-    /// Where `entry`'s index files and dictionaries are.
+    /// Where `entry`'s index files, its reasoning indexes' and its
+    /// dictionaries are.
     fn index_prefixes(&self, entry: &DroppedLedger) -> Result<Vec<String>> {
         let storage = self.erasure_runtime()?.index.address_prefix();
         let mut prefixes: Vec<String> = entry
             .branches
             .iter()
-            .map(|b| {
+            .flat_map(|b| {
                 let namespace = StorageNamespace::new(entry.root.clone(), &b.branch);
-                format!("{storage}{}/index/", namespace.branch_prefix())
+                [
+                    format!("{storage}{}/index/", namespace.branch_prefix()),
+                    format!("{storage}{}/", namespace.reasoning_prefix()),
+                ]
             })
             .collect();
         prefixes.push(format!("{storage}{}/dicts/", entry.root.shared_prefix()));
@@ -87,6 +91,16 @@ impl Fluree {
                     }
                     branch.index_t = 0;
                     changed = true;
+                }
+            }
+            // A reasoning index's generations are copies of the branch's
+            // facts: unpublished here, they are built again after a restore.
+            for document in next.reasoning_indexes.values_mut() {
+                for index in document.indexes.values_mut() {
+                    if index.head.take().is_some() {
+                        index.floor.0 += 1;
+                        changed = true;
+                    }
                 }
             }
             // Marked before anything is deleted: a restore after a crash

@@ -5533,6 +5533,7 @@ impl Fluree {
         self.expire_erasures();
         for holder in holders {
             self.disconnect_ledger(holder).await;
+            self.reasoning_index_state.forget_loaded(holder);
         }
         self.clear_decoded();
         if let Some(runtime) = self.retention.erasure.get() {

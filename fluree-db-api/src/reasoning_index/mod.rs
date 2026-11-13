@@ -327,6 +327,20 @@ impl ReasoningIndexState {
         }
     }
 
+    /// Drop every generation of `ledger_id`'s indexes loaded here.
+    pub(crate) fn forget_loaded(&self, ledger_id: &str) {
+        let mut loaded = self.loaded.lock();
+        let keys: Vec<_> = loaded
+            .0
+            .iter()
+            .filter(|((ledger, _, _), _)| ledger == ledger_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            loaded.0.pop(&key);
+        }
+    }
+
     pub(crate) fn forget_index(&self, ledger_id: &str, index_id: &ReasoningIndexId) {
         self.clear_failure(ledger_id, index_id);
         self.repairs

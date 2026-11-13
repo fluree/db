@@ -77,8 +77,10 @@ impl fmt::Debug for ReasoningIndexId {
 }
 
 /// Increases whenever a branch's readable content changes without a new
-/// commit (an erasure replacement activating). Until erasure lands on this
-/// line every branch is at epoch 0.
+/// commit: an erasure reaching it. An index counts them in its floor, which
+/// the purge of an erasure raises as it discards the index's generations,
+/// and a generation is of the epoch the floor stood at when its build
+/// began.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]

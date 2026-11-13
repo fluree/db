@@ -172,7 +172,9 @@ publishing an erasure wait for it, so the ledgers a pass purges stay those it fo
    full-text value or triple term), or is a string, JSON value or duration in a ledger with triple
    terms, which may spell it too. Full-text (BM25) and vector indexes over a holding branch that read
    an erased property (each request records the properties it erases when it is accepted) are rebuilt
-   from scratch; one that reads none of them never held the value and keeps its index. Every such
+   from scratch; one that reads none of them never held the value and keeps its index. A
+   [reasoning index](../query/materialized-reasoning.md#storage-and-durability) of a holding branch
+   is a copy of its facts: its generations are discarded, and built again at its next refresh. Every such
    index loses the files its current index does not use, which an earlier index of the same name may
    have left, and one dropped before the purge loses all of its files. A soft-dropped ledger that
    holds an erased commit has its indexes deleted, and restoring it rebuilds them before it serves.

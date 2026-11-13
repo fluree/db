@@ -236,12 +236,20 @@ a persisted retention deadline defers both sweeping and shared-dictionary
 reclamation after detaching the chain, including across restarts. This protects
 files that readers may still hold before they become eligible for collection.
 
-Serving checks the registration's erasure floor for both current and retained
-`asOf` generations. This is a serving fence, not permanent deletion. Before
-combining reasoning indexes with retention, targeted removal or permanent
-erasure from PR #2280, that implementation must include `@reasoning` artifacts
-and retained generations in its purge protocol, or gate the combination in both
-directions. This branch does not implement that cross-PR purge integration.
+Each index keeps an erasure floor. A generation records the floor its build
+began under, and one below its index's floor is neither published nor served,
+current or retained (`asOf`). The purge of a
+[permanent erasure](../transactions/permanent-erasure.md#purge) raises the floor
+of every index of each branch that holds an erased commit, unpublishes its
+head and deletes its generations, with the dictionaries only they reached. A
+build begun before the purge publishes nothing. The next refresh builds each
+index again from the branch as it now reads; until then reasoning queries on
+that branch reason at query time.
+
+A [targeted removal](../transactions/history-retention.md#targeted-removal)
+discards nothing. A reasoning query of an earlier point counts as reading
+every property, so it is refused when a removal covers that point, whichever
+generation would have answered it.
 
 Engine semantics version 4 rebuilds generations from earlier engines, including
 ones whose incremental closure could have treated derived schema as new rules.

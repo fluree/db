@@ -376,6 +376,74 @@ impl Fluree {
         Ok(removed)
     }
 
+    /// Discard every generation of the branch's reasoning indexes, as a
+    /// purge does once an erasure has reached the branch: a generation is a
+    /// copy of the branch's facts, and one built before holds what was
+    /// erased. Each index's floor is raised, so a build begun before
+    /// publishes nothing; its head is unpublished and its files deleted.
+    /// Their shared dictionary blobs are left for the sweep. The next
+    /// refresh builds each index again from the branch as it now reads.
+    /// Returns the files deleted.
+    pub(crate) async fn discard_reasoning_generations(&self, ledger_id: &str) -> Result<usize> {
+        let id = canonical_id(ledger_id)?;
+        if self.reasoning_indexes(&id).await?.indexes.is_empty() {
+            return Ok(0);
+        }
+        if self.backend().admin_storage_cloned().is_none() {
+            return Err(ApiError::internal(format!(
+                "the reasoning indexes of {id} cannot be discarded without managed storage"
+            )));
+        }
+        let record = self.branch_record(&id).await?;
+        // A build already writing finishes first, and none starts writing
+        // until the folders are gone.
+        let _hold = self
+            .reasoning_index_state
+            .hold_for_reclaim(record.ledger_id.name())
+            .await;
+        let discarded = self
+            .update_reasoning_indexes(&id, |actual| {
+                let mut next = actual.clone();
+                for entry in next.indexes.values_mut() {
+                    entry.floor = ErasureEpoch(entry.floor.0 + 1);
+                    entry.head = None;
+                }
+                let indexes: Vec<ReasoningIndexId> = next.indexes.keys().cloned().collect();
+                Ok(((!indexes.is_empty()).then_some(next), indexes))
+            })
+            .await?;
+        let deleted = self.delete_reasoning_files(&record).await?;
+        for index_id in &discarded {
+            self.reasoning_index_state.forget_index(&id, index_id);
+        }
+        Ok(deleted)
+    }
+
+    /// Delete every file of the reasoning indexes of `record`'s branch,
+    /// whatever its document says: all a dropped branch's can have done to
+    /// them, since it takes no writes. Returns the files deleted.
+    pub(crate) async fn delete_reasoning_files(&self, record: &NsRecord) -> Result<usize> {
+        let Some(storage) = self.backend().admin_storage_cloned() else {
+            return Ok(0);
+        };
+        let prefix = format!(
+            "fluree:{}://{}/",
+            storage.storage_method(),
+            record.storage_namespace().reasoning_prefix()
+        );
+        let files = storage
+            .list_prefix(&prefix)
+            .await
+            .map_err(|e| ApiError::internal(format!("list {prefix}: {e}")))?;
+        for file in &files {
+            storage
+                .delete(file)
+                .await
+                .map_err(|e| ApiError::internal(format!("delete {file}: {e}")))?;
+        }
+        Ok(files.len())
+    }
+
     /// Bring every active index of the branch up to its current commit.
     pub async fn refresh_reasoning_indexes(
         &self,
@@ -464,6 +532,15 @@ impl Fluree {
         index_id: &ReasoningIndexId,
     ) -> Result<RefreshOutcome> {
         let mut phases = Phases::new();
+        // Read before the base it is computed from: a generation is of the
+        // epoch its index's floor stood at then, so one raised since (an
+        // erasure reaching the branch) refuses it.
+        let doc = self.reasoning_indexes(ledger_id).await?;
+        let Some(entry) = doc.indexes.get(index_id) else {
+            return Err(ApiError::NotFound(format!(
+                "reasoning index {index_id} is not registered on {ledger_id}"
+            )));
+        };
         let (record, db) = self.consistent_base(ledger_id).await?;
         phases.mark("base");
         let Some(commit) = record.commit_head_id.clone() else {
@@ -474,13 +551,7 @@ impl Fluree {
         let basis = Basis {
             commit,
             t: record.commit_t,
-            epoch: ErasureEpoch::default(),
-        };
-        let doc = self.reasoning_indexes(ledger_id).await?;
-        let Some(entry) = doc.indexes.get(index_id) else {
-            return Err(ApiError::NotFound(format!(
-                "reasoning index {index_id} is not registered on {ledger_id}"
-            )));
+            epoch: entry.floor,
         };
         if !matches!(entry.registration.state, RegistrationState::Active) {
             return Ok(RefreshOutcome::Discarded {
