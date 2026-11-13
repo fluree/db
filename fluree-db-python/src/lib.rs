@@ -57,8 +57,7 @@ fn _fluree(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rdf::term_ntriples, m)?)?;
     m.add_function(wrap_pyfunction!(logging::set_log_level, m)?)?;
     m.add_function(wrap_pyfunction!(doc::read_document, m)?)?;
-    m.add_function(wrap_pyfunction!(doc::reading_turtle, m)?)?;
-    m.add_function(wrap_pyfunction!(doc::reading_context, m)?)?;
+    m.add_function(wrap_pyfunction!(doc::reading_text, m)?)?;
     logging::install();
     Ok(())
 }

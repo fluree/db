@@ -6,8 +6,12 @@
 //!   `nif:beginIndex` / `nif:endIndex` into that text and
 //!   `doc:sourceDocument` naming the document;
 //! - `xt:ontology`: the classes and properties to read for;
-//! - `xt:instances`: the catalog, records to link mentions to;
-//! - `xt:request`: optional controls, here the windows a long text is read in.
+//! - `xt:instances`: the catalog, records to link mentions to.
+//!
+//! Nothing else: the request's controls (the windows a long text is read
+//! in, what the answer holds) are the call's headers
+//! ([`super::client::Controls`]), since a reader refuses a request that
+//! sends a control both ways.
 //!
 //! A reader takes a bounded text per call and a bounded prompt per window,
 //! so a long document is cut into [`Part`]s, each one call, and a part whose
@@ -251,7 +255,7 @@ impl Structure {
         for _ in 0..6 {
             let mut requests = Vec::new();
             for part in self.plan(&limits, size)? {
-                let body = body(&self.document_graph(doc, &part), ontology, catalog, &part)?;
+                let body = body(&self.document_graph(doc, &part), ontology, catalog)?;
                 requests.push((part, body));
             }
             let largest = requests.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
@@ -443,8 +447,9 @@ impl Structure {
     }
 }
 
-/// The request body for one part, as TriG.
-pub fn body(document: &Graph, ontology: &Graph, catalog: &Graph, part: &Part) -> Result<String> {
+/// The request body for one part, as TriG: its document graph, the
+/// ontology and the catalog. The part's windows go in the call's headers.
+pub fn body(document: &Graph, ontology: &Graph, catalog: &Graph) -> Result<String> {
     let mut out = String::new();
     for (role, graph) in [
         ("document", document),
@@ -455,34 +460,6 @@ pub fn body(document: &Graph, ontology: &Graph, catalog: &Graph, part: &Part) ->
             continue;
         }
         push_graph(&mut out, role, graph)?;
-    }
-    if !part.windows.is_empty() {
-        let mut controls = Graph::new();
-        let request = Term::blank("request");
-        controls.add_triple(
-            request.clone(),
-            Term::iri(format!("{RDF_NS}type")),
-            Term::iri(format!("{ROLE_NS}Request")),
-        );
-        for (i, (b, e)) in part.windows.iter().enumerate() {
-            let w = Term::blank(format!("window{i}"));
-            controls.add_triple(
-                request.clone(),
-                Term::iri(format!("{ROLE_NS}window")),
-                w.clone(),
-            );
-            controls.add_triple(
-                w.clone(),
-                Term::iri(format!("{NIF_NS}beginIndex")),
-                Term::integer(*b as i64),
-            );
-            controls.add_triple(
-                w,
-                Term::iri(format!("{NIF_NS}endIndex")),
-                Term::integer(*e as i64),
-            );
-        }
-        push_graph(&mut out, "request", &controls)?;
     }
     Ok(out)
 }
@@ -945,15 +922,12 @@ mod tests {
         let mut catalog = Graph::new();
         catalog.add_triple(Term::blank("b0"), Term::iri("urn:p"), Term::string("c"));
         let document = Graph::new();
-        let part = Part {
-            begin: 0,
-            end: 10,
-            windows: vec![(0, 5), (5, 10)],
-        };
-        let trig = body(&document, &ontology, &catalog, &part).unwrap();
+        let trig = body(&document, &ontology, &catalog).unwrap();
         assert!(trig.contains("<https://ns.flur.ee/extract#ontology> {"));
         assert!(trig.contains("<https://ns.flur.ee/extract#instances> {"));
-        assert!(trig.contains("<https://ns.flur.ee/extract#request> {"));
+        // Controls are headers: no `xt:request` graph, no `xt:Request` node.
+        assert!(!trig.contains("extract#request"));
+        assert!(!trig.contains("extract#Request"));
         assert!(trig.contains("_:ontology_b0") && trig.contains("_:instances_b0"));
     }
 
