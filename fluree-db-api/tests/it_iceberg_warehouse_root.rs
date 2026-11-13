@@ -113,11 +113,24 @@ const TWO_SITES_R2RML: &str = r#"
             rr:predicate ex:name ;
             rr:objectMap [ rr:column "name" ]
         ] .
+
+    <http://example.org/mapping#EuWestPeople>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "eu.west.people" ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/eu-west/person/{id}" ;
+            rr:class ex:EuWestPerson
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
 "#;
 
-/// A root laid out `<root>/<namespace>/<table>` holds a same-named table in two
-/// namespaces. Each `rr:tableName` must read its OWN namespace's directory;
-/// matching on the table name alone cannot tell the two apart.
+/// A root laid out `<root>/<namespace>/<table>` holds a same-named table in
+/// several namespaces, one of them two levels deep (`eu.west` → `eu/west/`).
+/// Each `rr:tableName` must read its OWN namespace's directory; matching on
+/// the table name alone cannot tell them apart.
 #[tokio::test]
 async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
     allow_fixture_roots();
@@ -133,6 +146,10 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
     copy_dir_all(
         &fixtures_dir().join("silver/people_window"),
         &staging.path().join("south/people"),
+    );
+    copy_dir_all(
+        &fixtures_dir().join("silver/people_backlog"),
+        &staging.path().join("eu/west/people"),
     );
     let root = format!("file://{}", staging.path().display());
 
@@ -166,6 +183,8 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
     };
     assert_eq!(count("ex:NorthPerson").await, 5, "north.people rows");
     assert_eq!(count("ex:SouthPerson").await, 3000, "south.people rows");
+    // Same row count as `south`; the snapshot pins below tell the two apart.
+    assert_eq!(count("ex:EuWestPerson").await, 3000, "eu.west.people rows");
 
     // The scan/pin entry point resolves by namespace too.
     let provider = FlureeR2rmlProvider::new(&fluree);
@@ -179,6 +198,14 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
         .await
         .expect("south.people pin");
     assert_ne!(north, south, "each namespace pins its own table");
+    let eu_west = provider
+        .current_snapshot_id(gs, "eu.west.people")
+        .await
+        .expect("eu.west.people pin");
+    assert!(
+        eu_west != north && eu_west != south,
+        "a two-level namespace pins its own table"
+    );
 
     // A namespace directory that lacks the table is a miss, not a match on
     // another namespace's same-named table.
