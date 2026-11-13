@@ -504,12 +504,22 @@ impl Fluree {
         if !automatic {
             self.reasoning_index_state.clear_failure(&id, index_id);
         }
-        let outcome = self.refresh_index_exclusive(&id, index_id).await;
+        let mut inputs = None;
+        let outcome = self
+            .refresh_index_exclusive(&id, index_id, automatic, &mut inputs)
+            .await;
         match &outcome {
-            Ok(RefreshOutcome::Failed { reason }) => {
-                self.reasoning_index_state
-                    .record_failure(&id, index_id, reason.clone());
-            }
+            Ok(RefreshOutcome::Failed { reason }) => match inputs {
+                Some(inputs) => self.reasoning_index_state.record_failure_of(
+                    &id,
+                    index_id,
+                    reason.clone(),
+                    inputs,
+                ),
+                None => self
+                    .reasoning_index_state
+                    .record_failure(&id, index_id, reason.clone()),
+            },
             Err(error) => {
                 self.reasoning_index_state
                     .record_failure(&id, index_id, error.to_string());
@@ -548,10 +558,16 @@ impl Fluree {
             .is_ok()
     }
 
+    /// One refresh of an index. `failed_of` is set when the refresh fails
+    /// because of what it computed from, to those inputs: an `automatic`
+    /// refresh is not computed again from inputs that failed, since the
+    /// closure is the cost and its outcome would be the same.
     async fn refresh_index_exclusive(
         &self,
         ledger_id: &str,
         index_id: &ReasoningIndexId,
+        automatic: bool,
+        failed_of: &mut Option<super::status::RefreshInputs>,
     ) -> Result<RefreshOutcome> {
         let mut phases = Phases::new();
         // Read before the base it is computed from: a generation is of the
@@ -618,6 +634,25 @@ impl Fluree {
         }
         let engine = self.reasoning_index_state.engine_semantics();
         let settled = program::settled_key(&executable.reasoning, db.graph_id, engine);
+        let inputs = super::status::RefreshInputs {
+            revision,
+            basis: basis.clone(),
+            settled: settled.clone(),
+            engine,
+        };
+        if automatic {
+            if let Some(reason) = self
+                .reasoning_index_state
+                .failed_of(ledger_id, index_id, &inputs)
+            {
+                return Ok(RefreshOutcome::Deferred {
+                    reason: format!(
+                        "nothing it is computed from has changed since it failed ({reason}); \
+                         explicit refresh retries now"
+                    ),
+                });
+            }
+        }
         let index_cs = self.backend().content_store(
             &record
                 .storage_namespace()
@@ -781,7 +816,10 @@ impl Fluree {
         };
         let mut output = match derived {
             Ok(Ok(output)) => output,
-            Ok(Err(reason)) => return Ok(RefreshOutcome::Failed { reason }),
+            Ok(Err(reason)) => {
+                *failed_of = Some(inputs);
+                return Ok(RefreshOutcome::Failed { reason });
+            }
             Err(e) => {
                 return Ok(RefreshOutcome::Failed {
                     reason: e.to_string(),
@@ -816,6 +854,7 @@ impl Fluree {
         if let Output::Whole(derived_only) = &output {
             if program::serves_rewrites(&executable.reasoning) {
                 if let Some(p) = derived_hierarchy_edge(derived_only) {
+                    *failed_of = Some(inputs);
                     return Ok(RefreshOutcome::Failed {
                         reason: format!(
                             "the program derives {p} facts, which query-time rdfs and owl2ql \
@@ -3617,6 +3656,54 @@ mod tests {
         )
         .await
         .is_ok());
+    }
+
+    /// A closure over its budget is over it for as long as nothing it is
+    /// computed from changes. Maintenance computes it once, not again each
+    /// time its backoff ends; a commit or an explicit refresh has it tried
+    /// again.
+    #[tokio::test]
+    async fn a_failure_of_its_inputs_is_not_computed_again_until_one_changes() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/failed-inputs:main";
+        let (_, mut ledger) = students(&fluree, id).await;
+        for student in ["carol", "dave", "erin"] {
+            ledger = insert_student(&fluree, ledger, student).await;
+        }
+        let index = fluree
+            .register_reasoning_index(
+                id,
+                &json!({"reasoning": "owl2rl", "reasoningBudget": {"maxFacts": 1}}),
+            )
+            .await
+            .unwrap();
+        let automatic = || async {
+            fluree.reasoning_index_state.end_backoff(id, &index);
+            fluree
+                .refresh_reasoning_index_with_retry(id, &index, true)
+                .await
+                .unwrap()
+        };
+        let failed = |outcome: &RefreshOutcome| matches!(outcome, RefreshOutcome::Failed { reason } if reason.contains("capped"));
+        let first = automatic().await;
+        assert!(failed(&first), "{first:?}");
+        let attempts = || fluree.reasoning_index_failures(id)[&index].attempts;
+        assert_eq!(attempts(), 1);
+
+        let again = automatic().await;
+        assert!(
+            matches!(&again, RefreshOutcome::Deferred { reason } if reason.contains("capped")),
+            "{again:?}"
+        );
+        assert_eq!(attempts(), 1);
+
+        let explicit = fluree.refresh_reasoning_index(id, &index).await.unwrap();
+        assert!(failed(&explicit), "{explicit:?}");
+
+        insert_student(&fluree, ledger, "bob").await;
+        let moved = automatic().await;
+        assert!(failed(&moved), "{moved:?}");
+        assert_eq!(attempts(), 2);
     }
 
     /// One read of a head that failed is not a broken head: the refresh

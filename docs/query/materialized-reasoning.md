@@ -78,6 +78,12 @@ Failed refreshes retry with exponential backoff from 5 seconds to 5 minutes,
 subject to the worker's one-minute retry tick. A new commit does not reset
 backoff, so a busy failing ledger cannot monopolize maintenance. Explicit
 refresh bypasses backoff, including after changing a budget or configuration.
+A failure that follows from what the closure is computed from (a closure over
+its budget, a program whose output an index cannot hold) is not computed again
+once its backoff ends: maintenance waits until the branch commits, the
+registration changes, or what the program settles to changes. An explicit
+refresh retries it at once, as does a restart; use one after raising a budget
+through the environment, which changes none of those.
 A failure in one registration does not prevent other indexes from refreshing.
 The list endpoint includes `maintenanceFailures` with each locally observed
 failure's reason, attempt count, failure time and retry time (Unix milliseconds).

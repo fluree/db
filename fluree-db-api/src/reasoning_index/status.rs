@@ -5,7 +5,7 @@ use fluree_db_core::clock::Instant;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use fluree_db_core::reasoning_index::ReasoningIndexId;
+use fluree_db_core::reasoning_index::{Basis, ReasoningIndexId};
 use fluree_db_core::ContentId;
 
 use super::ReasoningIndexState;
@@ -24,6 +24,19 @@ pub struct ReasoningIndexFailure {
 pub(super) struct Failure {
     status: ReasoningIndexFailure,
     retry_at: Instant,
+    /// What the refresh computed from, when its failure follows from that
+    /// alone: computing it again would fail again.
+    of: Option<RefreshInputs>,
+}
+
+/// Everything a refresh's closure is computed from. A closure over its
+/// budget, or one whose output an index cannot hold, is so for these.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct RefreshInputs {
+    pub(super) revision: u64,
+    pub(super) basis: Basis,
+    pub(super) settled: ContentId,
+    pub(super) engine: u32,
 }
 
 fn retry_delay(attempts: u32) -> Duration {
@@ -67,7 +80,54 @@ impl ReasoningIndexState {
             .map(|failure| failure.status.retry_at_ms)
     }
 
+    /// The reason a refresh from `inputs` failed, when it failed because of
+    /// them and nothing has been tried since.
+    pub(super) fn failed_of(
+        &self,
+        ledger: &str,
+        index: &ReasoningIndexId,
+        inputs: &RefreshInputs,
+    ) -> Option<String> {
+        self.failures
+            .lock()
+            .get(&(ledger.to_string(), index.clone()))
+            .filter(|failure| failure.of.as_ref() == Some(inputs))
+            .map(|failure| failure.status.reason.clone())
+    }
+
+    /// [`Self::record_failure`] for a failure that follows from `inputs`.
+    pub(super) fn record_failure_of(
+        &self,
+        ledger: &str,
+        index: &ReasoningIndexId,
+        reason: String,
+        inputs: RefreshInputs,
+    ) {
+        self.record(ledger, index, reason, Some(inputs));
+    }
+
     pub(super) fn record_failure(&self, ledger: &str, index: &ReasoningIndexId, reason: String) {
+        self.record(ledger, index, reason, None);
+    }
+
+    #[cfg(test)]
+    pub(super) fn end_backoff(&self, ledger: &str, index: &ReasoningIndexId) {
+        if let Some(failure) = self
+            .failures
+            .lock()
+            .get_mut(&(ledger.to_string(), index.clone()))
+        {
+            failure.retry_at = Instant::now();
+        }
+    }
+
+    fn record(
+        &self,
+        ledger: &str,
+        index: &ReasoningIndexId,
+        reason: String,
+        of: Option<RefreshInputs>,
+    ) {
         let mut failures = self.failures.lock();
         let key = (ledger.to_string(), index.clone());
         let attempts = failures
@@ -87,6 +147,7 @@ impl ReasoningIndexState {
                     retry_at_ms: now.saturating_add(delay.as_millis() as i64),
                 },
                 retry_at: Instant::now() + delay,
+                of,
             },
         );
     }
