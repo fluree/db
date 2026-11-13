@@ -18,6 +18,7 @@ use crate::{
     PolicyStats, Tracker, TrackingTally, VarRegistry,
 };
 
+use crate::view::ReadView;
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot};
 
@@ -219,10 +220,12 @@ pub struct QueryResult {
     /// renders nodes through it, judged as the query's rows were, so a node
     /// shows the labels and properties the query saw.
     pub reasoned_overlay: Option<std::sync::Arc<dyn OverlayProvider>>,
-    /// The actual single-graph execution view, retained for hydration. It
-    /// includes the selected generation's snapshot and the policy that judged
-    /// derived facts, so callers may format with their original view safely.
-    pub read_view: Option<GraphDb>,
+    /// The state the query read, retained for hydration: the snapshot (a
+    /// served generation's, when one answered), the overlay with any derived
+    /// facts, and the policy that judged the rows. The formatters read it in
+    /// place of the `db` and `policy` they are passed, so a result formats
+    /// the same whichever view a caller hands them.
+    pub read_view: Option<ReadView>,
     /// Non-fatal notes about how the query was read (see
     /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
     /// result.
@@ -373,22 +376,30 @@ impl TrackedErrorResponse {
 }
 
 impl QueryResult {
+    /// This result as one that read `db`, through `overlay` when reasoning
+    /// derived facts.
     pub(crate) fn with_read_view(
         mut self,
         db: &GraphDb,
         overlay: Option<std::sync::Arc<dyn OverlayProvider>>,
     ) -> Self {
-        let view = overlay
-            .as_ref()
-            .map_or_else(|| db.clone(), |o| db.reasoned(o.clone()));
-        self.novelty = Some(view.overlay.clone());
+        let view = match &overlay {
+            Some(overlay) => ReadView::of(&db.reasoned(Arc::clone(overlay))),
+            None => ReadView::of(db),
+        };
         self.reasoned_overlay = overlay;
+        self.reading(view)
+    }
+
+    /// This result as one that read `view`.
+    pub(crate) fn reading(mut self, view: ReadView) -> Self {
+        self.novelty = Some(Arc::clone(&view.overlay));
         self.read_view = Some(view);
         self
     }
 
     pub(crate) fn with_dataset_read_view(
-        mut self,
+        self,
         dataset: &crate::view::DataSetDb,
         derived: Option<std::sync::Arc<fluree_db_query::reasoning::DerivedFactsOverlay>>,
     ) -> Self {
@@ -399,17 +410,12 @@ impl QueryResult {
                 .or_else(|| dataset.composite_overlay())
                 .unwrap_or_else(|| primary.overlay.clone());
             let view = match derived {
-                Some(derived) => primary.reasoned(std::sync::Arc::new(
+                Some(derived) => ReadView::of(&primary.reasoned(Arc::new(
                     fluree_db_query::ReasoningOverlay::shared(base, derived),
-                )),
-                None => {
-                    let mut view = primary.clone();
-                    view.overlay = base;
-                    view
-                }
+                ))),
+                None => ReadView::of(primary).reading(base),
             };
-            self.novelty = Some(view.overlay.clone());
-            self.read_view = Some(view);
+            return self.reading(view);
         }
         self
     }
@@ -773,6 +779,11 @@ impl QueryResult {
     /// When `policy` is provided, hydration queries filter flakes according to
     /// view policies during formatting. This ensures that nested objects fetched
     /// during hydration also respect policy restrictions.
+    ///
+    /// A result of a query on a view with a policy is formatted under that
+    /// policy, the one its rows were judged by, whatever is passed here:
+    /// `policy` applies to a result whose query ran under none. See
+    /// [`format::format_results_async`].
     ///
     /// # Example
     ///

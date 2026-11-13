@@ -572,10 +572,14 @@ fn format_ask(result: &QueryResult, config: &FormatterConfig) -> Option<Result<J
 ///
 /// A `serde_json::Value` containing the formatted results
 ///
-/// # Policy Support
+/// # The state and policy a crawl renders from
 ///
-/// When `policy` is `Some`, hydration queries filter flakes according to view policies.
-/// When `policy` is `None`, no filtering is applied (zero overhead for the common case).
+/// A result a view query produced carries the state it read
+/// ([`QueryResult::read_view`]), and is formatted from that state under the
+/// policy that judged its rows, in place of `db` and `policy`: a crawl cannot
+/// show what the query's own policy hid, whichever view the caller passes.
+/// `policy` decides only for a result whose query ran under none, where
+/// `Some` filters the flakes hydration fetches and `None` filters nothing.
 pub async fn format_results_async(
     result: &QueryResult,
     context: &ParsedContext,
@@ -587,7 +591,7 @@ pub async fn format_results_async(
     let db = result
         .read_view
         .as_ref()
-        .map_or(db, crate::view::GraphDb::as_graph_db_ref);
+        .map_or(db, crate::view::ReadView::as_graph_db_ref);
     let policy = result
         .read_view
         .as_ref()
@@ -767,10 +771,11 @@ pub async fn format_results_async_dataset(
 ///
 /// Required for hydration queries. For other queries, can use sync version.
 ///
-/// # Policy Support
+/// # The state and policy a crawl renders from
 ///
-/// When `policy` is `Some`, hydration queries filter flakes according to view policies.
-/// When `policy` is `None`, no filtering is applied (zero overhead).
+/// As [`format_results_async`]: a result that carries the state its query
+/// read is formatted from it, under the policy that judged its rows. `policy`
+/// decides only for a result whose query ran under none.
 pub async fn format_results_string_async(
     result: &QueryResult,
     context: &ParsedContext,

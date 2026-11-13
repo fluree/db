@@ -274,7 +274,7 @@ pub use tx::{
 pub use tx_builder::{GraphPayload, OwnedTransactBuilder, RefTransactBuilder, Staged};
 pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
-    ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
+    ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput, ReadView,
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
 };
 

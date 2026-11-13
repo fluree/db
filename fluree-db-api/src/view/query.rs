@@ -526,16 +526,15 @@ impl Fluree {
         );
 
         // 5. Build result
-        let db = &read_view;
         Ok(build_query_result(
             vars,
             parsed,
             batches,
-            Some(db.t),
-            Some(db.overlay.clone()),
-            db.binary_graph(),
+            Some(read_view.t),
+            None,
+            read_view.binary_graph(),
         )
-        .with_read_view(db, None))
+        .reading(read_view))
     }
 
     /// Execute a Cypher (openCypher 9 subset) query against a GraphDb.
@@ -1553,7 +1552,7 @@ impl Fluree {
     /// schema bundle is attached to `options.schema_bundle` so the runner
     /// can layer it as a `SchemaBundleOverlay` at prep time.
     /// Plan and execute one round against a given fuel tracker, returning the
-    /// batches plus the plan/exec timings.
+    /// batches, the plan/exec timings and the state the round read.
     ///
     /// Both cfg arms of the query entry path call this, so they differ only
     /// in the retry wrapper around it and cannot drift apart. That matters
@@ -1572,7 +1571,7 @@ impl Fluree {
         parsed: &fluree_db_query::ir::Query,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> Result<(Vec<crate::Batch>, f64, f64, GraphDb)> {
+    ) -> Result<(Vec<crate::Batch>, f64, f64, super::ReadView)> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let mut executable = self
             .build_executable_for_view(db, parsed, options.server_identity.as_ref())
@@ -1598,7 +1597,10 @@ impl Fluree {
                 options,
             )
             .await?;
-        let read_view = read.map_or_else(|| db.clone(), |overlay| db.reasoned(overlay));
+        let read_view = match read {
+            Some(overlay) => super::ReadView::of(&db.reasoned(overlay)),
+            None => super::ReadView::of(db),
+        };
         Ok((
             batches,
             plan_ms,

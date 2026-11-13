@@ -648,6 +648,129 @@ impl GraphDb {
 }
 
 // ============================================================================
+// Read state
+// ============================================================================
+
+/// The state a single-graph query read, kept on its result so a crawl
+/// renders from that state under the policy that judged the rows, whichever
+/// view the result is formatted with.
+///
+/// It holds the handles of a [`GraphDb`] that reading takes and none of its
+/// configuration, so carrying it costs a result a few reference counts: every
+/// query pays for it.
+#[derive(Clone)]
+pub struct ReadView {
+    /// The snapshot the query read: a served generation's, or the view's.
+    pub snapshot: Arc<LedgerSnapshot>,
+    /// The overlay the query read, with any derived facts merged over it.
+    pub overlay: Arc<dyn OverlayProvider>,
+    pub t: i64,
+    pub graph_id: GraphId,
+    novelty: Option<Arc<Novelty>>,
+    policy: Option<Arc<PolicyContext>>,
+    policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    binary_store: Option<Arc<BinaryIndexStore>>,
+    dict_novelty: Option<Arc<DictNovelty>>,
+    runtime_small_dicts: Option<Arc<RuntimeSmallDicts>>,
+}
+
+impl ReadView {
+    /// What a query that read `db` as it stands read.
+    pub(crate) fn of(db: &GraphDb) -> Self {
+        Self {
+            snapshot: Arc::clone(&db.snapshot),
+            overlay: Arc::clone(&db.overlay),
+            t: db.t,
+            graph_id: db.graph_id,
+            novelty: db.novelty.clone(),
+            policy: db.policy.clone(),
+            policy_enforcer: db.policy_enforcer.clone(),
+            binary_store: db.binary_store.clone(),
+            dict_novelty: db.dict_novelty.clone(),
+            runtime_small_dicts: db.runtime_small_dicts.clone(),
+        }
+    }
+
+    /// This state read through `overlay` instead.
+    pub(crate) fn reading(mut self, overlay: Arc<dyn OverlayProvider>) -> Self {
+        self.overlay = overlay;
+        self
+    }
+
+    /// A `GraphDbRef` over this state, as [`GraphDb::as_graph_db_ref`].
+    pub fn as_graph_db_ref(&self) -> GraphDbRef<'_> {
+        let db = GraphDbRef::new(&self.snapshot, self.graph_id, &*self.overlay, self.t);
+        match self.runtime_small_dicts.as_deref() {
+            Some(dicts) => db.with_runtime_small_dicts(dicts),
+            None => db,
+        }
+    }
+
+    /// The policy that judged the query's rows, if it ran under one.
+    pub fn policy(&self) -> Option<&PolicyContext> {
+        self.policy.as_deref()
+    }
+
+    /// As [`GraphDb::binary_graph`].
+    pub(crate) fn binary_graph(&self) -> Option<BinaryGraphView> {
+        binary_graph(
+            self.binary_store.as_ref(),
+            self.graph_id,
+            self.dict_novelty.as_ref(),
+            &self.snapshot,
+        )
+    }
+
+    /// Whether `view` reads this state under this policy, so that formatting
+    /// with `view` is formatting with this.
+    pub(crate) fn is(&self, view: &GraphDb) -> bool {
+        fn same<T: ?Sized>(a: &Arc<T>, b: &Arc<T>) -> bool {
+            std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+        }
+        same(&self.snapshot, &view.snapshot)
+            && same(&self.overlay, &view.overlay)
+            && self.t == view.t
+            && self.graph_id == view.graph_id
+            && match (&self.policy, &view.policy) {
+                (None, None) => true,
+                (Some(a), Some(b)) => same(a, b),
+                _ => false,
+            }
+    }
+
+    /// `base` reading this state: its configuration over these handles.
+    pub(crate) fn over(&self, base: &GraphDb) -> GraphDb {
+        let mut view = base.clone();
+        view.snapshot = Arc::clone(&self.snapshot);
+        view.overlay = Arc::clone(&self.overlay);
+        view.t = self.t;
+        view.graph_id = self.graph_id;
+        view.novelty = self.novelty.clone();
+        view.policy = self.policy.clone();
+        view.policy_enforcer = self.policy_enforcer.clone();
+        view.binary_store = self.binary_store.clone();
+        view.dict_novelty = self.dict_novelty.clone();
+        view.runtime_small_dicts = self.runtime_small_dicts.clone();
+        view
+    }
+}
+
+fn binary_graph(
+    store: Option<&Arc<BinaryIndexStore>>,
+    graph_id: GraphId,
+    dict_novelty: Option<&Arc<DictNovelty>>,
+    snapshot: &LedgerSnapshot,
+) -> Option<BinaryGraphView> {
+    store.map(|store| {
+        // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
+        // namespace table; `namespaces().clone()` would deep-copy the whole map
+        // on every query (a dominant per-query cost on large ledgers).
+        BinaryGraphView::with_novelty(Arc::clone(store), graph_id, dict_novelty.cloned())
+            .with_namespace_codes_fallback(Some(snapshot.shared_namespaces()))
+    })
+}
+
+// ============================================================================
 // Binary Store
 // ============================================================================
 
@@ -670,13 +793,12 @@ impl GraphDb {
     /// (novelty-only subjects/strings) resolve via watermark routing instead
     /// of failing against the persisted forward packs.
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
-        self.binary_store.as_ref().map(|store| {
-            // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
-            // namespace table; `namespaces().clone()` would deep-copy the whole map
-            // on every query (a dominant per-query cost on large ledgers).
-            BinaryGraphView::with_novelty(store.clone(), self.graph_id, self.dict_novelty.clone())
-                .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
-        })
+        binary_graph(
+            self.binary_store.as_ref(),
+            self.graph_id,
+            self.dict_novelty.as_ref(),
+            &self.snapshot,
+        )
     }
 }
 

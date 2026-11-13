@@ -270,7 +270,17 @@ No-op implementations cannot provide persistence or fencing guarantees.
 `run_stream_query` no longer takes its former `LedgerState` argument.
 `QueryResult`, `ReasoningTally`, and `ReasoningManifest` have new public fields; code constructing
 these structs directly must initialize them. `QueryResult::read_view` retains
-the snapshot, overlay and policy used for single-graph hydration. Prefer
+the snapshot, overlay and policy a single-graph query read, as a `ReadView`.
+
+The async formatters (`format_results_async`, `format_results_string_async`
+and the `QueryResult` methods over them, such as `to_jsonld_async` and
+`to_jsonld_async_with_policy`) format a result that carries a read view from
+that state, under the policy that judged its rows. The `db` and `policy`
+arguments no longer decide anything for such a result: a crawl formatted with
+no policy is filtered by the query's, and a different policy passed for a
+result whose query ran under one is not applied. A `policy` argument still
+applies to a result whose query ran under none. `format_results_async_dataset`
+formats a one-graph dataset's result the same way. Prefer
 `format_async_for_view` when formatting API query results.
 
 The incremental reasoner entry points take both the closed state and the
