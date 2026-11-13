@@ -778,6 +778,28 @@ impl R2rmlPattern {
         self
     }
 
+    /// The [`Self::produced_vars`] bound in **every** row this scan emits: what
+    /// a sub-select may hash-join on (`subquery::self_produced_vars`).
+    ///
+    /// `materialize_row` (`r2rml/operator.rs`) emits a row only once each of
+    /// these has a value: a NULL subject template drops the row; a NULL or
+    /// dangling referencing-object FK, or a NULL column object, materializes
+    /// no object, so a single-member scan skips that predicate-object map and
+    /// a star drops the row (every star member is required: the rewrite never
+    /// fuses an OPTIONAL body into an outer star); a variable predicate whose
+    /// column is NULL skips the map; and the view-policy gate drops rows, it
+    /// never unbinds a variable. The one exception is a type variable fused
+    /// into a variable-predicate wildcard (a browse crawl): over a map that
+    /// declares no class it keeps the `(p, o)` row with the type unbound, so
+    /// that shape leaves the type variable out.
+    pub fn always_bound_vars(&self) -> Vec<VarId> {
+        let mut vars = self.produced_vars();
+        if let (Some(tv), Some(_)) = (self.type_var, self.predicate_var) {
+            vars.retain(|v| *v != tv);
+        }
+        vars
+    }
+
     /// Variables this pattern binds from the table scan. Filter dependencies
     /// are included separately by [`Self::referenced_vars`].
     pub fn produced_vars(&self) -> Vec<VarId> {

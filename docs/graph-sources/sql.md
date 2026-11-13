@@ -96,9 +96,10 @@ set, an unqualified name resolves inside it.
 
 ### `rr:sqlQuery`
 
-Unlike Iceberg sources, a SQL source accepts the R2RML `rr:sqlQuery` logical
-table. The query is scanned as a derived table, with Fluree's projection and
-pushed filters applied on top of it:
+A SQL source accepts any R2RML `rr:sqlQuery` logical table (an Iceberg source
+accepts only a single-table [row filter](iceberg.md#row-filters-rrsqlquery)).
+The query is scanned as a derived table, with Fluree's projection and pushed
+filters applied on top of it:
 
 ```turtle
 <#OpenOrders> a rr:TriplesMap ;
@@ -237,10 +238,11 @@ pushable. In that statement:
   pattern binding it too is declined as it would be inside one block. A
   sub-select with another `HAVING`, an `OFFSET`, a `BIND`, a nested
   sub-select, a filter the statement cannot evaluate exactly, or one that
-  hides an inner variable the enclosing block also uses is not admitted. There is
-  no other lane for a sub-select over a graph source (the engine's
-  subquery operator has no native index to run against), so one the lane
-  does not take still refuses the query, as it did before;
+  hides an inner variable the enclosing block also uses is not admitted. One
+  the lane does not take runs on the per-scan lane below, which evaluates
+  the sub-select's body over its own table reads (see [Sub-selects over a
+  Graph Source](overview.md#sub-selects-over-a-graph-source), including the
+  cost of a sliced JSON-LD sub-select there);
 - an entity whose members come from **several triples maps sharing its
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,
@@ -595,7 +597,7 @@ class it found. Declare the column `NUMERIC` to read mixed storage as a
 | `COUNT` | manifest stats, when provably exact | exact `COUNT(*)` |
 | `ORDER BY … LIMIT` | top-k file ordering | pushed by the pushdown lane on typed required columns |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |
-| `rr:sqlQuery` | refused | supported |
+| `rr:sqlQuery` | a single-table `WHERE` conjunction, applied exactly | supported |
 | View policy | static targeting in the scan, `--model` ledger | same |
 | Extra infrastructure | none | Trino, or a bridge sidecar |
 

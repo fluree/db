@@ -490,6 +490,18 @@ Fulltext scoring works naturally with standard graph patterns. Filter by type, c
 
 Placing the category filter before the `fulltext()` bind reduces the number of documents scored, improving query performance.
 
+`fulltext()` scores against the graph its own group reads. To score values held in a named graph, write the `fulltext()` filter or bind inside that `GRAPH` block, not after it:
+
+```sparql
+SELECT ?title ?score WHERE {
+  GRAPH <http://example.org/catalog> {
+    ?doc ex:title ?title .
+    BIND(fulltext(?title, "zapato") AS ?score)
+    FILTER(?score > 0)
+  }
+}
+```
+
 ## How Scoring Works
 
 The `fulltext()` function uses **BM25** (Best Match 25), the standard information retrieval scoring algorithm used by search engines.

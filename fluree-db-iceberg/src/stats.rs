@@ -15,9 +15,15 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Result;
 use crate::io::IcebergStorage;
+#[cfg(feature = "aws")]
+use crate::manifest::send_read_manifests;
 use crate::manifest::value_codec::decode_bound;
-use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes, DataFile, TypedValue};
+use crate::manifest::{
+    parse_manifest_list_with_deletes, read_manifests, DataFile, ManifestEntry, ManifestListEntry,
+    TypedValue, DEFAULT_MANIFEST_READ_CONCURRENCY,
+};
 use crate::metadata::{Schema, SchemaField, Snapshot};
+use futures::{Stream, StreamExt};
 
 /// Aggregated statistics for a single column across a snapshot's data files.
 #[derive(Debug, Clone, Default)]
@@ -305,6 +311,23 @@ fn format_decimal(unscaled: i128, scale: i8) -> String {
     format!("{sign}{int_part}.{frac_part}")
 }
 
+/// Every data file the manifests yield, in manifest-list order, and how many
+/// manifests that was. The manifests are read through
+/// [`read_manifests`], concurrently.
+async fn collect_data_files<'m>(
+    manifests: impl Stream<Item = Result<(&'m ManifestListEntry, Vec<ManifestEntry>)>>,
+) -> Result<(Vec<DataFile>, usize)> {
+    let mut manifests = std::pin::pin!(manifests);
+    let mut data_files = Vec::new();
+    let mut manifests_read = 0usize;
+    while let Some(next) = manifests.next().await {
+        let (_, entries) = next?;
+        manifests_read += 1;
+        data_files.extend(entries.into_iter().map(|entry| entry.data_file));
+    }
+    Ok((data_files, manifests_read))
+}
+
 /// Read the data files listed by a snapshot's manifests — **manifest-list +
 /// manifest Avro only**, never a data file. Returns the collected data files,
 /// the number of data-manifest files read, and whether the snapshot carries any
@@ -332,20 +355,13 @@ pub async fn read_snapshot_data_files<S: IcebergStorage + ?Sized>(
     // record-count sum does not subtract.
     let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
 
-    let mut data_files = Vec::new();
-    let mut manifests_read = 0usize;
-    let mut has_delete_manifests = false;
-    for me in &manifest_entries {
-        if me.is_deletes() {
-            has_delete_manifests = true;
-            continue;
-        }
-        let manifest_data = storage.read(&me.manifest_path).await?;
-        manifests_read += 1;
-        for entry in parse_manifest(&manifest_data)? {
-            data_files.push(entry.data_file);
-        }
-    }
+    let has_delete_manifests = manifest_entries.iter().any(ManifestListEntry::is_deletes);
+    let (data_files, manifests_read) = collect_data_files(read_manifests(
+        manifest_entries.iter().filter(|me| !me.is_deletes()),
+        DEFAULT_MANIFEST_READ_CONCURRENCY,
+        |path| storage.read(path),
+    ))
+    .await?;
 
     Ok((data_files, manifests_read, has_delete_manifests))
 }
@@ -367,20 +383,13 @@ pub async fn send_read_snapshot_data_files<S: crate::io::SendIcebergStorage + ?S
     // read delete manifests without reading them.
     let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
 
-    let mut data_files = Vec::new();
-    let mut manifests_read = 0usize;
-    let mut has_delete_manifests = false;
-    for me in &manifest_entries {
-        if me.is_deletes() {
-            has_delete_manifests = true;
-            continue;
-        }
-        let manifest_data = storage.read(&me.manifest_path).await?;
-        manifests_read += 1;
-        for entry in parse_manifest(&manifest_data)? {
-            data_files.push(entry.data_file);
-        }
-    }
+    let has_delete_manifests = manifest_entries.iter().any(ManifestListEntry::is_deletes);
+    let (data_files, manifests_read) = collect_data_files(send_read_manifests(
+        storage,
+        manifest_entries.iter().filter(|me| !me.is_deletes()),
+        DEFAULT_MANIFEST_READ_CONCURRENCY,
+    ))
+    .await?;
 
     Ok((data_files, manifests_read, has_delete_manifests))
 }
@@ -513,7 +522,7 @@ pub async fn send_read_manifest_list_totals<S: crate::io::SendIcebergStorage + ?
 mod tests {
     use super::*;
     use crate::manifest::value_codec::encode_value;
-    use crate::manifest::{FileFormat, PartitionData};
+    use crate::manifest::{parse_manifest, FileFormat, PartitionData};
 
     fn schema_id_amount() -> Schema {
         Schema {

@@ -28,7 +28,7 @@ pub use term::{expand_template, materialize_object, materialize_subject, RdfTerm
 
 // Subject-template reversal (constant IRI → raw column values), for pushing a
 // bound-subject predicate down to the Iceberg scan.
-pub use term::reverse_subject_template;
+pub use term::{reverse_subject_template, TemplateReverser};
 
 // ColumnBatch-based API (for production efficiency)
 pub use term::{
