@@ -150,11 +150,12 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
 /// - `GRAPH` is its own scope — already covered by the rewrite guard;
 /// - `SERVICE` targets another ledger or endpoint, which may have a native
 ///   index, so refusing on its body would reject a query that works;
-/// - the RDF-star `EdgeAnnotation` patterns are left untouched here as the
-///   rewriter leaves them, and do not count as reading this view: a mapping
-///   produces no annotation, so they match nothing over a graph source, which
-///   is the answer a ledger holding the mapping's triples gives too. Refusing
-///   a sub-select whose body is only annotations would refuse a correct answer.
+/// - the RDF-star `EdgeAnnotation` patterns, and a triple term's
+///   `TermComponents`, are left untouched here as the rewriter leaves them,
+///   and do not count as reading this view: a mapping produces no triple term,
+///   so they match nothing over a graph source, which is the answer a ledger
+///   holding the mapping's triples gives too. Refusing a sub-select whose body
+///   is only annotations would refuse a correct answer.
 pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static str> {
     let mut kinds = Vec::new();
     collect_unsupported_outside_graph_scopes(patterns, &mut kinds);
@@ -173,7 +174,6 @@ fn collect_unsupported_outside_graph_scopes(
             // The path kinds the rewriter flags, named identically so one
             // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
-            Pattern::TermComponents(_) => kinds.push("triple-term components"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
             // A sub-select whose body, or HAVING / ORDER BY, reads this view,
             // which no rewrite reaches out here (see above).
@@ -216,7 +216,8 @@ fn collect_unsupported_outside_graph_scopes(
             | Pattern::S2Search(_)
             | Pattern::Graph { .. }
             | Pattern::Service(_)
-            | Pattern::EdgeAnnotation { .. } => {}
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::TermComponents(_) => {}
         }
     }
     reads_view
@@ -550,11 +551,6 @@ pub fn rewrite_patterns_for_r2rml(
                 result_patterns.push(pattern.clone());
                 origins.push(i);
             }
-            Pattern::TermComponents(_) => {
-                unsupported.push("triple-term components");
-                result_patterns.push(pattern.clone());
-                origins.push(i);
-            }
             Pattern::ShortestPath(_) => {
                 unsupported.push("shortest path");
                 result_patterns.push(pattern.clone());
@@ -566,9 +562,12 @@ pub fn rewrite_patterns_for_r2rml(
             // `graph_source_id` and route independently; `R2rml` is already
             // converted; nested `Graph`/`DefaultGraphSource` re-enter routing
             // for their own target; the RDF-star `EdgeAnnotation` is expanded
-            // during planning and matches nothing here, which is correct: a
-            // mapping produces no annotation, and a ledger holding its triples
-            // holds none either. A `ListView` never reaches here from a
+            // during planning, and a triple term's `TermComponents` reads the
+            // term dictionary, which a graph source has none of: both match
+            // nothing here, which is correct, since a mapping produces no
+            // triple term and a ledger holding its triples holds none either.
+            // The `rdf:reifies` link beside them is a triple, rewritten like
+            // any other, and no map produces it. A `ListView` never reaches here from a
             // graph-source scope: the callers strip the list view first
             // (`list_view::without_list_view`), since a mapping holds no list
             // values.
@@ -581,6 +580,7 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::S2Search(_)
             | Pattern::Graph { .. }
             | Pattern::EdgeAnnotation { .. }
+            | Pattern::TermComponents(_)
             | Pattern::DefaultGraphSource { .. } => {
                 result_patterns.push(pattern.clone());
                 origins.push(i);
