@@ -343,7 +343,9 @@ impl EncodedPreFilter {
 /// provably carries object type `ot16`.
 ///
 /// Base side: every non-empty leaflet in the predicate's POST range must be
-/// `o_type_const == ot16` (directory-only reads, cached). Overlay side: when
+/// `o_type_const == ot16` (directory-only reads). Below the index's `t` a
+/// leaflet's history can hold a type its rows no longer do, so a leaflet the
+/// read replays has no constant to prove by and declines. Overlay side: when
 /// live novelty exists, every translated overlay op for the predicate must
 /// carry `ot16`; an untranslatable overlay declines. Used to prove that an
 /// equality value seek cannot miss a differently-typed representation of the
@@ -355,6 +357,7 @@ fn predicate_otype_uniform(
     p_id: u32,
     ot16: u16,
 ) -> Result<bool> {
+    let replay_to = (ctx.to_t < store.max_t()).then_some(ctx.to_t);
     for leaf_entry in crate::fast_path_common::leaf_entries_for_predicate(
         store,
         g_id,
@@ -365,10 +368,11 @@ fn predicate_otype_uniform(
             .open_leaf_dir(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
         for entry in &dir.entries {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            let replays = entry.replays_history(replay_to);
+            if (entry.row_count == 0 && !replays) || entry.p_const != Some(p_id) {
                 continue;
             }
-            if entry.o_type_const != Some(ot16) {
+            if entry.o_type_const_for(replays) != Some(ot16) {
                 return Ok(false);
             }
         }
