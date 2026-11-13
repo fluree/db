@@ -98,6 +98,11 @@ impl RaftLogStore for MemoryRaftLogStore {
         let state = self.state.read().map_err(|_| lock_poisoned("log store"))?;
         Ok(state.committed)
     }
+
+    async fn first_retained_index(&self) -> Result<Option<u64>, StorageError> {
+        let state = self.state.read().map_err(|_| lock_poisoned("log store"))?;
+        Ok(state.entries.keys().next().copied())
+    }
 }
 
 #[derive(Default)]
@@ -149,6 +154,16 @@ impl RaftSnapshotStore for MemoryRaftSnapshotStore {
             .current
             .as_ref()
             .and_then(|id| state.snapshots.get(id).cloned()))
+    }
+
+    async fn discard_superseded(&self) -> Result<(), StorageError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| lock_poisoned("snapshot store"))?;
+        let current = state.current.clone();
+        state.snapshots.retain(|id, _| current.as_ref() == Some(id));
+        Ok(())
     }
 }
 

@@ -8,6 +8,7 @@
 //! easy to get subtly wrong (see [`spawn_leader_watcher`]).
 
 use crate::admin::{self, RaftAdmin};
+use crate::compaction::CompactionStorage;
 use crate::config::FlureeRaftConfig;
 use crate::group::GroupId;
 use crate::log_adapter::LogAdapter;
@@ -231,6 +232,7 @@ pub struct RaftGroup<A: AppStateMachine> {
     /// no-redirects guarantee the SSRF guard depends on.
     pub client: RaftHttpClient,
     transport: RaftTransportConfig,
+    pub(crate) storage: Arc<dyn CompactionStorage>,
 }
 
 impl<A: AppStateMachine> RaftGroup<A> {
@@ -287,6 +289,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
         let raft_config = Arc::new(raft);
         check_election_timeout(&raft_config, &config.transport);
 
+        let compaction_storage: Arc<dyn CompactionStorage> = storage.clone();
         let log = LogAdapter::new(Arc::clone(&storage));
         // `open` restores from the current snapshot if there is one.
         // Required on restart: without it the adapter boots at
@@ -320,6 +323,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
             state,
             client,
             transport: config.transport,
+            storage: compaction_storage,
         })
     }
 

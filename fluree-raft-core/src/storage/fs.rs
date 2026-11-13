@@ -286,6 +286,9 @@ struct Segment {
     last_index: Option<u64>,
     path: PathBuf,
     len: u64,
+    /// Closed to appends by [`Inner::seal`]; the next append starts a
+    /// new segment. In memory only: a reopened segment takes appends.
+    sealed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -531,6 +534,7 @@ impl Inner {
                 last_index,
                 path,
                 len: at as u64,
+                sealed: false,
             });
             expected_next = Some(physical_next);
         }
@@ -647,6 +651,7 @@ impl Inner {
             last_index: None,
             path,
             len: SEGMENT_HEADER as u64,
+            sealed: false,
         });
         self.active = Some(file);
         Ok(())
@@ -692,7 +697,7 @@ impl Inner {
         let needs_segment = self
             .segments
             .last()
-            .is_none_or(|seg| seg.len >= self.segment_bytes);
+            .is_none_or(|seg| seg.sealed || seg.len >= self.segment_bytes);
         if needs_segment {
             self.start_segment(first)?;
         }
@@ -871,6 +876,26 @@ impl Inner {
         Ok(())
     }
 
+    /// Close the segment holding the tail, so a purge through the tail
+    /// unlinks it: `purge_through` only removes whole segments, and one
+    /// that kept taking appends would outlive every purge point inside it.
+    /// A header-only segment holds nothing to protect and stays open.
+    fn seal(&mut self) -> Option<u64> {
+        if let Some(seg) = self.segments.last_mut() {
+            if seg.last_index.is_some() {
+                seg.sealed = true;
+            }
+        }
+        self.segments.iter().rev().find_map(|seg| seg.last_index)
+    }
+
+    fn first_retained_index(&self) -> Option<u64> {
+        self.segments
+            .iter()
+            .find(|seg| seg.last_index.is_some())
+            .map(|seg| seg.first_index)
+    }
+
     fn log_state(&self) -> LogState {
         LogState {
             last_purged: self.last_purged,
@@ -1003,11 +1028,24 @@ impl RaftLogStore for FsRaftLogStore {
     async fn read_committed(&self) -> Result<Option<LogId>, StorageError> {
         self.with_inner(|inner| Ok(inner.committed)).await
     }
+
+    async fn seal(&self) -> Result<Option<u64>, StorageError> {
+        self.with_inner(|inner| Ok(inner.seal())).await
+    }
+
+    async fn first_retained_index(&self) -> Result<Option<u64>, StorageError> {
+        self.with_inner(|inner| Ok(inner.first_retained_index()))
+            .await
+    }
 }
 
 /// Filesystem-backed implementation of [`RaftSnapshotStore`].
 pub struct FsRaftSnapshotStore {
     root: PathBuf,
+    /// Held across a write and across [`RaftSnapshotStore::discard_superseded`],
+    /// so a discard cannot remove the files of a snapshot staged but not
+    /// yet named `current`.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl FsRaftSnapshotStore {
@@ -1018,7 +1056,10 @@ impl FsRaftSnapshotStore {
         fs::create_dir_all(root.join("snapshots"))
             .await
             .map_err(|e| io_err("create snapshot dir", e))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            write_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     fn snapshot_dir(&self) -> PathBuf {
@@ -1090,10 +1131,15 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
         let safe_id = validate_path_safe_id(&meta.id)?;
         let meta_bytes =
             postcard::to_allocvec(meta).map_err(|e| ser_err("encode snapshot meta", e))?;
+        let _guard = self.write_lock.lock().await;
         atomic_write(&self.meta_path(safe_id), &meta_bytes).await?;
         atomic_write(&self.data_path(safe_id), &data).await?;
         atomic_write(&self.current_path(), safe_id.as_bytes()).await?;
-        self.reclaim_superseded(safe_id).await;
+        // Best-effort here: a removal that fails leaves an orphan for the
+        // next write or `discard_superseded`, never a broken snapshot.
+        if let Err(e) = self.remove_superseded(Some(safe_id)).await {
+            warn!(error = %e, "snapshot reclamation incomplete");
+        }
         Ok(())
     }
 
@@ -1133,35 +1179,46 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
 
         Ok(Some((meta, data)))
     }
+
+    async fn discard_superseded(&self) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock().await;
+        let current = read_if_exists(&self.current_path()).await?;
+        let keep = match &current {
+            Some(bytes) => Some(std::str::from_utf8(bytes).map_err(|e| {
+                StorageError::corruption(format!("current snapshot id is not utf8: {e}"))
+            })?),
+            None => None,
+        };
+        self.remove_superseded(keep).await
+    }
 }
 
 impl FsRaftSnapshotStore {
     /// Remove every snapshot file except `keep_id`'s pair and the
     /// `current` pointer, plus any `*.tmp` staged by a crashed
-    /// `atomic_write`. Called after the pointer durably names
-    /// `keep_id`, so nothing removed here is reachable; without the
-    /// sweep every superseded snapshot (a full serialized state
-    /// machine) stays on disk forever. Best-effort — a failed
-    /// removal leaves an orphan for the next write's sweep, never a
-    /// broken snapshot — but completed removals get one directory
-    /// fsync so a crash can't resurrect a half-removed sibling.
-    async fn reclaim_superseded(&self, keep_id: &str) {
+    /// `atomic_write`; with no `keep_id`, every snapshot file. Call only
+    /// once the pointer durably names `keep_id`, so nothing removed is
+    /// reachable. Keeps going past a failed removal and returns the
+    /// first failure; completed removals get one directory fsync so a
+    /// crash can't resurrect a half-removed sibling.
+    async fn remove_superseded(&self, keep_id: Option<&str>) -> Result<(), StorageError> {
         let dir = self.snapshot_dir();
-        let mut entries = match fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(error = %e, "snapshot reclamation could not list directory");
-                return;
-            }
-        };
+        let mut entries = fs::read_dir(&dir)
+            .await
+            .map_err(|e| io_err("list snapshot dir", e))?;
         let mut removed = false;
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        let mut first_failure = None;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| io_err("list snapshot dir", e))?
+        {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let superseded = name
                 .strip_suffix(".meta")
                 .or_else(|| name.strip_suffix(".data"))
-                .is_some_and(|stem| stem != keep_id)
+                .is_some_and(|stem| keep_id != Some(stem))
                 || name.ends_with(".tmp");
             if !superseded {
                 continue;
@@ -1170,15 +1227,14 @@ impl FsRaftSnapshotStore {
                 Ok(()) => removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    warn!(file = %name, error = %e, "snapshot reclamation failed to remove file");
+                    first_failure.get_or_insert(io_err(&format!("remove snapshot file {name}"), e));
                 }
             }
         }
         if removed {
-            if let Err(e) = fsync_dir(&dir).await {
-                warn!(error = %e, "snapshot reclamation directory sync failed");
-            }
+            fsync_dir(&dir).await?;
         }
+        first_failure.map_or(Ok(()), Err)
     }
 }
 

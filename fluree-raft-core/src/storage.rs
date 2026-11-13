@@ -185,6 +185,27 @@ pub trait RaftLogStore: Send + Sync + 'static {
 
     /// Read the persisted committed watermark.
     async fn read_committed(&self) -> Result<Option<LogId>, StorageError>;
+
+    /// Stop appending to whatever the current tail is stored in, so a
+    /// later [`Self::purge_through`] that reaches the returned index
+    /// removes the bytes of every entry up to it. Returns that index:
+    /// the last entry held, `None` when the store holds none.
+    ///
+    /// The default suits a backend whose purge removes entries exactly.
+    async fn seal(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self.log_state().await?.last_log.map(|id| id.index))
+    }
+
+    /// Lowest index whose entry this store still holds on its medium,
+    /// purged or not. `None` when it holds no entries.
+    ///
+    /// The default refuses: a backend that cannot answer must not let
+    /// log compaction report success it cannot vouch for.
+    async fn first_retained_index(&self) -> Result<Option<u64>, StorageError> {
+        Err(StorageError::other(
+            "this log store cannot report which entries it retains",
+        ))
+    }
 }
 
 /// Persistence for Raft state-machine snapshots.
@@ -200,6 +221,17 @@ pub trait RaftSnapshotStore: Send + Sync + 'static {
 
     /// Return the most recently written snapshot (metadata + data).
     async fn current(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, StorageError>;
+
+    /// Remove every snapshot except the current one, failing if any
+    /// remains.
+    ///
+    /// The default refuses, for the same reason as
+    /// [`RaftLogStore::first_retained_index`].
+    async fn discard_superseded(&self) -> Result<(), StorageError> {
+        Err(StorageError::other(
+            "this snapshot store cannot discard superseded snapshots",
+        ))
+    }
 }
 
 /// Combined storage entry point. A backend implements one of these,
