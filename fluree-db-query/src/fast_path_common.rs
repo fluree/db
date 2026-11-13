@@ -60,8 +60,21 @@ pub(crate) fn bail_if_cancelled(cancellation: &fluree_db_core::QueryCancellation
 /// Same placement rule as [`bail_if_cancelled`]: once per leaflet, never per
 /// row. On an untracked query `consume_fuel` returns before touching the
 /// atomic.
+///
+/// Only the enabled check is inlined: the charge itself is out of line, so a
+/// refill inlined into a per-row loop keeps that loop's code as it was.
 #[inline]
 pub(crate) fn charge_leaflet(tracker: &fluree_db_core::Tracker) -> Result<()> {
+    if tracker.is_enabled() {
+        charge_leaflet_tracked(tracker)
+    } else {
+        Ok(())
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn charge_leaflet_tracked(tracker: &fluree_db_core::Tracker) -> Result<()> {
     tracker
         .consume_fuel(fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL)
         .map_err(QueryError::FuelLimitExceeded)
@@ -962,6 +975,10 @@ impl<'a> PsotSubjectCountIter<'a> {
         self
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         bail_if_cancelled(&self.cancellation)?;
         let projection = projection_sid_only();
@@ -1171,6 +1188,10 @@ impl<'a> PsotSubjectSeek<'a> {
         self
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
         use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
         bail_if_cancelled(&self.cancellation)?;
@@ -1386,6 +1407,10 @@ impl<'a> PostObjectGroupCountIter<'a> {
         }))
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         let proj_okey = projection_okey_only();
         let proj_otype_okey = projection_otype_okey();
@@ -1620,6 +1645,10 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
         }))
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         bail_if_cancelled(&self.cancellation)?;
         let proj_sid_okey = projection_sid_okey();
@@ -1893,6 +1922,10 @@ impl<'a> PsotObjectFilterCountIter<'a> {
         }))
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         let proj_sid_okey = projection_sid_okey();
         let proj_sid_otype_okey = projection_sid_otype_okey();

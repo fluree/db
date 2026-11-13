@@ -2732,6 +2732,8 @@ fn execute_chain(
             }
         }
 
+        // Left inline, unlike the count iterators' refills: out of line it
+        // measured slower on the chain fold this cursor serves.
         fn load_next_batch(&mut self, target_b: u64) -> Result<Option<()>> {
             use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
             loop {
@@ -3592,6 +3594,10 @@ impl<'a> PsotSoIter<'a> {
         }
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         loop {
             if self.handle.is_none() {
