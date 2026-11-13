@@ -27,11 +27,19 @@ use crate::{ApiError, Fluree, Result};
 /// What a read can touch.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reads {
-    /// Any predicate (a variable predicate, a wildcard path or crawl,
-    /// reasoning).
+    /// Any predicate of any subject (a variable predicate with a variable
+    /// subject, a wildcard path or crawl, reasoning).
     Everything,
-    /// These `(subject, predicate)` IRIs; a variable subject is `None`.
-    Facts(Vec<(Option<String>, String)>),
+    Facts(Vec<Fact>),
+}
+
+/// What one pattern reads, in IRIs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Fact {
+    /// One predicate, of one subject or (`None`) of any.
+    Of(Option<String>, String),
+    /// Every predicate of one subject.
+    About(String),
 }
 
 /// What `query` reads, in IRIs: every pattern it evaluates, those in its
@@ -64,23 +72,23 @@ fn iri(r: &Ref, snapshot: &LedgerSnapshot) -> Option<String> {
 
 /// Collect the facts `pattern` itself reads, not those of the patterns
 /// nested in it; `false` when it can read anything.
-fn read_by(
-    pattern: &Pattern,
-    snapshot: &LedgerSnapshot,
-    out: &mut Vec<(Option<String>, String)>,
-) -> bool {
+fn read_by(pattern: &Pattern, snapshot: &LedgerSnapshot, out: &mut Vec<Fact>) -> bool {
     match pattern {
-        Pattern::Triple(tp) => match iri(&tp.p, snapshot) {
-            Some(p) => {
-                out.push((iri(&tp.s, snapshot), p));
+        Pattern::Triple(tp) => match (iri(&tp.s, snapshot), iri(&tp.p, snapshot)) {
+            (s, Some(p)) => {
+                out.push(Fact::Of(s, p));
                 true
             }
-            None => false,
+            (Some(s), None) => {
+                out.push(Fact::About(s));
+                true
+            }
+            (None, None) => false,
         },
         Pattern::EdgeAnnotation { edge, .. } => match iri(&edge.p, snapshot) {
             Some(p) => {
-                out.push((iri(&edge.s, snapshot), p));
-                out.push((None, fluree_vocab::rdf::REIFIES.to_string()));
+                out.push(Fact::Of(iri(&edge.s, snapshot), p));
+                out.push(Fact::Of(None, fluree_vocab::rdf::REIFIES.to_string()));
                 true
             }
             None => false,
@@ -88,9 +96,9 @@ fn read_by(
         // Its values may be a list's members, read through the list's cells.
         Pattern::ListView(lv) => match iri(&lv.triple.p, snapshot) {
             Some(p) => {
-                out.push((iri(&lv.triple.s, snapshot), p));
-                out.push((None, fluree_vocab::rdf::FIRST.to_string()));
-                out.push((None, fluree_vocab::rdf::REST.to_string()));
+                out.push(Fact::Of(iri(&lv.triple.s, snapshot), p));
+                out.push(Fact::Of(None, fluree_vocab::rdf::FIRST.to_string()));
+                out.push(Fact::Of(None, fluree_vocab::rdf::REST.to_string()));
                 true
             }
             None => false,
@@ -106,7 +114,7 @@ fn read_by(
                     .iter()
                     .all(|p| match snapshot.decode_sid(p) {
                         Some(p) => {
-                            out.push((None, p));
+                            out.push(Fact::Of(None, p));
                             true
                         }
                         None => false,
@@ -260,25 +268,33 @@ impl Suppression {
         let any = |of: &RemovedOf| {
             of.any_subject.iter().any(covered) || of.by_subject.values().flatten().any(covered)
         };
+        let about = |of: &RemovedOf, subject: &str| {
+            of.any_subject.iter().any(covered)
+                || of
+                    .by_subject
+                    .get(&super::journal::subject_fingerprint(subject))
+                    .is_some_and(|spans| spans.iter().any(covered))
+        };
         match reads {
             Reads::Everything => self
                 .removed
                 .iter()
                 .find(|(_, of)| any(of))
                 .map(|(p, _)| p.as_str()),
-            Reads::Facts(facts) => facts.iter().find_map(|(subject, predicate)| {
-                let (predicate, of) = self.removed.get_key_value(predicate)?;
-                let needed = match subject {
-                    None => any(of),
-                    Some(iri) => {
-                        of.any_subject.iter().any(covered)
-                            || of
-                                .by_subject
-                                .get(&super::journal::subject_fingerprint(iri))
-                                .is_some_and(|spans| spans.iter().any(covered))
-                    }
-                };
-                needed.then_some(predicate.as_str())
+            Reads::Facts(facts) => facts.iter().find_map(|fact| match fact {
+                Fact::Of(None, predicate) => {
+                    let (predicate, of) = self.removed.get_key_value(predicate)?;
+                    any(of).then_some(predicate.as_str())
+                }
+                Fact::Of(Some(subject), predicate) => {
+                    let (predicate, of) = self.removed.get_key_value(predicate)?;
+                    about(of, subject).then_some(predicate.as_str())
+                }
+                Fact::About(subject) => self
+                    .removed
+                    .iter()
+                    .find(|(_, of)| about(of, subject))
+                    .map(|(p, _)| p.as_str()),
             }),
         }
     }
@@ -920,14 +936,14 @@ mod tests {
         Reads::Facts(
             facts
                 .iter()
-                .map(|(s, p)| (s.map(str::to_string), p.to_string()))
+                .map(|(s, p)| Fact::Of(s.map(str::to_string), p.to_string()))
                 .collect(),
         )
     }
 
     /// A removal whose subject is recorded refuses only reads that name it,
     /// or no subject; one whose subject is not recorded refuses every read
-    /// of its predicate; one that does not apply refuses none.
+    /// that could reach its predicate; one that does not apply refuses none.
     #[test]
     fn a_removals_subject_narrows_the_reads_it_refuses() {
         let journal = |removals| Journal {
@@ -957,6 +973,10 @@ mod tests {
             30
         ));
         assert!(refuses(&carol, Reads::Everything, 30));
+        let about = |subject: &str| Reads::Facts(vec![Fact::About(subject.to_string())]);
+        assert!(refuses(&carol, about("ex:carol"), 30));
+        assert!(!refuses(&carol, about("ex:erin"), 30));
+        assert!(!refuses(&carol, about("ex:carol"), 50));
         // The span is half-open for a point read.
         assert!(!refuses(
             &carol,
@@ -979,6 +999,7 @@ mod tests {
             reads(&[(Some("ex:erin"), "ex:likes")]),
             30
         ));
+        assert!(refuses(&unknown, about("ex:erin"), 30));
 
         let elsewhere =
             Suppression::new(journal(vec![removal(None, "c1")]), String::new(), &[false]);

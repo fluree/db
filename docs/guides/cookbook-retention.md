@@ -334,7 +334,7 @@ A removal selects by exact value. If the same secret was also written with diffe
 
 ### What still works in history afterwards
 
-A removal also changes which *other* historical reads the ledger answers. Once a ledger has one, a read of the past must name its predicates:
+A removal also changes which *other* historical reads the ledger answers. Once a ledger has one, a read of the past is answered when its patterns show it cannot reach a removed value: they name their predicates, or one constant subject.
 
 | Historical read | After a removal of `ex:notes` on `ex:ticket-204` |
 |---|---|
@@ -342,9 +342,12 @@ A removal also changes which *other* historical reads the ledger answers. Once a
 | `?s ex:notes ?v` at an earlier point | Refused: it could return the removed value |
 | `ex:ticket-9 ex:notes ?v` at an earlier point | Answered: a different, constant subject |
 | `ex:ticket-204 ex:subject ?v` at an earlier point | Answered: a predicate the removal does not cover |
-| `?s ?p ?o`, or `ex:ticket-9 ?p ?o`, at an earlier point | Refused, for every subject: a variable predicate can read anything |
-| A graph crawl (`select {"?s": ["*"]}`), a Cypher query, or a query under reasoning, at an earlier point | Refused, for the same reason |
-| `fluree history <entity>` over a range the removal covers | Refused. Add `-p <predicate>` to name the property |
+| `ex:ticket-204 ?p ?o` at an earlier point | Refused: every property of the subject includes the removed one |
+| `ex:ticket-9 ?p ?o` at an earlier point | Answered: every property, but of a different, constant subject |
+| `?s ?p ?o` at an earlier point | Refused: with no subject and no predicate named, it can read anything |
+| A graph crawl (`select {"?s": ["*"]}` or `select {"ex:ticket-9": ["*"]}`), a Cypher query, or a query under reasoning, at an earlier point | Refused, for every subject: these read properties their patterns do not name |
+| `fluree history ex:ticket-204` over a range the removal covers | Refused. Add `-p <predicate>` to read another of its properties |
+| `fluree history ex:ticket-9` over the same range | Answered |
 | Any query as of the head | Answered |
 | Any query at a point before the removed value was first written | Answered |
 
@@ -413,7 +416,7 @@ It is not undone by re-inserting the value, by resetting a branch, or by any tra
 
 - **"My value did not expire."** Check [retention status](#check-that-expiry-is-running). The usual causes are a ledger not yet registered (its first lifetime has not been indexed), a node that is not the maintenance owner, or an invalid retention config under `problems`.
 - **Expiry on a local CLI ledger.** The CLI runs no background worker. A value written with a lifetime by the CLI alone stays until a server runs over that storage, which then expires whatever is due.
-- **Wildcard history queries after a removal.** A removal makes the ledger refuse historical reads with a variable predicate, for every subject; see [What still works in history afterwards](#what-still-works-in-history-afterwards).
+- **Wildcard history queries after a removal.** A removal makes the ledger refuse historical reads that name neither their predicates nor one subject, and every graph crawl of the past; see [What still works in history afterwards](#what-still-works-in-history-afterwards).
 - **Bulk import refuses lifetimes.** Import the data without `@ttl` or `f:ttl`, then write the values that expire with a transaction.
 - **A TTL on a shared relationship is refused.** If several annotations or parallel Cypher relationships share one triple, expiring it would end all of them.
 - **`f:noHistory` is not privacy.** It changes what the index holds. The commit log, and anyone with raw access to it, still has every value.

@@ -848,6 +848,113 @@ async fn removing_one_occurrence_preserves_the_others() {
     );
 }
 
+/// A read of every property of one subject needs only that subject's
+/// removals: another subject's history stays readable, at a point and over
+/// a range, where a read of every subject is refused.
+#[tokio::test]
+async fn a_removal_refuses_an_every_property_read_of_its_subject_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-every-property").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@old", "ex:name": "Alice"},
+            {"@id": "ex:bob", "ex:email": "b@old"}
+        ]}),
+    )
+    .await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@new"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    let earlier = json!(format!("{id}@t:{t1}"));
+
+    assert_eq!(
+        read(&fluree, &id, earlier.clone(), "ex:bob", "?p")
+            .await
+            .unwrap(),
+        vec![json!("b@old")]
+    );
+    assert!(unavailable(
+        read(&fluree, &id, earlier.clone(), "ex:alice", "?p").await
+    ));
+    assert!(unavailable(
+        read(&fluree, &id, earlier.clone(), "?s", "?p").await
+    ));
+    // A crawl follows references to other subjects.
+    assert!(matches!(
+        fluree
+            .query_connection(&json!({
+                "@context": ctx(),
+                "from": earlier,
+                "select": {"ex:bob": ["*"]}
+            }))
+            .await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+
+    let history = |subject: &str| {
+        json!({
+            "@context": ctx(),
+            "from": format!("{id}@t:{t1}"),
+            "to": format!("{id}@t:latest"),
+            "select": ["?p", "?v", "?t", "?op"],
+            "where": [{"@id": subject, "?p": {"@value": "?v", "@t": "?t", "@op": "?op"}}],
+            "orderBy": "?t"
+        })
+    };
+    let bob = fluree
+        .query_connection(&history("ex:bob"))
+        .await
+        .expect("another subject's history is served");
+    assert_eq!(
+        bob.batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .sum::<usize>(),
+        3,
+        "b@old asserted and retracted, b@new asserted"
+    );
+    assert!(matches!(
+        fluree.query_connection(&history("ex:alice")).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+
+    let sparql = |subject: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?p ?o FROM <{id}@t:{t1}> WHERE {{ {subject} ?p ?o }}"
+        )
+    };
+    let bob = fluree
+        .query_connection_sparql(&sparql("ex:bob"))
+        .await
+        .expect("another subject's properties are served");
+    assert_eq!(
+        bob.batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .sum::<usize>(),
+        1
+    );
+    for refused in ["ex:alice", "?s"] {
+        assert!(
+            matches!(
+                fluree.query_connection_sparql(&sparql(refused)).await,
+                Err(ApiError::HistoryUnavailable(_))
+            ),
+            "{refused}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn removing_a_current_occurrence_retracts_it() {
     let fluree = FlureeBuilder::memory().build_memory();
