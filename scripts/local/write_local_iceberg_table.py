@@ -24,6 +24,11 @@
   timestamptz, binary, string, and numeric text), in two files, with values whose lexical order
   differs from their natural order, duplicates to group on, and a row that is
   null in every typed column.
+- `silver.versions`: two snapshots (one file each) of rows that do not all
+  yield a solution: the second file holds the top names, among them a row
+  whose `id` (the subject's only column) is null and a row whose `city` is
+  null, so a top-k that counted them would prune the first file, whose
+  `erin` belongs in the answer.
 - `silver.renamed`: two snapshots across a column rename: three rows with
   `id`, `name`; then `name` renamed to `full_name`; then two more rows. A
   read pinned to the first snapshot must find its rows under the current

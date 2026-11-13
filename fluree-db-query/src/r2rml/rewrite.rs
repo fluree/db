@@ -4137,9 +4137,9 @@ mod tests {
 
     #[test]
     fn filter_in_declines_over_cap() {
-        // Default cap is 64; 65 members decline (kept cheap — O(files × members)).
+        // One member past the cap declines the whole set.
         let mut args = vec![Expression::Var(VarId(0))];
-        for i in 0..65 {
+        for i in 0..=crate::r2rml::in_pushdown_max() as i64 {
             args.push(Expression::Const(FlakeValue::Long(i)));
         }
         let mut out = Vec::new();

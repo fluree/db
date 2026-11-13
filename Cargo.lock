@@ -3526,6 +3526,7 @@ dependencies = [
  "fluree-db-tabular",
  "fluree-test-support",
  "futures",
+ "hashbrown 0.16.1",
  "http 1.4.0",
  "hyper-rustls 0.24.2",
  "jsonwebtoken",

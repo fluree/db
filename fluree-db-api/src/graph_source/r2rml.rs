@@ -35,8 +35,8 @@ use fluree_db_iceberg::{
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanOrder,
-    ScanTopK, ScanValue, SourceTime, TermOrder,
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFileCounts, ScanFilter,
+    ScanOrder, ScanTopK, ScanValue, SourceTime, TermOrder,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
@@ -1044,11 +1044,7 @@ fn build_iceberg_filter(
         if f.op == ScanCmpOp::In {
             if let ScanValue::Set(members) = &f.value {
                 if let Some(values) = set_members_to_literals(field.type_string(), members, true) {
-                    comparisons.push(Expression::In {
-                        field_id: field.id,
-                        column: f.column.clone(),
-                        values,
-                    });
+                    comparisons.push(Expression::in_list(field.id, f.column.clone(), values));
                 }
             }
             continue;
@@ -3359,6 +3355,119 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .await
     }
 
+    /// The pinned snapshot's row count from what is already at hand, never
+    /// reading manifests to find out: the snapshot's kept file list (in
+    /// memory, from a scan of the table earlier in this process, then on
+    /// disk), else the snapshot summary's `total-records` (most writers record
+    /// it).
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<u64>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        // A filtered logical table keeps at most its table's rows: the table's
+        // count bounds it, which is all a caller sizing a cache needs.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
+        let TableContext {
+            metadata,
+            metadata_location,
+            scope,
+            ..
+        } = self.load_table_context(graph_source_id, table_name).await?;
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
+            return Ok(Some(0));
+        };
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
+        if let Some(files) = self
+            .fluree
+            .r2rml_cache()
+            .get_scan_files(&scope, &cache_key)
+            .await
+        {
+            return Ok(u64::try_from(files.record_count()).ok());
+        }
+        if let Some(files) = self.catalog_disk_cache().get_scan_files(&scope, &cache_key) {
+            return Ok(u64::try_from(files.record_count()).ok());
+        }
+        Ok(selected
+            .snapshot
+            .total_records()
+            .and_then(|total| u64::try_from(total).ok()))
+    }
+
+    /// Plan the filtered scan against the same pinned snapshot the scan reads,
+    /// from the snapshot's kept file list as a scan would
+    /// (`plan_from_kept_files`): a warm snapshot reads nothing, and a cold one
+    /// reads its manifests once and keeps the list for the scan that follows.
+    /// Filters with nothing the planner can prune on report no file skipped;
+    /// SQL and Delta sources cannot tell.
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<ScanFileCounts>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        // A filtered logical table plans `filters` against the table it reads.
+        // Its row filter may prune more files than these counts show; they
+        // only decide whether a keyed read is worth making.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
+        let TableContext {
+            storage,
+            metadata,
+            metadata_location,
+            scope,
+        } = self.load_table_context(graph_source_id, table_name).await?;
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
+            return Ok(Some(ScanFileCounts {
+                selected: 0,
+                pruned: 0,
+            }));
+        };
+        let snapshot = selected.snapshot;
+        let Some(schema) = metadata.read_schema_for_snapshot(snapshot) else {
+            return Ok(None);
+        };
+        let Some(filter) = build_iceberg_filter(filters, schema.as_ref()) else {
+            return Ok(Some(ScanFileCounts {
+                selected: 0,
+                pruned: 0,
+            }));
+        };
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
+        let planner = SendScanPlanner::new(
+            storage.as_ref(),
+            &metadata,
+            ScanConfig::new().with_filter(filter),
+        );
+        let plan = self
+            .plan_from_kept_files(&planner, snapshot, &scope, &cache_key, &metadata_location)
+            .await?;
+        Ok(Some(ScanFileCounts {
+            selected: plan.files_selected as u64,
+            pruned: plan.files_pruned as u64,
+        }))
+    }
+
     fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> QueryResult<()> {
         let mut pins = self
             .source_times
@@ -4025,6 +4134,69 @@ impl FlureeR2rmlProvider<'_> {
         Ok(format!("{root}/{matched}"))
     }
 
+    /// Plan a scan of `snapshot` from its kept file list, the one path every
+    /// plan of a snapshot goes through (a scan's, and a keyed read's file
+    /// counts): the in-memory scan-files cache, then the disk catalog cache
+    /// (promoted into memory), else the manifests, read once and kept in both.
+    /// Whatever the planner's filter, the list kept is the whole unfiltered
+    /// one; `plan_from_files` prunes it with the same file test the manifest
+    /// walk uses, and re-applies the merge-on-read refusal.
+    async fn plan_from_kept_files<S: SendIcebergStorage>(
+        &self,
+        planner: &SendScanPlanner<'_, S>,
+        snapshot: &fluree_db_iceberg::metadata::Snapshot,
+        scope: &StorageScope,
+        cache_key: &str,
+        metadata_location: &str,
+    ) -> QueryResult<ScanPlan> {
+        let cache = self.fluree.r2rml_cache();
+        let plan = if let Some(cached) = cache.get_scan_files(scope, cache_key).await {
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = cached.data_files.len(),
+                "Iceberg scan-files cache hit"
+            );
+            planner
+                .plan_from_files(snapshot, cached.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?
+        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(scope, cache_key) {
+            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
+            // cache has this snapshot's file list — a warm-catalog cold process
+            // skips the manifest read. The plan re-applies the merge-on-read
+            // refusal (F-AUD-1, the cross-process case: an entry written under
+            // the override by an earlier process) before the list is promoted
+            // into the in-memory cache.
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = disk.data_files.len(),
+                "Iceberg scan-files disk-cache hit"
+            );
+            let plan = planner
+                .plan_from_files(snapshot, disk.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            cache.put_scan_files(scope, cache_key, disk).await;
+            plan
+        } else {
+            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
+            let (plan, files) = planner
+                .plan_scan_for_snapshot_retaining_files(snapshot)
+                .await
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            let cached = Arc::new(CachedScanFiles::new(files, plan.has_delete_manifests));
+            // Persist to the disk catalog cache (content-addressed, immutable),
+            // also when the list is too large for the in-memory cache. Written
+            // off this query's path: thousands of files are megabytes of JSON.
+            self.catalog_disk_cache().put_scan_files_in_background(
+                scope.clone(),
+                cache_key.to_string(),
+                Arc::clone(&cached),
+            );
+            cache.put_scan_files(scope, cache_key, cached).await;
+            plan
+        };
+        Ok(plan)
+    }
+
     /// Build (or find cached) the shared catalog client a source's table loads
     /// use, so loads issued together share one. A Direct source has none.
     async fn warm_catalog_client(
@@ -4660,55 +4832,11 @@ impl FlureeR2rmlProvider<'_> {
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
 
         // A snapshot's live file list never changes, so it is read from the
-        // manifests once and kept: in memory, and in the disk catalog cache for
-        // later processes. Whatever this scan's filter, the list kept is the
-        // whole unfiltered one, and every scan of the snapshot plans from it in
-        // memory (`plan_from_files` prunes it with the same file test the
-        // manifest walk uses, and re-applies the merge-on-read refusal).
-        let plan = if let Some(cached) = cache.get_scan_files(&scope, &cache_key).await {
-            debug!(
-                metadata_location = %metadata_location,
-                cached_files = cached.data_files.len(),
-                "Iceberg scan-files cache hit"
-            );
-            planner
-                .plan_from_files(snapshot, cached.kept())
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?
-        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&scope, &cache_key) {
-            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
-            // cache has this snapshot's file list — a warm-catalog cold process
-            // skips the manifest read. The plan re-applies the merge-on-read
-            // refusal (F-AUD-1, the cross-process case: an entry written under
-            // the override by an earlier process) before the list is promoted
-            // into the in-memory cache.
-            debug!(
-                metadata_location = %metadata_location,
-                cached_files = disk.data_files.len(),
-                "Iceberg scan-files disk-cache hit"
-            );
-            let plan = planner
-                .plan_from_files(snapshot, disk.kept())
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-            cache.put_scan_files(&scope, &cache_key, disk).await;
-            plan
-        } else {
-            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
-            let (plan, files) = planner
-                .plan_scan_for_snapshot_retaining_files(snapshot)
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-            let cached = Arc::new(CachedScanFiles::new(files, plan.has_delete_manifests));
-            // Persist to the disk catalog cache (content-addressed, immutable),
-            // also when the list is too large for the in-memory cache. Written
-            // off this query's path: thousands of files are megabytes of JSON.
-            self.catalog_disk_cache().put_scan_files_in_background(
-                scope.clone(),
-                cache_key.clone(),
-                Arc::clone(&cached),
-            );
-            cache.put_scan_files(&scope, &cache_key, cached).await;
-            plan
-        };
+        // manifests once and kept, and every scan of the snapshot plans from it
+        // (see `plan_from_kept_files`).
+        let plan = self
+            .plan_from_kept_files(&planner, snapshot, &scope, &cache_key, &metadata_location)
+            .await?;
         let ScanPlan {
             tasks,
             files_selected,
@@ -5820,7 +5948,7 @@ mod tests {
         assert!(matches!(
             build_iceberg_filter(&[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "10"]))], &s),
             Some(Expression::In { values, .. })
-                if values == [LiteralValue::Int64(9), LiteralValue::Int64(10)]
+                if values.values() == [LiteralValue::Int64(9), LiteralValue::Int64(10)]
         ));
         assert!(build_iceberg_filter(
             &[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "09"]))],
