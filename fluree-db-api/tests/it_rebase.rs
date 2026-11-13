@@ -1073,3 +1073,65 @@ async fn an_index_of_a_replaced_line_is_not_extended() {
         .unwrap();
     support::build_incrementally_and_publish_index(&fresh, "rb:dev").await;
 }
+
+/// The nameservice's commit-CID index keeps the entries of the line a rebase
+/// replaced below the new head, so a build handed that index for its walk
+/// sees every `t` covered while the entries are not the head's line. The
+/// build checks the entries link and walks the line itself when they do not.
+#[tokio::test]
+async fn a_build_from_the_commit_index_reads_the_rebased_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    let name = |n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{n}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree.insert(main, &name("alice")).await.unwrap().ledger;
+    support::rebuild_and_publish_index(&fluree, "rb:main").await;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    for n in ["bob", "carol"] {
+        let dev = fluree.ledger("rb:dev").await.unwrap();
+        fluree.insert(dev, &name(n)).await.unwrap();
+    }
+    fluree.insert(main, &name("dave")).await.unwrap();
+    fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    let record = fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = fluree
+        .branch_admin()
+        .unwrap()
+        .pending_commit_cids("rb:dev", record.index_t)
+        .await
+        .unwrap();
+    let covered: Vec<i64> = pending.iter().flatten().map(|(t, _)| *t).collect();
+    assert_eq!(
+        covered,
+        (record.index_t + 1..=record.commit_t).collect::<Vec<_>>(),
+        "the commit index no longer covers the range, so the build would not use it"
+    );
+    let config = fluree_db_indexer::IndexerConfig {
+        pending_commit_cids: pending,
+        ..Default::default()
+    };
+    let built = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.branched_content_store("rb:dev").await.unwrap(),
+        &record,
+        config,
+    )
+    .await
+    .unwrap();
+    support::publish_built_index(&fluree, "rb:dev", built.index_t, &built.root_id).await;
+    drop(fluree);
+
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+}
