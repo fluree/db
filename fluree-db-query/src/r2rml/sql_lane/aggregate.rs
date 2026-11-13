@@ -1,8 +1,11 @@
 //! GROUP BY and aggregates over one SQL block, as one grouped statement.
 //!
 //! The block's rows are exactly the SPARQL solutions (the join layer's
-//! contract), so grouping them in the database is exact wherever SQL and
-//! SPARQL agree on the aggregate; where they differ the plan is patched:
+//! contract) where its maps prove no row repeats a solution; elsewhere the
+//! statement groups the block's distinct solutions instead, a `SELECT
+//! DISTINCT` derived table ([`over_distinct_solutions`]). Grouping them in
+//! the database is then exact wherever SQL and SPARQL agree on the
+//! aggregate; where they differ the plan is patched:
 //! `AVG` is pushed as `SUM` + `COUNT` and divided in the engine (databases
 //! round a decimal average to the input scale), an empty `SUM` comes back
 //! `NULL` and is reported as `0`, and string keys or `MIN`/`MAX` are pushed
@@ -18,7 +21,9 @@ use std::sync::Arc;
 use bigdecimal::BigDecimal;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::ObjectMap;
-use fluree_db_tabular::plan::{CmpOp, ColRef, OrderKey, OutputCol, OutputExpr, Pred, RelPlan};
+use fluree_db_tabular::plan::{
+    CmpOp, ColRef, OrderKey, OutputCol, OutputExpr, Pred, RelNode, RelPlan,
+};
 use fluree_db_tabular::{Column, ColumnBatch, FieldType};
 use fluree_vocab::xsd;
 use num_bigint::BigInt;
@@ -210,11 +215,114 @@ fn lower_aggregate(
     for_terms.accesses.extend(grouped.extremes);
     let materializer =
         Materializer::new(&for_terms, &resolved.mapping, snapshot).map_err(|_| "materializer")?;
+    // The materializer reads outputs by name, which the rewrite keeps.
+    let plan = if lowered.dedupes {
+        over_distinct_solutions(&grouped.plan, lowered)
+            .ok_or("aggregate over columns outside the solutions")?
+    } else {
+        grouped.plan
+    };
     Ok(AggLowered {
-        plan: grouped.plan,
+        plan,
         materializer,
         decodes: grouped.decodes,
     })
+}
+
+/// Alias of the derived table holding a block's distinct solutions.
+const SOLUTIONS_ALIAS: &str = "s";
+
+/// `plan`, a grouped statement over `lowered`'s join, read instead from the
+/// block's distinct solutions: `lowered`'s statement as a `SELECT DISTINCT`
+/// over every block variable's columns, in a derived table, with every column
+/// the grouped statement reads renamed to the output carrying it. Its groups
+/// and aggregates then count solutions, not rows. Output names are kept, so a
+/// materializer built for `plan` decodes the result. `None` when `plan` reads
+/// a column the solutions do not carry.
+pub(super) fn over_distinct_solutions(plan: &RelPlan, lowered: &Lowered) -> Option<RelPlan> {
+    let solution = |c: &ColRef| -> Option<ColRef> {
+        lowered
+            .outputs
+            .iter()
+            .find(|o| matches!(&o.expr, OutputExpr::Col(k) if k == c))
+            .map(|o| ColRef::new(SOLUTIONS_ALIAS, &o.name))
+    };
+    let output = plan
+        .output
+        .iter()
+        .map(|o| {
+            let expr = match &o.expr {
+                OutputExpr::Col(c) => OutputExpr::Col(solution(c)?),
+                OutputExpr::Min(c) => OutputExpr::Min(solution(c)?),
+                OutputExpr::Max(c) => OutputExpr::Max(solution(c)?),
+                OutputExpr::Count { col, distinct } => OutputExpr::Count {
+                    col: solution(col)?,
+                    distinct: *distinct,
+                },
+                OutputExpr::Sum { col, distinct } => OutputExpr::Sum {
+                    col: solution(col)?,
+                    distinct: *distinct,
+                },
+                other @ (OutputExpr::CountRows | OutputExpr::Tag(_) | OutputExpr::Null) => {
+                    other.clone()
+                }
+            };
+            Some(OutputCol {
+                expr,
+                name: o.name.clone(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let group_by = plan
+        .group_by
+        .iter()
+        .map(solution)
+        .collect::<Option<Vec<_>>>()?;
+    let order_by = plan
+        .order_by
+        .iter()
+        .map(|(key, asc)| {
+            let key = match key {
+                OrderKey::Col(c) => OrderKey::Col(solution(c)?),
+                OrderKey::Output(name) => OrderKey::Output(name.clone()),
+                OrderKey::Expr(_) => return None,
+            };
+            Some((key, *asc))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if plan.having.as_ref().is_some_and(reads_columns) {
+        return None;
+    }
+    Some(RelPlan {
+        root: RelNode::Derived {
+            alias: SOLUTIONS_ALIAS.into(),
+            plan: Box::new(RelPlan {
+                root: lowered.root.clone(),
+                output: lowered.outputs.clone(),
+                group_by: Vec::new(),
+                distinct: true,
+                order_by: Vec::new(),
+                limit: None,
+                having: None,
+            }),
+        },
+        output,
+        group_by,
+        distinct: plan.distinct,
+        order_by,
+        limit: plan.limit,
+        having: plan.having.clone(),
+    })
+}
+
+/// Whether a predicate reads a column (rather than only grouped outputs).
+fn reads_columns(pred: &Pred) -> bool {
+    match pred {
+        Pred::OutputCmp { .. } => false,
+        Pred::And(ps) | Pred::Or(ps) => ps.iter().any(reads_columns),
+        Pred::Not(p) => reads_columns(p),
+        _ => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

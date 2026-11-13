@@ -2231,7 +2231,6 @@ impl NestedLoopJoinOperator {
         let mut matched_rows: u64 = 0;
         let need_replay = ctx.to_t < store.max_t();
         let replay_to = need_replay.then_some(ctx.to_t);
-        let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         let proj = fluree_db_binary_index::ColumnProjection::all();
 
         for leaf_idx in leaf_range {
@@ -2245,8 +2244,7 @@ impl NestedLoopJoinOperator {
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
                 // by the indexer for time-travel replay. Skip only when there is
                 // also no history past `to_t` to reconstruct.
-                let needs_history_replay =
-                    need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+                let needs_history_replay = entry.replays_history(replay_to);
                 if entry.row_count == 0 && !needs_history_replay {
                     continue;
                 }
@@ -2258,6 +2256,9 @@ impl NestedLoopJoinOperator {
                 }
 
                 let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+                // Rows restored by replay keep their own types, which the
+                // constant, taken over the live rows, does not describe.
+                let o_type_const = entry.o_type_const_for(needs_history_replay);
                 ctx.check_cancelled()?;
 
                 let row_count = batch.row_count;
@@ -2304,9 +2305,8 @@ impl NestedLoopJoinOperator {
                         .filter(|w| !w.is_empty());
                     for row in row_start..row_end {
                         matched_rows += 1;
-                        let o_type_val = entry
-                            .o_type_const
-                            .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                        let o_type_val =
+                            o_type_const.unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                             let o_i_val = batch.o_i.get_or(row, u32::MAX);
@@ -3168,7 +3168,7 @@ fn build_probe_object_binding(
         late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
     {
         // Eager callers get what the per-row scan emits: a datalog rule head
-        // built from an encoded binding derives nothing.
+        // rejects an encoded binding.
         match binding {
             Binding::EncodedSid { .. } if ctx.eager_materialization => {
                 return Ok(Binding::Sid {
@@ -3293,7 +3293,6 @@ pub(crate) fn for_each_object_probe_match(
 
     let need_replay = ctx.to_t < store.max_t();
     let replay_to = need_replay.then_some(ctx.to_t);
-    let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
     for leaf_idx in leaf_indices {
         ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
@@ -3301,8 +3300,7 @@ pub(crate) fn for_each_object_probe_match(
 
         for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
             ctx.check_cancelled()?;
-            let needs_history_replay =
-                need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+            let needs_history_replay = entry.replays_history(replay_to);
             if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
@@ -3580,7 +3578,6 @@ fn batched_subject_probe_binary_uncharged(
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let need_replay = ctx.to_t < store.max_t();
     let replay_to = need_replay.then_some(ctx.to_t);
-    let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
     let proj = ColumnProjection::all();
     let mut out = Vec::new();
 
@@ -3591,8 +3588,7 @@ fn batched_subject_probe_binary_uncharged(
 
         for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
             ctx.check_cancelled()?;
-            let needs_history_replay =
-                need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+            let needs_history_replay = entry.replays_history(replay_to);
             if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
@@ -3625,6 +3621,7 @@ fn batched_subject_probe_binary_uncharged(
             }
 
             let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let o_type_const = entry.o_type_const_for(needs_history_replay);
             ctx.check_cancelled()?;
 
             let row_count = batch.row_count;
@@ -3667,9 +3664,7 @@ fn batched_subject_probe_binary_uncharged(
                     .filter(|w| !w.is_empty());
 
                 for row in row_start..row_end {
-                    let o_type_val = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                    let o_type_val = o_type_const.unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                         let o_i_val = batch.o_i.get_or(row, u32::MAX);
@@ -3873,7 +3868,6 @@ fn batched_subject_star_spot_uncharged(
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let need_replay = ctx.to_t < store.max_t();
     let replay_to = need_replay.then_some(ctx.to_t);
-    let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
     let proj = ColumnProjection::all();
     let mut out = Vec::new();
     let (mut leaflets_read, mut leaflets_replayed, mut leaflets_skipped) = (0u64, 0u64, 0u64);
@@ -3884,8 +3878,7 @@ fn batched_subject_star_spot_uncharged(
         let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
-            let needs_history_replay =
-                need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+            let needs_history_replay = entry.replays_history(replay_to);
             if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
@@ -3904,6 +3897,7 @@ fn batched_subject_star_spot_uncharged(
             leaflets_replayed += u64::from(needs_history_replay);
 
             let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let o_type_const = entry.o_type_const_for(needs_history_replay);
 
             let row_count = batch.row_count;
             if row_count == 0 {
@@ -3935,9 +3929,7 @@ fn batched_subject_star_spot_uncharged(
                         continue;
                     };
 
-                    let o_type_val = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                    let o_type_val = o_type_const.unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                         let o_i_val = batch.o_i.get_or(row, u32::MAX);

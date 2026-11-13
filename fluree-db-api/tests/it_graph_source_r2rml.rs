@@ -3379,15 +3379,17 @@ async fn temporal_values_compare_equal_by_value() {
 // (Store and Employee) — the predicate fan-out that caused unrelated dimension
 // tables to be scanned — and Store has a RefObjectMap to Geography, so we can
 // assert parents are pruned for unreferenced predicates yet kept for referenced
-// ones (R2RML dangling-FK semantics are not weakened).
+// ones (R2RML dangling-FK semantics are not weakened). Each table declares its
+// surrogate key, so each subject is one row's and the star may fuse.
 
 const EDW_GUARD_MAPPING_TTL: &str = r#"
 @prefix rr: <http://www.w3.org/ns/r2rml#> .
 @prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix f: <https://ns.flur.ee/db#> .
 
 <http://example.org/mapping#Store> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:logicalTable [ rr:tableName "dw.store" ; f:key ( "store_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
     rr:predicateObjectMap [ rr:predicate ex:storeId ; rr:objectMap [ rr:column "store_id" ] ] ;
     rr:predicateObjectMap [ rr:predicate ex:storeKey ; rr:objectMap [ rr:column "store_key" ; rr:datatype xsd:integer ] ] ;
@@ -3401,13 +3403,13 @@ const EDW_GUARD_MAPPING_TTL: &str = r#"
     ] .
 
 <http://example.org/mapping#Geography> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.geography" ] ;
+    rr:logicalTable [ rr:tableName "dw.geography" ; f:key ( "geo_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Geography ] ;
     rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
     rr:predicateObjectMap [ rr:predicate ex:region ; rr:objectMap [ rr:column "region" ] ] .
 
 <http://example.org/mapping#Employee> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.employee" ] ;
+    rr:logicalTable [ rr:tableName "dw.employee" ; f:key ( "emp_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Employee ] ;
     rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
 "#;
@@ -5843,8 +5845,8 @@ async fn verify_twin_full_passes_on_multi_chunk_twin() {
 /// A parent whose SUBJECT is keyed on `c_id` but is JOINED on `region` (non-unique):
 /// two customers in the same region mint DIFFERENT subjects for the same join key, so
 /// key `["EU"]` maps to both `customer/1` and `customer/2` — the duplicate-parent-key
-/// fan-out shape. The two customers are split across two scan BATCHES (the cross-file
-/// race the deterministic keep-min tie-break repairs); `reverse` flips their order.
+/// fan-out shape. The two customers are split across two scan BATCHES (two data
+/// files, read in either order); `reverse` flips their order.
 #[cfg(feature = "native")]
 fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock> {
     use fluree_db_r2rml::mapping::{
@@ -5925,68 +5927,35 @@ fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock
     Arc::new(MultiTableMock { mapping, tables })
 }
 
-/// DUP-KEY DECLINE (dupkey-adjudication.md ruling C2): a source whose FK parent join
-/// key maps to more than one parent must be REFUSED by default, with an error that
-/// names the anomaly and points at the override.
+/// FAN-OUT (#1583): a source whose FK parent join key matches two parent subjects
+/// builds, and the order joins BOTH, whichever batch is scanned first; the twin's
+/// stamp records no ambiguous keys. The old override is accepted and changes nothing.
 #[cfg(feature = "native")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialize_declines_duplicate_parent_keys_by_default() {
-    const LEDGER: &str = "test/dupkey-decline:main";
-    let provider = dup_parent_key_provider(false);
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-        .build()
-        .expect("build Fluree");
-    let err = fluree
-        .create(LEDGER)
-        .import_r2rml(Arc::clone(&provider), "gs:main")
-        .threads(2)
-        .memory_budget_mb(256)
-        .execute()
-        .await
-        .expect_err("a source with duplicate parent join keys must be declined by default");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("duplicate parent join keys"),
-        "the error must name the anomaly; got: {msg}"
-    );
-    assert!(
-        msg.contains("--allow-duplicate-parent-keys"),
-        "the error must point at the override; got: {msg}"
-    );
-}
-
-/// DUP-KEY OVERRIDE + DETERMINISM + STAMP: with `--allow-duplicate-parent-keys` the
-/// twin builds; the FK resolves to the SAME deterministic winner (keep-min =
-/// `customer/1`) regardless of scan-batch order; and the completion stamp records the
-/// ambiguous-key count so the overridden twin self-documents its anomaly.
-#[cfg(feature = "native")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialize_override_builds_deterministic_twin_and_records_stamp() {
-    for reverse in [false, true] {
-        let ledger = if reverse {
-            "test/dupkey-ovr-rev:main"
-        } else {
-            "test/dupkey-ovr:main"
-        };
+async fn materialize_emits_an_edge_to_every_parent_a_duplicate_key_matches() {
+    for (reverse, flag) in [(false, false), (true, false), (false, true)] {
+        let ledger = format!("test/dupkey-fanout-{reverse}-{flag}:main");
         let provider = dup_parent_key_provider(reverse);
         let dir = tempfile::tempdir().expect("tmpdir");
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
             .build()
             .expect("build Fluree");
-        fluree
-            .create(ledger)
+        let mut builder = fluree
+            .create(&ledger)
             .import_r2rml(Arc::clone(&provider), "gs:main")
             .threads(2)
-            .memory_budget_mb(256)
-            .allow_duplicate_parent_keys(true)
+            .memory_budget_mb(256);
+        if flag {
+            #[allow(deprecated)]
+            let with_flag = builder.allow_duplicate_parent_keys(true);
+            builder = with_flag;
+        }
+        builder
             .execute()
             .await
-            .expect("override builds the twin");
-        let loaded = fluree.ledger(ledger).await.expect("load twin");
+            .expect("a duplicate parent key builds the twin");
+        let loaded = fluree.ledger(&ledger).await.expect("load twin");
 
-        // Deterministic winner: order/100 -> customer/1 (the lexicographically smaller
-        // of {customer/1, customer/2}), independent of which batch was scanned first.
         let json = support::query_sparql(
             &fluree,
             &loaded,
@@ -5996,22 +5965,23 @@ async fn materialize_override_builds_deterministic_twin_and_records_stamp() {
         .expect("query")
         .to_sparql_json(&loaded.snapshot)
         .expect("sparql json");
+        let mut customers: Vec<&str> = json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .map(|b| b["c"]["value"].as_str().expect("an IRI"))
+            .collect();
+        customers.sort_unstable();
         assert_eq!(
-            json["results"]["bindings"][0]["c"]["value"],
-            "http://ex.org/customer/1",
-            "keep-min must resolve the FK to customer/1 regardless of batch order (reverse={reverse})"
+            customers,
+            ["http://ex.org/customer/1", "http://ex.org/customer/2"],
+            "the order joins both customers of its region (reverse={reverse}, flag={flag})"
         );
 
-        // The stamp self-documents the anomaly (exactly one ambiguous key: region=EU).
-        let stamp = read_head_stamp(&fluree, ledger).await;
+        let stamp = read_head_stamp(&fluree, &ledger).await;
         assert!(
-            !stamp.dup_parent_keys.is_empty(),
-            "an override-built twin must record dup_parent_keys in its stamp (reverse={reverse})"
-        );
-        let total: u64 = stamp.dup_parent_keys.values().sum();
-        assert_eq!(
-            total, 1,
-            "exactly one ambiguous parent key (region=EU) regardless of order (reverse={reverse})"
+            stamp.dup_parent_keys.is_empty(),
+            "a twin that holds every edge records no ambiguous keys (reverse={reverse}, flag={flag})"
         );
     }
 }

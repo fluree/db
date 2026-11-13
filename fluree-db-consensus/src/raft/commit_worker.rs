@@ -1098,6 +1098,7 @@ impl Worker {
         // without observable mutation. If the branch was at genesis
         // with no head to fall back to, the situation is anomalous
         // — poison rather than fabricate a head.
+        let advanced = new_head_id.is_some();
         let (advance_to, advance_t) = match (new_head_id, pre_rebase_head_id) {
             (Some(head), _) => (head, new_head_t),
             (None, Some(head)) => (head, pre_rebase_head_t),
@@ -1131,11 +1132,15 @@ impl Worker {
                 source_head_id,
                 strategy,
             }),
-            install: write_guard.map(|guard| StagedStateInstall {
-                write_guard: guard,
-                new_state: final_state,
-                commit_t: advance_t,
-            }),
+            // With no advance `final_state` is the source's state, not the
+            // branch's, so the cache keeps what it has.
+            install: write_guard
+                .filter(|_| advanced)
+                .map(|guard| StagedStateInstall {
+                    write_guard: guard,
+                    new_state: final_state,
+                    commit_t: advance_t,
+                }),
         })
     }
 
