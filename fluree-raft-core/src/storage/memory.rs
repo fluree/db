@@ -98,6 +98,11 @@ impl RaftLogStore for MemoryRaftLogStore {
         let state = self.state.read().map_err(|_| lock_poisoned("log store"))?;
         Ok(state.committed)
     }
+
+    async fn first_retained_index(&self) -> Result<Option<u64>, StorageError> {
+        let state = self.state.read().map_err(|_| lock_poisoned("log store"))?;
+        Ok(state.entries.keys().next().copied())
+    }
 }
 
 #[derive(Default)]
@@ -149,6 +154,16 @@ impl RaftSnapshotStore for MemoryRaftSnapshotStore {
             .current
             .as_ref()
             .and_then(|id| state.snapshots.get(id).cloned()))
+    }
+
+    async fn discard_superseded(&self) -> Result<(), StorageError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| lock_poisoned("snapshot store"))?;
+        let current = state.current.clone();
+        state.snapshots.retain(|id, _| current.as_ref() == Some(id));
+        Ok(())
     }
 }
 
@@ -215,6 +230,38 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].log_id.index, 2);
         assert_eq!(got[1].log_id.index, 3);
+    }
+
+    #[tokio::test]
+    async fn a_purge_drops_exactly_the_purged_entries() {
+        let store = MemoryRaftLogStore::new();
+        assert_eq!(store.seal().await.unwrap(), None);
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        assert_eq!(store.seal().await.unwrap(), Some(3));
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn discard_superseded_keeps_only_the_current_snapshot() {
+        let store = MemoryRaftSnapshotStore::new();
+        for id in ["snap-1", "snap-2"] {
+            let meta = SnapshotMeta {
+                id: SnapshotId::new(id),
+                last_applied: None,
+                membership: vec![],
+            };
+            store.write(&meta, id.as_bytes().to_vec()).await.unwrap();
+        }
+        store.discard_superseded().await.unwrap();
+        assert_eq!(store.read(&SnapshotId::new("snap-1")).await.unwrap(), None);
+        assert_eq!(
+            store.read(&SnapshotId::new("snap-2")).await.unwrap(),
+            Some(b"snap-2".to_vec())
+        );
     }
 
     #[tokio::test]

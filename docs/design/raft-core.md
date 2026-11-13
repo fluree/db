@@ -104,6 +104,37 @@ commands are uniformly small (the nameservice) is safe leaving it `None`; one
 embedding `kv` should set it from its policies' `max_key_bytes + max_value_bytes`
 plus the command envelope.
 
+## Removing compacted entries from disk
+
+openraft compacts by snapshotting and purging the log behind the snapshot, and a
+purge is logical. The filesystem backend keeps entries in 4 MiB segments and
+unlinks only a segment whose every entry is purged, so the segment holding the
+purge point keeps its bytes. On a quiet group that segment is usually the whole
+log, and anything appended after the snapshot (a write, a sweep, the empty entry
+a leader writes on election) keeps it alive. With the default policy (a snapshot
+every 5,000 entries, purges keeping 1,000) a value deleted from the state machine
+can stay readable under `log/` for months.
+
+`RaftGroup::compact_log` is for an application that needs such a value gone, for
+example before the storage directory is copied:
+
+1. seal the tail segment, so later appends start a new one, and take its last
+   index N;
+2. wait until entries through N are applied, then snapshot until a snapshot
+   covers N;
+3. purge through N and wait for the purge to finish;
+4. remove every superseded snapshot, failing if any removal fails;
+5. fail with `CompactionError::Retained` unless the oldest entry still on disk
+   is above N.
+
+Each node holds its own log, so a cluster runs it on every node. A seal lives in
+memory only: if the process stops before `compact_log` returns, run it again.
+
+Sealing, rather than rewriting the straddling segment's suffix into a new file,
+keeps `purge_through`'s crash ordering as it was: whole segments only, oldest
+first, each unlink durable before the next. The scan on open refuses overlapping
+segments, so a rewrite would need a recovery path of its own.
+
 ## Leader-only tasks
 
 `spawn_leader_watcher` runs a task factory only while this node leads. On

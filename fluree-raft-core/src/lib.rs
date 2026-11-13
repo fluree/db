@@ -36,6 +36,8 @@
 //!   openraft-facing adapters: log storage, HTTP transport, membership
 //!   administration, and follower→leader forwarding.
 //! - [`runtime`] — group bootstrap and the leader-only task lifecycle.
+//! - [`compaction`] — removing compacted log entries from disk, not
+//!   just from the log.
 //!
 //! And under `testing`, [`testing`] — a conformance fixture any
 //! `AppStateMachine` can be run through.
@@ -62,6 +64,8 @@ pub mod kv;
 
 #[cfg(feature = "raft")]
 pub mod admin;
+#[cfg(feature = "raft")]
+pub mod compaction;
 #[cfg(feature = "raft")]
 pub mod config;
 #[cfg(feature = "raft")]

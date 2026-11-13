@@ -11,7 +11,8 @@
 //! an `AppStateMachine` alongside a tenant registry, lease acquire /
 //! renew / lapse / takeover through `client_write`, followers reading
 //! the same fence, and the sweep driver reclaiming a backlog through
-//! Raft rather than through a direct `apply`.
+//! Raft rather than through a direct `apply`. Also log compaction: a
+//! deleted value must leave the disk, not just the state.
 
 #![cfg(all(feature = "raft", feature = "kv"))]
 
@@ -24,11 +25,17 @@ mod leases;
 
 use async_trait::async_trait;
 use cluster::{eventually, form_cluster, leader, start_node, Node};
+use fluree_raft_core::admin::{AdminError, NodeAddrs};
 use fluree_raft_core::group::GroupId;
 use fluree_raft_core::kv::sweep::{run_sweep, sweep_once, SweepConfig, SweepTarget};
 use fluree_raft_core::kv::{Expect, KvCommand, KvResponse};
-use fluree_raft_core::runtime::RaftGroup;
+use fluree_raft_core::runtime::{RaftGroup, RaftGroupConfig};
+use fluree_raft_core::state_machine::NoObserver;
+use fluree_raft_core::storage::fs::FsRaftStorage;
 use leases::{acquire, evict, renew, LeaseCommand, Leases, Tenant};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -406,4 +413,264 @@ async fn the_sweep_ticker_runs_as_a_leader_task() {
     .await;
 
     watcher.shutdown().await;
+}
+
+// ============================================================================
+// Log compaction
+// ============================================================================
+
+const SECRET: &[u8] = b"refresh-token-5f0c9e7a1d";
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn put_config(key: &str, value: &[u8]) -> LeaseCommand {
+    LeaseCommand::Kv(
+        Tenant::Config,
+        KvCommand::Put {
+            key: key.into(),
+            value: value.to_vec(),
+            expect: Expect::Any,
+            ttl_ms: None,
+            now_ms: 0,
+        },
+    )
+}
+
+fn delete_config(key: &str) -> LeaseCommand {
+    LeaseCommand::Kv(
+        Tenant::Config,
+        KvCommand::Delete {
+            key: key.into(),
+            expect: Expect::Any,
+            now_ms: 0,
+        },
+    )
+}
+
+async fn write(group: &RaftGroup<Leases>, command: LeaseCommand) -> KvResponse {
+    group
+        .raft
+        .client_write(command)
+        .await
+        .expect("client_write")
+        .data
+        .kv()
+}
+
+async fn read_config(group: &RaftGroup<Leases>, key: &str) -> Option<Vec<u8>> {
+    let state = group.state.read().await;
+    state
+        .fragment(Tenant::Config)
+        .and_then(|fragment| fragment.get_at(key, 0))
+        .map(|record| record.value.to_vec())
+}
+
+/// A one-node group on the filesystem backend under `root`, leading.
+/// Built here rather than by `start_node`, which keeps its storage
+/// directory private: these tests read the files.
+async fn single_node_group(root: &Path) -> Arc<RaftGroup<Leases>> {
+    let config = RaftGroupConfig::new(GroupId::new("settings").expect("valid group id"), 1, root);
+    let storage = Arc::new(
+        FsRaftStorage::open(config.group_storage_root())
+            .await
+            .expect("storage opens"),
+    );
+    let group = RaftGroup::<Leases>::bootstrap(config, storage, NoObserver::default())
+        .await
+        .expect("group bootstraps");
+    // Never dialed: a lone voter sends no RPCs.
+    let addrs = NodeAddrs {
+        raft_addr: "http://127.0.0.1:9/raft".into(),
+        client_addr: "http://127.0.0.1:9".into(),
+    };
+    match group.admin.initialize(BTreeMap::from([(1, addrs)])).await {
+        Ok(()) | Err(AdminError::AlreadyInitialized) => {}
+        Err(e) => panic!("initialize: {e}"),
+    }
+    group
+        .raft
+        .wait(Some(COMPACTION_TIMEOUT))
+        .current_leader(1, "the lone node to lead")
+        .await
+        .expect("the lone node leads");
+    Arc::new(group)
+}
+
+/// Every file under `root` whose bytes contain `needle`.
+fn files_holding(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if std::fs::read(&path)
+                .expect("read file")
+                .windows(needle.len())
+                .any(|w| w == needle)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// What `compact_log` exists for: openraft's own snapshot and purge
+/// leave a deleted value on disk once anything is appended between the
+/// two, because the purge point lands inside the segment still taking
+/// appends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_and_purge_alone_leave_a_deleted_value_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let group = single_node_group(dir.path()).await;
+    write(&group, put_config("credential", SECRET)).await;
+    write(&group, delete_config("credential")).await;
+    let applied = group
+        .raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .as_ref()
+        .expect("entries applied")
+        .index;
+
+    group
+        .raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("trigger snapshot");
+    group
+        .raft
+        .wait(Some(COMPACTION_TIMEOUT))
+        .metrics(
+            |m| m.snapshot.as_ref().is_some_and(|id| id.index >= applied),
+            "a snapshot covering the delete",
+        )
+        .await
+        .expect("snapshot");
+    write(&group, put_config("unrelated", b"later")).await;
+    group
+        .raft
+        .trigger()
+        .purge_log(applied)
+        .await
+        .expect("trigger purge");
+    group
+        .raft
+        .wait(Some(COMPACTION_TIMEOUT))
+        .metrics(
+            |m| m.purged.as_ref().is_some_and(|id| id.index >= applied),
+            "the purge",
+        )
+        .await
+        .expect("purge");
+
+    assert_eq!(read_config(&group, "credential").await, None);
+    assert!(
+        !files_holding(dir.path(), SECRET).is_empty(),
+        "a purge into the segment taking appends keeps its bytes",
+    );
+}
+
+/// The same deleted value, with writes landing throughout compaction:
+/// afterwards no file holds it, and the group restarts from what is
+/// left with every surviving write intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_log_removes_a_deleted_value_from_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let group = single_node_group(dir.path()).await;
+    write(&group, put_config("credential", SECRET)).await;
+    write(
+        &group,
+        put_config("credential", &[SECRET, b"-refreshed"].concat()),
+    )
+    .await;
+    assert_eq!(
+        write(&group, delete_config("credential")).await,
+        KvResponse::Deleted { removed: true }
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let group = Arc::clone(&group);
+        let stop = Arc::clone(&stop);
+        async move {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                write(&group, put_config("counter", &n.to_le_bytes())).await;
+                n += 1;
+            }
+            n
+        }
+    });
+    let through = group
+        .compact_log(COMPACTION_TIMEOUT)
+        .await
+        .expect("compacts")
+        .expect("the log held entries");
+    stop.store(true, Ordering::Relaxed);
+    let concurrent_writes = writer.await.expect("writer");
+    assert!(concurrent_writes > 0, "the writer must have run");
+
+    assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
+    write(&group, put_config("after", b"compaction")).await;
+    let counter = read_config(&group, "counter").await;
+    assert!(counter.is_some());
+
+    group.raft.shutdown().await.expect("shutdown");
+    drop(group);
+    let group = single_node_group(dir.path()).await;
+    // A write applies only after everything before it, replay included.
+    write(&group, put_config("restarted", b"yes")).await;
+    assert!(
+        group
+            .raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .as_ref()
+            .map(|id| id.index)
+            >= Some(through),
+        "the restart must start from the compaction snapshot",
+    );
+    assert_eq!(read_config(&group, "credential").await, None);
+    assert_eq!(read_config(&group, "counter").await, counter);
+    assert_eq!(
+        read_config(&group, "after").await.as_deref(),
+        Some(&b"compaction"[..])
+    );
+}
+
+/// Compaction is per node. On the leader the purge waits out
+/// replication; afterwards the group still replicates to every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_node_compacts_and_the_group_keeps_replicating() {
+    let nodes = cluster("compaction").await;
+    let leader = leader(&nodes).await;
+    for i in 0..5u8 {
+        fence(propose(leader, put_config(&format!("key-{i}"), &[i])).await);
+    }
+
+    for node in &nodes {
+        let through = node
+            .group
+            .compact_log(COMPACTION_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("node {} compacts: {e}", node.id));
+        assert!(through.is_some(), "node {} held entries", node.id);
+    }
+
+    fence(propose(leader, put_config("after", b"compaction")).await);
+    for node in &nodes {
+        let id = node.id;
+        eventually(
+            &format!("node {id} to apply a write after compaction"),
+            || async {
+                read_config(&node.group, "after").await.as_deref() == Some(&b"compaction"[..])
+            },
+        )
+        .await;
+    }
 }
