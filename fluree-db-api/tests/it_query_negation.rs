@@ -1329,3 +1329,152 @@ async fn not_exists_reads_the_default_graph_after_a_graph_block() {
         .expect("query");
     assert_eq!(rows, json!([["ex:carol"]]), "{jsonld}");
 }
+
+/// `?g` is bound outside `GRAPH ?g { … }`, never inside it, so a pattern that
+/// reads it stays outside the block wherever it is written.
+#[tokio::test]
+async fn a_pattern_that_reads_the_graph_variable_stays_outside_its_block() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, "negation/graph-var:main"))
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.com/> .
+               ex:alice ex:knows ex:note .
+               GRAPH ex:g { ex:note ex:label "in-g" . }
+               GRAPH ex:h { ex:memo ex:label "in-h" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let graph = "GRAPH ?g { ?n ex:label ?l }";
+    let both = json!([["ex:memo"], ["ex:note"]]);
+    let note = json!([["ex:note"]]);
+    for (body, expected) in [
+        (format!("{graph} FILTER(?g = ex:g)"), &note),
+        (format!("FILTER(?g = ex:g) {graph}"), &note),
+        (format!("{graph} FILTER(BOUND(?g))"), &both),
+        (
+            format!("{graph} FILTER NOT EXISTS {{ ex:alice ex:knows ?n }}"),
+            &json!([["ex:memo"]]),
+        ),
+    ] {
+        let query =
+            format!("PREFIX ex: <http://example.com/> SELECT ?n WHERE {{ {body} }} ORDER BY ?n");
+        let rows = support::query_sparql_formatted(&fluree, &ledger, &query)
+            .await
+            .expect("query");
+        assert_eq!(&rows, expected, "{query}");
+    }
+    let bound_graphs = json!([
+        ["ex:memo", "http://example.com/h"],
+        ["ex:note", "http://example.com/g"]
+    ]);
+    let query = format!(
+        "PREFIX ex: <http://example.com/> SELECT ?n ?gs WHERE {{ {graph} BIND(STR(?g) AS ?gs) }} \
+         ORDER BY ?n"
+    );
+    let rows = support::query_sparql_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    assert_eq!(rows, bound_graphs, "{query}");
+    let jsonld = json!({
+        "@context": ctx_ex(),
+        "select": ["?n", "?gs"],
+        "where": [
+            ["graph", "?g", {"@id": "?n", "ex:label": "?l"}],
+            ["bind", "?gs", "(str ?g)"]
+        ],
+        "orderBy": "?n"
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &jsonld)
+        .await
+        .expect("query");
+    assert_eq!(rows, bound_graphs, "{jsonld}");
+}
+
+/// An EXISTS embedded in an expression that reads a variable the `GRAPH`
+/// block binds is placed right after the block, and still reads the group's
+/// graph.
+#[tokio::test]
+async fn an_embedded_exists_over_a_graph_bound_variable_reads_the_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .stage_owned(genesis_ledger(
+            &fluree,
+            "negation/embedded-after-graph:main",
+        ))
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.com/> .
+               ex:alice ex:knows ex:note .
+               GRAPH ex:g { ex:note ex:label "n" . ex:memo ex:label "m" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let graph = "GRAPH ex:g { ?n ex:label ?l }";
+    let query = format!(
+        "PREFIX ex: <http://example.com/> SELECT ?n WHERE {{ {graph} \
+         FILTER(?l = \"none\" || NOT EXISTS {{ ex:alice ex:knows ?n }}) }}"
+    );
+    let rows = support::query_sparql_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    assert_eq!(rows, json!([["ex:memo"]]), "{query}");
+    let query = format!(
+        "PREFIX ex: <http://example.com/> SELECT ?n ?k WHERE {{ {graph} \
+         BIND(EXISTS {{ ex:alice ex:knows ?n }} AS ?k) }} ORDER BY ?n"
+    );
+    let rows = support::query_sparql_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    assert_eq!(
+        rows,
+        json!([["ex:memo", false], ["ex:note", true]]),
+        "{query}"
+    );
+}
+
+/// A negation after a `SERVICE` block reads the group's own ledger, not the
+/// service's.
+#[tokio::test]
+async fn not_exists_after_a_service_block_reads_the_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (ledger, ranks) in [
+        (
+            "negation-alpha:main",
+            json!([{"@id": "ex:a", "ex:rank": 2}]),
+        ),
+        (
+            "negation-beta:main",
+            json!([{"@id": "ex:a", "ex:rank": 1}, {"@id": "ex:b", "ex:rank": 2}]),
+        ),
+    ] {
+        fluree
+            .insert(
+                genesis_ledger(&fluree, ledger),
+                &json!({"@context": ctx_ex(), "@graph": ranks}),
+            )
+            .await
+            .expect("seed");
+    }
+    let service = "SERVICE <fluree:ledger:negation-beta:main> { ?s ex:rank ?r }";
+    for negation in [
+        "FILTER NOT EXISTS { ?s ex:rank 2 }",
+        "MINUS { ?s ex:rank 2 }",
+    ] {
+        let query = format!(
+            "PREFIX ex: <http://example.com/> SELECT ?s FROM <negation-alpha:main> \
+             FROM NAMED <negation-beta:main> WHERE {{ {service} {negation} }}"
+        );
+        let rows = fluree
+            .query_from()
+            .sparql(&query)
+            .format(fluree_db_api::FormatterConfig::jsonld())
+            .execute_formatted()
+            .await
+            .expect("query");
+        assert_eq!(rows, json!([["ex:b"]]), "{query}");
+    }
+}
