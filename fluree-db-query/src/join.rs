@@ -3050,17 +3050,17 @@ impl NestedLoopJoinOperator {
                 (p_id, group.o_type),
                 &group.keys,
                 probe_ops.as_mut(),
-                |obj_idx, s_id| {
+                |obj_idx, s_ids| {
                     let list = group.lists[obj_idx] as usize;
                     debug_assert!(!streamed.get(list), "match for a closed object");
                     let held = &mut subjects[list];
-                    if held.len() == cap {
+                    if s_ids.len() > cap - held.len() {
                         discarded += cap as u64 + 1;
                         *held = Vec::new();
                         streamed.set(list, list_count);
                         return Ok(std::ops::ControlFlow::Break(()));
                     }
-                    held.push(s_id);
+                    held.extend_from_slice(s_ids);
                     Ok(std::ops::ControlFlow::Continue(()))
                 },
             )?;
@@ -3646,9 +3646,11 @@ fn post_rows_of(
 }
 
 /// Walk the POST rows of `want = (p_id, o_type)` whose object key is one of
-/// `objs` (sorted, deduplicated), calling `visit(obj_idx, s_id)` — `obj_idx`
-/// indexes `objs` — for each live row: base rows the overlay does not retract,
-/// then each novelty-only assert when `probe_ops` (of that type) merges one.
+/// `objs` (sorted, deduplicated), calling `visit(obj_idx, s_ids)` — `obj_idx`
+/// indexes `objs` — with the subjects of its live rows, a leaflet's worth at a
+/// time (an object can have millions, too many for a call each): base rows the
+/// overlay does not retract, then the novelty-only asserts when `probe_ops`
+/// (of that type) merges any.
 /// A visitor that breaks is given no more of that object's matches, and a
 /// leaf or leaflet holding only such objects is not read. Returns the leaflets
 /// read.
@@ -3667,7 +3669,7 @@ pub(crate) fn for_each_object_probe_match(
     want: (u32, u16),
     objs: &[u64],
     mut probe_ops: Option<&mut ObjectProbeOps>,
-    mut visit: impl FnMut(usize, u64) -> Result<std::ops::ControlFlow<()>>,
+    mut visit: impl FnMut(usize, &[u64]) -> Result<std::ops::ControlFlow<()>>,
 ) -> Result<usize> {
     use fluree_db_binary_index::format::run_record_v2::{
         cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
@@ -3682,6 +3684,8 @@ pub(crate) fn for_each_object_probe_match(
     // Objects whose visitor broke.
     let mut closed = LazyFlags::default();
     let mut leaflets_read = 0usize;
+    // A run's subjects, when they cannot be handed over as stored.
+    let mut live: Vec<u64> = Vec::new();
     let (p_id, o_type) = want;
     let cmp = cmp_v2_for_order(RunSortOrder::Post);
     let key = |o_key: u64, o_i: u32, s_id: u64| RunRecordV2 {
@@ -3788,26 +3792,34 @@ pub(crate) fn for_each_object_probe_match(
                 continue;
             }
 
-            // Breaks when the visitor does, leaving the rest of `run` unread.
+            // Breaks when the visitor does. A run with nothing to reconcile
+            // goes to the visitor as stored.
             let mut emit =
                 |obj_idx: usize, run: std::ops::Range<usize>| -> Result<ControlFlow<()>> {
                     let window = probe_ops
                         .as_ref()
                         .map(|probe| probe.object_window(objs[obj_idx]))
                         .filter(|window| !window.is_empty());
+                    let (Some(probe), Some(window)) = (probe_ops.as_mut(), &window) else {
+                        if let ColumnData::Block(s_ids) = &batch.s_id {
+                            return visit(obj_idx, &s_ids[run]);
+                        }
+                        live.clear();
+                        live.extend(run.map(|row| batch.s_id.get_or(row, 0)));
+                        return visit(obj_idx, &live);
+                    };
+                    live.clear();
                     for row in run {
                         let s_id = batch.s_id.get_or(row, 0);
-                        if let (Some(probe), Some(window)) = (probe_ops.as_mut(), &window) {
-                            let o_i = batch.o_i.get_or(row, u32::MAX);
-                            if probe.base_row_fate(window, s_id, o_i) == RowFate::Drop {
-                                continue;
-                            }
-                        }
-                        if visit(obj_idx, s_id)?.is_break() {
-                            return Ok(ControlFlow::Break(()));
+                        let o_i = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(window, s_id, o_i) != RowFate::Drop {
+                            live.push(s_id);
                         }
                     }
-                    Ok(ControlFlow::Continue(()))
+                    if live.is_empty() {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    visit(obj_idx, &live)
                 };
             match &batch.o_key {
                 // `rows` share `(p_id, o_type)`, so their keys are sorted.
@@ -3864,15 +3876,14 @@ pub(crate) fn for_each_object_probe_match(
             if closed.get(obj_idx) {
                 continue;
             }
-            let mut injected: Vec<u64> = Vec::new();
+            live.clear();
             probe.drain_asserts_for_object(o_key, |s_id| {
-                injected.push(s_id);
+                live.push(s_id);
                 Ok(())
             })?;
-            for s_id in injected {
-                if visit(obj_idx, s_id)?.is_break() {
-                    break;
-                }
+            if !live.is_empty() {
+                // An object's last run: a break leaves nothing to skip.
+                let _ = visit(obj_idx, &live)?;
             }
         }
     }

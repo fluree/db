@@ -520,10 +520,10 @@ impl PatternOptionalBuilder {
                 (p_id, ref_type),
                 &objects,
                 probe_ops.as_mut(),
-                |obj_idx, s_id| {
+                |obj_idx, s_ids| {
                     for &slot in slots_by_object[obj_idx] {
-                        values[slot].push(Binding::encoded_sid(s_id));
-                        matched += 1;
+                        values[slot].extend(s_ids.iter().copied().map(Binding::encoded_sid));
+                        matched += s_ids.len();
                     }
                     Ok(std::ops::ControlFlow::Continue(()))
                 },
