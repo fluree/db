@@ -551,10 +551,15 @@ impl crate::Fluree {
         // rollback, nothing put it back. The branch then loaded the
         // source's index and its own commits dropped out of every read.
         // Replay itself reads the source's state, never the copied index,
-        // so nothing above needs this to have happened. Best-effort.
-        let source_index = self
-            .copy_source_index(&source_id, &branch_id, &source_record)
-            .await;
+        // so nothing above needs this to have happened. Best-effort. A
+        // rebase that replayed nothing leaves the branch where it was, on
+        // its own line and its own index.
+        let source_index = if pending_replays.is_empty() {
+            None
+        } else {
+            self.copy_source_index(&source_id, &branch_id, &source_record)
+                .await
+        };
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
@@ -656,7 +661,9 @@ impl crate::Fluree {
         // never a clone of the cached state, so the cache co-holds none of the
         // dictionaries the replay's `make_mut`s extend — the state threads
         // owned through the loop. This install performs no dictionary work.
-        if let Some(guard) = write_guard {
+        // With no new head the branch did not move, and `final_state` is the
+        // source's state, so nothing is installed.
+        if let Some(guard) = write_guard.filter(|_| new_head_id.is_some()) {
             let needs_reindex = final_state.should_reindex(&self.index_config);
             let commit_t = final_state.t();
             self.finalize_commit(guard, final_state, commit_t, needs_reindex)
