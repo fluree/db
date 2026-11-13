@@ -132,14 +132,21 @@ impl GroupByOperator {
             .collect()
     }
 
-    /// Build an output row from a group
+    /// Build an output row from a group.
+    ///
+    /// `group_key` is the normalized key, which is the encoded form wherever
+    /// one exists. With `keys_as_bound` a key column carries the binding the
+    /// child gave the group's first row instead: an eager caller is owed
+    /// decoded bindings, and the child's are.
     fn build_output_row(
         schema_len: usize,
         group_key_indices: &[usize],
         group_key: &[Binding],
         group_rows: &[Vec<Binding>],
+        keys_as_bound: bool,
     ) -> Vec<Binding> {
         let mut output = Vec::with_capacity(schema_len);
+        let first_row = group_rows.first().filter(|_| keys_as_bound);
 
         for col_idx in 0..schema_len {
             if group_key_indices.contains(&col_idx) {
@@ -148,7 +155,10 @@ impl GroupByOperator {
                     .iter()
                     .position(|&idx| idx == col_idx)
                     .unwrap();
-                output.push(group_key[key_pos].clone());
+                output.push(match first_row {
+                    Some(row) => row[col_idx].clone(),
+                    None => group_key[key_pos].clone(),
+                });
             } else {
                 // Non-grouped column - collect all values into Grouped
                 let values: Vec<Binding> =
@@ -298,6 +308,7 @@ impl Operator for GroupByOperator {
                             &group_key_indices,
                             &group_key,
                             &group_rows,
+                            ctx.eager_materialization,
                         );
                         for (col, val) in output_row.into_iter().enumerate() {
                             output_columns[col].push(val);
