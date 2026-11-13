@@ -164,6 +164,8 @@ pub struct LeafWriter {
     leaf_target_rows: usize,
     zstd_level: i32,
     skip_history: bool,
+    /// History entries retention leaves out.
+    history_drop: Option<std::sync::Arc<super::history_sidecar::HistoryDrop>>,
 
     // Current leaflet accumulation.
     record_buf: Vec<RunRecordV2>,
@@ -233,6 +235,7 @@ impl LeafWriter {
             leaf_target_rows,
             zstd_level,
             skip_history: false,
+            history_drop: None,
             record_buf: Vec::with_capacity(leaflet_target_rows),
             sidecar_builder: HistSidecarBuilder::for_order(order),
             current_segment_started: false,
@@ -288,6 +291,14 @@ impl LeafWriter {
     /// Skip history sidecar production (import fast path).
     pub fn set_skip_history(&mut self, skip: bool) {
         self.skip_history = skip;
+    }
+
+    /// Leave out the history entries `drop` covers (retention).
+    pub fn set_history_drop(
+        &mut self,
+        drop: Option<std::sync::Arc<super::history_sidecar::HistoryDrop>>,
+    ) {
+        self.history_drop = drop.filter(|d| !d.is_empty());
     }
 
     /// Push a record into the writer.
@@ -361,18 +372,7 @@ impl LeafWriter {
     /// order and is left holding the sidecar transitions.
     pub fn push_lifecycle(&mut self, events: &mut Vec<(RunRecordV2, u8)>) -> io::Result<bool> {
         let row = resolve_transitions(events, false);
-        for &(rec, op) in events.iter() {
-            self.push_history_entry(HistEntryV2 {
-                s_id: rec.s_id,
-                p_id: rec.p_id,
-                o_type: rec.o_type,
-                o_key: rec.o_key,
-                o_i: rec.o_i,
-                t: rec.t,
-                op,
-                g_id: rec.g_id,
-            });
-        }
+        self.push_transitions(events);
         match row {
             Some(row) => self.push_record(row).map(|()| true),
             None => Ok(false),
@@ -388,12 +388,43 @@ impl LeafWriter {
     /// entry into the leaflet that actually holds its row. Retract-winner facts
     /// (no materialized row) push history only; those entries are committed to the
     /// current leaflet by the next `push_record` (or by `finish`).
+    ///
+    /// Retention's drop applies per fact, through [`Self::push_transitions`].
     pub fn push_history_entry(&mut self, entry: HistEntryV2) {
         if self.skip_history {
             return;
         }
         self.tally(entry.g_id, 0, 1);
         self.pending_history.push(entry);
+    }
+
+    /// Push one fact identity's sidecar transitions (`op`: 1 = assert,
+    /// 0 = retract), leaving out what retention drops.
+    pub fn push_transitions(&mut self, transitions: &[(RunRecordV2, u8)]) {
+        let entry = |&(rec, op): &(RunRecordV2, u8)| HistEntryV2 {
+            s_id: rec.s_id,
+            p_id: rec.p_id,
+            o_type: rec.o_type,
+            o_key: rec.o_key,
+            o_i: rec.o_i,
+            t: rec.t,
+            op,
+            g_id: rec.g_id,
+        };
+        match &self.history_drop {
+            Some(drop) => {
+                let mut entries: Vec<HistEntryV2> = transitions.iter().map(entry).collect();
+                drop.retain(&mut entries);
+                for e in entries {
+                    self.push_history_entry(e);
+                }
+            }
+            None => {
+                for t in transitions {
+                    self.push_history_entry(entry(t));
+                }
+            }
+        }
     }
 
     /// Commit `entry` into the current leaflet's sidecar segment, starting the
@@ -785,7 +816,7 @@ impl LeafWriter {
 
 pub fn compute_cid_leaf(bytes: &[u8]) -> ContentId {
     let hex_digest = fluree_db_core::sha256_hex(bytes);
-    ContentId::from_hex_digest(
+    ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_LEAF,
         &hex_digest,
     )
@@ -794,7 +825,7 @@ pub fn compute_cid_leaf(bytes: &[u8]) -> ContentId {
 
 pub fn compute_cid_sidecar(bytes: &[u8]) -> ContentId {
     let hex_digest = fluree_db_core::sha256_hex(bytes);
-    ContentId::from_hex_digest(
+    ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_HISTORY_SIDECAR,
         &hex_digest,
     )

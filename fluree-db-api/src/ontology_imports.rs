@@ -452,8 +452,8 @@ impl SchemaBundleCache {
         self.inner.insert(key, bundle);
     }
 
-    /// Clear the cache. Intended for tests only.
-    #[cfg(test)]
+    /// Drop every cached bundle: a purge's, whose released indexes may have
+    /// supplied one.
     pub fn clear(&self) {
         self.inner.invalidate_all();
         self.inner.run_pending_tasks();
@@ -532,7 +532,7 @@ impl SchemaBundleFlakesCache {
         self.inner.insert(key, flakes);
     }
 
-    #[cfg(test)]
+    /// Drop every cached bundle's flakes, as [`SchemaBundleCache::clear`].
     pub fn clear(&self) {
         self.inner.invalidate_all();
         self.inner.run_pending_tasks();

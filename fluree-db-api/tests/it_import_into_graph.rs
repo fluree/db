@@ -1106,7 +1106,7 @@ async fn a_ledger_indexed_before_links_is_reindexed_first() {
     fluree
         .publisher()
         .unwrap()
-        .publish_index_allow_equal_fenced(LEDGER, record.fence, record.index_t, &cid)
+        .publish_index_allow_equal_fenced(LEDGER, record.write_basis(), record.index_t, &cid)
         .await
         .unwrap();
 

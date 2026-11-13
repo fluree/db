@@ -43,6 +43,55 @@ pub(super) struct StagedCommit {
     pub commit_id: ContentId,
     pub commit_t: i64,
     pub receipt: AppliedReceipt,
+    /// The erasure fields come last, so a leader a release behind reads
+    /// the rest and ignores them.
+    pub erasure_generation: u64,
+    pub erasure_source: Option<(RefKey, u64)>,
+    pub seen: Option<u64>,
+}
+
+/// [`StagedCommit`] as a follower a release behind sends it, before
+/// erasure generations.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct StagedCommitV1 {
+    ref_key: RefKey,
+    queue_id: u64,
+    commit_id: ContentId,
+    commit_t: i64,
+    receipt: AppliedReceipt,
+}
+
+impl StagedCommit {
+    /// Decode a ferried commit. A follower a release behind presents no
+    /// erasure generation, as its writes did before them, and is fenced as
+    /// having loaded no collection intent, since it checks none; its shape
+    /// is accepted only when it is the whole body, so a damaged current one
+    /// is not read as it.
+    pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes).or_else(|e| match postcard::take_from_bytes(bytes) {
+            Ok((v1, [])) => {
+                let StagedCommitV1 {
+                    ref_key,
+                    queue_id,
+                    commit_id,
+                    commit_t,
+                    receipt,
+                } = v1;
+                Ok(Self {
+                    ref_key,
+                    queue_id,
+                    commit_id,
+                    commit_t,
+                    receipt,
+                    erasure_generation: 0,
+                    erasure_source: None,
+                    seen: Some(0),
+                })
+            }
+            _ => Err(e),
+        })
+    }
 }
 
 /// Skip-free mirror of
@@ -77,6 +126,9 @@ impl From<InMemoryArgs> for StagedCommit {
             commit_id: args.commit_id,
             commit_t: args.commit_t,
             receipt: args.receipt.into(),
+            erasure_generation: args.erasure_generation,
+            erasure_source: args.erasure_source,
+            seen: args.seen,
         }
     }
 }
@@ -89,6 +141,9 @@ impl From<StagedCommit> for InMemoryArgs {
             commit_id: args.commit_id,
             commit_t: args.commit_t,
             receipt: args.receipt.into(),
+            erasure_generation: args.erasure_generation,
+            erasure_source: args.erasure_source,
+            seen: args.seen,
         }
     }
 }
@@ -138,5 +193,54 @@ impl From<AppliedReceipt> for InMemoryReceipt {
                 commit_t,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::ContentKind;
+
+    fn cid(seed: u8) -> ContentId {
+        ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    /// A follower a release behind ferries its commit without erasure
+    /// generations or the intents it saw, and a damaged current body is not
+    /// read as one.
+    #[test]
+    fn a_ferried_commit_decodes_from_a_follower_a_release_behind() {
+        let v1 = StagedCommitV1 {
+            ref_key: RefKey::new("test/db", "main"),
+            queue_id: 9,
+            commit_id: cid(1),
+            commit_t: 17,
+            receipt: AppliedReceipt::Minimal {
+                commit_id: cid(1),
+                commit_t: 17,
+            },
+        };
+        let decoded = StagedCommit::decode(&postcard::to_allocvec(&v1).unwrap()).unwrap();
+        assert_eq!(decoded.queue_id, 9);
+        assert_eq!(decoded.erasure_generation, 0);
+        assert_eq!(decoded.erasure_source, None);
+        assert_eq!(decoded.seen, Some(0), "fenced: it checks no intent");
+
+        let current = StagedCommit {
+            ref_key: v1.ref_key,
+            queue_id: 9,
+            commit_id: cid(1),
+            commit_t: 17,
+            receipt: v1.receipt,
+            erasure_generation: 2,
+            erasure_source: Some((RefKey::new("test/db", "dev"), 1)),
+            seen: Some(4),
+        };
+        let bytes = postcard::to_allocvec(&current).unwrap();
+        let decoded = StagedCommit::decode(&bytes).unwrap();
+        assert_eq!(decoded.erasure_generation, 2);
+        assert_eq!(decoded.erasure_source, current.erasure_source);
+        assert_eq!(decoded.seen, Some(4));
+        assert!(StagedCommit::decode(&bytes[..bytes.len() - 1]).is_err());
     }
 }

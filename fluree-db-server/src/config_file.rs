@@ -139,6 +139,12 @@ pub struct IndexingFileConfig {
     /// How often to sweep storage for instance folders no ledger references,
     /// in seconds. `0` never does.
     pub orphan_sweep_interval_secs: Option<u64>,
+    /// How often to reconcile each ledger's commit and transaction files in
+    /// the background, in seconds. `0` never does.
+    pub garbage_reconcile_interval_secs: Option<u64>,
+    /// How often the retention worker runs a pass over TTL-enabled ledgers,
+    /// in seconds.
+    pub retention_interval_secs: Option<u64>,
     /// Keep BM25 full-text indexes current automatically.
     pub bm25_auto_sync: Option<bool>,
     /// Maintain registered reasoning indexes automatically (default false).
@@ -454,6 +460,8 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
     "orphan_sweep_interval_secs",
+    "garbage_reconcile_interval_secs",
+    "retention_interval_secs",
     "gc_max_old_indexes",
     "gc_min_time_mins",
     "gc_hard_max_old_indexes",
@@ -650,6 +658,16 @@ pub fn apply_to_server_config(
         if is_default("orphan_sweep_interval_secs") {
             if let Some(v) = idx.orphan_sweep_interval_secs {
                 config.orphan_sweep_interval_secs = v;
+            }
+        }
+        if is_default("garbage_reconcile_interval_secs") {
+            if let Some(v) = idx.garbage_reconcile_interval_secs {
+                config.garbage_reconcile_interval_secs = v;
+            }
+        }
+        if is_default("retention_interval_secs") {
+            if let Some(v) = idx.retention_interval_secs {
+                config.retention_interval_secs = v;
             }
         }
         if is_default("gc_max_old_indexes") {
@@ -1443,6 +1461,8 @@ default_policy_class = "ex:DefaultPolicy"
                 reindex_min_bytes: Some(100_000),
                 indexer_catchup_interval_secs: None,
                 orphan_sweep_interval_secs: None,
+                garbage_reconcile_interval_secs: None,
+                retention_interval_secs: None,
                 reindex_max_bytes: Some(1_000_000),
                 bm25_auto_sync: None,
                 reasoning_index_auto_refresh: None,
@@ -1460,6 +1480,8 @@ default_policy_class = "ex:DefaultPolicy"
                 reindex_min_bytes: None, // should NOT override
                 indexer_catchup_interval_secs: None,
                 orphan_sweep_interval_secs: None,
+                garbage_reconcile_interval_secs: None,
+                retention_interval_secs: None,
                 reindex_max_bytes: None, // should NOT override
                 bm25_auto_sync: None,
                 reasoning_index_auto_refresh: None,

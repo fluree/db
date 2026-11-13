@@ -4810,6 +4810,9 @@ async fn newest_commits(
         blobs: export.blobs,
         missing_blobs: Vec::new(),
         merged_commits: Vec::new(),
+        commit_ids: Vec::new(),
+        merged_commit_ids: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -5163,12 +5166,7 @@ async fn transfer_to_a_new_instance(
         .expect("create target");
     let taken = if pull {
         target
-            .import_commits_incremental(
-                ledger_id,
-                request.commits,
-                request.merged_commits,
-                request.blobs,
-            )
+            .import_commits_incremental(ledger_id, request)
             .await
             .map(|pulled| pulled.imported)
     } else {

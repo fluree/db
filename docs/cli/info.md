@@ -81,6 +81,14 @@ Index t:        5
 Index ID:       bafybeig...
 ```
 
+A branch with [permanent erasures](../transactions/permanent-erasure.md) adds how many it has and
+how many have had their files deleted from this storage, then each of the others with its state:
+
+```
+Erasures:       2 (1 with their files deleted)
+  removal-67f8aa8c03c6a21c28966570: files not yet deleted
+```
+
 When the ledger config is in a state that does not do what it appears to, the
 output ends with the ledger info's `configDiagnostics`, for example:
 

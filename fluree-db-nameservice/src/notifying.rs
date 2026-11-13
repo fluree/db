@@ -4,6 +4,7 @@
 //! Wrap any nameservice implementation in [`NotifyingNameService`] to get
 //! automatic event emission without modifying the backend itself.
 
+use crate::WriteBasis;
 use std::sync::Arc;
 
 use crate::Fence;
@@ -116,11 +117,11 @@ where
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
         self.inner
-            .reset_head_fenced(ledger_id, fence, snapshot)
+            .reset_head_fenced(ledger_id, basis, snapshot)
             .await
     }
 
@@ -153,12 +154,12 @@ where
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, basis, commit_t, commit_id)
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerCommitPublished {
@@ -182,12 +183,12 @@ where
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_fenced(ledger_id, basis, index_t, index_id)
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
@@ -211,12 +212,12 @@ where
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, basis, index_t, index_id)
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
@@ -225,6 +226,11 @@ where
                 index_t,
             });
         Ok(())
+    }
+
+    /// Emits nothing: nothing loads a frozen branch.
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        self.inner.clear_frozen_index(ledger_id).await
     }
 }
 
@@ -254,14 +260,14 @@ where
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         let result = self
             .inner
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, expected, new)
             .await?;
 
         if matches!(result, CasResult::Updated) {
@@ -356,9 +362,10 @@ where
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         self.inner
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await?;
         let graph_source_id = LedgerId::from_parts(name, branch)?;
         self.event_bus
@@ -382,6 +389,27 @@ where
     /// announces it.
     async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
         self.inner.reset_graph_source_index(name, branch).await
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        sources: &[(String, u64)],
+    ) -> Result<()> {
+        self.inner
+            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t, sources)
+            .await?;
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        self.event_bus
+            .notify(NameServiceEvent::GraphSourceIndexPublished {
+                graph_source_id,
+                index_id: index_id.clone(),
+                index_t,
+            });
+        Ok(())
     }
 }
 
@@ -471,7 +499,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// ConfigPublisher — pure delegation (no events)
+// ConfigPublisher — notify after a successful CAS
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -486,9 +514,18 @@ where
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        self.inner
+        let result = self
+            .inner
             .push_config_fenced(ledger_id, fence, expected, new)
-            .await
+            .await?;
+        if matches!(result, ConfigCasResult::Updated) {
+            self.event_bus
+                .notify(NameServiceEvent::LedgerConfigPublished {
+                    ledger_id: fluree_db_core::LedgerId::parse(ledger_id)?,
+                    config_version: new.v,
+                });
+        }
+        Ok(result)
     }
 }
 
@@ -627,7 +664,7 @@ where
             // A branch drop freezes the branch first, and one with children
             // deletes nothing until its last child goes, so the drop is
             // announced here. A ledger drop announces as it deletes.
-            let id = LedgerId::parse(ledger_id)?;
+            let id = LedgerId::parse_persisted(ledger_id)?;
             if let Some(binding) = self
                 .listing_binding(&id, Some(fence))
                 .await
@@ -642,12 +679,20 @@ where
         Ok(outcome)
     }
 
+    async fn thaw_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        self.inner.thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(
         &self,
         ledger_id: &str,
         fence: crate::Fence,
     ) -> Result<crate::FenceOutcome> {
-        let id = LedgerId::parse(ledger_id)?;
+        let id = LedgerId::parse_persisted(ledger_id)?;
         // A drop deletes records while its binding still lists them, which
         // names the ledger they belonged to.
         let instance = self
@@ -670,6 +715,45 @@ mod tests {
     use super::*;
     use crate::{lifecycle, memory::MemoryNameService, SubscriptionScope};
     use fluree_db_core::{InstanceId, LedgerName};
+
+    #[tokio::test]
+    async fn successful_config_updates_publish_the_atomic_record_revision() {
+        let bus = Arc::new(LedgerEventBus::new(8));
+        let ns = NotifyingNameService::new(MemoryNameService::new(), bus.clone());
+        let id = LedgerId::parse("config:main").unwrap();
+        let record = lifecycle::create_ledger(&ns, &id).await.unwrap();
+        let mut sub = bus.subscribe(SubscriptionScope::all());
+        let prior = ns.get_config(id.as_str()).await.unwrap().unwrap();
+        let next = ConfigValue::new(prior.v + 1, Some(crate::ConfigPayload::new()));
+        assert_eq!(
+            ns.push_config_fenced(id.as_str(), record.fence, Some(&prior), &next)
+                .await
+                .unwrap(),
+            ConfigCasResult::Updated
+        );
+        assert_eq!(
+            ns.lookup(id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .config_version,
+            Some(next.v)
+        );
+        assert_eq!(
+            drain(&mut sub),
+            vec![NameServiceEvent::LedgerConfigPublished {
+                ledger_id: id.clone(),
+                config_version: next.v
+            }]
+        );
+        assert!(matches!(
+            ns.push_config_fenced(id.as_str(), record.fence, Some(&prior), &next)
+                .await
+                .unwrap(),
+            ConfigCasResult::Conflict { .. }
+        ));
+        assert!(drain(&mut sub).is_empty());
+    }
 
     fn drain(sub: &mut Subscription) -> Vec<NameServiceEvent> {
         std::iter::from_fn(|| sub.receiver.try_recv().ok()).collect()

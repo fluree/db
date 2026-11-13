@@ -2012,6 +2012,21 @@ async fn hidden_restatements(
     Ok(hidden)
 }
 
+/// Enforce `policy`'s modify rules on `flakes` against `ledger`, as staging
+/// does for a transaction's own flakes. A root policy allows everything.
+pub async fn enforce_modify_policy(
+    flakes: &[Flake],
+    policy: &PolicyContext,
+    ledger: &LedgerState,
+    tracker: Option<&Tracker>,
+) -> Result<()> {
+    if policy.wrapper().is_root() {
+        return Ok(());
+    }
+    let reverse_graph = ledger.snapshot.build_reverse_graph()?;
+    enforce_modify_policies(flakes, policy, ledger, tracker, &reverse_graph).await
+}
+
 /// A list's cells hold its owner's members, so a change to a stored cell's
 /// `rdf:first` or `rdf:rest` among `flakes` is judged also as a change to
 /// the owner's edge to the list, `owner p head`, as the pre-state holds it:

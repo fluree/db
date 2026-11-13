@@ -71,6 +71,7 @@ fn apply_window(
         leaflet_target_rows: 100,
         leaf_target_rows: 1000,
         collect_matched: false,
+        history_drop: None,
     };
     let result = update_branch(
         &branch_bytes,

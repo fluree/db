@@ -86,6 +86,9 @@ async fn a_push_retracts_values_the_target_holds_in_its_index() {
                 blobs: export.blobs.clone(),
                 missing_blobs: Vec::new(),
                 merged_commits: Vec::new(),
+                commit_ids: Vec::new(),
+                merged_commit_ids: Vec::new(),
+                ..Default::default()
             };
             pushed.push(
                 fluree

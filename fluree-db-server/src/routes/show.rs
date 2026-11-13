@@ -120,6 +120,11 @@ async fn show_local(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
+        // A commit's flakes are audit data on a ledger that suppresses history.
+        let audit = |branch: &fluree_db_api::LedgerId| {
+            bearer.0.as_ref().is_some_and(|p| p.can_audit(branch))
+        };
+        crate::routes::audit::require_audit(&state, &headers.raw, &alias, audit).await?;
 
         // Keep the entire verified selection: reconstructing it from identity
         // alone can widen a delegated view to the identity's local policy set.

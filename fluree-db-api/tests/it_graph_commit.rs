@@ -431,7 +431,7 @@ async fn commit_show_prefix_with_identity_filters_flakes_by_policy() {
     // Extract the SHA-256 hex digest from the CID, then take a prefix.
     // resolve_commit_prefix expects a hex digest prefix, not a CID string prefix.
     let cid: ContentId = by_t.id.parse().expect("parse CID");
-    let hex_digest = cid.digest_hex();
+    let hex_digest = cid.address_digest();
     let prefix = &hex_digest[..12];
 
     // Resolve via prefix WITHOUT policy → should see both SSNs

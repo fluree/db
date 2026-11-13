@@ -1817,7 +1817,7 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
             .storage_namespace("rawmode:test")
             .await
             .unwrap(),
-        &reindex_result.root_id.digest_hex(),
+        &reindex_result.root_id.address_digest(),
     );
     let direct_root_bytes = admin_storage
         .read_bytes(&root_address)
@@ -2562,7 +2562,7 @@ async fn leaf_address_from_cid(cid_str: &str, state: &AppState, ledger_id: &str)
         "file",
         ContentKind::IndexLeaf,
         &state.fluree.storage_namespace(ledger_id).await.unwrap(),
-        &cid.digest_hex(),
+        &cid.address_digest(),
     )
 }
 
@@ -2689,7 +2689,7 @@ async fn test_policy_filtered_flkb_has_fewer_flakes_than_raw() {
         .expect("reindex should succeed");
 
     assert!(
-        reindex_result.root_id.digest_hex().len() == 64,
+        reindex_result.root_id.address_digest().len() == 64,
         "Reindex should produce a valid root CID"
     );
     assert!(
@@ -2985,7 +2985,7 @@ async fn test_object_endpoint_serves_ledger_scoped_advanced_kinds() {
             .unwrap_or_else(|e| panic!("seed {kind:?}: {e}"));
         assert_eq!(
             written.content_hash,
-            id.digest_hex(),
+            id.address_digest(),
             "seed hash must match the CID digest for {kind:?}"
         );
 
@@ -4161,8 +4161,973 @@ async fn test_proxy_peer_forwards_a_write() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let ledger = state.fluree.ledger("peerfw:main").await.expect("ledger");
     assert_eq!(ledger.t(), 1);
     server_handle.abort();
+}
+
+/// A stand-in prover of this release: it answers `--image-id`, which the
+/// server checks at start-up, and refuses to prove.
+#[cfg(unix)]
+fn stand_in_prover(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let image_id = fluree_db_api::retention::erasure::REDACT_IMAGE_IDS[0]
+        .iter()
+        .map(|w| format!("{w:#010x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let path = dir.join("fluree-prover");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --image-id ] && echo '{image_id}' && exit 0\n\
+             echo 'a stand-in prover proves nothing' >&2\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A peer forwards removal and erasure requests to the transaction server,
+/// which writes them. Run on the peer, a removal would have no writer and an
+/// erasure no file storage.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_forwards_removal_and_erasure() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        // Acceptance does not wait for a proof, but needs a prover.
+        erasure_prover: Some(stand_in_prover(tmp.path())),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "peerrm:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let insert = client
+        .post(format!("{server_url}/v1/fluree/insert/peerrm:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"@graph": [
+                {"@id": "http://example.org/alice", "http://example.org/email": "a@x"},
+                {"@id": "http://example.org/bob", "http://example.org/email": "b@x"}
+            ]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("insert");
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+    for (route, subject) in [("remove", "alice"), ("erase", "bob")] {
+        let body = serde_json::json!({"matching": [{
+            "subject": format!("http://example.org/{subject}"),
+            "predicate": "http://example.org/email"
+        }]});
+        let resp = peer_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/{route}/peerrm:main"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+    }
+
+    let registration = state
+        .fluree
+        .retention_status("peerrm:main")
+        .await
+        .expect("status")
+        .registration
+        .expect("registration");
+    let requests: std::collections::BTreeSet<&str> = registration
+        .journal
+        .removals
+        .iter()
+        .map(|r| r.request_id.as_str())
+        .collect();
+    assert_eq!(requests.len(), 2, "{registration:?}");
+    assert_eq!(registration.erasures.len(), 1, "{registration:?}");
+    server_handle.abort();
+}
+
+/// A peer that was serving a ledger before its first removal holds no audit
+/// access yet: the server refuses it the removal's commit. That tells the
+/// peer nothing of whether the ledger holds the commit, so the removal
+/// applies, and the history its caches hold is refused as soon as it
+/// learns of the journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_without_audit_access_refuses_removed_history() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let post = |path: &'static str, body: serde_json::Value| {
+        let request = client
+            .post(format!("{server_url}/v1/fluree/{path}"))
+            .header("content-type", "application/json")
+            .body(body.to_string());
+        async move { request.send().await.expect("request").status() }
+    };
+    let email = |value: &str| serde_json::json!({"@id": "http://example.org/alice", "http://example.org/email": value});
+    assert_eq!(
+        post("create", serde_json::json!({"ledger": "peerlate:main"})).await,
+        reqwest::StatusCode::CREATED
+    );
+    assert!(post("insert/peerlate:main", email("a@x"))
+        .await
+        .is_success());
+    assert!(post("upsert/peerlate:main", email("a@y"))
+        .await
+        .is_success());
+    // Indexed, so the peer answers from what it has cached, with no
+    // commit to fetch.
+    let reindexed = post("reindex", serde_json::json!({"ledger": "peerlate:main"})).await;
+    assert!(reindexed.is_success(), "{reindexed}");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+    let at_t1 = || {
+        let app = peer_app.clone();
+        async move {
+            let body = serde_json::json!({
+                "from": "peerlate:main@t:1",
+                "select": ["?o"],
+                "where": {
+                    "@id": "http://example.org/alice",
+                    "http://example.org/email": "?o"
+                }
+            });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/fluree/query")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+    let (status, json) = at_t1().await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, serde_json::json!([["a@x"]]));
+
+    // The value is no longer current: the removal commits nothing, and the
+    // peer has every commit it needs already.
+    let remove = serde_json::json!({"matching": [{
+        "subject": "http://example.org/alice",
+        "predicate": "http://example.org/email",
+        "object": "a@x"
+    }]});
+    assert!(post("remove/peerlate:main", remove).await.is_success());
+
+    // Within the peer's refresh interval, not for as long as the ledger
+    // stays quiet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (status, json) = at_t1().await;
+        if status != StatusCode::OK {
+            assert_eq!(status, StatusCode::GONE, "{json}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer kept serving the removed value: {json}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    server_handle.abort();
+}
+
+/// A peer reads a ledger's removal journal through the storage proxy: a
+/// time-travel query that could see a removed value is refused there as on
+/// the server, and every other one answers. Without the journal the peer
+/// failed every time-travel query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_refuses_removed_history() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "peerhist:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let insert = client
+        .post(format!("{server_url}/v1/fluree/insert/peerhist:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"@graph": [
+                {"@id": "http://example.org/alice", "http://example.org/email": "a@x"},
+                {"@id": "http://example.org/bob", "http://example.org/email": "b@x"}
+            ]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("insert");
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+    let remove = client
+        .post(format!("{server_url}/v1/fluree/remove/peerhist:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"matching": [{
+                "subject": "http://example.org/alice",
+                "predicate": "http://example.org/email"
+            }]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("remove");
+    assert_eq!(remove.status(), reqwest::StatusCode::OK);
+
+    // A peer reads a journaled ledger's commits, so it holds audit access.
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+    );
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+    let query = |from: &'static str, subject: &'static str| {
+        let app = peer_app.clone();
+        async move {
+            let body = serde_json::json!({
+                "from": from,
+                "select": ["?o"],
+                "where": {
+                    "@id": format!("http://example.org/{subject}"),
+                    "http://example.org/email": "?o"
+                }
+            });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/fluree/query")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+    let (status, json) = query("peerhist:main", "bob").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let (status, json) = query("peerhist:main@t:1", "bob").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, serde_json::json!([["b@x"]]));
+    let (status, json) = query("peerhist:main@t:1", "alice").await;
+    assert_eq!(status, StatusCode::GONE, "{json}");
+    // Read again, the journal is revalidated, not sent again, and still
+    // refuses.
+    let (status, json) = query("peerhist:main@t:1", "alice").await;
+    assert_eq!(status, StatusCode::GONE, "{json}");
+
+    // The route answers with the journal alone, tagged; an unchanged one is
+    // not sent again, and a changed one is.
+    let config = |tag: Option<String>| {
+        let mut request = client
+            .get(format!(
+                "{server_url}/v1/fluree/storage/config/peerhist:main"
+            ))
+            .bearer_auth(&token);
+        if let Some(tag) = tag {
+            request = request.header("if-none-match", tag);
+        }
+        request.send()
+    };
+    let first = config(None).await.expect("config");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let tag = first.headers()["etag"].to_str().unwrap().to_string();
+    let body: serde_json::Value = first.json().await.unwrap();
+    let retention = &body["payload"]["retention"];
+    let mut keys: Vec<&str> = retention
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["activeSinceT", "journal"], "{body}");
+    let again = config(Some(tag.clone())).await.expect("config");
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_MODIFIED);
+    let remove = client
+        .post(format!("{server_url}/v1/fluree/remove/peerhist:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"matching": [{
+                "subject": "http://example.org/bob",
+                "predicate": "http://example.org/email"
+            }]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("remove");
+    assert_eq!(remove.status(), reqwest::StatusCode::OK);
+    let changed = config(Some(tag.clone())).await.expect("config");
+    assert_eq!(changed.status(), reqwest::StatusCode::OK);
+    let tag = changed.headers()["etag"].to_str().unwrap().to_string();
+    // A peer learns of another process's removal in the background, at most
+    // once a second while it is queried.
+    eventually("the peer refuses the newly removed history", || async {
+        query("peerhist:main@t:1", "bob").await.0 == StatusCode::GONE
+    })
+    .await;
+
+    // A partitioned replica still revalidates the journal it holds, with
+    // no leader round trip.
+    struct Partitioned;
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
+        async fn sync_reads(&self) -> Result<(), String> {
+            panic!("config reads must not contact the leader")
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    state.fluree.set_retention_replicas(Arc::new(Partitioned));
+    let unconfirmed = config(Some(tag)).await.expect("config");
+    assert_eq!(unconfirmed.status(), reqwest::StatusCode::NOT_MODIFIED);
+    server_handle.abort();
+}
+
+/// A storage-proxy token carrying `claims` besides the issuer's.
+fn token_with_claims(signing_key: &SigningKey, claims: serde_json::Value) -> String {
+    let pubkey = signing_key.verifying_key().to_bytes();
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "jwk": {"kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(pubkey)}
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut payload = serde_json::json!({
+        "iss": did_from_pubkey(&pubkey),
+        "sub": "test-peer@example.com",
+        "exp": now + 3600,
+        "iat": now,
+    });
+    for (claim, value) in claims.as_object().unwrap() {
+        payload[claim] = value.clone();
+    }
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    let signature = signing_key.sign(format!("{header_b64}.{payload_b64}").as_bytes());
+    format!(
+        "{header_b64}.{payload_b64}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
+
+/// `POST /pack` streams a decodable pack: a client's erasure opt-in is
+/// accepted, and the ledger's removal journal travels after the header, so
+/// a copy refuses the history its source refuses. A ledger with a journal
+/// needs audit access.
+#[tokio::test]
+async fn test_pack_streams_commits_and_the_removal_journal() {
+    use fluree_db_core::pack::{
+        decode_frame, read_stream_preamble, PackFrame, PackRequest, DEFAULT_MAX_PAYLOAD,
+    };
+
+    let (_tmp, state) = tx_server_state().await;
+    state.fluree.create_ledger("packed").await.unwrap();
+    state
+        .fluree
+        .graph("packed:main")
+        .transact()
+        .insert(&serde_json::json!({
+            "@id": "http://example.org/alice",
+            "http://example.org/email": "a@old"
+        }))
+        .commit()
+        .await
+        .unwrap();
+    state
+        .fluree
+        .remove_occurrences(
+            "packed:main",
+            fluree_db_api::retention::RemovalRequest {
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let head = state
+        .fluree
+        .nameservice()
+        .lookup("packed:main")
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_head_id
+        .unwrap();
+    let request =
+        serde_json::to_vec(&PackRequest::commits(vec![head], vec![]).with_erasures(Vec::new()))
+            .unwrap();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let post = |token: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/pack/packed:main")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(request.clone()))
+            .unwrap()
+    };
+
+    let storage_only = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(storage_only))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let mut pos = read_stream_preamble(&body).unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let (frame, used) = decode_frame(&body[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+        pos += used;
+        let end = matches!(frame, PackFrame::End);
+        frames.push(frame);
+        if end {
+            break;
+        }
+    }
+    assert!(matches!(frames[0], PackFrame::Header(_)));
+    let PackFrame::Manifest(journal) = &frames[1] else {
+        panic!("the journal follows the header: {:?}", frames[1]);
+    };
+    assert_eq!(journal["phase"], "retention");
+    assert_eq!(
+        journal["journal"]["removals"].as_array().map(Vec::len),
+        Some(2),
+        "the assertion and the removal's retraction: {journal}"
+    );
+    let commits = frames
+        .iter()
+        .filter(|f| matches!(f, PackFrame::Data { cid, .. } if cid.content_kind() == Some(fluree_db_core::ContentKind::Commit)))
+        .count();
+    assert_eq!(commits, 2, "the insert and the removal's retraction");
+}
+
+/// A branch with nothing removed still reads its source's commits from the
+/// source's folder: a pack through it that wants its source's head, past
+/// the fork, reaches a value the source removed, and needs audit access.
+#[tokio::test]
+async fn test_pack_through_a_branch_needs_audit_for_its_sources_removals() {
+    use fluree_db_core::pack::PackRequest;
+
+    let (_tmp, state) = tx_server_state().await;
+    state.fluree.create_ledger("packedb").await.unwrap();
+    let insert = |doc: serde_json::Value| {
+        let fluree = state.fluree.clone();
+        async move {
+            fluree
+                .graph("packedb:main")
+                .transact()
+                .insert(&doc)
+                .commit()
+                .await
+                .unwrap();
+        }
+    };
+    insert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/name": "Alice"
+    }))
+    .await;
+    state
+        .fluree
+        .create_branch("packedb", "dev", None, None)
+        .await
+        .unwrap();
+    // Written on main after the fork, so dev's journal never holds it.
+    insert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@old"
+    }))
+    .await;
+    state
+        .fluree
+        .remove_occurrences(
+            "packedb:main",
+            fluree_db_api::retention::RemovalRequest {
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!state
+        .fluree
+        .history_suppressed("packedb:dev")
+        .await
+        .unwrap());
+    let main_head = state
+        .fluree
+        .nameservice()
+        .lookup("packedb:main")
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_head_id
+        .unwrap();
+    let request = serde_json::to_vec(
+        &PackRequest::commits(vec![main_head], vec![]).with_erasures(Vec::new()),
+    )
+    .unwrap();
+    let signing_key = SigningKey::from_bytes(&[8u8; 32]);
+    let post = |token: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/pack/packedb:dev")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(request.clone()))
+            .unwrap()
+    };
+    let storage_only = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(storage_only))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Audit of the branch read through does not cover its source's removals.
+    let dev_auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({
+            "fluree.storage.all": true,
+            "fluree.ledger.audit.ledgers": ["packedb:dev"]
+        }),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(dev_auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let main_auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({
+            "fluree.storage.all": true,
+            "fluree.ledger.audit.ledgers": ["packedb:main"]
+        }),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(main_auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Wait for `check` to hold, for up to ten seconds.
+async fn eventually<F, Fut>(what: &str, check: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A peer following a transaction server over `/events` evicts a ledger it
+/// cached when the server announces a refresh of it. The ledger's stored
+/// history changed without its heads moving (an erasure published, or a
+/// purge rewrote its index), which no record update would tell the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_evicts_a_ledger_the_server_refreshes() {
+    use fluree_db_api::LedgerId;
+    use fluree_db_nameservice::NameServiceEvent;
+
+    let (_tx_tmp, tx) = tx_server_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = build_router(tx.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tx.fluree.create_ledger("mydb").await.expect("create");
+    tx.fluree
+        .graph("mydb:main")
+        .transact()
+        .insert(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:alice",
+            "ex:name": "Alice"
+        }))
+        .commit()
+        .await
+        .expect("insert");
+
+    let token = create_storage_proxy_token(&SigningKey::from_bytes(&[7u8; 32]), true);
+    let (_peer_tmp, peer) = proxy_peer_state(&url, &token).await.expect("peer");
+    fluree_db_server::PeerSubscriptionTask::new(
+        peer.config.clone(),
+        peer.peer_state.clone().expect("peer state"),
+        peer.fluree.clone(),
+    )
+    .spawn();
+    let ledger = LedgerId::parse("mydb:main").unwrap();
+    let peer_state = peer.peer_state.clone().unwrap();
+    eventually("the peer to follow the ledger", || async {
+        peer_state.known_ledgers().await.contains(&ledger)
+    })
+    .await;
+    peer.fluree.ledger_cached("mydb:main").await.expect("load");
+    let cached = || async {
+        peer.fluree
+            .ledger_manager()
+            .expect("a peer caches ledgers")
+            .cached_aliases()
+            .await
+            .contains(&ledger)
+    };
+    assert!(cached().await);
+
+    tx.fluree
+        .event_bus()
+        .notify(NameServiceEvent::LedgerRefresh {
+            ledger_id: ledger.clone(),
+        });
+    eventually("the peer to evict the ledger", || async { !cached().await }).await;
+}
+
+/// On a ledger with a removal, an index's root, leaves and dictionaries can
+/// hold removed values: a storage token alone does not fetch them, an audit
+/// token does. A ledger without one serves them to either.
+#[tokio::test]
+async fn test_index_objects_of_a_ledger_with_a_removal_need_audit() {
+    let (_tmp, state) = tx_server_state().await;
+    let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+    let storage_only = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+    );
+    let admin_storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+    for (name, removed) in [("journaled", true), ("plain", false)] {
+        let ledger = format!("{name}:main");
+        state.fluree.create_ledger(name).await.unwrap();
+        state
+            .fluree
+            .graph(&ledger)
+            .transact()
+            .insert(&serde_json::json!({
+                "@id": "http://example.org/alice",
+                "http://example.org/email": "a@old"
+            }))
+            .commit()
+            .await
+            .unwrap();
+        if removed {
+            state
+                .fluree
+                .remove_occurrences(
+                    &ledger,
+                    fluree_db_api::retention::RemovalRequest {
+                        matching: vec![fluree_db_api::retention::FactSelector {
+                            subject: "http://example.org/alice".into(),
+                            predicate: "http://example.org/email".into(),
+                            graph: None,
+                            object: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let namespace = state.fluree.storage_namespace(&ledger).await.unwrap();
+        for kind in [
+            ContentKind::IndexRoot,
+            ContentKind::IndexLeaf,
+            ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::Graphs,
+            },
+        ] {
+            let payload = format!("{name} {kind:?} bytes");
+            admin_storage
+                .content_write_bytes(kind, &namespace, payload.as_bytes())
+                .await
+                .unwrap();
+            let id = ContentId::new(kind, payload.as_bytes());
+            let fetch = |token: &str| {
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/fluree/storage/objects/{id}?ledger={ledger}"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let status = |token: &str| {
+                let request = fetch(token);
+                let app = build_router(state.clone());
+                async move { app.oneshot(request).await.unwrap().status() }
+            };
+            let expected = if removed {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(status(&storage_only).await, expected, "{name}: {kind:?}");
+            assert_eq!(status(&auditor).await, StatusCode::OK, "{name}: {kind:?}");
+        }
+    }
+}
+
+/// An index object other than history is checked against the journal a
+/// cluster replica holds, waiting on no leader: a replica that cannot reach
+/// one still serves an ordinary ledger's index, and still refuses the index
+/// of a ledger with a removal to a storage token. Raw commits use the
+/// same local checks.
+#[tokio::test]
+async fn test_raw_objects_wait_on_no_leader() {
+    struct Partitioned(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
+        async fn sync_reads(&self) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err("no leader".into())
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    let (_tmp, state) = tx_server_state().await;
+    let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+    let token = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+    let mut seeded = Vec::new();
+    for (name, removed) in [("plain-index", false), ("removed-index", true)] {
+        let ledger = format!("{name}:main");
+        state.fluree.create_ledger(name).await.unwrap();
+        state
+            .fluree
+            .graph(&ledger)
+            .transact()
+            .insert(&serde_json::json!({
+                "@id": "http://example.org/alice",
+                "http://example.org/email": "a@old"
+            }))
+            .commit()
+            .await
+            .unwrap();
+        if removed {
+            state
+                .fluree
+                .remove_occurrences(
+                    &ledger,
+                    fluree_db_api::retention::RemovalRequest {
+                        matching: vec![fluree_db_api::retention::FactSelector {
+                            subject: "http://example.org/alice".into(),
+                            predicate: "http://example.org/email".into(),
+                            graph: None,
+                            object: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let namespace = state.fluree.storage_namespace(&ledger).await.unwrap();
+        let payload = format!("{name} index root");
+        storage
+            .content_write_bytes(ContentKind::IndexRoot, &namespace, payload.as_bytes())
+            .await
+            .unwrap();
+        let head = state
+            .fluree
+            .nameservice()
+            .lookup(&ledger)
+            .await
+            .unwrap()
+            .unwrap()
+            .commit_head_id
+            .unwrap();
+        seeded.push((
+            ledger,
+            ContentId::new(ContentKind::IndexRoot, payload.as_bytes()),
+            head,
+        ));
+    }
+    let replicas = Arc::new(Partitioned(std::sync::atomic::AtomicUsize::new(0)));
+    state.fluree.set_retention_replicas(replicas.clone());
+    let status = |id: &ContentId, ledger: &str| {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/fluree/storage/objects/{id}?ledger={ledger}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let app = build_router(state.clone());
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+    let (plain, plain_root, plain_head) = &seeded[0];
+    let (removed, removed_root, _) = &seeded[1];
+    assert_eq!(status(plain_root, plain).await, StatusCode::OK);
+    assert_eq!(status(removed_root, removed).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        replicas.0.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an index read waited on the leader"
+    );
+    assert_eq!(status(plain_head, plain).await, StatusCode::OK);
+    assert_eq!(replicas.0.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

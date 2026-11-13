@@ -181,6 +181,15 @@ impl LedgerView {
         self.ns_record.as_ref().and_then(|r| r.fence)
     }
 
+    /// What this view's writes present; see
+    /// [`LedgerState::write_basis`](fluree_db_ledger::LedgerState::write_basis).
+    pub fn write_basis(&self) -> fluree_db_nameservice::WriteBasis {
+        self.ns_record
+            .as_ref()
+            .map(fluree_db_nameservice::NsRecord::write_basis)
+            .unwrap_or_default()
+    }
+
     /// Where this branch's artifacts live; see
     /// [`LedgerState::storage_namespace`](fluree_db_ledger::LedgerState::storage_namespace).
     pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {
@@ -313,7 +322,7 @@ pub use fluree_db_core::ledger_id::COMMIT_PREFIX_MIN_LEN;
 ///
 /// Both resolvers — this module's [`resolve_commit_prefix`] and
 /// `time_resolve::commit_to_t` — key on the *indexed commit subject*, which is
-/// minted as `Sid::new(FLUREE_COMMIT, cid.digest_hex())` in
+/// minted by `fluree_db_core::commit_subject::commit_sid` in
 /// `fluree-db-novelty/src/commit_flakes.rs` and mirrored by the indexer. Hex is
 /// therefore the only spelling a bounded prefix scan can bound, which is why it
 /// is also the spelling `fluree log` prints.
@@ -334,26 +343,48 @@ pub use fluree_db_core::ledger_id::COMMIT_PREFIX_MIN_LEN;
 /// and a healthy ledger was reported as 100% orphaned. That one resolves it by
 /// trying the hex key first, which works when you hold a whole key; a prefix has
 /// nothing to look up, so the guard here is the round trip instead.
-pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
+pub(crate) fn normalize_commit_ref(input: &str) -> Result<fluree_db_core::Sid> {
+    use fluree_db_core::commit_subject::{commit_sid, COMMIT_URN_NAME_PREFIX};
+    use fluree_db_core::HashAlgorithm;
+    use fluree_db_core::Sid;
+
     let stripped = input.strip_prefix("fluree:commit:").unwrap_or(input);
     let stripped = stripped.strip_prefix("sha256:").unwrap_or(stripped);
 
     if let Some(cid) = ContentId::parse_canonical(stripped) {
-        return Ok(cid.digest_hex());
+        return Ok(commit_sid(&cid));
     }
 
-    if stripped.len() < COMMIT_PREFIX_MIN_LEN {
-        return Err(ApiError::invalid_query(format!(
-            "Commit prefix must be at least {COMMIT_PREFIX_MIN_LEN} characters, got {}",
-            stripped.len()
-        )));
+    // A commit minted with another hash: its subject IRI
+    // `urn:fluree:commit-<alg>-<hex>`, or `<alg>:<hex>`.
+    let tagged = stripped
+        .strip_prefix(fluree_vocab::fluree::URN)
+        .and_then(|s| s.strip_prefix(COMMIT_URN_NAME_PREFIX))
+        .and_then(|s| s.rsplit_once('-'))
+        .or_else(|| stripped.split_once(':'));
+    if let Some((tag, hex)) = tagged {
+        let alg: HashAlgorithm = tag.parse().map_err(|_| {
+            ApiError::invalid_query(format!(
+                "'{input}' is not a commit id: unsupported digest '{tag}'"
+            ))
+        })?;
+        if alg != HashAlgorithm::Sha2_256 {
+            check_commit_prefix_len(hex, alg)?;
+            return Ok(Sid::new(
+                fluree_vocab::namespaces::FLUREE_URN,
+                format!("{COMMIT_URN_NAME_PREFIX}{}-{hex}", alg.name()),
+            ));
+        }
+        check_commit_prefix_len(hex, alg)?;
+        return Ok(Sid::new(fluree_vocab::namespaces::FLUREE_COMMIT, hex));
     }
 
     // An abbreviated CID carries almost no digest — the first twelve characters
     // are a constant — so it cannot be scanned for. Say that, rather than
     // reporting it as a prefix that matched nothing.
-    if stripped.starts_with(COMMIT_CID_CONSTANT_HEAD)
-        || COMMIT_CID_CONSTANT_HEAD.starts_with(stripped)
+    if stripped.len() >= COMMIT_PREFIX_MIN_LEN
+        && (stripped.starts_with(COMMIT_CID_CONSTANT_HEAD)
+            || COMMIT_CID_CONSTANT_HEAD.starts_with(stripped))
     {
         return Err(ApiError::invalid_query(format!(
             "'{input}' is an abbreviated CID, not a commit id this can resolve: \
@@ -361,16 +392,32 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
              Pass the hex digest that `fluree log` prints, or a full CID."
         )));
     }
+    check_commit_prefix_len(stripped, HashAlgorithm::Sha2_256)?;
+    Ok(Sid::new(fluree_vocab::namespaces::FLUREE_COMMIT, stripped))
+}
 
-    // SHA-256 in hex is 64 characters
-    if stripped.len() > 64 {
+/// A digest prefix long enough to scan for and no longer than the digest.
+fn check_commit_prefix_len(hex: &str, alg: fluree_db_core::HashAlgorithm) -> Result<()> {
+    if hex.len() < COMMIT_PREFIX_MIN_LEN {
         return Err(ApiError::invalid_query(format!(
-            "Commit prefix too long ({} chars). SHA-256 in hex is 64 characters.",
-            stripped.len()
+            "Commit prefix must be at least {COMMIT_PREFIX_MIN_LEN} characters, got {}",
+            hex.len()
         )));
     }
+    let max = alg.digest_len() * 2;
+    if hex.len() > max {
+        return Err(ApiError::invalid_query(format!(
+            "Commit prefix too long ({} chars). {alg} in hex is {max} characters.",
+            hex.len()
+        )));
+    }
+    Ok(())
+}
 
-    Ok(stripped.to_string())
+/// The CID a matched commit subject names.
+fn commit_id_of_subject(sid: &fluree_db_core::Sid) -> Result<ContentId> {
+    fluree_db_core::commit_subject::commit_id_of_sid(sid)
+        .ok_or_else(|| ApiError::internal(format!("commit subject {} is not a digest", sid.name)))
 }
 
 /// The error for a prefix that matched more than one commit.
@@ -412,15 +459,13 @@ async fn resolve_commit_prefix(
     use fluree_db_core::{
         range_bounded_with_overlay, Flake, IndexType, RangeOptions, Sid, TXN_META_GRAPH_ID,
     };
-    use fluree_vocab::namespaces::FLUREE_COMMIT;
-
-    let normalized = normalize_commit_ref(prefix)?;
+    let start_sid = normalize_commit_ref(prefix)?;
+    let ns = start_sid.namespace_code;
+    let normalized = start_sid.name.to_string();
     let normalized = normalized.as_str();
 
     // Build scan range: [prefix, prefix~) where ~ sorts after all hex chars
-    let start_sid = Sid::new(FLUREE_COMMIT, normalized);
-    let end_prefix = format!("{normalized}~");
-    let end_sid = Sid::new(FLUREE_COMMIT, &end_prefix);
+    let end_sid = Sid::new(ns, format!("{normalized}~"));
 
     let start_bound = Flake::min_for_subject(start_sid);
     let end_bound = Flake::min_for_subject(end_sid);
@@ -442,17 +487,17 @@ async fn resolve_commit_prefix(
 
     // Collect unique matching commit subjects
     let mut seen = std::collections::HashSet::new();
-    let mut matches: Vec<String> = Vec::new();
+    let mut matches: Vec<Sid> = Vec::new();
 
     for flake in &flakes {
-        if flake.s.namespace_code != FLUREE_COMMIT {
+        if flake.s.namespace_code != ns {
             continue;
         }
         if !flake.s.name.starts_with(normalized) {
             continue;
         }
         if seen.insert(flake.s.name.as_ref()) {
-            matches.push(flake.s.name.to_string());
+            matches.push(flake.s.clone());
         }
         if matches.len() > 1 {
             break;
@@ -463,20 +508,10 @@ async fn resolve_commit_prefix(
         0 => Err(ApiError::CommitNotFound(format!(
             "No commit found with prefix: {normalized}"
         ))),
-        1 => {
-            let hex = &matches[0];
-            let digest: [u8; 32] = hex::decode(hex)
-                .map_err(|e| ApiError::internal(format!("Invalid hex digest: {e}")))?
-                .try_into()
-                .map_err(|_| ApiError::internal("Digest not 32 bytes"))?;
-            Ok(ContentId::from_sha256_digest(
-                fluree_db_core::CODEC_FLUREE_COMMIT,
-                &digest,
-            ))
-        }
+        1 => commit_id_of_subject(&matches[0]),
         _ => Err(ambiguous_commit_prefix(
             normalized,
-            matches.iter().map(String::as_str),
+            matches.iter().map(|sid| sid.name.as_ref()),
         )),
     }
 }
@@ -496,7 +531,7 @@ async fn resolve_t_to_commit_id(
         range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
         TXN_META_GRAPH_ID,
     };
-    use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
+    use fluree_vocab::namespaces::FLUREE_DB;
 
     if target_t < 1 {
         return Err(ApiError::invalid_query(format!(
@@ -532,7 +567,7 @@ async fn resolve_t_to_commit_id(
     // matching subjects so we can detect and surface the ambiguity rather
     // than silently returning the first one.
     let mut seen = std::collections::HashSet::new();
-    let mut matches: Vec<String> = Vec::new();
+    let mut matches: Vec<Sid> = Vec::new();
     for flake in &flakes {
         if flake.p.namespace_code != FLUREE_DB || flake.p.name.as_ref() != fluree_vocab::db::T {
             continue;
@@ -540,11 +575,11 @@ async fn resolve_t_to_commit_id(
         if flake.o != FlakeValue::Long(target_t) {
             continue;
         }
-        if flake.s.namespace_code != FLUREE_COMMIT {
+        if !fluree_db_core::commit_subject::is_commit_sid(&flake.s) {
             continue;
         }
-        if seen.insert(flake.s.name.as_ref()) {
-            matches.push(flake.s.name.to_string());
+        if seen.insert(&flake.s) {
+            matches.push(flake.s.clone());
         }
         if matches.len() > 1 {
             break;
@@ -555,18 +590,16 @@ async fn resolve_t_to_commit_id(
         0 => Err(ApiError::CommitNotFound(format!(
             "No commit found for t={target_t}"
         ))),
-        1 => {
-            let digest: [u8; 32] = hex::decode(&matches[0])
-                .map_err(|e| ApiError::internal(format!("Invalid hex digest: {e}")))?
-                .try_into()
-                .map_err(|_| ApiError::internal("Digest not 32 bytes"))?;
-            Ok(ContentId::from_sha256_digest(
-                fluree_db_core::CODEC_FLUREE_COMMIT,
-                &digest,
-            ))
-        }
+        1 => commit_id_of_subject(&matches[0]),
         _ => {
-            let ids: Vec<_> = matches.iter().map(|h| &h[..7.min(h.len())]).collect();
+            // Their CIDs, which is what disambiguates.
+            let ids: Vec<String> = matches
+                .iter()
+                .map(|sid| match commit_id_of_subject(sid) {
+                    Ok(id) => id.to_string(),
+                    Err(_) => sid.name.to_string(),
+                })
+                .collect();
             Err(ApiError::invalid_query(format!(
                 "Ambiguous t={target_t}: multiple commits match {ids:?} (likely a rebased history). Disambiguate by passing the full commit CID."
             )))
@@ -694,7 +727,7 @@ mod tests {
     #[test]
     fn normalize_accepts_every_spelling_of_one_commit() {
         let cid = ContentId::new(ContentKind::Commit, b"one commit, many spellings");
-        let hex = cid.digest_hex();
+        let hex = cid.address_digest();
 
         for spelling in [
             cid.to_string(),
@@ -704,11 +737,44 @@ mod tests {
             hex[..12].to_string(),
         ] {
             let normalized = normalize_commit_ref(&spelling).expect("should normalize");
+            assert_eq!(
+                normalized.namespace_code,
+                fluree_vocab::namespaces::FLUREE_COMMIT
+            );
             assert!(
-                hex.starts_with(&normalized),
-                "{spelling} normalized to {normalized}, not a prefix of {hex}"
+                hex.starts_with(&*normalized.name),
+                "{spelling} normalized to {}, not a prefix of {hex}",
+                normalized.name
             );
         }
+    }
+
+    #[test]
+    fn a_sha2_512_commit_has_its_own_spellings() {
+        let cid = ContentId::new_with(
+            fluree_db_core::HashAlgorithm::Sha2_512,
+            ContentKind::Commit,
+            b"a wide commit",
+        );
+        let subject = fluree_db_core::commit_subject::commit_sid(&cid);
+        let hex = &subject.name["commit-sha2-512-".len()..];
+        for spelling in [
+            cid.to_string(),
+            format!("urn:fluree:commit-sha2-512-{hex}"),
+            format!("sha2-512:{hex}"),
+            format!("sha2-512:{}", &hex[..12]),
+        ] {
+            let normalized = normalize_commit_ref(&spelling).expect("should normalize");
+            assert_eq!(normalized.namespace_code, subject.namespace_code);
+            assert!(
+                subject.name.starts_with(&*normalized.name),
+                "{spelling} normalized to {}",
+                normalized.name
+            );
+        }
+        // Too long for its digest, or an unknown tag.
+        assert!(normalize_commit_ref(&format!("sha2-512:{hex}00")).is_err());
+        assert!(normalize_commit_ref("blake3:abcdef012345").is_err());
     }
 
     /// A hex digest is never re-read as multibase.
@@ -740,7 +806,9 @@ mod tests {
                 "fixture is only interesting if it DOES parse as a CID: {hex}"
             );
             assert_eq!(
-                normalize_commit_ref(hex).expect("hex should normalize"),
+                &*normalize_commit_ref(hex)
+                    .expect("hex should normalize")
+                    .name,
                 hex,
                 "a hex digest must pass through unchanged, not be decoded"
             );
@@ -767,8 +835,10 @@ mod tests {
 
         // ...but the whole thing resolves.
         assert_eq!(
-            normalize_commit_ref(&full).expect("a full CID resolves"),
-            cid.digest_hex()
+            &*normalize_commit_ref(&full)
+                .expect("a full CID resolves")
+                .name,
+            cid.address_digest()
         );
     }
 

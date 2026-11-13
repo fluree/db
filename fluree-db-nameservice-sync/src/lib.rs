@@ -78,8 +78,9 @@ pub use integrity::verify_object_integrity;
 pub use origin::{HttpOriginFetcher, MultiOriginFetcher};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pack_client::{
-    fetch_and_ingest_pack, ingest_pack_frame, ingest_pack_stream, ingest_pack_stream_with_header,
-    peek_pack_header, PackIngestResult,
+    fetch_and_ingest_pack, ingest_pack_frame, ingest_pack_stream, ingest_pack_stream_into,
+    ingest_pack_stream_with_header, ingest_pack_stream_with_header_into, peek_pack_header,
+    PackIngestResult, PackSink,
 };
 pub use proxy_nameservice::ProxyNameService;
 pub use proxy_storage::{cid_and_ledger_from_address, ProxyReadMode, ProxyStorage};

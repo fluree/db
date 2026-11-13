@@ -301,6 +301,9 @@ pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
 ///   deferral-only `MaterializePartial` split) — same capacity class.
 /// - `COMMIT_CONTENTION`: every commit attempt lost its race with other
 ///   writers — clears when they ease off.
+/// - `REPLICA_NOT_CURRENT`: a cluster replica could not confirm it holds a
+///   ledger's current removal journal — clears when it reaches a leader and
+///   catches up.
 /// - `INDEX_NOT_LOADED`: this server has not loaded the ledger's index; the
 ///   write was refused before it read anything — clears when the index
 ///   loads.
@@ -309,12 +312,13 @@ pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
 ///   error relayed via `ApiError::Http { status: 503 }` reach `error_type`'s
 ///   `Http` catch-all. If a new 503 lands here, give it a typed code instead
 ///   of relying on this entry.
-pub(crate) const RETRYABLE_503_TYPES: [&str; 5] = [
+pub(crate) const RETRYABLE_503_TYPES: [&str; 6] = [
     fluree_vocab::errors::NOVELTY_AT_MAX,
     fluree_vocab::errors::NOVELTY_DEFERRED,
     fluree_vocab::errors::COMMIT_CONTENTION,
     fluree_vocab::errors::INDEX_NOT_LOADED,
     fluree_vocab::errors::INTERNAL,
+    fluree_vocab::errors::REPLICA_NOT_CURRENT,
 ];
 
 /// Extract cause chain from error (only for high-value cases)
@@ -736,7 +740,7 @@ mod tests {
     #[test]
     fn every_503_source_is_classified_retryable_capacity() {
         // One entry per 503-producing path, with the code it must carry.
-        let sources: [(ServerError, &str, &str); 10] = [
+        let sources: [(ServerError, &str, &str); 11] = [
             (
                 ServerError::Api(ApiError::NoveltyDeferred { remaining: 3 }),
                 errors::NOVELTY_DEFERRED,
@@ -813,6 +817,11 @@ mod tests {
                 errors::INTERNAL,
                 "committer-overload status passthrough",
             ),
+            (
+                ServerError::Api(ApiError::ReplicaNotCurrent("no leader".into())),
+                errors::REPLICA_NOT_CURRENT,
+                "replica cannot confirm its removal journal",
+            ),
         ];
         for (se, expected_type, why) in sources {
             assert_eq!(se.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{why}");
@@ -831,7 +840,7 @@ mod tests {
         }
         // The allowlist itself is part of the contract: growing it is a
         // conscious act, recorded here.
-        assert_eq!(RETRYABLE_503_TYPES.len(), 5);
+        assert_eq!(RETRYABLE_503_TYPES.len(), 6);
     }
 
     /// The two 413s carry distinct codes for clients to branch on: the HTTP

@@ -43,6 +43,10 @@ pub struct DataPrincipal {
     pub write_all: bool,
     /// Write access to specific ledgers, parsed like `read_ledgers`.
     pub write_ledgers: HashSet<LedgerId>,
+    /// Raw commit/transaction (audit-log) access to all ledgers.
+    pub audit_all: bool,
+    /// Raw commit/transaction access to specific ledgers.
+    pub audit_ledgers: HashSet<LedgerId>,
     /// Token expiry (Unix seconds). HTTP re-verifies per request so this is
     /// redundant there; long-lived transports (Bolt sessions) re-check it
     /// before each statement.
@@ -55,6 +59,14 @@ impl DataPrincipal {
     pub fn can_read(&self, ledger_id: &LedgerId) -> bool {
         let allowed = self.read_all || self.read_ledgers.contains(ledger_id);
         self.audit_scope(ledger_id, "read", allowed);
+        allowed
+    }
+
+    /// Audit-log access: raw commits and transactions of a ledger whose
+    /// retention suppresses history. Not implied by read or storage scopes.
+    pub fn can_audit(&self, ledger_id: &LedgerId) -> bool {
+        let allowed = self.audit_all || self.audit_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "audit", allowed);
         allowed
     }
 
@@ -271,6 +283,8 @@ fn build_principal(
         read_ledgers,
         write_all: payload.ledger_write_all.unwrap_or(false),
         write_ledgers: parse_scopes(payload.ledger_write_ledgers.as_ref()),
+        audit_all: payload.ledger_audit_all.unwrap_or(false),
+        audit_ledgers: parse_scopes(payload.ledger_audit_ledgers.as_ref()),
         expires_unix: payload.exp,
     }
 }

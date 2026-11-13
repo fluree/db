@@ -925,6 +925,7 @@ async fn dynamodb_lists_bindings_and_dropped_ledgers_in_batches() {
             root: fluree_db_core::StorageRoot::legacy(&name),
             root_branch: "main".into(),
             branches: Vec::new(),
+            configs: None,
         };
         ns.cas_dropped(&instance, None, Some(&entry)).await.unwrap();
     }
@@ -966,6 +967,7 @@ async fn dynamodb_dropped_entry_at_the_cap_is_written() {
         root: fluree_db_core::StorageRoot::legacy(&name),
         root_branch: "main".into(),
         branches: Vec::new(),
+        configs: None,
     };
     for i in 0.. {
         let mut record = NsRecord::new(name.with_branch(&format!("b{i}")).unwrap());

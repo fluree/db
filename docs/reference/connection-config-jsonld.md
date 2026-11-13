@@ -305,6 +305,7 @@ carry an explicit storage identifier.
 Rust supports the tiered `commitStorage` + `indexStorage` format via `FlureeBuilder::from_json_ld()` / `build_client()`.
 Internally, Rust routes:
 - `.../commit/...` and `.../txn/...` → commit storage
+- `@retention/...` (retention records, which commits do not rebuild) → commit storage
 - everything else → index storage
 
 **S3 only today.** The routing itself (`TieredStorage`) is backend-agnostic, but

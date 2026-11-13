@@ -404,7 +404,7 @@ mod tests {
 
     fn make_leaf_cid(index: u32) -> ContentId {
         let data = format!("v3-leaf-{index}");
-        ContentId::from_hex_digest(
+        ContentId::from_address_digest(
             CODEC_FLUREE_INDEX_LEAF,
             &fluree_db_core::sha256_hex(data.as_bytes()),
         )
@@ -413,7 +413,7 @@ mod tests {
 
     fn make_sidecar_cid(index: u32) -> ContentId {
         let data = format!("v3-sidecar-{index}");
-        ContentId::from_hex_digest(
+        ContentId::from_address_digest(
             CODEC_FLUREE_INDEX_BRANCH,
             &fluree_db_core::sha256_hex(data.as_bytes()),
         )

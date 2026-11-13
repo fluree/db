@@ -113,7 +113,10 @@ fn main() {
         };
         match IndexRoot::decode(&bytes) {
             Ok(root) => {
-                let prev = root.prev_index.as_ref().map(|p| (p.id.digest_hex(), p.t));
+                let prev = root
+                    .prev_index
+                    .as_ref()
+                    .map(|p| (p.id.address_digest(), p.t));
                 nodes.insert(
                     digest,
                     Node {
@@ -379,7 +382,7 @@ fn resolve_head(
     if nodes.contains_key(arg) {
         return arg.to_string();
     }
-    if let Ok(digest) = ContentId::from_str(arg).map(|cid| cid.digest_hex()) {
+    if let Ok(digest) = ContentId::from_str(arg).map(|cid| cid.address_digest()) {
         if nodes.contains_key(&digest) {
             println!("head {arg} resolved to digest {digest}");
             return digest;

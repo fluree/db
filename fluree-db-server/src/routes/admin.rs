@@ -215,6 +215,10 @@ pub struct WhoAmIScopes {
     pub ledger_write_ledgers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_ledgers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_audit_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_audit_ledgers: Option<Vec<String>>,
 }
 
 /// Extract scope fields from a verified payload into the response shape.
@@ -239,6 +243,8 @@ fn scopes_from_payload(p: &fluree_db_credential::jwt_claims::EventsTokenPayload)
         ledger_read_ledgers: effective(&p.ledger_read_ledgers),
         ledger_write_ledgers: effective(&p.ledger_write_ledgers),
         storage_ledgers: effective(&p.storage_ledgers),
+        ledger_audit_all: p.ledger_audit_all,
+        ledger_audit_ledgers: effective(&p.ledger_audit_ledgers),
     }
 }
 
@@ -363,9 +369,17 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     // Advertise that `POST /push-merges` exists. A client refuses to push a
     // history containing a merge to a server without it, rather than send a
     // bundle that server would store incompletely.
+    // `erasures`: a push may carry permanently erased commits, which this
+    // server holds. `retention`: a push may carry the removal journal, and
+    // need carry no commits.
     doc["push"] = serde_json::json!({
         "merged_commits": true,
+        "erasures": state.fluree.can_hold_erasures(),
+        "retention": state.fluree.takes_pushed_retention(),
     });
+    // `proving`: this server takes permanent erasure requests (`POST /erase`):
+    // it has a prover of this release.
+    doc["erasure"] = serde_json::json!({ "proving": state.fluree.can_prove_erasures() });
 
     // Advertise server-wide serving capabilities so clients can negotiate
     // query-shipping vs peer (block-fetch) mode before authenticating.

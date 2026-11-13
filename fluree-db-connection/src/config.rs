@@ -269,6 +269,9 @@ pub struct ConnectionConfig {
     /// `fluree:<identifier>:<method>://path` is read, the identifier is looked up
     /// in this map to route to the correct storage.
     pub address_identifiers: Option<HashMap<Arc<str>, StorageConfig>>,
+    /// The hash this connection mints commit and transaction CIDs with.
+    /// Other content stays SHA2-256.
+    pub content_hash: fluree_db_core::HashAlgorithm,
 }
 
 impl Default for ConnectionConfig {
@@ -282,6 +285,7 @@ impl Default for ConnectionConfig {
             primary_publisher: None,
             defaults: None,
             address_identifiers: None,
+            content_hash: fluree_db_core::HashAlgorithm::default(),
         }
     }
 }
@@ -466,6 +470,7 @@ impl ConnectionConfig {
             primary_publisher,
             defaults,
             address_identifiers,
+            content_hash: fluree_db_core::HashAlgorithm::default(),
         })
     }
 }

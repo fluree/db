@@ -8,6 +8,7 @@ use crate::binding::{
     BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
     RegistryCas, Versioned,
 };
+use crate::WriteBasis;
 use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -259,7 +260,7 @@ impl LedgerRegistry for MemoryNameService {
 #[async_trait]
 impl BranchRecordStore for MemoryNameService {
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         Ok(self.records.read().get(&key).cloned())
     }
 
@@ -279,7 +280,7 @@ impl BranchRecordStore for MemoryNameService {
     }
 
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         Ok(match self.records.write().get_mut(&key) {
             None => FenceOutcome::Missing,
             Some(record) => match record.fence {
@@ -294,7 +295,7 @@ impl BranchRecordStore for MemoryNameService {
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         Ok(match self.records.write().get_mut(&key) {
             None => FenceOutcome::Missing,
             Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
@@ -305,8 +306,20 @@ impl BranchRecordStore for MemoryNameService {
         })
     }
 
-    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let key = LedgerId::parse(ledger_id)?;
+        Ok(match self.records.write().get_mut(&key) {
+            None => FenceOutcome::Missing,
+            Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
+            Some(record) => {
+                record.frozen = false;
+                FenceOutcome::Applied
+            }
+        })
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let key = LedgerId::parse_persisted(ledger_id)?;
         let mut records = self.records.write();
         match records.get(&key) {
             None => return Ok(FenceOutcome::Missing),
@@ -326,9 +339,10 @@ impl crate::BranchLifecycle for MemoryNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -350,10 +364,11 @@ impl CommitPublisher for MemoryNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -386,10 +401,11 @@ impl IndexPublisher for MemoryNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -418,10 +434,11 @@ impl AdminPublisher for MemoryNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -442,6 +459,19 @@ impl AdminPublisher for MemoryNameService {
         }
 
         Ok(())
+    }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        let key = LedgerId::parse(ledger_id)?;
+        let mut records = self.records.write();
+        match records.get_mut(&key) {
+            Some(record) if record.frozen => {
+                record.index_head_id = None;
+                record.index_t = 0;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
@@ -472,11 +502,12 @@ impl RefPublisher for MemoryNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -601,6 +632,7 @@ impl GraphSourcePublisher for MemoryNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let key = LedgerId::from_parts(name, branch)?;
         let mut graph_source_records = self.graph_source_records.write();
@@ -636,6 +668,24 @@ impl GraphSourcePublisher for MemoryNameService {
             if record.retracted {
                 record.index_id = None;
                 record.index_t = 0;
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        _sources: &[(String, u64)],
+    ) -> Result<()> {
+        let key = LedgerId::from_parts(name, branch)?;
+        if let Some(record) = self.graph_source_records.write().get_mut(&key) {
+            if index_t >= record.index_t {
+                record.index_id = Some(index_id.clone());
+                record.index_t = index_t;
             }
         }
         Ok(())
@@ -814,6 +864,7 @@ impl ConfigPublisher for MemoryNameService {
         if let Some(record) = records.get_mut(&key) {
             record.default_context = new_default_context;
             record.config_id = new_config_id;
+            record.config_version = Some(new.v);
         }
 
         Ok(ConfigCasResult::Updated)
@@ -880,6 +931,11 @@ fn check_fence(
 #[cfg(test)]
 mod lifecycle_conformance {
     crate::lifecycle_conformance_tests!((super::MemoryNameService::new(), ()));
+}
+
+#[cfg(test)]
+mod purge_conformance {
+    crate::purge_conformance_tests!((super::MemoryNameService::new(), ()));
 }
 
 #[cfg(test)]
@@ -1130,11 +1186,11 @@ mod tests {
         let id_v2 = ContentId::new(ContentKind::IndexRoot, b"index-v2");
         let id_old = ContentId::new(ContentKind::IndexRoot, b"index-old");
 
-        ns.publish_graph_source_index("gs", "main", &id_v1, 10)
+        ns.publish_graph_source_index("gs", "main", &id_v1, 10, &[])
             .await
             .unwrap();
 
-        ns.publish_graph_source_index("gs", "main", &id_v2, 20)
+        ns.publish_graph_source_index("gs", "main", &id_v2, 20, &[])
             .await
             .unwrap();
 
@@ -1143,7 +1199,7 @@ mod tests {
         assert_eq!(record.index_t, 20);
 
         // Lower t should be ignored
-        ns.publish_graph_source_index("gs", "main", &id_old, 15)
+        ns.publish_graph_source_index("gs", "main", &id_old, 15, &[])
             .await
             .unwrap();
 

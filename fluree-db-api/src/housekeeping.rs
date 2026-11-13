@@ -13,10 +13,12 @@
 //! the name and deletes whatever the create wrote. A branch create that has
 //! not confirmed its listing for as long is rolled back the same way.
 //!
-//! With an interval set, it also runs the orphan sweep. And a ledger whose
-//! commits and index have not moved since the last tick has its pooled delta
-//! folded into its base, once per index root: otherwise the delta would wait
-//! for the ledger's next write.
+//! With an interval set, it also runs the orphan sweep. Where the instance
+//! collects, it collects commit and transaction garbage and reconciles the
+//! ledgers due, in a task of its own, within a time budget per pass. And a
+//! ledger whose commits and index have not moved since the last tick has its
+//! pooled delta folded into its base, once per index root: otherwise the
+//! delta would wait for the ledger's next write.
 
 use crate::admin::{DropMode, DropStatus, PoolCompaction};
 use crate::Fluree;
@@ -62,6 +64,21 @@ pub struct HousekeepingOptions {
     /// long, and a branch create that has left its listing unconfirmed this
     /// long, timed by this process.
     pub abandoned_create_after: Duration,
+    /// Collect commit and transaction garbage at most this often:
+    /// [`Fluree::collect_garbage`].
+    pub garbage_interval: Duration,
+    /// How long a garbage record stands before its blob may be deleted.
+    pub garbage_grace: Duration,
+    /// Reconcile each ledger at most this often in the background:
+    /// [`Fluree::reconcile_garbage`]. `None`, the default, never does: a
+    /// reconciliation lists the ledger's files and reads its references
+    /// whole, whatever `reconcile_budget` allows. Garbage already recorded
+    /// is collected either way, and an erasure's purge reconciles what it
+    /// needs.
+    pub reconcile_interval: Option<Duration>,
+    /// How long one garbage pass may spend collecting, and then
+    /// reconciling, half of the latter pausing between steps.
+    pub reconcile_budget: Duration,
     /// Fold the pooled delta of a ledger idle since the last tick into its
     /// base.
     pub compact_idle_pool_deltas: bool,
@@ -72,6 +89,13 @@ impl Default for HousekeepingOptions {
         Self {
             orphan_sweep_interval: None,
             abandoned_create_after: ABANDONED_CREATE_AFTER,
+            garbage_interval: Duration::from_secs(5 * 60),
+            // The index collector's minimum age.
+            garbage_grace: Duration::from_secs(
+                60 * u64::from(fluree_db_indexer::IndexerConfig::default().gc_min_time_mins),
+            ),
+            reconcile_interval: None,
+            reconcile_budget: Duration::from_secs(30),
             compact_idle_pool_deltas: true,
         }
     }
@@ -101,6 +125,10 @@ struct LifecycleHousekeeping {
     options: HousekeepingOptions,
     previous: parking_lot::Mutex<Observed>,
     last_sweep: parking_lot::Mutex<Instant>,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    last_garbage: parking_lot::Mutex<Instant>,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    collecting: Arc<std::sync::atomic::AtomicBool>,
     indexes: parking_lot::Mutex<HashMap<LedgerId, IndexSeen>>,
 }
 
@@ -141,11 +169,51 @@ impl Housekeeping for LifecycleHousekeeping {
             Err(e) => warn!(error = %e, "lifecycle housekeeping: cannot list the nameservice"),
         }
         self.sweep_if_due(&fluree).await;
+        #[cfg(feature = "native")]
+        self.collect_if_due(&fluree).await;
         self.compact_idle_pool_deltas(&fluree).await;
     }
 }
 
 impl LifecycleHousekeeping {
+    #[cfg(feature = "native")]
+    async fn collect_if_due(&self, fluree: &Arc<Fluree>) {
+        use std::sync::atomic::Ordering;
+        if !fluree.collects_garbage().await {
+            return;
+        }
+        {
+            let mut last = self.last_garbage.lock();
+            if last.elapsed() < self.options.garbage_interval {
+                return;
+            }
+            *last = Instant::now();
+        }
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let (fluree, options, collecting) = (
+            Arc::clone(fluree),
+            self.options.clone(),
+            Arc::clone(&self.collecting),
+        );
+        tokio::spawn(async move {
+            // Cleared even if the pass panics.
+            struct Clear(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = Clear(collecting);
+            collect_and_reconcile(&fluree, &options).await;
+        });
+    }
+
     async fn compact_idle_pool_deltas(&self, fluree: &Fluree) {
         if !self.options.compact_idle_pool_deltas {
             return;
@@ -212,6 +280,53 @@ impl LifecycleHousekeeping {
             ),
             Err(e) => warn!(error = %e, "orphan sweep failed"),
         }
+    }
+}
+
+#[cfg(feature = "native")]
+pub(crate) async fn collect_and_reconcile(fluree: &Fluree, options: &HousekeepingOptions) {
+    match fluree
+        .collect_garbage_within(options.garbage_grace, Some(options.reconcile_budget))
+        .await
+    {
+        Ok(report) if report == crate::garbage::GarbageReport::default() => {}
+        Ok(report) => info!(?report, "garbage collected"),
+        Err(e) => warn!(error = %e, "garbage collection failed"),
+    }
+    let Some(reconcile_interval) = options.reconcile_interval else {
+        return;
+    };
+    let pass = match fluree
+        .reconcile_due(reconcile_interval, options.reconcile_budget)
+        .await
+    {
+        Ok(pass) => pass,
+        Err(e) => {
+            warn!(error = %e, "garbage reconciliation failed");
+            return;
+        }
+    };
+    for (ledger, report) in &pass.ledgers {
+        debug!(%ledger, ?report, "garbage reconciled");
+    }
+    // Throttling only defers: say when it falls behind.
+    let behind = pass.oldest_ms.map(|ms| {
+        Duration::from_millis(
+            u64::try_from(chrono::Utc::now().timestamp_millis() - ms).unwrap_or(0),
+        )
+    });
+    match behind {
+        Some(age) if age > 2 * reconcile_interval => warn!(
+            due = pass.due,
+            behind_secs = age.as_secs(),
+            "garbage reconciliation is behind"
+        ),
+        _ if !pass.ledgers.is_empty() => info!(
+            ledgers = pass.ledgers.len(),
+            due = pass.due,
+            "garbage reconciled"
+        ),
+        _ => {}
     }
 }
 
@@ -341,8 +456,23 @@ async fn resume_drop(fluree: &Fluree, name: &str) -> crate::Result<()> {
 }
 
 async fn resume_restore(fluree: &Fluree, instance: &InstanceId) -> crate::Result<()> {
-    match lifecycle::resume_restore(fluree.publisher()?, instance).await {
-        Ok(Some(_)) => {
+    #[cfg(feature = "native")]
+    let _admission = match fluree.retention.erasure.get() {
+        Some(erasure) => Some(erasure.admission.read().await),
+        None => None,
+    };
+    let resumed =
+        lifecycle::resume_restore_with(fluree.publisher()?, instance, |entry, records| {
+            fluree.prepare_restore(entry, records)
+        })
+        .await;
+    match resumed {
+        Ok(Some(records)) => {
+            fluree.resume_restored_retention(&records).await?;
+            #[cfg(feature = "native")]
+            if let Some(record) = records.first() {
+                fluree.sweep_after_restore(record.ledger_id.name()).await;
+            }
             info!(%instance, "resumed an interrupted restore");
             Ok(())
         }
@@ -416,6 +546,8 @@ impl Fluree {
             options,
             previous: parking_lot::Mutex::default(),
             last_sweep: parking_lot::Mutex::new(Instant::now()),
+            last_garbage: parking_lot::Mutex::new(Instant::now()),
+            collecting: Arc::default(),
             indexes: parking_lot::Mutex::default(),
         })
     }
@@ -427,10 +559,56 @@ impl Fluree {
         self: &Arc<Self>,
         orphan_sweep_interval: Option<Duration>,
     ) -> bool {
+        self.start_maintenance(
+            HousekeepingOptions {
+                orphan_sweep_interval,
+                ..HousekeepingOptions::default()
+            },
+            None,
+        )
+    }
+
+    /// Install this instance's maintenance on its background indexer, which
+    /// must own catch-up: [`lifecycle_housekeeping`](Self::lifecycle_housekeeping)
+    /// and, with `retention` settings, the retention worker committing
+    /// directly ([`retention_housekeeping`](Self::retention_housekeeping) and
+    /// its build observer). Returns `false`, installing nothing, when it has
+    /// no background indexer.
+    pub fn start_maintenance(
+        self: &Arc<Self>,
+        housekeeping: HousekeepingOptions,
+        retention: Option<crate::retention::RetentionOptions>,
+    ) -> bool {
         let crate::tx::IndexingMode::Background(handle) = &self.indexing_mode else {
             return false;
         };
-        handle.set_housekeeping(self.lifecycle_housekeeping(orphan_sweep_interval));
+        let lifecycle = self.lifecycle_housekeeping_with(housekeeping);
+        match retention {
+            Some(options) => {
+                handle.set_housekeeping(Arc::new(fluree_db_indexer::Housekeepings(vec![
+                    lifecycle,
+                    self.retention_housekeeping(None, options),
+                ])));
+                handle.set_build_observer(self.retention_build_observer());
+            }
+            None => handle.set_housekeeping(lifecycle),
+        }
+        true
+    }
+
+    /// Attach retention's build hook to this instance's background indexer,
+    /// with no worker: for a host with no process running between requests
+    /// (a function invoked per event), whose builds must still register a
+    /// ledger before an index covers its first TTL input, and apply its
+    /// `f:noHistory` rules. Expiration then runs through
+    /// [`run_registered_retention`](Self::run_registered_retention) on the
+    /// host's own schedule. A ledger that never used retention adds no
+    /// reads to its builds. Returns `false` without a background indexer.
+    pub fn install_retention_build_hook(self: &Arc<Self>) -> bool {
+        let crate::tx::IndexingMode::Background(handle) = &self.indexing_mode else {
+            return false;
+        };
+        handle.set_build_observer(self.retention_build_observer());
         true
     }
 }

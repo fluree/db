@@ -72,7 +72,7 @@ async fn rebuild_the_base(fluree: &Fluree) {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal_fenced(LEDGER, record.fence, 1, &built.root_id)
+        .publish_index_allow_equal_fenced(LEDGER, record.write_basis(), 1, &built.root_id)
         .await
         .expect("publish the rebuilt index");
 }

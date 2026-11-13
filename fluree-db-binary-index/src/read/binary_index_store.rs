@@ -3246,6 +3246,19 @@ impl BinaryIndexStore {
         }
     }
 
+    /// [`Self::find_string_id`] for many values, reading each reverse-tree
+    /// leaf once.
+    pub fn find_string_ids(&self, values: &[&str]) -> io::Result<Vec<Option<u32>>> {
+        match &self.dicts.string_reverse_tree {
+            Some(tree) => Ok(tree
+                .reverse_lookup_many(values.iter().map(|v| v.as_bytes()))?
+                .into_iter()
+                .map(|opt| opt.map(|id| id as u32))
+                .collect()),
+            None => Ok(vec![None; values.len()]),
+        }
+    }
+
     /// Find all string IDs whose value starts with `prefix`.
     ///
     /// Uses a range scan on the reverse string tree over the key range
@@ -4436,7 +4449,7 @@ async fn load_per_graph_arenas(
                 .chain(sp_ref.leaflets.iter())
             {
                 let bytes = cs.get(cid).await.map_err(storage_io_error)?;
-                blob_cache.insert(cid.digest_hex(), bytes.into_vec());
+                blob_cache.insert(cid.address_digest(), bytes.into_vec());
             }
             let blob_cache = Arc::new(blob_cache);
 

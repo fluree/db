@@ -28,6 +28,8 @@ For indexes:
 
 Commit blobs are immutable and are the canonical history of the ledger. Indexes,
 statistics, and derived query structures can always be reconstructed from commits.
+Retention records (under `@retention/`) cannot, so they are kept in commit storage
+too.
 
 For that reason, prefer Standard S3 for `commitStorage` even when using S3 Express
 One Zone for `indexStorage`:

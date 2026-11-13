@@ -24,6 +24,7 @@ use crate::config::ConnectionConfig;
 use crate::error::{ConnectionError, Result};
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_nameservice::NameServicePublisher;
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_storage_aws::S3Storage;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
@@ -200,17 +201,17 @@ impl AwsConnectionHandle {
     /// Publish a new index to the nameservice
     ///
     /// This is typically called by the indexer after successfully writing new index roots.
-    /// `fence` is the fence of the record the indexer read before building
-    /// (`NsRecord::fence`); a branch dropped or replaced since refuses it.
+    /// `basis` is what the record the indexer read before building presents
+    /// (`NsRecord::write_basis`); a branch dropped or replaced since refuses it.
     pub async fn publish_index(
         &self,
         ledger_id: &str,
-        fence: Option<fluree_db_nameservice::Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &fluree_db_core::ContentId,
     ) -> Result<()> {
         self.nameservice
-            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_fenced(ledger_id, basis, index_t, index_id)
             .await
             .map_err(|e| ConnectionError::storage(format!("Publish index failed: {e}")))
     }

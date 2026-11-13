@@ -691,6 +691,20 @@ impl Fluree {
             }
         }
 
+        // The query was lowered against the primary's namespace table.
+        let history_range = dataset.history_time_range();
+        let encoded_with = dataset.primary().map(|primary| &primary.snapshot);
+        for view in dataset.views() {
+            self.refuse_suppressed_view_history(
+                view,
+                parsed,
+                &executable,
+                history_range,
+                encoded_with.unwrap_or(&view.snapshot),
+            )
+            .await?;
+        }
+
         Ok(executable)
     }
 
@@ -897,6 +911,12 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
             bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,
@@ -1095,6 +1115,12 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
             bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,

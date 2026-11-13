@@ -1960,21 +1960,35 @@ fn source_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Every node journals the shared payload root under its own log. Writes
-/// through every node leave one owned log per node; a node's payloads are
-/// on disk, and only its log directory carries its lock.
+/// Every node journals the shared payload root under its own log. A
+/// follower forwards a write to the leader and stores nothing, so each node
+/// is given a ledger whose commit worker it is, and stores that ledger's
+/// commits. Every node then owns a log, and only its log directory carries
+/// its lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_node_journals_the_shared_root_under_its_own_log() {
+    use fluree_db_consensus::raft::{ownership, state_machine::RefKey};
+
     let cluster = TestCluster::spawn(3).await;
     cluster.bootstrap().await;
-    let ledger = "raft:owners";
-    cluster
-        .create_ledger(cluster.nodes[0].node_id, ledger)
-        .await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let voters: BTreeSet<NodeId> = cluster.nodes.iter().map(|n| n.node_id).collect();
+    assert_eq!(
+        wait_for_eligible_voters(&cluster, leader, &voters, DEFAULT_TIMEOUT).await,
+        voters,
+        "every voter takes commit workers"
+    );
     for node in &cluster.nodes {
-        let subject = format!("via{}", node.node_id);
+        let name = (0..64)
+            .map(|k| format!("owners{k}"))
+            .find(|name| {
+                ownership::owner(&RefKey::new(name.as_str(), "main"), &voters) == Some(node.node_id)
+            })
+            .expect("a ledger whose worker is this node");
+        let ledger = format!("{name}:main");
+        cluster.create_ledger(node.node_id, &ledger).await;
         cluster
-            .insert_subject(node.node_id, ledger, &subject, &subject)
+            .insert_subject(node.node_id, &ledger, "via", "via")
             .await;
     }
     let owners = cluster._shared_data_tmp.path().join(".fluree-wal/owners");
@@ -1982,7 +1996,7 @@ async fn every_node_journals_the_shared_root_under_its_own_log() {
         let lock = owners.join(format!("node-{}", node.node_id)).join("LOCK");
         assert!(
             lock.exists(),
-            "node {} received a write and must own a log at {}",
+            "node {} stored a ledger's commits and must own a log at {}",
             node.node_id,
             lock.display()
         );
@@ -2114,4 +2128,250 @@ async fn a_survivors_miss_applies_the_stopped_workers_log() {
         commits.iter().all(|p| p.exists()),
         "the survivor's miss applied the stopped worker's log and restored every commit"
     );
+}
+
+impl TestCluster {
+    /// Insert `subject ex:name name` with a TTL of `ttl_secs` via the chosen
+    /// node.
+    async fn insert_expiring(
+        &self,
+        via_node: NodeId,
+        ledger: &str,
+        subject: &str,
+        name: &str,
+        ttl_secs: u64,
+    ) {
+        let url = format!("{}/v1/fluree/insert", self.public_url(via_node));
+        let body = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": format!("ex:{subject}"),
+            "ex:name": { "@value": name, "@ttl": ttl_secs },
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("fluree-ledger", ledger)
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("insert request");
+        assert!(
+            resp.status().is_success(),
+            "insert({subject}) via node {via_node} returned {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
+    async fn retention_status(&self, via_node: NodeId, ledger: &str) -> serde_json::Value {
+        let url = format!("{}/v1/fluree/retention/{ledger}", self.public_url(via_node));
+        let resp = self.client.get(&url).send().await.expect("status request");
+        assert!(resp.status().is_success(), "status: {}", resp.status());
+        resp.json().await.expect("status json")
+    }
+}
+
+fn retention_config() -> ServerConfig {
+    ServerConfig {
+        retention_interval_secs: 1,
+        indexer_catchup_interval_secs: 1,
+        ..Default::default()
+    }
+}
+
+/// A TTL write through a follower is committed by the queue, registered by
+/// the leader's indexer, and expired by the leader's retention worker through
+/// the cluster committer: every node sees the value go, and the value
+/// without a lifetime stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ttl_expires_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let follower = cluster.pick_follower().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let ledger = "raft:ttl";
+    cluster.create_ledger(follower, ledger).await;
+    cluster
+        .insert_subject(follower, ledger, "kept", "Kept")
+        .await;
+    cluster
+        .insert_expiring(follower, ledger, "temp", "Temp", 1)
+        .await;
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(node.node_id, ledger, &["Kept"], Duration::from_secs(30))
+            .await;
+    }
+    let status = cluster.retention_status(leader, ledger).await;
+    assert_eq!(status["active"], json!(true), "{status}");
+    assert_eq!(status["maintenanceRunning"], json!(true), "{status}");
+    // The registration is replicated: a follower reads it too.
+    let status = cluster.retention_status(follower, ledger).await;
+    assert_eq!(status["active"], json!(true), "{status}");
+}
+
+/// The schedule outlives its leader: a value written before the leader
+/// stops is expired by the next leader's worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ttl_survives_leader_failover() {
+    init_test_tracing();
+    let mut cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:ttl-failover";
+    let first = cluster.nodes[0].node_id;
+    cluster.create_ledger(first, ledger).await;
+    cluster.insert_subject(first, ledger, "kept", "Kept").await;
+    cluster
+        .insert_expiring(first, ledger, "temp", "Temp", 4)
+        .await;
+    let old_leader = cluster.current_leader().await.expect("leader");
+    cluster
+        .wait_for_names(old_leader, ledger, &["Kept", "Temp"], DEFAULT_TIMEOUT)
+        .await;
+    cluster.shutdown_node(old_leader).await;
+    let new_leader = cluster
+        .wait_for_leader_change(old_leader, DEFAULT_TIMEOUT)
+        .await;
+    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+        cluster
+            .wait_for_names(node.node_id, ledger, &["Kept"], Duration::from_secs(30))
+            .await;
+    }
+    let status = cluster.retention_status(new_leader, ledger).await;
+    assert_eq!(status["active"], json!(true), "{status}");
+}
+
+impl TestCluster {
+    /// Remove every occurrence of `subject ex:name name` through the chosen
+    /// node; the removal receipt.
+    async fn remove_name(
+        &self,
+        via_node: NodeId,
+        ledger: &str,
+        subject: &str,
+        name: &str,
+    ) -> serde_json::Value {
+        let url = format!("{}/v1/fluree/remove/{ledger}", self.public_url(via_node));
+        let body = json!({ "matching": [{
+            "subject": format!("http://example.org/{subject}"),
+            "predicate": "http://example.org/name",
+            "object": name,
+        }]});
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(30))
+            .json(&body)
+            .send()
+            .await
+            .expect("remove request");
+        assert!(resp.status().is_success(), "remove: {}", resp.status());
+        resp.json().await.expect("receipt json")
+    }
+
+    /// `subject`'s names as of `t`, read on the chosen node: the status and
+    /// body.
+    async fn names_as_of(
+        &self,
+        via_node: NodeId,
+        ledger: &str,
+        subject: &str,
+        t: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let url = format!("{}/v1/fluree/query", self.public_url(via_node));
+        let body = json!({
+            "@context": { "ex": "http://example.org/" },
+            "from": format!("{ledger}@t:{t}"),
+            "select": ["?name"],
+            "where": { "@id": format!("ex:{subject}"), "ex:name": "?name" }
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .expect("query request");
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or_default())
+    }
+}
+
+/// A removal returns once every replica has applied it, so each one then
+/// refuses the removed history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_replica_acknowledges_a_removal() {
+    init_test_tracing();
+    let cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:remove";
+    let follower = cluster.pick_follower().await;
+    cluster.create_ledger(follower, ledger).await;
+    cluster.insert_subject(follower, ledger, "a", "A1").await;
+    cluster.insert_subject(follower, ledger, "b", "B").await;
+
+    let receipt = cluster.remove_name(follower, ledger, "a", "A1").await;
+    assert!(receipt.get("unacknowledgedReplicas").is_none(), "{receipt}");
+    for node in &cluster.nodes {
+        let (status, body) = cluster.names_as_of(node.node_id, ledger, "a", 1).await;
+        assert_eq!(status, StatusCode::GONE, "node {}: {body}", node.node_id);
+        // Another subject's history is still served.
+        let (status, body) = cluster.names_as_of(node.node_id, ledger, "b", 2).await;
+        assert_eq!(status, StatusCode::OK, "node {}: {body}", node.node_id);
+    }
+}
+
+/// A removal names the replicas that did not apply it. A replica cut off
+/// from the quorum serves history from the journal it has learned, waiting
+/// on no leader: the removals it applied stay refused, and the rest of the
+/// ledger's history is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_without_a_quorum_serves_history_from_its_journal() {
+    init_test_tracing();
+    let mut cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:remove-lag";
+    let leader = cluster.current_leader().await.expect("leader");
+    cluster.create_ledger(leader, ledger).await;
+    cluster.insert_subject(leader, ledger, "a", "A1").await;
+    cluster.insert_subject(leader, ledger, "b", "B").await;
+    cluster.insert_subject(leader, ledger, "c", "C").await;
+    cluster.remove_name(leader, ledger, "a", "A1").await;
+
+    let followers: Vec<NodeId> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.node_id)
+        .filter(|id| *id != leader)
+        .collect();
+    let (down, last) = (followers[0], followers[1]);
+    cluster
+        .wait_for_names(last, ledger, &["B", "C"], DEFAULT_TIMEOUT)
+        .await;
+    cluster.shutdown_node(down).await;
+    let receipt = cluster.remove_name(leader, ledger, "b", "B").await;
+    let pending = receipt["unacknowledgedReplicas"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{receipt}"));
+    assert_eq!(pending.len(), 1, "{receipt}");
+    assert!(
+        pending[0]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("node {down} ")),
+        "{receipt}"
+    );
+
+    cluster.shutdown_node(leader).await;
+    let (status, body) = cluster.names_as_of(last, ledger, "b", 3).await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    let (status, body) = cluster.names_as_of(last, ledger, "c", 3).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(cluster.query_names(last, ledger).await, vec!["C"]);
 }

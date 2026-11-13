@@ -1,0 +1,4618 @@
+//! Permanent erasure through proof-verified replacements: a request removes
+//! the occurrences on every branch that holds them, records its
+//! authorization, and once its proofs verify and its commits are indexed,
+//! every read of an affected commit reads its replacement — across restarts,
+//! reindexing and raw retrieval — while every other commit and CID stays as
+//! it was.
+
+use std::sync::Arc;
+
+use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, ErasureStage, Verifier};
+use fluree_db_api::retention::{FactSelector, OccurrenceRef};
+use fluree_db_api::{ApiError, ConflictStrategy, Fluree, FlureeBuilder, ReindexOptions};
+use fluree_db_core::commit::codec::replacement::is_replacement;
+use fluree_db_core::{
+    collect_first_parent_cids, load_commit_by_id, ContentId, ContentStore, FlakeValue,
+};
+use fluree_db_erasure::testing::NativeProver;
+use serde_json::{json, Value as JsonValue};
+
+fn ctx() -> JsonValue {
+    json!({"ex": "http://example.org/"})
+}
+
+fn erasing(dir: &tempfile::TempDir, prover: Arc<NativeProver>) -> Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(ErasureConfig {
+            prover,
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build()
+        .unwrap()
+}
+
+async fn ledger(fluree: &Fluree, name: &str) -> String {
+    fluree.create_ledger(name).await.expect("create");
+    format!("{name}:main")
+}
+
+async fn insert(fluree: &Fluree, ledger_id: &str, doc: JsonValue) -> i64 {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert(&doc)
+        .commit()
+        .await
+        .expect("insert")
+        .receipt
+        .t
+}
+
+async fn objects(fluree: &Fluree, ledger_id: &str, s: &str, p: &str) -> Vec<JsonValue> {
+    let query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "select": "?o",
+        "where": {"@id": s, p: "?o"}
+    });
+    let results = fluree.query_connection(&query).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    results
+        .to_jsonld(&ledger.snapshot)
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn email(subject: &str, value: &str) -> ErasureRequest {
+    ErasureRequest {
+        matching: vec![FactSelector {
+            subject: format!("http://example.org/{subject}"),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(json!(value)),
+        }],
+        ..Default::default()
+    }
+}
+
+async fn store_of(fluree: &Fluree, ledger_id: &str) -> Arc<dyn ContentStore> {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+    fluree.content_store(&record.storage_namespace())
+}
+
+/// The ledger's commits, head first.
+async fn chain(fluree: &Fluree, ledger_id: &str) -> Vec<(i64, ContentId)> {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = store_of(fluree, ledger_id).await;
+    collect_first_parent_cids(store.as_ref(), record.commit_head_id.as_ref().unwrap(), 0)
+        .await
+        .unwrap()
+}
+
+async fn commit_at(fluree: &Fluree, ledger_id: &str, t: i64) -> ContentId {
+    chain(fluree, ledger_id)
+        .await
+        .into_iter()
+        .find(|(ct, _)| *ct == t)
+        .unwrap()
+        .1
+}
+
+async fn reindex(fluree: &Fluree, ledger_id: &str) {
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+}
+
+/// The file under `root` holding commit `cid`.
+fn commit_file(root: &std::path::Path, cid: &ContentId) -> Option<std::path::PathBuf> {
+    let name = format!("{}.fcv2", cid.address_digest());
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|n| n == name.as_str()) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn contains(bytes: &[u8], needle: &str) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+}
+
+/// History entries in the default graph's index sidecars, read straight
+/// from storage, past any serving check.
+async fn indexed_history_entries(fluree: &Fluree, ledger_id: &str) -> usize {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let root_id = record.index_head_id.clone().expect("indexed");
+    let store = fluree.content_store(&record.storage_namespace());
+    let root_bytes = store.get(&root_id).await.unwrap();
+    let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes).unwrap();
+    let mut entries = 0;
+    for order in &root.default_graph_orders {
+        for leaf in &order.leaves {
+            let Some(cid) = &leaf.sidecar_cid else {
+                continue;
+            };
+            let bytes = store.get(cid).await.unwrap();
+            let mut pos = 8;
+            while pos + 4 <= bytes.len() {
+                let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                entries += n;
+                pos += 4 + n * 31;
+            }
+        }
+    }
+    entries
+}
+
+#[tokio::test]
+async fn an_erasure_replaces_its_commits_everywhere_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let id = ledger(&fluree, "it/erase").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "alice@secret.example", "ex:name": "Alice"},
+            {"@id": "ex:bob", "ex:email": "bob@kept.example"}
+        ]}),
+    )
+    .await;
+    let original_t1 = commit_at(&fluree, &id, t1).await;
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            email("alice", "alice@secret.example"),
+            Some("did:example:officer".into()),
+        )
+        .await
+        .expect("erase");
+    // The assertion, and the retraction the removal made of it.
+    assert_eq!(receipt.manifest.len(), 2, "{receipt:?}");
+    assert_eq!(receipt.commits, 2);
+    assert_eq!(receipt.stage, ErasureStage::Proving);
+    // Its authorization is a control commit naming the request and its
+    // requester, and no value.
+    let store = store_of(&fluree, &id).await;
+    let authorization = load_commit_by_id(
+        store.as_ref(),
+        &commit_at(&fluree, &id, receipt.authorized_t).await,
+    )
+    .await
+    .unwrap();
+    assert!(authorization.flakes.is_empty());
+    let meta = format!("{:?}", authorization.txn_meta);
+    assert!(meta.contains(&receipt.request_id) && meta.contains("did:example:officer"));
+    assert!(!meta.contains("secret"));
+    // Removed from queries at once.
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    let heads_before = chain(&fluree, &id).await;
+
+    // Proved and verified, but not published before an index covers it.
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!((report.proved, report.published), (2, 0), "{report:?}");
+    assert!(!is_replacement(&store.get(&original_t1).await.unwrap()));
+    reindex(&fluree, &id).await;
+    assert!(
+        indexed_history_entries(&fluree, &id).await > 0,
+        "the index built from the originals holds the removed email's history"
+    );
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let status = fluree.retention_status(&id).await.unwrap();
+    let job = &status.registration.as_ref().unwrap().erasures[0];
+    assert_eq!(job.stage, ErasureStage::Published);
+    assert!(job.commits.iter().all(|c| c.proved.is_some()));
+
+    // Every read of the commit is its replacement: raw bytes included.
+    let raw = store.get(&original_t1).await.unwrap().into_vec();
+    assert!(is_replacement(&raw));
+    assert!(!contains(&raw, "alice@secret.example"));
+    assert!(contains(&raw, "bob@kept.example"));
+    let decoded = load_commit_by_id(store.as_ref(), &original_t1)
+        .await
+        .unwrap();
+    assert_eq!(
+        decoded.id.as_ref(),
+        Some(&original_t1),
+        "it keeps its identity"
+    );
+    assert!(decoded.redaction.is_some());
+    // No CID changed, and the chain walks as before.
+    assert_eq!(chain(&fluree, &id).await, heads_before);
+    // Current state, as before.
+    assert_eq!(
+        objects(&fluree, &id, "ex:bob", "ex:email").await,
+        vec![json!("bob@kept.example")]
+    );
+
+    // A restarted instance, with no prover, reads the replacements; an
+    // index rebuilt from them holds no history of the erased value.
+    drop(fluree);
+    let restarted = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let store = store_of(&restarted, &id).await;
+    // Its verifier pins the production images, so it refuses this test's
+    // fake receipts rather than read the original.
+    assert!(store.get(&original_t1).await.is_err());
+    drop(restarted);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    let store = store_of(&restarted, &id).await;
+    assert!(is_replacement(&store.get(&original_t1).await.unwrap()));
+    reindex(&restarted, &id).await;
+    assert_eq!(indexed_history_entries(&restarted, &id).await, 0);
+    assert!(objects(&restarted, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&restarted, &id, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
+    );
+    assert_eq!(prover.proved().len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_step_is_retried_and_a_restart_resumes_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let id = ledger(&fluree, "it/erase-retry").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    prover.fail_next(1);
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.failed, 1, "{report:?}");
+    let status = fluree.retention_status(&id).await.unwrap();
+    let job = status.registration.unwrap().erasures[0].clone();
+    assert_eq!((job.stage, job.retries), (ErasureStage::Proving, 1));
+    assert!(job.last_error.is_some() && job.retry_at_ms.is_some());
+
+    // Restarted before the retry: the job is where it was left.
+    drop(fluree);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!((report.proved, report.published), (2, 1), "{report:?}");
+    // Asked again, nothing of it is left to erase.
+    let again = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await;
+    assert!(
+        matches!(again, Err(ApiError::Http { status: 404, .. })),
+        "{again:?}"
+    );
+}
+
+/// A step that runs out of proving time is tried again, but a job whose
+/// steps time out three times fails: its commit is too large to prove
+/// within the timeout, and trying again would only hold the prover.
+#[tokio::test]
+async fn a_job_fails_at_its_third_proving_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let mut jobs = Vec::new();
+    for (name, timeouts) in [("it/erase-slow", 2), ("it/erase-too-slow", 3)] {
+        let id = ledger(&fluree, name).await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+        )
+        .await;
+        fluree
+            .erase_occurrences(&id, email("alice", "a@secret"), None)
+            .await
+            .expect("erase");
+        prover.time_out_next(timeouts);
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            fluree.run_erasure_pass(&id).await.unwrap();
+        }
+        let status = fluree.retention_status(&id).await.unwrap();
+        jobs.push(status.registration.unwrap().erasures[0].clone());
+    }
+    let (slow, too_slow) = (&jobs[0], &jobs[1]);
+    assert_eq!(slow.timeouts, 2);
+    assert_ne!(slow.stage, ErasureStage::Failed, "{slow:?}");
+    assert!(!slow.commits.iter().all(|c| c.proved.is_none()), "{slow:?}");
+    assert_eq!(too_slow.stage, ErasureStage::Failed, "{too_slow:?}");
+    assert_eq!(too_slow.timeouts, 3);
+    assert!(
+        too_slow
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("too large to prove")),
+        "{too_slow:?}"
+    );
+
+    // Asked again, the failed job is tried again, and now proves.
+    let id = "it/erase-too-slow:main";
+    let receipt = fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase again");
+    assert_eq!(receipt.request_id, too_slow.request_id);
+    assert_eq!(receipt.stage, ErasureStage::Proving);
+    fluree.run_erasure_pass(id).await.unwrap();
+    let status = fluree.retention_status(id).await.unwrap();
+    let retried = &status.registration.unwrap().erasures[0];
+    assert_ne!(retried.stage, ErasureStage::Failed, "{retried:?}");
+    assert_eq!(retried.timeouts, 0, "{retried:?}");
+    assert!(
+        retried.commits.iter().all(|c| c.proved.is_some()),
+        "{retried:?}"
+    );
+}
+
+/// Proving a commit past the most operations a proof can cover would only
+/// time out, so its erasure is refused when it is asked for.
+#[tokio::test]
+async fn an_erasure_of_a_commit_too_large_to_prove_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-large").await;
+    let values: Vec<i64> = (0..50_000).collect();
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice",
+               "ex:email": "a@secret", "ex:n": values}),
+    )
+    .await;
+    let refused = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await;
+    assert!(
+        matches!(&refused, Err(ApiError::Http { status: 422, message })
+            if message.contains("more than the 50000")),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_erasure_of_a_commit_builds_on_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-twice").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, t1).await;
+    for who in [("alice", "a@secret"), ("carol", "c@secret")] {
+        fluree
+            .erase_occurrences(&id, email(who.0, who.1), None)
+            .await
+            .expect("erase");
+        reindex(&fluree, &id).await;
+        let report = fluree.run_erasure_pass(&id).await.unwrap();
+        assert_eq!(report.published, 1, "{report:?}");
+    }
+    // A fresh instance verifies the two-step chain before reading it.
+    drop(fluree);
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let store = store_of(&fluree, &id).await;
+    let raw = store.get(&original).await.unwrap().into_vec();
+    assert!(!contains(&raw, "a@secret") && !contains(&raw, "c@secret"));
+    assert!(contains(&raw, "b@kept"));
+    let decoded = load_commit_by_id(store.as_ref(), &original).await.unwrap();
+    assert_eq!(decoded.flakes.len(), 1);
+}
+
+#[tokio::test]
+async fn an_erasure_reaches_every_branch_holding_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-branches").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .create_branch("it/erase-branches", "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = "it/erase-branches:dev";
+    let shared = commit_at(&fluree, &id, t1).await;
+
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert_eq!(receipt.removals.len(), 2, "both branches: {receipt:?}");
+    // The shared commit once, and each branch's own retraction.
+    assert_eq!(receipt.commits, 3, "{receipt:?}");
+    assert!(objects(&fluree, dev, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 0, "dev is not indexed yet: {report:?}");
+    reindex(&fluree, dev).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let dev_store = store_of(&fluree, dev).await;
+    assert!(is_replacement(&dev_store.get(&shared).await.unwrap()));
+}
+
+#[tokio::test]
+async fn an_erased_commit_is_never_written_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-transfer").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let cid = commit_at(&fluree, &id, t1).await;
+    let store = store_of(&fluree, &id).await;
+    let original = store.get(&cid).await.unwrap().into_vec();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    // Its original gone (as a purge will leave it), writing it back (an
+    // import, a restore) writes nothing.
+    let file = commit_file(dir.path(), &cid).expect("the original's file");
+    std::fs::remove_file(&file).unwrap();
+    store.put_with_id(&cid, &original).await.unwrap();
+    assert!(!file.exists(), "the original was written back");
+    assert!(is_replacement(&store.get(&cid).await.unwrap()));
+}
+
+#[tokio::test]
+async fn erasure_is_refused_outside_its_scope() {
+    let request = || email("alice", "a@secret");
+    // Memory storage.
+    let memory = FlureeBuilder::memory().build_memory();
+    let id = ledger(&memory, "it/erase-memory").await;
+    insert(
+        &memory,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let refused = memory.erase_occurrences(&id, request(), None).await;
+    assert!(
+        matches!(refused, Err(ApiError::Http { status: 501, .. })),
+        "{refused:?}"
+    );
+    // File storage with no prover.
+    let dir = tempfile::tempdir().unwrap();
+    let file = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let id = ledger(&file, "it/erase-noprover").await;
+    insert(
+        &file,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let refused = file.erase_occurrences(&id, request(), None).await;
+    assert!(
+        matches!(refused, Err(ApiError::Http { status: 501, .. })),
+        "{refused:?}"
+    );
+    // Nothing was removed by a refused request.
+    assert_eq!(
+        objects(&file, &id, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")]
+    );
+}
+
+/// A named assertion takes the retraction that ended it (and a named
+/// retraction the assertion it ended): both carry the value, and erasing
+/// one alone would change what replaying the other states.
+#[tokio::test]
+async fn a_named_occurrence_takes_the_one_bounding_its_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-span").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let t2 = fluree
+        .graph(&id)
+        .transact()
+        .upsert(&json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@new"}))
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    let store = store_of(&fluree, &id).await;
+    let asserted = commit_at(&fluree, &id, t1).await;
+    let retracted = commit_at(&fluree, &id, t2).await;
+    let commit = load_commit_by_id(store.as_ref(), &asserted).await.unwrap();
+    let slot = commit
+        .occurrences()
+        .find(|(_, f)| f.op && format!("{:?}", f.o).contains("a@old"))
+        .unwrap()
+        .0;
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                occurrences: vec![fluree_db_api::retention::OccurrenceRef {
+                    commit: asserted.to_string(),
+                    slot,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    let commits: Vec<&str> = receipt.manifest.iter().map(|o| o.commit.as_str()).collect();
+    assert_eq!(receipt.manifest.len(), 2, "{receipt:?}");
+    assert!(commits.contains(&asserted.to_string().as_str()));
+    assert!(commits.contains(&retracted.to_string().as_str()));
+    // The current value is not part of it.
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:email").await,
+        vec![json!("a@new")]
+    );
+}
+
+/// A branch made while an erasure is proved holds its commits above that
+/// branch's index: publication waits for the branch's index too, or its
+/// indexed assertion would replay without the erased retraction.
+#[tokio::test]
+async fn a_branch_made_while_proving_is_indexed_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-late-branch").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    fluree
+        .create_branch("it/erase-late-branch", "late", None, None)
+        .await
+        .expect("branch");
+    let late = "it/erase-late-branch:late";
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(
+        (report.proved, report.published),
+        (2, 0),
+        "late is not indexed yet: {report:?}"
+    );
+    reindex(&fluree, late).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    assert!(objects(&fluree, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A branch made after acceptance at a point before the removal holds the
+/// value as current. It is retracted as the branch is made, the erasure
+/// takes that retraction too, and the purge leaves no file holding it.
+#[tokio::test]
+async fn a_branch_made_before_the_removal_after_acceptance_is_erased_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-past-branch").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@kept"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    fluree
+        .create_branch(
+            "it/erase-past-branch",
+            "past",
+            None,
+            Some(fluree_db_api::TimeSpec::AtT(t1 + 1)),
+        )
+        .await
+        .expect("branch");
+    let past = "it/erase-past-branch:past";
+    assert!(objects(&fluree, past, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, past).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert!(
+        job.commits
+            .iter()
+            .any(|c| c.branches.iter().any(|b| b == past)),
+        "the branch's retraction joined the job: {job:?}"
+    );
+    assert_eq!(purge_until_purged(&fluree, &id).await.1, 1);
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, past, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, past, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A holder whose head moved back past the removal holds the value as
+/// current again: publication waits, naming it, rather than publish an
+/// erasure its index would go on serving.
+#[tokio::test]
+async fn publication_waits_while_a_holder_holds_the_value_as_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-reset").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let before = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    fluree
+        .branch_admin()
+        .unwrap()
+        .reset_head_fenced(
+            &id,
+            before.write_basis(),
+            fluree_db_nameservice::NsRecordSnapshot::from_record(&before),
+        )
+        .await
+        .unwrap();
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 0, "{report:?}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_ne!(job.stage, ErasureStage::Published);
+    assert!(
+        job.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("still current on it/erase-reset:main")),
+        "{job:?}"
+    );
+}
+
+/// `ex:claim` reifying `ex:alice ex:email "a@secret"`: a triple term that
+/// spells the value, without asserting it.
+async fn reify_email(fluree: &Fluree, ledger_id: &str) -> i64 {
+    insert(
+        fluree,
+        ledger_id,
+        json!({
+            "@context": ctx(),
+            "@id": "ex:claim",
+            "ex:note": "seen",
+            "@reifies": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }),
+    )
+    .await
+}
+
+/// The occurrence at `t` whose object is a triple term.
+async fn triple_term_occurrence(fluree: &Fluree, ledger_id: &str, t: i64) -> OccurrenceRef {
+    let cid = commit_at(fluree, ledger_id, t).await;
+    let commit = load_commit_by_id(store_of(fluree, ledger_id).await.as_ref(), &cid)
+        .await
+        .unwrap();
+    let slot = commit
+        .occurrences()
+        .find(|(_, f)| matches!(f.o, FlakeValue::TripleTerm(_)))
+        .map(|(slot, _)| slot)
+        .expect("a triple term");
+    OccurrenceRef {
+        commit: cid.to_string(),
+        slot,
+    }
+}
+
+/// A fact naming a triple term that spells an erased value would keep it
+/// readable: the erasure is refused, naming the fact, before anything is
+/// removed, until the request names it too.
+#[tokio::test]
+async fn an_erasure_is_refused_while_a_triple_term_spells_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-spelled").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let reified = reify_email(&fluree, &id).await;
+
+    match fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+    {
+        Err(ApiError::Http {
+            status: 409,
+            message,
+        }) => assert!(
+            message.contains("<http://example.org/claim>") && message.contains("triple term"),
+            "{message}"
+        ),
+        other => panic!("expected 409, got {:?}", other.map(|r| r.request_id)),
+    }
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")],
+        "nothing removed"
+    );
+
+    let request = ErasureRequest {
+        occurrences: vec![triple_term_occurrence(&fluree, &id, reified).await],
+        ..email("alice", "a@secret")
+    };
+    fluree
+        .erase_occurrences(&id, request, None)
+        .await
+        .expect("the request names the fact too");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+}
+
+/// A copy restored from an archive holds the request's commits too: a fact
+/// there naming a triple term that spells the value refuses the request,
+/// before anything is removed from either ledger.
+#[tokio::test]
+async fn an_erasure_is_refused_while_a_restored_copy_spells_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-spelled-source").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-spelled-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reify_email(&fluree, &copy).await;
+
+    match fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+    {
+        Err(ApiError::Http {
+            status: 409,
+            message,
+        }) => {
+            assert!(message.contains("it/erase-spelled-copy"), "{message}");
+        }
+        other => panic!("expected 409, got {:?}", other.map(|r| r.request_id)),
+    }
+    for ledger in [&id, &copy] {
+        assert_eq!(
+            objects(&fluree, ledger, "ex:alice", "ex:email").await,
+            vec![json!("a@secret")],
+            "nothing removed from {ledger}"
+        );
+    }
+}
+
+/// A fact naming a triple term that spells the value, written after the
+/// request was accepted, holds its publication back.
+#[tokio::test]
+async fn a_triple_term_written_since_acceptance_holds_publication_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-spelled-later").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reify_email(&fluree, &id).await;
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 0, "{report:?}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert!(
+        job.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("<http://example.org/claim>")),
+        "{job:?}"
+    );
+}
+
+/// A branch made while a request is accepted is made after it, holding its
+/// removal; made before the removal, the request would miss it.
+#[tokio::test]
+async fn a_branch_made_during_acceptance_holds_the_removal() {
+    use fluree_db_api::retention::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
+    type Branching = tokio::task::JoinHandle<fluree_db_api::Result<()>>;
+    /// Starts making a branch as the removal commits.
+    struct Brancher(Arc<Fluree>, std::sync::Mutex<Option<Branching>>);
+    #[async_trait::async_trait]
+    impl RetentionWriter for Brancher {
+        async fn submit(
+            &self,
+            ledger_id: &str,
+            batch: RetentionBatch,
+        ) -> fluree_db_api::Result<SubmitOutcome> {
+            if !batch.retractions.is_empty() {
+                let fluree = self.0.clone();
+                let mut branching = tokio::spawn(async move {
+                    fluree
+                        .create_branch("it/erase-admission", "late", None, None)
+                        .await
+                        .map(|_| ())
+                });
+                // Made now unless it waits for the request.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(300), &mut branching)
+                    .await;
+                *self.1.lock().unwrap() = Some(branching);
+            }
+            outcome_of(self.0.commit_retention_batch(ledger_id, batch).await)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(erasing(&dir, Arc::new(NativeProver::default())));
+    let id = ledger(&fluree, "it/erase-admission").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let writer = Brancher(fluree.clone(), std::sync::Mutex::new(None));
+    fluree
+        .erase_occurrences_with(&writer, &id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    let branching = writer.1.lock().unwrap().take().expect("branching");
+    branching.await.unwrap().expect("branch");
+    let late = "it/erase-admission:late";
+    assert!(objects(&fluree, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, late).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    drop(writer);
+    let fluree = Arc::into_inner(fluree).expect("sole owner");
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// The removal's own retraction carries the value: it is erased however
+/// far the head has moved by the time the removal looks for it.
+#[tokio::test]
+async fn the_removals_retraction_is_erased_after_the_head_moves_on() {
+    use fluree_db_api::retention::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
+    /// Commits another transaction right after each retraction.
+    struct Busy<'a>(&'a Fluree);
+    #[async_trait::async_trait]
+    impl RetentionWriter for Busy<'_> {
+        async fn submit(
+            &self,
+            ledger_id: &str,
+            batch: RetentionBatch,
+        ) -> fluree_db_api::Result<SubmitOutcome> {
+            let retracting = !batch.retractions.is_empty();
+            let outcome = outcome_of(self.0.commit_retention_batch(ledger_id, batch).await);
+            if retracting && outcome.is_ok() {
+                insert(
+                    self.0,
+                    ledger_id,
+                    json!({"@context": ctx(), "@id": "ex:other", "ex:name": "Other"}),
+                )
+                .await;
+            }
+            outcome
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-busy").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences_with(&Busy(&fluree), &id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    let retraction = commit_at(&fluree, &id, t1 + 1).await;
+    assert_eq!(receipt.commits, 2, "{receipt:?}");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&retraction)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw) && !contains(&raw, "a@secret"));
+}
+
+/// Another instance open on the same storage, a query peer, reads the
+/// replacement once the erasure reports published.
+#[tokio::test]
+async fn a_reader_open_before_publication_reads_the_replacement() {
+    use fluree_db_api::NameServiceMode;
+    use fluree_db_nameservice::file::FileNameService;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-reader").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let cid = commit_at(&fluree, &id, t1).await;
+    let reader = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build_client_with_nameservice(NameServiceMode::ReadOnly(Arc::new(FileNameService::new(
+            dir.path(),
+        ))))
+        .await
+        .unwrap();
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let store = reader.content_store(&record.storage_namespace());
+    assert!(!is_replacement(&store.get(&cid).await.unwrap()));
+
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store.get(&cid).await.unwrap().into_vec();
+    assert!(is_replacement(&raw) && !contains(&raw, "a@secret"));
+}
+
+/// A request overlapping one still in progress completes only once the
+/// published erasures remove all it asks for.
+#[tokio::test]
+async fn an_overlapping_request_completes_with_the_one_ahead_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let id = ledger(&fluree, "it/erase-overlap").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"}
+        ]}),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, t1).await;
+    let mut both = email("alice", "a@secret");
+    both.matching.extend(email("carol", "c@secret").matching);
+    fluree
+        .erase_occurrences(&id, both, None)
+        .await
+        .expect("erase");
+    let second = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert_eq!(
+        (second.stage.clone(), second.commits),
+        (ErasureStage::Proving, 2),
+        "{second:?}"
+    );
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    // The first request's steps remove what the second asks for.
+    assert_eq!((report.proved, report.published), (2, 2), "{report:?}");
+    let status = fluree.retention_status(&id).await.unwrap();
+    let jobs = status.registration.unwrap().erasures;
+    assert!(jobs.iter().all(|j| j.stage == ErasureStage::Published));
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(!contains(&raw, "a@secret") && !contains(&raw, "c@secret"));
+}
+
+/// When the request ahead of it fails, an overlapping request proves what
+/// it asks for itself.
+#[tokio::test]
+async fn an_overlapping_request_proves_what_a_failed_one_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let id = ledger(&fluree, "it/erase-overlap-failed").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"}
+        ]}),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, t1).await;
+    let mut both = email("alice", "a@secret");
+    both.matching.extend(email("carol", "c@secret").matching);
+    let first = fluree
+        .erase_occurrences(&id, both, None)
+        .await
+        .expect("erase");
+    let second = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+
+    prover.refuse_next(1);
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(
+        (report.failed, report.proved, report.published),
+        (1, 2, 1),
+        "{report:?}"
+    );
+    let status = fluree.retention_status(&id).await.unwrap();
+    let jobs = status.registration.unwrap().erasures;
+    let stage = |id: &str| {
+        jobs.iter()
+            .find(|j| j.request_id == id)
+            .unwrap()
+            .stage
+            .clone()
+    };
+    assert_eq!(stage(&first.request_id), ErasureStage::Failed);
+    assert_eq!(stage(&second.request_id), ErasureStage::Published);
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(!contains(&raw, "a@secret") && contains(&raw, "c@secret"));
+}
+
+/// A signed commit, through the whole workflow in either signature mode:
+/// the proof verifies the original's signatures, or exposes them for the
+/// verifier, and the replacement reads, replays and reindexes like any
+/// other.
+#[tokio::test]
+async fn a_signed_commit_is_erased_in_either_signature_mode() {
+    use fluree_db_api::retention::erasure::SignatureMode;
+    for (n, mode) in [SignatureMode::Verify, SignatureMode::Expose]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let prover = Arc::new(NativeProver::default());
+        let fluree = erasing(&dir, prover.clone());
+        let id = ledger(&fluree, &format!("it/erase-signed-{n}")).await;
+        let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let t1 = fluree
+            .graph(&id)
+            .transact()
+            .insert(&json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:email": "a@secret"},
+                {"@id": "ex:bob", "ex:email": "b@kept"}
+            ]}))
+            .commit_opts(fluree_db_api::CommitOpts::default().with_signing_key(key))
+            .commit()
+            .await
+            .unwrap()
+            .receipt
+            .t;
+        let original = commit_at(&fluree, &id, t1).await;
+        let store = store_of(&fluree, &id).await;
+        let signed = load_commit_by_id(store.as_ref(), &original).await.unwrap();
+        assert_eq!(signed.commit_signatures.len(), 1);
+
+        fluree
+            .erase_occurrences(
+                &id,
+                ErasureRequest {
+                    signatures: mode,
+                    ..email("alice", "a@secret")
+                },
+                None,
+            )
+            .await
+            .expect("erase");
+        reindex(&fluree, &id).await;
+        let report = fluree.run_erasure_pass(&id).await.unwrap();
+        assert_eq!(
+            (report.proved, report.published),
+            (2, 1),
+            "{mode:?}: {report:?}"
+        );
+        let proved = prover.proved();
+        let step = proved
+            .iter()
+            .find(|r| commit_signed(&r.input))
+            .expect("the signed commit's step");
+        assert_eq!(step.signatures, mode.into());
+
+        drop(fluree);
+        let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+        let raw = store_of(&restarted, &id)
+            .await
+            .get(&original)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(is_replacement(&raw) && !contains(&raw, "a@secret") && contains(&raw, "b@kept"));
+        reindex(&restarted, &id).await;
+        assert!(objects(&restarted, &id, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        assert_eq!(
+            objects(&restarted, &id, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+    }
+}
+
+/// Whether a commit blob carries a commit signature.
+fn commit_signed(bytes: &[u8]) -> bool {
+    fluree_db_core::commit::codec::read_commit(bytes).is_ok_and(|c| !c.commit_signatures.is_empty())
+}
+
+/// A ledger's erasure jobs survive its drop and restore, across a restart:
+/// a published one stays published, and a pending one resumes.
+#[tokio::test]
+async fn erasures_survive_a_drop_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-restored").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"}
+        ]}),
+    )
+    .await;
+    let shared = commit_at(&fluree, &id, t1).await;
+    let first = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let second = fluree
+        .erase_occurrences(&id, email("carol", "c@secret"), None)
+        .await
+        .expect("erase");
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!((report.proved, report.published), (2, 0), "{report:?}");
+
+    let dropped = fluree
+        .drop_ledger("it/erase-restored", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    drop(fluree);
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    fluree
+        .restore_dropped(&dropped.instance.unwrap().to_string())
+        .await
+        .unwrap();
+    let status = fluree.retention_status(&id).await.unwrap();
+    let jobs = status.registration.expect("registration").erasures;
+    let stage = |request: &str| {
+        jobs.iter()
+            .find(|j| j.request_id == request)
+            .unwrap()
+            .stage
+            .clone()
+    };
+    assert_eq!(stage(&first.request_id), ErasureStage::Published);
+    assert!(jobs
+        .iter()
+        .any(|j| j.request_id == second.request_id && j.pending()));
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&shared)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(!contains(&raw, "a@secret") && !contains(&raw, "c@secret"));
+}
+
+/// After a restore, the retention worker resumes the ledger's pending
+/// erasure without waiting for its periodic rescan of registrations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_resumes_a_restored_ledgers_erasure() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Arc::new(
+            FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                .with_indexer_catchup_interval(Duration::from_millis(200))
+                .with_erasure(ErasureConfig {
+                    prover: Arc::new(NativeProver::default()),
+                    verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                    retry_ms: 10,
+                })
+                .build()
+                .unwrap(),
+        )
+    };
+    let fluree = open();
+    let id = ledger(&fluree, "it/erase-worker-restored").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let asserted = commit_at(&fluree, &id, t1).await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    // Indexed through its head, so no build after the restore registers it.
+    reindex(&fluree, &id).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-worker-restored", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    drop(fluree);
+
+    // Restarted, the worker's first rescan finds no such ledger; its next
+    // is minutes away.
+    let fluree = open();
+    assert!(fluree.start_maintenance(
+        Default::default(),
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        })
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fluree
+        .restore_dropped(&dropped.instance.unwrap().to_string())
+        .await
+        .unwrap();
+
+    let mut stage = ErasureStage::Proving;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = fluree.retention_status(&id).await.unwrap();
+        stage = status.registration.unwrap().erasures[0].stage.clone();
+        // The worker goes on to purge it.
+        if stage != ErasureStage::Proving && stage != ErasureStage::Indexing {
+            break;
+        }
+    }
+    assert!(
+        matches!(
+            stage,
+            ErasureStage::Published | ErasureStage::Purging | ErasureStage::Purged
+        ),
+        "{stage:?}"
+    );
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&asserted)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw));
+}
+
+/// The whole workflow with the real prover and the production verifier, on a
+/// signed commit of 1,000 operations whose signature the proof verifies: run
+/// with `FLUREE_TEST_PROVER` naming a `fluree-prover` built from this tree.
+#[tokio::test]
+#[ignore = "needs a built fluree-prover (FLUREE_TEST_PROVER)"]
+async fn the_real_prover_erases_under_a_pinned_image() {
+    let command = std::env::var_os("FLUREE_TEST_PROVER").expect("FLUREE_TEST_PROVER");
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = || {
+        ErasureConfig::subprocess(fluree_db_api::retention::erasure::ProverConfig {
+            command: command.clone().into(),
+            scratch_dir: scratch.path().to_path_buf(),
+            threads: None,
+            niceness: 10,
+            timeout: std::time::Duration::from_secs(3_600),
+        })
+    };
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(config())
+        .build()
+        .unwrap();
+    let id = ledger(&fluree, "it/erase-real").await;
+    let people: Vec<JsonValue> = (0..500)
+        .map(|i| json!({"@id": format!("ex:p{i}"), "ex:email": format!("p{i}@secret.example"), "ex:name": format!("Person {i}")}))
+        .collect();
+    let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+    let t1 = fluree
+        .graph(&id)
+        .transact()
+        .insert(&json!({"@context": ctx(), "@graph": people}))
+        .commit_opts(fluree_db_api::CommitOpts::default().with_signing_key(key))
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    let original = commit_at(&fluree, &id, t1).await;
+    fluree
+        .erase_occurrences(&id, email("p0", "p0@secret.example"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    let started = std::time::Instant::now();
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    eprintln!(
+        "proved and published in {:?}: {report:?}",
+        started.elapsed()
+    );
+    assert_eq!((report.proved, report.published), (2, 1), "{report:?}");
+    let status = fluree.retention_status(&id).await.unwrap();
+    for task in &status.registration.unwrap().erasures[0].commits {
+        eprintln!("{}: {:?}", task.commit, task.proved);
+    }
+    // Scratch is gone, and a restart verifies the real receipts again.
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    drop(fluree);
+    let restarted = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let raw = store_of(&restarted, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw) && !contains(&raw, "p0@secret.example"));
+    assert!(contains(&raw, "p1@secret.example"));
+}
+
+/// A copy of the ledger in the same storage, restored from an archive,
+/// holds the erased commits too and reads their replacements: the request
+/// removes the value there, and publication waits for the copy's index, or
+/// the copy would go on serving the value it indexed.
+#[tokio::test]
+async fn an_erasure_reaches_a_copy_restored_from_an_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-copied").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&fluree, &copy).await;
+
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(
+        report.published, 0,
+        "the copy is not indexed yet: {report:?}"
+    );
+    reindex(&fluree, &copy).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    let past = restarted
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+}
+
+/// A copy soft-dropped before an erasure and restored after it publishes
+/// had no removal, and its index was built before the erasure: the restore
+/// rebuilds that index from the commits, which read as their replacements,
+/// before the copy serves.
+#[tokio::test]
+async fn a_copy_restored_after_publication_serves_no_erased_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-drop-origin").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-dropped-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&fluree, &copy).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-dropped-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A copy with a branch, both indexed over an erased commit, restored after
+/// publication: the branch's index is rebuilt too, reading the commits it
+/// shares with its parent from the parent's folder before either is
+/// visible.
+#[tokio::test]
+async fn a_restored_copys_branch_is_rebuilt_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-branch-origin").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-branch-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .create_branch("it/erase-branch-copy", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = "it/erase-branch-copy:dev";
+    insert(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@kept"}),
+    )
+    .await;
+    reindex(&fluree, &copy).await;
+    reindex(&fluree, dev).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-branch-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    for ledger in [copy.as_str(), dev] {
+        assert!(objects(&fluree, ledger, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+    }
+    assert_eq!(
+        objects(&fluree, dev, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+}
+
+/// A copy restored from an older archive while an erasure is proved
+/// retracts the value still current in it. That retraction holds the value
+/// too: it joins the job and is erased with it.
+#[tokio::test]
+async fn a_copy_restored_while_proving_has_its_retraction_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-late-origin").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    let copy = fluree
+        .restore_ledger("it/erase-late-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let retraction = commit_at(&fluree, &copy, t1 + 1).await;
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, &copy).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+
+    let status = fluree.retention_status(&id).await.unwrap();
+    let job = status
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(job.stage, ErasureStage::Published);
+    assert!(
+        job.added.iter().any(|o| o.commit == retraction.to_string()),
+        "{job:?}"
+    );
+    let bytes = store_of(&fluree, &copy)
+        .await
+        .get(&retraction)
+        .await
+        .unwrap();
+    assert!(is_replacement(&bytes) && !contains(&bytes, "a@secret"));
+}
+
+/// A copy that retracted the value itself, then was soft-dropped before the
+/// request, holds a retraction carrying the value that nothing indexes or
+/// removes while it is dropped: the retraction joins the job, and the copy,
+/// restored, holds the value nowhere.
+#[tokio::test]
+async fn a_dropped_copys_own_retraction_is_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-own-origin").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-own-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .graph(&copy)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    let retraction = commit_at(&fluree, &copy, t1 + 1).await;
+    reindex(&fluree, &copy).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-own-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert!(
+        job.added.iter().any(|o| o.commit == retraction.to_string()),
+        "{job:?}"
+    );
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    let bytes = store_of(&fluree, &copy)
+        .await
+        .get(&retraction)
+        .await
+        .unwrap();
+    assert!(is_replacement(&bytes) && !contains(&bytes, "a@secret"));
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A purge plan inventories, before anything is deleted, every copy of an
+/// erased commit's original — the ledger's, a copy's, a dropped copy's —
+/// and the transaction documents those copies name. Another ledger's
+/// identical transaction document is not in it.
+#[tokio::test]
+async fn a_purge_plan_lists_every_original_and_its_transaction_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let stored = fluree_db_transact::TxnOpts::default().store_raw_txn(true);
+    let doc = json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"});
+    let id = ledger(&fluree, "it/purge-origin").await;
+    let t1 = fluree
+        .graph(&id)
+        .transact()
+        .txn_opts(stored.clone())
+        .insert(&doc)
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    let asserted = commit_at(&fluree, &id, t1).await;
+    let unrelated = ledger(&fluree, "it/purge-unrelated").await;
+    fluree
+        .graph(&unrelated)
+        .transact()
+        .txn_opts(stored)
+        .insert(&doc)
+        .commit()
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let dropped = fluree
+        .restore_ledger("it/purge-dropped", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .drop_ledger("it/purge-dropped", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert!(fluree.plan_purge(&id).await.unwrap().requests.is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, &copy).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert_eq!(plan.requests, vec![receipt.request_id.clone()]);
+    let digest = asserted.address_digest();
+    let originals: Vec<&String> = plan
+        .originals
+        .iter()
+        .filter(|a| a.ends_with(&format!("/commit/{digest}.fcv2")))
+        .collect();
+    assert_eq!(originals.len(), 3, "{plan:?}");
+    for ledger in ["it/purge-origin/", "it/purge-copy/", "it/purge-dropped/"] {
+        assert!(originals.iter().any(|a| a.contains(ledger)), "{plan:?}");
+        assert!(
+            plan.transactions.iter().any(|a| a.contains(ledger)),
+            "{plan:?}"
+        );
+    }
+    assert!(
+        !plan
+            .originals
+            .iter()
+            .chain(&plan.transactions)
+            .any(|a| a.contains("it/purge-unrelated")),
+        "{plan:?}"
+    );
+    assert!(plan.rebuild.contains(&id) && plan.rebuild.contains(&copy));
+    assert_eq!(plan.release, vec![dropped]);
+}
+
+/// The raw files under `root` holding `needle`, wherever they are.
+fn files_holding(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut next = vec![root.to_path_buf()];
+    while let Some(dir) = next.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                next.push(path);
+            } else if contains(&std::fs::read(&path).unwrap(), needle) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A purge rebuilds every holder's index from the replacements, releases
+/// the older indexes once readers have had time, deletes every copy of the
+/// erased originals and their transaction documents, and checks they are
+/// gone: no inspected file holds the value, and the ledger reads as before.
+/// A pass that must wait for readers resumes from its rebuild.
+#[tokio::test]
+async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-run").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .insert(&json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}))
+        .commit()
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-run-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    reindex(&fluree, &copy).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert!(!plan.originals.is_empty() && !plan.transactions.is_empty());
+    assert!(!files_holding(dir.path(), "a@secret").is_empty());
+
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting && report.purged == 0, "{report:?}");
+    // The ledger and its copy, rewritten leaf by leaf.
+    assert_eq!((report.leafwise, report.rebuilt), (2, 0), "{report:?}");
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(job.stage, ErasureStage::Purged, "{job:?}");
+    let unverified = &job.purge.as_ref().unwrap().unverified;
+    assert!(
+        unverified.iter().any(|u| u.contains("other processes")),
+        "{job:?}"
+    );
+    for address in plan.originals.iter().chain(&plan.transactions) {
+        let path = dir
+            .path()
+            .join(address.strip_prefix("fluree:file://").unwrap());
+        assert!(!path.exists(), "{address}");
+    }
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let inspection = fluree.inspect_purge(&id).await.unwrap();
+    assert!(inspection.scan.clean(), "{inspection:?}");
+    for ledger in [&id, &copy] {
+        let verified = fluree.verify_ledger(ledger, None).await.unwrap();
+        assert!(verified.problems.is_empty(), "{verified:?}");
+    }
+
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    for ledger in [&id, &copy] {
+        assert_eq!(
+            objects(&restarted, ledger, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+        assert!(objects(&restarted, ledger, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        reindex(&restarted, ledger).await;
+        assert_eq!(
+            objects(&restarted, ledger, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+    }
+}
+
+/// A purge empties a string from the dictionaries only once nothing uses
+/// it: a small named graph, held in the pooled tree, still does, whether
+/// its row is in the pool's base or in a delta run written since.
+#[tokio::test]
+async fn a_purge_keeps_a_string_a_pooled_graph_still_uses() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-pooled").await;
+    let update = |sparql: &'static str| {
+        let fluree = &fluree;
+        let id = &id;
+        async move {
+            let handle = fluree.ledger_cached(id).await.unwrap();
+            fluree
+                .stage(&handle)
+                .sparql_update(sparql)
+                .execute()
+                .await
+                .unwrap();
+        }
+    };
+    update(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {
+           ex:alice ex:email \"base@secret\", \"delta@secret\" .
+           GRAPH ex:g { ex:carol ex:email \"base@secret\" }
+         }",
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    update(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g { ex:dave ex:email \"delta@secret\" } }",
+    )
+    .await;
+    crate::support::build_incrementally_and_publish_index(&fluree, &id).await;
+    let mut request = email("alice", "base@secret");
+    request
+        .matching
+        .extend(email("alice", "delta@secret").matching);
+    fluree
+        .erase_occurrences(&id, request, None)
+        .await
+        .expect("erase");
+    crate::support::build_incrementally_and_publish_index(&fluree, &id).await;
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let store = store_of(&fluree, &id).await;
+    let root = fluree_db_binary_index::IndexRoot::decode(
+        &store
+            .get(record.index_head_id.as_ref().unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let pool = root.pool.as_ref().expect("ex:g is pooled");
+    assert!(
+        pool.deltas.iter().any(|(order, runs)| {
+            *order == fluree_db_binary_index::format::run_record::RunSortOrder::OpstG
+                && !runs.is_empty()
+        }),
+        "ex:dave's row is in a delta run: {pool:?}"
+    );
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!((report.leafwise, report.rebuilt), (1, 0), "{report:?}");
+    assert_eq!(
+        fluree
+            .run_purge_pass(&id, Duration::ZERO)
+            .await
+            .unwrap()
+            .purged,
+        1
+    );
+
+    let db = fluree.db(&id).await.unwrap();
+    let rows = fluree
+        .query(
+            &db,
+            "SELECT ?s ?o WHERE { GRAPH <http://example.org/g> \
+             { ?s <http://example.org/email> ?o } } ORDER BY ?s",
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&db.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            ["http://example.org/carol", "base@secret"],
+            ["http://example.org/dave", "delta@secret"]
+        ])
+    );
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A second erasure of a commit whose originals a purge already deleted
+/// still reaches the copies that held them: they read it as its
+/// replacement, holding what the second erasure removes.
+#[tokio::test]
+async fn a_second_erasure_after_a_purge_reaches_the_copies() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-twice").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@second"}
+        ]}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-twice-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    for (subject, value) in [("alice", "a@secret"), ("bob", "b@second")] {
+        fluree
+            .erase_occurrences(&id, email(subject, value), None)
+            .await
+            .expect("erase");
+        reindex(&fluree, &id).await;
+        reindex(&fluree, &copy).await;
+        assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert_eq!(report.purged, 1, "{report:?}");
+    }
+
+    assert!(objects(&fluree, &copy, "ex:bob", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        files_holding(dir.path(), "b@second"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A soft-dropped copy holding an erased commit, with a branch, both indexed
+/// over it: the purge releases the copy's indexes and dictionaries, marking
+/// its drop entry to rebuild them, and completes with no file anywhere
+/// holding the value. A restore rebuilds both branches before the copy
+/// serves, from the replacements.
+#[tokio::test]
+async fn a_purge_releases_a_dropped_holders_index_and_a_restore_rebuilds_it() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-dropped-origin").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-dropped-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .create_branch("it/purge-dropped-copy", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = "it/purge-dropped-copy:dev";
+    insert(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@kept"}),
+    )
+    .await;
+    reindex(&fluree, &copy).await;
+    reindex(&fluree, dev).await;
+    let dropped = fluree
+        .drop_ledger("it/purge-dropped-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    assert!(!files_holding(dir.path(), "a@secret").is_empty());
+
+    let mut released = 0;
+    let mut purged = 0;
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        released += report.released;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((released, purged), (1, 1));
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(job.stage, ErasureStage::Purged, "{job:?}");
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    for ledger in [copy.as_str(), dev] {
+        let record = fluree.nameservice().lookup(ledger).await.unwrap().unwrap();
+        assert!(record.index_head_id.is_some(), "{ledger} rebuilt");
+        assert!(objects(&fluree, ledger, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        assert_eq!(
+            objects(&fluree, ledger, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+    }
+    assert_eq!(
+        objects(&fluree, dev, "ex:carol", "ex:email").await,
+        vec![json!("c@kept")]
+    );
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// Soft-drops `copy`, a copy of `id` whose index holds `a@secret`, publishes
+/// the value's erasure on `id`, and stops a restore of `copy` once it marked
+/// the entry, before it claimed the name.
+async fn restore_stopped_part_way(
+    fluree: &Fluree,
+    id: &str,
+    copy: &str,
+) -> fluree_db_core::InstanceId {
+    use fluree_db_nameservice::{BranchFence, DroppedLedger, DroppedState, Fence};
+
+    insert(
+        fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy_id = fluree
+        .restore_ledger(copy, &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(fluree, &copy_id).await;
+    let instance = fluree
+        .drop_ledger(copy, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(fluree, id).await;
+    assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+
+    let store = fluree.publisher().unwrap();
+    let held = store.get_dropped(&instance).await.unwrap().unwrap();
+    let fences = held
+        .value
+        .branches
+        .iter()
+        .map(|r| BranchFence {
+            dropped: r.retracted,
+            ..BranchFence::for_record(r, Fence::generate())
+        })
+        .collect();
+    let restoring = DroppedLedger {
+        state: DroppedState::Restoring { fences },
+        ..held.value
+    };
+    store
+        .cas_dropped(&instance, Some(held.version), Some(&restoring))
+        .await
+        .unwrap();
+    instance
+}
+
+/// Purge passes over `id` until one purges: what they released and purged.
+async fn purge_until_purged(fluree: &Fluree, id: &str) -> (usize, usize) {
+    let (mut released, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree
+            .run_purge_pass(id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        released += report.released;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    (released, purged)
+}
+
+/// A purge waits while a soft-dropped holder is being restored. Past it, a
+/// restore that then found its name taken would leave the ledger dropped
+/// with its index from before the erasure, which no later pass releases.
+#[tokio::test]
+async fn a_purge_waits_for_a_restore_that_leaves_the_ledger_dropped() {
+    use fluree_db_nameservice::DroppedState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-restoring-origin").await;
+    let copy = "it/purge-restoring-copy";
+    let instance = restore_stopped_part_way(&fluree, &id, copy).await;
+    for _ in 0..3 {
+        let report = fluree
+            .run_purge_pass(&id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.waiting && report.purged == 0, "{report:?}");
+    }
+
+    // The name taken meanwhile: the restore leaves the ledger dropped.
+    ledger(&fluree, copy).await;
+    assert!(fluree.restore_dropped(instance.as_str()).await.is_err());
+    let entry = fluree
+        .publisher()
+        .unwrap()
+        .get_dropped(&instance)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(entry.value.state, DroppedState::Dropped));
+
+    assert_eq!(purge_until_purged(&fluree, &id).await, (1, 1));
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A purge that waited for a restore finishes once the restore does, the
+/// restored ledger a holder like any other.
+#[tokio::test]
+async fn a_purge_waits_for_a_restore_that_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-restored-origin").await;
+    let copy = "it/purge-restored-copy";
+    let instance = restore_stopped_part_way(&fluree, &id, copy).await;
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(report.waiting && report.purged == 0, "{report:?}");
+
+    fluree.restore_dropped(instance.as_str()).await.unwrap();
+    assert_eq!(purge_until_purged(&fluree, &id).await, (0, 1));
+    let copy = format!("{copy}:main");
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&fluree, &copy, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// Under the write-ahead log, no file under the storage holds the erased
+/// value once a purge completes, the log's segments included.
+#[tokio::test]
+async fn a_purge_under_the_write_ahead_log_leaves_no_file_holding_the_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_storage_durability(fluree_db_core::Durability::Wal)
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build()
+        .unwrap();
+    let id = ledger(&fluree, "it/purge-wal").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A staging file a crashed write of another process left in the ledger's
+/// folder may hold an original's bytes, as may a crashed rebuild's or
+/// import's spill: the purge removes them, whatever their age.
+#[tokio::test]
+async fn a_purge_removes_staging_files_crashed_writes_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-staging").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let folder = dir
+        .path()
+        .join(fluree.storage_namespace(&id).await.unwrap().branch_prefix());
+    let staging = folder.join("commit/0011.fcv2.4242.00000000deadbeef.1.tmp");
+    std::fs::write(&staging, b"{\"email\": \"a@secret\"}").unwrap();
+    // One whose writer's clock ran ahead: dated tomorrow.
+    let ahead = folder.join("commit/0012.fcv2.4242.00000000deadbeef.2.tmp");
+    std::fs::write(&ahead, b"{\"email\": \"a@secret\"}").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&ahead)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(86_400))
+        .unwrap();
+    // A rebuild of the ledger by a process that has since ended, which
+    // spilled its runs to the default scratch directory.
+    let ended = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    let session = std::env::temp_dir()
+        .join("fluree-index/it/purge-staging/main/tmp_import")
+        .join(format!("{ended}-crashed"));
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("run.bin"), b"a@secret").unwrap();
+    // An import's, named `{nanos}-{pid}-{seq}` in hex.
+    let import = std::env::temp_dir()
+        .join("fluree-import/it/purge-staging/main/tmp_import")
+        .join(format!("{:032x}-{ended:08x}-{:016x}", 1, 0));
+    std::fs::create_dir_all(&import).unwrap();
+    std::fs::write(import.join("spool.bin"), b"a@secret").unwrap();
+
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert!(!staging.exists() && !ahead.exists());
+    assert!(!session.exists());
+    assert!(!import.exists());
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// Another process's write-ahead log under the storage may hold the erased
+/// bytes, beyond this process's checkpoint, and an open after it stops
+/// replays it: the purge stops and says why.
+#[tokio::test]
+async fn a_purge_waits_for_another_processs_write_ahead_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-foreign-log").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let owner = dir.path().join(".fluree-wal/owners/another-node");
+    std::fs::create_dir_all(&owner).unwrap();
+    std::fs::write(owner.join("00000000000000000001.wal"), b"").unwrap();
+
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    let why = report.blocked.expect("blocked");
+    assert!(why.contains("write-ahead log"), "{why}");
+    assert_eq!(report.purged, 0);
+}
+
+/// An archive made before an erasure, restored after its purge, brings back
+/// neither the transaction documents nor the index files that held the
+/// value: their writes are dropped, and the archive's index, rebuilt over,
+/// is released and swept before the copy serves.
+#[tokio::test]
+async fn an_old_archive_restored_after_a_purge_brings_nothing_back() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-old-archive").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .insert(&json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}))
+        .commit()
+        .await
+        .unwrap();
+    reindex(&fluree, &id).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, true, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert!(files_holding(dir.path(), "a@secret").is_empty());
+
+    let copy = fluree
+        .restore_ledger("it/purge-old-archive-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&fluree, &copy, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+}
+
+async fn published(name: &str) -> (tempfile::TempDir, Fluree, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, name).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    (dir, fluree, id)
+}
+
+async fn publish(fluree: &Fluree, id: &str, holders: &[&str]) {
+    fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    for holder in std::iter::once(&id).chain(holders) {
+        reindex(fluree, holder).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+}
+
+/// A branch of a copy dropped while another still forks from it keeps its
+/// index, frozen: the purge clears its index head, the sweep releases the
+/// index, and the purge completes with no file holding the value, the child
+/// reading as before.
+#[tokio::test]
+async fn a_purge_releases_a_retracted_holders_index() {
+    use std::time::Duration;
+
+    let (dir, fluree, id) = published("it/purge-retracted").await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .restore_ledger("it/purge-retracted-copy", &mut archive.as_slice())
+        .await
+        .unwrap();
+    // Indexed, so the branch made from it starts with a copy of the index.
+    reindex(&fluree, "it/purge-retracted-copy:main").await;
+    fluree
+        .create_branch("it/purge-retracted-copy", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree
+        .nameservice()
+        .lookup("it/purge-retracted-copy:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(dev.index_head_id.is_some());
+    fluree
+        .create_branch("it/purge-retracted-copy", "dev2", Some("dev"), None)
+        .await
+        .unwrap();
+    let dropped = fluree
+        .drop_branch("it/purge-retracted-copy", "dev")
+        .await
+        .unwrap();
+    assert!(dropped.deferred, "{dropped:?}");
+    publish(
+        &fluree,
+        &id,
+        &[
+            "it/purge-retracted-copy:main",
+            "it/purge-retracted-copy:dev2",
+        ],
+    )
+    .await;
+    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert_eq!(
+        plan.retracted,
+        vec!["it/purge-retracted-copy:dev".to_string()]
+    );
+
+    let mut purged = 0;
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!(purged, 1);
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let dev = fluree
+        .nameservice()
+        .lookup("it/purge-retracted-copy:dev")
+        .await
+        .unwrap()
+        .expect("kept for its child");
+    assert!(dev.index_head_id.is_none());
+    assert!(objects(
+        &fluree,
+        "it/purge-retracted-copy:dev2",
+        "ex:alice",
+        "ex:email"
+    )
+    .await
+    .is_empty());
+}
+
+/// A full-text index over a holder keeps its own copy of the terms, and a
+/// sync keeps every term it ever held: the purge rebuilds it from the
+/// ledger as it is, releases its older manifests and snapshots, and
+/// completes with no file holding the erased value's term, the index still
+/// serving the rest.
+#[tokio::test]
+async fn a_purge_rebuilds_a_full_text_index_over_a_holder() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-indexed").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "confidential zephyr"}),
+    )
+    .await;
+    let query = json!({
+        "@context": ctx(),
+        "where": [{"@id": "?x", "@type": "ex:Person", "ex:email": "?email"}],
+        "select": {"?x": ["@id", "ex:email"]}
+    });
+    // Named by the ledger alone, as a creator may: its main branch.
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-purge-search",
+            "it/purge-indexed",
+            query,
+        ))
+        .await
+        .unwrap();
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:bob", "ex:email": "ordinary note"}),
+    )
+    .await;
+    fluree
+        .sync_bm25_index("it-purge-search:main")
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "confidential zephyr"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    fluree
+        .sync_bm25_index("it-purge-search:main")
+        .await
+        .unwrap();
+    // The sync removed alice's document, and kept its terms.
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1));
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let (index, _) = fluree
+        .load_bm25_index_with_sync("it-purge-search:main", false)
+        .await
+        .unwrap();
+    assert_eq!(index.num_docs(), 1);
+    assert!(index.term_idx("note").is_some());
+    assert!(index.term_idx("zephyr").is_none());
+}
+
+/// A purge rebuilds only the full-text indexes that read an erased
+/// property: one over another property never held the value.
+#[tokio::test]
+async fn a_purge_leaves_a_full_text_index_that_never_read_the_property() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-other-index").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice",
+               "ex:email": "confidential zephyr", "ex:bio": "ordinary note"}),
+    )
+    .await;
+    for (name, property) in [("it-email", "ex:email"), ("it-bio", "ex:bio")] {
+        fluree
+            .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+                name,
+                &id,
+                json!({
+                    "@context": ctx(),
+                    "where": [{"@id": "?x", "@type": "ex:Person"}],
+                    "select": {"?x": ["@id", property]}
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+    publish_erasure(&fluree, &id, email("alice", "confidential zephyr")).await;
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1), "only it-email is rebuilt");
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A full-text index dropped before the purge is no longer listed, but a
+/// soft drop leaves its files: the purge deletes them.
+#[tokio::test]
+async fn a_purge_deletes_what_a_dropped_full_text_index_left() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-dropped-index").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "confidential zephyr"}),
+    )
+    .await;
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-dropped-search",
+            &id,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Person"}],
+                "select": {"?x": ["@id", "ex:email"]}
+            }),
+        ))
+        .await
+        .unwrap();
+    publish_erasure(&fluree, &id, email("alice", "confidential zephyr")).await;
+    fluree
+        .drop_graph_source("it-dropped-search", None, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    let mut purged = 0;
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!(purged, 1);
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A full-text index recreated under a dropped one's name, over another
+/// property, shares its folder: the purge releases what the earlier index
+/// left there without rebuilding the new one.
+#[tokio::test]
+async fn a_purge_releases_what_an_earlier_index_of_the_name_left() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-reused-index").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice",
+               "ex:email": "confidential zephyr", "ex:bio": "ordinary note"}),
+    )
+    .await;
+    let index = |property: &str| {
+        fluree.create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-reused",
+            &id,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Person"}],
+                "select": {"?x": ["@id", property]}
+            }),
+        ))
+    };
+    index("ex:email").await.unwrap();
+    fluree
+        .drop_graph_source("it-reused", None, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    index("ex:bio").await.unwrap();
+    publish_erasure(&fluree, &id, email("alice", "confidential zephyr")).await;
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (0, 1), "the bio index is not rebuilt");
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// An erasure keeps the properties it erases from acceptance: one whose
+/// occurrence only a branch held still counts once the branch is dropped,
+/// so a copy's index of it is rebuilt.
+#[tokio::test]
+async fn an_erasure_keeps_a_dropped_branch_s_property() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-branch-props").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .create_branch("it/purge-branch-props", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = "it/purge-branch-props:dev";
+    insert(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:bio": "zephyr biography"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(dev, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-branch-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-copy-bio",
+            &copy,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Person"}],
+                "select": {"?x": ["@id", "ex:bio"]}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                matching: [("email", "a@secret"), ("bio", "zephyr biography")]
+                    .map(|(p, o)| FactSelector {
+                        subject: "http://example.org/alice".into(),
+                        predicate: format!("http://example.org/{p}"),
+                        graph: None,
+                        object: Some(json!(o)),
+                    })
+                    .to_vec(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    for ledger in [id.as_str(), dev, copy.as_str()] {
+        reindex(&fluree, ledger).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    fluree
+        .drop_branch("it/purge-branch-props", "dev")
+        .await
+        .unwrap();
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1));
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// The retention worker purges a published erasure by itself: its
+/// originals, and every file that held the value, are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_purges_a_published_erasure() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build()
+            .unwrap(),
+    );
+    let id = ledger(&fluree, "it/erase-worker-purges").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    assert!(fluree.start_maintenance(
+        Default::default(),
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            purge_grace: Duration::ZERO,
+            ..Default::default()
+        })
+    ));
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+
+    let mut stage = ErasureStage::Proving;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = fluree.retention_status(&id).await.unwrap();
+        stage = status.registration.unwrap().erasures[0].stage.clone();
+        if stage == ErasureStage::Purged {
+            break;
+        }
+    }
+    assert_eq!(stage, ErasureStage::Purged);
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A string the erased occurrence shares with one surviving in the same
+/// commit is in use there: the purge keeps it in the dictionary and
+/// completes, leaf by leaf. The erased occurrence's subject, left with no
+/// fact, stays only in the index dictionaries: an IRI is an identifier,
+/// which erasure does not remove.
+#[tokio::test]
+async fn a_string_a_surviving_occurrence_shares_does_not_block_the_purge() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-shared").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:zephyr-ann", "ex:email": "shared@zephyr"},
+            {"@id": "ex:bob", "ex:email": "shared@zephyr"}
+        ]}),
+    )
+    .await;
+    publish_erasure(&fluree, &id, email("zephyr-ann", "shared@zephyr")).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        (report.purged, report.leafwise, report.rebuilt),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(only_dictionaries(&files_holding(dir.path(), "zephyr-ann")));
+    assert_eq!(
+        objects(&fluree, &id, "ex:bob", "ex:email").await,
+        vec![json!("shared@zephyr")]
+    );
+}
+
+/// A generic duration is interned as its lexical form, like a string: an
+/// erased string that a surviving duration spells the same keeps the entry
+/// the duration reads, and an erased duration nothing else spells leaves the
+/// dictionaries.
+#[tokio::test]
+async fn a_purge_treats_a_duration_s_lexical_form_as_a_string() {
+    use std::time::Duration;
+
+    let duration = |lexical: &str| json!({"@value": lexical, "@type": "http://www.w3.org/2001/XMLSchema#duration"});
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-duration").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "P1Y2M"},
+            {"@id": "ex:bob", "ex:period": duration("P1Y2M")},
+            {"@id": "ex:carol", "ex:period": duration("P2Y3M")}
+        ]}),
+    )
+    .await;
+    publish_erasure(&fluree, &id, email("alice", "P1Y2M")).await;
+    let carol = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/carol".into(),
+            predicate: "http://example.org/period".into(),
+            graph: None,
+            object: None,
+        }],
+        ..Default::default()
+    };
+    publish_erasure(&fluree, &id, carol).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!((report.purged, report.leafwise), (2, 1), "{report:?}");
+    assert_eq!(
+        objects(&fluree, &id, "ex:bob", "ex:period").await,
+        vec![duration("P1Y2M")]
+    );
+    assert_eq!(
+        files_holding(dir.path(), "P2Y3M"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A triple term names its literal's dictionary entry too: an erased
+/// duration or string a surviving triple term spells the same keeps it.
+#[tokio::test]
+async fn an_erased_value_a_triple_term_spells_keeps_its_entry() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    // Each on a ledger of its own: erasing a string alone already sends a
+    // holder with a triple-term dictionary to a rebuild.
+    for (name, property, turtle, value) in [
+        (
+            "it/purge-term-duration",
+            "period",
+            "\"P1Y2M\"^^xsd:duration",
+            json!({"@value": "P1Y2M", "@type": "http://www.w3.org/2001/XMLSchema#duration"}),
+        ),
+        (
+            "it/purge-term-string",
+            "email",
+            "\"zephyr-term\"",
+            json!("zephyr-term"),
+        ),
+    ] {
+        let id = ledger(&fluree, name).await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", format!("ex:{property}"): value}),
+        )
+        .await;
+        fluree
+            .graph(&id)
+            .transact()
+            .sparql_update(&format!(
+                "PREFIX ex: <http://example.org/>\n\
+                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                 INSERT DATA {{ ex:doc ex:mentions <<( ex:bob ex:{property} {turtle} )>> }}"
+            ))
+            .commit()
+            .await
+            .expect("insert triple term");
+        let mentioned = || async {
+            let result = fluree
+                .query_connection_sparql(&format!(
+                    "PREFIX ex: <http://example.org/>\n\
+                     SELECT ?o FROM <{id}> WHERE {{ ex:doc ex:mentions <<( ex:bob ?p ?o )>> }}"
+                ))
+                .await
+                .expect("query");
+            let ledger = fluree.ledger(&id).await.unwrap();
+            result.to_jsonld(&ledger.snapshot).unwrap()
+        };
+        let before = mentioned().await;
+        assert_eq!(before, json!([[value]]), "{name}");
+        publish_erasure(
+            &fluree,
+            &id,
+            ErasureRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: format!("http://example.org/{property}"),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert_eq!(
+            (report.purged, report.rebuilt),
+            (1, 1),
+            "{name}: {report:?}"
+        );
+        assert_eq!(mentioned().await, before, "{name}");
+    }
+}
+
+/// The empty string, erased where nothing else uses it, leaves the
+/// dictionaries like any other: the purge completes.
+#[tokio::test]
+async fn an_erased_empty_string_does_not_block_the_purge() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-empty").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice", "ex:email": ""}),
+    )
+    .await;
+    publish_erasure(&fluree, &id, email("alice", "")).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!((report.purged, report.leafwise), (1, 1), "{report:?}");
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// Whether every one of `files` is an index dictionary.
+fn only_dictionaries(files: &[std::path::PathBuf]) -> bool {
+    files
+        .iter()
+        .all(|f| f.to_string_lossy().contains("/@shared/dicts/"))
+}
+
+/// Erase, index and publish `request` on `id`.
+async fn publish_erasure(fluree: &Fluree, id: &str, request: ErasureRequest) {
+    fluree
+        .erase_occurrences(id, request, None)
+        .await
+        .expect("erase");
+    reindex(fluree, id).await;
+    assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+}
+
+/// An erased reference whose IRI nothing else uses is purged leaf by leaf:
+/// the IRI, an identifier, stays only in the index dictionaries.
+#[tokio::test]
+async fn an_erased_reference_leaves_its_iri_only_in_the_dictionaries() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-iri").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice",
+               "ex:knows": {"@id": "ex:zephyr-contact"}}),
+    )
+    .await;
+    publish_erasure(
+        &fluree,
+        &id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/knows".into(),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        (report.purged, report.leafwise, report.rebuilt),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(objects(&fluree, &id, "ex:alice", "ex:knows")
+        .await
+        .is_empty());
+    assert!(only_dictionaries(&files_holding(
+        dir.path(),
+        "zephyr-contact"
+    )));
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
+    );
+}
+
+/// A value stored outside the leaves and the string dictionary, here an
+/// integer too large for 64 bits in the big-number arena, cannot be erased
+/// leaf by leaf: that holder's index is rebuilt from the replacements, and
+/// the purge completes as before.
+#[tokio::test]
+async fn a_value_outside_the_leaves_is_purged_by_a_rebuild() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-big").await;
+    let big = "123456789012345678901234567890";
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:balance": {
+            "@value": big,
+            "@type": "http://www.w3.org/2001/XMLSchema#integer"
+        }}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/balance".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        (report.purged, report.leafwise, report.rebuilt),
+        (1, 0, 1),
+        "{report:?}"
+    );
+    assert!(objects(&fluree, &id, "ex:alice", "ex:balance")
+        .await
+        .is_empty());
+}
+
+/// A geometry's text is kept in its graph's spatial arena as well as the
+/// string dictionary, which leaf by leaf erasure does not rewrite: the
+/// holder's index is rebuilt, and no index file keeps the text.
+#[tokio::test]
+async fn an_erased_geometry_is_purged_by_a_rebuild() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-geometry").await;
+    let track = "LINESTRING(-71.0601 42.3554, -71.0589 42.3601, -71.0573 42.3622)";
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice", "ex:track": {
+            "@value": track,
+            "@type": "http://www.opengis.net/ont/geosparql#wktLiteral"
+        }}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let in_spatial_index = |dir: &std::path::Path| {
+        files_holding(dir, "LINESTRING")
+            .into_iter()
+            .filter(|f| f.to_string_lossy().contains("/index/spatial/"))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !in_spatial_index(dir.path()).is_empty(),
+        "fixture: the spatial arena holds the geometry"
+    );
+    publish_erasure(
+        &fluree,
+        &id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/track".into(),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        (report.purged, report.leafwise, report.rebuilt),
+        (1, 0, 1),
+        "{report:?}"
+    );
+    assert_eq!(
+        in_spatial_index(dir.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        files_holding(dir.path(), "42.3601"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
+    );
+}
+
+/// The `t` of each commit `ledger_id`'s head reaches, through every parent,
+/// that still states `value`.
+async fn commits_stating(fluree: &Fluree, ledger_id: &str, value: &str) -> Vec<i64> {
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut next: Vec<ContentId> = record.commit_head_id.iter().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut stating = Vec::new();
+    while let Some(cid) = next.pop() {
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
+        let commit = load_commit_by_id(store.as_ref(), &cid).await.unwrap();
+        if commit
+            .flakes
+            .iter()
+            .any(|f| f.o == FlakeValue::String(value.into()))
+        {
+            stating.push(commit.t);
+        }
+        next.extend(commit.parents);
+    }
+    stating.sort_unstable();
+    stating
+}
+
+/// `name` with a branch that wrote `ex:alice`'s email `a@secret`, in a
+/// signed commit when `key` is given; merged into `main` without
+/// fast-forwarding, and dropped. With `kept`, `main` wrote an email of its
+/// own and the merge kept that one: nothing on its line states the secret.
+async fn merged_from_a_dropped_branch(
+    fluree: &Fluree,
+    name: &str,
+    kept: bool,
+    key: Option<Arc<ed25519_dalek::SigningKey>>,
+) -> String {
+    let main = ledger(fluree, name).await;
+    let feature = format!("{name}:feature");
+    insert(
+        fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:base", "ex:n": 0}),
+    )
+    .await;
+    fluree
+        .create_branch(name, "feature", None, None)
+        .await
+        .unwrap();
+    let mut opts = fluree_db_api::CommitOpts::default();
+    if let Some(key) = key {
+        opts = opts.with_signing_key(key);
+    }
+    fluree
+        .graph(&feature)
+        .transact()
+        .insert(&json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}))
+        .commit_opts(opts)
+        .commit()
+        .await
+        .expect("insert");
+    let on_main = match kept {
+        true => json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@kept"}),
+        false => json!({"@context": ctx(), "@id": "ex:m", "ex:n": 1}),
+    };
+    insert(fluree, &main, on_main).await;
+    let strategy = match kept {
+        true => ConflictStrategy::TakeBranch,
+        false => ConflictStrategy::default(),
+    };
+    let merged = fluree
+        .merge_branch(name, "feature", Some("main"), strategy)
+        .await
+        .expect("merge");
+    assert!(!merged.fast_forward);
+    fluree.drop_branch(name, "feature").await.expect("drop");
+    main
+}
+
+/// How many operations on `ledger_id`'s own line state `value`.
+async fn stated_on_the_line(fluree: &Fluree, ledger_id: &str, value: &str) -> usize {
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let mut stated = 0;
+    for (_, cid) in chain(fluree, ledger_id).await {
+        let commit = load_commit_by_id(store.as_ref(), &cid).await.unwrap();
+        stated += commit
+            .flakes
+            .iter()
+            .filter(|f| f.o == FlakeValue::String(value.into()))
+            .count();
+    }
+    stated
+}
+
+/// A merge that does not fast-forward leaves the merged branch's commits in
+/// the target's folder, off its own line, and they stay when that branch is
+/// dropped. An erasure of a fact on the target redacts them too, whether
+/// the merge brought the value onto the target's line or kept the target's
+/// own.
+#[tokio::test]
+async fn an_erasure_reaches_the_commits_a_merge_left_of_a_dropped_branch() {
+    use std::time::Duration;
+
+    for (name, kept) in [("it/erase-merged", false), ("it/erase-merged-kept", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+        let main = merged_from_a_dropped_branch(&fluree, name, kept, None).await;
+        assert!(
+            !commits_stating(&fluree, &main, "a@secret").await.is_empty(),
+            "{name}: fixture"
+        );
+        assert_eq!(
+            stated_on_the_line(&fluree, &main, "a@secret").await == 0,
+            kept,
+            "{name}: fixture"
+        );
+
+        publish_erasure(&fluree, &main, email("alice", "a@secret")).await;
+        assert_eq!(
+            commits_stating(&fluree, &main, "a@secret").await,
+            Vec::<i64>::new(),
+            "{name}"
+        );
+        let report = fluree.run_purge_pass(&main, Duration::ZERO).await.unwrap();
+        assert_eq!(report.purged, 1, "{name}: {report:?}");
+        assert_eq!(
+            files_holding(dir.path(), "a@secret"),
+            Vec::<std::path::PathBuf>::new(),
+            "{name}"
+        );
+        assert_eq!(
+            objects(&fluree, &main, "ex:base", "ex:n").await,
+            vec![json!(0)],
+            "{name}"
+        );
+    }
+}
+
+/// A commit's signature is made for the branch it was written on. Once that
+/// branch is dropped its id is not known, the signature cannot be checked,
+/// and the erasure is refused, not left half done. A branch made again
+/// under the name lets it through.
+#[tokio::test]
+async fn an_erasure_of_a_dropped_branchs_signed_commit_needs_the_branchs_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let name = "it/erase-merged-signed";
+    let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+    let main = merged_from_a_dropped_branch(&fluree, name, false, Some(key)).await;
+    let refused = fluree
+        .erase_occurrences(&main, email("alice", "a@secret"), None)
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.status_code(), 422, "{refused}");
+    assert!(refused.to_string().contains("signature"), "{refused}");
+
+    fluree
+        .create_branch(name, "feature", None, None)
+        .await
+        .expect("the name again");
+    let feature = format!("{name}:feature");
+    fluree
+        .erase_occurrences(&main, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    for branch in [&main, &feature] {
+        reindex(&fluree, branch).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&main).await.unwrap().published, 1);
+    assert_eq!(
+        commits_stating(&fluree, &main, "a@secret").await,
+        Vec::<i64>::new()
+    );
+}
+
+/// The same through a second merge: a branch merged into one that is then
+/// merged on, with both its merges off the last target's line.
+#[tokio::test]
+async fn an_erasure_reaches_commits_two_merges_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let name = "it/erase-merged-twice";
+    let main = ledger(&fluree, name).await;
+    let (dev, feature) = (format!("{name}:dev"), format!("{name}:feature"));
+    let plain = |id: &str| json!({"@context": ctx(), "@id": id, "ex:n": 1});
+    insert(&fluree, &main, plain("ex:base")).await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    insert(&fluree, &dev, plain("ex:dev")).await;
+    fluree
+        .create_branch(name, "feature", Some("dev"), None)
+        .await
+        .unwrap();
+    insert(
+        &fluree,
+        &feature,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    insert(&fluree, &dev, plain("ex:dev-again")).await;
+    fluree
+        .merge_branch(name, "feature", Some("dev"), ConflictStrategy::default())
+        .await
+        .expect("merge into dev");
+    fluree.drop_branch(name, "feature").await.expect("drop");
+    insert(&fluree, &main, plain("ex:main")).await;
+    fluree
+        .merge_branch(name, "dev", Some("main"), ConflictStrategy::default())
+        .await
+        .expect("merge into main");
+
+    fluree
+        .erase_occurrences(&main, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    for branch in [&main, &dev] {
+        reindex(&fluree, branch).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&main).await.unwrap().published, 1);
+    for branch in [&main, &dev] {
+        assert_eq!(
+            commits_stating(&fluree, branch, "a@secret").await,
+            Vec::<i64>::new(),
+            "{branch}"
+        );
+    }
+}
+
+/// A rebase begun after an erasure is accepted would write the occurrence
+/// again in commits the erasure does not name: it is refused, and the
+/// erasure publishes against the branch's own line.
+#[tokio::test]
+async fn a_rebase_is_refused_while_the_branch_holds_an_erased_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let name = "it/erase-rebase";
+    let main = ledger(&fluree, name).await;
+    let dev = format!("{name}:dev");
+    insert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:base", "ex:n": 0}),
+    )
+    .await;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    insert(
+        &fluree,
+        &dev,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&dev, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    insert(
+        &fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:m", "ex:n": 1}),
+    )
+    .await;
+    let refused = fluree
+        .rebase_branch(name, "dev", ConflictStrategy::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.status_code(), 409, "{refused}");
+    reindex(&fluree, &dev).await;
+    assert_eq!(fluree.run_erasure_pass(&dev).await.unwrap().published, 1);
+    let store = fluree.branched_content_store(&dev).await.unwrap();
+    let record = fluree.nameservice().lookup(&dev).await.unwrap().unwrap();
+    let head = record.commit_head_id.as_ref().unwrap();
+    for (t, cid) in collect_first_parent_cids(store.as_ref(), head, 0)
+        .await
+        .unwrap()
+    {
+        let commit = load_commit_by_id(store.as_ref(), &cid).await.unwrap();
+        assert!(
+            !commit
+                .flakes
+                .iter()
+                .any(|f| f.o == FlakeValue::String("a@secret".into())),
+            "t {t} still states the value"
+        );
+    }
+}
+
+/// `?o` of `s p ?o`, or `?s` of `?s p o`, read from `from` (to `to`, for a
+/// history range); `Err` when refused for suppressed history.
+async fn historical(
+    fluree: &Fluree,
+    ledger_id: &str,
+    from: String,
+    to: Option<String>,
+    pattern: JsonValue,
+) -> std::result::Result<Vec<JsonValue>, ApiError> {
+    let mut query = json!({"@context": ctx(), "from": from, "select": "?x", "where": pattern});
+    if let Some(to) = to {
+        query["to"] = json!(to);
+    }
+    let results = fluree.query_connection(&query).await?;
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let mut rows = results
+        .to_jsonld(&ledger.snapshot)
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    rows.sort_by_key(ToString::to_string);
+    Ok(rows)
+}
+
+/// Historical reads of `id` around Carol's erased like of Bob, asserted at
+/// `t1` and retracted by the removal at `removed_t`.
+async fn the_erased_like_refuses_only_its_own(
+    fluree: &Fluree,
+    id: &str,
+    t1: i64,
+    removed_t: i64,
+    stage: &str,
+) {
+    let refused = |r: &std::result::Result<Vec<JsonValue>, ApiError>| {
+        matches!(r, Err(ApiError::HistoryUnavailable(_)))
+    };
+    let at = |t: i64| format!("{id}@t:{t}");
+    let likes = |s: &str| json!({"@id": s, "ex:likes": "?x"});
+    let carol = historical(fluree, id, at(t1), None, likes("ex:carol")).await;
+    assert!(refused(&carol), "{stage}: Carol's likes: {carol:?}");
+    let erin = historical(fluree, id, at(t1), None, likes("ex:erin")).await;
+    assert_eq!(
+        erin.unwrap(),
+        vec![json!("ex:dave")],
+        "{stage}: Erin's likes"
+    );
+    let who = historical(
+        fluree,
+        id,
+        at(t1),
+        None,
+        json!({"@id": "?x", "ex:likes": {"@id": "ex:dave"}}),
+    )
+    .await;
+    assert!(refused(&who), "{stage}: who liked Dave: {who:?}");
+    // The same through SPARQL, which shares the check.
+    let sparql = |subject: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?x FROM <{id}@t:{t1}> WHERE {{ ex:{subject} ex:likes ?x }}"
+        )
+    };
+    let carol = fluree.query_connection_sparql(&sparql("carol")).await;
+    assert!(
+        matches!(carol, Err(ApiError::HistoryUnavailable(_))),
+        "{stage}: SPARQL, Carol's likes"
+    );
+    let erin = fluree.query_connection_sparql(&sparql("erin")).await;
+    assert!(
+        erin.is_ok(),
+        "{stage}: SPARQL, Erin's likes: {:?}",
+        erin.err()
+    );
+    let name = historical(
+        fluree,
+        id,
+        at(t1),
+        None,
+        json!({"@id": "ex:carol", "ex:name": "?x"}),
+    )
+    .await;
+    assert_eq!(name.unwrap(), vec![json!("Carol")], "{stage}: Carol's name");
+    // A point read at the retraction no longer sees the like; a range
+    // ending there lists the retraction, one starting after it does not.
+    // A copy made before the removal has no such point.
+    let head = fluree.ledger(id).await.unwrap().t();
+    if head < removed_t {
+        return;
+    }
+    let after = historical(fluree, id, at(removed_t), None, likes("ex:carol")).await;
+    assert_eq!(
+        after.unwrap(),
+        vec![json!("ex:dave")],
+        "{stage}: at the retraction"
+    );
+    let through = historical(fluree, id, at(t1), Some(at(removed_t)), likes("ex:carol")).await;
+    assert!(
+        refused(&through),
+        "{stage}: range to the retraction: {through:?}"
+    );
+    if head > removed_t {
+        let past = historical(
+            fluree,
+            id,
+            at(removed_t + 1),
+            Some(at(head)),
+            likes("ex:carol"),
+        )
+        .await;
+        assert!(past.is_ok(), "{stage}: range past the retraction: {past:?}");
+    }
+}
+
+/// A removal refuses the same historical reads however far the erasure
+/// that made it has come. Its subject is recorded with it, so neither the
+/// replacement (which no longer says whose the occurrence was), the purge,
+/// a restart nor a copy restored afterwards widens the refusal to every
+/// subject of the predicate. A removal of a commit the copy never held
+/// refuses nothing there.
+#[tokio::test]
+async fn an_erasure_refuses_the_same_history_at_every_stage() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-narrow").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:carol", "ex:name": "Carol",
+             "ex:likes": [{"@id": "ex:bob"}, {"@id": "ex:dave"}]},
+            {"@id": "ex:erin", "ex:likes": {"@id": "ex:dave"}}
+        ]}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:frank", "ex:name": "Frank"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    // After the archive: the copy restored from it never holds this.
+    let late = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:erin", "ex:likes": {"@id": "ex:gina"}}),
+    )
+    .await;
+    let like = |s: &str, o: &str| FactSelector {
+        subject: format!("http://example.org/{s}"),
+        predicate: "http://example.org/likes".into(),
+        graph: None,
+        object: Some(json!({"@id": format!("http://example.org/{o}")})),
+    };
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                matching: vec![like("carol", "bob"), like("erin", "gina")],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    let removed_t = receipt.removals[0].removal.retracted_t.expect("retracted");
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "removed").await;
+
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "published").await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "purged").await;
+
+    drop(fluree);
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "restarted").await;
+
+    let copy = fluree
+        .restore_ledger("it/erase-narrow-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    the_erased_like_refuses_only_its_own(&fluree, &copy, t1, removed_t, "restored").await;
+    let mut head = fluree.ledger(&copy).await.unwrap().t();
+    while head <= late {
+        head = insert(
+            &fluree,
+            &copy,
+            json!({"@context": ctx(), "@id": "ex:hank", "ex:n": head}),
+        )
+        .await;
+    }
+    let erin = historical(
+        &fluree,
+        &copy,
+        format!("{copy}@t:{late}"),
+        None,
+        json!({"@id": "ex:erin", "ex:likes": "?x"}),
+    )
+    .await;
+    assert_eq!(
+        erin.unwrap(),
+        vec![json!("ex:dave")],
+        "a removal the copy never held"
+    );
+}
+
+/// The ledgers `events` announced refreshing since last drained.
+fn refreshed(
+    events: &mut tokio::sync::broadcast::Receiver<fluree_db_nameservice::NameServiceEvent>,
+) -> Vec<String> {
+    let mut ledgers = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let fluree_db_nameservice::NameServiceEvent::LedgerRefresh { ledger_id } = event {
+            ledgers.push(ledger_id.to_string());
+        }
+    }
+    ledgers.sort();
+    ledgers.dedup();
+    ledgers
+}
+
+/// Publishing an erasure, rewriting an index without its values, and
+/// purging change a ledger's stored history without moving its heads: each
+/// announces a refresh of every branch holding the commits, on which
+/// followers evict what they cached. Publication also moves the erasure
+/// generation they compare across reconnects.
+#[tokio::test]
+async fn publication_and_purge_announce_a_refresh() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/refresh").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    fluree
+        .create_branch("it/refresh", "dev", None, None)
+        .await
+        .unwrap();
+    let other = ledger(&fluree, "it/refresh-other").await;
+    insert(
+        &fluree,
+        &other,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@kept"}),
+    )
+    .await;
+    let mut events = fluree
+        .event_bus()
+        .subscribe(fluree_db_nameservice::SubscriptionScope::all())
+        .receiver;
+    let before = fluree.erasure_generation().await.unwrap();
+
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    for branch in [id.as_str(), "it/refresh:dev"] {
+        reindex(&fluree, branch).await;
+    }
+    refreshed(&mut events);
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
+    assert_ne!(fluree.erasure_generation().await.unwrap(), before);
+
+    // An index rewritten while its old files wait out the grace: a peer on
+    // the old root learns of the new one now, not when they are deleted.
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting && report.leafwise == 2, "{report:?}");
+    assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
+}
+
+/// A value leaf-by-leaf erasure cannot reach (a big integer, in its numeric
+/// arena) sends the index to a rebuild: a new root at the same `t`, which a
+/// follower learns of by a refresh before the old files wait out the grace.
+#[tokio::test]
+async fn a_purge_rebuild_announces_a_refresh() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/refresh-rebuild").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:count": {
+            "@value": "123456789012345678901234567890",
+            "@type": "http://www.w3.org/2001/XMLSchema#integer"
+        }}),
+    )
+    .await;
+    publish_erasure(
+        &fluree,
+        &id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/count".into(),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut events = fluree
+        .event_bus()
+        .subscribe(fluree_db_nameservice::SubscriptionScope::all())
+        .receiver;
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting && report.rebuilt == 1, "{report:?}");
+    assert_eq!(refreshed(&mut events), [id.as_str()]);
+}
+
+#[path = "it_retention_erasure_transfer.rs"]
+mod transfer;
+
+/// Main and `side` each assert Alice's email at the same `t`, in commits of
+/// their own, and `late` branches from main after; `side` then merges main
+/// (having replaced its value first, with `replace`). Main's occurrence is
+/// erased and published: `side` reaches its commit only through the merge's
+/// other parent, so its index holds its own commit at that `t`. Returns
+/// main, `side`, `late` and that `t`.
+async fn independent_occurrences(
+    fluree: &Fluree,
+    name: &str,
+    replace: bool,
+) -> (String, String, String, i64) {
+    let main = ledger(fluree, name).await;
+    insert(
+        fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:seed", "ex:x": 0}),
+    )
+    .await;
+    fluree
+        .create_branch(name, "side", None, None)
+        .await
+        .unwrap();
+    let side = format!("{name}:side");
+    let alice = |marker: &str| json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret", "ex:marker": marker});
+    let t = insert(fluree, &main, alice("main")).await;
+    assert_eq!(insert(fluree, &side, alice("side")).await, t);
+    fluree
+        .create_branch(name, "late", None, None)
+        .await
+        .unwrap();
+    let late = format!("{name}:late");
+    if replace {
+        fluree
+            .graph(&side)
+            .transact()
+            .update(&json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:alice", "ex:email": "a@secret"},
+                "insert": {"@id": "ex:alice", "ex:email": "public"}
+            }))
+            .commit()
+            .await
+            .unwrap();
+    }
+    let merged = fluree
+        .merge_branch(name, "main", Some("side"), ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    assert!(!merged.fast_forward);
+
+    let original = commit_at(fluree, &main, t).await;
+    let store = store_of(fluree, &main).await;
+    let commit = load_commit_by_id(store.as_ref(), &original).await.unwrap();
+    let (slot, _) = commit
+        .occurrences()
+        .find(|(_, f)| f.o == FlakeValue::String("a@secret".into()))
+        .unwrap();
+    let occurrences = vec![OccurrenceRef {
+        commit: original.to_string(),
+        slot,
+    }];
+    fluree
+        .erase_occurrences(
+            &main,
+            ErasureRequest {
+                occurrences,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    for id in [&main, &side, &late] {
+        reindex(fluree, id).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&main).await.unwrap().published, 1);
+    (main, side, late, t)
+}
+
+/// A purge erases from a branch's index only the occurrences of its own
+/// first-parent commits: `side`'s history keeps the same fact asserted at
+/// the same `t` by a commit of its own, while `late`'s index, which holds
+/// main's commit, is found holding it until the purge.
+#[tokio::test]
+async fn a_purge_keeps_a_branchs_own_history_of_the_same_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let (main, side, late, t) = independent_occurrences(&fluree, "it/own-history", true).await;
+    let at_t = || {
+        historical(
+            &fluree,
+            &side,
+            format!("{side}@t:{t}"),
+            None,
+            json!({"@id": "ex:alice", "ex:email": "?x"}),
+        )
+    };
+    assert_eq!(at_t().await.unwrap(), [json!("a@secret")]);
+    let scan = fluree.inspect_purge(&main).await.unwrap().scan;
+    assert_eq!(scan.indexed, [late, main.clone()], "{scan:?}");
+
+    assert_eq!(purge_until_purged(&fluree, &main).await.1, 1);
+    assert_eq!(at_t().await.unwrap(), [json!("a@secret")]);
+    assert_eq!(
+        objects(&fluree, &side, "ex:alice", "ex:email").await,
+        [json!("public")]
+    );
+}
+
+/// A branch's own current value, the same fact an erased commit it reaches
+/// through a merge asserted at the same `t`, neither blocks the purge nor
+/// leaves its index.
+#[tokio::test]
+async fn a_purge_keeps_a_branchs_own_current_value_of_the_same_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let (main, side, _, _) = independent_occurrences(&fluree, "it/own-current", false).await;
+    assert_eq!(purge_until_purged(&fluree, &main).await.1, 1);
+    assert_eq!(
+        objects(&fluree, &side, "ex:alice", "ex:email").await,
+        [json!("a@secret")]
+    );
+}
+
+const DROPPED: &str = "http://example.org/graphs/dropped";
+
+async fn sparql_update(fluree: &Fluree, ledger_id: &str, sparql: &str) -> i64 {
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    fluree
+        .stage(&handle)
+        .sparql_update(sparql)
+        .execute()
+        .await
+        .expect("update")
+        .receipt
+        .t
+}
+
+async fn listed_graphs(fluree: &Fluree, ledger_id: &str) -> Vec<String> {
+    let info = fluree.ledger_info(ledger_id).execute().await.expect("info");
+    info["ledger"]["named-graphs"]
+        .as_array()
+        .expect("named-graphs")
+        .iter()
+        .filter_map(|graph| graph["iri"].as_str().map(String::from))
+        .collect()
+}
+
+fn email_in(graph: &str, subject: &str, value: &str) -> ErasureRequest {
+    ErasureRequest {
+        matching: vec![FactSelector {
+            subject: format!("http://example.org/{subject}"),
+            predicate: "http://example.org/email".into(),
+            graph: Some(graph.into()),
+            object: Some(json!(value)),
+        }],
+        ..Default::default()
+    }
+}
+
+/// A graph's drop ends what it held: a value the drop took is erased from
+/// the commit that wrote it, and the removal retracts nothing, so the
+/// graph stays dropped.
+#[tokio::test]
+async fn a_value_its_graphs_drop_ended_is_erased_without_a_retraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-dropped").await;
+    let written = sparql_update(
+        &fluree,
+        &id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{DROPPED}> {{
+               ex:alice ex:email \"alice@secret.example\" .
+               ex:bob ex:email \"bob@kept.example\" }} }}"
+        ),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, written).await;
+    sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    assert!(!listed_graphs(&fluree, &id)
+        .await
+        .contains(&DROPPED.to_string()));
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            email_in(DROPPED, "alice", "alice@secret.example"),
+            Some("did:example:officer".into()),
+        )
+        .await
+        .expect("erase");
+    assert_eq!(receipt.manifest.len(), 1, "{receipt:?}");
+    assert_eq!(receipt.removals[0].removal.retracted_t, None, "{receipt:?}");
+    assert!(
+        !listed_graphs(&fluree, &id)
+            .await
+            .contains(&DROPPED.to_string()),
+        "the removal wrote nothing into the dropped graph"
+    );
+
+    fluree.run_erasure_pass(&id).await.unwrap();
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw));
+    assert!(!contains(&raw, "alice@secret.example"));
+    assert!(contains(&raw, "bob@kept.example"));
+}
+
+/// A value written again after its graph's drop is current: the removal
+/// retracts that one, and erases the occurrence the drop ended too.
+#[tokio::test]
+async fn a_value_written_again_after_its_graphs_drop_is_retracted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-revived").await;
+    let insert = format!(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+    );
+    sparql_update(&fluree, &id, &insert).await;
+    sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    sparql_update(&fluree, &id, &insert).await;
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            email_in(DROPPED, "alice", "alice@secret.example"),
+            Some("did:example:officer".into()),
+        )
+        .await
+        .expect("erase");
+    // Both assertions, and the one retraction of the current value.
+    assert_eq!(receipt.manifest.len(), 3, "{receipt:?}");
+    let retracted_t = receipt.removals[0].removal.retracted_t.expect("retracted");
+    let store = store_of(&fluree, &id).await;
+    let retraction = load_commit_by_id(store.as_ref(), &commit_at(&fluree, &id, retracted_t).await)
+        .await
+        .unwrap();
+    assert_eq!(retraction.flakes.len(), 1, "{:?}", retraction.flakes);
+    let db = fluree.db(&id).await.unwrap();
+    let rows = fluree
+        .query(
+            &db,
+            &format!(
+                "PREFIX ex: <http://example.org/>
+                 SELECT ?o WHERE {{ GRAPH <{DROPPED}> {{ ex:alice ex:email ?o }} }}"
+            ),
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&db.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([]));
+}
+
+/// A copy of a history holding the drop, restored after the erasure with an
+/// index built before the drop, takes the removal as it is restored and
+/// retracts nothing, so its graph stays dropped as well.
+#[tokio::test]
+async fn a_copy_holding_the_drop_retracts_nothing_into_the_dropped_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-dropped-copied").await;
+    sparql_update(
+        &fluree,
+        &id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+        ),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let dropped_t = sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, true, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(
+            &id,
+            email_in(DROPPED, "alice", "alice@secret.example"),
+            None,
+        )
+        .await
+        .expect("erase");
+
+    let copy = fluree
+        .restore_ledger("it/erase-dropped-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let copy_t = fluree
+        .nameservice()
+        .lookup(&copy)
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_t;
+    assert_eq!(copy_t, dropped_t, "nothing retracted in the copy");
+    assert!(!listed_graphs(&fluree, &copy)
+        .await
+        .contains(&DROPPED.to_string()));
+}
+
+/// A named assertion its graph's drop ended takes no retraction with it: a
+/// later retraction ends the value written again after the drop.
+#[tokio::test]
+async fn a_named_occurrence_its_graphs_drop_ended_takes_no_later_retraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-dropped-span").await;
+    let insert = format!(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+    );
+    let written = sparql_update(&fluree, &id, &insert).await;
+    sparql_update(&fluree, &id, &format!("DROP GRAPH <{DROPPED}>")).await;
+    sparql_update(&fluree, &id, &insert).await;
+    sparql_update(
+        &fluree,
+        &id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             DELETE DATA {{ GRAPH <{DROPPED}> {{ ex:alice ex:email \"alice@secret.example\" }} }}"
+        ),
+    )
+    .await;
+    let asserted = commit_at(&fluree, &id, written).await;
+
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                occurrences: vec![fluree_db_api::retention::OccurrenceRef {
+                    commit: asserted.to_string(),
+                    slot: 0,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    assert_eq!(
+        receipt.manifest,
+        [fluree_db_api::retention::OccurrenceRef {
+            commit: asserted.to_string(),
+            slot: 0,
+        }],
+        "{receipt:?}"
+    );
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let registration = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .unwrap();
+    let job = registration
+        .erasures
+        .iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(
+        job.commits.len(),
+        1,
+        "the later span must remain intact: {job:?}"
+    );
+
+    // Replaying the replacement must not resurrect the later assertion by
+    // erasing its retraction as though it ended the first assertion.
+    reindex(&fluree, &id).await;
+    let db = fluree.db(&id).await.unwrap();
+    let rows = fluree.query(&db, &format!(
+        "PREFIX ex: <http://example.org/> SELECT ?o WHERE {{ GRAPH <{DROPPED}> {{ ex:alice ex:email ?o }} }}"
+    )).await.unwrap().to_jsonld(&db.snapshot).unwrap();
+    assert_eq!(rows, json!([]));
+}
+
+/// A replacement exists only where a verified proof made it. A push that
+/// names no CIDs would otherwise take one's CID from its bytes and store a
+/// redacted commit no proof covers, which reads as another commit.
+#[tokio::test]
+async fn a_push_naming_no_cids_refuses_a_replacement() {
+    use fluree_db_api::{
+        Base64Bytes, ExportCommitsRequest, GovernanceOptions, IndexConfig, PushCommitsRequest,
+    };
+    use fluree_db_redaction::{redact_with, HostSha, Signatures};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let src = ledger(&fluree, "it/push-fcr1-src").await;
+    insert(
+        &fluree,
+        &src,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &src,
+        json!({"@context": ctx(), "@id": "ex:alice",
+               "ex:email": "a@secret", "ex:phone": "555"}),
+    )
+    .await;
+    let handle = fluree.ledger_cached(&src).await.unwrap();
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut commits = export.commits;
+    commits.reverse();
+    let (first, second) = (commits[0].clone(), commits[1].clone());
+    let (redacted, _) =
+        redact_with::<HostSha, _>(&second.0, &[0], &src, Signatures::Verify, &mut ()).unwrap();
+    assert!(is_replacement(&redacted));
+
+    let tgt = ledger(&fluree, "it/push-fcr1-tgt").await;
+    let push = |commit: Base64Bytes| PushCommitsRequest {
+        commits: vec![commit],
+        blobs: export.blobs.clone(),
+        ..Default::default()
+    };
+    let config = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let opts = GovernanceOptions::default();
+    let accepted = fluree
+        .push_commits(&tgt, push(first), &opts, &config)
+        .await
+        .unwrap();
+    assert_eq!(accepted.accepted, 1);
+    let refused = fluree
+        .push_commits(&tgt, push(Base64Bytes(redacted)), &opts, &config)
+        .await;
+    assert!(
+        matches!(&refused, Err(e) if e.status_code() == 422),
+        "{:?}",
+        refused.map(|r| r.accepted)
+    );
+    assert_eq!(fluree.ledger(&tgt).await.unwrap().t(), 1);
+}

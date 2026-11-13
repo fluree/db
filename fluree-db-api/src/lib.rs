@@ -46,11 +46,14 @@ pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
 mod branch_validation;
+#[cfg(feature = "native")]
+pub mod collect;
 mod commit_data;
 pub mod commit_transfer;
 mod config_guard;
 pub mod config_resolver;
 mod config_vocab;
+mod content_hash;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
@@ -68,6 +71,8 @@ pub mod export;
 pub mod export_annotations;
 pub mod export_builder;
 pub mod format;
+#[cfg(feature = "native")]
+pub mod garbage;
 pub mod graph;
 pub mod graph_commit_builder;
 #[cfg(not(target_arch = "wasm32"))]
@@ -109,6 +114,7 @@ pub mod rdf;
 pub mod reasoning_index;
 mod rebase;
 pub mod remote_service;
+pub mod retention;
 mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
@@ -169,8 +175,9 @@ pub use block_fetch::{
     LedgerBlockContext,
 };
 pub use commit_transfer::{
-    Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
+    erasures_needed, Base64Bytes, BaseErasure, BulkImportResult, CommitImportResult,
+    ExportCommitsRequest, ExportCommitsResponse, PushAuthority, PushCommitsRequest,
+    PushCommitsResponse, PushedHead, RestoreResult, StagedPush, ERASURES_NEEDED,
 };
 pub use dataset::{
     sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
@@ -192,6 +199,10 @@ pub use fluree_db_core::{StorageNamespace, StorageRoot};
 pub use format::{
     sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
     QueryOutput,
+};
+#[cfg(feature = "native")]
+pub use garbage::{
+    CollectTimings, GarbageReason, GarbageReport, ReconcilePass, ReconcileReport, ReconcileTimings,
 };
 pub use graph::Graph;
 pub use graph_commit_builder::{
@@ -875,6 +886,7 @@ impl fluree_db_nameservice::RefLookup for NameServiceMode {
 ///
 /// This routes writes/reads based on the address path:
 /// - `.../commit/...` and `.../txn/...` -> commit storage
+/// - `@retention/...` -> commit storage
 /// - everything else -> index storage
 #[derive(Clone, Debug)]
 pub struct TieredStorage<S> {
@@ -896,8 +908,9 @@ fn tier_routes_to_commit(address: &str) -> bool {
     // Extract the path portion after :// if present (fluree:*://path)
     let path = address.split("://").nth(1).unwrap_or(address);
 
-    // Commit blobs + txn blobs go to commit storage.
-    path.contains("/commit/") || path.contains("/txn/")
+    // Commit blobs + txn blobs go to commit storage, as do retention
+    // records: index storage holds only what commits rebuild.
+    path.contains("/commit/") || path.contains("/txn/") || path.starts_with("@retention/")
 }
 
 /// Encryption admin for a [`TieredStorage`] whose tiers both encrypt: each
@@ -1089,6 +1102,18 @@ where
             self.commit.delete(address).await
         } else {
             self.index.delete(address).await
+        }
+    }
+
+    async fn delete_unlogged(
+        &self,
+        address: &str,
+        until: std::time::Instant,
+    ) -> std::result::Result<bool, fluree_db_core::Error> {
+        if Self::route_to_commit(address) {
+            self.commit.delete_unlogged(address, until).await
+        } else {
+            self.index.delete_unlogged(address, until).await
         }
     }
 
@@ -1323,6 +1348,14 @@ impl StorageWrite for AddressIdentifierResolverStorage {
     /// Deletes always go to the default storage
     async fn delete(&self, address: &str) -> std::result::Result<(), fluree_db_core::Error> {
         self.default.delete(address).await
+    }
+
+    async fn delete_unlogged(
+        &self,
+        address: &str,
+        until: std::time::Instant,
+    ) -> std::result::Result<bool, fluree_db_core::Error> {
+        self.default.delete_unlogged(address, until).await
     }
 
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
@@ -1692,6 +1725,12 @@ pub struct FlureeBuilder {
     storage_unlocked: bool,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
     encryption_key: Option<ConfiguredKey>,
+    /// How a file-backed instance proves permanent erasures.
+    #[cfg(feature = "native")]
+    erasure: Option<retention::erasure::ErasureConfig>,
+    /// How it checks erasure receipts without proving.
+    #[cfg(feature = "native")]
+    erasure_verifier: Option<Arc<retention::erasure::Verifier>>,
     /// Optional ledger cache configuration (enables LedgerManager)
     ledger_cache_config: Option<LedgerManagerConfig>,
     /// Optional background indexing configuration.
@@ -1908,6 +1947,10 @@ pub fn spawn_local_cache_event_listener(
                         "local cache event listener disconnected retracted ledger"
                     );
                 }
+                // Its history changed in place: the cached state reloads.
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRefresh { ledger_id }) => {
+                    ledger_manager.disconnect(&ledger_id).await;
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     // The channel overflowed and dropped events. With
@@ -2006,6 +2049,10 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_wal_owner: None,
             #[cfg(feature = "native")]
+            erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
+            #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
@@ -2030,6 +2077,10 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2111,6 +2162,10 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2220,6 +2275,23 @@ impl FlureeBuilder {
     ///     .with_encryption_key(key)
     ///     .build()?;
     /// ```
+    /// Prove permanent erasures with `config` (file storage only; other
+    /// builds refuse erasure requests).
+    #[cfg(feature = "native")]
+    pub fn with_erasure(mut self, config: retention::erasure::ErasureConfig) -> Self {
+        self.erasure = Some(config);
+        self
+    }
+
+    /// Check the receipts of erasures this instance reads or receives with
+    /// `verifier`, without proving any (default: the pinned guest images).
+    /// A prover's configuration brings its own.
+    #[cfg(feature = "native")]
+    pub fn with_erasure_verifier(mut self, verifier: Arc<retention::erasure::Verifier>) -> Self {
+        self.erasure_verifier = Some(verifier);
+        self
+    }
+
     pub fn with_encryption_key(mut self, key: [u8; 32]) -> Self {
         self.encryption_key = Some(ConfiguredKey::from_bytes(key));
         self
@@ -2344,6 +2416,10 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2497,6 +2573,13 @@ impl FlureeBuilder {
         self
     }
 
+    /// Whether `lock` keeps every other process out of the root: not a root
+    /// opened unprotected because its filesystem cannot lock.
+    #[cfg(feature = "native")]
+    fn excludes_others(lock: &Option<Arc<fluree_db_core::RootLock>>) -> bool {
+        lock.as_ref().is_some_and(|lock| lock.is_locked())
+    }
+
     /// The root lock this build takes, before the root is swept or its WAL
     /// replayed.
     #[cfg(feature = "native")]
@@ -2622,6 +2705,14 @@ impl FlureeBuilder {
     ///
     /// No-op unless background indexing is enabled, since it configures the
     /// worker; call it after `with_indexing*`.
+    /// Mint new commit and transaction CIDs with `alg` (SHA2-256 by
+    /// default). Index and other content stays SHA2-256, and existing
+    /// objects keep the hash they were written with.
+    pub fn with_content_hash(mut self, alg: fluree_db_core::HashAlgorithm) -> Self {
+        self.config.content_hash = alg;
+        self
+    }
+
     pub fn with_indexer_catchup_interval(mut self, interval: std::time::Duration) -> Self {
         if let Some(cfg) = self.indexing_config.take() {
             self.indexing_config = Some(IndexingBuilderConfig {
@@ -2851,7 +2942,10 @@ impl FlureeBuilder {
         // A store from before name bindings moves to the current format.
         let nameservice = FileNameService::with_storage(storage.clone());
         nameservice.migrate_blocking()?;
-        Ok(self.build_file(storage, nameservice).holding(root_lock))
+        let locked = Self::excludes_others(&root_lock);
+        Ok(self
+            .build_file(storage, nameservice, locked)
+            .holding(root_lock))
     }
 
     /// Build a file-backed Fluree instance, recovering the storage root's WAL
@@ -2870,7 +2964,10 @@ impl FlureeBuilder {
             Ok(nameservice)
         })
         .await?;
-        Ok(self.build_file(storage, nameservice).holding(root_lock))
+        let locked = Self::excludes_others(&root_lock);
+        Ok(self
+            .build_file(storage, nameservice, locked)
+            .holding(root_lock))
     }
 
     /// Run a build's startup work on its root in a task that holds
@@ -2910,18 +3007,28 @@ impl FlureeBuilder {
 
     /// Assembles a file-backed instance over `storage`, whose WAL is already
     /// recovered, and its `nameservice`, already in the current format.
+    /// `locked`: the instance holds the root's lock, so it is the only writer
+    /// and may collect commit and transaction garbage.
     #[cfg(feature = "native")]
-    fn build_file(self, storage: FileStorage, nameservice: FileNameService) -> Fluree {
+    fn build_file(
+        mut self,
+        storage: FileStorage,
+        nameservice: FileNameService,
+        locked: bool,
+    ) -> Fluree {
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
+        let stored = self.encrypt_if_configured(Arc::new(storage));
+        let pins = locked.then(|| Arc::new(fluree_db_core::BlobPins::new()));
+        let (stored, erasure) = self.erasure_storage(stored, pins.clone());
+        let backend = StorageBackend::Managed(stored);
         let index_config = self.derive_indexing();
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let ledger_manager_cell = Self::new_ledger_manager_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &ledger_manager_cell);
-        Self::finalize_with_backend(
+        let mut fluree = Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2936,6 +3043,48 @@ impl FlureeBuilder {
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
             self.identity,
+        );
+        // The storage root's lock keeps every other process out.
+        if locked {
+            fluree.retention.watch.set_sole_writer();
+            erasure.index.set_sole_writer();
+        }
+        let _ = fluree.retention.erasure.set(erasure);
+        fluree.root.pins = pins;
+        fluree
+    }
+
+    /// Front file storage with erasure: every read of an erased commit
+    /// reads its verified replacement, whether or not this instance proves
+    /// erasures itself.
+    #[cfg(feature = "native")]
+    fn erasure_storage(
+        &mut self,
+        stored: Arc<dyn Storage>,
+        pins: Option<Arc<fluree_db_core::BlobPins>>,
+    ) -> (Arc<dyn Storage>, Arc<retention::erasure::ErasureRuntime>) {
+        let config = self.erasure.take();
+        let verifier = match (&config, self.erasure_verifier.take()) {
+            (Some(config), _) => config.verifier.clone(),
+            (None, Some(verifier)) => verifier,
+            (None, None) => Default::default(),
+        };
+        let index = Arc::new(retention::erasure::index::ErasureIndex::new(
+            stored.clone(),
+            verifier,
+        ));
+        let condemned = Arc::new(collect::Condemned::default());
+        let storage: Arc<dyn Storage> = Arc::new(retention::erasure::index::ErasureStorage::new(
+            stored,
+            index.clone(),
+            pins,
+            condemned.clone(),
+        ));
+        (
+            storage,
+            Arc::new(retention::erasure::ErasureRuntime::new(
+                index, condemned, config,
+            )),
         )
     }
 
@@ -2985,6 +3134,16 @@ impl FlureeBuilder {
             );
         }
         let event_bus = self.resolve_event_bus();
+        // A nameservice given without the bus it reports to reports to the
+        // one built here, which the ledger cache and retention follow.
+        let nameservice = match nameservice {
+            NameServiceMode::ReadWrite(ns) if self.event_bus.is_none() => {
+                NameServiceMode::ReadWrite(Arc::new(
+                    fluree_db_nameservice::NotifyingNameService::new(ns, Arc::clone(&event_bus)),
+                ))
+            }
+            given => given,
+        };
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
             self.ledger_cache_config,
@@ -3112,7 +3271,7 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
         let index_config = self.derive_indexing();
-        Self::finalize_with_backend(
+        let fluree = Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -3127,7 +3286,10 @@ impl FlureeBuilder {
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
             self.identity,
-        )
+        );
+        // Nothing else writes this nameservice.
+        fluree.retention.watch.set_sole_writer();
+        fluree
     }
 
     /// Build an IPFS-backed Fluree instance with an in-memory nameservice.
@@ -3551,7 +3713,10 @@ impl FlureeBuilder {
         if let Some(manager) = &ledger_manager {
             spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
         }
+        let retention = Arc::<retention::RetentionRuntime>::default();
+        retention.watch.track(&event_bus);
 
+        let config_content_hash = config.content_hash;
         Fluree {
             config,
             backend,
@@ -3568,6 +3733,10 @@ impl FlureeBuilder {
             identity,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             reasoning_index_state: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            leader_indexer: Arc::default(),
+            retention,
+            content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }
@@ -3691,7 +3860,10 @@ impl FlureeBuilder {
     /// is `Some`, it replaces the default `FileNameService` (and
     /// the notifying wrapper + background indexer that ride along
     /// with it).
-    async fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
+    async fn build_client_file(
+        #[cfg_attr(not(feature = "native"), allow(unused_mut))] mut self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
         #[cfg(not(feature = "native"))]
         {
             let _ = nameservice;
@@ -3737,10 +3909,16 @@ impl FlureeBuilder {
             let storage = self
                 .wrap_address_identifiers(base_storage, &self.config)
                 .await?;
+            let pins = Self::excludes_others(&root_lock)
+                .then(|| Arc::new(fluree_db_core::BlobPins::new()));
+            let (storage, erasure) = self.erasure_storage(storage, pins.clone());
             let backend = StorageBackend::Managed(storage);
             let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
             let ledger_manager_cell = Self::new_ledger_manager_cell();
+            // The root's lock keeps every other process out, and its own
+            // nameservice reports every write this instance makes.
+            let sole_writer = nameservice.is_none() && Self::excludes_others(&root_lock);
 
             let (ns_mode, indexing_mode) = match nameservice {
                 Some(ns) => (ns, tx::IndexingMode::Disabled),
@@ -3757,7 +3935,7 @@ impl FlureeBuilder {
                     )
                 }
             };
-            Ok(Self::finalize_with_backend(
+            let mut fluree = Self::finalize_with_backend(
                 self.ledger_cache_config,
                 self.config,
                 RuntimeParts {
@@ -3772,8 +3950,14 @@ impl FlureeBuilder {
                 self.remote_mounts,
                 #[cfg(feature = "iceberg")]
                 self.identity,
-            )
-            .holding(root_lock))
+            );
+            if sole_writer {
+                fluree.retention.watch.set_sole_writer();
+                erasure.index.set_sole_writer();
+            }
+            let _ = fluree.retention.erasure.set(erasure);
+            fluree.root.pins = pins;
+            Ok(fluree.holding(root_lock))
         }
     }
 
@@ -3932,6 +4116,14 @@ pub struct Fluree {
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
     /// Reasoning indexes being refreshed, and generations loaded for serving.
     reasoning_index_state: Arc<reasoning_index::ReasoningIndexState>,
+    /// On a cluster member: the indexer its leader role builds with.
+    #[cfg(not(target_arch = "wasm32"))]
+    leader_indexer: Arc<admin::LeaderIndexer>,
+    /// The retention worker's in-process state: the branches it knows are
+    /// active, and how to wake it.
+    retention: Arc<retention::RetentionRuntime>,
+    /// The hash new commit and transaction CIDs are minted with.
+    content_hash: Arc<content_hash::ContentHashPolicy>,
     /// What this instance holds of its file storage root.
     #[cfg(feature = "native")]
     root: RootHold,
@@ -3947,6 +4139,17 @@ struct RootHold {
     /// Set for an instance [`SharedFluree`] handles own. Its lifecycle is
     /// theirs, so [`Fluree::disconnect`] leaves it alone.
     owned_by_shared_handles: bool,
+    /// Pins on the commit and transaction blobs writers have not yet
+    /// published. Only an instance holding the lock collects garbage.
+    pins: Option<Arc<fluree_db_core::BlobPins>>,
+    /// The ledger the next garbage collection starts with: the first the
+    /// last ran out of time for.
+    collect_from: Arc<parking_lot::Mutex<Option<String>>>,
+    /// On a cluster's leader: when it first saw each open intent, which
+    /// begins deleting a settle period later.
+    intents_seen: Arc<parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>>,
+    /// On a cluster member: held through each collection pass.
+    cluster_pass: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Fluree {
@@ -3972,6 +4175,21 @@ impl Fluree {
         nameservice: NameServiceMode,
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config, &backend);
+        let config_content_hash = config.content_hash;
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let retention = Arc::<retention::RetentionRuntime>::default();
+        // Writes made through this instance reach its bus, so what it keeps
+        // of a branch follows them. A writer it does not see (another
+        // process on the same storage) is learned in the background.
+        let nameservice = match nameservice {
+            NameServiceMode::ReadWrite(ns) => {
+                retention.watch.track(&event_bus);
+                NameServiceMode::ReadWrite(Arc::new(
+                    fluree_db_nameservice::NotifyingNameService::new(ns, Arc::clone(&event_bus)),
+                ))
+            }
+            read_only => read_only,
+        };
         Self {
             config,
             backend: with_artifact_cache(backend, None),
@@ -3981,13 +4199,17 @@ impl Fluree {
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
-            event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
+            event_bus,
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
             identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             reasoning_index_state: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            leader_indexer: Arc::default(),
+            retention,
+            content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }
@@ -4211,6 +4433,17 @@ impl Fluree {
         self.backend.content_store(namespace)
     }
 
+    /// Where blobs written under `namespace` are pinned against the garbage
+    /// collector: by the storage, so every instance writing to it pins.
+    pub(crate) fn blob_pinner(
+        &self,
+        namespace: &StorageNamespace,
+    ) -> Option<fluree_db_core::BlobPinner> {
+        self.admin_storage()?
+            .blob_pins()
+            .map(|pins| fluree_db_core::BlobPinner::new(pins, namespace.clone()))
+    }
+
     /// Where `ledger_id`'s artifacts live, from its nameservice record.
     pub async fn storage_namespace(&self, ledger_id: &str) -> Result<StorageNamespace> {
         Ok(self
@@ -4288,20 +4521,27 @@ impl Fluree {
 
     /// Build `ledger_id`'s index in this process: incremental over the
     /// commits since the last index when possible, a full rebuild otherwise.
-    /// The caller publishes the result.
+    /// The caller publishes the result. A branch whose built commits carry
+    /// retention input is registered for retention first, and the build
+    /// leaves out the history its `f:noHistory` rules dropped.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn build_index(&self, ledger_id: &str) -> Result<fluree_db_indexer::IndexResult> {
-        let config = fluree_db_indexer::IndexerConfig::default()
+        let mut config = fluree_db_indexer::IndexerConfig::default()
             .with_ledger_config_provider(self.ledger_config_provider());
+        config.history_suppression = self
+            .suppressed_history_for_index(fluree_db_core::LedgerId::parse(ledger_id)?.as_str())
+            .await?;
         warn_if_staging_plaintext(&self.backend, &config);
         let content_store = self.branched_content_store(ledger_id).await?;
-        Ok(fluree_db_indexer::build_index_for_ledger(
+        let built = fluree_db_indexer::build_index_for_ledger(
             content_store,
             self.nameservice(),
             ledger_id,
             config,
         )
-        .await?)
+        .await?;
+        self.register_built_retention(&built).await?;
+        Ok(built)
     }
 
     /// Build a [`fluree_db_indexer::LedgerConfigProvider`] backed by this
@@ -4332,6 +4572,17 @@ impl Fluree {
     /// for callers that want to introspect occupancy in tests.
     pub fn governance_cache(&self) -> &Arc<cross_ledger::GovernanceCache> {
         &self.governance_cache
+    }
+
+    /// Run `write`, which stores what it then publishes, in a write scope:
+    /// on a cluster member what it stores is checked against what the
+    /// cluster's collection condemned; elsewhere it runs as is.
+    pub(crate) async fn write_scope<F: std::future::Future>(&self, write: F) -> F::Output {
+        #[cfg(feature = "native")]
+        if let Some(condemned) = self.condemned() {
+            return condemned.scoped(write).await;
+        }
+        write.await
     }
 
     /// Get the raw address-based storage for admin/GC operations.
@@ -5261,6 +5512,59 @@ impl Fluree {
         // If caching is disabled, this is a no-op
     }
 
+    /// Drop what this instance holds of `ledger_id`, whose stored history
+    /// another instance changed in place (see
+    /// [`fluree_db_nameservice::NameServiceEvent::LedgerRefresh`]): its
+    /// cached state reloads on next use, after the erasure maps are listed
+    /// again, and decoded leaves are read again.
+    pub async fn refresh_ledger(&self, ledger_id: &str) {
+        self.retention.watch.forget(ledger_id);
+        self.expire_erasures();
+        self.disconnect_ledger(ledger_id).await;
+        self.clear_decoded();
+    }
+
+    /// After installing erasures over `holders`: as [`Self::refresh_ledger`]
+    /// for each, then wait until every read of a commit or transaction
+    /// document begun before this has finished, since one may still return
+    /// an original.
+    #[cfg(feature = "native")]
+    pub(crate) async fn evict_erased(&self, holders: &[String]) {
+        self.expire_erasures();
+        for holder in holders {
+            self.disconnect_ledger(holder).await;
+        }
+        self.clear_decoded();
+        if let Some(runtime) = self.retention.erasure.get() {
+            runtime.index.drain().await;
+        }
+    }
+
+    /// [`Self::refresh_ledger`] for every ledger cached here: a follower
+    /// that may have missed a refresh.
+    pub async fn refresh_ledgers(&self) {
+        self.retention.watch.forget_all();
+        self.expire_erasures();
+        if let Some(mgr) = &self.ledger_manager {
+            for ledger_id in mgr.cached_aliases().await {
+                mgr.disconnect(&ledger_id).await;
+            }
+        }
+        self.clear_decoded();
+    }
+
+    fn expire_erasures(&self) {
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            runtime.index.expire();
+        }
+    }
+
+    fn clear_decoded(&self) {
+        self.leaflet_cache().clear();
+        crate::ontology_imports::global_schema_bundle_cache().clear();
+    }
+
     /// Disconnect the Fluree system, performing best-effort cleanup
     ///
     /// Callers should stop issuing new queries and transactions before calling
@@ -5616,6 +5920,11 @@ impl Fluree {
         if let Some(ctx_cid) = record.default_context.as_ref() {
             manifest["default_context_id"] = serde_json::Value::String(ctx_cid.to_string());
         }
+        // The removal journal, so the restored ledger serves no history this
+        // one no longer serves.
+        if let Some(retention) = self.retention_archive_section(&canonical_id).await? {
+            manifest["retention"] = retention;
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<pack::PackChunk>(64);
 
@@ -5904,6 +6213,23 @@ mod tests {
         commit.insert(index_addr, b"misplaced".to_vec());
         index.remove(index_addr);
         assert!(tiered.get_local(index_addr).unwrap().is_none());
+    }
+
+    /// Retention records go with the commits: nothing rebuilds them.
+    #[tokio::test]
+    async fn tiered_storage_keeps_retention_records_with_the_commits() {
+        let commit = MemoryStorage::new();
+        let index = MemoryStorage::new();
+        let tiered = TieredStorage::new(commit.clone(), index.clone());
+        let record = "fluree:memory://@retention/journal/abc/def.json";
+        tiered.write_bytes(record, b"journal").await.unwrap();
+
+        assert_eq!(commit.read_bytes(record).await.unwrap(), b"journal");
+        assert!(!index.exists(record).await.unwrap());
+        assert_eq!(
+            tiered.list_prefix("fluree:memory://").await.unwrap(),
+            [record]
+        );
     }
 
     /// Every constructor that takes a storage fronts a remote one with the

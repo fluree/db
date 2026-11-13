@@ -499,6 +499,36 @@ where
     Ok(outcome)
 }
 
+/// Clear the record's frozen mark, if it carries `fence`: the index file
+/// first, so a record that still reads frozen is one to thaw again.
+pub(crate) async fn thaw_record<S>(
+    storage: &S,
+    keys: RecordKeys<'_>,
+    fence: Fence,
+) -> Result<FenceOutcome>
+where
+    S: StorageCas + ?Sized,
+{
+    storage
+        .compare_and_swap(keys.index, move |bytes| {
+            match bytes.map(deserialize_json::<NsIndexFileV2>).transpose()? {
+                Some(mut file) if file.fence == Some(fence) && file.frozen => {
+                    file.frozen = false;
+                    Ok(CasAction::Write(serialize_json(&file)?))
+                }
+                _ => Ok(CasAction::<()>::Abort(())),
+            }
+        })
+        .await?;
+    update_fenced(storage, keys.main, fence, |file| {
+        if file.status == STATUS_FROZEN {
+            file.status = "ready".to_string();
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Turn the record into a tombstone, if it carries `fence`.
 pub(crate) async fn delete_record<S>(
     storage: &S,

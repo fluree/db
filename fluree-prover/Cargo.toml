@@ -1,0 +1,11 @@
+# The redaction prover for permanent erasure (docs/transactions/permanent-erasure.md,
+# docs/cli/prover.md). A separate binary outside
+# the main workspace, so RISC Zero's prover and toolchain never enter a
+# Fluree build; Fluree runs it once per redaction step.
+[workspace]
+resolver = "2"
+members = ["prover", "methods"]
+
+[profile.release]
+lto = true
+strip = true

@@ -20,6 +20,7 @@
 //! mounts, since local ledgers can be created later).
 
 use crate::Fence;
+use crate::WriteBasis;
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -300,7 +301,7 @@ impl CommitPublisher for CompositeNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -308,7 +309,7 @@ impl CommitPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, basis, commit_t, commit_id)
             .await
     }
 
@@ -325,7 +326,7 @@ impl IndexPublisher for CompositeNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -333,7 +334,7 @@ impl IndexPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_fenced(ledger_id, basis, index_t, index_id)
             .await
     }
 }
@@ -343,14 +344,14 @@ impl BranchLifecycle for CompositeNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
         if let Some(err) = self.reject_mounted_write(ledger_id) {
             return Err(err);
         }
         self.local
-            .reset_head_fenced(ledger_id, fence, snapshot)
+            .reset_head_fenced(ledger_id, basis, snapshot)
             .await
     }
 
@@ -379,7 +380,7 @@ impl AdminPublisher for CompositeNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -387,8 +388,15 @@ impl AdminPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, basis, index_t, index_id)
             .await
+    }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.clear_frozen_index(ledger_id).await
     }
 }
 
@@ -397,7 +405,7 @@ impl RefPublisher for CompositeNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -406,7 +414,7 @@ impl RefPublisher for CompositeNameService {
             return Err(err);
         }
         self.local
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, expected, new)
             .await
     }
 }
@@ -435,12 +443,13 @@ impl GraphSourcePublisher for CompositeNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         if let Some(err) = self.reject_mounted_write(name) {
             return Err(err);
         }
         self.local
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await
     }
 
@@ -456,6 +465,22 @@ impl GraphSourcePublisher for CompositeNameService {
             return Err(err);
         }
         self.local.reset_graph_source_index(name, branch).await
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        sources: &[(String, u64)],
+    ) -> Result<()> {
+        if let Some(err) = self.reject_mounted_write(name) {
+            return Err(err);
+        }
+        self.local
+            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t, sources)
+            .await
     }
 }
 
@@ -616,6 +641,17 @@ impl crate::BranchRecordStore for CompositeNameService {
             return Err(err);
         }
         self.local.freeze_record(ledger_id, fence).await
+    }
+
+    async fn thaw_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.thaw_record(ledger_id, fence).await
     }
 
     async fn delete_record(

@@ -29,6 +29,7 @@
 //!   travel verbatim; redaction is future work.
 
 use async_trait::async_trait;
+use fluree_db_nameservice::WriteBasis;
 
 use crate::local::build_policy_context;
 use crate::raft::ownership::owner;
@@ -225,6 +226,18 @@ impl Worker {
             .map(|f| (fluree_db_nameservice::Fence::from_u64(f.fence), f.frozen))
     }
 
+    /// Whether an erasure activation being prepared holds the branch's
+    /// head, so that a stage now would only be refused.
+    async fn held(&self) -> bool {
+        held_in(&*self.shared_state.read().await, &self.ref_key)
+    }
+
+    async fn wait_out_hold(&self) {
+        while self.held().await {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     fn new(
         ref_key: RefKey,
         shared_state: SharedState,
@@ -340,6 +353,7 @@ impl Worker {
                         "staged on a lagging view; refreshing and re-staging"
                     );
                     tokio::time::sleep(RAFT_BACKOFF).await;
+                    self.wait_out_hold().await;
                     let ledger_id = self.ref_key.ledger_id();
                     if let Err(refresh_err) = self
                         .staging
@@ -363,7 +377,25 @@ impl Worker {
         }
     }
 
+    /// Stage `entry` and publish its head in a write scope: what staging
+    /// stores is checked against what collection condemned, and the head
+    /// presents the intents loaded when staging began.
     async fn try_advance_head(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
+        match self.staging.fluree.condemned() {
+            Some(condemned) => {
+                crate::raft::collect::catch_up(
+                    &self.staging.fluree,
+                    &condemned,
+                    &self.shared_state,
+                )
+                .await;
+                condemned.scoped(self.stage_and_advance(entry)).await
+            }
+            None => self.stage_and_advance(entry).await,
+        }
+    }
+
+    async fn stage_and_advance(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
         let envelope = self.load_envelope(entry).await?;
         // The state machine doesn't introspect the envelope at enqueue
         // time, so the inline discriminator could disagree with what
@@ -371,7 +403,11 @@ impl Worker {
         // process under a kind the queue didn't declare.
         check_envelope_kind(entry.body_kind, &envelope)?;
 
-        let StagedOutcome { receipt, install } = match envelope {
+        let StagedOutcome {
+            receipt,
+            install,
+            basis,
+        } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
             QueuedRequest::Push(push) => self.process_push(*push).await?,
             QueuedRequest::PushWithMerges(push) => self.process_push_with_merges(*push).await?,
@@ -381,10 +417,6 @@ impl Worker {
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
-        // A stage on a cached state presents that state's fence, so one
-        // built on another activation's state, cached from before a drop
-        // and recreate this node has not yet reconciled, is refused.
-        let staged_fence = install.as_ref().and_then(|i| i.new_state.fence());
 
         // Stash the typed receipt through `StashGuard` so an abort
         // mid-publish (ownership flap during the propose await)
@@ -405,7 +437,7 @@ impl Worker {
             receipt,
         );
         match self
-            .publish_head_advance(commit_id.clone(), commit_t, staged_fence)
+            .publish_head_advance(commit_id.clone(), commit_t, basis)
             .await
         {
             Ok(()) => {
@@ -546,6 +578,19 @@ impl Worker {
         let Ok(namespace) = self.storage_namespace().await else {
             return;
         };
+        match self
+            .staging
+            .fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(commit_id))
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(commit_id = %commit_id, error = %err, "could not record an orphaned commit blob");
+                return;
+            }
+        }
         let content_store = self.staging.fluree.content_store(&namespace);
         if let Err(err) = content_store.release(commit_id).await {
             warn!(
@@ -648,6 +693,10 @@ impl Worker {
             .await
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 
+        if let TransactionBody::Retention { batch } = &body {
+            return self.stage_retention(&ledger_id, batch).await;
+        }
+
         let policy_ctx = build_policy_context(&self.staging.fluree, &ledger_handle, &governance)
             .await
             .map_err(submission_to_stage)?;
@@ -706,6 +755,9 @@ impl Worker {
                 staged.upsert_turtle(text.as_str())
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+            TransactionBody::Retention { .. } => {
+                unreachable!("a retention batch stages before the builder")
+            }
             TransactionBody::Cypher { .. } => {
                 match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
                     crate::local::CypherWriteUnderLock::Resolved(resolved) => {
@@ -765,6 +817,7 @@ impl Worker {
                     tally: None,
                 }),
                 install: None,
+                basis: snap.write_basis(),
             });
         };
 
@@ -805,6 +858,76 @@ impl Worker {
                 flake_count: receipt.flake_count,
                 tally,
             }),
+            basis: new_state.write_basis(),
+            install: Some(StagedStateInstall {
+                write_guard,
+                new_state,
+                commit_t,
+            }),
+        })
+    }
+
+    /// Stage a retention batch: exact retractions committed only against the
+    /// head they were verified at. A moved head (or novelty near its limit)
+    /// poisons the entry at once with a reason the submitting worker reads
+    /// as "recompute", instead of retrying a batch that can never apply.
+    async fn stage_retention(
+        &self,
+        ledger_id: &str,
+        batch: &str,
+    ) -> Result<StagedOutcome, WorkerError> {
+        use fluree_db_api::retention::{DEFERRED, HEAD_MOVED};
+        let batch = crate::local::decode_retention_batch(batch).map_err(|e| {
+            stage(PoisonReason::BodyMalformed {
+                error: e.to_string(),
+            })
+        })?;
+        let expected_t = batch.expected_t;
+        let built = self
+            .staging
+            .fluree
+            .build_retention_commit(ledger_id, batch)
+            .await;
+        let (write_guard, staged_commit) = match built {
+            Ok(built) => built,
+            Err(e) if e.is_commit_conflict() => {
+                return Err(stage(PoisonReason::BodyMalformed {
+                    error: format!("{HEAD_MOVED} (verified at t {expected_t}): {e}"),
+                }))
+            }
+            Err(ApiError::Transact(fluree_db_api::TransactError::NoveltyAtMax)) => {
+                return Err(stage(PoisonReason::BodyMalformed {
+                    error: DEFERRED.to_string(),
+                }))
+            }
+            Err(e) => return Err(build_commit_failure(e)),
+        };
+        let write_guard = write_guard
+            .ok_or_else(|| stage_failure("retention batch: the ledger manager holds no lock"))?;
+        let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
+            stage(PoisonReason::WorkerPanic {
+                message: "build_retention_commit produced a commit without commit.id".into(),
+            })
+        })?;
+        let commit_t = staged_commit.commit.t;
+        self.persist_staged_blobs(
+            &self.storage_namespace().await?,
+            &commit_cid,
+            &staged_commit,
+            "retention",
+        )
+        .await?;
+        let (receipt, new_state) = staged_commit
+            .finalize_state()
+            .map_err(|e| stage_failure(&format!("finalize_state failed: {e}")))?;
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Transact(TransactApplied {
+                commit_id: commit_cid,
+                commit_t,
+                flake_count: receipt.flake_count,
+                tally: None,
+            }),
+            basis: new_state.write_basis(),
             install: Some(StagedStateInstall {
                 write_guard,
                 new_state,
@@ -843,6 +966,7 @@ impl Worker {
             current_head_t,
             current_head_id,
             commit,
+            branch_basis,
             ..
         } = self
             .staging
@@ -868,6 +992,7 @@ impl Worker {
                     strategy: applied_strategy,
                 }),
                 install: None,
+                basis: branch_basis,
             });
         };
 
@@ -898,6 +1023,7 @@ impl Worker {
                 new_state,
                 commit_t,
             }),
+            basis: branch_basis,
         })
     }
 
@@ -962,8 +1088,8 @@ impl Worker {
                 Ok::<_, WorkerError>(out)
             }
         };
-        let commits = read_commits(commit_cids).await?;
-        let merged_commits = read_commits(merged_commit_cids).await?;
+        let commits = read_commits(commit_cids.clone()).await?;
+        let merged_commits = read_commits(merged_commit_cids.clone()).await?;
         let payload = PushCommitsRequest {
             commits,
             blobs: blobs
@@ -974,6 +1100,9 @@ impl Worker {
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
             merged_commits,
+            commit_ids: commit_cids,
+            merged_commit_ids: merged_commit_cids,
+            ..Default::default()
         };
         let StagedPush {
             accepted,
@@ -997,6 +1126,7 @@ impl Worker {
                 accepted,
                 indexing: indexing_status,
             }),
+            basis: final_state.write_basis(),
             install: Some(StagedStateInstall {
                 write_guard,
                 new_state: final_state,
@@ -1023,6 +1153,7 @@ impl Worker {
         let StagedMerge {
             target,
             target_namespace,
+            target_basis,
             fast_forward,
             conflict_count,
             commits_copied,
@@ -1096,6 +1227,7 @@ impl Worker {
                 strategy: applied_strategy.unwrap_or(strategy),
             }),
             install,
+            basis: target_basis,
         })
     }
 
@@ -1114,6 +1246,7 @@ impl Worker {
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
             branch_namespace,
+            branch_basis,
             source_head_id,
             source_head_t,
             fast_forward,
@@ -1179,27 +1312,24 @@ impl Worker {
                 new_state: final_state,
                 commit_t: advance_t,
             }),
+            basis: branch_basis,
         })
     }
 
-    /// Publish the head, presenting `staged_fence`, the fence of the state
-    /// the commit was staged on, or the branch's current fence for work
-    /// staged from the nameservice's records rather than a cached state.
+    /// Publish the head, presenting `basis`: what the views the commit was
+    /// staged on presented.
     async fn publish_head_advance(
         &self,
         commit_id: ContentId,
         commit_t: i64,
-        staged_fence: Option<fluree_db_nameservice::Fence>,
+        basis: WriteBasis,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
-        let fence = match staged_fence {
-            Some(fence) => Some(fence),
-            None => self.branch_fence().await.map(|(fence, _)| fence),
-        };
+        let fence = basis.fence;
         match self
             .publishing
             .commits
-            .publish_commit_fenced(&full_ledger_id, fence, commit_t, &commit_id)
+            .publish_commit_fenced(&full_ledger_id, basis, commit_t, &commit_id)
             .await
         {
             Ok(()) => Ok(()),
@@ -1293,7 +1423,7 @@ impl Worker {
         let mut last_committed: Option<u64> = None;
         let mut idle_since: Option<tokio::time::Instant> = None;
         loop {
-            let Some(entry) = self.snapshot_front().await else {
+            let Some((entry, held)) = self.snapshot_front().await else {
                 let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
                 if since.elapsed() >= IDLE_EXIT {
                     return;
@@ -1316,6 +1446,10 @@ impl Worker {
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
+            }
+            if held {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
             }
             let queue_id = entry.queue_id;
             // Wrap `process_entry` in `catch_unwind` so a panic
@@ -1391,13 +1525,25 @@ impl Worker {
         }
     }
 
-    async fn snapshot_front(&self) -> Option<QueueEntry> {
+    /// The front of the branch's queue, and whether an erasure activation
+    /// being prepared holds the branch (see [`Self::held`]), in one read.
+    async fn snapshot_front(&self) -> Option<(QueueEntry, bool)> {
         let state = self.shared_state.read().await;
-        state
+        let entry = state
             .queues
             .get(&self.ref_key)
-            .and_then(|queue| queue.front().cloned())
+            .and_then(|queue| queue.front().cloned())?;
+        Some((entry, held_in(&state, &self.ref_key)))
     }
+}
+
+/// Whether an erasure activation being prepared holds `key`'s head.
+fn held_in(state: &crate::raft::state_machine::NameServiceState, key: &RefKey) -> bool {
+    state
+        .erasure
+        .holds
+        .get(key)
+        .is_some_and(|&until| crate::raft::current_millis() < until)
 }
 
 /// Signal `abort` on every handle, then `await` each one. Returns
@@ -1864,6 +2010,10 @@ impl WorkerError {
 pub(crate) struct StagedOutcome {
     receipt: AppliedReceipt,
     install: Option<StagedStateInstall>,
+    /// What the views the commit was staged on present, captured when
+    /// they were read: one taken at publish would label older work with
+    /// a newer erasure generation, or give a branch its source's.
+    basis: WriteBasis,
 }
 
 /// Local state install owed once the publish succeeds. `None` when
@@ -2042,10 +2192,11 @@ mod tests {
         async fn publish_commit_fenced(
             &self,
             ledger_id: &str,
-            fence: Option<fluree_db_nameservice::Fence>,
+            basis: WriteBasis,
             _commit_t: i64,
             _commit_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
+            let fence = basis.fence;
             self.presented.lock().unwrap().push(fence);
             if fence.is_some() && fence == self.live {
                 Ok(())
@@ -2125,7 +2276,7 @@ mod tests {
         let (worker, publisher) = fenced_worker(2, false);
 
         let stale = worker
-            .publish_head_advance(cid(1), 5, Some(Fence::from_u64(1)))
+            .publish_head_advance(cid(1), 5, WriteBasis::fenced(Some(Fence::from_u64(1))))
             .await;
         assert!(matches!(stale, Err(WorkerError::Lagged(_))), "{stale:?}");
         assert_eq!(
@@ -2133,9 +2284,85 @@ mod tests {
             [Some(Fence::from_u64(1))]
         );
 
-        // Work staged from the nameservice, with no cached state, presents
-        // the live fence.
-        worker.publish_head_advance(cid(1), 5, None).await.unwrap();
+        // Restaged on the live activation's state, it lands.
+        worker
+            .publish_head_advance(cid(1), 5, WriteBasis::fenced(Some(Fence::from_u64(2))))
+            .await
+            .unwrap();
+    }
+
+    /// A fast-forward merge installs no state to take what its publish
+    /// presents from, and a rebased state is the source's: each carries its
+    /// target's record as it was prepared against, with the source view's
+    /// generation.
+    #[tokio::test]
+    async fn merges_and_rebases_present_the_target_they_were_prepared_on() {
+        let fluree = Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory());
+        let doc =
+            |id: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": id, "ex:n": 1});
+        let main = fluree.create_ledger("test/db").await.unwrap();
+        fluree.insert(main, &doc("ex:a")).await.unwrap();
+        fluree
+            .create_branch("test/db", "dev", None, None)
+            .await
+            .unwrap();
+        let main = fluree.ledger("test/db:main").await.unwrap();
+        fluree.insert(main, &doc("ex:b")).await.unwrap();
+
+        let ns = fluree.nameservice();
+        let dev = ns.lookup("test/db:dev").await.unwrap().unwrap();
+        let source = ns.lookup("test/db:main").await.unwrap().unwrap();
+        assert_ne!(
+            dev.fence, source.fence,
+            "the branches' fences tell them apart"
+        );
+        let expected = dev
+            .write_basis()
+            .with_source(&source, source.erasure_generation);
+
+        let worker = Worker::new(
+            RefKey::new("test/db", "dev"),
+            SharedState::view_of(Arc::new(RwLock::new(NameServiceState::new()))),
+            PublishingChannel {
+                commits: Arc::new(FencedPublisher::default()),
+                poison: Arc::new(NoPoison),
+                staged_receipts: Arc::new(StagedReceiptMap::default()),
+            },
+            StagingContext {
+                fluree: Arc::clone(&fluree),
+                index_config: fluree_db_api::server_defaults::default_index_config(),
+            },
+        );
+
+        let rebased = worker
+            .process_rebase(QueuedRebase {
+                strategy: fluree_db_api::ConflictStrategy::default(),
+                submission: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&rebased.receipt, AppliedReceipt::Rebase(r) if r.fast_forward),
+            "a fast-forward rebase"
+        );
+        assert_eq!(rebased.basis, expected);
+        drop(rebased);
+
+        let merged = worker
+            .process_merge(QueuedMerge {
+                source_branch: "main".into(),
+                target_branch: Some("dev".into()),
+                strategy: fluree_db_api::ConflictStrategy::default(),
+                submission: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&merged.receipt, AppliedReceipt::Merge(m) if m.fast_forward),
+            "a fast-forward merge"
+        );
+        assert!(merged.install.is_none());
+        assert_eq!(merged.basis, expected);
     }
 
     /// A branch frozen since takes no commit: the entry is poisoned, not
@@ -2144,7 +2371,11 @@ mod tests {
     async fn a_commit_to_a_frozen_branch_is_poisoned() {
         let (worker, _) = fenced_worker(2, true);
         let frozen = worker
-            .publish_head_advance(cid(1), 5, Some(fluree_db_nameservice::Fence::from_u64(2)))
+            .publish_head_advance(
+                cid(1),
+                5,
+                WriteBasis::fenced(Some(fluree_db_nameservice::Fence::from_u64(2))),
+            )
             .await;
         assert!(
             matches!(&frozen, Err(WorkerError::Stage(reason)) if matches!(**reason, PoisonReason::LedgerNotFound { .. })),

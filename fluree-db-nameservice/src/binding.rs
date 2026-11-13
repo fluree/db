@@ -16,7 +16,7 @@
 //! registry entry, guarded by a [`Versioned::version`] counter the backend
 //! keeps with the item.
 
-use crate::{NameServiceError, NsRecord, Result};
+use crate::{ConfigValue, NameServiceError, NsRecord, Result};
 use async_trait::async_trait;
 use fluree_db_core::{InstanceId, StorageRoot};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -65,6 +65,43 @@ impl std::str::FromStr for Fence {
         u64::from_str_radix(s, 16)
             .map(Self)
             .map_err(|e| format!("invalid fence '{s}': {e}"))
+    }
+}
+
+/// What a write presents of the branch state it was made from: the fence of
+/// the branch it loaded, and that view's erasure generation. A writer takes
+/// both from the record it loaded ([`NsRecord::write_basis`]).
+///
+/// Erasure generations are a cluster's: activating a permanent erasure
+/// advances the generation of every branch holding the erased data, and a
+/// write made from a view before it is refused. Other backends keep none and
+/// ignore it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteBasis {
+    pub fence: Option<Fence>,
+    pub erasure_generation: u64,
+    /// For a write built from another branch's view too, as a merge or
+    /// rebase builds from its source: that branch's id and the view's
+    /// erasure generation.
+    pub source: Option<(String, u64)>,
+}
+
+impl WriteBasis {
+    /// A write presenting `fence`, from a view no erasure has reached.
+    pub fn fenced(fence: Option<Fence>) -> Self {
+        Self {
+            fence,
+            ..Self::default()
+        }
+    }
+
+    /// This basis, for a write also built from `source`'s view: the
+    /// record it read, at `generation` (see [`Self::source`]).
+    pub fn with_source(self, source: &NsRecord, generation: u64) -> Self {
+        Self {
+            source: Some((source.ledger_id.to_string(), generation)),
+            ..self
+        }
     }
 }
 
@@ -268,6 +305,12 @@ pub struct DroppedLedger {
     /// marked retracted is a branch dropped before its ledger, which a
     /// restore brings back still dropped.
     pub branches: Vec<NsRecord>,
+    /// Each branch's config as it was when the ledger was dropped, by
+    /// branch; a branch with none is absent. `None` when the drop did not
+    /// capture configs (a hard drop, or an entry from before drops did): a
+    /// restore then has none to reinstate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configs: Option<std::collections::BTreeMap<String, ConfigValue>>,
     /// Each branch's reasoning-indexes document, by branch, as it was when the
     /// ledger was dropped; a restore writes it back under the fresh fences.
     /// The heads' files stay under the instance root meanwhile.
@@ -291,6 +334,8 @@ struct DroppedLedgerFields {
     root: StorageRoot,
     root_branch: String,
     branches: Vec<NsRecord>,
+    #[serde(default)]
+    configs: Option<std::collections::BTreeMap<String, ConfigValue>>,
     #[serde(rename = "reasoningIndexes", default)]
     reasoning_indexes: std::collections::BTreeMap<String, crate::ReasoningIndexes>,
     #[serde(flatten)]
@@ -308,6 +353,7 @@ impl From<DroppedLedgerFields> for DroppedLedger {
             root: f.root,
             root_branch: f.root_branch,
             branches: f.branches,
+            configs: f.configs,
             reasoning_indexes: f.reasoning_indexes,
         }
     }
@@ -433,6 +479,10 @@ pub trait BranchRecordStore: Debug + Send + Sync {
 
     /// Mark the record frozen, if it carries `fence`.
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
+
+    /// Clear the record's frozen mark, if it carries `fence`: a drop that
+    /// froze it and wrote nothing else is undone.
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
 
     /// Delete the record and everything stored with it, if it carries
     /// `fence`.
@@ -636,11 +686,43 @@ mod tests {
                 name: "mydb".into(),
                 root_branch: "main".into(),
                 branches: vec![record.clone()],
+                configs: Some(
+                    [("main".to_string(), ConfigValue::new(3, None))]
+                        .into_iter()
+                        .collect(),
+                ),
                 reasoning_indexes: Default::default(),
             };
             let json = serde_json::to_string(&entry).unwrap();
             assert_eq!(serde_json::from_str::<DroppedLedger>(&json).unwrap(), entry);
         }
+    }
+
+    /// An entry from before drops captured configs reads as having none
+    /// captured, not as having captured none.
+    #[test]
+    fn an_entry_without_configs_did_not_capture_them() {
+        let instance = new_instance_id();
+        let mut record = NsRecord::new("mydb:main");
+        record.fence = Some(Fence::generate());
+        let entry = DroppedLedger {
+            extra: crate::binding::ExtraFields::new(),
+            root: StorageRoot::for_instance(&LedgerName::parse("mydb").unwrap(), &instance),
+            instance,
+            state: DroppedState::Dropped,
+            dropped_at: 1,
+            name: "mydb".into(),
+            root_branch: "main".into(),
+            branches: vec![record],
+            configs: Some(Default::default()),
+            reasoning_indexes: Default::default(),
+        };
+        let mut json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["configs"], json!({}));
+        json.as_object_mut().unwrap().remove("configs");
+        let legacy: DroppedLedger = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.configs, None);
+        assert!(legacy.extra.is_empty());
     }
 
     #[test]

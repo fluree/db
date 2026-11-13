@@ -1,0 +1,93 @@
+name: Prover build
+
+# Every platform's prover, as a release ships it. The guest builds once, in
+# RISC Zero's container pinned by digest, and each platform's prover embeds
+# that build, so each proves the image fluree-db-erasure pins: macOS runners
+# have no Docker to build it themselves. Each prover is checked against the
+# pins and uploaded as `artifacts-fluree-prover-<target>`, zstd-packed with
+# its checksum. release.yml attaches them; prover.yml builds them without
+# publishing.
+on:
+  workflow_call:
+
+jobs:
+  guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install RISC Zero's toolchain (risc0-build reads its version, even in the container)
+        run: |
+          curl -sSL https://risczero.com/install | bash
+          "$HOME/.risc0/bin/rzup" install rust
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+      - name: Build the guest in the pinned container
+        working-directory: fluree-prover
+        run: cargo run --locked --release -p fluree-prover-methods --example guest -- "$RUNNER_TEMP/redact.bin"
+      - name: Check that fluree-db-erasure pins it
+        working-directory: fluree-prover
+        run: cargo run --locked --release -p fluree-prover-methods --example image_id | python3 check-image-id.py
+      - uses: actions/upload-artifact@v6
+        with:
+          name: fluree-prover-guest
+          path: ${{ runner.temp }}/redact.bin
+
+  build:
+    needs: guest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            # The release CLI's runner (dist-workspace.toml): the default
+            # macOS runner is short of memory for an LTO link.
+            runner: macos-26-xlarge
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: actions/download-artifact@v7
+        with:
+          name: fluree-prover-guest
+          path: ${{ runner.temp }}/guest
+      # Xcode 26 ships without the Metal compiler, which risc0-sys's kernels need.
+      - name: Install the Metal toolchain
+        if: runner.os == 'macOS'
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Build the prover
+        working-directory: fluree-prover
+        env:
+          FLUREE_PROVER_GUEST: ${{ runner.temp }}/guest/redact.bin
+        run: cargo build --locked --release -p fluree-prover
+      - name: Check that fluree-db-erasure pins its guest, and package it
+        shell: bash
+        run: |
+          prover="$GITHUB_WORKSPACE/fluree-prover/target/release/fluree-prover"
+          "$prover" --image-id | python3 fluree-prover/check-image-id.py
+          mkdir -p "$RUNNER_TEMP/out"
+          cd "$RUNNER_TEMP/out"
+          command -v zstd >/dev/null || brew install zstd
+          # A long window: 27 MB, against 63 MB gzipped.
+          zstd -19 --long=27 -q "$prover" -o "fluree-prover-${{ matrix.target }}.zst"
+          shasum -a 256 "fluree-prover-${{ matrix.target }}.zst" > "fluree-prover-${{ matrix.target }}.zst.sha256"
+      # The `-erasure` image runs it on the Dockerfile's base.
+      - name: Run it on the server image's base
+        if: runner.os == 'Linux'
+        run: |
+          base=$(awk '$1 == "FROM" && $4 == "server-base" { print $2 }' Dockerfile)
+          docker run --rm -v "$GITHUB_WORKSPACE/fluree-prover/target/release:/prover:ro" "$base" \
+            /prover/fluree-prover --image-id | python3 fluree-prover/check-image-id.py
+      - uses: actions/upload-artifact@v6
+        with:
+          name: artifacts-fluree-prover-${{ matrix.target }}
+          path: ${{ runner.temp }}/out/

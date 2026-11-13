@@ -46,6 +46,9 @@ shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
 graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
+# Entry points for other crates' tests, such as accepting an erasure on a
+# cluster member. Never enabled outside dev-dependencies.
+testing = []
 # Remote search client (HTTP client for remote search service)
 search-remote-client = ["dep:reqwest"]
 # Embedded vector search (HNSW-based approximate nearest neighbor)
@@ -347,6 +350,10 @@ path = "tests/it_reasoning_lane_cache.rs"
 [[test]]
 name = "grp_transact"
 path = "tests/grp_transact.rs"
+
+[[test]]
+name = "grp_retention"
+path = "tests/grp_retention.rs"
 
 # Own binary: installs a process-global tracing subscriber and asserts on every
 # `fluree::cow_probe` event the process emits, so it must not share a process
@@ -739,6 +746,10 @@ name = "transact_commit"
 harness = false
 
 [[bench]]
+name = "content_hash"
+harness = false
+
+[[bench]]
 name = "transact_filtered_delete"
 harness = false
 
@@ -894,15 +905,23 @@ required-features = ["native"]
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Test hooks: halting a ledger, and building incrementally without fallback.
 fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }
+# A native prover with fake receipts, for erasure workflow tests.
+fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 moka = { workspace = true }
+# Permanent erasure: the redaction transform (to check a request against
+# what the prover will do) and the proof verifier.
+fluree-db-redaction = { path = "../fluree-db-redaction", default-features = false, features = ["host-sha", "c-zstd"] }
+fluree-db-erasure = { path = "../fluree-db-erasure" }
 fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 tokio = { workspace = true }
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
 dirs = "5"
+# Cluster collection: each intent object's nonce.
+rand = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 fluree-db-transact = { path = "../fluree-db-transact" }

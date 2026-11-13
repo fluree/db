@@ -25,6 +25,7 @@ use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
     merge_heads, ns_context, parse_record, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION,
 };
+use crate::WriteBasis;
 use crate::{
     deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -33,7 +34,7 @@ use crate::{
     RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{
     CasAction, CasOutcome, ContentId, Error as CoreError, InstanceId, LedgerId, StorageCas,
     StorageList, StorageRead, StorageWrite,
@@ -897,7 +898,7 @@ where
     }
 
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
         ns_cas::raw_record(
             &self.storage,
@@ -926,7 +927,7 @@ where
     }
 
     async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
         ns_cas::adopt_record(
             &self.storage,
@@ -940,7 +941,7 @@ where
     }
 
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
         ns_cas::freeze_record(
             &self.storage,
@@ -953,8 +954,22 @@ where
         .await
     }
 
-    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::thaw_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
+    async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_persisted_ledger_id(ledger_id)?;
         ns_cas::delete_record(&self.storage, &self.ns_key(&name, &branch), fence).await
     }
 }
@@ -967,11 +982,14 @@ where
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
+        let index_key = self.index_key(&ledger_name, &branch);
+        let index = crate::ns_format::snapshot_index(&snapshot);
 
         let outcome = self
             .storage
@@ -990,10 +1008,20 @@ where
             .await?;
 
         match outcome {
-            CasOutcome::Written => Ok(()),
-            CasOutcome::Aborted(true) => Err(NameServiceError::fenced(ledger_id)),
-            CasOutcome::Aborted(false) => Err(NameServiceError::not_found(ledger_id)),
+            CasOutcome::Written => {}
+            CasOutcome::Aborted(true) => return Err(NameServiceError::fenced(ledger_id)),
+            CasOutcome::Aborted(false) => return Err(NameServiceError::not_found(ledger_id)),
         }
+
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        self.cas_update::<NsIndexFileV2, _>(&index_key, move |existing| {
+            existing.map(|mut file| {
+                file.index = index.clone();
+                file
+            })
+        })
+        .await
     }
 }
 
@@ -1005,10 +1033,11 @@ where
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
@@ -1077,10 +1106,11 @@ where
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let key = self.index_key(&ledger_name, &branch);
@@ -1125,10 +1155,11 @@ where
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let index_key = self.index_key(&ledger_name, &branch);
@@ -1206,11 +1237,12 @@ where
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
 
         match kind {
@@ -1348,6 +1380,7 @@ where
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let key = self.index_key(name, branch);
 
@@ -2560,11 +2593,40 @@ mod tests {
             .unwrap();
 
         let index = ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"index");
-        ns.publish_index_fenced("mydb:main", record.fence, 5, &index)
+        ns.publish_index_fenced("mydb:main", record.write_basis(), 5, &index)
             .await
             .unwrap();
         let after = ns.lookup("mydb:main").await.unwrap().unwrap();
         assert_eq!((after.index_head_id, after.index_t), (Some(index), 5));
+    }
+
+    /// A reset moves the index back, even below one in the separate index
+    /// file, which otherwise wins at an equal or higher `t`.
+    #[tokio::test]
+    async fn reset_head_moves_the_index_back() {
+        let ns = make_storage_ns();
+        crate::testing::create(&ns, "mydb:main").await.unwrap();
+        publish_commit(&ns, "mydb:main", 3, &dummy_cid("commit-3")).await;
+        let basis = ns.lookup("mydb:main").await.unwrap().unwrap().write_basis();
+        ns.publish_index_fenced("mydb:main", basis.clone(), 3, &dummy_cid("index-3"))
+            .await
+            .unwrap();
+        for (index, t) in [(Some(dummy_cid("index-1")), 1), (None, 0)] {
+            ns.reset_head_fenced(
+                "mydb:main",
+                basis.clone(),
+                crate::NsRecordSnapshot {
+                    commit_head_id: Some(dummy_cid("commit-3")),
+                    commit_t: 3,
+                    index_head_id: index.clone(),
+                    index_t: t,
+                },
+            )
+            .await
+            .unwrap();
+            let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+            assert_eq!((record.index_head_id, record.index_t), (index, t));
+        }
     }
 
     #[tokio::test]

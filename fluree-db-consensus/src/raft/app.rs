@@ -119,11 +119,8 @@ impl AppStateMachine for NameServiceApp {
     /// does not drop the demoted voter — growing the cluster, say —
     /// re-promotes it, opening an `unreachable_after`-long window where
     /// work rendezvouses to an unreachable node.
-    fn apply_membership(
-        state: &mut NameServiceState,
-        membership: &MembershipView,
-        _log_index: u64,
-    ) {
+    fn apply_membership(state: &mut NameServiceState, membership: &MembershipView, log_index: u64) {
+        state.membership_index = log_index;
         let new_voters: BTreeSet<NodeId> = membership.voters.clone();
         let surviving_demotions: BTreeSet<NodeId> = state
             .configured_voters
@@ -188,6 +185,7 @@ pub struct NameServiceObserver {
     staged_receipts: Option<Arc<StagedReceiptMap>>,
     release_tx: Option<UnboundedSender<(String, ContentId)>>,
     ledger_manager: Arc<OnceLock<Arc<LedgerManager>>>,
+    erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
 }
 
 impl NameServiceObserver {
@@ -223,6 +221,19 @@ impl NameServiceObserver {
     pub fn with_release_sender(mut self, tx: UnboundedSender<(String, ContentId)>) -> Self {
         self.release_tx = Some(tx);
         self
+    }
+
+    /// Tell `node` how many erasure activations each apply leaves applied,
+    /// so a read can find them all installed without the state lock.
+    pub fn with_erasure_node(mut self, node: Arc<crate::raft::erasure::ErasureNode>) -> Self {
+        self.erasure = Some(node);
+        self
+    }
+
+    fn note_applied(&self, state: &NameServiceState) {
+        if let Some(node) = &self.erasure {
+            node.note_applied(state.erasure.next_activation);
+        }
     }
 
     /// Clone out the late-binding ledger-cache cell.
@@ -293,12 +304,10 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
         _log_index: u64,
         out: &mut Vec<Effect>,
     ) {
-        // A fenced write is the write it wraps, once the state machine has
+        self.note_applied(state);
+        // A wrapped write is the write it wraps, once the state machine has
         // admitted it.
-        let command = match command {
-            Command::Fenced { command, .. } => command.as_ref(),
-            command => command,
-        };
+        let command = command.admitted();
         if let Some(event) = event_for(command, response, state) {
             out.push(Effect::Event(event));
         }
@@ -323,6 +332,7 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
         load: SnapshotLoad,
         out: &mut Vec<Effect>,
     ) {
+        self.note_applied(state);
         // A snapshot advances heads in bulk without per-entry applies,
         // so the per-apply watermark report never fires for them.
         out.extend(state.refs.iter().filter_map(|(key, entry)| {
@@ -332,6 +342,16 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
             })
         }));
         if matches!(load, SnapshotLoad::LiveInstall) {
+            // A snapshot can replace a removal journal without moving its
+            // commit head. Invalidate readers through the same channel as
+            // ordinary replicated config changes, including SSE followers.
+            for (name, ledger) in &state.ledgers {
+                for branch in &ledger.branches {
+                    if let Some(ledger_id) = event_ledger_id(name, branch) {
+                        out.push(Effect::Event(NameServiceEvent::LedgerRefresh { ledger_id }));
+                    }
+                }
+            }
             // Only a live install can strand in-flight work. At boot
             // there is none to strand.
             out.push(Effect::InvalidateInFlight);
@@ -569,6 +589,12 @@ fn event_for(
     state: &NameServiceState,
 ) -> Option<NameServiceEvent> {
     match (cmd, response) {
+        (Command::PushConfig(args), Response::ConfigUpdated) => {
+            Some(NameServiceEvent::LedgerConfigPublished {
+                ledger_id: parsed_event_ledger_id(&args.ledger_id)?,
+                config_version: args.new.v,
+            })
+        }
         (
             Command::ApplyHead(args),
             Response::HeadApplied {
@@ -581,8 +607,10 @@ fn event_for(
             commit_id: commit_id.clone(),
             commit_t: *commit_t,
         }),
+        // A rewrite at the same `t` (a purge's) replaces the index a member
+        // has cached as much as an advance does.
         (
-            Command::AdvanceIndexHead(args),
+            Command::AdvanceIndexHead(args) | Command::RewriteIndexHead(args),
             Response::IndexAdvanced {
                 index_t,
                 index_head,
@@ -784,6 +812,31 @@ mod tests {
         ContentId::new(ContentKind::Commit, &[seed])
     }
 
+    /// Every apply and snapshot load tells the erasure node how many
+    /// activations are applied, so its reads can skip the state lock.
+    #[test]
+    fn applies_and_snapshot_loads_report_applied_activations() {
+        let node = Arc::new(crate::raft::erasure::ErasureNode::new(1, 7));
+        let observer = NameServiceObserver::new().with_erasure_node(Arc::clone(&node));
+        let mut state = NameServiceState::default();
+        state.erasure.next_activation = 2;
+        let mut out = Vec::new();
+        observer.on_snapshot_loaded(&state, SnapshotLoad::BootRestore, &mut out);
+        assert!(!node.installed_everything());
+        node.mark_installed(2);
+        assert!(node.installed_everything());
+        state.erasure.next_activation = 3;
+        let mut response = Response::NoOp;
+        observer.on_command(
+            &state,
+            &RaftCommand::ReleaseContent { id: cid(1) },
+            &mut response,
+            1,
+            &mut out,
+        );
+        assert!(!node.installed_everything());
+    }
+
     /// `drain_releases` must forward a keyless entry's envelope
     /// (paired with the response's ledger_id) so the per-node
     /// release task frees it, and forward nothing when the entry
@@ -819,6 +872,58 @@ mod tests {
             drain_releases(&mut poisoned),
             vec![("test/db:main".to_string(), cid(3))]
         );
+    }
+
+    #[test]
+    fn a_config_change_is_announced_without_a_head_change() {
+        let command = Command::PushConfig(Box::new(crate::raft::state_machine::ConfigUpdate {
+            ledger_id: "test/db:main".into(),
+            expected: None,
+            new: crate::raft::state_machine::StoredConfig {
+                v: 9,
+                payload: None,
+            },
+        }));
+        assert!(matches!(
+            event_for(
+                &command,
+                &Response::ConfigUpdated,
+                &NameServiceState::default()
+            ),
+            Some(NameServiceEvent::LedgerConfigPublished {
+                config_version: 9,
+                ..
+            })
+        ));
+    }
+
+    /// An index rewritten at the same `t`, as a purge rewrites one, is
+    /// announced as an advance is: members reload what they cached.
+    #[test]
+    fn an_index_rewrite_is_announced() {
+        let command = Command::RewriteIndexHead(crate::raft::state_machine::NewIndexHead {
+            ledger_id: "test/db".into(),
+            branch: "main".into(),
+            new_index_head: cid(2),
+            t: 3,
+            applied_at_millis: 1_000,
+        });
+        let mut response = Response::IndexAdvanced {
+            index_t: 3,
+            index_head: cid(2),
+        };
+        let mut effects = Vec::new();
+        NameServiceObserver::new().on_command(
+            &NameServiceState::default(),
+            &command,
+            &mut response,
+            1,
+            &mut effects,
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Event(NameServiceEvent::LedgerIndexPublished { index_t: 3, .. })
+        )));
     }
 
     /// A write presenting a fence reaches the observer wrapped, as it was
@@ -954,6 +1059,7 @@ mod tests {
         let expected: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
         assert_eq!(state.configured_voters, expected);
         assert_eq!(state.worker_eligible_voters, expected);
+        assert_eq!(state.membership_index, 1, "the membership in force");
     }
 
     #[tokio::test]
@@ -1534,6 +1640,50 @@ mod tests {
             .contains_key("test/db"));
         let (applied, _) = target.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 1)));
+    }
+
+    /// A snapshot whose layout predates the membership index (V1/V2)
+    /// carries none; the membership in force when it was taken is applied
+    /// as it loads, on install and on a restart, so every member agrees
+    /// with one that replayed the membership entry instead.
+    #[tokio::test]
+    async fn a_snapshot_from_before_the_membership_index_takes_it_from_its_membership() {
+        let source_storage = Arc::new(MemoryRaftStorage::new());
+        let mut source =
+            StateMachineAdapter::new(Arc::clone(&source_storage), NameServiceObserver::new());
+        source
+            .apply([
+                membership_entry(1, &[1, 2, 3]),
+                create_ledger_entry(2, "test/db"),
+            ])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let v2 = source.shared_state().read().await.to_v2_snapshot();
+        assert_eq!(
+            NameServiceState::from_snapshot(&v2)
+                .unwrap()
+                .membership_index,
+            0,
+            "the layout carries none"
+        );
+
+        let target_storage = Arc::new(MemoryRaftStorage::new());
+        let mut target =
+            StateMachineAdapter::new(Arc::clone(&target_storage), NameServiceObserver::new());
+        target
+            .install_snapshot(&snap.meta, Box::new(std::io::Cursor::new(v2)))
+            .await
+            .unwrap();
+        let installed = target.shared_state().read().await.clone();
+        assert_eq!(installed.membership_index, 1);
+        assert!(installed.ledgers.contains_key("test/db"));
+
+        let restarted = StateMachineAdapter::open(target_storage, NameServiceObserver::new())
+            .await
+            .unwrap();
+        assert_eq!(restarted.shared_state().read().await.membership_index, 1);
     }
 
     #[tokio::test]

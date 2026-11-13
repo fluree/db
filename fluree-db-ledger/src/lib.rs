@@ -806,6 +806,15 @@ impl LedgerState {
         self.ns_record.as_ref().and_then(|r| r.fence)
     }
 
+    /// What this state's writes present: its record's fence and erasure
+    /// generation, captured when it was loaded.
+    pub fn write_basis(&self) -> fluree_db_nameservice::WriteBasis {
+        self.ns_record
+            .as_ref()
+            .map(fluree_db_nameservice::NsRecord::write_basis)
+            .unwrap_or_default()
+    }
+
     /// Where this branch's artifacts live, from its nameservice record. A
     /// state built without one belongs to no created ledger and holds no
     /// data; it reads from its id's namespace at the name.

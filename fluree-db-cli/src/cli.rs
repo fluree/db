@@ -1194,6 +1194,12 @@ pub enum Commands {
         action: RemoteAction,
     },
 
+    /// Install and check the prover that permanent erasure needs
+    Prover {
+        #[command(subcommand)]
+        action: ProverAction,
+    },
+
     /// Manage authentication tokens for remotes
     Auth {
         #[command(subcommand)]
@@ -1238,6 +1244,13 @@ pub enum Commands {
         /// Skip pulling binary index data (indexes are pulled by default)
         #[arg(long)]
         no_indexes: bool,
+
+        /// Accept the permanent erasures the ledger's origins carry, for this
+        /// pull: they remove values from history held here, which nothing
+        /// undoes. A named remote is designated with `fluree remote
+        /// erasure-authority` instead
+        #[arg(long)]
+        erasure_authority: bool,
     },
 
     /// Push a ledger to its upstream remote
@@ -1304,6 +1317,12 @@ pub enum Commands {
         /// needed — e.g., when cloning a large ledger for read-only query use.
         #[arg(long)]
         no_txns: bool,
+
+        /// Accept the permanent erasures the origin's history carries, for
+        /// this clone. A named remote is designated with `fluree remote
+        /// erasure-authority` instead
+        #[arg(long, requires = "origin")]
+        erasure_authority: bool,
     },
 
     /// Track a remote ledger (remote-only, no local data)
@@ -3573,6 +3592,29 @@ pub enum InspectOutputFormat {
 }
 
 #[derive(Subcommand)]
+pub enum ProverAction {
+    /// Download this release's prover and install it beside `fluree`, where
+    /// a server finds it
+    Install {
+        /// Release to install from (default: this binary's)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Directory to install into (default: beside this binary)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Replace a prover already there
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Show the prover a server started here would use, and whether it
+    /// proves an image this release accepts
+    Status,
+}
+
+#[derive(Subcommand)]
 pub enum RemoteAction {
     /// Add a remote server
     Add {
@@ -3585,6 +3627,23 @@ pub enum RemoteAction {
         /// Authentication token (or @filepath to read from file)
         #[arg(long)]
         token: Option<String>,
+
+        /// Accept the permanent erasures this remote's history carries, on
+        /// clone and pull (see `remote erasure-authority`)
+        #[arg(long)]
+        erasure_authority: bool,
+    },
+
+    /// Whether clone and pull accept the permanent erasures a remote's
+    /// history carries. They remove values from history held here too, which
+    /// nothing undoes: designate only a remote trusted to authorize them.
+    ErasureAuthority {
+        /// Remote name
+        name: String,
+
+        /// `true` to accept its erasures, `false` to refuse them
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
     },
 
     /// Remove a remote

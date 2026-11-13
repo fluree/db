@@ -955,9 +955,51 @@ pub trait Housekeeping: Send + Sync {
     async fn tick(&self);
 }
 
+/// Several housekeepings run as one, in order, each to completion.
+pub struct Housekeepings(pub Vec<Arc<dyn Housekeeping>>);
+
+#[async_trait::async_trait]
+impl Housekeeping for Housekeepings {
+    async fn tick(&self) {
+        for housekeeping in &self.0 {
+            housekeeping.tick().await;
+        }
+    }
+}
+
 /// The housekeeping a worker's catch-up tick runs, shared with its handle so
 /// it can be installed once the worker is running.
 type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
+
+/// Work the background worker runs around a build of a ledger's index, with
+/// the record it builds from: see [`IndexerHandle::set_build_observer`].
+#[async_trait::async_trait]
+pub trait BuildObserver: Send + Sync {
+    /// Runs before the build. An error skips the build, which is retried.
+    async fn before_build(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+    ) -> std::result::Result<BuildDirectives, String>;
+
+    /// Runs once `result` is built from `record` and before it is published:
+    /// what the build read that the index will cover. An error leaves the
+    /// root unpublished, and the build is retried.
+    async fn before_publish(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+        result: &IndexResult,
+    ) -> std::result::Result<(), String>;
+}
+
+/// What a [`BuildObserver`] asks of the build it was shown.
+#[derive(Clone, Debug, Default)]
+pub struct BuildDirectives {
+    /// History the build leaves out of the index (retention).
+    pub history_suppression: Vec<crate::config::SuppressedHistory>,
+}
+
+/// The build observer, shared with the worker's handle like housekeeping.
+type BuildObserverSlot = Arc<std::sync::RwLock<Option<Arc<dyn BuildObserver>>>>;
 
 async fn run_housekeeping(slot: &HousekeepingSlot) {
     let housekeeping = slot.read().ok().and_then(|h| h.clone());
@@ -982,6 +1024,9 @@ async fn run_housekeeping(slot: &HousekeepingSlot) {
 pub struct IndexerHandle {
     trigger: TriggerHandle,
     housekeeping: HousekeepingSlot,
+    build_observer: BuildObserverSlot,
+    /// Where the worker's builds spill: [`IndexerConfig::data_dir`].
+    data_dir: Option<std::path::PathBuf>,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -1368,8 +1413,21 @@ impl TriggerHandle {
 }
 
 impl IndexerHandle {
+    /// Where the worker's builds spill: [`IndexerConfig::data_dir`].
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.data_dir.as_deref()
+    }
+
     /// Run `housekeeping` on this worker's catch-up ticks, replacing any
     /// installed before. A worker that does not own catch-up never runs it.
+    /// Run `observer` before each background build, replacing any observer
+    /// installed before.
+    pub fn set_build_observer(&self, observer: Arc<dyn BuildObserver>) {
+        if let Ok(mut slot) = self.build_observer.write() {
+            *slot = Some(observer);
+        }
+    }
+
     pub fn set_housekeeping(&self, housekeeping: Arc<dyn Housekeeping>) {
         if let Ok(mut slot) = self.housekeeping.write() {
             *slot = Some(housekeeping);
@@ -1550,6 +1608,7 @@ pub struct BackgroundIndexerWorker {
     gc_locks: GcLocks,
     /// Shared with the handle; run on each catch-up tick.
     housekeeping: HousekeepingSlot,
+    build_observer: BuildObserverSlot,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
@@ -1606,6 +1665,7 @@ impl BackgroundIndexerWorker {
         let maintenance: MaintenanceHolds = Arc::default();
         let gc_locks: GcLocks = Arc::default();
         let housekeeping: HousekeepingSlot = Arc::default();
+        let build_observer: BuildObserverSlot = Arc::default();
 
         let trigger = TriggerHandle {
             states: Arc::clone(&states),
@@ -1617,6 +1677,8 @@ impl BackgroundIndexerWorker {
         let handle = IndexerHandle {
             trigger: trigger.clone(),
             housekeeping: Arc::clone(&housekeeping),
+            build_observer: Arc::clone(&build_observer),
+            data_dir: config.data_dir.clone(),
             _shutdown: shutdown,
         };
 
@@ -1634,6 +1696,7 @@ impl BackgroundIndexerWorker {
             maintenance,
             gc_locks,
             housekeeping,
+            build_observer,
         };
 
         (worker, handle)
@@ -2349,6 +2412,19 @@ impl BackgroundIndexerWorker {
                 .unwrap_or(None)
         };
 
+        let observer = self.build_observer.read().ok().and_then(|o| o.clone());
+        if let Some(observer) = &observer {
+            match observer.before_build(&record).await {
+                Ok(directives) => {
+                    job_config.history_suppression = directives.history_suppression;
+                }
+                Err(e) => {
+                    warn!(ledger_id = %ledger_id, error = %e, "build observer failed; build deferred");
+                    self.schedule_retry(ledger_id, &e).await;
+                    return;
+                }
+            }
+        }
         let result = crate::build_index_for_record_with_tracker(
             content_store.clone(),
             build_tracker.clone(),
@@ -2359,6 +2435,13 @@ impl BackgroundIndexerWorker {
 
         match result {
             Ok(index_result) => {
+                if let Some(observer) = &observer {
+                    if let Err(e) = observer.before_publish(&record, &index_result).await {
+                        warn!(ledger_id = %ledger_id, error = %e, "build observer failed; publish deferred");
+                        self.schedule_retry(ledger_id, &e).await;
+                        return;
+                    }
+                }
                 // Try to publish
                 if let Err(e) = crate::publish_index_result(
                     &content_store,
@@ -3039,7 +3122,7 @@ where
                 Ok(()) => nameservice
                     .publish_index_fenced(
                         &ledger_addr,
-                        result.fence,
+                        result.basis.clone(),
                         result.index_t,
                         &result.root_id,
                     )
@@ -3158,7 +3241,7 @@ where
         )))
     })?;
     nameservice
-        .publish_index_fenced(&ledger_addr, result.fence, result.index_t, &result.root_id)
+        .publish_index_fenced(&ledger_addr, result.basis, result.index_t, &result.root_id)
         .await
         .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
 
@@ -3336,6 +3419,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -3374,6 +3458,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -3421,6 +3506,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -3455,6 +3541,7 @@ mod tests {
             namespace_delta: HashMap::new(),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -3484,6 +3571,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -3911,12 +3999,12 @@ mod tests {
             async fn publish_index_fenced(
                 &self,
                 id: &str,
-                fence: Option<fluree_db_nameservice::Fence>,
+                basis: fluree_db_nameservice::WriteBasis,
                 t: i64,
                 index_id: &ContentId,
             ) -> Result<()> {
                 self.inner
-                    .publish_index_fenced(id, fence, t, index_id)
+                    .publish_index_fenced(id, basis, t, index_id)
                     .await
             }
         }
@@ -3926,10 +4014,10 @@ mod tests {
             async fn reset_head_fenced(
                 &self,
                 id: &str,
-                fence: Option<fluree_db_nameservice::Fence>,
+                basis: fluree_db_nameservice::WriteBasis,
                 snapshot: NsRecordSnapshot,
             ) -> Result<()> {
-                self.inner.reset_head_fenced(id, fence, snapshot).await
+                self.inner.reset_head_fenced(id, basis, snapshot).await
             }
         }
     }
@@ -4180,6 +4268,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -4227,6 +4316,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -4782,6 +4872,7 @@ mod tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -4834,6 +4925,86 @@ mod tests {
         // Idle and halt-free, the entry may already be pruned.
         assert!(handle.status(&ledger).await.is_none_or(|s| !s.halted));
         run.abort();
+    }
+
+    /// The build reports the earliest commit carrying retention input to the
+    /// observer before publishing, and a refusal there leaves the root
+    /// unpublished.
+    #[tokio::test]
+    async fn a_refused_publish_hook_leaves_the_build_unpublished() {
+        struct Refusing(std::sync::Mutex<Vec<Option<i64>>>);
+        #[async_trait::async_trait]
+        impl BuildObserver for Refusing {
+            async fn before_build(
+                &self,
+                _: &NsRecord,
+            ) -> std::result::Result<BuildDirectives, String> {
+                Ok(BuildDirectives::default())
+            }
+            async fn before_publish(
+                &self,
+                _: &NsRecord,
+                built: &IndexResult,
+            ) -> std::result::Result<(), String> {
+                self.0.lock().unwrap().push(built.retention_input_from_t);
+                Err("refused".into())
+            }
+        }
+
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let commit = |t: i64, parents: Vec<ContentId>, marked: bool| Commit {
+            id: None,
+            t,
+            time: None,
+            flakes: vec![make_flake(1, "ex:alice", 1, "ex:age", t, t)],
+            parents,
+            txn: None,
+            namespace_delta: HashMap::from([(1, "ex:".to_string())]),
+            txn_signature: None,
+            commit_signatures: Vec::new(),
+            redaction: None,
+            txn_meta: if marked {
+                vec![fluree_db_core::TxnMetaEntry::new(
+                    fluree_vocab::namespaces::FLUREE_DB,
+                    fluree_vocab::db::RETENTION_CONTROL,
+                    fluree_db_core::TxnMetaValue::Boolean(true),
+                )]
+            } else {
+                Vec::new()
+            },
+            graph_delta: HashMap::new(),
+            ns_split_mode: None,
+            graph_drops: Vec::new(),
+        };
+        let first = store_commit(&storage, &commit(1, Vec::new(), false)).await;
+        let second = store_commit(&storage, &commit(2, vec![first], true)).await;
+        let third = store_commit(&storage, &commit(3, vec![second.clone()], true)).await;
+        fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
+            .await
+            .unwrap();
+        ns.publish_commit("test:main", 3, &third).await.unwrap();
+
+        let config = IndexerConfig::small()
+            .with_data_dir(std::env::temp_dir().join("fluree-test-orch-publish-hook"));
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            Arc::clone(&ns) as Arc<dyn IndexingNameService>,
+            config,
+        );
+        let observer = Arc::new(Refusing(std::sync::Mutex::default()));
+        handle.set_build_observer(observer.clone());
+        let ledger = id("test:main");
+        let _waiter = handle.trigger(&ledger, 3).await;
+        worker.process_ledger(&ledger).await;
+
+        assert_eq!(*observer.0.lock().unwrap(), vec![Some(2)]);
+        let record = ns.lookup("test:main").await.unwrap().unwrap();
+        assert_eq!(record.index_t, 0, "a refused hook publishes nothing");
+        let states = handle.trigger.states.lock().await;
+        let state = states.get(&ledger).expect("state exists");
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(state.last_error.as_deref(), Some("refused"));
     }
 
     #[tokio::test]
@@ -5936,6 +6107,7 @@ mod embedded_tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
@@ -5993,6 +6165,7 @@ mod embedded_tests {
             namespace_delta: HashMap::from([(1, "ex:".to_string())]),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,

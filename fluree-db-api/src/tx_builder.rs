@@ -21,7 +21,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
 use crate::ledger_manager::{
-    CommitFootprint, LedgerHandle, LedgerManager, LedgerWriteGuard, RefreshOpts, WritePath,
+    other_activation, CommitFootprint, LedgerHandle, LedgerManager, LedgerWriteGuard, RefreshOpts,
+    WritePath,
 };
 use crate::tx::{
     IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef, WriteScope,
@@ -1234,6 +1235,12 @@ impl Fluree {
     /// When the guard is `Some`, the state was cloned from the locked
     /// cache; when `None`, it was loaded fresh from storage via
     /// `fallback_store`/`fallback_record`.
+    ///
+    /// The state is of the activation `fallback_record` names, which the
+    /// caller planned from: one cached from before a drop and recreate, or
+    /// before an erasure, would stage that plan on other history and
+    /// publish it under the record's fence. Such a state is evicted and
+    /// loaded again.
     pub(crate) async fn lock_or_load<C>(
         &self,
         ledger_id: &LedgerId,
@@ -1243,15 +1250,25 @@ impl Fluree {
     where
         C: ContentStore + Clone + 'static,
     {
-        let write_guard = self.lock_ledger(ledger_id).await?;
-        let state = match write_guard.as_ref() {
-            Some(guard) => guard.clone_state(),
-            None => {
-                self.load_queryable_state_with_store(fallback_store, fallback_record)
-                    .await?
+        for _ in 0..2 {
+            let write_guard = self.lock_ledger(ledger_id).await?;
+            let Some(guard) = write_guard.as_ref() else {
+                let state = self
+                    .load_queryable_state_with_store(fallback_store, fallback_record)
+                    .await?;
+                return Ok((None, state));
+            };
+            let state = guard.clone_state();
+            if !other_activation(state.ns_record.as_ref(), &fallback_record) {
+                return Ok((write_guard, state));
             }
-        };
-        Ok((write_guard, state))
+            drop(write_guard);
+            self.disconnect_ledger(ledger_id.as_str()).await;
+        }
+        Err(ApiError::http(
+            409,
+            format!("{ledger_id} changed while the operation was prepared; retry it"),
+        ))
     }
 
     /// Finalize a successful commit against the cached [`LedgerHandle`].
@@ -1331,7 +1348,9 @@ impl Fluree {
     ) -> CommitOpts {
         if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(namespace);
-            commit_opts.with_raw_txn_spawned(content_store, txn_payload)
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, txn_payload)
         } else {
             commit_opts
         }
@@ -2018,6 +2037,8 @@ impl Fluree {
             graph_delta,
             sync_graph,
         } = stage;
+        let mut view = view;
+        let system_txn_meta = view.take_system_txn_meta();
         let (stale_base, mut flakes) = view.into_parts();
         drop(stale_base);
         let new_t = current.t() + 1;
@@ -2081,7 +2102,10 @@ impl Fluree {
         );
         // A bounded scope has no named-graph flakes (see `write_scope`), so
         // the graph routing map is empty.
-        let view = StagedLedger::new(guard.clone_state(), flakes, &HashMap::new()).ok()?;
+        let mut view = StagedLedger::new(guard.clone_state(), flakes, &HashMap::new()).ok()?;
+        for entry in system_txn_meta {
+            view.push_system_txn_meta(entry);
+        }
         Some(StageResult {
             view,
             ns_registry,
@@ -2253,14 +2277,18 @@ impl Fluree {
         // local pending upload — both pointing to the same CID would
         // be redundant work. The result CID ends up referenced by the
         // commit record.
+        let mut txn_pin = fluree_db_core::Unpublished::new();
         let txn_id = if let Some(cid) = commit_opts.raw_txn_id.take() {
             // Drop any redundant pending upload — its blob (if it
             // landed) shares the same CID and stays content-addressed.
             commit_opts.raw_txn_upload.take();
             Some(cid)
         } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
-            let cid = pending.finish().await.map_err(ApiError::from)?;
+            let (cid, pin) = pending.finish().await.map_err(ApiError::from)?;
             tracing::debug!(ledger = %ledger.id(), raw_txn_cid = %cid, "raw txn upload finished");
+            if let Some(pin) = pin {
+                txn_pin.push(pin);
+            }
             Some(cid)
         } else {
             None
@@ -2288,10 +2316,11 @@ impl Fluree {
             expected_head_ref,
             txn_id,
             &index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await
         .map_err(ApiError::from)?;
+        staged.pins = txn_pin;
         tracing::debug!(
             ledger = %ledger.id(),
             t = staged.commit.t,
@@ -2780,5 +2809,108 @@ mod tests {
         // Handle should be updated
         let snapshot = handle.snapshot().await;
         assert_eq!(snapshot.t, 1);
+    }
+
+    /// A revert or merge plans from the branch's record and stages on the
+    /// state [`Fluree::lock_or_load`] returns. Each evicts the branch first,
+    /// but a load racing a drop and recreate can cache the old ledger's state
+    /// again after that: it is not staged on, the new ledger is loaded, and
+    /// nothing of the old one lands in it.
+    #[tokio::test]
+    async fn the_state_staged_on_is_the_activation_the_record_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        let id = "t/recreated:main";
+        let insert = |subject: &'static str| {
+            let fluree = &fluree;
+            async move {
+                fluree
+                    .graph(id)
+                    .transact()
+                    .insert(&json!({
+                        "@id": format!("http://example.org/{subject}"),
+                        "http://example.org/n": 1
+                    }))
+                    .commit()
+                    .await
+                    .unwrap();
+            }
+        };
+        let ledger_id = LedgerId::parse(id).unwrap();
+        // The old ledger's state, cached as a racing load would leave it.
+        let cache_stale = |stale: LedgerState| {
+            let fluree = &fluree;
+            let ledger_id = &ledger_id;
+            async move {
+                fluree
+                    .lock_ledger(ledger_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .replace(stale);
+            }
+        };
+        fluree.create_ledger("t/recreated").await.unwrap();
+        insert("old1").await;
+        insert("old2").await;
+        insert("old3").await;
+        let stale = fluree
+            .lock_ledger(&ledger_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .clone_state();
+        fluree
+            .drop_ledger("t/recreated", crate::DropMode::Soft)
+            .await
+            .unwrap();
+        fluree.create_ledger("t/recreated").await.unwrap();
+        insert("new1").await;
+        insert("new2").await;
+
+        cache_stale(stale.clone()).await;
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        let store = fluree.content_store(&record.storage_namespace());
+        let (guard, state) = fluree
+            .lock_or_load(&ledger_id, store, record.clone())
+            .await
+            .unwrap();
+        assert!(guard.is_some());
+        assert_eq!(state.t(), 2);
+        assert_eq!(state.ns_record.as_ref().unwrap().fence, record.fence);
+        drop(guard);
+
+        // And through a revert, the old state cached again.
+        cache_stale(stale).await;
+        fluree
+            .revert_commit(
+                "t/recreated",
+                "main",
+                crate::CommitRef::T(2),
+                crate::ConflictStrategy::Abort,
+            )
+            .await
+            .unwrap();
+        let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+        assert_eq!(
+            record.commit_t, 3,
+            "the revert followed the new ledger's head"
+        );
+        let subjects = fluree
+            .query_connection(&json!({
+                "from": id,
+                "select": "?s",
+                "where": {"@id": "?s", "http://example.org/n": 1}
+            }))
+            .await
+            .unwrap();
+        let ledger = fluree.ledger(id).await.unwrap();
+        let subjects = subjects.to_jsonld(&ledger.snapshot).unwrap().to_string();
+        assert!(!subjects.contains("old"), "{subjects}");
+        assert!(subjects.contains("new1"), "{subjects}");
+        assert!(!subjects.contains("new2"), "{subjects}");
     }
 }

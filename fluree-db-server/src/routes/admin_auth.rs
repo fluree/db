@@ -95,6 +95,31 @@ pub async fn require_admin_token(
     next.run(request).await
 }
 
+/// Whether a request with `headers` has what admin endpoints require: always
+/// with admin auth off, else a Bearer token from a trusted admin issuer.
+/// For a request on another route that does something only an admin may.
+pub(crate) async fn has_admin_authority(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let admin_auth = state.config.admin_auth();
+    if admin_auth.mode == AdminAuthMode::None {
+        return true;
+    }
+    let Some(token) = extract_bearer_token(headers) else {
+        return false;
+    };
+    let events_auth = state.config.events_auth();
+    #[cfg(feature = "oidc")]
+    let verified = verify_admin_token(
+        &token,
+        &admin_auth,
+        &events_auth,
+        state.jwks_cache.as_deref(),
+    )
+    .await;
+    #[cfg(not(feature = "oidc"))]
+    let verified = verify_admin_token(&token, &admin_auth, &events_auth);
+    verified.is_ok()
+}
+
 /// Verify admin token and build principal (embedded JWK only — non-oidc builds)
 #[cfg(not(feature = "oidc"))]
 fn verify_admin_token(

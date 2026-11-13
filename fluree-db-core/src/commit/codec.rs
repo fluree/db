@@ -7,6 +7,8 @@
 //!
 //! - **V4** (current write format) — see [`reader`], [`raw_reader`], [`writer`]
 //! - **V3** (legacy read-only) — see [`legacy_v3`]
+//! - **`FCR1`** — a redacted replacement of a v4 commit, read as that commit
+//!   less its erased operations; see [`replacement`]
 //!
 //! V3 blobs carry a trailing 32-byte SHA-256 hash over the commit body and
 //! derive their CID from that embedded hash. V4 removes the embedded hash and
@@ -37,11 +39,13 @@
 
 pub mod envelope;
 mod error;
+pub mod flake_batch;
 pub mod format;
 pub mod legacy_v3;
 pub mod op_codec;
 pub mod raw_reader;
 mod reader;
+pub mod replacement;
 pub mod string_dict;
 pub mod varint;
 #[cfg(feature = "credential")]
@@ -49,6 +53,7 @@ mod writer;
 
 pub use envelope::CodecEnvelope;
 pub use error::CommitCodecError;
+pub use flake_batch::{decode_flake_batch, encode_flake_batch};
 pub use format::{CommitSignature, ALGO_ED25519, MAGIC, VERSION, VERSION_V3};
 pub use raw_reader::{CommitOps, RawObject, RawOp, RawTripleTerm};
 #[cfg(feature = "credential")]
@@ -66,12 +71,16 @@ use format::{HEADER_LEN, MAGIC as HEADER_MAGIC};
 enum CommitBlobVersion {
     V3,
     V4,
+    Replacement,
 }
 
 /// Inspect the blob header and determine which format version it is.
 ///
 /// Validates minimum length and magic bytes before returning the version.
 fn detect_version(bytes: &[u8]) -> Result<CommitBlobVersion, CommitCodecError> {
+    if replacement::is_replacement(bytes) {
+        return Ok(CommitBlobVersion::Replacement);
+    }
     if bytes.len() < HEADER_LEN {
         return Err(CommitCodecError::TooSmall {
             got: bytes.len(),
@@ -97,6 +106,7 @@ pub fn read_commit(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
     match detect_version(bytes)? {
         CommitBlobVersion::V3 => legacy_v3::read_commit_v3(bytes),
         CommitBlobVersion::V4 => reader::read_commit_v4(bytes),
+        CommitBlobVersion::Replacement => replacement::read_commit_replacement(bytes),
     }
 }
 
@@ -108,6 +118,7 @@ pub fn read_commit_envelope(bytes: &[u8]) -> Result<CommitEnvelope, CommitCodecE
     match detect_version(bytes)? {
         CommitBlobVersion::V3 => legacy_v3::read_commit_envelope_v3(bytes),
         CommitBlobVersion::V4 => reader::read_commit_envelope_v4(bytes),
+        CommitBlobVersion::Replacement => replacement::read_envelope_replacement(bytes),
     }
 }
 
@@ -120,6 +131,7 @@ pub fn load_commit_ops(bytes: &[u8]) -> Result<CommitOps, CommitCodecError> {
     match detect_version(bytes)? {
         CommitBlobVersion::V3 => legacy_v3::load_commit_ops_v3(bytes),
         CommitBlobVersion::V4 => raw_reader::load_commit_ops_v4(bytes),
+        CommitBlobVersion::Replacement => replacement::load_commit_ops_replacement(bytes),
     }
 }
 
@@ -128,9 +140,28 @@ pub fn load_commit_ops(bytes: &[u8]) -> Result<CommitOps, CommitCodecError> {
 /// Dispatches to the v3 or v4 verifier based on the blob's header version
 /// byte. V3 verifies the embedded trailing hash; V4 derives the CID from
 /// `SHA-256(full blob)` and relies on the content store for integrity.
+///
+/// A replacement is refused: it is reached only through an erasure mapping,
+/// never received or stored as a commit blob.
 pub fn verify_commit_blob(bytes: &[u8]) -> Result<ContentId, CommitCodecError> {
     match detect_version(bytes)? {
         CommitBlobVersion::V3 => legacy_v3::verify_commit_v3(bytes),
         CommitBlobVersion::V4 => reader::verify_commit_blob_v4(bytes),
+        CommitBlobVersion::Replacement => Err(CommitCodecError::InvalidMagic),
+    }
+}
+
+/// Whether `bytes` are the commit blob `id` names, by the blob's own rules:
+/// a v3 blob's embedded hash, a v4 blob's full-bytes hash under `id`'s
+/// algorithm. Use this, not [`verify_commit_blob`], wherever the expected
+/// CID is known: the derived CID is always SHA2-256. A replacement matches
+/// no CID here (see [`verify_commit_blob`]).
+pub fn commit_blob_matches(id: &ContentId, bytes: &[u8]) -> bool {
+    match detect_version(bytes) {
+        Ok(CommitBlobVersion::V3) => legacy_v3::verify_commit_v3(bytes).is_ok_and(|d| d == *id),
+        Ok(CommitBlobVersion::V4) => {
+            reader::validate_commit_blob_v4(bytes).is_ok() && id.verify(bytes)
+        }
+        Ok(CommitBlobVersion::Replacement) | Err(_) => false,
     }
 }

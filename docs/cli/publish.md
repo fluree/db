@@ -30,7 +30,7 @@ fluree publish <REMOTE> [LEDGER] [OPTIONS]
 3. Pushes all local commits (`POST /push`, or `POST /push-merges` when the history contains a merge)
 4. Configures upstream tracking so subsequent `fluree push` and `fluree pull` work
 
-A history containing a merge needs a server that supports pushing merges. See [push](push.md#pushing-a-merge). Publish checks this before creating the remote ledger, so a refusal leaves the remote untouched.
+A history containing a merge needs a server that supports pushing merges. See [push](push.md#pushing-a-merge). So does a history holding permanently erased commits, which travel as their erasures ([push](push.md#erased-history-and-the-removal-journal)). Publish checks both before creating the remote ledger, so a refusal leaves the remote untouched.
 
 This is intended for the "create locally, deploy to server" workflow. If the remote ledger already has data (t > 0), the command will fail — use `fluree push` instead for incremental updates.
 

@@ -96,8 +96,10 @@
 //! per-endpoint.
 
 pub mod app;
+pub mod collect;
 pub mod commit_worker;
 pub mod embedded;
+pub mod erasure;
 pub mod eviction_scheduler;
 pub mod integration;
 pub mod liveness_monitor;

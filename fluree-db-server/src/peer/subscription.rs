@@ -112,8 +112,12 @@ struct PeerEventSink {
 impl PeerEventSink {
     /// Evict cached ledgers the subscription covers that a completed
     /// snapshot did not name: the server retracted them while this peer
-    /// was away.
+    /// was away. One that missed a refresh meanwhile refreshes them all.
     async fn reconcile(&self, named: &SnapshotNames) {
+        if named.missed_refresh {
+            self.fluree.refresh_ledgers().await;
+            tracing::info!("Erasures changed while disconnected; cached ledgers refreshed");
+        }
         let Some(mgr) = self.fluree.ledger_manager() else {
             return;
         };
@@ -201,7 +205,7 @@ impl HeadSink for PeerEventSink {
     async fn on_event(&self, event: RemoteEvent) {
         let named = self.snapshot.observe(&event);
         match event {
-            RemoteEvent::SnapshotComplete => {
+            RemoteEvent::SnapshotComplete { .. } => {
                 if let Some(named) = named {
                     self.reconcile(&named).await;
                 }
@@ -219,6 +223,7 @@ impl HeadSink for PeerEventSink {
                 self.preload_configured_ledgers().await;
             }
             RemoteEvent::LedgerUpdated(record) => {
+                self.fluree.observe_nameservice_record(&record);
                 let changed = self
                     .peer_state
                     .update_ledger(
@@ -274,6 +279,10 @@ impl HeadSink for PeerEventSink {
 
                 // Evict any cached state for the ledger (no-op if not cached).
                 self.fluree.disconnect_ledger(&ledger_id).await;
+            }
+            RemoteEvent::LedgerRefresh { ledger_id, .. } => {
+                tracing::info!(ledger_id = %ledger_id, "Ledger history changed on remote; refreshing");
+                self.fluree.refresh_ledger(&ledger_id).await;
             }
             RemoteEvent::GraphSourceRetracted { graph_source_id } => {
                 self.peer_state.remove_graph_source(&graph_source_id).await;

@@ -154,6 +154,7 @@ pub async fn run(
                     }
                     None => println!("Index ID:       (none)"),
                 }
+                print_erasures(&fluree, &ledger_id).await;
                 // Only the config diagnostics, not the full ledger-info stats:
                 // the ledger is loaded, and its config graph read.
                 let diagnostics = match fluree.ledger(&ledger_id).await {
@@ -188,6 +189,40 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// The branch's permanent erasures, and those whose files this storage
+/// still holds.
+async fn print_erasures(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    use fluree_db_api::retention::erasure::ErasureStage;
+    let Ok(status) = fluree.retention_status(ledger_id).await else {
+        return;
+    };
+    let jobs = status.registration.map(|r| r.erasures).unwrap_or_default();
+    if jobs.is_empty() {
+        return;
+    }
+    let purged = jobs
+        .iter()
+        .filter(|j| j.stage == ErasureStage::Purged)
+        .count();
+    println!(
+        "Erasures:       {} ({purged} with their files deleted)",
+        jobs.len()
+    );
+    for job in jobs.iter().filter(|j| j.stage != ErasureStage::Purged) {
+        let blocked = job.purge.as_ref().and_then(|p| p.blocked.as_deref());
+        let state = match (&job.stage, blocked) {
+            (ErasureStage::Failed, _) => format!(
+                "failed: {}",
+                job.last_error.as_deref().unwrap_or("no reason recorded")
+            ),
+            (_, Some(why)) => format!("files not yet deleted: {why}"),
+            _ if job.purge_pending() => "files not yet deleted".to_string(),
+            _ => "not yet published".to_string(),
+        };
+        println!("  {}: {state}", job.request_id);
+    }
 }
 
 /// The ledger's index predates triple-term links, so its annotations cannot be

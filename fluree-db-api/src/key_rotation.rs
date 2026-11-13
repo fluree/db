@@ -241,6 +241,15 @@ impl Throttle {
 }
 
 impl Fluree {
+    /// The lock a purge pass holds, where erasures are purged.
+    fn purge_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            return Some(runtime.purging.clone());
+        }
+        None
+    }
+
     /// The key ids this instance's storage holds, current first, and the id
     /// of the current key; `None` when the storage does not encrypt at rest.
     /// A permanent (IPFS) backend has no admin storage and is never
@@ -495,6 +504,7 @@ impl Fluree {
             Arc::clone(&control),
             Arc::clone(&shared),
             opts.max_bytes_per_sec,
+            self.purge_lock(),
         ));
         *active = Some(ActiveJob {
             control,
@@ -708,6 +718,7 @@ async fn run_sweep(
     control: Arc<Control>,
     shared: Arc<parking_lot::RwLock<KeyRotationProgress>>,
     max_bytes_per_sec: Option<u64>,
+    purging: Option<Arc<tokio::sync::Mutex<()>>>,
 ) {
     let mut progress = shared.read().clone();
     let dry_run = progress.dry_run;
@@ -801,6 +812,12 @@ async fn run_sweep(
                 Ok(Some(_)) => {
                     progress.on_retired += 1;
                     if !dry_run {
+                        // A purge pass deletes what it purges between its
+                        // checks: a rewrite in between would put it back.
+                        let _purge = match &purging {
+                            Some(lock) => Some(lock.lock().await),
+                            None => None,
+                        };
                         match admin.reencrypt(&address).await {
                             Ok(Some(bytes)) => {
                                 progress.rewritten += 1;
@@ -810,6 +827,8 @@ async fn run_sweep(
                             // Rewritten by a concurrent writer between the
                             // header read and ours; nothing to do.
                             Ok(None) => progress.already_current += 1,
+                            // Deleted since it was listed, as by a purge.
+                            Err(fluree_db_core::Error::NotFound(_)) => {}
                             Err(e) => record_failure(&mut progress, &address, &e),
                         }
                     }
@@ -872,4 +891,97 @@ fn record_failure(
     }
     progress.last_error = Some(format!("{address}: {error}"));
     tracing::warn!(address, %error, "key rotation: blob skipped");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{KeyRotationOptions, KeyRotationState};
+    use crate::retention::erasure::{ErasureConfig, Verifier};
+    use crate::{Fluree, FlureeBuilder};
+
+    const KEY1: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const KEY2: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    async fn client(path: &std::path::Path, keys: &[(u32, &str)], current: u32) -> Fluree {
+        let keys: Vec<_> = keys
+            .iter()
+            .map(|(id, key)| json!({"keyId": id, "AES256Key": key}))
+            .collect();
+        let config = json!({
+            "@context": {
+                "@base": "https://ns.flur.ee/config/connection/",
+                "@vocab": "https://ns.flur.ee/system#"
+            },
+            "@graph": [
+                {
+                    "@id": "storage",
+                    "@type": "Storage",
+                    "filePath": path.to_string_lossy(),
+                    "AES256Keys": keys,
+                    "AES256CurrentKey": current
+                },
+                {
+                    "@id": "connection",
+                    "@type": "Connection",
+                    "indexStorage": {"@id": "storage"},
+                    "defaults": {"indexing": {"indexingEnabled": false}}
+                }
+            ]
+        });
+        FlureeBuilder::from_json_ld(&config)
+            .unwrap()
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build_client()
+            .await
+            .unwrap()
+    }
+
+    /// A rotation's rewrite waits for a purge pass under way, so it cannot
+    /// put back a file the purge deletes.
+    #[tokio::test]
+    async fn a_rotation_waits_for_a_purge_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let fluree = client(dir.path(), &[(1, KEY1)], 1).await;
+            fluree.create_ledger("rotate").await.unwrap();
+            fluree
+                .graph("rotate:main")
+                .transact()
+                .insert(&json!({"@id": "http://example.org/a", "http://example.org/n": 1}))
+                .commit()
+                .await
+                .unwrap();
+        }
+        let fluree = client(dir.path(), &[(1, KEY1), (2, KEY2)], 2).await;
+        let runtime = fluree.erasure_runtime().unwrap().clone();
+        let purge = runtime.purging.lock().await;
+
+        fluree
+            .start_key_rotation(KeyRotationOptions {
+                retire_key_id: 1,
+                dry_run: false,
+                ledger: None,
+                max_bytes_per_sec: None,
+                holder: "test".to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let status = fluree.key_rotation_status().await.unwrap();
+        let progress = status.progress.expect("running");
+        assert_eq!(progress.rewritten, 0, "{progress:?}");
+
+        drop(purge);
+        let done = fluree.wait_for_key_rotation().await.unwrap().unwrap();
+        assert!(done.rewritten > 0, "{done:?}");
+        assert_eq!(done.state, KeyRotationState::Completed, "{done:?}");
+    }
 }

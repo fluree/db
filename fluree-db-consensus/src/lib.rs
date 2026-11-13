@@ -30,6 +30,7 @@ pub use fluree_raft_core::http;
 pub mod local;
 #[cfg(feature = "raft")]
 pub mod raft;
+pub mod retention;
 
 pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
 pub use local::LocalCommitter;
@@ -225,6 +226,11 @@ pub enum TransactionBody {
         graph_iri: Option<String>,
         payload: GraphBody,
     },
+    /// A retention worker's expiration batch: exact retractions verified
+    /// against one head (`fluree_db_api::retention::RetentionBatch`, encoded
+    /// as hex), committed only while that head is current. Appended last, as
+    /// above.
+    Retention { batch: String },
 }
 
 /// The triples of a [`TransactionBody::GraphInsert`].
@@ -261,6 +267,7 @@ impl TransactionBody {
             Self::JsonLdUpdate(_) => "update",
             Self::JsonLdGraphSync { .. } | Self::RdfGraphSync { .. } => "graph-sync",
             Self::GraphInsert { .. } => "graph-insert",
+            Self::Retention { .. } => "retention",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -323,6 +330,10 @@ impl TransactionBody {
                         hasher.update(text.as_bytes());
                     }
                 }
+            }
+            Self::Retention { batch } => {
+                hasher.update(b"retention");
+                hasher.update(batch.as_bytes());
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -401,6 +412,8 @@ pub enum BodyKind {
     RdfGraphSync,
     /// Graph insert. Appended last (see `JsonLdGraphSync`).
     GraphInsert,
+    /// Retention expiration batch. Appended last (see `JsonLdGraphSync`).
+    Retention,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -412,6 +425,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
             TransactionBody::RdfGraphSync { .. } => BodyKind::RdfGraphSync,
             TransactionBody::GraphInsert { .. } => BodyKind::GraphInsert,
+            TransactionBody::Retention { .. } => BodyKind::Retention,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
@@ -827,7 +841,19 @@ pub struct PushRequest {
     /// Commit blobs that merges in `commits` brought in, parents before
     /// children. See [`fluree_db_api::PushCommitsRequest::merged_commits`].
     pub merged_commits: Vec<Vec<u8>>,
+    /// The CIDs of `commits` and `merged_commits`, when the sender named
+    /// them (see [`fluree_db_api::PushCommitsRequest::commit_ids`]); empty
+    /// means each is the SHA2-256 of its bytes.
+    pub commit_ids: Vec<fluree_db_core::ContentId>,
+    pub merged_commit_ids: Vec<fluree_db_core::ContentId>,
     pub governance: GovernanceOptions,
+    /// Erased history and retention the push carries (see
+    /// [`fluree_db_api::PushCommitsRequest::erasure_frames`]).
+    pub erasure_frames: Vec<Vec<u8>>,
+    pub base_erasures: Vec<fluree_db_api::BaseErasure>,
+    pub retention: Option<serde_json::Value>,
+    /// What the principal may do beyond pushing commits.
+    pub authority: fluree_db_api::PushAuthority,
 }
 
 /// Receipt returned once a push is durably accepted.

@@ -226,7 +226,9 @@ pub trait AppStateMachine: Send + Sync + 'static {
     /// set. Default is a no-op for machines that do not care.
     ///
     /// Still deterministic: every node applies the same membership
-    /// entries in the same order.
+    /// entries in the same order. A loaded snapshot's membership is
+    /// applied again (see [`StateMachineAdapter`]), so applying the same
+    /// membership twice must change nothing.
     fn apply_membership(state: &mut Self::State, membership: &MembershipView, log_index: u64) {
         let _ = (state, membership, log_index);
     }
@@ -351,6 +353,24 @@ fn snapshot_err<S: ToString>(verb: ErrorVerb, source: S) -> StorageError<NodeId>
             verb,
             AnyError::error(source.to_string()),
         ),
+    }
+}
+
+/// Apply to a snapshot's `state` the membership in force when it was
+/// taken, as the entry that made it was applied: what the application
+/// derives from membership is then the same on a node that loaded the
+/// snapshot as on one that replayed the entry, whatever the snapshot's
+/// own layout recorded of it.
+fn with_membership<A: AppStateMachine>(
+    state: &mut A::State,
+    membership: &StoredMembership<NodeId, ClusterNode>,
+) {
+    if let Some(log_id) = membership.log_id() {
+        A::apply_membership(
+            state,
+            &membership_view(membership.membership()),
+            log_id.index,
+        );
     }
 }
 
@@ -494,9 +514,10 @@ where
         let Some((our_meta, bytes)) = current else {
             return Ok(());
         };
-        let restored = A::decode_snapshot(&bytes).map_err(read_state_err)?;
+        let mut restored = A::decode_snapshot(&bytes).map_err(read_state_err)?;
         let last_membership: StoredMembership<NodeId, ClusterNode> =
             postcard::from_bytes(&our_meta.membership).map_err(read_state_err)?;
+        with_membership::<A>(&mut restored, &last_membership);
 
         let mut effects = Vec::new();
         self.observer
@@ -612,7 +633,8 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let new_state = A::decode_snapshot(&bytes).map_err(read_state_err)?;
+        let mut new_state = A::decode_snapshot(&bytes).map_err(read_state_err)?;
+        with_membership::<A>(&mut new_state, &meta.last_membership);
         let membership_bytes =
             postcard::to_allocvec(&meta.last_membership).map_err(write_state_err)?;
 

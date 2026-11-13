@@ -187,7 +187,7 @@ mod tests {
             "memory",
             kind,
             &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
-            &cid.digest_hex(),
+            &cid.address_digest(),
         );
         (cid, addr)
     }
@@ -276,6 +276,7 @@ mod tests {
             namespace_delta: std::collections::HashMap::new(),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: std::collections::HashMap::new(),
             ns_split_mode: None,
@@ -284,7 +285,7 @@ mod tests {
 
         let result = write_commit(&commit, false, None).expect("write_commit");
         let cid = ContentId::new(ContentKind::Commit, &result.bytes);
-        let hash_hex = cid.digest_hex();
+        let hash_hex = cid.address_digest();
         let addr = fluree_db_core::content_address(
             "memory",
             ContentKind::Commit,

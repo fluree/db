@@ -37,6 +37,9 @@ pub struct LedgerConfig {
     pub transact: Option<TransactDefaults>,
     /// Full-text indexing defaults (`f:fullTextDefaults`).
     pub full_text: Option<FullTextDefaults>,
+    /// Retention policy (`f:retentionDefaults`). Durable state policy: no
+    /// request-time override and no override control.
+    pub retention: Option<RetentionDefaults>,
     /// Serving-posture defaults (`f:servingDefaults`). Ledger-scoped:
     /// never merged per-graph and not subject to override control.
     pub serving: Option<ServingDefaults>,
@@ -69,6 +72,8 @@ pub struct ResolvedConfig {
     pub transact: Option<TransactDefaults>,
     /// Effective full-text indexing defaults.
     pub full_text: Option<FullTextDefaults>,
+    /// Effective retention policy.
+    pub retention: Option<RetentionDefaults>,
 }
 
 // ============================================================================
@@ -299,6 +304,73 @@ pub struct FullTextProperty {
     pub target: String,
 }
 
+/// Retention policy from the config graph (`f:retentionDefaults`).
+///
+/// One entry per governed predicate. Entries merge by `f:target`, and each
+/// field merges on its own: an absent field inherits, while an explicit
+/// `false` / `0` overrides what it would inherit (see [`Self::merge_over`]).
+/// Retention is durable state policy, so it has no override control and no
+/// request-time override; it changes only by transacting the config graph.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionDefaults {
+    /// `f:property` — one entry per governed predicate.
+    pub properties: Vec<RetentionProperty>,
+    /// What the reader could not accept. A non-empty list blocks retention
+    /// processing for the ledger rather than reading as "no policy".
+    pub problems: Vec<String>,
+}
+
+/// A retention property entry (`f:RetentionProperty`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionProperty {
+    /// `f:target` — IRI of the governed predicate.
+    pub target: String,
+    /// `f:noHistory` — `None` inherits; system default `false`.
+    pub no_history: Option<bool>,
+    /// `f:ttl` — `None` inherits; `Some(0)` disables an inherited
+    /// duration for future assertions.
+    pub ttl_seconds: Option<u64>,
+}
+
+impl RetentionDefaults {
+    /// Merge `self` (a graph's entries) over `base` (the ledger-wide ones).
+    ///
+    /// Entries pair up by target, and each field of a paired entry takes
+    /// `self`'s value when set and `base`'s otherwise, so overriding
+    /// `noHistory` keeps an inherited TTL. Unpaired entries from either side
+    /// are kept; an empty `self` leaves `base` as it is.
+    pub fn merge_over(&self, base: &Self) -> Self {
+        let mut properties = base.properties.clone();
+        for entry in &self.properties {
+            match properties.iter_mut().find(|p| p.target == entry.target) {
+                Some(slot) => {
+                    slot.no_history = entry.no_history.or(slot.no_history);
+                    slot.ttl_seconds = entry.ttl_seconds.or(slot.ttl_seconds);
+                }
+                None => properties.push(entry.clone()),
+            }
+        }
+        let mut problems = base.problems.clone();
+        problems.extend(self.problems.iter().cloned());
+        Self {
+            properties,
+            problems,
+        }
+    }
+
+    /// The entry for `target`, if any.
+    pub fn property(&self, target: &str) -> Option<&RetentionProperty> {
+        self.properties.iter().find(|p| p.target == target)
+    }
+
+    /// Whether any entry, once resolved, schedules expiry or drops history.
+    pub fn is_active(&self) -> bool {
+        self.properties
+            .iter()
+            .any(|p| p.ttl_seconds.is_some_and(|s| s > 0) || p.no_history == Some(true))
+    }
+}
+
 /// Transact-time constraint defaults from the config graph (`f:transactDefaults`).
 ///
 /// Controls enforcement of property-level constraints (e.g., `f:enforceUnique`)
@@ -397,6 +469,13 @@ impl FullTextDefaults {
     }
 }
 
+impl RetentionDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.properties.is_empty() && self.problems.is_empty()
+    }
+}
+
 impl TransactDefaults {
     /// No field is set.
     pub fn is_empty(&self) -> bool {
@@ -432,6 +511,8 @@ pub struct GraphConfig {
     pub transact: Option<TransactDefaults>,
     /// Full-text indexing overrides for this graph.
     pub full_text: Option<FullTextDefaults>,
+    /// Retention overrides for this graph.
+    pub retention: Option<RetentionDefaults>,
     /// Indexing overrides for this graph.
     pub indexing: Option<IndexingDefaults>,
 }

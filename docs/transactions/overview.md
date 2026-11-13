@@ -295,7 +295,7 @@ Each commit includes rich metadata:
 - `f:message`: Optional commit message. Pure user txn-meta — supply `f:message` as a top-level property in the envelope-form transaction body, or in a TriG `<#txn-meta>` block.
 - `previous_commit_id`: ContentId of previous commit (in the commit envelope).
 
-`f:author` and `f:message` are the only predicates in Fluree's namespaces a transaction's txn-meta may carry. Any other, such as `f:t`, `f:identity` or `f:reverts`, is refused, because the commit's own provenance lives on the same subject.
+`f:author`, `f:message` and a [TTL default](ttl.md#a-transaction-default) (`f:ttl` or `f:expiresAt`) are the only predicates in Fluree's namespaces a transaction's txn-meta may carry. Any other, such as `f:t`, `f:identity` or `f:reverts`, is refused, because the commit's own provenance lives on the same subject.
 
 See [Commit Receipts](commit-receipts.md) for details.
 

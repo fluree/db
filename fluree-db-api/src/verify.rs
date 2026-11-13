@@ -172,7 +172,10 @@ pub async fn verify_commit_chain<C: ContentStore + ?Sized>(
             }
         };
 
-        if let Some(txn_id) = &env.txn {
+        // An erased commit reads as its replacement, and its transaction
+        // document is deleted with its purge.
+        let erased = fluree_db_core::commit::codec::replacement::is_replacement(&bytes);
+        if let Some(txn_id) = env.txn.as_ref().filter(|_| !erased) {
             txn_refs_checked += 1;
             if !store.has(txn_id).await? {
                 problems.push(VerifyProblem::MissingTxnBlob {

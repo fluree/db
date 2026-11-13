@@ -20,6 +20,7 @@ use aws_sdk_dynamodb::Client;
 use aws_smithy_types::timeout::TimeoutConfig;
 use fluree_db_core::ledger_id::{format_ledger_id, DEFAULT_BRANCH};
 use fluree_db_core::{ContentId, LedgerId};
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPayload, ConfigPublisher, ConfigValue, Fence, GraphSourceLookup, GraphSourcePublisher,
@@ -135,6 +136,13 @@ impl DynamoDbNameService {
     /// Normalize ledger ID to canonical `name:branch` form (the partition key).
     fn normalize(ledger_id: &str) -> std::result::Result<String, NameServiceError> {
         Ok(LedgerId::parse(ledger_id)?.to_string())
+    }
+
+    /// [`Self::normalize`] under the stored-record grammar, for the
+    /// operations that remove a record an earlier release wrote under a name
+    /// no request can address.
+    fn normalize_persisted(ledger_id: &str) -> std::result::Result<String, NameServiceError> {
+        Ok(LedgerId::parse_persisted(ledger_id)?.to_string())
     }
 
     /// Current epoch time in milliseconds.
@@ -362,6 +370,11 @@ impl DynamoDbNameService {
             storage_root: None,
             fence,
             frozen,
+            erasure_generation: 0,
+            config_version: config
+                .and_then(|c| c.get(ATTR_CONFIG_V))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse().ok()),
         })
     }
 
@@ -824,9 +837,10 @@ impl BranchLifecycle for DynamoDbNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: fluree_db_nameservice::NsRecordSnapshot,
     ) -> std::result::Result<(), NameServiceError> {
+        let fence = basis.fence;
         let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
@@ -1077,10 +1091,11 @@ impl CommitPublisher for DynamoDbNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
+        let fence = basis.fence;
         let pk = Self::normalize(ledger_id)?;
         let now = Self::now_epoch_ms().to_string();
 
@@ -1140,10 +1155,11 @@ impl IndexPublisher for DynamoDbNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
+        let fence = basis.fence;
         self.update_index_item(ledger_id, index_t, index_id, "#it < :t", fence)
             .await
     }
@@ -1262,10 +1278,11 @@ impl AdminPublisher for DynamoDbNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> std::result::Result<(), NameServiceError> {
+        let fence = basis.fence;
         self.update_index_item(ledger_id, index_t, index_id, "#it <= :t", fence)
             .await
     }
@@ -1332,11 +1349,12 @@ impl RefPublisher for DynamoDbNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> std::result::Result<CasResult, NameServiceError> {
+        let fence = basis.fence;
         let pk = Self::normalize(ledger_id)?;
         let sk = Self::ref_kind_sk(kind);
         let (id_attr, t_attr) = Self::ref_kind_attrs(kind);
@@ -1608,6 +1626,7 @@ impl GraphSourcePublisher for DynamoDbNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> std::result::Result<(), NameServiceError> {
         let pk = format_ledger_id(name, branch);
         let now = Self::now_epoch_ms().to_string();

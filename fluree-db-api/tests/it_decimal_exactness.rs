@@ -1019,7 +1019,12 @@ async fn full_rebuild_publish_decode_root(
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
+        .publish_index_fenced(
+            ledger_id,
+            record.write_basis(),
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
     fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes).expect("decode root")
