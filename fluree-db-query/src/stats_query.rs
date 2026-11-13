@@ -104,7 +104,8 @@ pub fn stats_count_by_predicate_operator(
                 return Ok(None);
             }
             let store = member.store();
-            let Some(counts) = exact_count_by_predicate_post(store, member.g_id())? else {
+            let Some(counts) = exact_count_by_predicate_post(store, member.g_id(), &ctx.tracker)?
+            else {
                 return Ok(None);
             };
             let census = if lists {
@@ -235,7 +236,7 @@ fn count_by_predicate_union(
         if indexes_nothing(store, member.g_id()) {
             continue;
         }
-        let Some(rows) = exact_count_by_predicate_post(store, member.g_id())? else {
+        let Some(rows) = exact_count_by_predicate_post(store, member.g_id(), &ctx.tracker)? else {
             return Ok(Err(FastPathFallback::GateDeclined));
         };
         for (p_id, rows) in rows {
@@ -516,6 +517,7 @@ fn distinct_facts_by_value(
 fn exact_count_by_predicate_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Vec<(u32, i64)>>> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Post) else {
         return Ok(None);
@@ -551,6 +553,7 @@ fn exact_count_by_predicate_post(
             if let Some(p) = entry.p_const {
                 *counts.entry(p).or_insert(0) += i64::from(entry.row_count);
             } else {
+                crate::fast_path_common::charge_leaflet(tracker)?;
                 let batch = match handle.load_columns(
                     leaflet_idx,
                     &pid_projection,

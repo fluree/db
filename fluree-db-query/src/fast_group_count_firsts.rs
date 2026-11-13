@@ -229,6 +229,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
                     &self.predicate,
                     self.limit,
                     &ctx.cancellation,
+                    &ctx.tracker,
                 )
                 .ok();
                 if grouped.is_some() {
@@ -566,6 +567,7 @@ impl Operator for PredicateObjectCountFirstsOperator {
                     &self.object,
                     stats_view.as_deref(),
                     &ctx.cancellation,
+                    &ctx.tracker,
                 )
                 .ok()
                 .inspect(|_| one_graph_answered = true)
@@ -666,7 +668,9 @@ fn pid_prefix_v6_from_entry(entry: &LeafletDirEntryV3) -> (u32, u16, u64) {
     (rec.p_id, rec.o_type, rec.o_key)
 }
 
-/// Load a V3 leaflet's columns, using the `LeafletCache` when available.
+/// Load a V3 leaflet's columns, using the `LeafletCache` when available,
+/// and charge `tracker` for the read.
+#[allow(clippy::too_many_arguments)]
 fn load_v6_batch(
     leaf_bytes: &[u8],
     entry: &LeafletDirEntryV3,
@@ -675,7 +679,9 @@ fn load_v6_batch(
     cache: &Option<&Arc<fluree_db_binary_index::LeafletCache>>,
     leaf_id: u128,
     leaflet_idx: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<fluree_db_binary_index::ColumnBatch> {
+    crate::fast_path_common::charge_leaflet(tracker)?;
     let mut needed = ColumnSet::EMPTY;
     needed.insert(ColumnId::OKey);
     if entry.o_type_const.is_none() {
@@ -707,7 +713,7 @@ fn load_v6_batch(
             load_leaflet_columns(leaf_bytes, entry, payload_base, &projection, order)
         }
     };
-    batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
+    batch.map_err(|e| QueryError::from_io("load columns", e))
 }
 
 /// Resolve a predicate [`Ref`] to its V6 binary index `p_id`.
@@ -726,6 +732,7 @@ fn resolve_predicate_id_v6(
 /// Scans the POST leaf range for the predicate, uses boundary-equality on
 /// `(o_type, o_key)` to skip whole leaflets, and decodes only `o_key` + `o_type`
 /// columns when needed.
+#[allow(clippy::too_many_arguments)]
 fn count_bound_object_v6(
     snapshot: &LedgerSnapshot,
     store: &BinaryIndexStore,
@@ -734,6 +741,7 @@ fn count_bound_object_v6(
     object: &Term,
     stats_view: Option<&fluree_db_core::StatsView>,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
@@ -763,7 +771,15 @@ fn count_bound_object_v6(
             let o_key = o_key.ok_or_else(|| {
                 QueryError::Internal("NumBig rows need the decoded-value filter".to_string())
             })?;
-            total += count_object_key_v6(store, g_id, p_id, o_type.as_u16(), o_key, cancellation)?;
+            total += count_object_key_v6(
+                store,
+                g_id,
+                p_id,
+                o_type.as_u16(),
+                o_key,
+                cancellation,
+                tracker,
+            )?;
         }
         return Ok(total);
     }
@@ -777,7 +793,15 @@ fn count_bound_object_v6(
     else {
         return Ok(0);
     };
-    count_object_key_v6(store, g_id, p_id, target_o_type, target_o_key, cancellation)
+    count_object_key_v6(
+        store,
+        g_id,
+        p_id,
+        target_o_type,
+        target_o_key,
+        cancellation,
+        tracker,
+    )
 }
 
 /// Rows of predicate `p_id` whose object is exactly `(target_o_type, target_o_key)`.
@@ -788,6 +812,7 @@ fn count_object_key_v6(
     target_o_type: u16,
     target_o_key: u64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<i64> {
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
@@ -916,6 +941,7 @@ fn count_object_key_v6(
                 leaf_id,
                 u32::try_from(i)
                     .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                tracker,
             )?;
 
             for row in 0..batch.row_count {
@@ -997,6 +1023,7 @@ pub(crate) fn group_count_v6(
     predicate: &crate::ir::triple::Ref,
     limit: usize,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
@@ -1100,6 +1127,7 @@ pub(crate) fn group_count_v6(
                 leaf_id,
                 u32::try_from(i)
                     .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                tracker,
             )?;
 
             for row in 0..batch.row_count {
@@ -1473,7 +1501,7 @@ fn collect_subject_counts_for_predicate_group(
     let mut cur_n: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         ctx.check_cancelled()?;
         for i in 0..batch.row_count {
@@ -1580,7 +1608,7 @@ fn compute_group_by_object_star_topk(
                     ctx.check_cancelled()?;
                     *f_batch = fcur
                         .next_batch()
-                        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                        .map_err(|e| QueryError::from_io("cursor batch", e))?;
                     *f_i = 0;
                     if f_batch.is_none() {
                         return Ok(None);
@@ -1603,7 +1631,7 @@ fn compute_group_by_object_star_topk(
                 ctx.check_cancelled()?;
                 *f_batch = fcur
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("cursor batch", e))?;
                 *f_i = 0;
                 if f_batch.is_none() {
                     break; // stream ended; group is complete
@@ -1620,7 +1648,7 @@ fn compute_group_by_object_star_topk(
                 ctx.check_cancelled()?;
                 *g_batch = cursor
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("cursor batch", e))?;
                 *g_i = 0;
                 if g_batch.is_none() {
                     return Ok(None);
@@ -1707,7 +1735,7 @@ fn compute_group_by_object_star_topk(
 
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            .map_err(|e| QueryError::from_io("cursor batch", e))?
         {
             ctx.check_cancelled()?;
             for i in 0..batch.row_count {
@@ -2084,7 +2112,15 @@ fn count_bound_object_union(
     for slice in &slices {
         check_cancelled(cancellation)?;
         total += if let [g_id] = slice.members[..] {
-            count_object_key_v6(store, g_id, p_id, slice.o_type, slice.o_key, cancellation)?
+            count_object_key_v6(
+                store,
+                g_id,
+                p_id,
+                slice.o_type,
+                slice.o_key,
+                cancellation,
+                tracker,
+            )?
         } else {
             merged = true;
             match merged_slice_count(

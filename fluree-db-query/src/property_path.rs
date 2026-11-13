@@ -1274,6 +1274,7 @@ impl PropertyPathOperator {
                 g_id: ctx.binary_g_id,
                 to_t,
                 dirty,
+                tracker: ctx.tracker.clone(),
             },
             typed_pids,
             reserved_pids,

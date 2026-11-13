@@ -113,7 +113,7 @@ pub fn label_regex_type_operator(
             let mut buf: Vec<u8> = Vec::with_capacity(128);
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(format!("binary cursor: {e}")))?
+                .map_err(|e| QueryError::from_io("binary cursor", e))?
             {
                 for i in 0..batch.row_count {
                     let ot_u16 = batch.o_type.get_or(i, 0);
@@ -165,11 +165,15 @@ pub fn label_regex_type_operator(
             let mut uniq_subjects = hit_subjects.clone();
             uniq_subjects.sort_unstable();
             uniq_subjects.dedup();
-            let type_map =
-                batched_lookup_predicate_refs(store, g_id, rdf_type_p_id, &uniq_subjects, ctx.to_t)
-                    .map_err(|e| {
-                        QueryError::Internal(format!("batched_lookup_predicate_refs: {e}"))
-                    })?;
+            let type_map = batched_lookup_predicate_refs(
+                store,
+                g_id,
+                rdf_type_p_id,
+                &uniq_subjects,
+                ctx.to_t,
+                &ctx.tracker,
+            )
+            .map_err(|e| QueryError::from_io("batched_lookup_predicate_refs", e))?;
 
             let dt_sid = store.as_ref().encode_iri(xsd::STRING);
             let mut col_s: Vec<Binding> = Vec::new();

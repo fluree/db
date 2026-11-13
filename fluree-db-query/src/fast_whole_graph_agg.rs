@@ -473,8 +473,14 @@ fn compute_clean(
         FoldKind::Scalars(tasks) => {
             let mut row = Vec::with_capacity(tasks.len());
             for task in tasks {
-                let Some(binding) =
-                    compute_task(*task, store, ctx.binary_g_id, subjects, accessor.as_ref())?
+                let Some(binding) = compute_task(
+                    *task,
+                    store,
+                    ctx.binary_g_id,
+                    subjects,
+                    accessor.as_ref(),
+                    &ctx.tracker,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -677,8 +683,9 @@ fn overlay_all_subjects_count(
         g_id,
         &touched,
         store.max_t(),
+        &ctx.tracker,
     )
-    .map_err(|e| QueryError::Internal(format!("subject-existence lookup: {e}")))?;
+    .map_err(|e| QueryError::from_io("subject-existence lookup", e))?;
 
     let mut delta: i64 = 0;
     for (s_id, assert) in &has_assert {
@@ -740,7 +747,7 @@ fn overlay_accessor_counts(
     let mut prev: Option<u64> = None;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("accessor PSOT cursor: {e}")))?
+        .map_err(|e| QueryError::from_io("accessor PSOT cursor", e))?
     {
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
@@ -855,7 +862,7 @@ fn overlay_minmax_numeric(
     let mut best: Option<(u16, u64)> = None;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("minmax POST cursor: {e}")))?
+        .map_err(|e| QueryError::from_io("minmax POST cursor", e))?
     {
         for row in 0..batch.row_count {
             let o_type = batch.o_type.get_or(row, 0);
@@ -930,6 +937,7 @@ fn compute_histogram(
         &accessor.pred,
         HISTOGRAM_MAX_GROUPS,
         &ctx.cancellation,
+        &ctx.tracker,
     ) else {
         return Ok(None);
     };
@@ -1009,6 +1017,7 @@ fn compute_task(
     g_id: GraphId,
     subjects: u64,
     accessor: Option<&AccessorCounts>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Binding>> {
     if task.needs_accessor() && accessor.is_none() {
         return Ok(None);
@@ -1046,7 +1055,7 @@ fn compute_task(
             if let Some(b) = minmax_numeric_post(store, g_id, p_id, mode)? {
                 return Ok(Some(b));
             }
-            minmax_string_dict_post(store, g_id, p_id, mode)
+            minmax_string_dict_post(store, g_id, p_id, mode, tracker)
         }
         AggTask::AvgProp | AggTask::SumProp => {
             let kind = if task == AggTask::AvgProp {
@@ -1054,7 +1063,7 @@ fn compute_task(
             } else {
                 ScalarAggKind::Sum(SumExprI64::Identity)
             };
-            match scan_predicate_scalar_agg(store, g_id, &accessor.unwrap().pred, kind)? {
+            match scan_predicate_scalar_agg(store, g_id, &accessor.unwrap().pred, kind, tracker)? {
                 Some(output) => Ok(Some(output.into_binding())),
                 None => Ok(None),
             }

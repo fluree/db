@@ -222,6 +222,7 @@ pub fn post_order_desc_limit_operator(
                     distinct,
                     emit_subject,
                     need,
+                    &ctx.tracker,
                 )?
             };
             let Some(rows) = rows_opt else {
@@ -396,6 +397,7 @@ fn collect_post_desc_topk(
     distinct: bool,
     dedup_includes_subject: bool,
     need: usize,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Vec<TopKRow>>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
@@ -437,9 +439,13 @@ fn collect_post_desc_topk(
                 return Ok(None);
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
             scanned += batch.row_count;
             for row in (0..batch.row_count).rev() {
                 leaf_cands.push((expected_o_type, batch.o_key.get(row), batch.s_id.get(row)));
@@ -453,7 +459,7 @@ fn collect_post_desc_topk(
                 uniq.sort_unstable();
                 uniq.dedup();
                 let type_map =
-                    batched_lookup_predicate_refs(store, g_id, rdf_type_p_id, &uniq, to_t)
+                    batched_lookup_predicate_refs(store, g_id, rdf_type_p_id, &uniq, to_t, tracker)
                         .map_err(|e| {
                             QueryError::Internal(format!("batched_lookup_predicate_refs: {e}"))
                         })?;
@@ -589,9 +595,13 @@ fn collect_post_desc_topk_overlay(
             if entry.o_type_const != Some(o_type) {
                 return Ok(None); // defensive: stale single-type proof
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                &ctx.tracker,
+            )?;
             scanned += batch.row_count;
             for row in (0..batch.row_count).rev() {
                 leaf_base.push(OvRow {
@@ -632,7 +642,14 @@ fn collect_post_desc_topk_overlay(
         debug_assert!(upper.is_none_or(|u| window_asserts.iter().all(|r| r.o_key < u)));
 
         let merged = merge_desc(window_asserts, &leaf_base);
-        let members = batch_members(class_filter.as_ref(), store, g_id, ctx.to_t, &merged)?;
+        let members = batch_members(
+            class_filter.as_ref(),
+            store,
+            g_id,
+            ctx.to_t,
+            &merged,
+            &ctx.tracker,
+        )?;
         if emit_merged(
             &merged,
             o_type,
@@ -657,7 +674,14 @@ fn collect_post_desc_topk_overlay(
     // Asserts below every base row (and all asserts when the base is empty).
     let tail_asserts: Vec<OvRow> = asserts[assert_idx..].to_vec();
     let merged = merge_desc(&tail_asserts, &[]);
-    let members = batch_members(class_filter.as_ref(), store, g_id, ctx.to_t, &merged)?;
+    let members = batch_members(
+        class_filter.as_ref(),
+        store,
+        g_id,
+        ctx.to_t,
+        &merged,
+        &ctx.tracker,
+    )?;
     let _ = emit_merged(
         &merged,
         o_type,
@@ -703,11 +727,12 @@ fn batch_members(
     g_id: GraphId,
     to_t: i64,
     merged: &[(OvRow, bool)],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<FxHashSet<u64>>> {
     match class_filter {
         Some(f) => {
             let subjects: Vec<u64> = merged.iter().map(|(r, _)| r.s_id).collect();
-            Ok(Some(f.members(store, g_id, to_t, &subjects)?))
+            Ok(Some(f.members(store, g_id, to_t, &subjects, tracker)?))
         }
         None => Ok(None),
     }
@@ -786,12 +811,14 @@ impl OverlayClassFilter {
         g_id: GraphId,
         to_t: i64,
         subjects: &[u64],
+        tracker: &fluree_db_core::Tracker,
     ) -> Result<FxHashSet<u64>> {
         let mut uniq: Vec<u64> = subjects.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
-        let type_map = batched_lookup_predicate_refs(store, g_id, self.rdf_type_p_id, &uniq, to_t)
-            .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?;
+        let type_map =
+            batched_lookup_predicate_refs(store, g_id, self.rdf_type_p_id, &uniq, to_t, tracker)
+                .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?;
         let mut out: FxHashSet<u64> = FxHashSet::default();
         for s in uniq {
             let base_member = type_map

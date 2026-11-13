@@ -143,6 +143,7 @@ impl GeoSearchOperator {
         store: &Arc<BinaryIndexStore>,
         g_id: GraphId,
         to_t: i64,
+        tracker: &fluree_db_core::Tracker,
         center_lat: f64,
         center_lng: f64,
         child_schema: &[VarId],
@@ -215,7 +216,8 @@ impl GeoSearchOperator {
                 &max_key,
                 filter,
                 ColumnProjection::all(),
-            );
+            )
+            .with_tracker(tracker.clone());
 
             // Time-travel and overlay support (must match binary scan semantics).
             cursor.set_to_t(to_t);
@@ -227,7 +229,7 @@ impl GeoSearchOperator {
             // (limit is applied after sorting by distance for correct "nearest k" semantics)
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(e.to_string()))?
+                .map_err(|e| QueryError::from_io("geo search cursor", e))?
             {
                 for i in 0..batch.row_count {
                     let o_key = batch.o_key.get(i);
@@ -499,6 +501,7 @@ impl Operator for GeoSearchOperator {
                 store,
                 g_id,
                 ctx.to_t,
+                &ctx.tracker,
                 center_lat,
                 center_lng,
                 child_schema,

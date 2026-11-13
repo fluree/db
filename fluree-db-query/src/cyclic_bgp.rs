@@ -912,7 +912,7 @@ impl CyclicBgpOperator {
         let mut rows: Vec<(u64, u64)> = Vec::new();
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("cyclic bgp ref cursor: {e}")))?
+            .map_err(|e| QueryError::from_io("cyclic bgp ref cursor", e))?
         {
             for row in 0..batch.row_count {
                 if batch.o_type.get(row) != OType::IRI_REF.as_u16() {
@@ -975,7 +975,7 @@ impl CyclicBgpOperator {
         let mut raw_rows = Vec::new();
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("cyclic bgp cursor: {e}")))?
+            .map_err(|e| QueryError::from_io("cyclic bgp cursor", e))?
         {
             for row in 0..batch.row_count {
                 raw_rows.push(RawEdgeRow {

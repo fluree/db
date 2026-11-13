@@ -85,7 +85,9 @@ pub fn predicate_min_max_string_operator(
                 return Ok(Some(batch));
             }
 
-            if let Some(b) = minmax_string_dict_post(store, ctx.binary_g_id, p_id, mode)? {
+            if let Some(b) =
+                minmax_string_dict_post(store, ctx.binary_g_id, p_id, mode, &ctx.tracker)?
+            {
                 let batch = Batch::single_row(Arc::from(vec![out_var].into_boxed_slice()), vec![b])
                     .map_err(|e| QueryError::execution(format!("min/max batch build: {e}")))?;
                 return Ok(Some(batch));
@@ -168,6 +170,7 @@ pub(crate) fn minmax_string_dict_post(
     g_id: GraphId,
     p_id: u32,
     mode: MinMaxMode,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Binding>> {
     if !store.lex_sorted_string_ids() {
         return Ok(None);
@@ -208,11 +211,13 @@ pub(crate) fn minmax_string_dict_post(
                             .map_err(|e| QueryError::from_io("leaf open", e))?,
                     );
                 }
-                let batch = handle
-                    .as_ref()
-                    .expect("handle opened above")
-                    .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    handle.as_deref().expect("handle opened above"),
+                    leaflet_idx,
+                    &projection_otype_okey(),
+                    RunSortOrder::Post,
+                    tracker,
+                )?;
                 for row in 0..batch.row_count {
                     let o_type = batch.o_type.get_or(row, 0);
                     let o_key = batch.o_key.get(row);

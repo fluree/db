@@ -633,7 +633,7 @@ fn scan_serial(scan: &VectorScan, pred_sid: &Sid) -> Result<Option<Vec<(u64, f64
     let mut scratch: Vec<f64> = Vec::new();
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for r in 0..batch.row_count {
             match scorer.score(batch.o_type.get(r), batch.o_key.get(r), &mut scratch) {
@@ -714,6 +714,7 @@ fn scan_partitioned(
     let ranges: Vec<(u64, u64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
 
     let cancellation = &ctx.cancellation;
+    let tracker = &ctx.tracker;
     let partials: Vec<Result<Option<ScoredRows>>> = parallel_map_pooled(ranges, |(lo, hi)| {
         crate::fast_path_common::bail_if_cancelled(cancellation)?;
         let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
@@ -726,6 +727,7 @@ fn scan_partitioned(
             hi,
             sliced,
             to_t,
+            tracker,
         ) else {
             return Ok(Some(Vec::new()));
         };
@@ -733,7 +735,7 @@ fn scan_partitioned(
         let mut scratch: Vec<f64> = Vec::new();
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            .map_err(|e| QueryError::from_io("cursor batch", e))?
         {
             for r in 0..batch.row_count {
                 let s = batch.s_id.get(r);

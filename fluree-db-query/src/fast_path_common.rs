@@ -54,6 +54,35 @@ pub(crate) fn bail_if_cancelled(cancellation: &fluree_db_core::QueryCancellation
     }
 }
 
+/// Charge `tracker` one index touch for a leaflet a fast path reads, the unit
+/// `BinaryCursor` charges per leaflet it returns, cache hit or not.
+///
+/// Same placement rule as [`bail_if_cancelled`]: once per leaflet, never per
+/// row. On an untracked query `consume_fuel` returns before touching the
+/// atomic.
+#[inline]
+pub(crate) fn charge_leaflet(tracker: &fluree_db_core::Tracker) -> Result<()> {
+    tracker
+        .consume_fuel(fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL)
+        .map_err(QueryError::FuelLimitExceeded)
+}
+
+/// Decode `projection`'s columns of leaflet `idx` straight from `handle`,
+/// bypassing the leaflet cache, and charge `tracker` for the read.
+#[inline]
+pub(crate) fn load_leaflet_columns_charged(
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    idx: usize,
+    projection: &ColumnProjection,
+    order: RunSortOrder,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<ColumnBatch> {
+    charge_leaflet(tracker)?;
+    handle
+        .load_columns(idx, projection, order)
+        .map_err(|e| QueryError::from_io("load columns", e))
+}
+
 // ---------------------------------------------------------------------------
 // 0. Shared string-ID range helpers
 // ---------------------------------------------------------------------------
@@ -125,14 +154,17 @@ pub fn projection_sid_only() -> ColumnProjection {
 
 /// Decode `projection`'s columns of leaflet `idx`, through the leaflet cache
 /// when the store has one: an entry that covers them serves them projected;
-/// one that falls short decodes only the missing columns into it.
+/// one that falls short decodes only the missing columns into it. Charges
+/// `tracker` for the read either way.
 pub(crate) fn load_leaflet_projection(
     store: &BinaryIndexStore,
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     idx: usize,
     projection: &ColumnProjection,
     order: RunSortOrder,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<ColumnBatch> {
+    charge_leaflet(tracker)?;
     let batch = match store.leaflet_cache() {
         Some(cache) => load_columns_cached_via_handle(
             handle,
@@ -148,7 +180,7 @@ pub(crate) fn load_leaflet_projection(
         ),
         None => handle.load_columns(idx, projection, order),
     };
-    batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
+    batch.map_err(|e| QueryError::from_io("load columns", e))
 }
 
 /// Projection that loads only the OKey column (internal, not output).
@@ -454,6 +486,7 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<bool> {
     use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
@@ -485,9 +518,13 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
                     }
                     // Range straddles a non-identifying o_type: decode this
                     // leaflet's o_type column and check exact membership.
-                    let batch = handle
-                        .load_columns(idx, &projection_otype_only(), RunSortOrder::Post)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                    let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                        &*handle,
+                        idx,
+                        &projection_otype_only(),
+                        RunSortOrder::Post,
+                        tracker,
+                    )?;
                     for i in 0..batch.row_count {
                         if !OType::from_u16(batch.o_type.get(i)).o_key_is_globally_identifying() {
                             return Ok(true);
@@ -660,6 +697,7 @@ pub fn collect_subjects_for_predicate_sorted(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_only();
@@ -676,9 +714,13 @@ pub fn collect_subjects_for_predicate_sorted(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if prev != Some(sid) {
@@ -698,9 +740,10 @@ pub fn collect_subjects_for_predicate_set(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<FxHashSet<u64>> {
     let mut out: FxHashSet<u64> = FxHashSet::default();
-    extend_subjects_for_predicate_set(store, g_id, p_id, &mut out)?;
+    extend_subjects_for_predicate_set(store, g_id, p_id, &mut out, tracker)?;
     Ok(out)
 }
 
@@ -713,6 +756,7 @@ pub fn extend_subjects_for_predicate_set(
     g_id: GraphId,
     p_id: u32,
     out: &mut FxHashSet<u64>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<()> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_only();
@@ -728,9 +772,13 @@ pub fn extend_subjects_for_predicate_set(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if prev != Some(sid) {
@@ -859,6 +907,8 @@ pub struct PsotSubjectCountIter<'a> {
     hi: u64,
     /// Checked once per leaflet refill (cold path), never per group.
     cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSubjectCountIter<'a> {
@@ -896,12 +946,19 @@ impl<'a> PsotSubjectCountIter<'a> {
             lo,
             hi,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         })
     }
 
     /// Attach a cancellation handle, checked once per leaflet refill.
     pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
         self
     }
 
@@ -944,6 +1001,7 @@ impl<'a> PsotSubjectCountIter<'a> {
                     idx,
                     &projection,
                     RunSortOrder::Psot,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1052,6 +1110,8 @@ pub struct PsotSubjectSeek<'a> {
     projection: ColumnProjection,
     /// Checked once per leaflet refill (cold path), never per probe.
     cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSubjectSeek<'a> {
@@ -1095,12 +1155,19 @@ impl<'a> PsotSubjectSeek<'a> {
             batch: None,
             projection,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         }
     }
 
     /// Attach a cancellation handle, checked once per leaflet refill.
     pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
         self
     }
 
@@ -1161,6 +1228,7 @@ impl<'a> PsotSubjectSeek<'a> {
                     idx,
                     &self.projection,
                     RunSortOrder::Psot,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1291,10 +1359,17 @@ pub struct PostObjectGroupCountIter<'a> {
     /// Accumulated object key for a group that may span leaflet boundaries.
     cur_key: Option<u64>,
     cur_count: u64,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PostObjectGroupCountIter<'a> {
-    pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Option<Self>> {
+    pub fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        tracker: &fluree_db_core::Tracker,
+    ) -> Result<Option<Self>> {
         Ok(Some(Self {
             store,
             p_id,
@@ -1307,6 +1382,7 @@ impl<'a> PostObjectGroupCountIter<'a> {
             mixed: false,
             cur_key: None,
             cur_count: 0,
+            tracker: tracker.clone(),
         }))
     }
 
@@ -1356,6 +1432,7 @@ impl<'a> PostObjectGroupCountIter<'a> {
                     idx,
                     if mixed { &proj_otype_okey } else { &proj_okey },
                     RunSortOrder::Post,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1460,6 +1537,8 @@ pub struct PsotSubjectWeightedSumIter<'a> {
     all_default: bool,
     /// Checked once per leaflet refill (cold path), never per group.
     cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSubjectWeightedSumIter<'a> {
@@ -1489,12 +1568,19 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             mixed: false,
             all_default: false,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         }))
     }
 
     /// Attach a cancellation handle, checked once per leaflet refill.
     pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
         self
     }
 
@@ -1530,6 +1616,7 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             mixed: false,
             all_default: false,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         }))
     }
 
@@ -1586,6 +1673,7 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                         &proj_sid_okey
                     },
                     RunSortOrder::Psot,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1775,6 +1863,8 @@ pub struct PsotObjectFilterCountIter<'a> {
     /// True when the current batch is a mixed leaflet (o_type_const is None) —
     /// each row must be checked for IRI_REF type before set membership lookup.
     mixed: bool,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotObjectFilterCountIter<'a> {
@@ -1784,6 +1874,7 @@ impl<'a> PsotObjectFilterCountIter<'a> {
         p_id: u32,
         reference_set: &'a FxHashSet<u64>,
         mode: ObjectFilterMode,
+        tracker: &fluree_db_core::Tracker,
     ) -> Result<Option<Self>> {
         Ok(Some(Self {
             store,
@@ -1798,6 +1889,7 @@ impl<'a> PsotObjectFilterCountIter<'a> {
             batch: None,
             all_count: false,
             mixed: false,
+            tracker: tracker.clone(),
         }))
     }
 
@@ -1848,9 +1940,13 @@ impl<'a> PsotObjectFilterCountIter<'a> {
                     }
                     // NotInSet: load s_id + o_key, mark all_count so next_group
                     // counts every row without checking the reference set.
-                    let batch = handle
-                        .load_columns(idx, &proj_sid_okey, RunSortOrder::Psot)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                    let batch = load_leaflet_columns_charged(
+                        handle.as_ref(),
+                        idx,
+                        &proj_sid_okey,
+                        RunSortOrder::Psot,
+                        &self.tracker,
+                    )?;
                     self.row = 0;
                     self.batch = Some(batch);
                     self.all_count = true;
@@ -1863,9 +1959,13 @@ impl<'a> PsotObjectFilterCountIter<'a> {
                 } else {
                     &proj_sid_okey
                 };
-                let batch = handle
-                    .load_columns(idx, projection, RunSortOrder::Psot)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch = load_leaflet_columns_charged(
+                    handle.as_ref(),
+                    idx,
+                    projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 self.all_count = false;
@@ -1942,6 +2042,7 @@ pub fn collect_subjects_with_object_in_set(
     g_id: GraphId,
     p_id: u32,
     object_set: &FxHashSet<u64>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Vec<u64>>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_okey();
@@ -1961,9 +2062,13 @@ pub fn collect_subjects_with_object_in_set(
                 return Ok(None);
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
 
             let mut i = 0usize;
             while i < batch.row_count {
@@ -1996,6 +2101,7 @@ pub fn sum_post_object_counts_filtered(
     g_id: GraphId,
     p_id: u32,
     allowed_objects_sorted: &[u64],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let projection = projection_okey_only();
@@ -2017,9 +2123,13 @@ pub fn sum_post_object_counts_filtered(
                 return Ok(None);
             }
 
-            let batch: ColumnBatch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch: ColumnBatch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
 
             let mut i = 0usize;
             while i < batch.row_count {
@@ -3099,11 +3209,13 @@ pub fn build_overlay_cursor_for_predicate(
         p_id: Some(p_id),
         ..Default::default()
     };
-    let Some(mut cursor) =
+    let Some(cursor) =
         build_range_cursor(store, g_id, order, &min_key, &max_key, filter, projection)
     else {
         return Ok(None);
     };
+    // Every leaflet it reads is charged to the query, as the scan's are.
+    let mut cursor = cursor.with_tracker(ctx.tracker.clone());
     cursor.set_to_t(ctx.to_t);
 
     // Fold the novelty overlay in. Skip the walk entirely when there is no
@@ -3178,8 +3290,9 @@ pub fn build_post_cursor_for_predicate(
 /// for parallelizing an overlay count: the partition harness hands each worker a
 /// subject range, and each worker scans only its leaves and merges only its ops.
 ///
-/// Takes `to_t` as a value (not `&ExecutionContext`) so the caller can hoist
-/// it out of the parallel region and keep the reducer `Sync`. The cursor's leaf
+/// Takes `to_t` and the query's `tracker` as values (not `&ExecutionContext`)
+/// so the caller can hoist them out of the parallel region and keep the
+/// reducer `Sync`; the tracker is charged for every leaflet the cursor reads. The cursor's leaf
 /// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
 /// leaf shared with an adjacent partition still emits its out-of-range subjects — the
 /// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
@@ -3194,6 +3307,7 @@ pub fn build_overlay_cursor_for_subject_range(
     hi: u64,
     sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> Option<BinaryCursor> {
     let overlay_active = !sliced_ops.is_empty();
     // Identity columns must be present for merge_overlay_into_batch (see
@@ -3222,7 +3336,8 @@ pub fn build_overlay_cursor_for_subject_range(
         &max_key,
         filter,
         projection,
-    )?;
+    )?
+    .with_tracker(tracker.clone());
     cursor.set_to_t(to_t);
     if overlay_active {
         cursor.set_overlay_ops(sliced_ops.into());
@@ -3304,7 +3419,7 @@ impl CursorSubjectCountStream {
                 self.current = self
                     .cursor
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("cursor batch", e))?;
                 self.row = 0;
                 if self.current.is_none() {
                     if let Some(s) = self.cur_s.take() {
@@ -3502,7 +3617,7 @@ where
     let mut total: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for r in 0..batch.row_count {
             match per_row(batch.s_id.get(r), batch.o_type.get(r), batch.o_key.get(r)) {
@@ -3544,6 +3659,7 @@ where
         None => return Ok(None),
     };
     let to_t = ctx.to_t;
+    let tracker = &ctx.tracker;
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
 
     let ops_ref = &ops;
@@ -3565,13 +3681,14 @@ where
                 hi,
                 sliced,
                 to_t,
+                tracker,
             ) else {
                 return Ok(0u128);
             };
             let mut total: u128 = 0;
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+                .map_err(|e| QueryError::from_io("cursor batch", e))?
             {
                 for r in 0..batch.row_count {
                     let s = batch.s_id.get(r);
@@ -3708,10 +3825,11 @@ pub fn count_predicate_overlay_delta(
             hi,
             sliced,
             to_t,
+            &ctx.tracker,
         ) {
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+                .map_err(|e| QueryError::from_io("cursor batch", e))?
             {
                 for r in 0..batch.row_count {
                     let s = batch.s_id.get(r);
@@ -3854,7 +3972,7 @@ pub fn build_iri_adjacency_from_cursor(
     let mut adj: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for i in 0..batch.row_count {
             if batch.o_type.get(i) != iri_ref {

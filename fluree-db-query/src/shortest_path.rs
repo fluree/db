@@ -564,6 +564,7 @@ impl ShortestPathOperator {
                 g_id,
                 to_t,
                 dirty,
+                tracker: ctx.tracker.clone(),
             },
             reserved_pids,
             typed_pid,

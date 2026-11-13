@@ -156,15 +156,27 @@ impl<'a> SubjectSource<'a> {
     }
 
     /// The subjects with a triple of predicate `p_id` in the source.
-    fn subjects(&self, p_id: u32) -> Result<FxHashSet<u64>> {
+    fn subjects(&self, p_id: u32, tracker: &fluree_db_core::Tracker) -> Result<FxHashSet<u64>> {
         let mut out = FxHashSet::default();
         match self {
             SubjectSource::One(member) => {
-                extend_subjects_for_predicate_set(member.store(), member.g_id(), p_id, &mut out)?;
+                extend_subjects_for_predicate_set(
+                    member.store(),
+                    member.g_id(),
+                    p_id,
+                    &mut out,
+                    tracker,
+                )?;
             }
             SubjectSource::Union(set) => {
                 for member in set.members() {
-                    extend_subjects_for_predicate_set(set.store(), member.g_id(), p_id, &mut out)?;
+                    extend_subjects_for_predicate_set(
+                        set.store(),
+                        member.g_id(),
+                        p_id,
+                        &mut out,
+                        tracker,
+                    )?;
                 }
             }
             SubjectSource::Empty => {}
@@ -323,7 +335,9 @@ fn build_exists_semijoin_cache(
             continue;
         };
 
-        cache.subjects_by_key.insert(key, source.subjects(p_id)?);
+        cache
+            .subjects_by_key
+            .insert(key, source.subjects(p_id, &ctx.tracker)?);
     }
 
     if cache.subjects_by_key.is_empty() {

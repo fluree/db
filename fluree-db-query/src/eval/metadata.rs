@@ -255,10 +255,11 @@ fn subject_ref_object_keys_merged(
     subject_s_id: u64,
 ) -> Result<Vec<u64>> {
     let g_id = ctx.binary_g_id;
-    let mut refs = batched_lookup_predicate_refs(store, g_id, p_id, &[subject_s_id], ctx.to_t)
-        .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?
-        .remove(&subject_s_id)
-        .unwrap_or_default();
+    let mut refs =
+        batched_lookup_predicate_refs(store, g_id, p_id, &[subject_s_id], ctx.to_t, &ctx.tracker)
+            .map_err(|e| QueryError::from_io("batched_lookup_predicate_refs", e))?
+            .remove(&subject_s_id)
+            .unwrap_or_default();
 
     if let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? {
         let iri_ref = OType::IRI_REF.as_u16();

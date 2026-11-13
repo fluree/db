@@ -173,7 +173,7 @@ impl LeafScan {
                     self.header.order,
                 ),
             }
-            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+            .map_err(|e| QueryError::from_io("load columns", e))?
         };
         let Some(to_t) = replay_to else {
             return Ok(batch);
