@@ -719,7 +719,6 @@ fn jsonld_document(
         .with_context_policy(context)
         .with_type_handling(TypeHandling::AsAtType)
         .with_blank_node_policy(BlankNodePolicy::PreserveLabeled)
-        .with_exact_native_values(true)
         .with_compactor(move |iri| compactor.compact(iri).unwrap_or_else(|| iri.to_string()));
     format_jsonld_dataset_ordered(dataset, graph_order, &config)
         .map_err(|e| RdfError::Unwritable(e.to_string()))
