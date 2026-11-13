@@ -332,12 +332,7 @@ pub fn warehouse_dir_name(dir: &str) -> &str {
 /// on the name part. Ambiguity (two dirs matching one name) or a miss is a
 /// fail-loud [`IcebergError::Catalog`] naming what WAS found.
 pub fn match_warehouse_table_dir(table_name: &str, dir_names: &[String]) -> Result<String> {
-    let want = table_name.trim();
-    let matches: Vec<&String> = dir_names
-        .iter()
-        .filter(|d| warehouse_dir_name(d).eq_ignore_ascii_case(want))
-        .collect();
-    match matches.as_slice() {
+    match warehouse_table_dir_candidates(table_name, dir_names).as_slice() {
         [one] => Ok((*one).trim_end_matches('/').to_string()),
         [] => Err(IcebergError::Catalog(format!(
             "no directory under the warehouse root matches table '{table_name}' \
@@ -349,6 +344,48 @@ pub fn match_warehouse_table_dir(table_name: &str, dir_names: &[String]) -> Resu
             "table '{table_name}' is AMBIGUOUS under the warehouse root — {} directories match: [{}]",
             many.len(),
             many.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+/// Every directory in `dir_names` whose name part matches `table_name` — the
+/// matching rule behind [`match_warehouse_table_dir`], for a caller that treats
+/// a miss differently from ambiguity.
+pub fn warehouse_table_dir_candidates<'a>(
+    table_name: &str,
+    dir_names: &'a [String],
+) -> Vec<&'a String> {
+    let want = table_name.trim();
+    dir_names
+        .iter()
+        .filter(|d| warehouse_dir_name(d).eq_ignore_ascii_case(want))
+        .collect()
+}
+
+/// Resolve one namespace level to its directory among `dir_names`, for a
+/// warehouse laid out `<root>/<namespace>/<table>`. Matches the WHOLE directory
+/// name (a namespace directory carries no `.suffix`), preferring an exact-case
+/// match and otherwise accepting a unique case-insensitive one. `Ok(None)` when
+/// no directory carries the name — the flat `<root>/<table>` layout. Two
+/// directories differing only in case, neither exact, is a fail-loud error.
+pub fn match_warehouse_namespace_dir(level: &str, dir_names: &[String]) -> Result<Option<String>> {
+    let want = level.trim();
+    let name = |d: &'_ String| d.trim_end_matches('/').to_string();
+    if let Some(exact) = dir_names.iter().map(name).find(|d| d == want) {
+        return Ok(Some(exact));
+    }
+    let folded: Vec<String> = dir_names
+        .iter()
+        .map(name)
+        .filter(|d| d.eq_ignore_ascii_case(want))
+        .collect();
+    match folded.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        many => Err(IcebergError::Catalog(format!(
+            "namespace '{level}' is AMBIGUOUS under the warehouse root — {} directories match: [{}]",
+            many.len(),
+            many.join(", ")
         ))),
     }
 }
@@ -416,6 +453,28 @@ mod warehouse_tests {
             err.contains("fact_order.NEWSUFFIX"),
             "lists both candidates: {err}"
         );
+    }
+
+    #[test]
+    fn namespace_dir_matches_whole_name_preferring_exact_case() {
+        let d = dirs(&["site1/", "Site2/", "site2/", "site3.AbC/"]);
+        assert_eq!(
+            match_warehouse_namespace_dir("SITE1", &d).unwrap(),
+            Some("site1".to_string())
+        );
+        // An exact-case directory wins over a case-folded sibling.
+        assert_eq!(
+            match_warehouse_namespace_dir("site2", &d).unwrap(),
+            Some("site2".to_string())
+        );
+        // Neither sibling is exact: refuse to guess.
+        let err = match_warehouse_namespace_dir("SITE2", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AMBIGUOUS"), "flags ambiguity: {err}");
+        // A suffixed table directory is not a namespace directory.
+        assert_eq!(match_warehouse_namespace_dir("site3", &d).unwrap(), None);
+        assert_eq!(match_warehouse_namespace_dir("site9", &d).unwrap(), None);
     }
 
     #[test]

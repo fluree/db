@@ -4101,7 +4101,9 @@ pub struct IcebergMapArgs {
     /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
     /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
     /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
-    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// on the name. A root holding a directory per namespace
+    /// (`<root>/<namespace>/<table>`) is searched there first; otherwise the
+    /// namespace is ignored. Warehouse mode is auto-detected when the
     /// location's leaf directory does not name the requested table; a bare
     /// single-table location resolves as before. (A table named exactly after its
     /// parent directory would read as single-table.) No catalog/OAuth flags are

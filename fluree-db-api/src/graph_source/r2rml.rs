@@ -3788,7 +3788,10 @@ impl FlureeR2rmlProvider<'_> {
     /// detected because its leaf directory does not name the requested table —
     /// LIST the root once (session-cached, one LIST per build) and match THIS
     /// table's own `<name>.<suffix>/` (or bare `<name>/`) directory beneath it,
-    /// case-insensitively on the name part. Ambiguity or a miss fails loud, naming
+    /// case-insensitively on the name part. A root laid out by namespace
+    /// (`<root>/<namespace>/<table>`) is searched there first, so same-named
+    /// tables in different namespaces stay distinct; a root with no directory
+    /// for the namespace is matched flat. Ambiguity or a miss fails loud, naming
     /// the candidates. Otherwise (a single-table direct location) returns
     /// `table_location` unchanged, so the caller's resolution is byte-identical.
     ///
@@ -3811,22 +3814,37 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         let root = trimmed.to_string();
-        let listing = match self.session.cached_warehouse_listing(&root) {
-            Some(l) => l,
-            None => {
-                let storage =
-                    session_storage(&self.session, lt_key, plan, &CatalogGrant::direct()).await?;
-                let dirs = storage.list_dir(&root).await.map_err(|e| {
-                    storage_query_error(&format!("Failed to LIST warehouse root {root}"), e)
-                })?;
-                info!(
-                    warehouse_root = %root,
-                    tables_found = dirs.len(),
-                    "Listed catalog-less warehouse root (direct mode)"
-                );
-                self.session.store_warehouse_listing(root.clone(), dirs)
+        let listing = self.warehouse_listing(&root, lt_key, plan).await?;
+
+        // Namespaced layout first: `<root>/<namespace>/<table>`, one directory
+        // per namespace level. Without it two namespaces holding a same-named
+        // table collide on the table name. A root with no directory for the
+        // namespace is the flat layout below (a Snowflake-style copy, where the
+        // namespace names no directory at all).
+        let mut searched_namespace_dir = None;
+        if let Some(ns_dir) = self
+            .resolve_namespace_dir(&root, &listing, &table_id.namespace, lt_key, plan)
+            .await?
+        {
+            let ns_listing = self.warehouse_listing(&ns_dir, lt_key, plan).await?;
+            let candidates =
+                fluree_db_iceberg::catalog::warehouse_table_dir_candidates(requested, &ns_listing);
+            match candidates.as_slice() {
+                [one] => return Ok(format!("{ns_dir}/{}", one.trim_end_matches('/'))),
+                [] => searched_namespace_dir = Some(ns_dir),
+                many => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "warehouse-root resolution for table '{table_id}': AMBIGUOUS under \
+                         {ns_dir} — {} directories match: [{}]",
+                        many.len(),
+                        many.iter()
+                            .map(|d| d.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
             }
-        };
+        }
 
         let matched =
             match fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing) {
@@ -3843,13 +3861,80 @@ impl FlureeR2rmlProvider<'_> {
                     if listing_is_single_table(&listing) {
                         return Ok(table_location.to_string());
                     }
+                    let also = searched_namespace_dir
+                        .map(|d| format!(" (also not found under namespace directory {d})"))
+                        .unwrap_or_default();
                     return Err(QueryError::InvalidQuery(format!(
-                        "warehouse-root resolution for table '{}': {e}",
+                        "warehouse-root resolution for table '{}': {e}{also}",
                         table_id.table
                     )));
                 }
             };
         Ok(format!("{root}/{matched}"))
+    }
+
+    /// The child-directory listing of a warehouse directory: one LIST per
+    /// directory per build, session-cached.
+    async fn warehouse_listing(
+        &self,
+        dir: &str,
+        lt_key: &str,
+        plan: &StoragePlan,
+    ) -> QueryResult<Arc<Vec<String>>> {
+        if let Some(listing) = self.session.cached_warehouse_listing(dir) {
+            return Ok(listing);
+        }
+        let storage = session_storage(&self.session, lt_key, plan, &CatalogGrant::direct()).await?;
+        let dirs = storage
+            .list_dir(dir)
+            .await
+            .map_err(|e| storage_query_error(&format!("Failed to LIST warehouse root {dir}"), e))?;
+        info!(
+            warehouse_root = %dir,
+            tables_found = dirs.len(),
+            "Listed catalog-less warehouse root (direct mode)"
+        );
+        Ok(self.session.store_warehouse_listing(dir.to_string(), dirs))
+    }
+
+    /// The directory under `root` for `namespace`, descending one directory per
+    /// dot-separated level. `None` when any level has no directory — the root
+    /// is not laid out by namespace.
+    async fn resolve_namespace_dir(
+        &self,
+        root: &str,
+        root_listing: &Arc<Vec<String>>,
+        namespace: &str,
+        lt_key: &str,
+        plan: &StoragePlan,
+    ) -> QueryResult<Option<String>> {
+        let mut dir = root.to_string();
+        let mut listing = Arc::clone(root_listing);
+        let levels: Vec<&str> = namespace
+            .split('.')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if levels.is_empty() {
+            return Ok(None);
+        }
+        for (i, level) in levels.iter().enumerate() {
+            let Some(child) =
+                fluree_db_iceberg::catalog::match_warehouse_namespace_dir(level, &listing)
+                    .map_err(|e| {
+                        QueryError::InvalidQuery(format!(
+                            "warehouse-root resolution for namespace '{namespace}' under {dir}: {e}"
+                        ))
+                    })?
+            else {
+                return Ok(None);
+            };
+            dir = format!("{dir}/{child}");
+            if i + 1 < levels.len() {
+                listing = self.warehouse_listing(&dir, lt_key, plan).await?;
+            }
+        }
+        Ok(Some(dir))
     }
 
     /// Build (or find cached) the shared catalog client a source's table loads
