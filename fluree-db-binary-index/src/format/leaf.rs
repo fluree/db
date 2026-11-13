@@ -884,7 +884,8 @@ impl LeafletDirEntryV3 {
     /// read at the index's own `t`, which replays nothing.
     ///
     /// Such a read cannot go by what the directory says of the rows alone:
-    /// their count, their key range, or their type constant.
+    /// their count, their key range, their type constant, or their flags
+    /// (`HAS_O_I`).
     #[inline]
     pub fn replays_history(&self, replay_to: Option<i64>) -> bool {
         replay_to.is_some_and(|to_t| {

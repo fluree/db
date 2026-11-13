@@ -1420,7 +1420,19 @@ async fn seed_retracted_type_ledger(
              "ns:reads": [{"@id": "ns:d1"}, {"@id": "ns:d2"}, {"@id": "ns:d4"}]},
             {"@id": "ns:d1", "ns:tag": {"@id": "ns:bob"}, "ns:val": 7},
             {"@id": "ns:d2", "ns:tag": {"@id": "ns:carol"}, "ns:val": "seven"},
-            {"@id": "ns:d4", "ns:tag": ["bob", "carol", "dave", "erin", "frank", "grace"]}
+            {"@id": "ns:d4", "ns:tag": ["bob", "carol", "dave", "erin", "frank", "grace"]},
+            // `ns:num`: an integer and a double of one value; the double goes.
+            {"@id": "ns:d1", "ns:num": 7},
+            {"@id": "ns:d3", "ns:num": {"@value": "7", "@type": "xsd:double"}},
+            {"@id": "ns:d5", "ns:num": 8},
+            // `ns:p1` / `ns:p2`: a decimal pair under both predicates, two more
+            // `ns:p1` decimals so their arena handles differ; the decimals go.
+            {"@id": "ns:zz",
+             "ns:p1": {"@value": "1.5", "@type": "xsd:decimal"},
+             "ns:p2": {"@value": "1.5", "@type": "xsd:decimal"}},
+            {"@id": "ns:z1", "ns:p1": {"@value": "2.5", "@type": "xsd:decimal"}},
+            {"@id": "ns:z2", "ns:p1": {"@value": "3.5", "@type": "xsd:decimal"}},
+            {"@id": "ns:c", "ns:p1": 3, "ns:p2": 3}
         ]
     });
     let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
@@ -1431,7 +1443,13 @@ async fn seed_retracted_type_ledger(
         "@context": ctx(),
         "delete": [
             {"@id": "ns:d1", "ns:tag": {"@id": "ns:bob"}, "ns:val": 7},
-            {"@id": "ns:d2", "ns:tag": {"@id": "ns:carol"}}
+            {"@id": "ns:d2", "ns:tag": {"@id": "ns:carol"}},
+            {"@id": "ns:d3", "ns:num": {"@value": "7", "@type": "xsd:double"}},
+            {"@id": "ns:zz",
+             "ns:p1": {"@value": "1.5", "@type": "xsd:decimal"},
+             "ns:p2": {"@value": "1.5", "@type": "xsd:decimal"}},
+            {"@id": "ns:z1", "ns:p1": {"@value": "2.5", "@type": "xsd:decimal"}},
+            {"@id": "ns:z2", "ns:p1": {"@value": "3.5", "@type": "xsd:decimal"}}
         ]
     });
     let _ = fluree.update(l1, &tx2).await.expect("tx2");
@@ -1502,6 +1520,16 @@ async fn assert_retracted_type_shapes(strategy: IndexStrategy, ledger_id: &str) 
             Lane::Any,
         ),
         (
+            // The planner proves `ns:num` integer-only from the leaflets'
+            // type constants and seeks the integer slice alone; the double
+            // the replay restores is of another type.
+            "equality filter",
+            "?x",
+            "?x ns:num ?v FILTER(?v = 7)",
+            json!([["ns:d1"], ["ns:d3"]]),
+            Lane::Any,
+        ),
+        (
             "bound ref from a join",
             "?b ?x",
             "ns:alice ns:knows ?b . ?x ns:tag ?b",
@@ -1553,6 +1581,18 @@ async fn assert_retracted_type_shapes(strategy: IndexStrategy, ledger_id: &str) 
         1,
         "{strategy:?}: COUNT of the bound ref at t=1"
     );
+    // The composite count joins the two predicates on their object keys; a
+    // retracted decimal's key is a per-predicate arena handle, which the
+    // directory no longer reports.
+    let composite_t1 = format!(
+        "PREFIX ns: <http://example.org/ns#>\n\
+         SELECT (COUNT(*) AS ?c) {at_t1} WHERE {{ ?s ns:p1 ?o . ?s ns:p2 ?o }}"
+    );
+    assert_eq!(
+        run_count_sparql(&fluree, &composite_t1).await,
+        2,
+        "{strategy:?}: COUNT of the composite join at t=1"
+    );
     let jsonld_t1 = json!({
         "@context": ctx(),
         "from": format!("{ledger_id}@t:1"),
@@ -1566,17 +1606,27 @@ async fn assert_retracted_type_shapes(strategy: IndexStrategy, ledger_id: &str) 
     );
 
     // Control: the retraction still holds at t=2.
-    for (name, body) in [
-        ("bound ref", "?x ns:tag ns:bob"),
-        ("bound integer", "?x ns:val 7"),
+    for (name, body, left) in [
+        ("bound ref", "?x ns:tag ns:bob", json!([])),
+        ("bound integer", "?x ns:val 7", json!([])),
+        (
+            "equality filter",
+            "?x ns:num ?v FILTER(?v = 7)",
+            json!([["ns:d1"]]),
+        ),
     ] {
-        assert!(
-            run_rows(&fluree, &sparql(&at_t2, "?x", body))
-                .await
-                .is_empty(),
-            "{strategy:?}: {name} is retracted at t=2"
+        assert_eq!(
+            JsonValue::Array(run_rows(&fluree, &sparql(&at_t2, "?x", body)).await),
+            left,
+            "{strategy:?}: {name} at t=2"
         );
     }
+    let composite_t2 = composite_t1.replace(&at_t1, &at_t2);
+    assert_eq!(
+        run_count_sparql(&fluree, &composite_t2).await,
+        1,
+        "{strategy:?}: COUNT of the composite join at t=2"
+    );
 
     // Control: a history range takes its events from the same sidecar and
     // filters on the object after the scan. The ref's assert at t=1 and its
