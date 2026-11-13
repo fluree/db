@@ -1113,8 +1113,10 @@ pub(crate) mod tests {
         driver.await.unwrap();
     }
 
+    /// An object the server refuses reads as not found, and is not thereby
+    /// absent: whether it exists is not known.
     #[tokio::test]
-    async fn forbidden_maps_to_not_found_and_exists_is_false() {
+    async fn forbidden_maps_to_not_found_and_exists_is_unknown() {
         let (id, address, _bytes) = object(6, 8);
         let state = Arc::new(Mutex::new(MockState::default()));
         state
@@ -1125,7 +1127,11 @@ pub(crate) mod tests {
         let (storage, io, driver) = storage_with(&state, &config());
         let err = storage.read_bytes(&address).await.expect_err("403");
         assert!(matches!(err, CoreError::NotFound(_)), "got {err:?}");
-        assert!(!storage.exists(&address).await.unwrap());
+        let unknown = storage.exists(&address).await.expect_err("unknown");
+        assert!(
+            !matches!(unknown, CoreError::NotFound(_)),
+            "got {unknown:?}"
+        );
         // Coalesced waiters see the same NotFound class.
         io.shutdown();
         driver.await.unwrap();
