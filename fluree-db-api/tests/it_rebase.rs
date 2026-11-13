@@ -33,14 +33,25 @@ fn extract_names(rows: &serde_json::Value) -> Vec<String> {
 /// Query all ex:name values on a branch.
 async fn query_all_names(fluree: &support::MemoryFluree, ledger_id: &str) -> Vec<String> {
     let ledger = fluree.ledger(ledger_id).await.unwrap();
+    query_names(fluree, &ledger).await
+}
+
+/// Query all ex:name values on a branch as its cached handle holds it.
+async fn query_cached_names(fluree: &support::MemoryFluree, ledger_id: &str) -> Vec<String> {
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    query_names(fluree, &handle.snapshot().await.to_ledger_state()).await
+}
+
+async fn query_names(
+    fluree: &support::MemoryFluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> Vec<String> {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "select": ["?name"],
         "where": {"@id": "?s", "ex:name": "?name"}
     });
-    let result = support::query_jsonld(fluree, &ledger, &query)
-        .await
-        .unwrap();
+    let result = support::query_jsonld(fluree, ledger, &query).await.unwrap();
     let rows = result.to_jsonld(&ledger.snapshot).unwrap();
     extract_names(&rows)
 }
@@ -1202,4 +1213,35 @@ async fn a_rebase_that_skips_every_commit_leaves_the_branch_as_it_was() {
         query_all_names(&fresh, "rb:dev").await,
         ["alice", "alice-dev", "erin"]
     );
+}
+
+/// An instance holding the branch warm across another instance's rebase
+/// does not apply the new line's commits onto the line they replaced: the
+/// commits sit on another commit at its `t`, so it reloads.
+#[tokio::test]
+async fn a_warm_cache_reloads_across_another_instances_rebase() {
+    let dir = tempfile::tempdir().unwrap();
+    let rebaser = file_fluree(&dir);
+    diverged(&rebaser).await;
+    let warm = file_fluree(&dir);
+    assert_eq!(
+        query_cached_names(&warm, "rb:dev").await,
+        ["alice", "bob", "carol"]
+    );
+
+    rebaser
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    let refreshed = warm
+        .refresh("rb:dev", Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(refreshed.action, fluree_db_api::NotifyResult::Reloaded),
+        "{:?}",
+        refreshed.action
+    );
+    assert_eq!(query_cached_names(&warm, "rb:dev").await, EVERY_NAME);
 }
