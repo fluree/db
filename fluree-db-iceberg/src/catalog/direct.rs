@@ -61,8 +61,8 @@ impl<S: IcebergStorage> DirectCatalogClient<S> {
     /// Returns the full path to the current metadata JSON file. The hint file,
     /// when present, contains the metadata filename
     /// (e.g., `00001-abc-def.metadata.json`) or a full path. Without one
-    /// (pyiceberg and most non-Hadoop writers never write it), the highest-
-    /// versioned `*.metadata.json` in `metadata/` is used; if the listing
+    /// (pyiceberg and most non-Hadoop writers never write it), or with an empty
+    /// one, the highest-versioned `*.metadata.json` in `metadata/` is used; if the listing
     /// itself fails, the original hint error is reported. SYNC: mirror any change in
     /// `SendDirectCatalogClient::resolve_metadata_location` below.
     async fn resolve_metadata_location(&self) -> Result<String> {
@@ -85,10 +85,16 @@ impl<S: IcebergStorage> DirectCatalogClient<S> {
             .map_err(|e| IcebergError::Metadata(format!("Invalid version-hint.text: {e}")))?
             .trim();
 
+        // An empty hint names nothing: it takes the fallback a missing one does.
         if hint.is_empty() {
-            return Err(IcebergError::Metadata(
-                "version-hint.text is empty".to_string(),
-            ));
+            return fallback_metadata_location(
+                self.storage
+                    .list_files(&format!("{}/metadata", self.table_location)),
+                &self.table_location,
+                &hint_path,
+                &IcebergError::Metadata("version-hint.text is empty".to_string()),
+            )
+            .await;
         }
 
         Ok(resolve_hint_to_metadata_path(hint, &self.table_location))
@@ -190,10 +196,16 @@ impl<S: SendIcebergStorage> SendDirectCatalogClient<S> {
             .map_err(|e| IcebergError::Metadata(format!("Invalid version-hint.text: {e}")))?
             .trim();
 
+        // An empty hint names nothing: it takes the fallback a missing one does.
         if hint.is_empty() {
-            return Err(IcebergError::Metadata(
-                "version-hint.text is empty".to_string(),
-            ));
+            return fallback_metadata_location(
+                self.storage
+                    .list_files(&format!("{}/metadata", self.table_location)),
+                &self.table_location,
+                &hint_path,
+                &IcebergError::Metadata("version-hint.text is empty".to_string()),
+            )
+            .await;
         }
 
         Ok(resolve_hint_to_metadata_path(hint, &self.table_location))
@@ -559,6 +571,23 @@ mod tests {
         assert_eq!(
             resp.metadata_location,
             "file:///wh/t/metadata/00003-bbbb.metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_version_hint_falls_back_to_metadata_listing() {
+        // An empty hint names no file: it resolves as a missing one does.
+        let mut storage = MemoryStorage::new();
+        storage.add_file("file:///wh/t/metadata/version-hint.text", "  \n");
+        storage.add_file("file:///wh/t/metadata/v1.metadata.json", "{}");
+        let client = DirectCatalogClient::new("file:///wh/t".to_string(), Arc::new(storage));
+        let resp = client
+            .load_table(&TableIdentifier::new("ns", "t"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata_location,
+            "file:///wh/t/metadata/v1.metadata.json"
         );
     }
 

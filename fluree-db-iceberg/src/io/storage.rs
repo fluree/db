@@ -1625,6 +1625,66 @@ mod tests {
 
     /// One delimited `ListObjectsV2` yields both listings: common prefixes are
     /// the child directories, object keys the child files. The file listing is
+    /// A listing longer than one page is read to its end. `v10` sorts below
+    /// `v9` and arrives on the second page, so a listing that stopped at the
+    /// first would resolve a stale metadata file.
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn s3_lists_every_page_of_a_prefix() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let contents: String = (1..=9)
+            .map(|v| format!("<Contents><Key>wh/t/metadata/v{v}.metadata.json</Key><Size>1</Size></Contents>"))
+            .collect();
+        let first = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>wh/t/metadata/</Prefix><Delimiter>/</Delimiter>
+  <KeyCount>9</KeyCount><MaxKeys>9</MaxKeys><IsTruncated>true</IsTruncated>
+  <NextContinuationToken>page-2</NextContinuationToken>
+  {contents}
+</ListBucketResult>"#
+        );
+        let second = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>wh/t/metadata/</Prefix><Delimiter>/</Delimiter>
+  <KeyCount>1</KeyCount><MaxKeys>9</MaxKeys><IsTruncated>false</IsTruncated>
+  <ContinuationToken>page-2</ContinuationToken>
+  <Contents><Key>wh/t/metadata/v10.metadata.json</Key><Size>1</Size></Contents>
+</ListBucketResult>"#;
+        Mock::given(method("GET"))
+            .and(path("/b/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("continuation-token", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(second, "application/xml"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "wh/t/metadata/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(first, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let storage = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            Some(&server.uri()),
+            true,
+        )
+        .await
+        .unwrap();
+        let files = SendIcebergStorage::list_files(&storage, "s3://b/wh/t/metadata")
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 10, "{files:?}");
+        assert!(files.iter().any(|f| f == "v10.metadata.json"), "{files:?}");
+    }
+
     /// what resolves a table with no `version-hint.text`.
     #[tokio::test]
     #[cfg(feature = "aws")]
