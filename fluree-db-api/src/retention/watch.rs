@@ -275,6 +275,7 @@ impl BranchWatch {
         token: Token,
     ) {
         let mut state = self.state.write().expect("watch lock never poisoned");
+        let state = &mut *state;
         let Some(branch) = state.branches.get_mut(ledger_id) else {
             return;
         };
@@ -296,6 +297,7 @@ impl BranchWatch {
             }
             return;
         }
+        let was = branch.revision();
         match record {
             Some(record) => branch.adopt(record),
             None => branch.seen = Some(Seen::Absent),
@@ -304,6 +306,10 @@ impl BranchWatch {
             *journal = Some(holds);
         }
         branch.validated_ms = token.at_ms;
+        if branch.revision() != was {
+            state.seq += 1;
+            branch.touched = state.seq;
+        }
     }
 
     /// The ledgers (canonically spelled) graph source `id` indexes, when
@@ -359,15 +365,21 @@ impl BranchWatch {
     /// since.
     pub(crate) fn learn(&self, ledger_id: &str, record: Option<&NsRecord>, token: Token) {
         let mut state = self.state.write().expect("watch lock never poisoned");
+        let state = &mut *state;
         let branch = state.branches.entry(ledger_id.to_string()).or_default();
         if branch.touched > token.seq {
             return;
         }
+        let was = branch.revision();
         match record {
             Some(record) => branch.adopt(record),
             None => branch.seen = Some(Seen::Absent),
         }
         branch.validated_ms = token.at_ms;
+        if branch.revision() != was {
+            state.seq += 1;
+            branch.touched = state.seq;
+        }
     }
 
     /// Record what a journal read after `token` holds, unless something
@@ -493,6 +505,13 @@ impl BranchWatch {
 }
 
 impl Branch {
+    /// The incarnation and configuration revision kept. A lookup that
+    /// learns another is a change to the branch like an event: a journal
+    /// read begun before it was of the earlier one, and is not recorded.
+    fn revision(&self) -> Option<(Option<Fence>, u128, Option<i64>)> {
+        self.seen.as_ref().and_then(Seen::revision)
+    }
+
     /// Whether what is kept is learned again as it ages: not what a peer's
     /// stream keeps current.
     fn revalidates(&self) -> bool {
@@ -637,6 +656,46 @@ mod tests {
             instance: None,
         });
         assert_eq!(get(&watch), Some(Seen::Dropped));
+    }
+
+    /// A journal read begun at one revision is not recorded once a lookup
+    /// has learned the next: it would stand as that revision's.
+    #[test]
+    fn a_journal_read_overtaken_by_a_newer_revision_is_not_kept() {
+        let watch = tracking();
+        let mut r = record(3);
+        r.config_version = Some(5);
+        watch.learn("w:main", Some(&r), watch.token());
+        let reading = watch.token();
+        r.config_version = Some(6);
+        watch.revalidated("w:main", Some((Some(&r), None)), watch.token());
+        watch.learn_journal("w:main", Holds::Nothing, reading);
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live {
+                journal: None,
+                config_version: Some(6),
+                ..
+            })
+        ));
+        // Learned by a plain lookup, the same.
+        let reading = watch.token();
+        r.config_version = Some(7);
+        watch.learn("w:main", Some(&r), watch.token());
+        watch.learn_journal("w:main", Holds::Nothing, reading);
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live { journal: None, .. })
+        ));
+        // One read at the revision kept is recorded.
+        watch.learn_journal("w:main", Holds::Removals, watch.token());
+        assert!(matches!(
+            get(&watch),
+            Some(Seen::Live {
+                journal: Some(Holds::Removals),
+                ..
+            })
+        ));
     }
 
     #[test]
