@@ -87,6 +87,208 @@ pub(crate) struct R2rmlPolicyGate {
     /// The snapshot the policy's targets are encoded against, where it is not
     /// the context's own (a source reached through `GRAPH` in a dataset).
     encoder: Option<LedgerSnapshot>,
+    /// What a subject may hold beyond the classes one row of its map shows.
+    scope: ClassScope,
+    /// The classes class-targeted restrictions select by: those of every
+    /// `f:onClass` restriction, which applies to every predicate, and those
+    /// of each `f:onProperty` restriction with classes, by property.
+    targeted_any: Vec<String>,
+    targeted_by_predicate: HashMap<String, Vec<String>>,
+    /// The view set holds an `f:required` or an `f:query` restriction, which
+    /// make a decision move both ways as a subject's class set grows, so the
+    /// two-point check does not settle it (see [`Self::allows`]).
+    enumerate: bool,
+    /// The source, for messages.
+    graph_source_id: String,
+    /// Final decisions, by map, triple and the row's classes, for
+    /// subject-independent policies.
+    decision_cache: HashMap<(String, String, Vec<String>), bool>,
+    /// Policy evaluations run (tests read it).
+    #[cfg(test)]
+    evaluations: std::sync::atomic::AtomicUsize,
+}
+
+/// The most classes beyond a row's own that a decision is enumerated over
+/// (`2^n` evaluations); a decision needing more refuses the query.
+const MAX_EXTRA_CLASSES: usize = 8;
+
+/// What a subject of each map may hold beyond the classes one row of its map
+/// shows, from the mapping alone (and the keys of maps deriving classes).
+#[derive(Debug, Default)]
+struct ClassScope {
+    /// Per map: the other maps whose subjects are not provably apart from its
+    /// own (`TriplesMap::subjects_provably_disjoint`).
+    overlaps: HashMap<String, Vec<String>>,
+    /// Per map: the classes every subject of it holds.
+    statics: HashMap<String, Vec<String>>,
+    /// Per map deriving a class from its row: the prefixes a derived class
+    /// starts with (an IRI template's constant text, a reference's parent
+    /// subject template's), or `None` where it can be any IRI (an
+    /// `rr:column` IRI, a parent minting from a column).
+    derives: HashMap<String, Option<Vec<String>>>,
+    /// Per map deriving a class: whether its table's key makes each subject
+    /// one row's, so a row's derived classes are the subject's.
+    unique: HashMap<String, bool>,
+}
+
+impl ClassScope {
+    fn of(mapping: &CompiledR2rmlMapping) -> Self {
+        let maps: Vec<&TriplesMap> = mapping.triples_maps.values().collect();
+        let mut scope = ClassScope::default();
+        for tm in &maps {
+            let others = maps
+                .iter()
+                .filter(|o| o.iri != tm.iri && !tm.subjects_provably_disjoint(o))
+                .map(|o| o.iri.clone())
+                .collect();
+            scope.overlaps.insert(tm.iri.clone(), others);
+            scope.statics.insert(tm.iri.clone(), static_classes(tm));
+            if let Some(prefixes) = derived_class_prefixes(mapping, tm) {
+                scope.derives.insert(tm.iri.clone(), prefixes);
+            }
+        }
+        scope
+    }
+
+    /// Whether `prefixes` (from [`Self::derives`]) can mint `class`.
+    fn can_mint(prefixes: &Option<Vec<String>>, class: &str) -> bool {
+        prefixes
+            .as_ref()
+            .is_none_or(|ps| ps.iter().any(|p| class.starts_with(p.as_str())))
+    }
+
+    /// The classes among `targeted` a subject of `tm` may hold that its row
+    /// does not show (`own`): those of overlapping maps' static classes, and
+    /// those deriving maps can mint where a row may not show its subject's
+    /// derived classes (the map's own rows when its subjects are not proven
+    /// one row's, every row of an overlapping map deriving classes).
+    fn extra(&self, tm: &str, own: &[String], targeted: &[String]) -> (Vec<String>, Vec<String>) {
+        let (mut statics, mut data) = (Vec::new(), Vec::new());
+        if targeted.is_empty() {
+            return (statics, data);
+        }
+        let overlaps = self.overlaps.get(tm).map(Vec::as_slice).unwrap_or_default();
+        for other in overlaps {
+            for class in self
+                .statics
+                .get(other)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if targeted.contains(class) && !own.contains(class) && !statics.contains(class) {
+                    statics.push(class.clone());
+                }
+            }
+        }
+        let mut deriving: Vec<&Option<Vec<String>>> = Vec::new();
+        if let Some(prefixes) = self.derives.get(tm) {
+            if !self.unique.get(tm).copied().unwrap_or(false) {
+                deriving.push(prefixes);
+            }
+        }
+        for other in overlaps {
+            if let Some(prefixes) = self.derives.get(other) {
+                deriving.push(prefixes);
+            }
+        }
+        for class in targeted {
+            if own.contains(class) || statics.contains(class) || data.contains(class) {
+                continue;
+            }
+            if deriving.iter().any(|p| Self::can_mint(p, class)) {
+                data.push(class.clone());
+            }
+        }
+        statics.sort();
+        data.sort();
+        (statics, data)
+    }
+}
+
+/// Warnings, for a source registered with a model, about subjects whose
+/// classes one row cannot show: each pair of triples maps whose subjects are
+/// not provably apart and that declare different classes, or where one derives
+/// classes from its row. A class-targeted view policy decides such a map's
+/// rows over every class set its subjects could hold, hiding rows a decision
+/// on one row's classes would show (or, where the classes come from rows the
+/// scan does not read, refusing the query).
+pub fn class_overlap_warnings(mapping: &CompiledR2rmlMapping) -> Vec<String> {
+    let scope = ClassScope::of(mapping);
+    let mut maps: Vec<&TriplesMap> = mapping.triples_maps.values().collect();
+    maps.sort_by(|a, b| a.iri.cmp(&b.iri));
+    let mut warnings = Vec::new();
+    for (i, a) in maps.iter().enumerate() {
+        for b in &maps[i + 1..] {
+            if a.subjects_provably_disjoint(b) {
+                continue;
+            }
+            let differ = scope.statics.get(&a.iri) != scope.statics.get(&b.iri)
+                || scope.derives.contains_key(&a.iri)
+                || scope.derives.contains_key(&b.iri);
+            if differ {
+                warnings.push(format!(
+                    "triples maps <{}> and <{}> can mint the same subjects with different \
+                     classes; a class-targeted view policy decides their rows over every class \
+                     set a subject could hold, and may hide rows a native ledger would show \
+                     (give them subject templates that keep them apart, or target such \
+                     policies by property or subject)",
+                    a.iri, b.iri
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+/// The prefixes a class `tm` derives from its row starts with (see/// The prefixes a class `tm` derives from its row starts with (see
+/// [`ClassScope::derives`]); `None` (outer) when it derives none.
+fn derived_class_prefixes(
+    mapping: &CompiledR2rmlMapping,
+    tm: &TriplesMap,
+) -> Option<Option<Vec<String>>> {
+    use fluree_db_r2rml::mapping::TermType;
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut derives = false;
+    for pom in &tm.predicate_object_maps {
+        if pom.predicate_map.as_constant() != Some(rdf::TYPE) {
+            continue;
+        }
+        match &pom.object_map {
+            ObjectMap::Constant { .. } => continue,
+            ObjectMap::Template {
+                template,
+                term_type,
+                ..
+            } => {
+                derives = true;
+                // Only an IRI is a class.
+                if *term_type == TermType::Iri {
+                    prefixes.push(super::rewrite::constant_prefix(template).to_string());
+                }
+            }
+            ObjectMap::RefObjectMap(rom) => {
+                derives = true;
+                let parent = mapping.get(&rom.parent_triples_map);
+                match parent.map(|p| &p.subject_map) {
+                    Some(sm) if sm.constant.is_some() => {
+                        prefixes.push(sm.constant.clone().unwrap_or_default());
+                    }
+                    Some(sm) if sm.column.is_none() && sm.template.is_some() => {
+                        let template = sm.template.as_deref().unwrap_or_default();
+                        prefixes.push(super::rewrite::constant_prefix(template).to_string());
+                    }
+                    _ => return Some(None),
+                }
+            }
+            ObjectMap::Column { term_type, .. } => {
+                derives = true;
+                if *term_type == TermType::Iri {
+                    return Some(None);
+                }
+            }
+        }
+    }
+    derives.then_some(Some(prefixes))
 }
 
 impl R2rmlPolicyGate {
@@ -101,7 +303,7 @@ impl R2rmlPolicyGate {
     /// is the source's own. Where filtering is required and no enforcer can be
     /// resolved for the source, the scan is refused rather than run
     /// unfiltered.
-    pub(crate) fn build(
+    pub(crate) async fn build(
         ctx: &ExecutionContext<'_>,
         mapping: &CompiledR2rmlMapping,
         graph_source_id: &str,
@@ -177,14 +379,35 @@ impl R2rmlPolicyGate {
                 view.by_class.entry(c).or_default().push(idx);
             }
         }
+        // A class-targeted restriction applies to a subject holding one of its
+        // classes. The property index may skip that check for a property
+        // only instances of the restriction's classes are known to use; the
+        // mapping's stats credit a property to static classes only, so a map
+        // that derives its class from a row, or declares none, would have its
+        // rows decided as if classed. Every class-targeted entry checks.
+        let class_policies: Vec<bool> = view.restrictions.iter().map(|r| r.class_policy).collect();
+        for entries in view.by_property.values_mut() {
+            for entry in entries {
+                if class_policies[entry.idx] {
+                    entry.class_check_needed = true;
+                }
+            }
+        }
         let per_subject = !view.by_subject.is_empty();
         let has_class_policies = view.restrictions.iter().any(|r| r.class_policy);
+        // Every class any restriction is selected by, whatever it targets: a
+        // restriction on a property of a class (`f:onProperty` with
+        // `f:onClass`) is indexed by its property, not its class, yet its
+        // verdict turns on the class all the same.
         let mut policy_classes: Vec<String> = view
-            .by_class
-            .keys()
+            .restrictions
+            .iter()
+            .filter(|r| r.class_policy)
+            .flat_map(|r| r.for_classes.iter())
             .filter_map(|c| snapshot.decode_sid(c))
             .collect();
         policy_classes.sort();
+        policy_classes.dedup();
         let mut policy_subjects: Option<Vec<String>> = view
             .by_subject
             .keys()
@@ -194,6 +417,68 @@ impl R2rmlPolicyGate {
             subjects.sort();
         }
         report_unevaluable_policies(ctx, graph_source_id, &view);
+        let mut targeted_any: Vec<String> = Vec::new();
+        let mut targeted_by_predicate: HashMap<String, Vec<String>> = HashMap::new();
+        for r in view.restrictions.iter().filter(|r| r.class_policy) {
+            let classes: Vec<String> = r
+                .for_classes
+                .iter()
+                .filter_map(|c| snapshot.decode_sid(c))
+                .collect();
+            if r.target_mode == TargetMode::OnClass {
+                targeted_any.extend(classes);
+            } else {
+                for target in &r.targets {
+                    if let Some(p) = snapshot.decode_sid(target) {
+                        targeted_by_predicate
+                            .entry(p)
+                            .or_default()
+                            .extend(classes.iter().cloned());
+                    }
+                }
+            }
+        }
+        targeted_any.sort();
+        targeted_any.dedup();
+        let enumerate = view
+            .restrictions
+            .iter()
+            .any(|r| r.required || matches!(r.value, fluree_db_policy::PolicyValue::Query(_)));
+        // Without a class-targeted restriction no class changes a decision:
+        // nothing about other maps' classes is worked out.
+        let mut scope = if has_class_policies {
+            ClassScope::of(mapping)
+        } else {
+            ClassScope::default()
+        };
+        if has_class_policies && !scope.derives.is_empty() {
+            // Whether a deriving map's rows each show their subject's derived
+            // classes rests on its table's keys, trusted as the deduplication
+            // that relies on them is.
+            let as_of_t = if ctx.explicit_dataset().is_some() {
+                None
+            } else {
+                Some(ctx.to_t)
+            };
+            let mut keys = super::set_semantics::TableKeyEvidence::default();
+            let deriving: Vec<String> = scope.derives.keys().cloned().collect();
+            for iri in deriving {
+                let unique = match (ctx.r2rml_table_provider, mapping.get(&iri)) {
+                    (Some(provider), Some(tm)) => {
+                        keys.subject_unique_fetching(
+                            provider,
+                            mapping,
+                            graph_source_id,
+                            as_of_t,
+                            tm,
+                        )
+                        .await?
+                    }
+                    _ => false,
+                };
+                scope.unique.insert(iri, unique);
+            }
+        }
         let wrapper = PolicyWrapper::new(
             view,
             PolicySet::default(),
@@ -225,6 +510,14 @@ impl R2rmlPolicyGate {
             policy_subjects,
             static_cache: HashMap::new(),
             encoder,
+            scope,
+            targeted_any,
+            targeted_by_predicate,
+            enumerate,
+            graph_source_id: graph_source_id.to_string(),
+            decision_cache: HashMap::new(),
+            #[cfg(test)]
+            evaluations: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -277,12 +570,28 @@ impl R2rmlPolicyGate {
                 .collect();
             preds.push(rdf::TYPE.to_string());
             for pred in preds {
-                let otherwise = self.allows(ctx, tm, None, &pred, &[]).await?;
+                // A type triple is decided on the class it states; a map
+                // stating classes whose triples are decided apart is not one
+                // verdict, and the lane declines it.
+                let mut decided: Option<bool> = None;
+                if pred == rdf::TYPE {
+                    for class in static_classes(tm) {
+                        let allowed = self.allows(ctx, tm, None, &pred, Some(&class), &[]).await?;
+                        if decided.is_some_and(|d| d != allowed) {
+                            return Ok(None);
+                        }
+                        decided = Some(allowed);
+                    }
+                }
+                let otherwise = match decided {
+                    Some(allowed) => allowed,
+                    None => self.allows(ctx, tm, None, &pred, None, &[]).await?,
+                };
                 let mut classes = Vec::new();
                 if by_class {
                     for class in self.policy_classes.clone() {
                         let allowed = self
-                            .allows(ctx, tm, None, &pred, std::slice::from_ref(&class))
+                            .allows(ctx, tm, None, &pred, None, std::slice::from_ref(&class))
                             .await?;
                         if allowed != otherwise {
                             classes.push((class, allowed));
@@ -291,7 +600,9 @@ impl R2rmlPolicyGate {
                 }
                 let mut by_subject = Vec::new();
                 for subject in &subjects {
-                    let allowed = self.allows(ctx, tm, Some(subject), &pred, &[]).await?;
+                    let allowed = self
+                        .allows(ctx, tm, Some(subject), &pred, None, &[])
+                        .await?;
                     if allowed != otherwise {
                         by_subject.push((subject.clone(), allowed));
                     }
@@ -334,7 +645,28 @@ impl R2rmlPolicyGate {
             return Ok(true);
         }
         for pred in required_predicates(pattern, tm) {
-            if !self.allows(ctx, tm, None, &pred, &[]).await? {
+            // A type triple is decided on the class it states: the map can
+            // yield when one of the classes the pattern can read is viewable.
+            let objects: Vec<Option<String>> = if pred == rdf::TYPE {
+                match (&pattern.class_filter, pattern.type_var) {
+                    (Some(class), _) => vec![Some(class.clone())],
+                    (None, Some(_)) => static_classes(tm).into_iter().map(Some).collect(),
+                    (None, None) => vec![None],
+                }
+            } else {
+                vec![None]
+            };
+            let mut any = false;
+            for object in &objects {
+                if self
+                    .allows(ctx, tm, None, &pred, object.as_deref(), &[])
+                    .await?
+                {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
                 return Ok(false);
             }
         }
@@ -359,21 +691,37 @@ impl R2rmlPolicyGate {
         let type_var = pattern.type_var;
         let needs_type = type_var.is_some() && !required.iter().any(|p| p == rdf::TYPE);
         let no_classes: Vec<String> = Vec::new();
+        // The class a row's type triple states, which decides it: the class
+        // the pattern selects, else the row's projected `?type`. A pattern
+        // reading neither (a bare subject) is decided on no specific class.
+        let type_object = |row: &[(VarId, Binding)]| -> Option<String> {
+            match (&pattern.class_filter, type_var) {
+                (Some(class), _) => Some(class.clone()),
+                (None, Some(tv)) => bound_iri(row, tv).map(str::to_string),
+                (None, None) => None,
+            }
+        };
 
-        // When no view restriction targets subjects and the map derives no row
-        // classes, every input to a decision is fixed for the whole window: the
-        // subject is ignored (`allows` substitutes `any_subject`) and the class
-        // set is the map's own. Settle `required` and the projected `rdf:type`
-        // once here rather than re-asking them for each of up to a window's
-        // worth of rows; only a bound predicate variable still varies per row.
-        if !self.per_subject && row_classes.is_none() {
+        // When no view restriction targets subjects, the map derives no row
+        // classes, and no type triple's class varies by row, every input to a
+        // decision is fixed for the whole window: the subject is ignored
+        // (`allows` substitutes `any_subject`) and the class set is the map's
+        // own. Settle `required` once here rather than re-asking it for each
+        // of up to a window's worth of rows; only a bound predicate variable
+        // still varies per row.
+        let type_varies = type_var.is_some() && pattern.class_filter.is_none();
+        if !self.per_subject && row_classes.is_none() && !type_varies {
             for pred in &required {
-                if !self.allows(ctx, tm, None, pred, &no_classes).await? {
+                let object = pattern
+                    .class_filter
+                    .as_deref()
+                    .filter(|_| pred == rdf::TYPE);
+                if !self
+                    .allows(ctx, tm, None, pred, object, &no_classes)
+                    .await?
+                {
                     return Ok(Vec::new());
                 }
-            }
-            if needs_type && !self.allows(ctx, tm, None, rdf::TYPE, &no_classes).await? {
-                return Ok(Vec::new());
             }
             let Some(pv) = predicate_var else {
                 return Ok(rows);
@@ -381,7 +729,10 @@ impl R2rmlPolicyGate {
             let mut kept = Vec::with_capacity(rows.len());
             for row in rows {
                 let ok = match bound_iri(&row, pv) {
-                    Some(p) => self.allows(ctx, tm, None, p, &no_classes).await?,
+                    Some(p) => {
+                        let object = wildcard_type_object(pattern, &row, p);
+                        self.allows(ctx, tm, None, p, object, &no_classes).await?
+                    }
                     None => true,
                 };
                 if ok {
@@ -401,9 +752,11 @@ impl R2rmlPolicyGate {
                 Some(s) => Some(s),
                 None => subject_var.and_then(|sv| bound_iri(&row, sv)),
             };
+            let type_class = type_object(&row);
             let mut ok = true;
             for pred in &required {
-                if !self.allows(ctx, tm, subject, pred, classes).await? {
+                let object = type_class.as_deref().filter(|_| pred == rdf::TYPE);
+                if !self.allows(ctx, tm, subject, pred, object, classes).await? {
                     ok = false;
                     break;
                 }
@@ -411,12 +764,15 @@ impl R2rmlPolicyGate {
             if ok {
                 if let Some(pv) = predicate_var {
                     if let Some(p) = bound_iri(&row, pv) {
-                        ok = self.allows(ctx, tm, subject, p, classes).await?;
+                        let object = wildcard_type_object(pattern, &row, p);
+                        ok = self.allows(ctx, tm, subject, p, object, classes).await?;
                     }
                 }
             }
             if ok && needs_type {
-                ok = self.allows(ctx, tm, subject, rdf::TYPE, classes).await?;
+                ok = self
+                    .allows(ctx, tm, subject, rdf::TYPE, type_class.as_deref(), classes)
+                    .await?;
             }
             if ok {
                 kept.push(row);
@@ -425,69 +781,299 @@ impl R2rmlPolicyGate {
         Ok(kept)
     }
 
-    /// Whether a `(subject, predicate)` flake produced by `tm` is viewable.
-    /// `subject` is only consulted when the view set targets subjects.
+    /// Whether a `(subject, predicate, object)` flake produced by `tm` is
+    /// viewable. `subject` is only consulted when the view set targets
+    /// subjects. `object` is the class a type triple states, which a type
+    /// triple is decided on (a schema class is always viewable, as on a
+    /// native ledger); `None` for any other triple, or a type triple of no
+    /// specific class, which takes a placeholder no schema class matches.
+    ///
+    /// A row shows its map's static classes and the classes it derives
+    /// (`row_classes`), but its subject can hold more: those another map
+    /// minting the same subjects declares, and, where a map's subjects are
+    /// not proven one row's or another such map derives classes, those other
+    /// rows derive ([`ClassScope::extra`]). Only classes a class-targeted
+    /// restriction applying to the predicate selects can change the
+    /// decision, so the extra classes `E` are those. The flake is viewable
+    /// when the policy allows it for every class set `S` with
+    /// `own ⊆ S ⊆ own ∪ E`: the subject's true set is one of them.
+    ///
+    /// Without `f:required` and `f:query` restrictions two evaluations settle
+    /// "every `S` allows". A restriction then applies to a set exactly when
+    /// it applies to some subset of it, so the applicable restrictions grow
+    /// with `S`; a decision is the default when none applies, a denial when a
+    /// denying one does, an allow otherwise. Let `A(S)` say an allowing
+    /// restriction applies and `D(S)` a denying one; both only grow with `S`.
+    /// With default allow the decision is `¬D(S)`, so every `S` allows iff
+    /// `¬D(own ∪ E)`; with default deny it is `A(S) ∧ ¬D(S)`, so every `S`
+    /// allows iff `A(own) ∧ ¬D(own ∪ E)`. In both cases that is
+    /// `decide(own) ∧ decide(own ∪ E)`. An `f:required` restriction drops the
+    /// others when it applies (so a denial can vanish as `S` grows) and an
+    /// `f:query` one can block the default, so with either every `S` is
+    /// evaluated, up to [`MAX_EXTRA_CLASSES`] extra classes.
+    ///
+    /// Where the decision is not "allow" for every `S`:
+    /// - extra classes known from the mapping alone hide the flake, and the
+    ///   map is recorded on the tracker and logged once;
+    /// - extra classes that depend on rows the scan does not see refuse the
+    ///   query when some `S` would allow it: the answer depends on data the
+    ///   decision cannot read.
     async fn allows(
         &mut self,
         ctx: &ExecutionContext<'_>,
         tm: &TriplesMap,
         subject: Option<&str>,
         pred: &str,
+        object: Option<&str>,
         row_classes: &[String],
+    ) -> Result<bool> {
+        let object = object.filter(|_| pred == rdf::TYPE);
+        let cache_key = match object {
+            Some(class) => format!("{pred} {class}"),
+            None => pred.to_string(),
+        };
+        let mut own: Vec<String> = self.scope.statics.get(&tm.iri).cloned().unwrap_or_default();
+        for c in row_classes {
+            if !own.contains(c) {
+                own.push(c.clone());
+            }
+        }
+        let targeted: Vec<String> = match self.targeted_by_predicate.get(pred) {
+            Some(by_pred) => {
+                let mut t = self.targeted_any.clone();
+                t.extend(by_pred.iter().cloned());
+                t
+            }
+            None => self.targeted_any.clone(),
+        };
+        let (static_extra, data_extra) = self.scope.extra(&tm.iri, &own, &targeted);
+        if static_extra.is_empty() && data_extra.is_empty() {
+            return self
+                .decide_once(ctx, tm, subject, pred, object, row_classes, &cache_key)
+                .await;
+        }
+
+        let key = if self.per_subject {
+            None
+        } else {
+            let mut classes = row_classes.to_vec();
+            classes.sort();
+            Some((tm.iri.clone(), cache_key, classes))
+        };
+        if let Some(allowed) = key.as_ref().and_then(|k| self.decision_cache.get(k)) {
+            return Ok(*allowed);
+        }
+        let mut extra = static_extra.clone();
+        extra.extend(data_extra.iter().cloned());
+        let all_allow = if self.enumerate {
+            self.check_extra_cap(tm, extra.len())?;
+            let mut all = true;
+            for subset in 0..(1u32 << extra.len()) {
+                if !self
+                    .decide_with(ctx, subject, pred, object, &own, &extra, subset)
+                    .await?
+                {
+                    all = false;
+                    break;
+                }
+            }
+            all
+        } else {
+            self.decide_with(ctx, subject, pred, object, &own, &extra, 0)
+                .await?
+                && self
+                    .decide_with(
+                        ctx,
+                        subject,
+                        pred,
+                        object,
+                        &own,
+                        &extra,
+                        (1u32 << extra.len()) - 1,
+                    )
+                    .await?
+        };
+        let allowed = if all_allow {
+            true
+        } else if data_extra.is_empty() {
+            self.report_undecidable(ctx, tm);
+            false
+        } else {
+            self.check_extra_cap(tm, extra.len())?;
+            for subset in 0..(1u32 << extra.len()) {
+                if self
+                    .decide_with(ctx, subject, pred, object, &own, &extra, subset)
+                    .await?
+                {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "Graph source '{}': a class-targeted view policy cannot be decided on the \
+                         rows of triples map <{}>: their subjects can hold classes rows the scan \
+                         does not read derive ({}), and the decision depends on them. If no two \
+                         rows of its table mint one subject, declare the table's key (f:key); \
+                         for a history table, map its current rows with an rr:sqlQuery \
+                         (`SELECT … WHERE <current-row condition>`) and declare the key there; \
+                         or target the policy by property or subject.",
+                        self.graph_source_id,
+                        tm.iri,
+                        data_extra.join(", ")
+                    )));
+                }
+            }
+            false
+        };
+        if let Some(k) = key {
+            self.decision_cache.insert(k, allowed);
+        }
+        Ok(allowed)
+    }
+
+    /// Refuse a decision needing more than [`MAX_EXTRA_CLASSES`] extra classes.
+    fn check_extra_cap(&self, tm: &TriplesMap, extra: usize) -> Result<()> {
+        if extra > MAX_EXTRA_CLASSES {
+            return Err(QueryError::InvalidQuery(format!(
+                "Graph source '{}': a class-targeted view policy over triples map <{}> would \
+                 have to be decided over {extra} classes its subjects might also hold (at most \
+                 {MAX_EXTRA_CLASSES}); target the policy by property or subject, or give the \
+                 maps minting these subjects keys or templates that keep them apart.",
+                self.graph_source_id, tm.iri
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record a map whose rows were hidden on classes another map declares.
+    fn report_undecidable(&self, ctx: &ExecutionContext<'_>, tm: &TriplesMap) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+        ctx.tracker.record_undecidable_class_map(&tm.iri);
+        let first = WARNED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .map(|mut set| set.insert((self.graph_source_id.clone(), tm.iri.clone())))
+            .unwrap_or(true);
+        if first {
+            tracing::warn!(
+                graph_source = %self.graph_source_id,
+                triples_map = %tm.iri,
+                "a class-targeted view policy hid rows of this triples map: another map \
+                 mints the same subjects with other classes, and a row is shown only when \
+                 every class set its subject could hold allows it"
+            );
+        }
+    }
+
+    /// One evaluation over `own` plus the members of `extra` that `subset`'s
+    /// bits select.
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_with(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        subject: Option<&str>,
+        pred: &str,
+        object: Option<&str>,
+        own: &[String],
+        extra: &[String],
+        subset: u32,
+    ) -> Result<bool> {
+        let snapshot = self.encoder.as_ref().unwrap_or(ctx.active_snapshot);
+        let mut classes: Vec<Sid> = own.iter().map(|c| encode(snapshot, c)).collect();
+        for (i, c) in extra.iter().enumerate() {
+            if subset & (1 << i) != 0 {
+                classes.push(encode(snapshot, c));
+            }
+        }
+        self.evaluate(ctx, subject, pred, object, &classes).await
+    }
+
+    /// The decision on the row's classes alone, cached for subject- and
+    /// row-independent decisions.
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_once(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        tm: &TriplesMap,
+        subject: Option<&str>,
+        pred: &str,
+        object: Option<&str>,
+        row_classes: &[String],
+        cache_key: &str,
     ) -> Result<bool> {
         let static_decision = !self.per_subject && row_classes.is_empty();
         if static_decision {
             if let Some(&allowed) = self
                 .static_cache
                 .get(tm.iri.as_str())
-                .and_then(|preds| preds.get(pred))
+                .and_then(|preds| preds.get(cache_key))
             {
                 return Ok(allowed);
             }
         }
-
         let snapshot = self.encoder.as_ref().unwrap_or(ctx.active_snapshot);
         let mut classes: Vec<Sid> = self.tm_classes.get(&tm.iri).cloned().unwrap_or_default();
-        classes.extend(row_classes.iter().filter_map(|c| snapshot.encode_iri(c)));
+        classes.extend(row_classes.iter().map(|c| encode(snapshot, c)));
+        let allowed = self.evaluate(ctx, subject, pred, object, &classes).await?;
+        if static_decision {
+            self.static_cache
+                .entry(tm.iri.clone())
+                .or_default()
+                .insert(cache_key.to_string(), allowed);
+        }
+        Ok(allowed)
+    }
+
+    /// The policy's decision on one flake of a subject holding `classes`.
+    async fn evaluate(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        subject: Option<&str>,
+        pred: &str,
+        object: Option<&str>,
+        classes: &[Sid],
+    ) -> Result<bool> {
+        #[cfg(test)]
+        self.evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = self.encoder.as_ref().unwrap_or(ctx.active_snapshot);
         let subject_sid = match (self.per_subject, subject) {
             (true, Some(iri)) => encode(snapshot, iri),
             _ => self.any_subject.clone(),
         };
         let pred_sid = encode(snapshot, pred);
-        // The object only matters for the schema-flake bypass (rdf:type whose
-        // object is itself a schema class); data rows never qualify, and
-        // `f:query` never runs here, so a class ref / placeholder suffices.
+        // The object only matters for the schema-flake exception (an rdf:type
+        // whose object is itself a schema class); `f:query` never runs here.
         let object = if pred == rdf::TYPE {
             FlakeValue::Ref(
-                classes
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| self.any_subject.clone()),
+                object.map_or_else(|| self.any_subject.clone(), |c| encode(snapshot, c)),
             )
         } else {
             FlakeValue::Long(0)
         };
-
-        let allowed = self
-            .policy
+        self.policy
             .allow_view_flake_async(
                 &subject_sid,
                 &pred_sid,
                 &object,
-                &classes,
+                classes,
                 &NoOpQueryExecutor,
                 &ctx.tracker,
             )
             .await
-            .map_err(|e| QueryError::Policy(e.to_string()))?;
-        if static_decision {
-            self.static_cache
-                .entry(tm.iri.clone())
-                .or_default()
-                .insert(pred.to_string(), allowed);
-        }
-        Ok(allowed)
+            .map_err(|e| QueryError::Policy(e.to_string()))
     }
+}
+
+/// The class a wildcard row's triple states when its bound predicate is
+/// `rdf:type`: the row's object.
+fn wildcard_type_object<'r>(
+    pattern: &R2rmlPattern,
+    row: &'r [(VarId, Binding)],
+    predicate: &str,
+) -> Option<&'r str> {
+    if predicate != rdf::TYPE {
+        return None;
+    }
+    pattern.object_var.and_then(|ov| bound_iri(row, ov))
 }
 
 /// Surface every `f:query` policy in the view set: it cannot run against a
@@ -697,6 +1283,290 @@ mod tests {
             predicate_map: PredicateMap::Constant(pred.to_string()),
             object_map,
         }
+    }
+
+    fn templated(
+        iri: &str,
+        template: &str,
+        classes: &[&str],
+        poms: Vec<PredicateObjectMap>,
+    ) -> TriplesMap {
+        let mut map = tm(iri, classes, poms);
+        map.subject_map.template = Some(template.to_string());
+        map
+    }
+
+    /// The classes a subject may hold beyond a row's own: overlapping maps'
+    /// declared classes, and classes a deriving map's template can mint where
+    /// a row may not show them; only targeted classes count, and none without
+    /// a targeted class.
+    #[test]
+    fn extra_classes_come_from_overlap_and_unproven_derivation() {
+        let us = templated(
+            "http://ex/us",
+            "http://ex/c/{id}",
+            &["http://ex/Customer"],
+            vec![],
+        );
+        let eu = templated(
+            "http://ex/eu",
+            "http://ex/c/{id}",
+            &["http://ex/Restricted"],
+            vec![],
+        );
+        let apart = templated(
+            "http://ex/other",
+            "http://ex/o/{id}",
+            &["http://ex/Secret"],
+            vec![],
+        );
+        let hist = templated(
+            "http://ex/hist",
+            "http://ex/h/{id}",
+            &[],
+            vec![pom(
+                rdf::TYPE,
+                ObjectMap::Template {
+                    template: "http://ex/city/{city}".to_string(),
+                    columns: vec!["city".to_string()],
+                    term_type: fluree_db_r2rml::mapping::TermType::Iri,
+                    datatype: None,
+                    language: None,
+                },
+            )],
+        );
+        let mapping = CompiledR2rmlMapping::new(vec![us, eu, apart, hist]);
+        let mut scope = ClassScope::of(&mapping);
+        let own = |c: &[&str]| c.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let targeted = own(&[
+            "http://ex/Restricted",
+            "http://ex/Secret",
+            "http://ex/city/Boston",
+            "http://ex/Other",
+        ]);
+        assert_eq!(
+            scope.extra("http://ex/us", &own(&["http://ex/Customer"]), &targeted),
+            (own(&["http://ex/Restricted"]), vec![]),
+            "an overlapping map's class; a provably apart map's is not"
+        );
+        assert_eq!(
+            scope.extra("http://ex/us", &own(&["http://ex/Customer"]), &[]),
+            (vec![], vec![]),
+            "no targeted class, nothing to consider"
+        );
+        assert_eq!(
+            scope.extra(
+                "http://ex/hist",
+                &own(&["http://ex/city/Denver"]),
+                &targeted
+            ),
+            (vec![], own(&["http://ex/city/Boston"])),
+            "only classes the template can mint"
+        );
+        scope.unique.insert("http://ex/hist".to_string(), true);
+        assert_eq!(
+            scope.extra(
+                "http://ex/hist",
+                &own(&["http://ex/city/Denver"]),
+                &targeted
+            ),
+            (vec![], vec![]),
+            "a subject one row's shows its derived classes"
+        );
+    }
+
+    /// A gate over `mapping` for one view restriction.
+    fn gate_for(
+        mapping: &CompiledR2rmlMapping,
+        restriction: fluree_db_policy::PolicyRestriction,
+        default_allow: bool,
+    ) -> R2rmlPolicyGate {
+        use crate::policy::QueryPolicyEnforcer;
+        use std::sync::Arc;
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let view = build_policy_set(vec![restriction], None, PolicyAction::View, None);
+        let wrapper = PolicyWrapper::new(
+            view,
+            PolicySet::default(),
+            false,
+            default_allow,
+            HashMap::new(),
+        );
+        let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+            wrapper, None,
+        ))));
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer);
+        futures::executor::block_on(R2rmlPolicyGate::build(&ctx, mapping, "gs:main"))
+            .expect("build")
+            .expect("a gate")
+    }
+
+    fn restriction(
+        mode: TargetMode,
+        targets: &[&str],
+        classes: &[&str],
+        allow: bool,
+    ) -> fluree_db_policy::PolicyRestriction {
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        fluree_db_policy::PolicyRestriction {
+            id: "ex:p".to_string(),
+            target_mode: mode,
+            targets: targets.iter().map(|t| encode(&snapshot, t)).collect(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: if allow {
+                fluree_db_policy::PolicyValue::Allow
+            } else {
+                fluree_db_policy::PolicyValue::Deny
+            },
+            required: false,
+            message: None,
+            class_policy: !classes.is_empty(),
+            for_classes: classes.iter().map(|c| encode(&snapshot, c)).collect(),
+            class_check_needed: !classes.is_empty(),
+        }
+    }
+
+    fn decide(gate: &mut R2rmlPolicyGate, tm: &TriplesMap, pred: &str) -> bool {
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        futures::executor::block_on(gate.allows(&ctx, tm, None, pred, None, &[])).expect("decide")
+    }
+
+    /// Without a class-targeted restriction nothing about other maps'
+    /// classes is worked out and each (map, predicate) costs one evaluation,
+    /// as before; with one, a map another differently classed map overlaps is
+    /// decided over its class sets.
+    #[test]
+    fn a_policy_without_classes_costs_one_evaluation_per_decision() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = templated(
+            "http://ex/us",
+            "http://ex/c/{id}",
+            &["http://ex/Customer"],
+            vec![],
+        );
+        let eu = templated(
+            "http://ex/eu",
+            "http://ex/c/{id}",
+            &["http://ex/Restricted"],
+            vec![],
+        );
+        let mapping = CompiledR2rmlMapping::new(vec![us.clone(), eu]);
+
+        let by_property = restriction(TargetMode::OnProperty, &["http://ex/age"], &[], false);
+        let mut gate = gate_for(&mapping, by_property, true);
+        assert!(
+            gate.scope.overlaps.is_empty(),
+            "no scope without class policies"
+        );
+        assert!(decide(&mut gate, &us, "http://ex/name"));
+        assert!(decide(&mut gate, &us, "http://ex/name"));
+        assert!(!decide(&mut gate, &us, "http://ex/age"));
+        assert_eq!(
+            gate.evaluations.load(Relaxed),
+            2,
+            "one per (map, predicate)"
+        );
+
+        let by_class = restriction(TargetMode::OnClass, &[], &["http://ex/Restricted"], false);
+        let mut gate = gate_for(&mapping, by_class, true);
+        assert!(
+            !decide(&mut gate, &us, "http://ex/name"),
+            "denied for the EU map's class"
+        );
+        assert_eq!(
+            gate.evaluations.load(Relaxed),
+            2,
+            "own, and own with the extra class"
+        );
+        assert!(!decide(&mut gate, &us, "http://ex/name"));
+        assert_eq!(gate.evaluations.load(Relaxed), 2, "cached");
+    }
+
+    /// More extra classes than the enumeration's cap refuse the decision,
+    /// naming the map and the count.
+    #[test]
+    fn a_decision_over_too_many_extra_classes_is_refused() {
+        let classes: Vec<String> = (0..=MAX_EXTRA_CLASSES)
+            .map(|i| format!("http://ex/K{i}"))
+            .collect();
+        let mut maps = vec![templated(
+            "http://ex/plain",
+            "http://ex/c/{id}",
+            &[],
+            vec![],
+        )];
+        for (i, c) in classes.iter().enumerate() {
+            maps.push(templated(
+                &format!("http://ex/m{i}"),
+                "http://ex/c/{id}",
+                &[c],
+                vec![],
+            ));
+        }
+        let mapping = CompiledR2rmlMapping::new(maps.clone());
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let mut required = restriction(TargetMode::OnClass, &[], &class_refs, true);
+        required.required = true;
+        let mut gate = gate_for(&mapping, required, true);
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let err = futures::executor::block_on(gate.allows(
+            &ctx,
+            &maps[0],
+            None,
+            "http://ex/name",
+            None,
+            &[],
+        ))
+        .expect_err("refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("http://ex/plain")
+                && text.contains(&format!("{}", MAX_EXTRA_CLASSES + 1)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlap_warnings_name_differently_classed_overlapping_maps() {
+        let mapping = CompiledR2rmlMapping::new(vec![
+            templated(
+                "http://ex/us",
+                "http://ex/c/{id}",
+                &["http://ex/Customer"],
+                vec![],
+            ),
+            templated(
+                "http://ex/eu",
+                "http://ex/c/{id}",
+                &["http://ex/Restricted"],
+                vec![],
+            ),
+            templated(
+                "http://ex/same",
+                "http://ex/c/{id}",
+                &["http://ex/Customer"],
+                vec![],
+            ),
+            templated(
+                "http://ex/other",
+                "http://ex/o/{id}",
+                &["http://ex/Secret"],
+                vec![],
+            ),
+        ]);
+        let warnings = class_overlap_warnings(&mapping);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("http://ex/eu")),
+            "{warnings:?}"
+        );
+        assert!(!warnings.iter().any(|w| w.contains("http://ex/other")));
     }
 
     #[test]

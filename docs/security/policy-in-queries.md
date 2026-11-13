@@ -286,6 +286,7 @@ request header — and the response gains two siblings:
 | `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" A selection that yields no rules under `default-allow: true` is root, so the field is absent for it too. |
 | `policy_enforcement.denies_all_data` | The effective view-policy set is empty and `default-allow` is false: under this request's policy configuration, **no data flake could have been returned**. |
 | `policy_enforcement.unevaluable_policies` | Ids of `f:query` policies a virtual graph source (Iceberg / SQL) could not evaluate and therefore denied. Omitted when empty; never set on a native ledger. |
+| `policy_enforcement.undecidable_class_maps` | Triples maps of a virtual graph source whose rows a class-targeted policy hid because their subjects could also hold classes another map declares (see [Iceberg → Class policies over subjects several rows mint](../graph-sources/iceberg.md#class-policies-over-subjects-several-rows-mint)). Omitted when empty; never set on a native ledger. |
 
 The same values ride the `x-fdb-policy` (base64 JSON) and
 `x-fdb-policy-enforcement` (plain JSON) response headers, which is how you read

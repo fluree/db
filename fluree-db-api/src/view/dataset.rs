@@ -362,6 +362,7 @@ fn aggregate_policy_enforcement(
         enforced: true,
         denies_all_data: all_deny,
         unevaluable_policies: Vec::new(),
+        undecidable_class_maps: Vec::new(),
     })
 }
 
@@ -376,6 +377,7 @@ mod tests {
             enforced: true,
             denies_all_data,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         })
     }
 

@@ -155,6 +155,7 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         };
         let v = parse(&end_record(0, Some(7), None, None, Some(&enforcement)));
         assert_eq!(

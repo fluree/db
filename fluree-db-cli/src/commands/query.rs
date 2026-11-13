@@ -2413,6 +2413,7 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         };
         assert_eq!(
             format_tally_suffix(None, None, Some(&empty), Some(&deny_all), POLICY_ONLY),
@@ -2423,6 +2424,7 @@ mod tests {
             enforced: true,
             denies_all_data: false,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         };
         assert_eq!(
             format_tally_suffix(None, None, Some(&empty), Some(&some_grants), POLICY_ONLY),

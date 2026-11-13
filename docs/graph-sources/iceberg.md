@@ -1287,13 +1287,22 @@ per-flake filter a native scan pays.
 Supported, with native parity (the test suite checks each shape against a
 native twin of the same data):
 
-- `f:onProperty`, `f:onClass`, `f:onSubject`, and untargeted policies with a
-  static `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onProperty`, `f:onSubject`, and untargeted policies with a static
+  `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onClass` (alone or with `f:onProperty`), with parity wherever each row
+  shows every class its subject holds: the subject is minted by one triples
+  map, or by maps that declare the same classes, and a map deriving
+  `rdf:type` from its row (a column, template or reference) declares a key
+  that makes each subject one row's. Otherwise see
+  [Class policies over subjects several rows mint](#class-policies-over-subjects-several-rows-mint).
 - `f:onClass` / `f:onProperty` expansion through `rdfs:subClassOf` /
   `rdfs:subPropertyOf`, when the source references a model ledger (below).
 - Every pattern shape the scan produces: fixed predicates, same-subject stars,
   constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
-  aggregates, and `GRAPH` blocks in a dataset query.
+  aggregates, and `GRAPH` blocks in a dataset query. A type triple is
+  decided on the class it states, so a schema class (`owl:Class`,
+  `rdfs:Class`) declared beside a data class is viewable while the data
+  class's triples follow the policy.
 
 A source read through a graph scope is filtered by its own policy (the
 request's and the source's model), whatever governs the graph the query
@@ -1311,6 +1320,40 @@ policy query against, so a targeted `f:query` evaluates as "no rows" and
 denies its targets — it never falls open. Relationship gates that join the
 requesting identity to the row (`fluree model access … --connected`) fall in
 this category. Write verbs do not apply; the source is read-only.
+
+### Class policies over subjects several rows mint
+
+A row shows its own map's classes and the classes it derives. A subject can
+hold more: another triples map minting the same subjects can declare other
+classes, and where a map's subjects are not proven one row's (no key covers
+the subject's columns), other rows can derive other classes. Two maps' subjects
+count as overlapping unless their templates provably mint apart (see
+[R2RML → keys](r2rml.md#declaring-a-tables-keys-fkey)); an `rr:column`
+subject overlaps every other map's.
+
+Under a class-targeted view policy, a row is shown only when the policy allows
+it for every class set its subject could hold. Only classes a class-targeted
+restriction on the read predicate selects are considered, and a derived class
+only when the deriving template could mint it.
+
+- **Classes another map declares** (known from the mapping): a row whose
+  decision depends on them is hidden, so rows a native ledger would show can
+  be missing (a customer only one map mints, denied because the other map's
+  class is denied). The tracked response's `policy_enforcement` lists such maps
+  as `undecidable_class_maps`, the server logs it once per map, and
+  registering a source with a model reports each overlapping, differently
+  classed pair in `model_warnings`.
+- **Classes other rows derive** (depending on rows the scan does not read):
+  the query is refused with `400` `err:db/InvalidQuery`, naming the map, when
+  the decision depends on them. Declare the table's key (`f:key`) if no two
+  rows mint one subject; for a history table, map its current rows with an
+  `rr:sqlQuery` (`SELECT * FROM t WHERE <current-row condition>`) and declare
+  the key there; or target the policy by property or subject.
+- A decision needing more than 8 such classes is refused the same way.
+
+A declared key (or an Iceberg table's identifier fields) is trusted here, as
+it is for [set semantics](r2rml.md#declaring-a-tables-keys-fkey): a table that
+breaks it is decided as if each subject were one row's.
 
 ### Where policies live: the model ledger
 
@@ -1361,7 +1404,9 @@ a native ledger's `f:defaultAllow` config: it fills a request that left
 With `"meta": {"policy": true}` (or the `fluree-meta` header) the tracked
 response's `policy_enforcement` carries `unevaluable_policies`: the ids of
 `f:query` policies the source could not evaluate and therefore denied. That is
-how to tell a fail-closed policy from an empty table. The server also logs a
+how to tell a fail-closed policy from an empty table. It also carries
+`undecidable_class_maps`: the triples maps whose rows a class policy hid
+because their subjects could hold classes another map declares (above). The server also logs a
 warning the first time each such policy is met, and a debug line for every
 triples map a scan skipped because its predicates were hidden.
 

@@ -24,6 +24,7 @@
 mod fused_aggregate;
 mod operator;
 pub(crate) mod policy;
+pub use policy::class_overlap_warnings;
 mod provider;
 mod rewrite;
 pub mod set_semantics;
