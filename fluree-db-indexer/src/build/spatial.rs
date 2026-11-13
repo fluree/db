@@ -101,7 +101,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(format!("spatial CAS write: {e}")))?;
             debug_assert_eq!(
-                &cid.digest_hex(),
+                &cid.address_digest(),
                 expected_hash,
                 "CAS content_hash mismatch for spatial blob"
             );
@@ -111,15 +111,14 @@ pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
         // Construct ContentIds from the content hashes.
         let spatial_codec = ContentKind::SpatialIndex.to_codec();
         let manifest_cid =
-            ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address).ok_or_else(
-                || {
+            ContentId::from_address_digest(spatial_codec, &write_result.manifest_address)
+                .ok_or_else(|| {
                     IndexerError::Other(format!(
                         "invalid spatial manifest hash: {}",
                         write_result.manifest_address
                     ))
-                },
-            )?;
-        let arena_cid = ContentId::from_hex_digest(spatial_codec, &write_result.arena_address)
+                })?;
+        let arena_cid = ContentId::from_address_digest(spatial_codec, &write_result.arena_address)
             .ok_or_else(|| {
                 IndexerError::Other(format!(
                     "invalid spatial arena hash: {}",
@@ -130,7 +129,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<C: ContentStore + ?Sized>(
             .leaflet_addresses
             .iter()
             .map(|hash| {
-                ContentId::from_hex_digest(spatial_codec, hash).ok_or_else(|| {
+                ContentId::from_address_digest(spatial_codec, hash).ok_or_else(|| {
                     IndexerError::Other(format!("invalid spatial leaflet hash: {hash}"))
                 })
             })

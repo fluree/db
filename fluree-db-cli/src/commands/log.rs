@@ -250,7 +250,7 @@ fn short_id(address: &str) -> String {
 /// A commit is addressed two ways and they are not interchangeable. `ContentId`
 /// *displays* as a base32 CIDv1 — that is the JSON API wire format and the
 /// `db:address` flake value — but the indexed commit *subject* is
-/// `Sid::new(FLUREE_COMMIT, cid.digest_hex())`, the on-disk blob path is hex,
+/// `Sid::new(FLUREE_COMMIT, cid.address_digest())`, the on-disk blob path is hex,
 /// and the `#txn-meta` IRI is `fluree:commit:sha256:<hex>`. Both prefix
 /// resolvers therefore scan hex, so hex is the only spelling that can be pasted
 /// from this output into `fluree show`, `--at`, or `@commit:`.
@@ -262,6 +262,7 @@ fn short_id(address: &str) -> String {
 ///
 /// Handles:
 /// - a base32 CID, as the server returns in JSON — decoded to its hex digest
+///   (`sha2-512:<hex>` for a SHA2-512 commit)
 /// - `fluree:file://ledger/main/commit/<hex>.fcv2` — already hex
 /// - `fluree:commit:sha256:<hex>` — already hex
 /// - a plain hex string
@@ -269,17 +270,22 @@ fn commit_id_of(address: &str) -> String {
     // `parse_canonical`, not `parse`: multibase reads a leading `f` as base16,
     // so a bare hex digest can decode into a different CID entirely.
     if let Some(cid) = ContentId::parse_canonical(address) {
-        return cid.digest_hex();
+        return fluree_db_core::commit_subject::commit_ref(&cid);
     }
 
-    // Path-style addresses (e.g., .../commit/<hash>.fcv2)
+    // Path-style addresses (e.g., .../commit/<hash>.fcv2); a SHA2-512 commit's
+    // path digest is tagged `sha2-512-<hex>`.
     if let Some(pos) = address.rfind("/commit/") {
         let after = &address[pos + 8..];
-        return after
+        let stem = after
             .strip_suffix(".fcv2")
             .or_else(|| after.strip_suffix(".json"))
-            .unwrap_or(after)
-            .to_string();
+            .unwrap_or(after);
+        return ContentId::from_address_digest(fluree_db_core::CODEC_FLUREE_COMMIT, stem)
+            .map_or_else(
+                || stem.to_string(),
+                |cid| fluree_db_core::commit_subject::commit_ref(&cid),
+            );
     }
 
     // `sha256:` prefix style
@@ -318,10 +324,10 @@ mod tests {
 
         assert_eq!(short.len(), ABBREV_LEN);
         assert!(
-            cid.digest_hex().starts_with(&short),
+            cid.address_digest().starts_with(&short),
             "the printed id must be a prefix of the digest the resolvers scan: \
              short={short} digest={}",
-            cid.digest_hex()
+            cid.address_digest()
         );
         assert!(
             !short.starts_with("bagaybq"),
@@ -343,8 +349,8 @@ mod tests {
         let short_b = short_id(&b.to_string());
 
         assert_ne!(short_a, short_b, "distinct commits must print distinct ids");
-        assert!(a.digest_hex().starts_with(&short_a));
-        assert!(b.digest_hex().starts_with(&short_b));
+        assert!(a.address_digest().starts_with(&short_a));
+        assert!(b.address_digest().starts_with(&short_b));
         assert!(!short_a.starts_with("bagaybq"));
         assert!(!short_b.starts_with("bagaybq"));
     }
@@ -392,7 +398,7 @@ mod tests {
     #[test]
     fn commit_id_of_normalizes_every_address_spelling() {
         let cid = real_commit_id(b"address spellings");
-        let hex = cid.digest_hex();
+        let hex = cid.address_digest();
 
         assert_eq!(commit_id_of(&cid.to_string()), hex, "bare base32 CID");
         assert_eq!(

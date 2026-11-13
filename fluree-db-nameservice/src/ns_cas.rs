@@ -499,6 +499,36 @@ where
     Ok(outcome)
 }
 
+/// Clear the record's frozen mark, if it carries `fence`: the index file
+/// first, so a record that still reads frozen is one to thaw again.
+pub(crate) async fn thaw_record<S>(
+    storage: &S,
+    keys: RecordKeys<'_>,
+    fence: Fence,
+) -> Result<FenceOutcome>
+where
+    S: StorageCas + ?Sized,
+{
+    storage
+        .compare_and_swap(keys.index, move |bytes| {
+            match bytes.map(deserialize_json::<NsIndexFileV2>).transpose()? {
+                Some(mut file) if file.fence == Some(fence) && file.frozen => {
+                    file.frozen = false;
+                    Ok(CasAction::Write(serialize_json(&file)?))
+                }
+                _ => Ok(CasAction::<()>::Abort(())),
+            }
+        })
+        .await?;
+    update_fenced(storage, keys.main, fence, |file| {
+        if file.status == STATUS_FROZEN {
+            file.status = "ready".to_string();
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Turn the record into a tombstone, if it carries `fence`.
 pub(crate) async fn delete_record<S>(
     storage: &S,
@@ -513,6 +543,61 @@ where
         Ok(())
     })
     .await
+}
+
+/// A branch's reasoning-indexes document, read from its main file: `None` when
+/// the record is missing or deleted, an empty document when none was written.
+pub(crate) async fn read_reasoning_indexes<S>(
+    storage: &S,
+    main_key: &str,
+) -> Result<Option<crate::ReasoningIndexes>>
+where
+    S: StorageRead + ?Sized,
+{
+    let Some(bytes) = read_bytes(storage, main_key).await? else {
+        return Ok(None);
+    };
+    let file: NsFileV2 = deserialize_json(&bytes)?;
+    if file.is_deleted() {
+        return Ok(None);
+    }
+    Ok(Some(file.reasoning_indexes.unwrap_or_default()))
+}
+
+/// Compare-and-swap a branch's reasoning-indexes document in its main file,
+/// checked against the fence and the document's version only.
+pub(crate) async fn push_reasoning_indexes<S>(
+    storage: &S,
+    main_key: &str,
+    ledger_id: &str,
+    fence: Option<Fence>,
+    expected_v: i64,
+    new: &crate::ReasoningIndexes,
+) -> Result<crate::ReasoningIndexesCasResult>
+where
+    S: StorageCas + ?Sized,
+{
+    let new = new.clone();
+    let outcome = storage
+        .compare_and_swap(main_key, move |bytes| {
+            let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+            if !main_admits(existing.as_ref(), fence) {
+                return Ok(CasAction::Abort(Err(FenceRefused)));
+            }
+            let mut file = existing.expect("admitted, so present");
+            let current = file.reasoning_indexes.clone().unwrap_or_default();
+            if let Some(conflict) = crate::reasoning_indexes_conflict(&current, expected_v, &new) {
+                return Ok(CasAction::Abort(Ok(conflict)));
+            }
+            file.reasoning_indexes = Some(new.clone());
+            Ok(CasAction::Write(serialize_json(&file)?))
+        })
+        .await?;
+    match outcome {
+        CasOutcome::Written => Ok(crate::ReasoningIndexesCasResult::Updated),
+        CasOutcome::Aborted(Ok(result)) => Ok(result),
+        CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+    }
 }
 
 /// Whether a write presenting `fence` may change the main file `current`,

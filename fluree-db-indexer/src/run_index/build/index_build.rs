@@ -99,6 +99,9 @@ pub struct IndexBuildConfig {
     /// `cascade_runs_to_fan_in`). `usize::MAX` disables cascading (legacy
     /// unbudgeted behavior).
     pub fan_in_cap: usize,
+    /// History entries retention leaves out of this graph.
+    pub history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 }
 
 // ============================================================================
@@ -220,6 +223,7 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
         config.zstd_level,
     )?;
     writer.set_skip_history(config.skip_history);
+    writer.set_history_drop(config.history_drop.clone());
 
     let mut total_rows: u64 = 0;
     let mut progress_batch: u64 = 0;
@@ -397,7 +401,7 @@ fn build_graph_index_result(
     // Write branch manifest (FBR3).
     let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
     let branch_hex = fluree_db_core::sha256_hex(&branch_bytes);
-    let branch_cid = ContentId::from_hex_digest(
+    let branch_cid = ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
         &branch_hex,
     )
@@ -462,6 +466,13 @@ impl PersistingLeafWriter {
 
     pub(crate) fn set_skip_history(&mut self, skip: bool) {
         self.inner.set_skip_history(skip);
+    }
+
+    pub(crate) fn set_history_drop(
+        &mut self,
+        drop: Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
+    ) {
+        self.inner.set_history_drop(drop);
     }
 
     pub(crate) fn push_record(&mut self, record: RunRecordV2) -> io::Result<()> {
@@ -676,6 +687,9 @@ pub struct BuildAllConfig {
     /// size this from the FD budget divided by the order concurrency (see
     /// `fd_plan::plan_fd_usage`); `usize::MAX` disables cascading.
     pub fan_in_cap: usize,
+    /// History entries retention leaves out of this graph.
+    pub history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 }
 
 /// Build V2 indexes for all four orders from a base run directory.
@@ -743,6 +757,7 @@ pub fn build_all_indexes(
             // representative order, so attach the shared counter to each.
             progress: config.progress.clone(),
             fan_in_cap: config.fan_in_cap,
+            history_drop: config.history_drop.clone(),
         };
 
         let result = build_index(&order_config)?;
@@ -919,6 +934,7 @@ mod tests {
             g_id: 0,
             progress: None,
             fan_in_cap: usize::MAX,
+            history_drop: None,
         };
 
         let result = build_index(&config).unwrap();
@@ -1014,6 +1030,7 @@ mod tests {
                 g_id: 0,
                 progress: None,
                 fan_in_cap,
+                history_drop: None,
             };
             build_index(&config).unwrap()
         };
@@ -1083,6 +1100,7 @@ mod tests {
                 g_id: 0,
                 progress: None,
                 fan_in_cap,
+                history_drop: None,
             };
             build_index(&config).unwrap()
         };
@@ -1156,6 +1174,7 @@ mod tests {
             g_id: 0,
             progress: None,
             fan_in_cap: usize::MAX,
+            history_drop: None,
         };
 
         let result = build_index(&config).unwrap();
@@ -1212,6 +1231,7 @@ mod tests {
             g_id: 0,
             progress: None,
             fan_in_cap: usize::MAX,
+            history_drop: None,
         };
         let result = build_index(&config).unwrap();
         assert_eq!(result.total_rows, 0);
@@ -1263,6 +1283,7 @@ mod tests {
             g_id: 0,
             progress: None,
             fan_in_cap: usize::MAX,
+            history_drop: None,
         };
 
         let result = build_index(&config).unwrap();
@@ -1316,6 +1337,7 @@ mod tests {
             g_id: 0,
             progress: None,
             fan_in_cap: usize::MAX,
+            history_drop: None,
         };
 
         let result = build_index(&config).unwrap();
@@ -1376,6 +1398,7 @@ mod tests {
             g_id: 0,
             progress: None,
             fan_in_cap: usize::MAX,
+            history_drop: None,
         };
 
         let result = build_index(&config).unwrap();

@@ -318,8 +318,8 @@ query-time overrides are allowed. See
 
 Materialization — OWL 2 RL and datalog rules alike — runs under a budget
 (default: 1,000,000 derived facts / 30 seconds). The limits are checked as
-work is dispatched rather than once a round, so a long round is bounded far
-more tightly than it used to be. They are not checked between every derived
+work is dispatched rather than once a round, so a long round is bounded
+within it. They are not checked between every derived
 fact everywhere: an OWL 2 RL property chain, and the rules that produce
 `owl:sameAs`, each run to completion before the next check, so a single
 high-fan-out input can still carry a round past a limit before it is noticed.
@@ -329,10 +329,14 @@ default of its own: it is derived from the fact ceiling, at an allowance well
 above what an ordinary fact costs, so the **fact** cap is what binds on normal
 data and the memory cap only fires when facts are abnormally large — long
 IRIs, or big string and JSON literals. Raising `maxFacts` raises it with them.
-Both limits count only *derived* facts, not the base data the fixpoint reads. When the closure exceeds the budget it is
-**capped**: the query still answers, but over an incomplete closure —
-results may be missing entailments. A capped run is therefore surfaced, not
-just logged:
+Both limits count only *derived* facts, not the base data the fixpoint reads.
+
+When the closure exceeds the budget it is **capped**: the query still answers,
+but over an incomplete closure — results may be missing entailments. A query
+that must not be answered that way sets `"reasoningFreshness": "exact"`
+(SPARQL: `# PRAGMA reasoning-freshness: exact`), which makes a capped run an
+error instead; see [Freshness](materialized-reasoning.md#freshness). A capped
+run is otherwise surfaced, not just logged:
 
 - Tracked responses (`"opts": {"meta": true}` or the `fluree-track-*`
   headers) carry a top-level `reasoning` block:
@@ -415,7 +419,15 @@ warning appears:
 
 - if the host has memory to spare, raise the memory limit;
 - if it doesn't, run fewer distinct reasoning workloads at once;
-- or narrow the rules or queries, so less is derived or translated.
+- or narrow the rules or queries, so less is derived or translated;
+- or register a [reasoning index](materialized-reasoning.md). A query answered
+  from one reads the persisted derived facts and holds no result in memory.
+  Two things it does not change: building a generation, and rebuilding one in
+  full, still computes the closure in memory, so persistence moves that cost
+  to maintenance; and a query no generation can answer reasons in memory as
+  before, unless it sets `reasoningFreshness` to `"strict"`, which fails it
+  instead. Use `strict` where reasoning in memory at query time is not
+  affordable.
 
 ## Performance considerations
 
@@ -435,6 +447,10 @@ warning appears:
   functional properties, `owl:sameAs`, restrictions, property chains).
 - The materialization cache is invalidated when the underlying data changes
   (new transactions), so the first query after a write will re-materialize.
+- For a program queried often over changing data, register it as a
+  [reasoning index](materialized-reasoning.md): its derived facts are persisted
+  and refreshed as the branch commits, so matching queries skip
+  materialization.
 
 ## Reasoning under access policy
 
@@ -446,7 +462,12 @@ Reasoning composes with view policy, but mind the contract when both are on:
 - Materialized facts are computed once over all of the ledger's data and shared by every caller; the policy applies when rows are read, not while facts are derived.
 - The two approaches can therefore answer the same query differently under the same policy. With `ex:ssn rdfs:subPropertyOf ex:identifier` and `ex:ssn` hidden, a query for `ex:identifier` returns nothing under `"rdfs"`, because the rewritten query scans the hidden `ex:ssn`. Under `"owl2rl"` it returns the value, because the derived `ex:identifier` fact is itself viewable.
 
-**If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden.
+**If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden. Under OWL 2 RL and datalog, an `f:onClass` policy applies by the classes the query reasons to: denying a derived class hides every fact of its members, including asserted ones, and every derived fact of an asserted member. A single-graph crawl (`select {"?s": ["*"]}`, at any depth) reads the same reasoned snapshot and applies the same policy as the query. A restricted reasoning crawl over a dataset of several graphs is refused (HTTP 400); select variables or use a single-graph view. A Cypher node rendered with its properties (Bolt's `RETURN n`) shows what the query saw: its derived labels and properties, judged by the same policy as the rows.
+
+**Policy reads what the query reads.** In a reasoning query, class policies and `f:query` conditions see derived facts, whether they were derived at query time or read from a [reasoning index](materialized-reasoning.md); a query without reasoning is judged on stored facts. Two consequences follow:
+
+- Data a rule or axiom reads is security data. A derived fact can grant access as well as deny it: a rule can place a subject in a class an `f:onClass` policy allows, or satisfy an `f:query` condition, so whoever can write a rule's inputs can open access through it.
+- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off; see [Override control](../ledger-config/override-control.md).
 
 **Query-time rules are admin-only.** Under a non-root view policy, caller-supplied `rules` are stripped before execution — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
 
@@ -456,6 +477,7 @@ Reasoning composes with view policy, but mind the contract when both are on:
 |-------|------|
 | Conceptual introduction | [Reasoning and inference](../concepts/reasoning.md) |
 | Custom inference rules | [Datalog rules](datalog-rules.md) |
+| Persisting a program's derived facts | [Materialized reasoning](materialized-reasoning.md) |
 | Supported OWL & RDFS constructs | [OWL & RDFS reference](../reference/owl-rdfs-support.md) |
 | Ledger-wide reasoning config | [Setting groups](../ledger-config/setting-groups.md) |
 | Reasoning under access policy | [Policy in queries](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog) |

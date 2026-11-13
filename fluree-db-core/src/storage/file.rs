@@ -85,7 +85,7 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// (content-addressed, hence identical) are in place. A 64-bit random token
 /// drawn once per process makes that collision negligible without needing a
 /// node id plumbed down from whoever knows one.
-fn process_token() -> u64 {
+pub(super) fn process_token() -> u64 {
     static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TOKEN.get_or_init(rand::random::<u64>)
 }
@@ -192,6 +192,18 @@ fn staging_token(name: &str) -> Option<&str> {
     }
 }
 
+/// Who a write-ahead log replay's temporary file
+/// (`<name>.wal-replay.<owner>.tmp`) is: a crash mid-replay leaves it,
+/// holding a full copy of the record's bytes. The owner is the process
+/// token, or the pid an earlier release named it with, which is never this
+/// process's to keep: containers on one storage commonly share pids.
+fn replay_temp_owner(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix(TMP_SUFFIX)?;
+    let (head, owner) = rest.rsplit_once('.')?;
+    let prefix = head.strip_suffix(".wal-replay")?;
+    (!prefix.is_empty() && (is_process_token(owner) || is_plain_decimal(owner))).then_some(owner)
+}
+
 /// How long a staging file must have gone untouched before a sweep may
 /// reclaim it.
 ///
@@ -227,6 +239,9 @@ struct StagingSweep {
     /// Staging files deliberately left alone — this process's own, too young,
     /// or refusing to be removed.
     kept: usize,
+    /// Of those, the ones old enough to go that could not be removed, and
+    /// directories that could not be read.
+    refused: usize,
     /// The entry budget ran out before the walk finished, so part of the tree
     /// was never looked at.
     truncated: bool,
@@ -285,6 +300,16 @@ fn sweep_orphaned_staging_files(
     older_than: std::time::Duration,
     budget: usize,
 ) -> StagingSweep {
+    sweep_staging(base, Some(older_than), budget)
+}
+
+/// [`sweep_orphaned_staging_files`]; with no `older_than`, rule 2 is off and
+/// every other process's file goes, whatever its mtime.
+fn sweep_staging(
+    base: &Path,
+    older_than: Option<std::time::Duration>,
+    budget: usize,
+) -> StagingSweep {
     let mut sweep = StagingSweep::default();
     let own_token = format!("{:016x}", process_token());
     let now = std::time::SystemTime::now();
@@ -292,8 +317,14 @@ fn sweep_orphaned_staging_files(
     let mut dirs = vec![base.to_path_buf()];
 
     while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    sweep.refused += 1;
+                }
+                continue;
+            }
         };
         for entry in entries.flatten() {
             if budget == 0 {
@@ -330,11 +361,15 @@ fn sweep_orphaned_staging_files(
             // staging file and an unlink — including the indexer's vocab-merge
             // temporaries, which are exactly the long-running shape
             // `STALE_STAGING_AGE` argues an age threshold must not judge.
-            let Some(token) = staging_token(&name) else {
-                continue;
+            // A replay's temporary file is the replay's own to clean up, the
+            // same rules otherwise: a replay writes it and renames it at once.
+            let own = match (staging_token(&name), replay_temp_owner(&name)) {
+                (Some(token), _) => token == own_token.as_str(),
+                (None, Some(owner)) => owner == own_token.as_str(),
+                (None, None) => continue,
             };
             // Rule 1: ours, whatever its age.
-            if token == own_token.as_str() {
+            if own {
                 sweep.kept += 1;
                 continue;
             }
@@ -342,12 +377,14 @@ fn sweep_orphaned_staging_files(
             // mtime we cannot read, or one in the future, counts as young —
             // `duration_since` fails on a future timestamp, and a clock the
             // sweep does not understand is not grounds for deleting data.
-            let stale = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .is_some_and(|age| age >= older_than);
+            let stale = older_than.is_none_or(|older_than| {
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .is_some_and(|age| age >= older_than)
+            });
             if !stale {
                 sweep.kept += 1;
                 continue;
@@ -355,14 +392,55 @@ fn sweep_orphaned_staging_files(
 
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => sweep.reclaimed += 1,
-                // Someone else got there first, or the platform refuses to
-                // unlink a file another process still holds open (Windows).
-                // Both are fine outcomes for a best-effort reclaim.
-                Err(_) => sweep.kept += 1,
+                // Someone else got there first.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Or the platform refuses to unlink a file another process
+                // still holds open (Windows): fine for a best-effort reclaim,
+                // reported for a strict one.
+                Err(_) => {
+                    sweep.kept += 1;
+                    sweep.refused += 1;
+                }
             }
         }
     }
     sweep
+}
+
+/// What bounds the deletes of the work under way, when anything does: a
+/// cluster's leader deletes only within its lease, so none lands once
+/// another leader may have begun writing what it would remove.
+#[async_trait]
+pub trait DeleteLease: Send + Sync {
+    /// Until when a delete may still begin; `None` once the lease is lost.
+    async fn until(&self) -> Option<std::time::Instant>;
+}
+
+tokio::task_local! {
+    static DELETE_LEASE: Arc<dyn DeleteLease>;
+}
+
+/// The deadline the lease in force, if any, sets a delete beginning now.
+async fn lease_deadline() -> Result<Option<std::time::Instant>> {
+    let Ok(lease) = DELETE_LEASE.try_with(Arc::clone) else {
+        return Ok(None);
+    };
+    match lease.until().await {
+        Some(until) => Ok(Some(until)),
+        None => Err(crate::error::Error::storage(
+            "the lease bounding this delete is no longer held",
+        )),
+    }
+}
+
+/// What [`FileStorage::retire_stopped_logs`] found of other owners' logs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoppedLogs {
+    /// Records applied from the logs of owners that had stopped; those logs
+    /// are retired.
+    pub applied: usize,
+    /// Owners still running.
+    pub running: Vec<String>,
 }
 
 /// Base paths this process has already swept.
@@ -799,6 +877,44 @@ impl FileStorage {
         }
     }
 
+    /// Unlink, under `dir`, every staging file another process left,
+    /// whatever its age or mtime, keeping this process's own; returns how
+    /// many it unlinked, or an error when one could not be, or a directory
+    /// read. Only for a root this process holds the lock on: no other
+    /// process writes there, so another's staging file is a crashed write's.
+    /// Blocking, and unbounded.
+    pub fn sweep_foreign_staging(dir: impl AsRef<Path>) -> std::io::Result<usize> {
+        let dir = dir.as_ref();
+        let sweep = sweep_staging(dir, None, usize::MAX);
+        if sweep.refused > 0 {
+            return Err(std::io::Error::other(format!(
+                "{} staging files or directories under {} could not be removed or read",
+                sweep.refused,
+                dir.display()
+            )));
+        }
+        Ok(sweep.reclaimed)
+    }
+
+    /// [`Self::sweep_foreign_staging`], taking only files untouched for
+    /// `older_than`: for a root other live processes write, whose own staging
+    /// files are in flight for milliseconds.
+    pub fn sweep_staging_older_than(
+        dir: impl AsRef<Path>,
+        older_than: std::time::Duration,
+    ) -> std::io::Result<usize> {
+        let dir = dir.as_ref();
+        let sweep = sweep_staging(dir, Some(older_than), usize::MAX);
+        if sweep.refused > 0 {
+            return Err(std::io::Error::other(format!(
+                "{} staging files or directories under {} could not be removed or read",
+                sweep.refused,
+                dir.display()
+            )));
+        }
+        Ok(sweep.reclaimed)
+    }
+
     /// The walk itself, plus what it reports.
     fn run_sweep(base_path: &Path, budget: usize) {
         let sweep = sweep_orphaned_staging_files(base_path, STALE_STAGING_AGE, budget);
@@ -1123,6 +1239,129 @@ impl FileStorage {
     /// process is not the WAL is left alone.
     pub fn checkpoint_wal(root: impl AsRef<Path>) -> Result<bool> {
         wal::checkpoint_root(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
+    }
+
+    /// How many segment files other processes' logs keep under `root`. Their
+    /// writes are beyond this process's checkpoint, and the next open after
+    /// their owner dies replays them.
+    pub fn foreign_wal_segments(root: impl AsRef<Path>) -> Result<usize> {
+        wal::foreign_segments(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
+    }
+
+    /// Run `work` with its deletes bounded by `lease`: one that would begin
+    /// after the lease runs out, its locks held, is refused.
+    pub async fn within_lease<F: std::future::Future>(
+        lease: Arc<dyn DeleteLease>,
+        work: F,
+    ) -> F::Output {
+        DELETE_LEASE.scope(lease, work).await
+    }
+
+    /// Apply and retire the logs other owners under `root` left when they
+    /// stopped, as a miss would, and name the owners still running, whose
+    /// logs are theirs to retire. Blocking.
+    pub fn retire_stopped_logs(root: impl AsRef<Path>) -> Result<StoppedLogs> {
+        let (applied, running) = wal::replay_stopped(root.as_ref())
+            .map_err(|e| Self::recovery_error(root.as_ref(), e))?;
+        Ok(StoppedLogs { applied, running })
+    }
+
+    /// Flush the directories under `root` that held the files at `keys`, so
+    /// their unlinks survive power loss: without the WAL, an unlink is
+    /// durable only once its directory is. Returns how many it flushed.
+    pub fn sync_parent_dirs(root: impl AsRef<Path>, keys: &[String]) -> Result<usize> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for key in keys {
+            if let Some(dir) = wal::key_path(root.as_ref(), key)
+                .as_deref()
+                .and_then(Path::parent)
+            {
+                dirs.insert(dir.to_path_buf());
+            }
+        }
+        let mut flushed = 0;
+        for dir in dirs {
+            #[cfg(not(unix))]
+            let _ = dir;
+            #[cfg(unix)]
+            match std::fs::File::open(&dir) {
+                Ok(handle) => {
+                    handle.sync_all().map_err(|e| {
+                        crate::error::Error::io(format!("flush {}: {e}", dir.display()))
+                    })?;
+                    flushed += 1;
+                }
+                // Gone with its last file: its parent records that.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(crate::error::Error::io(format!(
+                        "open {}: {e}",
+                        dir.display()
+                    )))
+                }
+            }
+        }
+        Ok(flushed)
+    }
+
+    /// Flush every directory under `root` at each of `prefixes`, and the one
+    /// holding each, so the unlinks made anywhere in those trees survive
+    /// power loss. Returns how many it flushed.
+    pub fn sync_dirs_under(root: impl AsRef<Path>, prefixes: &[String]) -> Result<usize> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for prefix in prefixes {
+            let Some(top) = wal::key_path(root.as_ref(), prefix.trim_end_matches('/')) else {
+                continue;
+            };
+            if let Some(parent) = top.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+            let mut next = vec![top];
+            while let Some(dir) = next.pop() {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(entries) => entries,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(crate::error::Error::io(format!(
+                            "read {}: {e}",
+                            dir.display()
+                        )))
+                    }
+                };
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        crate::error::Error::io(format!("read {}: {e}", dir.display()))
+                    })?;
+                    if entry.file_type().is_ok_and(|t| t.is_dir()) && entry.file_name() != WAL_DIR {
+                        next.push(entry.path());
+                    }
+                }
+                dirs.insert(dir);
+            }
+        }
+        let keys: Vec<PathBuf> = dirs.into_iter().collect();
+        let mut flushed = 0;
+        for dir in keys {
+            #[cfg(not(unix))]
+            let _ = dir;
+            #[cfg(unix)]
+            match std::fs::File::open(&dir) {
+                Ok(handle) => {
+                    handle.sync_all().map_err(|e| {
+                        crate::error::Error::io(format!("flush {}: {e}", dir.display()))
+                    })?;
+                    flushed += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(crate::error::Error::io(format!(
+                        "open {}: {e}",
+                        dir.display()
+                    )))
+                }
+            }
+        }
+        Ok(flushed)
     }
 
     /// Abandon the WAL without flushing, as a crash would, so a test can
@@ -1549,8 +1788,23 @@ impl StorageRead for FileStorage {
 
         // Get the directory to list from and the file prefix to match
         let full_path = self.resolve_relative_path(path_prefix)?;
-        let (list_dir, file_prefix) = if full_path.is_dir() {
+        let is_dir = match tokio::fs::metadata(&full_path).await {
+            Ok(metadata) => metadata.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(crate::error::Error::io(format!(
+                    "Failed to inspect {}: {}",
+                    full_path.display(),
+                    e
+                )));
+            }
+        };
+        let (list_dir, file_prefix) = if is_dir {
             (full_path, String::new())
+        } else if path_prefix.ends_with('/') {
+            // A directory that is not there holds nothing: listing its
+            // parent for a partial name would walk every sibling.
+            return Ok(Vec::new());
         } else {
             // The prefix might be a partial filename, so list the parent
             let parent = full_path.parent().unwrap_or(&self.base_path);
@@ -1560,11 +1814,6 @@ impl StorageRead for FileStorage {
                 .unwrap_or_default();
             (parent.to_path_buf(), file_part)
         };
-
-        // Check if directory exists
-        if !list_dir.exists() {
-            return Ok(Vec::new());
-        }
 
         // Walk directory recursively
         let mut results = Vec::new();
@@ -1701,10 +1950,25 @@ impl StorageWrite for FileStorage {
 
     async fn delete(&self, address: &str) -> Result<()> {
         let (key, path) = self.resolve_key(address)?;
+        let until = lease_deadline().await?;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.delete_key_blocking(&key, &path))
+        tokio::task::spawn_blocking(move || storage.delete_key_within(&key, &path, until))
             .await
             .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+    }
+
+    async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
+        let (key, path) = self.resolve_key(address)?;
+        let until = match lease_deadline().await? {
+            Some(lease) => until.min(lease),
+            None => until,
+        };
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.delete_key_unlogged_blocking(&key, &path, until)
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 
     /// One blocking task for the whole batch rather than one per address:
@@ -1719,11 +1983,23 @@ impl StorageWrite for FileStorage {
                 Err(e) => failures.push((address.clone(), e)),
             }
         }
+        let until = match lease_deadline().await {
+            Ok(until) => until,
+            Err(e) => {
+                let why = e.to_string();
+                failures.extend(
+                    resolved
+                        .into_iter()
+                        .map(|(a, _, _)| (a, crate::error::Error::storage(why.clone()))),
+                );
+                return failures;
+            }
+        };
         let storage = self.clone();
         match tokio::task::spawn_blocking(move || {
             let mut failed = Vec::new();
             for (address, key, path) in resolved {
-                if let Err(e) = storage.delete_key_blocking(&key, &path) {
+                if let Err(e) = storage.delete_key_within(&key, &path, until) {
                     failed.push((address, e));
                 }
             }
@@ -1744,9 +2020,58 @@ impl StorageWrite for FileStorage {
 }
 
 impl FileStorage {
+    /// Unlink `path` with no WAL record, then flush its directory. Ordered
+    /// with writes to the key like any delete; a replay of an earlier write
+    /// may bring the file back, never take a later one away.
+    fn delete_key_unlogged_blocking(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        until: std::time::Instant,
+    ) -> Result<bool> {
+        let _operation = self.begin_operation(self.durability, key)?;
+        // Checked once the locks are held: waiting for them may outlast it.
+        if std::time::Instant::now() >= until {
+            return Ok(false);
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => {
+                return Err(crate::error::Error::io(format!(
+                    "Failed to delete {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+        Self::sync_parent_dirs(&self.base_path, &[key.to_string()])?;
+        Ok(true)
+    }
+
     /// Unlink `path`, recording the delete in the WAL first when one is
     /// attached. Absence is success. Runs on the caller's thread: it takes
     /// the root gate and a key stripe, which block.
+    /// Delete `key`, within the lease bounding it if one does: then
+    /// unlogged, so no replay of this log redoes it over a later write, and
+    /// begun only if the lease still holds once the locks are, just before
+    /// the unlink.
+    fn delete_key_within(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        until: Option<std::time::Instant>,
+    ) -> Result<()> {
+        match until {
+            None => self.delete_key_blocking(key, path),
+            Some(until) => match self.delete_key_unlogged_blocking(key, path, until)? {
+                true => Ok(()),
+                false => Err(crate::error::Error::storage(
+                    "the lease bounding this delete ran out before it began",
+                )),
+            },
+        }
+    }
+
     fn delete_key_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let operation = self.begin_operation(self.durability, key)?;
         let (_, log) = self.write_plan(&operation, 0)?;
@@ -2624,6 +2949,59 @@ mod tests {
         );
     }
 
+    /// A ledger without garbage records has no `@garbage/` beside its
+    /// commits and indexes; listing it reads none of them. The sibling is
+    /// made unreadable, so a walk of it fails (unless run as root).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_prefix_of_a_missing_directory_reads_no_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://l/commit/a.fcv2", b"v")
+            .await
+            .unwrap();
+        let sibling = dir.path().join("l/commit");
+        let set_mode = |mode| {
+            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o000);
+        let listed = storage.list_prefix("fluree:file://l/@garbage/").await;
+        set_mode(0o755);
+        assert_eq!(listed.unwrap(), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_prefix_preserves_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://blocked/map/entry.json", b"present")
+            .await
+            .unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::metadata(parent.join("map")).is_err();
+        let listed = storage.list_prefix("fluree:file://blocked/map/").await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A privileged test process can bypass mode bits.
+        if denied {
+            assert!(
+                listed.is_err(),
+                "permission denied must not mean an empty prefix"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_prefix_preserves_metadata_errors_even_for_root() {
+        let (dir, storage) = storage();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        assert!(storage.list_prefix("fluree:file://loop/").await.is_err());
+    }
+
     #[tokio::test]
     async fn compare_and_swap_writes_through_staging() {
         let (dir, storage) = storage();
@@ -3015,6 +3393,74 @@ mod tests {
 
         assert!(path.exists(), "a future-dated staging file was reclaimed");
         assert_eq!((sweep.reclaimed, sweep.kept), (0, 1));
+    }
+
+    /// A replay's temporary file left by another process is a crash's, and
+    /// swept once old enough; this process's own stays.
+    #[test]
+    fn a_crashed_replays_temporary_file_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("a.bin.wal-replay.0123456789abcdef.tmp");
+        // Named by an earlier release with a pid, this process's own pid
+        // among them: another container's.
+        let pid_named = dir
+            .path()
+            .join(format!("c.bin.wal-replay.{}.tmp", std::process::id()));
+        let ours = dir
+            .path()
+            .join(format!("b.bin.wal-replay.{:016x}.tmp", process_token()));
+        for file in [&theirs, &pid_named, &ours] {
+            std::fs::write(file, b"bytes").unwrap();
+        }
+        let day = std::time::Duration::from_secs(86_400);
+        assert_eq!(
+            FileStorage::sweep_staging_older_than(dir.path(), day).unwrap(),
+            0
+        );
+        assert!(theirs.exists(), "too young");
+        let swept = FileStorage::sweep_staging_older_than(dir.path(), std::time::Duration::ZERO);
+        assert_eq!(swept.unwrap(), 2);
+        assert!(!theirs.exists() && !pid_named.exists());
+        assert!(ours.exists());
+    }
+
+    /// The purge's sweep takes every other process's staging file, a
+    /// future-dated one too, and reports one it could not remove.
+    #[cfg(unix)]
+    #[test]
+    fn the_strict_sweep_takes_every_foreign_file_or_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ahead = dir
+            .path()
+            .join(format!("ahead.json.7.cccccccccccccccc.0{TMP_SUFFIX}"));
+        std::fs::File::create(&ahead)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(86_400))
+            .unwrap();
+        let ours = plant_staging_file(dir.path(), "mine.json", &own_token(), Duration::ZERO);
+        assert_eq!(FileStorage::sweep_foreign_staging(dir.path()).unwrap(), 1);
+        assert!(!ahead.exists() && ours.exists());
+
+        let locked = dir.path().join("locked");
+        let stuck = plant_staging_file(&locked, "stuck.json", "dddddddddddddddd", Duration::ZERO);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let swept = FileStorage::sweep_foreign_staging(dir.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(swept.is_err() && stuck.exists(), "{swept:?}");
+    }
+
+    /// Every directory under a prefix is flushed, and the one holding it.
+    #[cfg(unix)]
+    #[test]
+    fn every_directory_under_a_prefix_is_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("l/@i/main/index/spot")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        let flushed = FileStorage::sync_dirs_under(dir.path(), &["l/@i".to_string()]).unwrap();
+        // `l`, `l/@i`, `main`, `index` and `spot`; not `other`.
+        assert_eq!(flushed, 5);
     }
 
     /// Content is not staging debris. The sweep must not touch a real object
@@ -3420,6 +3866,135 @@ mod wal_tests {
         assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
     }
 
+    /// An unlogged delete leaves the log no record to replay, so a later
+    /// write of the same address by another writer survives the replay.
+    #[tokio::test]
+    async fn an_unlogged_delete_is_not_replayed_over_a_later_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        storage
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(storage
+            .delete_unlogged("fluree:file://a.bin", until)
+            .await
+            .unwrap());
+        assert!(!dir.path().join("a.bin").exists());
+        publish(&storage, b"h").await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        other
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        let storage = with_wal(dir.path());
+        assert_eq!(
+            storage.read_bytes("fluree:file://a.bin").await.unwrap(),
+            b"a"
+        );
+    }
+
+    /// An unlogged delete whose deadline passes while it waits for the
+    /// storage's locks deletes nothing.
+    #[tokio::test]
+    async fn an_unlogged_delete_past_its_deadline_once_it_holds_the_locks_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        let exclusive = storage.root_gate().unwrap().write_owned().await;
+        let delete = {
+            let storage = storage.clone();
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            tokio::spawn(async move { storage.delete_unlogged("fluree:file://a.bin", until).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(exclusive);
+        assert!(!delete.await.unwrap().unwrap());
+        assert!(dir.path().join("a.bin").exists());
+    }
+
+    /// Deletes under a lease begin only while it is held: one is refused
+    /// once it is lost, or once it runs out while the delete waits for the
+    /// storage's locks.
+    #[tokio::test]
+    async fn a_delete_under_a_lease_begins_only_while_it_is_held() {
+        struct Lease(Option<std::time::Instant>);
+        #[async_trait]
+        impl DeleteLease for Lease {
+            async fn until(&self) -> Option<std::time::Instant> {
+                self.0
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        for name in ["a.bin", "b.bin"] {
+            storage
+                .write_bytes(&format!("fluree:file://{name}"), b"x")
+                .await
+                .unwrap();
+        }
+        let lost: Arc<dyn DeleteLease> = Arc::new(Lease(None));
+        let refused = FileStorage::within_lease(Arc::clone(&lost), async {
+            (
+                storage.delete("fluree:file://a.bin").await,
+                storage
+                    .delete_many(&["fluree:file://b.bin".to_string()])
+                    .await,
+            )
+        })
+        .await;
+        assert!(refused.0.is_err());
+        assert_eq!(refused.1.len(), 1);
+        assert!(dir.path().join("a.bin").exists() && dir.path().join("b.bin").exists());
+
+        let exclusive = storage.root_gate().unwrap().write_owned().await;
+        let delete = {
+            let storage = storage.clone();
+            let lease: Arc<dyn DeleteLease> = Arc::new(Lease(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
+            )));
+            tokio::spawn(FileStorage::within_lease(lease, async move {
+                storage.delete("fluree:file://a.bin").await
+            }))
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(exclusive);
+        assert!(delete.await.unwrap().is_err());
+        assert!(dir.path().join("a.bin").exists());
+
+        let held: Arc<dyn DeleteLease> = Arc::new(Lease(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )));
+        FileStorage::within_lease(held, storage.delete("fluree:file://a.bin"))
+            .await
+            .unwrap();
+        assert!(!dir.path().join("a.bin").exists());
+
+        // Unlogged: a replay of this log does not delete what another writer
+        // stores there again since.
+        storage.simulate_crash_for_test();
+        drop(storage);
+        FileStorage::new(dir.path())
+            .with_durability(Durability::Sync)
+            .write_bytes("fluree:file://a.bin", b"x")
+            .await
+            .unwrap();
+        let reopened = with_wal(dir.path());
+        assert_eq!(
+            reopened.read_bytes("fluree:file://a.bin").await.unwrap(),
+            b"x"
+        );
+    }
+
     /// Replay applies records in order, so a delete cannot resurrect what it
     /// removed, and a later write after the delete wins.
     #[tokio::test]
@@ -3581,6 +4156,36 @@ mod wal_tests {
                 .count(),
             1,
             "the stopped owner's log was retired, leaving its lock file"
+        );
+    }
+
+    /// Retiring stopped owners' logs applies and removes them, and names the
+    /// owners still running, whose logs stay theirs.
+    #[tokio::test]
+    async fn retiring_stopped_logs_names_the_owners_still_running() {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_wal_segments_for_test().unwrap();
+        a.write_bytes(COMMIT, b"c").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/commit/bbbb.bin")).unwrap();
+        let running = dir.path().join(WAL_DIR).join("owners").join("node-3");
+        std::fs::create_dir_all(&running).unwrap();
+        let lock = std::fs::File::create(running.join("LOCK")).unwrap();
+        lock.try_lock_exclusive().unwrap();
+
+        let stopped = FileStorage::retire_stopped_logs(dir.path()).unwrap();
+        assert!(stopped.applied > 0, "{stopped:?}");
+        assert_eq!(stopped.running, ["node-3"]);
+        assert!(dir.path().join("ledger/commit/bbbb.bin").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(WAL_DIR).join("owners").join("node-1"))
+                .unwrap()
+                .count(),
+            1,
+            "only the lock file is left"
         );
     }
 

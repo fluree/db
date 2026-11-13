@@ -15,6 +15,7 @@ When no config graph is present (or a setting group is absent), the system defau
 | Reasoning | Disabled — no OWL/RDFS inference |
 | Datalog | Disabled — no rule evaluation |
 | Transact constraints | Disabled — no uniqueness enforcement |
+| Retention | No property lifetimes — values expire only by their own or their transaction's TTL |
 | Query defaults | The default graph holds only its own triples (no union default graph) |
 | Indexing defaults | Named graphs placed automatically |
 | Override control | `f:OverrideAll` — any request can override any setting |
@@ -386,12 +387,82 @@ and how configured properties interact with `@fulltext`-datatype values.
 
 ---
 
+## Retention defaults
+
+**Group predicate**: `f:retentionDefaults`
+
+Gives predicates a default lifetime: every value of the predicate asserted after the config commit is retracted by the background retention worker once its lifetime ends. See [Time to live (TTL)](../transactions/ttl.md) for per-value lifetimes, renewal and how expiration runs. `f:noHistory` keeps a predicate's superseded values out of the index; see [History retention](../transactions/history-retention.md).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:property` | `f:RetentionProperty` nodes (0..n) | none | One entry per governed predicate |
+
+Each `f:RetentionProperty` entry:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:target` | IRI (exactly one) | required | The predicate the entry governs |
+| `f:ttl` | whole seconds, or a duration such as `"P1D"^^xsd:dayTimeDuration` | inherit | Lifetime from the commit time of each new assertion. `0` turns an inherited duration off for future assertions |
+| `f:noHistory` | boolean | inherit; system default `false` | `true` keeps the predicate's superseded values out of the index; reads as of an earlier point see a current value from the transaction that asserted it. See [History retention](../transactions/history-retention.md) |
+
+```json
+{
+  "@context": { "f": "https://ns.flur.ee/db#", "ex": "https://example.org/" },
+  "@id": "urn:fluree:mydb:main:config:ledger",
+  "@type": "f:LedgerConfig",
+  "@graph": "config",
+  "f:retentionDefaults": {
+    "@id": "urn:fluree:mydb:main:config:retention",
+    "@type": "f:RetentionDefaults",
+    "f:property": [
+      {
+        "@id": "urn:fluree:mydb:main:config:retention:counter",
+        "@type": "f:RetentionProperty",
+        "f:target": { "@id": "ex:reading" },
+        "f:ttl": 86400
+      }
+    ]
+  }
+}
+```
+
+If the ledger already has a config subject, attach the group to it rather than creating a second `f:LedgerConfig`. Stable `@id`s on the group and its entries make later updates straightforward.
+
+**Scope.** A ledger-wide entry governs its predicate in the default graph and every named graph, never in the reserved `#config` and `#txn-meta` graphs.
+
+**Graph overrides.** An `f:GraphConfig` with its own `f:retentionDefaults` adjusts the entries for its `f:targetGraph` (`f:defaultGraph` for the default graph):
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix ex: <https://example.org/> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> f:graphOverrides [
+    a f:GraphConfig ;
+    f:targetGraph ex:auditedMetrics ;
+    f:retentionDefaults [
+      f:property [ a f:RetentionProperty ; f:target ex:reading ; f:ttl 0 ]
+    ]
+  ] .
+}
+```
+
+Entries merge by `f:target`, and each field merges on its own: an absent field inherits the ledger-wide value, while an explicit `0` (or `false`) overrides it. An empty `f:property` list clears nothing. Retention cannot target a reserved graph.
+
+**No override control.** Retention is durable state policy. No query or transaction option overrides it, and `f:overrideControl` on the group is refused. A per-value or per-transaction lifetime is an input for that value, not an override of the property's policy.
+
+**Validation.** A config write is refused if it would leave the retention config ambiguous or malformed: an entry without exactly one IRI `f:target`, two entries for the same target in one group, a field with the wrong type or a negative duration, a field that belongs on an entry written on the group, a target in Fluree's own vocabulary, or two graph overrides setting retention for the same graph. Config that reaches a ledger some other way (bulk import, say) and is invalid is not treated as "no retention": the worker stops expiring values for the ledger and reports the problem in its status.
+
+---
+
 ## Indexing defaults
 
 **Group predicate**: `f:indexingDefaults`
 
 Controls how the indexer lays out named graphs. It changes storage layout and
-performance, never query results.
+performance, never query results, except how soon a read as of an earlier point
+stops seeing an [`f:noHistory`](../transactions/history-retention.md#the-index)
+predicate's superseded values.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

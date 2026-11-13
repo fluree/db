@@ -1174,6 +1174,8 @@ mod tests {
                 read_ledgers: Default::default(),
                 write_all: false,
                 write_ledgers: Default::default(),
+                audit_all: false,
+                audit_ledgers: Default::default(),
                 expires_unix: u64::MAX,
                 policy_authorization: crate::extract::CredentialPolicy::ScopeOnly,
             }),

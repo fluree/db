@@ -1250,7 +1250,7 @@ mod tests {
         }
 
         fn path(&self, id: &ContentId) -> PathBuf {
-            self.dir.join(format!("{}.fpk", id.digest_hex()))
+            self.dir.join(format!("{}.fpk", id.address_digest()))
         }
     }
 

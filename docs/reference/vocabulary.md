@@ -194,6 +194,31 @@ These predicates live in the ledger's `#config` named graph and declare which pr
 | `f:FullTextProperty` | `https://ns.flur.ee/db#FullTextProperty` | Class of each `f:property` entry |
 | `f:target` | `https://ns.flur.ee/db#target` | IRI of the property being indexed (on `f:FullTextProperty`) |
 
+### Retention (TTL) predicates
+
+`f:ttl` and `f:expiresAt` are TTL instructions on a value's annotation or a transaction's txn-meta; `f:retentionDefaults` and its entries live in the `#config` graph. See [Time to live (TTL)](../transactions/ttl.md).
+
+| Term | IRI | Description |
+|------|-----|-------------|
+| `f:ttl` | `https://ns.flur.ee/db#ttl` | Lifetime, in whole seconds or as a day/time duration: on an annotation, in txn-meta, or on an `f:RetentionProperty` entry |
+| `f:expiresAt` | `https://ns.flur.ee/db#expiresAt` | Absolute deadline (`xsd:dateTime` with an offset): on an annotation or in txn-meta |
+| `f:retentionDefaults` | `https://ns.flur.ee/db#retentionDefaults` | Setting group on `f:LedgerConfig` / `f:GraphConfig` |
+| `f:RetentionDefaults` | `https://ns.flur.ee/db#RetentionDefaults` | Class of the setting-group node |
+| `f:RetentionProperty` | `https://ns.flur.ee/db#RetentionProperty` | Class of each `f:property` entry |
+| `f:noHistory` | `https://ns.flur.ee/db#noHistory` | On an entry: keep the predicate's superseded values out of the index ([History retention](../transactions/history-retention.md)) |
+| `f:retentionControl` | `https://ns.flur.ee/db#retentionControl` | System txn-meta marker on a commit that carries retention input |
+
+### Erasure predicates
+
+A [permanent erasure](../transactions/permanent-erasure.md) request is authorized by a control commit, which carries these in its txn-meta. The system writes them; a transaction cannot set them. None records an erased value.
+
+| Term | IRI | Description |
+|------|-----|-------------|
+| `f:erasureRequest` | `https://ns.flur.ee/db#erasureRequest` | The request's id |
+| `f:erasureRequester` | `https://ns.flur.ee/db#erasureRequester` | The identity that requested the erasure |
+| `f:erasureManifest` | `https://ns.flur.ee/db#erasureManifest` | SHA-256 (hex) of the request's manifest: the occurrences it removes, by commit and slot |
+| `f:erasureSignatures` | `https://ns.flur.ee/db#erasureSignatures` | How the proofs treat the original commits' signatures: `verify` or `expose` ([Signatures](../transactions/permanent-erasure.md#signatures)). Absent means `verify` |
+
 ---
 
 ## Search query vocabulary
@@ -353,6 +378,7 @@ These predicates define ledger-level configuration stored in the config graph. S
 | `f:reasoningDefaults` | `https://ns.flur.ee/db#reasoningDefaults` | OWL/RDFS reasoning defaults |
 | `f:datalogDefaults` | `https://ns.flur.ee/db#datalogDefaults` | Datalog rule defaults |
 | `f:transactDefaults` | `https://ns.flur.ee/db#transactDefaults` | Transaction constraint defaults |
+| `f:retentionDefaults` | `https://ns.flur.ee/db#retentionDefaults` | Value lifetime (TTL) defaults |
 | `f:queryDefaults` | `https://ns.flur.ee/db#queryDefaults` | Query defaults (ledger-scoped: `f:LedgerConfig` only) |
 
 ### Policy fields

@@ -97,3 +97,13 @@ async fn single_node_nameservice() -> RaftNameService {
 async fn raft_lifecycle_conformance() {
     fluree_db_nameservice::conformance::run_all(single_node_nameservice).await;
 }
+
+/// The writes a purge makes, which a cluster's leader makes too.
+#[tokio::test]
+async fn raft_purge_conformance() {
+    use fluree_db_nameservice::conformance::{
+        a_frozen_branchs_index_head_clears, a_graph_source_index_is_replaced_at_the_same_t,
+    };
+    a_frozen_branchs_index_head_clears(&single_node_nameservice().await).await;
+    a_graph_source_index_is_replaced_at_the_same_t(&single_node_nameservice().await).await;
+}

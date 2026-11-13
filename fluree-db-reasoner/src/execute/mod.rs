@@ -17,6 +17,7 @@ mod class_rules;
 mod delta;
 mod derived;
 mod equality_rules;
+mod known;
 mod property_rules;
 mod restriction_rules;
 pub mod util;
@@ -24,6 +25,7 @@ pub mod util;
 // Re-export main types
 pub use delta::DeltaSet;
 pub use derived::DerivedSet;
+pub use known::{Known, KnownIter, OnDemand, ReadCache, ReadKey};
 pub use util::{IdentityRuleContext, IdentityRuleState, RuleContext};
 
 // Re-export property rules (prp-*)

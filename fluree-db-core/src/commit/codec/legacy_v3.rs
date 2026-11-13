@@ -259,6 +259,7 @@ pub fn read_commit_v3(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         graph_delta: envelope.graph_delta,
         graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
+        redaction: None,
     })
 }
 

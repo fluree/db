@@ -25,6 +25,8 @@ members = [
     "fluree-db-shacl",
     "fluree-db-reasoner",
     "fluree-db-credential",
+    "fluree-db-redaction",
+    "fluree-db-erasure",
     "fluree-db-api",
     "fluree-db-storage-aws",
     "fluree-db-storage-ipfs",
@@ -57,7 +59,7 @@ members = [
     "fluree-db-wasm",
     "fluree-db-python",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge"]
+exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge", "fluree-prover"]
 
 [workspace.package]
 version = "5.0.0-alpha.3"

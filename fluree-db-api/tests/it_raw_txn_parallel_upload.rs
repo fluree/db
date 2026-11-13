@@ -341,6 +341,9 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
                     blobs: Default::default(),
                     missing_blobs,
                     merged_commits: Vec::new(),
+                    commit_ids: Vec::new(),
+                    merged_commit_ids: Vec::new(),
+                    ..Default::default()
                 },
                 &GovernanceOptions::default(),
                 &index_config,
@@ -376,6 +379,9 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
                     blobs: Default::default(),
                     missing_blobs: Vec::new(),
                     merged_commits: Vec::new(),
+                    commit_ids: Vec::new(),
+                    merged_commit_ids: Vec::new(),
+                    ..Default::default()
                 },
                 &GovernanceOptions::default(),
                 &index_config,

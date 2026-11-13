@@ -147,6 +147,10 @@ pub struct IncrementalResolveConfig {
     pub pending_commit_cids: Option<Vec<(i64, ContentId)>>,
     /// Global bound on in-flight commit-body fetches on the fast path.
     pub commit_fetch_concurrency: usize,
+    /// A reasoning index's derived facts, in commit-codec form, applied after
+    /// the window's commits at their `t` (see
+    /// [`crate::config::IndexerConfig::derived_facts`]).
+    pub derived_facts: Option<Arc<Vec<u8>>>,
 }
 
 /// Result of V6 incremental commit resolution.
@@ -384,10 +388,26 @@ pub async fn resolve_incremental_commits_v6(
     // 5. Walk commit chain (commit format is version-independent). Moved
     // ahead of the vector-shard load so we can detect whether the chunk
     // contains any vector op before deciding to pay that cost.
-    let (walked_commits, t_walk_chain_ms) = {
+    let (mut walked_commits, t_walk_chain_ms) = {
         let t0 = Instant::now();
         let commits = walk_commit_chain_since(cs.as_ref(), &config).await?;
+        refuse_base_off_the_line(&commits, &subject_tree)?;
         (commits, t0.elapsed().as_millis() as u64)
+    };
+    // The derived facts go last, so at their `t` they follow the commit that
+    // ends the window.
+    let derived_index = match &config.derived_facts {
+        Some(bytes) => {
+            let envelope = fluree_db_core::commit::codec::read_commit_envelope(bytes)
+                .map_err(|e| IncrementalResolveError::CommitChain(format!("derived facts: {e}")))?;
+            walked_commits.push(WalkedCommit {
+                cid: ContentId::new(fluree_db_core::ContentKind::DerivedFacts, bytes),
+                t: envelope.t,
+                bytes: bytes.as_ref().clone(),
+            });
+            Some(walked_commits.len() - 1)
+        }
+        None => None,
     };
 
     // 4b/4c. Vector arena shard load + fact-handle seeding — gated on the
@@ -513,17 +533,24 @@ pub async fn resolve_incremental_commits_v6(
         let mut delta_retracts = 0u64;
         let mut commit_count = 0usize;
 
-        for walked in &walked_commits {
-            let resolved = shared
-                .resolve_commit_into_chunk(&walked.bytes, &walked.cid.digest_hex(), &mut chunk)
-                .map_err(|e| {
-                    IncrementalResolveError::Resolve(match e {
-                        ResolverError::Unindexable(msg) => {
-                            ResolverError::Unindexable(format!("commit {}: {msg}", walked.cid))
-                        }
-                        e => e,
-                    })
-                })?;
+        for (index, walked) in walked_commits.iter().enumerate() {
+            let resolved = if Some(index) == derived_index {
+                shared.resolve_derived_into_chunk(&walked.bytes, &mut chunk)
+            } else {
+                shared.resolve_commit_into_chunk(
+                    &walked.bytes,
+                    &walked.cid.address_digest(),
+                    &mut chunk,
+                )
+            };
+            let resolved = resolved.map_err(|e| {
+                IncrementalResolveError::Resolve(match e {
+                    ResolverError::Unindexable(msg) => {
+                        ResolverError::Unindexable(format!("commit {}: {msg}", walked.cid))
+                    }
+                    e => e,
+                })
+            })?;
 
             max_t = max_t.max(walked.t);
             delta_commit_size += resolved.size;
@@ -1704,7 +1731,11 @@ async fn fetch_commit_bytes(
 /// is gap-free iff each `t` is exactly one greater than its predecessor and the
 /// first entry is `from_t + 1`. A failure here is never a correctness hazard —
 /// it just declines the fast path.
-fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &ContentId) -> bool {
+pub fn pending_covers_range(
+    pending: &[(i64, ContentId)],
+    from_t: i64,
+    head_id: &ContentId,
+) -> bool {
     let Some((_, tip_cid)) = pending.last() else {
         return false;
     };
@@ -1715,6 +1746,36 @@ fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &Con
     (from_t + 1..)
         .zip(pending.iter())
         .all(|(expected, (t, _))| *t == expected)
+}
+
+/// Refuse to extend a base index that does not hold the commit the walk
+/// starts after: the head's line at the base's `t`. An index of a line a
+/// rebase replaced does not, and extending it would mix the two lines. The
+/// build falls back to a full rebuild, which reads the head's line alone.
+fn refuse_base_off_the_line(
+    walked: &[WalkedCommit],
+    subject_tree: &DictTreeReader,
+) -> Result<(), IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    let Some(oldest) = walked.first() else {
+        return Ok(());
+    };
+    let envelope = read_commit_envelope(&oldest.bytes).map_err(|e| {
+        IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", oldest.cid))
+    })?;
+    let Some(base) = envelope.parents.first() else {
+        return Ok(());
+    };
+    let sid = fluree_db_core::commit_subject::commit_sid(base);
+    let key = subject_reverse_key(sid.namespace_code, sid.name.as_bytes());
+    match subject_tree.reverse_lookup(&key) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(IncrementalResolveError::CommitChain(format!(
+            "the base index does not hold commit {base}, which the head's line has at \
+             its t: it indexes another line"
+        ))),
+        Err(e) => Err(IncrementalResolveError::Io(e)),
+    }
 }
 
 async fn walk_commit_chain_since(

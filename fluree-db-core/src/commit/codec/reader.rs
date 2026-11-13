@@ -28,19 +28,20 @@ use crate::{Commit, CommitEnvelope, ContentId, ContentKind};
 /// `ContentId::new(ContentKind::Commit, bytes)`. Integrity is guaranteed by
 /// the content-addressed store.
 pub(crate) fn verify_commit_blob_v4(bytes: &[u8]) -> Result<ContentId, CommitCodecError> {
-    let blob_len = bytes.len();
+    validate_commit_blob_v4(bytes)?;
+    Ok(ContentId::new(ContentKind::Commit, bytes))
+}
 
-    if blob_len < MIN_COMMIT_LEN {
+/// Check a v4 commit blob's structure (size, magic, version) without hashing it.
+pub(crate) fn validate_commit_blob_v4(bytes: &[u8]) -> Result<(), CommitCodecError> {
+    if bytes.len() < MIN_COMMIT_LEN {
         return Err(CommitCodecError::TooSmall {
-            got: blob_len,
+            got: bytes.len(),
             min: MIN_COMMIT_LEN,
         });
     }
-
-    // Validate header (checks magic + version).
     CommitHeader::read_from(bytes)?;
-
-    Ok(ContentId::new(ContentKind::Commit, bytes))
+    Ok(())
 }
 
 /// Read a v4 commit blob and return a full `Commit` (with flakes).
@@ -170,6 +171,7 @@ pub(crate) fn read_commit_v4(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         graph_delta: envelope.graph_delta,
         graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
+        redaction: None,
     })
 }
 

@@ -632,7 +632,7 @@ async fn reindex_rebuilds_and_publishes_index_at_current_commit_t() {
         .await
         .expect("reindex");
     assert_eq!(r.index_t, 4);
-    assert!(r.root_id.digest_hex().len() == 64);
+    assert!(r.root_id.address_digest().len() == 64);
 
     // Nameservice record should be updated
     let status = fluree.index_status(&a).await.expect("index_status");
@@ -820,7 +820,7 @@ async fn reindex_with_existing_index_completes_successfully() {
                 .expect("reindex");
             assert_eq!(reindexed.index_t, 3, "Reindex should still be at t=3");
             assert!(
-                reindexed.root_id.digest_hex().len() == 64,
+                reindexed.root_id.address_digest().len() == 64,
                 "Should have valid root_id"
             );
 
@@ -997,7 +997,7 @@ async fn reindex_uses_provided_indexer_config() {
 
     assert_eq!(r.index_t, 1, "Should index to t=1");
     assert!(
-        r.root_id.digest_hex().len() == 64,
+        r.root_id.address_digest().len() == 64,
         "Should have valid root_id"
     );
 

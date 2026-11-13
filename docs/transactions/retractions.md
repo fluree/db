@@ -597,13 +597,16 @@ Track retraction metrics:
 
 ### GDPR "Right to be Forgotten"
 
-For compliance, consider:
+A retraction alone does not satisfy an erasure request: the value leaves current state, and history and the commit log still hold it. For compliance:
 
-1. **Soft delete first** (marks as deleted)
-2. **Schedule purge** (actual removal from history)
-3. **Anonymize references** (replace with pseudonymous ID)
+1. **Retract or anonymize** the current data, as in the example below.
+2. **Withdraw it from history** with a [targeted removal](history-retention.md#targeted-removal), which makes the ledger refuse historical reads of the value at once and keeps the commit log for audit.
+3. **Destroy it** with a [permanent erasure](permanent-erasure.md), which replaces the commits that hold the value and deletes the originals from storage. An erasure does steps 1 and 2 itself.
+4. **Use opaque identifiers** from the start (`ex:user-123`, not an email address): erasure removes values, not IRIs.
 
-Example:
+The [permanent erasure cookbook](../guides/cookbook-erasure.md) walks through a request, and [Data lifecycle](../concepts/data-lifecycle.md) covers designing a ledger for it.
+
+Example (step 1):
 ```json
 {
   "where": [{ "@id": "ex:user-123", "?pred": "?val" }],
@@ -616,7 +619,7 @@ Example:
 }
 ```
 
-Note: True purging from history requires administrative operations beyond standard retractions.
+Note: this transaction changes current state only. The retracted values remain readable through time travel until a targeted removal or permanent erasure withdraws them.
 
 ## Related Documentation
 

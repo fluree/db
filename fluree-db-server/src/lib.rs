@@ -67,33 +67,46 @@ enum Consensus {
     Standalone,
 }
 
-/// Which part of the deployment runs the BM25 maintenance worker.
+/// Which part of the deployment runs a maintenance worker an operator opts
+/// into: BM25 auto-sync, reasoning-index refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bm25WorkerOwner {
-    /// Nothing: `--bm25-auto-sync` is off.
+enum WorkerOwner {
+    /// Nothing: the worker's flag is off.
     Disabled,
     /// Nothing on this server. A peer forwards its writes, so the commit
-    /// events that drive a sync are published on the transaction server's
-    /// event bus rather than this one.
+    /// events that drive the worker are published on the transaction
+    /// server's event bus rather than this one.
     PeerForwardsWrites,
-    /// The Raft leader watcher, which spawns the worker on election. A sync
-    /// proposes `PublishGraphSourceIndex`, so it must originate on the leader.
+    /// The Raft leader watcher, which spawns the worker on election. What
+    /// the worker publishes is proposed to the state machine, so it must
+    /// originate on the leader.
     RaftLeader,
     /// This server, for the life of `serve()`.
     ThisServer,
 }
 
-/// Decide who runs the BM25 maintenance worker for this deployment.
-fn bm25_worker_owner(config: &ServerConfig, consensus: Consensus) -> Bm25WorkerOwner {
-    if !config.bm25_auto_sync {
-        Bm25WorkerOwner::Disabled
+fn worker_owner(enabled: bool, config: &ServerConfig, consensus: Consensus) -> WorkerOwner {
+    if !enabled {
+        WorkerOwner::Disabled
     } else if config.server_role == ServerRole::Peer {
-        Bm25WorkerOwner::PeerForwardsWrites
+        WorkerOwner::PeerForwardsWrites
     } else if consensus == Consensus::Raft {
-        Bm25WorkerOwner::RaftLeader
+        WorkerOwner::RaftLeader
     } else {
-        Bm25WorkerOwner::ThisServer
+        WorkerOwner::ThisServer
     }
+}
+
+/// Decide who runs the BM25 maintenance worker for this deployment.
+fn bm25_worker_owner(config: &ServerConfig, consensus: Consensus) -> WorkerOwner {
+    worker_owner(config.bm25_auto_sync, config, consensus)
+}
+
+/// Decide who runs reasoning-index maintenance for this deployment. Off
+/// unless asked for: a server that registered no index should not pay to
+/// look for one.
+fn reasoning_worker_owner(config: &ServerConfig, consensus: Consensus) -> WorkerOwner {
+    worker_owner(config.reasoning_index_auto_refresh, config, consensus)
 }
 
 /// Select the graph sources the startup registration pass hands to the worker.
@@ -419,12 +432,12 @@ impl FlureeServer {
         let consensus = Consensus::Standalone;
 
         let bm25_auto_sync = match bm25_worker_owner(&self.state.config, consensus) {
-            Bm25WorkerOwner::Disabled | Bm25WorkerOwner::RaftLeader => None,
-            Bm25WorkerOwner::PeerForwardsWrites => {
+            WorkerOwner::Disabled | WorkerOwner::RaftLeader => None,
+            WorkerOwner::PeerForwardsWrites => {
                 info!("BM25 auto-sync requested but does not run in peer mode");
                 None
             }
-            Bm25WorkerOwner::ThisServer => {
+            WorkerOwner::ThisServer => {
                 let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
                 let task = tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
@@ -434,6 +447,17 @@ impl FlureeServer {
                 Some((handle, task))
             }
         };
+
+        // Reasoning indexes are built where writes publish: here when this
+        // server owns its ledgers, on the leader under Raft (spawned with
+        // the leader's tasks), never on a peer.
+        let reasoning_indexes_task = (reasoning_worker_owner(&self.state.config, consensus)
+            == WorkerOwner::ThisServer)
+            .then(|| {
+                tokio::spawn(
+                    fluree_db_api::ReasoningIndexWorker::new(Arc::clone(&self.state.fluree)).run(),
+                )
+            });
 
         // Spawn the private Raft listener. Carries the inter-node
         // RPC + cluster admin routers — mount on a VPC-internal
@@ -552,6 +576,11 @@ impl FlureeServer {
         //
         // Bounded, because a sync re-runs the whole indexing query over the
         // source ledger; a large corpus must not hold teardown open.
+        // A refresh cut short publishes nothing: publication is one
+        // compare-and-swap, and its unpublished files are a sweep's to reclaim.
+        if let Some(task) = reasoning_indexes_task {
+            task.abort();
+        }
         if let Some((handle, task)) = bm25_auto_sync {
             handle.stop();
             if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
@@ -830,6 +859,9 @@ impl FlureeServerBuilder {
                 );
                 let backend = state_inner.fluree.backend().clone();
                 let bm25_auto_sync = state_inner.config.bm25_auto_sync;
+                let reasoning_index_auto_refresh =
+                    reasoning_worker_owner(&state_inner.config, Consensus::Raft)
+                        == WorkerOwner::RaftLeader;
                 let bm25_fluree = Arc::clone(&state_inner.fluree);
                 // The leader-scope worker is the one that sweeps under raft
                 // (the node-scope worker every node builds through
@@ -850,7 +882,18 @@ impl FlureeServerBuilder {
                 let event_bus = Arc::clone(&integration.event_bus);
                 let rotation_fluree = Arc::clone(&state_inner.fluree);
                 let housekeeping_fluree = Arc::clone(&state_inner.fluree);
-                let orphan_sweep_interval = state_inner.config.orphan_sweep_interval();
+                let housekeeping_options = state_inner.config.housekeeping_options();
+                let retention_options = state_inner.config.retention_options();
+                // Expiration batches go through the cluster's committer, which
+                // exists once `attach` returns; until then they wait.
+                let retention_committer: Arc<
+                    std::sync::OnceLock<Arc<dyn fluree_db_consensus::SubmittingCommitter>>,
+                > = Arc::default();
+                let retention_writer: Arc<dyn fluree_db_api::retention::RetentionWriter> = Arc::new(
+                    fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::clone(
+                        &retention_committer,
+                    )),
+                );
                 let rotation_holder = routes::rotation_holder(&state_inner);
                 let leader_tasks = move || {
                     let nameservice: std::sync::Arc<
@@ -863,10 +906,22 @@ impl FlureeServerBuilder {
                     );
                     let worker = worker.with_event_bus(Arc::clone(&event_bus));
                     // This worker owns catch-up, so its ticks also finish
-                    // lifecycle operations a crashed leader left.
-                    handle.set_housekeeping(
-                        housekeeping_fluree.lifecycle_housekeeping(orphan_sweep_interval),
-                    );
+                    // lifecycle operations a crashed leader left, and run the
+                    // retention worker. Both stop with leadership.
+                    handle.set_housekeeping(Arc::new(fluree_db_indexer::Housekeepings(vec![
+                        housekeeping_fluree
+                            .lifecycle_housekeeping_with(housekeeping_options.clone()),
+                        housekeeping_fluree.retention_housekeeping(
+                            Some(Arc::clone(&retention_writer)),
+                            retention_options.clone(),
+                        ),
+                    ])));
+                    handle.set_build_observer(housekeeping_fluree.retention_build_observer());
+                    // Maintenance holds (a reindex, a purge's erasure) wait
+                    // for this indexer's builds while its task lives.
+                    let alive = std::sync::Arc::new(());
+                    housekeeping_fluree
+                        .set_leader_indexer(handle.clone(), std::sync::Arc::downgrade(&alive));
                     // The handle owns the worker's ShutdownTrigger:
                     // dropping it fires the shutdown oneshot and `run()`
                     // exits on its FIRST select — silently, before its
@@ -876,7 +931,7 @@ impl FlureeServerBuilder {
                     // they live and die together; the leader watcher's
                     // abort on leadership loss releases both.
                     let mut tasks = vec![tokio::spawn(async move {
-                        let _keepalive = handle;
+                        let _keepalive = (handle, alive);
                         worker.run().await;
                     })];
                     // BM25 auto-sync is leader-only for the same reason
@@ -891,6 +946,13 @@ impl FlureeServerBuilder {
                     // handover.
                     if bm25_auto_sync {
                         tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
+                    }
+                    // Reasoning indexes publish through the nameservice too.
+                    if reasoning_index_auto_refresh {
+                        tasks.push(tokio::spawn(
+                            fluree_db_api::ReasoningIndexWorker::new(Arc::clone(&bm25_fluree))
+                                .run(),
+                        ));
                     }
                     // A key rotation in progress continues on the new leader
                     // and is handed off when leadership is lost: the guard's
@@ -921,6 +983,7 @@ impl FlureeServerBuilder {
                 )
                 .await;
                 state_inner.committer = Arc::clone(&node.committer);
+                let _ = retention_committer.set(Arc::clone(&node.committer));
                 state_inner.raft = Some(Arc::clone(integration));
                 Some(node)
             }
@@ -1082,7 +1145,7 @@ mod tests {
         assert!(!config.bm25_auto_sync, "the flag must default off");
         assert_eq!(
             bm25_worker_owner(&config, Consensus::Standalone),
-            Bm25WorkerOwner::Disabled
+            WorkerOwner::Disabled
         );
     }
 
@@ -1093,7 +1156,7 @@ mod tests {
                 &auto_sync_config(ServerRole::Transaction),
                 Consensus::Standalone
             ),
-            Bm25WorkerOwner::ThisServer
+            WorkerOwner::ThisServer
         );
     }
 
@@ -1101,7 +1164,7 @@ mod tests {
     fn a_peer_does_not_run_the_worker() {
         assert_eq!(
             bm25_worker_owner(&auto_sync_config(ServerRole::Peer), Consensus::Standalone),
-            Bm25WorkerOwner::PeerForwardsWrites
+            WorkerOwner::PeerForwardsWrites
         );
     }
 
@@ -1109,7 +1172,7 @@ mod tests {
     fn raft_hands_the_worker_to_the_leader_watcher() {
         assert_eq!(
             bm25_worker_owner(&auto_sync_config(ServerRole::Transaction), Consensus::Raft),
-            Bm25WorkerOwner::RaftLeader
+            WorkerOwner::RaftLeader
         );
     }
 
@@ -1119,7 +1182,42 @@ mod tests {
     fn a_raft_peer_does_not_run_the_worker() {
         assert_eq!(
             bm25_worker_owner(&auto_sync_config(ServerRole::Peer), Consensus::Raft),
-            Bm25WorkerOwner::PeerForwardsWrites
+            WorkerOwner::PeerForwardsWrites
+        );
+    }
+
+    /// Reasoning maintenance lists ledgers and reads their registrations on
+    /// a timer, so no part of a deployment runs it unless its flag is set;
+    /// with the flag, it runs where BM25's worker would.
+    #[test]
+    fn reasoning_maintenance_runs_only_where_it_was_asked_for() {
+        let asked = |server_role| ServerConfig {
+            reasoning_index_auto_refresh: true,
+            server_role,
+            ..ServerConfig::default()
+        };
+        for consensus in [Consensus::Standalone, Consensus::Raft] {
+            assert_eq!(
+                reasoning_worker_owner(&ServerConfig::default(), consensus),
+                WorkerOwner::Disabled
+            );
+            // BM25's flag is not this one.
+            assert_eq!(
+                reasoning_worker_owner(&auto_sync_config(ServerRole::Transaction), consensus),
+                WorkerOwner::Disabled
+            );
+            assert_eq!(
+                reasoning_worker_owner(&asked(ServerRole::Peer), consensus),
+                WorkerOwner::PeerForwardsWrites
+            );
+        }
+        assert_eq!(
+            reasoning_worker_owner(&asked(ServerRole::Transaction), Consensus::Standalone),
+            WorkerOwner::ThisServer
+        );
+        assert_eq!(
+            reasoning_worker_owner(&asked(ServerRole::Transaction), Consensus::Raft),
+            WorkerOwner::RaftLeader
         );
     }
 

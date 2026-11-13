@@ -37,12 +37,21 @@ pub struct StorageProxyPrincipal {
     /// fluree.storage.ledgers claim, parsed like data scopes (bare `mydb` is
     /// `mydb:main`).
     pub storage_ledgers: HashSet<fluree_db_api::LedgerId>,
+    /// fluree.ledger.audit.* claims: raw commits and transactions of a
+    /// ledger whose retention suppresses history.
+    pub audit_all: bool,
+    pub audit_ledgers: HashSet<fluree_db_api::LedgerId>,
 }
 
 impl StorageProxyPrincipal {
     /// Check if principal has any storage proxy permissions
     pub fn has_storage_permissions(&self) -> bool {
         self.storage_all || !self.storage_ledgers.is_empty()
+    }
+
+    /// Audit-log access to `alias`; storage scopes do not imply it.
+    pub fn can_audit(&self, alias: &fluree_db_api::LedgerId) -> bool {
+        self.audit_all || self.audit_ledgers.contains(alias)
     }
 
     /// Check if principal is authorized for a specific ledger alias
@@ -122,6 +131,8 @@ fn build_principal(
         identity: payload.resolve_identity(),
         storage_all: payload.storage_all.unwrap_or(false),
         storage_ledgers: super::data_bearer::parse_scopes(payload.storage_ledgers.as_ref()),
+        audit_all: payload.ledger_audit_all.unwrap_or(false),
+        audit_ledgers: super::data_bearer::parse_scopes(payload.ledger_audit_ledgers.as_ref()),
     })
 }
 
@@ -240,6 +251,8 @@ mod tests {
                 .into_iter()
                 .map(|l| fluree_db_api::LedgerId::parse(l).unwrap())
                 .collect(),
+            audit_all: false,
+            audit_ledgers: Default::default(),
         };
 
         assert!(principal.has_storage_permissions());
@@ -259,6 +272,8 @@ mod tests {
             identity: None,
             storage_all: true,
             storage_ledgers: HashSet::new(),
+            audit_all: false,
+            audit_ledgers: Default::default(),
         };
 
         assert!(principal.has_storage_permissions());
@@ -276,6 +291,8 @@ mod tests {
             identity: None,
             storage_all: false,
             storage_ledgers: HashSet::new(),
+            audit_all: false,
+            audit_ledgers: Default::default(),
         };
 
         assert!(!principal.has_storage_permissions());

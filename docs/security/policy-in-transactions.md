@@ -87,7 +87,7 @@ A write that restates a stored value as it is stages nothing: an upsert of an un
 
 Enforcement is also independent of the **wire format**: the check runs on the staged flakes, so JSON-LD, SPARQL UPDATE, and Turtle / TriG / N-Triples writes are all governed by the same `f:modify` policy. Sending data as Turtle is not a way to bypass write policy.
 
-Class targeting on the write side is **exact**: an `f:onClass` modify policy governs *every* flake whose subject is an instance of the class — including properties the class has never carried before. (Read-side class targeting uses the committed class→property index; write-side targeting matches by the subject's classes directly, since a write may introduce class/property combinations no committed data predicts.)
+Class targeting on the write side is **exact**: an `f:onClass` modify policy governs *every* flake whose subject is an instance of the class — including properties the class has never carried before. (Read-side class targeting uses the committed class→property index, except in a query that materializes reasoning, which matches by the subject's reasoned classes; write-side targeting matches by the subject's classes directly, since a write may introduce class/property combinations no committed data predicts.)
 
 ### Schema writes
 

@@ -963,3 +963,113 @@ async fn rebase_replays_commit_that_creates_named_graph() {
         .unwrap();
     assert_eq!(rows, json!(["Dave"]));
 }
+
+/// A branch with its own commits, `bob` and `carol` after the fork at
+/// `alice`, and a source that moved on to `dave`.
+async fn diverged(fluree: &fluree_db_api::Fluree) {
+    let name = |n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{n}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree.insert(main, &name("alice")).await.unwrap().ledger;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    for n in ["bob", "carol"] {
+        let dev = fluree.ledger("rb:dev").await.unwrap();
+        fluree.insert(dev, &name(n)).await.unwrap();
+    }
+    fluree.insert(main, &name("dave")).await.unwrap();
+}
+
+fn file_fluree(dir: &tempfile::TempDir) -> fluree_db_api::Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap()
+}
+
+const EVERY_NAME: [&str; 4] = ["alice", "bob", "carol", "dave"];
+
+/// A rebase that replays the branch's commits takes the branch's index of
+/// the line it replaced away, even where the source's index is older or
+/// absent: a fresh load of the branch reads its new line, not that index
+/// with the new line's later commits on top.
+#[tokio::test]
+async fn a_rebase_takes_away_the_index_of_the_line_it_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    support::rebuild_and_publish_index(&fluree, "rb:dev").await;
+
+    let report = fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 2);
+    drop(fluree);
+
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+}
+
+/// An index of a branch's line built before a rebase and published after it
+/// is not extended over the new line: the incremental build refuses it, and
+/// the build falls back to a full rebuild of the new line. An index on the
+/// head's line is extended as before.
+#[tokio::test]
+async fn an_index_of_a_replaced_line_is_not_extended() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    let before = fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let store = fluree.branched_content_store("rb:dev").await.unwrap();
+    let stale = fluree_db_indexer::rebuild_index_from_commits(
+        store,
+        "rb:dev",
+        &before,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    support::publish_built_index(&fluree, "rb:dev", stale.index_t, &stale.root_id).await;
+
+    let record = fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.branched_content_store("rb:dev").await.unwrap(),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await;
+    assert!(refused.is_err(), "the replaced line's index was extended");
+    support::build_and_publish_index(&fluree, "rb:dev").await;
+    drop(fluree);
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+
+    // On the head's line, the index is extended.
+    let dev = fresh.ledger("rb:dev").await.unwrap();
+    fresh
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/ns/"},
+                    "@id": "ex:erin", "ex:name": "erin"}),
+        )
+        .await
+        .unwrap();
+    support::build_incrementally_and_publish_index(&fresh, "rb:dev").await;
+}

@@ -15,16 +15,17 @@ These concepts build on each other. If you're new to Fluree, read them in this o
 **Core capabilities** (read next):
 
 4. [Time Travel](time-travel.md) — Query any point in history
-5. [Branching](ledgers-and-nameservice.md#branching) — Git-like branch, merge, and rebase for your data
-6. [Datasets and Named Graphs](datasets-and-named-graphs.md) — Partition and query across graphs
-7. [Edge Annotations](edge-annotations.md) — Properties on relationships, RDF-star, and property-graph edges
+5. [Data Lifecycle](data-lifecycle.md) — Expiry, history retention, removal and erasure
+6. [Branching](ledgers-and-nameservice.md#branching) — Git-like branch, merge, and rebase for your data
+7. [Datasets and Named Graphs](datasets-and-named-graphs.md) — Partition and query across graphs
+8. [Edge Annotations](edge-annotations.md) — Properties on relationships, RDF-star, and property-graph edges
 
 **Differentiating features** (read as needed):
 
-8. [Graph Sources](graph-sources.md) — Integrated search and external data
-9. [Policy Enforcement](policy-enforcement.md) — Fine-grained access control
-10. [Verifiable Data](verifiable-data.md) — Cryptographic signatures and trust
-11. [Reasoning and Inference](reasoning.md) — Derive facts from ontology rules
+9. [Graph Sources](graph-sources.md) — Integrated search and external data
+10. [Policy Enforcement](policy-enforcement.md) — Fine-grained access control
+11. [Verifiable Data](verifiable-data.md) — Cryptographic signatures and trust
+12. [Reasoning and Inference](reasoning.md) — Derive facts from ontology rules
 
 If you're coming from a SQL/relational background, start with [Fluree for SQL Developers](../getting-started/fluree-for-sql-developers.md) before diving into the concepts above.
 
@@ -45,6 +46,10 @@ Learn about ledgers (Fluree's equivalent of databases), how they're organized wi
 ### [Time Travel](time-travel.md)
 
 **Differentiator**: Discover Fluree's temporal database capabilities, including transaction-time versioning, historical queries, and the ability to query data "as of" any previous transaction. Every change is preserved, enabling complete audit trails and historical analysis.
+
+### [Data Lifecycle: Expiry, History Retention and Erasure](data-lifecycle.md)
+
+Fluree keeps every value and every change unless you say otherwise. Four opt-in features change that: TTL retracts a value when its lifetime ends, `f:noHistory` keeps only a predicate's current values in the index, targeted removal stops serving chosen values in history, and permanent erasure replaces the commits that hold a value and deletes the originals, under a zero-knowledge proof. This page explains where a committed value lives and which feature reaches how far.
 
 ### [Datasets and Named Graphs](datasets-and-named-graphs.md)
 

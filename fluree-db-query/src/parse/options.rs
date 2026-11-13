@@ -525,6 +525,7 @@ const REASONING_KEYS: &[&str] = &[
     "ontology",
     "reasoningBudget",
     "reasoningTime",
+    "reasoningFreshness",
 ];
 
 fn reasoning_from(

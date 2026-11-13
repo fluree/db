@@ -9,6 +9,7 @@ use crate::binding::{
     LedgerRegistry, NameBinding, RegistryCas, Versioned,
 };
 use crate::lifecycle::{self, BranchDrop, LifecycleStore};
+use crate::WriteBasis;
 use crate::{NameServiceError, NsRecord, Result};
 use async_trait::async_trait;
 use fluree_db_core::{InstanceId, LedgerId, LedgerName, StorageRoot};
@@ -68,6 +69,35 @@ impl<'a, S> PausedBeforeInsert<'a, S> {
 impl<S> std::fmt::Debug for PausedBeforeInsert<'_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PausedBeforeInsert")
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ReasoningIndexesLookup for PausedBeforeInsert<'_, S> {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
+        self.inner.get_reasoning_indexes(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ReasoningIndexesPublisher for PausedBeforeInsert<'_, S> {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<crate::Fence>,
+        expected_v: i64,
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
+        self.inner
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.inner.max_reasoning_indexes_bytes()
     }
 }
 
@@ -138,8 +168,34 @@ impl<S: LifecycleStore> BranchRecordStore for PausedBeforeInsert<'_, S> {
         self.inner.freeze_record(ledger_id, fence).await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        self.inner.thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         self.inner.delete_record(ledger_id, fence).await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ConfigLookup for PausedBeforeInsert<'_, S> {
+    async fn get_config(&self, ledger_id: &str) -> Result<Option<crate::ConfigValue>> {
+        self.inner.get_config(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ConfigPublisher for PausedBeforeInsert<'_, S> {
+    async fn push_config_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected: Option<&crate::ConfigValue>,
+        new: &crate::ConfigValue,
+    ) -> Result<crate::ConfigCasResult> {
+        self.inner
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
     }
 }
 
@@ -239,6 +295,161 @@ pub async fn restore_reinstates_under_fresh_fences<S: LifecycleStore>(store: &S)
         .await
         .unwrap()
         .is_none());
+}
+
+/// Write a config holding `marker` to `ledger_id`'s branch, with a field
+/// no reader knows.
+async fn set_config<S: LifecycleStore>(
+    store: &S,
+    ledger_id: &str,
+    marker: i64,
+) -> crate::ConfigValue {
+    let fence = store.raw_record(ledger_id).await.unwrap().unwrap().fence;
+    let mut payload = crate::ConfigPayload::new();
+    payload.extra.insert(
+        "retention".into(),
+        serde_json::json!({"journal": {"generation": marker}}),
+    );
+    payload
+        .extra
+        .insert("future".into(), serde_json::json!([marker]));
+    let config = crate::ConfigValue::new(marker, Some(payload));
+    let current = store.get_config(ledger_id).await.unwrap();
+    let pushed = store
+        .push_config_fenced(ledger_id, fence, current.as_ref(), &config)
+        .await
+        .unwrap();
+    assert!(matches!(pushed, crate::ConfigCasResult::Updated));
+    config
+}
+
+/// A soft drop keeps each branch's config, unknown fields included, and a
+/// restore reinstates it under the branch's fresh fence before the ledger
+/// is visible.
+pub async fn restore_keeps_branch_configs<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    for branch in ["dev", "bare"] {
+        lifecycle::create_branch(store, &name("mydb"), branch, "main", None)
+            .await
+            .unwrap();
+    }
+    let mut configs = std::collections::BTreeMap::new();
+    for (branch, marker) in [("main", 1), ("dev", 2)] {
+        let config = set_config(store, &format!("mydb:{branch}"), marker).await;
+        configs.insert(branch.to_string(), config);
+    }
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.entry.configs.as_ref(), Some(&configs));
+
+    let expected = &configs;
+    lifecycle::restore_dropped_with(store, &dropped.instance, |_, records| async move {
+        let binding = store.get_binding("mydb").await?.unwrap().value;
+        assert_eq!(binding.state, BindingState::Restoring);
+        for record in &records {
+            let config = store.get_config(record.ledger_id.as_ref()).await?;
+            match expected.get(&record.branch) {
+                Some(kept) => assert_eq!(config.as_ref(), Some(kept)),
+                None => assert!(config.is_none_or(|c| c.payload.is_none())),
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    for (branch, config) in &configs {
+        let restored = store.get_config(&format!("mydb:{branch}")).await.unwrap();
+        assert_eq!(restored.as_ref(), Some(config));
+    }
+}
+
+/// A restore stopped once its configs are in shows no branch, and resuming
+/// it finishes with the configs in place: no branch is ever visible without
+/// its config.
+pub async fn an_interrupted_restore_shows_no_branch_without_its_config<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let config = set_config(store, "mydb:main", 4).await;
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stopped = lifecycle::restore_dropped_with(store, &dropped.instance, |_, _| async {
+        Err(NameServiceError::storage("stopped"))
+    })
+    .await;
+    assert!(stopped.is_err());
+    assert!(store.lookup("mydb:main").await.unwrap().is_none());
+
+    lifecycle::resume_restore(store, &dropped.instance)
+        .await
+        .unwrap()
+        .expect("resumed");
+    assert!(store.lookup("mydb:main").await.unwrap().is_some());
+    let restored = store.get_config("mydb:main").await.unwrap();
+    assert_eq!(restored.as_ref(), Some(&config));
+}
+
+/// An entry from before drops captured configs restores with none: its
+/// branches come back with no config, not a refusal.
+pub async fn an_entry_without_configs_restores_with_none<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    set_config(store, "mydb:main", 5).await;
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    let held = store.get_dropped(&dropped.instance).await.unwrap().unwrap();
+    let legacy = DroppedLedger {
+        configs: None,
+        ..held.value
+    };
+    let written = store
+        .cas_dropped(&dropped.instance, Some(held.version), Some(&legacy))
+        .await
+        .unwrap();
+    assert!(matches!(written, RegistryCas::Updated { .. }));
+
+    lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let restored = store.get_config("mydb:main").await.unwrap();
+    assert!(restored.is_none_or(|c| c.payload.is_none()));
+}
+
+/// Thawing a frozen record admits its writes again, and only under its
+/// fence.
+pub async fn a_thawed_record_takes_writes_again<S: LifecycleStore>(store: &S) {
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence.unwrap();
+    assert_eq!(
+        store.freeze_record("mydb:main", fence).await.unwrap(),
+        FenceOutcome::Applied
+    );
+    assert!(store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+    assert_eq!(
+        store
+            .thaw_record("mydb:main", Fence::generate())
+            .await
+            .unwrap(),
+        FenceOutcome::Mismatch
+    );
+    assert_eq!(
+        store.thaw_record("mydb:other", fence).await.unwrap(),
+        FenceOutcome::Missing
+    );
+    assert_eq!(
+        store.thaw_record("mydb:main", fence).await.unwrap(),
+        FenceOutcome::Applied
+    );
+    assert!(!store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+    set_config(store, "mydb:main", 6).await;
 }
 
 /// Restoring into a name another ledger now holds is refused, and the dropped
@@ -431,7 +642,7 @@ pub async fn a_graph_source_keeps_its_key<S: crate::NameServicePublisher>(store:
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &index, 5)
+        .publish_graph_source_index("search", "main", &index, 5, &[])
         .await
         .unwrap();
 
@@ -1067,7 +1278,7 @@ pub async fn a_mirrored_index_head_reads_and_swaps_as_one<
     let swapped = store
         .compare_and_set_ref_fenced(
             "mydb:main",
-            copy.fence,
+            copy.write_basis(),
             RefKind::IndexHead,
             Some(&read),
             &next,
@@ -1126,7 +1337,7 @@ async fn advance_commit<S: crate::NameServicePublisher>(
         store
             .compare_and_set_ref_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::CommitHead,
                 current.as_ref(),
                 &next
@@ -1164,7 +1375,9 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         t,
     };
     assert_refused(
-        store.publish_commit_fenced(id, fence, 99, &commit).await,
+        store
+            .publish_commit_fenced(id, WriteBasis::fenced(fence), 99, &commit)
+            .await,
         "publish_commit",
         missing,
     );
@@ -1173,7 +1386,7 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         store
             .compare_and_set_ref_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::CommitHead,
                 current.as_ref(),
                 &next(99),
@@ -1184,19 +1397,21 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
     );
     assert_refused(
         store
-            .fast_forward_commit_fenced(id, fence, &next(99), 3)
+            .fast_forward_commit_fenced(id, WriteBasis::fenced(fence), &next(99), 3)
             .await,
         "fast_forward_commit",
         missing,
     );
     assert_refused(
-        store.publish_index_fenced(id, fence, 99, &index).await,
+        store
+            .publish_index_fenced(id, WriteBasis::fenced(fence), 99, &index)
+            .await,
         "publish_index",
         missing,
     );
     assert_refused(
         store
-            .publish_index_allow_equal_fenced(id, fence, 99, &index)
+            .publish_index_allow_equal_fenced(id, WriteBasis::fenced(fence), 99, &index)
             .await,
         "publish_index_allow_equal",
         missing,
@@ -1206,7 +1421,7 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         store
             .compare_and_set_ref_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::IndexHead,
                 current.as_ref(),
                 &crate::RefValue {
@@ -1222,7 +1437,7 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         store
             .reset_head_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::NsRecordSnapshot {
                     commit_head_id: None,
                     commit_t: 0,
@@ -1255,6 +1470,22 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         "push_config",
         missing,
     );
+    let heads = store
+        .get_reasoning_indexes(id)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    let next_heads = crate::ReasoningIndexes {
+        v: heads.v + 1,
+        ..heads.clone()
+    };
+    assert_refused(
+        store
+            .push_reasoning_indexes_fenced(id, fence, heads.v, &next_heads)
+            .await,
+        "push_reasoning_indexes",
+        missing,
+    );
 }
 
 /// Every write to a branch record presents the fence its writer loaded: a
@@ -1280,7 +1511,7 @@ pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(sto
         store
             .compare_and_set_ref_fenced(
                 "mydb:main",
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::CommitHead,
                 head.as_ref(),
                 &c2
@@ -1290,11 +1521,21 @@ pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(sto
         crate::CasResult::Updated
     );
     store
-        .publish_index_fenced("mydb:main", fence, 2, &cid(IndexRoot, "i2"))
+        .publish_index_fenced(
+            "mydb:main",
+            WriteBasis::fenced(fence),
+            2,
+            &cid(IndexRoot, "i2"),
+        )
         .await
         .unwrap();
     store
-        .publish_index_allow_equal_fenced("mydb:main", fence, 2, &cid(IndexRoot, "i2b"))
+        .publish_index_allow_equal_fenced(
+            "mydb:main",
+            WriteBasis::fenced(fence),
+            2,
+            &cid(IndexRoot, "i2b"),
+        )
         .await
         .unwrap();
     let record = store.lookup("mydb:main").await.unwrap().unwrap();
@@ -1313,7 +1554,7 @@ pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(sto
     store
         .reset_head_fenced(
             "mydb:main",
-            fence,
+            WriteBasis::fenced(fence),
             crate::NsRecordSnapshot::from_record(&record),
         )
         .await
@@ -1348,7 +1589,7 @@ pub async fn stale_writers_are_refused_across_drop_and_restore<S: crate::NameSer
         .unwrap();
     assert_fenced(
         store
-            .publish_commit_fenced("mydb:main", old.fence, 5, &cid(Commit, "late"))
+            .publish_commit_fenced("mydb:main", old.write_basis(), 5, &cid(Commit, "late"))
             .await,
         "publish after drop",
     );
@@ -1701,6 +1942,90 @@ pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store
 /// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
 /// A retracted graph source's index head can be cleared, so one created
 /// again under its name publishes from `t` 0; a live one's is left alone.
+/// A purge clears the index head of a frozen branch once it has released
+/// that branch's index, and of no branch that is not frozen.
+pub async fn a_frozen_branchs_index_head_clears<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::IndexRoot;
+    let main = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+        .await
+        .unwrap();
+    for (ledger, fence) in [("mydb:main", main.fence), ("mydb:dev", dev.fence)] {
+        // Indexed, so committed.
+        advance_commit(store, ledger, fence, 3).await;
+        store
+            .publish_index_allow_equal_fenced(
+                ledger,
+                WriteBasis::fenced(fence),
+                3,
+                &cid(IndexRoot, ledger),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(!store.clear_frozen_index("mydb:dev").await.unwrap(), "live");
+
+    // With a child, the drop leaves the branch frozen.
+    lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    assert!(store.clear_frozen_index("mydb:dev").await.unwrap());
+    let dev = store.lookup("mydb:dev").await.unwrap().expect("kept");
+    assert_eq!((dev.index_head_id, dev.index_t), (None, 0));
+    assert!(!store.clear_frozen_index("mydb:main").await.unwrap());
+    let main = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!(main.index_head_id, Some(cid(IndexRoot, "mydb:main")));
+}
+
+/// A graph source's index head is replaced at the same `t` by the write that
+/// allows it, never at a lower one; the ordinary publish keeps the first.
+pub async fn a_graph_source_index_is_replaced_at_the_same_t<S: crate::NameServicePublisher>(
+    store: &S,
+) {
+    use crate::GraphSourceType;
+    use fluree_db_core::ContentKind::IndexRoot;
+    let head = || async {
+        let record = store
+            .lookup_graph_source("search:main")
+            .await
+            .unwrap()
+            .expect("graph source");
+        (record.index_id, record.index_t)
+    };
+    store
+        .publish_graph_source(
+            "search",
+            "main",
+            GraphSourceType::Bm25,
+            "{}",
+            &["docs:main".to_string()],
+        )
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &cid(IndexRoot, "a"), 5, &[])
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &cid(IndexRoot, "b"), 5, &[])
+        .await
+        .unwrap();
+    assert_eq!(head().await, (Some(cid(IndexRoot, "a")), 5));
+    store
+        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "b"), 5, &[])
+        .await
+        .unwrap();
+    assert_eq!(head().await, (Some(cid(IndexRoot, "b")), 5));
+    store
+        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "c"), 4, &[])
+        .await
+        .unwrap();
+    assert_eq!(head().await, (Some(cid(IndexRoot, "b")), 5));
+}
+
 pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>(store: &S) {
     use crate::{GraphSourceLookup, GraphSourceType};
     use fluree_db_core::{ContentId, ContentKind};
@@ -1720,7 +2045,7 @@ pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &index("a"), 5)
+        .publish_graph_source_index("search", "main", &index("a"), 5, &[])
         .await
         .unwrap();
     store
@@ -1739,7 +2064,7 @@ pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &index("b"), 1)
+        .publish_graph_source_index("search", "main", &index("b"), 1, &[])
         .await
         .unwrap();
     assert_eq!(head(store).await, (false, Some(index("b")), 1), "recreated");
@@ -1964,6 +2289,166 @@ pub async fn a_dropped_branch_reads_as_absent<S: crate::NameServicePublisher>(st
     }
     assert!(store.get_status("mydb:main").await.unwrap().is_none());
     assert!(store.get_config("mydb:main").await.unwrap().is_none());
+    assert!(store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A sample reasoning-indexes document with one active index.
+fn sample_heads(v: i64, revision: u64) -> crate::ReasoningIndexes {
+    use fluree_db_core::reasoning_index::{
+        ClockPolicy, ErasureEpoch, ReasoningIndexEntry, ReasoningIndexId, Registration,
+        RegistrationState, SemanticKey,
+    };
+    let mut indexes = std::collections::BTreeMap::new();
+    indexes.insert(
+        ReasoningIndexId::parse("01JC0000000000000000000000").unwrap(),
+        ReasoningIndexEntry {
+            registration: Registration {
+                revision,
+                semantics: SemanticKey {
+                    program: cid(fluree_db_core::ContentKind::LedgerConfig, "program"),
+                    reasoned_graph: None,
+                    clock: ClockPolicy::SnapshotCommitTime,
+                },
+                program: serde_json::json!({"reasoning": "owl2rl"}),
+                state: RegistrationState::Active,
+            },
+            floor: ErasureEpoch(0),
+            head: None,
+        },
+    );
+    crate::ReasoningIndexes { v, indexes }
+}
+
+/// A soft-dropped ledger keeps each branch's reasoning-indexes document in its
+/// entry, and a restore writes it back under the fresh fence; the old fence
+/// takes no write.
+pub async fn reasoning_indexes_survive_drop_and_restore<S: crate::NameServicePublisher>(store: &S) {
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let doc = sample_heads(1, 3);
+    store
+        .push_reasoning_indexes_fenced("mydb:main", created.fence, 0, &doc)
+        .await
+        .unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.entry.reasoning_indexes.get("main"), Some(&doc));
+    assert!(store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .is_none());
+
+    let restored = lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let fence = restored[0].fence;
+    let back = store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.indexes, doc.indexes);
+    assert_fenced(
+        store
+            .push_reasoning_indexes_fenced(
+                "mydb:main",
+                created.fence,
+                back.v,
+                &sample_heads(back.v + 1, 4),
+            )
+            .await,
+        "push_reasoning_indexes with the fence from before the drop",
+    );
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, back.v, &sample_heads(back.v + 1, 4))
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Updated
+    );
+}
+
+/// A branch's reasoning-indexes document swaps on its version under the
+/// branch fence; a conflict carries the document as it stands, and commit
+/// and index publication leave it alone.
+pub async fn reasoning_indexes_swap_on_version<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::IndexRoot;
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence;
+    let unborn = store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unborn.v, 0);
+    assert!(unborn.indexes.is_empty());
+
+    let first = sample_heads(1, 1);
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 0, &first)
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Updated
+    );
+    // A writer that read v=0 loses, and is handed the current document.
+    let stale = sample_heads(1, 7);
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 0, &stale)
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Conflict {
+            actual: Some(first.clone())
+        }
+    );
+    // The version must advance.
+    assert!(matches!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 1, &sample_heads(1, 2))
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Conflict { .. }
+    ));
+
+    advance_commit(store, "mydb:main", fence, 1).await;
+    store
+        .publish_index_fenced(
+            "mydb:main",
+            WriteBasis::fenced(fence),
+            1,
+            &cid(IndexRoot, "i1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_reasoning_indexes("mydb:main").await.unwrap(),
+        Some(first.clone())
+    );
+
+    let second = sample_heads(2, 2);
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 1, &second)
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Updated
+    );
+    assert_eq!(
+        store.get_reasoning_indexes("mydb:main").await.unwrap(),
+        Some(second)
+    );
+    assert!(store
+        .get_reasoning_indexes("other:main")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Fields a later version wrote into a binding survive this version's
@@ -2006,6 +2491,10 @@ where
     create_claims_the_name(&make().await).await;
     drop_frees_the_name(&make().await).await;
     restore_reinstates_under_fresh_fences(&make().await).await;
+    restore_keeps_branch_configs(&make().await).await;
+    an_interrupted_restore_shows_no_branch_without_its_config(&make().await).await;
+    an_entry_without_configs_restores_with_none(&make().await).await;
+    a_thawed_record_takes_writes_again(&make().await).await;
     restore_into_a_taken_name_is_refused(&make().await).await;
     a_restore_an_older_records_blocks_is_undone(&make().await).await;
     hard_drop_purges(&make().await).await;
@@ -2048,7 +2537,21 @@ where
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
+    reasoning_indexes_swap_on_version(&make().await).await;
+    reasoning_indexes_survive_drop_and_restore(&make().await).await;
     a_ledger_drop_takes_a_legacy_branch_with_it(&make().await).await;
+}
+
+/// The writes a purge makes, which the backends it runs on support (file,
+/// memory, and the Raft nameservice, whose suite runs them itself).
+#[macro_export]
+macro_rules! purge_conformance_tests {
+    ($make:expr) => {
+        $crate::lifecycle_conformance_tests!(@cases $make;
+            a_frozen_branchs_index_head_clears,
+            a_graph_source_index_is_replaced_at_the_same_t,
+        );
+    };
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -2062,6 +2565,10 @@ macro_rules! lifecycle_conformance_tests {
             create_claims_the_name,
             drop_frees_the_name,
             restore_reinstates_under_fresh_fences,
+            restore_keeps_branch_configs,
+            an_interrupted_restore_shows_no_branch_without_its_config,
+            an_entry_without_configs_restores_with_none,
+            a_thawed_record_takes_writes_again,
             restore_into_a_taken_name_is_refused,
             a_restore_an_older_records_blocks_is_undone,
             hard_drop_purges,
@@ -2104,6 +2611,8 @@ macro_rules! lifecycle_conformance_tests {
             an_unmirrored_branch_with_children_is_kept,
             a_rerun_migration_binds_late_legacy_records,
             a_rerun_migration_keeps_a_stopped_branch_drop_dropped,
+            reasoning_indexes_swap_on_version,
+            reasoning_indexes_survive_drop_and_restore,
             a_ledger_drop_takes_a_legacy_branch_with_it,
         );
     };

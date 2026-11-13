@@ -27,6 +27,16 @@ Protect data at rest with AES-256-GCM encryption:
 - Portable ciphertext format
 - Key rotation support
 
+## Data Retention and Erasure
+
+Policies decide who may read data. These features decide how long it exists; they are documented with transactions:
+
+- [Time to live (TTL)](../transactions/ttl.md): values that expire on their own
+- [History retention](../transactions/history-retention.md): `f:noHistory`, and targeted removal of a value from everything the ledger serves, with [audit scopes](authentication.md#scope-claims) for the commit log
+- [Permanent erasure](../transactions/permanent-erasure.md): destroying data under a zero-knowledge proof, for a right-to-erasure request or a leaked secret
+
+[Data lifecycle](../concepts/data-lifecycle.md) explains how to choose, and what to set up ahead of time (opaque IRIs, [signed commits](commit-signing.md), [encryption at rest](encryption.md)) so an erasure is as strong as it can be.
+
 ## Commit Integrity
 
 ### [Commit Signing and Attestation](commit-signing.md)

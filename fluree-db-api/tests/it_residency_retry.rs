@@ -146,7 +146,7 @@ impl StorageRead for ResidencyStorage {
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
-        let hit = self.resident.read().get(&id.digest_hex()).cloned();
+        let hit = self.resident.read().get(&id.address_digest()).cloned();
         if hit.is_none() {
             self.misses.fetch_add(1, Ordering::Relaxed);
         }

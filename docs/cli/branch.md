@@ -216,6 +216,8 @@ Conflicts occur when both the branch and source have modified the same (subject,
 
 Each replayed commit is validated against the source branch's configuration (SHACL shapes, uniqueness constraints and the config-group checks), exactly as a transaction would be. A commit that conformed on the branch can violate a shape the source installed since the fork; the first such replay aborts the whole rebase with the same violation report a rejected transaction prints, naming the commit it stopped on, and the branch is left as it was.
 
+A rebase is refused when the branch has [removed an occurrence](../transactions/history-retention.md#limits) from one of the commits it would replay, since the replay would write the occurrence again in a new commit. Merge the source into the branch instead.
+
 **Examples:**
 
 ```bash

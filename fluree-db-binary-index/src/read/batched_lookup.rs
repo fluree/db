@@ -312,7 +312,7 @@ pub fn batched_lookup_subject_properties(
 /// range — true for SPOT-order leaflets (subject is the primary sort key),
 /// including time-travel replayed ones, and for PSOT batches after the
 /// cursor's `p_id` filter pinned the leading key.
-fn for_each_subject_run(
+pub fn for_each_subject_run(
     batch: &super::column_types::ColumnBatch,
     wanted: &[u64],
     mut visit: impl FnMut(u64, usize, &super::column_types::ColumnBatch),

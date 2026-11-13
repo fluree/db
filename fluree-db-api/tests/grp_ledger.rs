@@ -12,12 +12,16 @@ mod it_branch_shacl;
 mod it_branch_time_travel;
 #[path = "it_commit_contention.rs"]
 mod it_commit_contention;
+#[path = "it_content_hash.rs"]
+mod it_content_hash;
 #[path = "it_drop_ledger.rs"]
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
 #[path = "it_dropped_ledgers.rs"]
 mod it_dropped_ledgers;
+#[path = "it_garbage.rs"]
+mod it_garbage;
 #[path = "it_graph_drop.rs"]
 mod it_graph_drop;
 #[path = "it_graph_scoped_writes.rs"]

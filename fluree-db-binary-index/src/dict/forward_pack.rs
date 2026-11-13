@@ -768,6 +768,28 @@ pub fn pack_encoded_len_from_header(header_bytes: &[u8]) -> io::Result<u64> {
 /// strictly adjacent (`next.first_id == prev.last_id + 1`) so the result stays
 /// gap-free. Any violation is an error — a silently mismerged pack would
 /// corrupt ID resolution.
+/// Re-encode a pack with the values of `ids` emptied. Every id keeps its
+/// place, so nothing that refers to the others changes.
+pub fn blank_forward_entries(
+    pack_bytes: &[u8],
+    ids: &[u64],
+    target_page_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let pack = ForwardPack::from_bytes(pack_bytes)?;
+    let header = *pack.header();
+    let mut entries: Vec<(u64, &[u8])> = Vec::new();
+    if header.page_count > 0 {
+        entries.reserve((header.last_id - header.first_id + 1) as usize);
+        for id in header.first_id..=header.last_id {
+            let value = pack.lookup(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("pack has no id {id}"))
+            })?;
+            entries.push((id, if ids.contains(&id) { &[] } else { value }));
+        }
+    }
+    encode_forward_pack(&entries, header.kind, header.ns_code, target_page_bytes)
+}
+
 pub fn concat_forward_packs(packs: &[&[u8]]) -> io::Result<Vec<u8>> {
     if packs.len() < 2 {
         return Err(io::Error::new(
@@ -921,6 +943,19 @@ mod tests {
 
     fn as_refs(entries: &[(u64, Vec<u8>)]) -> Vec<(u64, &[u8])> {
         entries.iter().map(|(id, v)| (*id, v.as_slice())).collect()
+    }
+
+    #[test]
+    fn blanking_entries_keeps_every_other_id() {
+        let entries = make_entries(10, 100);
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 256).unwrap();
+        let blanked = blank_forward_entries(&bytes, &[42, 77], 256).unwrap();
+        let pack = ForwardPack::from_bytes(&blanked).unwrap();
+        for (id, value) in &entries {
+            let expected: &[u8] = if [42, 77].contains(id) { &[] } else { value };
+            assert_eq!(pack.lookup(*id), Some(expected), "{id}");
+        }
+        assert!(!blanked.windows(b"value_42".len()).any(|w| w == b"value_42"));
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub use binding::{
     check_write_fence, fence_admits, lookup_resolved, new_instance_id, read_all_resolved,
     read_resolved, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
     DroppedState, ExtraFields, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas,
-    Versioned,
+    Versioned, WriteBasis,
 };
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,
@@ -226,9 +226,23 @@ pub struct NsRecord {
     /// Set by a drop: the branch accepts no more writes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub frozen: bool,
+
+    /// The branch's erasure generation, as this node has installed it; see
+    /// [`WriteBasis`]. Always 0 outside a cluster.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub erasure_generation: u64,
+
+    /// Version of the runtime configuration, including the removal journal.
+    /// `Some(0)` is an unborn config; `None` is an older or unknown projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<i64>,
 }
 
 pub(crate) fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
@@ -252,6 +266,17 @@ impl NsRecord {
             storage_root: None,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
+            config_version: Some(0),
+        }
+    }
+
+    /// What a write made from this record presents.
+    pub fn write_basis(&self) -> WriteBasis {
+        WriteBasis {
+            fence: self.fence,
+            erasure_generation: self.erasure_generation,
+            source: None,
         }
     }
 
@@ -499,7 +524,14 @@ pub enum NsLookupResult {
 /// implement the lookup surface without claiming write capability.
 #[async_trait]
 pub trait NameServiceLookup:
-    GraphSourceLookup + RefLookup + StatusLookup + ConfigLookup + Debug + Send + Sync
+    GraphSourceLookup
+    + RefLookup
+    + StatusLookup
+    + ConfigLookup
+    + ReasoningIndexesLookup
+    + Debug
+    + Send
+    + Sync
 {
     /// Look up a ledger by its ledger ID (e.g. "mydb:main")
     ///
@@ -585,7 +617,7 @@ pub trait BranchLifecycle: Debug + Send + Sync {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()>;
 
@@ -662,7 +694,7 @@ pub trait CommitPublisher: Debug + Send + Sync {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()>;
@@ -700,7 +732,7 @@ pub trait IndexPublisher: Debug + Send + Sync {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
@@ -777,10 +809,20 @@ pub trait AdminPublisher: Publisher {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
+
+    /// Clear the index head of a frozen branch, whose index a purge has
+    /// released: nothing loads a frozen branch, and a head naming deleted
+    /// files would stop every index sweep of its ledger. `false`, changing
+    /// nothing, unless the branch is frozen.
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        Err(NameServiceError::storage(format!(
+            "clearing a frozen branch's index head is not supported here: {ledger_id}"
+        )))
+    }
 }
 
 /// Read-only graph source lookup trait.
@@ -838,12 +880,18 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     ///
     /// Config updates must NOT reset index watermark.
     /// Index updates must NOT rewrite config.
+    ///
+    /// `sources` names the erasure generation of each source ledger view
+    /// the index was built from (see [`WriteBasis`]); a cluster refuses an
+    /// index built from a view an erasure has since replaced. Other
+    /// backends keep no generations and ignore it.
     async fn publish_graph_source_index(
         &self,
         name: &str,
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()>;
 
     /// Retract a graph source
@@ -858,6 +906,25 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     /// it indexes a ledger that replaced the dropped one's. A live source is
     /// left as it is.
     async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()>;
+
+    /// [`Self::publish_graph_source_index`], also replacing a head at the same
+    /// `t`: an index rebuilt from the same state, as a purge rebuilds one
+    /// that held erased values. Never one at a lower `t`. `sources` as
+    /// there.
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        sources: &[(String, u64)],
+    ) -> Result<()> {
+        let _ = (index_id, index_t, sources);
+        Err(NameServiceError::storage(format!(
+            "replacing a graph source's index at the same t is not supported here: \
+             {name}:{branch}"
+        )))
+    }
 }
 
 /// Subscription scope for filtering nameservice events.
@@ -906,6 +973,11 @@ pub enum NameServiceEvent {
         commit_id: ContentId,
         commit_t: i64,
     },
+    /// Runtime configuration changed, even if the commit head did not.
+    LedgerConfigPublished {
+        ledger_id: LedgerId,
+        config_version: i64,
+    },
     /// A ledger index head was advanced.
     LedgerIndexPublished {
         ledger_id: LedgerId,
@@ -939,6 +1011,10 @@ pub enum NameServiceEvent {
         ledger_id: LedgerId,
         instance: InstanceId,
     },
+    /// A branch's stored history changed without its heads moving: a
+    /// permanent erasure published over its commits, or a purge rewrote its
+    /// index. A state cached of it is stale; consumers evict it.
+    LedgerRefresh { ledger_id: LedgerId },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
         graph_source_id: LedgerId,
@@ -1103,7 +1179,7 @@ pub trait RefPublisher: RefLookup {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1125,7 +1201,7 @@ pub trait RefPublisher: RefLookup {
     async fn fast_forward_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         new: &RefValue,
         max_retries: usize,
     ) -> Result<CasResult> {
@@ -1142,7 +1218,7 @@ pub trait RefPublisher: RefLookup {
             match self
                 .compare_and_set_ref_fenced(
                     ledger_id,
-                    fence,
+                    basis.clone(),
                     RefKind::CommitHead,
                     current.as_ref(),
                     new,
@@ -1450,6 +1526,67 @@ pub trait ConfigPublisher: ConfigLookup {
     ) -> Result<ConfigCasResult>;
 }
 
+// ---------------------------------------------------------------------------
+// Reasoning indexes
+// ---------------------------------------------------------------------------
+
+pub use fluree_db_core::reasoning_index::ReasoningIndexes;
+
+/// Result of a compare-and-swap on a branch's reasoning-indexes document.
+///
+/// A conflict is not an error: `actual` is the document as it stands (`None`
+/// when the branch record does not exist), and the caller rebuilds its
+/// update from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasoningIndexesCasResult {
+    Updated,
+    Conflict { actual: Option<ReasoningIndexes> },
+}
+
+/// Read access to each branch's reasoning-indexes document.
+#[async_trait]
+pub trait ReasoningIndexesLookup: Debug + Send + Sync {
+    /// The branch's document. `Some` with `v == 0` when the branch exists
+    /// but no index was ever registered; `None` when the branch record does
+    /// not exist (or is a tombstone).
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>>;
+}
+
+/// Compare-and-swap on a branch's reasoning-indexes document.
+///
+/// Backends check only the version and the fence: the update lands when the
+/// stored document's `v` equals `expected_v` and `new.v > expected_v`, and is
+/// refused with [`NameServiceError::Fenced`] unless the record carries
+/// `fence` and is not frozen. Publication rules (eligibility, basis,
+/// progress) run above the nameservice, in
+/// [`fluree_db_core::reasoning_index::admit`].
+#[async_trait]
+pub trait ReasoningIndexesPublisher: ReasoningIndexesLookup {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult>;
+
+    /// The largest reasoning-indexes document this store holds, in bytes of
+    /// its JSON; `None` for no limit. A larger push is refused before it
+    /// writes anything.
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize>;
+}
+
+/// The version check every backend applies to a reasoning-indexes push.
+pub(crate) fn reasoning_indexes_conflict(
+    current: &ReasoningIndexes,
+    expected_v: i64,
+    new: &ReasoningIndexes,
+) -> Option<ReasoningIndexesCasResult> {
+    (current.v != expected_v || new.v <= current.v).then(|| ReasoningIndexesCasResult::Conflict {
+        actual: Some(current.clone()),
+    })
+}
+
 /// A dynamically-dispatched nameservice with full read-write capability.
 ///
 /// This is the complete set of nameservice traits needed for full read-write
@@ -1466,6 +1603,7 @@ pub trait NameServicePublisher:
     + GraphSourcePublisher
     + StatusPublisher
     + ConfigPublisher
+    + ReasoningIndexesPublisher
     + LedgerRegistry
     + BranchRecordStore
 {
@@ -1478,6 +1616,7 @@ impl<T> NameServicePublisher for T where
         + GraphSourcePublisher
         + StatusPublisher
         + ConfigPublisher
+        + ReasoningIndexesPublisher
         + LedgerRegistry
         + BranchRecordStore
 {
@@ -1555,6 +1694,10 @@ where
         (**self).freeze_record(ledger_id, fence).await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         (**self).delete_record(ledger_id, fence).await
     }
@@ -1612,6 +1755,16 @@ where
 }
 
 #[async_trait]
+impl<T> ReasoningIndexesLookup for Arc<T>
+where
+    T: ReasoningIndexesLookup + ?Sized,
+{
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>> {
+        (**self).get_reasoning_indexes(ledger_id).await
+    }
+}
+
+#[async_trait]
 impl<T> NameServiceLookup for Arc<T>
 where
     T: NameServiceLookup + ?Sized,
@@ -1641,10 +1794,10 @@ where
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
-        (**self).reset_head_fenced(ledger_id, fence, snapshot).await
+        (**self).reset_head_fenced(ledger_id, basis, snapshot).await
     }
 
     async fn pending_commit_cids(
@@ -1668,12 +1821,12 @@ where
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, basis, commit_t, commit_id)
             .await
     }
 
@@ -1690,12 +1843,12 @@ where
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_fenced(ledger_id, basis, index_t, index_id)
             .await
     }
 }
@@ -1708,13 +1861,17 @@ where
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, basis, index_t, index_id)
             .await
+    }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        (**self).clear_frozen_index(ledger_id).await
     }
 }
 
@@ -1726,13 +1883,13 @@ where
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         (**self)
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, expected, new)
             .await
     }
 }
@@ -1761,9 +1918,10 @@ where
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         (**self)
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await
     }
 
@@ -1773,6 +1931,19 @@ where
 
     async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
         (**self).reset_graph_source_index(name, branch).await
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        sources: &[(String, u64)],
+    ) -> Result<()> {
+        (**self)
+            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t, sources)
+            .await
     }
 }
 
@@ -1791,6 +1962,28 @@ where
         (**self)
             .push_status_fenced(ledger_id, fence, expected, new)
             .await
+    }
+}
+
+#[async_trait]
+impl<T> ReasoningIndexesPublisher for Arc<T>
+where
+    T: ReasoningIndexesPublisher + ?Sized,
+{
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult> {
+        (**self)
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        (**self).max_reasoning_indexes_bytes()
     }
 }
 
@@ -2076,6 +2269,12 @@ mod tests {
     #[async_trait]
     impl ConfigLookup for RefOnlyNs {
         async fn get_config(&self, _: &str) -> Result<Option<ConfigValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl ReasoningIndexesLookup for RefOnlyNs {
+        async fn get_reasoning_indexes(&self, _: &str) -> Result<Option<ReasoningIndexes>> {
             Ok(None)
         }
     }

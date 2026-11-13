@@ -665,6 +665,14 @@ pub struct Query {
 }
 
 impl Query {
+    /// Whether the query was lowered from Cypher. Its expressions read a
+    /// node's properties as they are evaluated (`properties(n)`, `keys(n)`,
+    /// a member of a list element), and its typed results hydrate the nodes
+    /// they return: reads no pattern states.
+    pub fn lowered_from_cypher(&self) -> bool {
+        self.unmatched_optional == crate::binding::UnmatchedOptional::Poisoned
+    }
+
     /// Create a new query with default Wildcard output.
     pub fn new(context: ParsedContext) -> Self {
         Self {

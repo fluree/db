@@ -98,6 +98,7 @@ impl BrowserPeer {
         );
         let sink = PeerHeadSink {
             fluree: self.fluree.clone(),
+            cas: self.cas.clone(),
             registry: Arc::clone(&self.heads),
             ledgers: ledgers
                 .iter()
@@ -299,6 +300,48 @@ mod tests {
             assert!(headers.contains(&("accept", "text/event-stream".to_string())));
             assert!(headers.contains(&("authorization", "Bearer tok".to_string())));
         }
+
+        tracker.stop();
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump must stop")
+            .unwrap();
+        peer.shutdown();
+        driver.await.unwrap();
+    }
+
+    /// A refresh from the server drops the blocks the peer holds, the
+    /// persistent cache among them: they are cached under CIDs that a change
+    /// in place (an erasure, a purge) leaves as they were.
+    #[tokio::test]
+    async fn a_refresh_drops_the_blocks_held() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let frame = "event: ns-refresh\ndata: {\"action\":\"ns-refresh\",\"kind\":\"ledger\",\"resource_id\":\"books:main\",\"erasures\":\"g2\",\"emitted_at\":\"now\"}\n\n";
+        {
+            let mut s = state.lock().unwrap();
+            s.sse_script.push_back(vec![frame.as_bytes().to_vec()]);
+            s.cache.insert("held".to_string(), vec![1, 2, 3]);
+        }
+        let (io, rx) = IoHandle::channel();
+        let driver = spawn_mock_driver(rx, Arc::clone(&state));
+        let config = BrowserIoConfig {
+            reconnect_initial: Duration::from_millis(5),
+            reconnect_max: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let peer = build_peer(io, API_BASE, "tok", &config);
+        let (tracker, future) = peer.head_stream(&["books:main".to_string()]);
+        let pump = tokio::spawn(future);
+
+        let cleared = async {
+            while state.lock().unwrap().clears == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), cleared)
+            .await
+            .expect("the refresh must clear the cache");
+        assert!(state.lock().unwrap().cache.is_empty());
 
         tracker.stop();
         tokio::time::timeout(Duration::from_secs(2), pump)

@@ -29,6 +29,7 @@
 //! peer side: bootstrap, then the existing leader's operator hits
 //! `POST /cluster/add-learner` referencing this node.
 
+use crate::raft::erasure::ErasureNode;
 use crate::raft::{
     admin as raft_admin,
     forward::LeaderForwarder,
@@ -109,6 +110,9 @@ pub struct RaftIntegration {
     /// through `Fluree`, the worker supervisor, and the inbound
     /// `apply_staged_commit` HTTP route on `raft_rpc_router`.
     nameservice: Arc<RaftNameService>,
+    /// What this node has installed of the erasure activations; see
+    /// [`crate::raft::erasure`].
+    pub erasure: Arc<ErasureNode>,
     /// One-shot slot holding the [`ReleaseReceiver`] half of the
     /// adapter's CAS release channel. Server startup
     /// [`take_release_receiver`](Self::take_release_receiver)s the
@@ -177,6 +181,7 @@ impl RaftIntegration {
         channels: AdapterChannels,
         transport: HttpTransport,
         release_rx: ReleaseReceiver,
+        erasure: Arc<ErasureNode>,
     ) -> Self {
         let AdapterChannels {
             event_bus,
@@ -195,7 +200,8 @@ impl RaftIntegration {
         let nameservice = Arc::new(
             RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
                 .with_staged_receipts(Arc::clone(&staged_receipts))
-                .with_forwarding(id, http_client, network_config.cross_node_propose_timeout),
+                .with_forwarding(id, http_client, network_config.cross_node_propose_timeout)
+                .with_erasure_node(Arc::clone(&erasure)),
         );
         Self {
             raft,
@@ -207,6 +213,7 @@ impl RaftIntegration {
             staged_receipts,
             network_config,
             nameservice,
+            erasure,
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
             ledger_manager,
             adoption: None,
@@ -251,7 +258,9 @@ impl RaftIntegration {
                 registry_root: root.clone(),
                 marker: config.storage_path.join("file-registry-adopted"),
             });
+        let storage_root = config.storage_path.clone();
         let storage = Arc::new(FsRaftStorage::open(config.storage_path).await?);
+        let erasure = Arc::new(ErasureNode::open(config.node_id, &storage_root)?);
 
         let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
         let waiter_map = Arc::new(WaiterMap::new());
@@ -267,7 +276,8 @@ impl RaftIntegration {
             .with_event_bus(Arc::clone(&event_bus))
             .with_waiter_map(Arc::clone(&waiter_map))
             .with_staged_receipts(Arc::clone(&staged_receipts))
-            .with_release_sender(release_tx);
+            .with_release_sender(release_tx)
+            .with_erasure_node(Arc::clone(&erasure));
         // Taken before the observer is handed off; server assembly
         // fills it once `Fluree` exists.
         let ledger_manager = observer.ledger_manager_cell();
@@ -307,6 +317,7 @@ impl RaftIntegration {
                 config: network_config,
             },
             release_rx,
+            erasure,
         );
         integration.adoption = adoption;
         Ok(integration)
@@ -332,6 +343,17 @@ impl RaftIntegration {
             .merge(apply_queue_poison_router(
                 Arc::clone(&self.nameservice),
                 &self.network_config,
+            ))
+            .merge(crate::raft::nameservice::erasure_report_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+            .merge(crate::raft::nameservice::collect_spare_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+            .merge(crate::raft::nameservice::read_index::read_index_router(
+                Arc::clone(&self.nameservice),
             ))
     }
 
@@ -712,6 +734,10 @@ pub enum RaftBootstrapError {
     /// surfaced during initial state load.
     #[error("raft startup: {0}")]
     RaftStart(#[from] RaftFatal<NodeId>),
+    /// Reading or creating the node's erasure storage incarnation in the
+    /// raft storage root failed.
+    #[error("erasure storage incarnation: {0}")]
+    ErasureIncarnation(#[from] std::io::Error),
 }
 
 /// Failures out of [`RaftIntegration::adopt_file_registry`].

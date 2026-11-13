@@ -145,9 +145,9 @@ pub struct StagedRebase {
     pub branch_id: LedgerId,
     /// Where the branch's artifacts live.
     pub branch_namespace: StorageNamespace,
-    /// The fence the branch's record carried when the rebase was prepared,
+    /// What the branch's record presented when the rebase was prepared,
     /// which its head publish presents.
-    pub branch_fence: Option<fluree_db_nameservice::Fence>,
+    pub branch_basis: fluree_db_nameservice::WriteBasis,
     /// Source branch name (without ledger prefix).
     pub source: String,
     /// Fully-qualified source id.
@@ -208,6 +208,14 @@ pub struct StagedRebase {
     /// content-addressed objects but aren't on the active head
     /// chain until that single advance commits.
     pub pending_replays: Vec<PendingReplay>,
+    /// The branch's commits the replays replace, unreferenced once the
+    /// advance commits.
+    pub superseded: Vec<ContentId>,
+    /// The source's index as copied into the branch's namespace, or `None`
+    /// when the source has none or the copy failed. After a rebase that
+    /// replays commits it replaces the branch's own index, which indexes
+    /// the line the replay replaces.
+    pub source_index: Option<(ContentId, i64)>,
 }
 
 /// Built-but-unwritten replay commit. Carried inside
@@ -250,9 +258,13 @@ impl crate::Fluree {
             let staged = self.prepare_rebase(ledger_name, branch, strategy).await?;
             let branch_id = staged.branch_id.clone();
             let rollback_snapshot = staged.rollback_snapshot.clone();
-            let branch_fence = staged.branch_fence;
+            let branch_basis = staged.branch_basis.clone();
 
-            match self.apply_rebase(staged).await {
+            // Held past a rollback: until the head is back on the line the
+            // rebase replaced, a collection pass would find that line's
+            // commits named by nothing.
+            let mut pins = Vec::new();
+            match self.apply_rebase(staged, &mut pins).await {
                 Ok(report) => Ok(report),
                 Err(e) => {
                     tracing::warn!(
@@ -262,7 +274,7 @@ impl crate::Fluree {
                     );
                     if let Err(rollback_err) = self
                         .branch_admin()?
-                        .reset_head_fenced(&branch_id, branch_fence, rollback_snapshot)
+                        .reset_head_fenced(&branch_id, branch_basis, rollback_snapshot)
                         .await
                     {
                         tracing::error!(
@@ -372,6 +384,15 @@ impl crate::Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         let source_name_owned = source_name.to_string();
 
+        self.refuse_replaying_removed(&branch_record, source_name, &diff.source.commits)
+            .await?;
+
+        // The branch takes on the source's history, with its lifetimes and
+        // what it removed: it is registered for retention as the source is,
+        // from the source's boundary where earlier, before it holds them.
+        self.register_retention_as(&source_id, &branch_id).await?;
+        self.take_removals(&source_record, &branch_id).await?;
+
         // Fast-forward: the branch has no commits of its own to replay.
         let is_fast_forward = diff.source.commits.is_empty();
         if !is_fast_forward {
@@ -381,18 +402,20 @@ impl crate::Fluree {
         if is_fast_forward {
             // Copy the source index into the branch namespace
             // (best-effort, matches local single-node behavior).
-            self.copy_source_index(
-                &source_id,
-                &branch_id,
-                &branch_namespace,
-                branch_record.fence,
-                &source_record,
-            )
-            .await;
+            let source_index = self
+                .copy_source_index(
+                    &source_id,
+                    &branch_id,
+                    &branch_namespace,
+                    branch_record.write_basis(),
+                    &source_record,
+                )
+                .await;
 
             // Load the source's state under the branch's id so the
             // post-apply cache reflects the fast-forwarded branch.
             let mut final_state = self.ledger(&source_id).await?;
+            let branch_basis = rebased_basis(&branch_record, &source_record, &final_state)?;
             std::sync::Arc::make_mut(&mut final_state.snapshot).ledger_id = branch_id.clone();
 
             let write_guard = self.lock_ledger(&branch_id).await?;
@@ -401,7 +424,7 @@ impl crate::Fluree {
                 branch: branch.to_string(),
                 branch_id,
                 branch_namespace,
-                branch_fence: branch_record.fence,
+                branch_basis,
                 source: source_name_owned,
                 source_id,
                 source_head_id: source_head_id.clone(),
@@ -419,6 +442,8 @@ impl crate::Fluree {
                 write_guard,
                 final_state,
                 pending_replays: Vec::new(),
+                superseded: Vec::new(),
+                source_index,
             });
         }
 
@@ -426,6 +451,7 @@ impl crate::Fluree {
         // the branch; both sides' keys and flakes name the config graph as
         // it does.
         let mut current_state = self.ledger(&source_id).await?;
+        let branch_basis = rebased_basis(&branch_record, &source_record, &current_state)?;
         std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
         let mut config = ConfigGraphs::for_target(&current_state);
 
@@ -470,6 +496,10 @@ impl crate::Fluree {
         let mut skipped = 0;
         let mut replayed = 0;
         let mut pending_replays: Vec<PendingReplay> = Vec::new();
+        // Whether a replay's values may carry a lifetime from a property
+        // policy, besides one its own commit gives them.
+        let retention = self.retention_registered(&source_id).await?
+            || self.retention_registered(&branch_id).await?;
 
         for summary in &summaries {
             let has_conflicts = !summary.conflict_keys.is_empty();
@@ -516,7 +546,7 @@ impl crate::Fluree {
             }
 
             let staged = self
-                .build_replay_commit(current_state, flakes, &commit)
+                .build_replay_commit(current_state, flakes, &commit, retention)
                 .await?;
             let commit_id = staged
                 .commit
@@ -560,14 +590,15 @@ impl crate::Fluree {
         // source's index and its own commits dropped out of every read.
         // Replay itself reads the source's state, never the copied index,
         // so nothing above needs this to have happened. Best-effort.
-        self.copy_source_index(
-            &source_id,
-            &branch_id,
-            &branch_namespace,
-            branch_record.fence,
-            &source_record,
-        )
-        .await;
+        let source_index = self
+            .copy_source_index(
+                &source_id,
+                &branch_id,
+                &branch_namespace,
+                branch_record.write_basis(),
+                &source_record,
+            )
+            .await;
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
@@ -576,7 +607,7 @@ impl crate::Fluree {
             branch: branch.to_string(),
             branch_id,
             branch_namespace,
-            branch_fence: branch_record.fence,
+            branch_basis,
             source: source_name_owned,
             source_id,
             source_head_id,
@@ -594,7 +625,48 @@ impl crate::Fluree {
             write_guard,
             final_state: current_state,
             pending_replays,
+            superseded: diff.source.commits.clone(),
+            source_index,
         })
+    }
+
+    /// Pin the planned replays and the line they replace, with its
+    /// transactions, and record them as garbage. The pins hold until the
+    /// rebase ends, a rollback of it included, so no collection pass
+    /// decides on them meanwhile.
+    async fn record_rebase(
+        &self,
+        namespace: &StorageNamespace,
+        replays: &[PendingReplay],
+        superseded: &[ContentId],
+    ) -> Result<Vec<fluree_db_core::BlobPin>> {
+        let Some(pinner) = self.blob_pinner(namespace) else {
+            return Ok(Vec::new());
+        };
+        let store = self.content_store(namespace);
+        let mut ids: Vec<ContentId> = replays.iter().map(|r| r.commit_id.clone()).collect();
+        for id in superseded {
+            ids.push(id.clone());
+            match fluree_db_core::load_commit_envelope_by_id(store.as_ref(), id).await {
+                Ok(envelope) => ids.extend(envelope.txn),
+                Err(fluree_db_core::Error::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut pins = Vec::with_capacity(ids.len());
+        for id in &ids {
+            pins.push(pinner.pin(id).await);
+        }
+        #[cfg(feature = "native")]
+        {
+            let blobs: Vec<crate::garbage::Blob> = ids
+                .into_iter()
+                .map(|id| crate::garbage::Blob::new(namespace.clone(), id))
+                .collect();
+            self.record_garbage(&blobs, crate::garbage::GarbageReason::Rebase)
+                .await?;
+        }
+        Ok(pins)
     }
 
     /// Apply a [`StagedRebase`] through the local commit pipeline:
@@ -604,14 +676,20 @@ impl crate::Fluree {
     /// against concurrent transactions via the held write guard.
     ///
     /// All-or-nothing: if the blob write or publish fails, nothing
-    /// is on the active head chain. Orphan blobs in the content
-    /// store are GC fodder later.
-    async fn apply_rebase(&self, staged: StagedRebase) -> Result<RebaseReport> {
+    /// is on the active head chain. Before writing, the replays and
+    /// the line they replace (with its transactions) are pinned and
+    /// recorded as garbage: the collector deletes whichever side the
+    /// branch no longer references once the pins go.
+    async fn apply_rebase(
+        &self,
+        staged: StagedRebase,
+        pins: &mut Vec<fluree_db_core::BlobPin>,
+    ) -> Result<RebaseReport> {
         let StagedRebase {
             branch: _,
             branch_id,
             branch_namespace,
-            branch_fence,
+            branch_basis,
             source: _,
             source_id: _,
             source_head_id,
@@ -629,9 +707,14 @@ impl crate::Fluree {
             write_guard,
             final_state,
             pending_replays,
+            superseded,
+            source_index,
         } = staged;
 
         if let Some(ref last_head_id) = new_head_id {
+            *pins = self
+                .record_rebase(&branch_namespace, &pending_replays, &superseded)
+                .await?;
             if !pending_replays.is_empty() {
                 let content_store = self.content_store(&branch_namespace);
                 for blob in &pending_replays {
@@ -644,8 +727,17 @@ impl crate::Fluree {
                 }
             }
             self.publisher()?
-                .publish_commit_fenced(&branch_id, branch_fence, new_head_t, last_head_id)
+                .publish_commit_fenced(&branch_id, branch_basis.clone(), new_head_t, last_head_id)
                 .await?;
+            if !fast_forward {
+                self.replace_rebased_index(
+                    &branch_id,
+                    branch_basis,
+                    (last_head_id, new_head_t),
+                    source_index,
+                )
+                .await?;
+            }
         }
 
         // No cache detach here (unlike merge/revert's `apply_staged_detached`):
@@ -697,6 +789,7 @@ impl crate::Fluree {
         state: LedgerState,
         flakes: Vec<Flake>,
         original_commit: &Commit,
+        retention: bool,
     ) -> Result<StagedCommit> {
         // A commit written before the staging fix can hold a retraction and
         // an assertion of one fact at one `t`. The pair means the fact holds,
@@ -707,7 +800,7 @@ impl crate::Fluree {
         // source installed since the fork. Each replay is validated against
         // the state it lands on; the first violation aborts the whole rebase,
         // which has published nothing yet, naming the commit it stopped on.
-        let (view, outcome) = self
+        let (mut view, outcome) = self
             .stage_validated(
                 state,
                 flakes,
@@ -716,6 +809,11 @@ impl crate::Fluree {
                 "rebase",
             )
             .await?;
+        // The replay keeps the original's lifetimes, counted from when the
+        // original was written: its transaction default, and the start.
+        for entry in crate::retention::replayed_lifetimes(original_commit, retention) {
+            view.push_system_txn_meta(entry);
+        }
         outcome.into_result_with(|report| {
             format!(
                 "replaying commit t={} was refused:\n{report}",
@@ -739,7 +837,7 @@ impl crate::Fluree {
             None,
             None,
             &self.index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await?;
 
@@ -874,39 +972,110 @@ impl crate::Fluree {
         Ok(retractions)
     }
 
-    /// Copy index artifacts from source to branch (best-effort).
+    /// Copy index artifacts from source to branch (best-effort), and
+    /// publish them on the branch where newer than its own. The index now in
+    /// the branch's namespace, if any. The caller has given the branch the
+    /// source's retention registration.
     async fn copy_source_index(
         &self,
         source_id: &str,
         branch_id: &str,
         branch: &StorageNamespace,
-        branch_fence: Option<fluree_db_nameservice::Fence>,
+        branch_basis: fluree_db_nameservice::WriteBasis,
         source_record: &fluree_db_nameservice::NsRecord,
-    ) {
-        if let Some(ref index_cid) = source_record.index_head_id {
-            if let Err(e) = self
-                .copy_index_to_branch(source_id, branch, index_cid)
+    ) -> Option<(ContentId, i64)> {
+        let index_cid = source_record.index_head_id.as_ref()?;
+        if let Err(e) = self
+            .copy_index_to_branch(source_id, branch, index_cid)
+            .await
+        {
+            tracing::warn!(
+                %e, source = %source_id, branch = %branch_id,
+                "failed to copy index during rebase; branch will replay from genesis"
+            );
+            return None;
+        }
+        if let Some(publisher) = self.nameservice_mode.publisher() {
+            // The index is the source's: published only if no erasure
+            // has reached the source since its record was read.
+            let basis = branch_basis.with_source(source_record, source_record.erasure_generation);
+            if let Err(e) = publisher
+                .publish_index_fenced(branch_id, basis, source_record.index_t, index_cid)
                 .await
             {
-                tracing::warn!(
-                    %e, source = %source_id, branch = %branch_id,
-                    "failed to copy index during rebase; branch will replay from genesis"
-                );
-            } else if let Some(publisher) = self.nameservice_mode.publisher() {
-                if let Err(e) = publisher
-                    .publish_index_fenced(branch_id, branch_fence, source_record.index_t, index_cid)
-                    .await
-                {
-                    tracing::warn!(%e, "failed to publish index for rebased branch");
-                }
+                tracing::warn!(%e, "failed to publish index for rebased branch");
             }
         }
+        Some((index_cid.clone(), source_record.index_t))
+    }
+
+    /// After a rebase that replayed commits moved the branch to `head`,
+    /// reset its index to the source's, or to none. The copy published the
+    /// source's only where newer than the branch's own, and the branch's
+    /// own indexes the line the replay replaced, so it goes whatever its
+    /// `t`. The source's is taken only while no erasure has reached the
+    /// source since the rebase read it (`basis`); otherwise the branch
+    /// reads from its commits until its next build.
+    async fn replace_rebased_index(
+        &self,
+        branch_id: &LedgerId,
+        basis: fluree_db_nameservice::WriteBasis,
+        head: (&ContentId, i64),
+        source_index: Option<(ContentId, i64)>,
+    ) -> Result<()> {
+        let source_unerased = match &basis.source {
+            Some((source_id, generation)) => self
+                .nameservice()
+                .lookup(source_id)
+                .await?
+                .is_some_and(|r| r.erasure_generation == *generation),
+            None => true,
+        };
+        let (index_head_id, index_t) = source_index
+            .filter(|_| source_unerased)
+            .map_or((None, 0), |(id, t)| (Some(id), t));
+        self.branch_admin()?
+            .reset_head_fenced(
+                branch_id,
+                basis,
+                NsRecordSnapshot {
+                    commit_head_id: Some(head.0.clone()),
+                    commit_t: head.1,
+                    index_head_id,
+                    index_t,
+                },
+            )
+            .await?;
+        Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// What a rebase's head publish presents: the branch's record, and the
+/// source's, whose activation `source_state` was loaded at. A source
+/// dropped and made again, or erased, since its record was read is
+/// another activation than the plan was made from: retried.
+fn rebased_basis(
+    branch_record: &fluree_db_nameservice::NsRecord,
+    source_record: &fluree_db_nameservice::NsRecord,
+    source_state: &LedgerState,
+) -> Result<fluree_db_nameservice::WriteBasis> {
+    if crate::ledger_manager::other_activation(source_state.ns_record.as_ref(), source_record) {
+        return Err(ApiError::http(
+            409,
+            format!(
+                "{} changed while the rebase was prepared; retry it",
+                source_record.ledger_id
+            ),
+        ));
+    }
+    Ok(branch_record
+        .write_basis()
+        .with_source(source_record, source_record.erasure_generation))
+}
 
 /// Lightweight summary of a branch commit, collected during the scan pass.
 /// Holds only the CID, `t`, and pre-computed conflict keys — not the full

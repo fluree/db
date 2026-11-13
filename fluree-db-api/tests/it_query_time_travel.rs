@@ -41,7 +41,7 @@ async fn seed_time_travel_ledger(
         "@graph": [{"@id":"test:person1","@type":"Person","name":"Alice","age":30}]
     });
     let out1 = fluree.insert(ledger0, &tx1).await.expect("insert t=1");
-    let commit_hex_t1 = out1.receipt.commit_id.digest_hex();
+    let commit_hex_t1 = out1.receipt.commit_id.address_digest();
     let ledger1 = out1.ledger;
     let time_t1 = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     iso_by_t.insert(1, time_t1);

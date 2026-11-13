@@ -27,7 +27,7 @@ use axum::{
     Json,
 };
 use fluree_db_api::block_fetch::{self, BlockContent, EnforcementMode, LedgerBlockContext};
-use fluree_db_api::{verify_commit_blob, StorageMethod, StorageRead};
+use fluree_db_api::{StorageMethod, StorageRead};
 use fluree_db_core::flake::Flake;
 use fluree_db_core::ContentKind;
 use fluree_db_core::{ContentId, CODEC_FLUREE_COMMIT};
@@ -195,6 +195,8 @@ pub struct NsRecordResponse {
     pub retracted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<i64>,
     /// Parent branch this branch was forked from. `None` for the
     /// initial branch. Peers need it to build the branched content
     /// store that walks parent ancestry for commits inherited from
@@ -216,6 +218,10 @@ pub struct NsRecordResponse {
     /// compute) modes. Omitted when the posture could not be resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serving: Option<Vec<&'static str>>,
+    /// The ledger's retention activation and removal journal, for archives
+    /// built from this record. Omitted for a ledger without retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<serde_json::Value>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -292,6 +298,14 @@ pub async fn get_vended_credentials(
     if !serving.blocks {
         return Err(ServerError::not_found("Ledger not found"));
     }
+    // The grant reaches every branch's commits and transactions.
+    crate::routes::audit::require_audit_of_every_branch(
+        &state,
+        &axum::http::HeaderMap::new(),
+        effective_ledger.as_str(),
+        |branch| principal.can_audit(branch),
+    )
+    .await?;
 
     let grant = fluree_db_api::vended_credentials::mint_scoped_credentials_ambient(
         role_arn,
@@ -439,6 +453,69 @@ async fn resolve_block_ledger(
 // Handlers
 // ============================================================================
 
+/// GET /fluree/storage/config/{alias}: the ledger's config record, for a
+/// query peer's nameservice. Its retention journal arrives readable without
+/// this server's storage, so the peer refuses the history this ledger
+/// refuses. `null` for a ledger with no config record.
+pub async fn get_config_record(
+    State(state): State<Arc<AppState>>,
+    Path(ledger_id): Path<String>,
+    StorageProxyBearer(principal): StorageProxyBearer,
+    headers: HeaderMap,
+) -> Result<Response, ServerError> {
+    if !principal.is_authorized_for_ledger(&crate::error::scope_id(&ledger_id)?) {
+        return Err(ServerError::not_found("Ledger not found"));
+    }
+    // Use the locally replicated journal, once locally applied erasures
+    // are installed. Revalidation makes no leader round trip.
+    state.fluree.ensure_read_ready(&ledger_id).await?;
+    let record = state
+        .fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await
+        .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
+        .ok_or_else(|| ServerError::not_found("Ledger not found"))?;
+    // The record's version, and the branch's fence, which a ledger created
+    // again under the name does not share.
+    let version = state
+        .fluree
+        .nameservice()
+        .get_config(&ledger_id)
+        .await
+        .map_err(|e| ServerError::internal(format!("Config lookup failed: {e}")))?
+        .map_or(0, |config| config.v);
+    let fence = record
+        .fence
+        .map_or_else(String::new, |fence| fence.to_string());
+    let tag = format!("\"{fence}-{version}\"");
+    let tagged = |mut response: Response| {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&tag) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::ETAG, value);
+        }
+        response
+    };
+    if headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|held| held.to_str().ok())
+        == Some(tag.as_str())
+    {
+        return Ok(tagged(axum::response::IntoResponse::into_response(
+            StatusCode::NOT_MODIFIED,
+        )));
+    }
+    let config = state
+        .fluree
+        .config_for_reader(&ledger_id)
+        .await
+        .map_err(|e| ServerError::internal(format!("Config lookup failed: {e}")))?;
+    Ok(tagged(axum::response::IntoResponse::into_response(Json(
+        config,
+    ))))
+}
+
 /// GET /fluree/storage/ns/{alias}
 ///
 /// Returns the nameservice record for a ledger.
@@ -494,6 +571,7 @@ pub async fn get_ns_record(
             .as_ref()
             .map(std::string::ToString::to_string),
         commit_t: ns_record.commit_t,
+        config_version: ns_record.config_version,
         index_head_id: ns_record
             .index_head_id
             .as_ref()
@@ -512,6 +590,11 @@ pub async fn get_ns_record(
         branches: ns_record.branches,
         storage_root: ns_record.storage_root.clone(),
         serving,
+        retention: state
+            .fluree
+            .retention_section_for_reader(&ns_record)
+            .await
+            .map_err(ServerError::Api)?,
     };
     let body_bytes = serde_json::to_vec(&body).map_err(|e| ServerError::internal(e.to_string()))?;
 
@@ -630,6 +713,10 @@ pub async fn get_block(
     if !serving.blocks {
         return Err(ServerError::not_found("Block not found"));
     }
+    require_audit_of_kind(&state, kind, effective_ledger.as_str(), |branch| {
+        principal.can_audit(branch)
+    })
+    .await?;
     let ledger_ctx = LedgerBlockContext {
         snapshot: &snapshot.snapshot,
         to_t,
@@ -737,19 +824,16 @@ fn is_allowed_object_kind(kind: ContentKind) -> bool {
 /// Verify object bytes against a CID, with format-sniffing for commits.
 ///
 /// Commit blobs are sniffed by magic bytes rather than assuming a fixed format:
-/// - `FCV2` magic → commit v4 verification (SHA-256 of full blob)
-/// - Anything else → full-bytes SHA-256 (future commit formats, txn, config, etc.)
+/// - `FCV2` magic → the commit format's own hashing rules
+/// - Anything else → the full bytes (future commit formats, txn, config, etc.)
 fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
     const COMMIT_V2_MAGIC: &[u8] = b"FCV2";
 
     if id.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(COMMIT_V2_MAGIC) {
-        // Commit blob: CID = SHA-256(full blob).
-        match verify_commit_blob(bytes) {
-            Ok(derived_id) => derived_id == *id,
-            Err(_) => false,
-        }
+        fluree_db_core::commit::codec::commit_blob_matches(id, bytes)
     } else {
-        // All other kinds + future commit formats: full-bytes SHA-256.
+        // All other kinds + future commit formats: the full bytes, under the
+        // CID's own hash algorithm.
         id.verify(bytes)
     }
 }
@@ -838,6 +922,41 @@ pub async fn get_object_by_cid(
     if !serving.blocks {
         return Err(ServerError::not_found("Object not found"));
     }
+    require_audit_of_kind(&state, kind, effective_ledger.as_str(), |branch| {
+        principal.can_audit(branch)
+    })
+    .await?;
+
+    // 3c'. A permanently erased commit is answered with its erasure, which
+    //      can grow, so never revalidated against the CID; its transaction
+    //      document is not served.
+    match state
+        .fluree
+        .erased_object(effective_ledger.as_str(), &id)
+        .await
+        .map_err(ServerError::Api)?
+    {
+        Some(fluree_db_api::retention::erasure::ErasedObject::Chain(frames)) => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    fluree_db_core::pack::ERASURE_CONTENT_TYPE,
+                )
+                .header(
+                    "X-Fluree-Content-Kind",
+                    fluree_db_core::pack::ERASURE_CONTENT_KIND,
+                )
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(header::VARY, OBJECT_VARY)
+                .body(Body::from(frames))
+                .map_err(|e| ServerError::internal(e.to_string()));
+        }
+        Some(fluree_db_api::retention::erasure::ErasedObject::Withheld) => {
+            return Err(ServerError::not_found("Object not found"));
+        }
+        None => {}
+    }
 
     // 3d. Conditional GET: the CID is the entity tag (content-addressed, so
     //     the representation can never change under it). Checked only after
@@ -866,7 +985,7 @@ pub async fn get_object_by_cid(
         method,
         kind,
         &effective_record.storage_namespace(),
-        &id.digest_hex(),
+        &id.address_digest(),
     );
 
     let bytes = admin_storage
@@ -924,10 +1043,56 @@ pub async fn get_object_by_cid(
         .map_err(|e| ServerError::internal(e.to_string()))
 }
 
+/// Content that can hold what a ledger's history no longer serves:
+/// everything served but its config. Commits and transactions keep removed
+/// occurrences; an index built before a removal (its root, branch keys,
+/// leaves, history sidecars, spatial arenas and statistics) keeps removed
+/// values, and its dictionaries keep their strings until a purge.
+fn is_audit_kind(kind: ContentKind) -> bool {
+    !matches!(kind, ContentKind::LedgerConfig)
+}
+
+/// Check raw content against this node's journal and local installation gate.
+async fn require_audit_of_kind(
+    state: &AppState,
+    kind: ContentKind,
+    ledger: &str,
+    granted: impl Fn(&fluree_db_api::LedgerId) -> bool,
+) -> Result<(), ServerError> {
+    let headers = axum::http::HeaderMap::new();
+    if is_audit_kind(kind) {
+        crate::routes::audit::require_audit(state, &headers, ledger, granted).await
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fluree_db_core::DictKind;
+
+    /// On a ledger with a removal, every kind served but its config is audit
+    /// data.
+    #[test]
+    fn every_served_kind_but_config_is_audit_data() {
+        for kind in [
+            ContentKind::Commit,
+            ContentKind::Txn,
+            ContentKind::IndexRoot,
+            ContentKind::IndexBranch,
+            ContentKind::IndexLeaf,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            ContentKind::StatsSketch,
+            ContentKind::SpatialIndex,
+            ContentKind::HistorySidecar,
+        ] {
+            assert!(is_audit_kind(kind), "{kind:?}");
+        }
+        assert!(!is_audit_kind(ContentKind::LedgerConfig));
+    }
 
     /// Direct pin of the object-endpoint kind allowlist. The integration
     /// tests exercise the endpoint end-to-end, but a re-widened allowlist

@@ -30,7 +30,9 @@ when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
 
 Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes` incl. `multipart-put`, `direct_max_bytes`, multipart hints) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
 
-Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it.
+Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it. `"erasures": true` advertises that a push may carry [permanently erased](../transactions/permanent-erasure.md#pushes) commits (see `erasure_frames` below); a single server on file storage takes them. The CLI refuses to push erased history to a server that does not advertise it. `"retention": true` advertises that a push may carry the removal journal (see `retention` below), and need carry no commits; a cluster does not.
+
+Implementations MAY also return an `erasure` block. `"erasure": {"proving": true}` advertises that the server takes [permanent erasure](../transactions/permanent-erasure.md) requests and proves them.
 
 ### GET {api_base_url}/whoami
 
@@ -414,12 +416,17 @@ JSON object:
 - `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present). Provided blobs must hash-verify against their CID. A referenced txn blob that is *not* provided is accepted with a warning — the source may itself have a provenance gap (see `missing_blobs` on export), and the commit's flakes do not depend on it.
 - `missing_blobs` (optional): array of CID strings the sender knows it cannot supply. Mirrors `missing_blobs` on the export response, so a sender declares a provenance gap instead of leaving the receiver to infer it from an absent `blobs` key. Undeclared gaps are still accepted today (a sender predating this field cannot declare one) but are logged at `warn` rather than `debug`.
 - `merged_commits`: must be absent or empty on this endpoint. A push that carries merged commits goes to [`POST /push-merges/*ledger`](#post-push-mergesledger). This endpoint refuses one with `400`.
+- `commit_ids` / `merged_commit_ids` (optional): the CIDs of `commits` / `merged_commits`, in order.
+- `erasure_frames` (optional): base64-encoded pack frames (erasure, authorization and erasure-artifact frames, as [`POST /pack`](#post-packledger) sends them) carrying [permanently erased](../transactions/permanent-erasure.md#pushes) commits. An erased commit among `commits` or `merged_commits` is sent as empty bytes, named in `commit_ids`, with its chain here; nothing of its original or its transaction document travels. Taking them needs the authority `POST /erase` needs.
+- `base_erasures` (optional): `{commit, digest, steps}` for each erased commit of the history the server already has. When the server holds the original of one but not its erasure (or a shorter chain), it answers `409` with a message that ends with `this server holds erased commits whose erasures it lacks: ` and a JSON array of their CIDs; the sender pushes their chains in `erasure_frames` (in pushes of no commits, keeping each request's chains in one), then the push again. A chain the server holds that differs from the listed digest is refused with another `409`.
+- `retention` (optional): the sender's retention section for the ledger, as a `.flpack` archive carries it. Its removals are merged into the server's journal; removals the server's journal lacks need the authority `POST /remove` needs. Its history rules are ignored: the server derives them from the config commits it holds.
+- A push with no `commits` (and no `merged_commits`) that carries `erasure_frames`, `base_erasures` or `retention` takes those for the history the ledger already has, and answers with `accepted: 0` and the ledger's head.
 
 **Chain rules:**
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
+- A commit with no flakes is rejected unless it is a merge commit, drops graphs, records transaction metadata (an erasure's authorization), or is erased. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops; an erasure may remove every operation of a commit.
 - A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
 - A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
@@ -457,8 +464,9 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
-- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy
-- `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy; or the push carries erasures, or removals the server's journal lacks, without the authority to make them
+- `409 Conflict`: head changed / diverged / first commit `t` did not match next-t; or the server asks for the erasures of commits it already has (see `base_erasures`)
+- `501 Not Implemented`: the push carries erased commits, which this server cannot store (memory or S3 storage, a cluster)
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
 - `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
 
@@ -1070,9 +1078,13 @@ The server verifies the hash of the stored bytes against the CID before returnin
 
 If verification fails, the server returns `500 Internal Server Error` — this indicates storage corruption.
 
+**Erased commits:**
+
+A [permanently erased](../transactions/permanent-erasure.md#object-requests) commit is answered with its erasure instead of its bytes: `200 OK` with `X-Fluree-Content-Kind: erasure`, `Content-Type: application/x-fluree-erasure` and `Cache-Control: no-store`. The body is pack frames without a preamble: the ledger's retention section as a `phase: "retention"` manifest, then the commit's chain with its latest replacement, receipts and authorizations, as [`POST /pack`](#post-packledger) sends them. The answer is never `304`, since an erasure can gain steps. The transaction document of an erased commit answers `404`.
+
 **Status Codes:**
 
-- `200 OK`: Object found and integrity verified
+- `200 OK`: Object found and integrity verified, or an erased commit's erasure
 - `400 Bad Request`: Invalid CID string
 - `404 Not Found`: Object not found, disallowed kind, not authorized, or storage proxy disabled
 - `500 Internal Server Error`: Hash verification failed (storage corruption)
@@ -3032,6 +3044,46 @@ curl "http://localhost:8090/v1/fluree/info/mydb:main" \
   -H "Authorization: Bearer eyJ..."
 ```
 
+### GET /retention/{ledger-id}
+
+A branch's [TTL](../transactions/ttl.md) retention status: whether it is registered for expiration processing, the commit its retention input is honored from, how far the worker has read its commits, scheduled and expired counts, the next due time, and problems that block or degrade processing.
+
+**URL:**
+```
+GET /retention/{ledger-id}
+```
+
+**Response:**
+
+```json
+{
+  "ledgerId": "mydb:main",
+  "active": true,
+  "registration": {
+    "activeSinceT": 12,
+    "watermarkT": 40,
+    "schedule": "bafy...",
+    "nextDueMs": 1792584000000,
+    "pending": 18,
+    "lastPassMs": 1792580412000,
+    "expiredTotal": 351,
+    "retries": 2
+  },
+  "maintenanceRunning": true,
+  "overdue": 0,
+  "removals": 0
+}
+```
+
+`active` is `false` (and `registration` absent) for a ledger that never wrote a lifetime or configured one. `maintenanceRunning` and `overdue` describe the node that answers: in a cluster, ask the leader.
+
+A ledger with [history retention](../transactions/history-retention.md#status) also reports `registration.journal`: its `f:noHistory` rules and removals, never the removed values. `removals` counts the journal's removals. The removals themselves, and each [erasure](../transactions/permanent-erasure.md#status) job's requester, commits, properties and last error, are audit data: they are shown only to a token with the `fluree.ledger.audit.*` permission for the ledger. Other readers get the counts, stages and timings.
+
+**Status Codes:**
+- `200 OK` - Ledger found
+- `401 Unauthorized` - Authentication required
+- `404 Not Found` - Ledger not found
+
 ### GET /exists/{ledger-id}
 
 Check if a ledger exists in the nameservice.
@@ -3178,7 +3230,8 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 |-------|-------------|
 | `ns-record` | A ledger or graph source was created, restored or updated. A ledger's record carries its `instance` |
 | `ns-retracted` | A ledger or graph source was dropped. A ledger's retraction carries the `instance` it belonged to when known |
-| `snapshot-complete` | The snapshot sent on connecting is complete; live events follow. A resource in scope it did not name was dropped |
+| `ns-refresh` | A ledger's stored history changed without its heads moving (a permanent erasure published, or a purge rewrote its index): a state cached of it is stale. Carries `erasures`, the server's erasure generation |
+| `snapshot-complete` | The snapshot sent on connecting is complete; live events follow. A resource in scope it did not name was dropped. Carries `erasures` when the server holds erasures: one other than last seen means a refresh was missed |
 
 **Authentication:** Configurable via `--events-auth-mode none|optional|required`. See [Query peers and replication](../operations/query-peers.md) for full details including auth configuration, event payloads, and peer subscription setup.
 
@@ -4023,6 +4076,102 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 
 When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
 
+### POST /remove/{ledger-id}
+
+Remove selected occurrences of facts from what a ledger serves, now and in history. See [History retention](../transactions/history-retention.md#targeted-removal). Admin-protected; the admin token's identity is recorded with each removal (`requester` in the journal, which only auditors see). In a cluster the request is forwarded to the leader.
+
+**URL:**
+```
+POST /remove/{ledger-id}
+```
+
+**Request Body:**
+
+```json
+{
+  "matching": [
+    {
+      "subject": "https://example.org/alice",
+      "predicate": "https://example.org/email",
+      "object": "alice@old.example"
+    }
+  ],
+  "occurrences": [{ "commit": "bafy...", "slot": 3 }]
+}
+```
+
+Either list may be empty. `matching[].graph` names a graph (absent for the default graph). `matching[].object` takes a JSON string (an `xsd:string`), number (under any numeric datatype) or boolean, `{"@id": ...}` for a reference, or a value object with `@type` (an absolute datatype IRI, `@json`, or an `xsd:` or `rdf:` compact IRI; selectors take no `@context`) or `@language`; it selects every value when absent. A removal cannot be undone, so a body with a field the server does not know, or a `null` object, is refused with `400` rather than read as "every value".
+
+**Response:**
+
+```json
+{
+  "requestId": "removal-5d1e...",
+  "scopeT": 41,
+  "manifest": [{ "commit": "bafy...", "slot": 3 }],
+  "retractedT": 42,
+  "generation": 4
+}
+```
+
+`retractedT` is the commit that retracted occurrences still current, if any. In a cluster, `unacknowledgedReplicas` lists replicas that had not applied the removal when the request returned.
+
+**Status Codes:**
+- `200 OK` - Removed
+- `401 Unauthorized` - Admin token required
+- `404 Not Found` - Ledger not found, or nothing in its history matches the request
+
+### POST /erase/{ledger-id}
+
+Permanently erase selected occurrences from the commits that hold them, under a zero-knowledge proof. See [Permanent erasure](../transactions/permanent-erasure.md). Admin-protected; the admin token's identity is recorded as the requester. In a cluster the request is forwarded to the leader.
+
+**URL:**
+```
+POST /erase/{ledger-id}
+```
+
+**Request Body:**
+
+```json
+{
+  "matching": [
+    {
+      "subject": "https://example.org/alice",
+      "predicate": "https://example.org/email",
+      "object": "alice@example.org"
+    }
+  ],
+  "occurrences": [{ "commit": "bafy...", "slot": 3 }],
+  "signatures": "verify"
+}
+```
+
+`matching` and `occurrences` select occurrences as `POST /remove/{ledger-id}` does. `signatures` is `verify` (the default: the proof verifies a signed commit's signatures) or `expose` (faster for signed commits, at a privacy cost; see [Signatures](../transactions/permanent-erasure.md#signatures)).
+
+**Response:**
+
+```json
+{
+  "requestId": "erasure-3f1c...",
+  "manifest": [{ "commit": "bafy...", "slot": 4 }, { "commit": "bafy...", "slot": 0 }],
+  "commits": 2,
+  "authorizedT": 43,
+  "stage": "proving",
+  "removals": [{ "ledgerId": "people:main", "removal": { "requestId": "removal-...", "...": "..." } }]
+}
+```
+
+The request returns once the occurrences are removed from what every branch serves and the job is recorded; proving and publishing run in the background. Follow the job in `GET /retention/{ledger-id}`. Repeating a request returns the same job.
+
+**Status Codes:**
+- `200 OK` - Accepted (or already accepted)
+- `400 Bad Request` - A malformed selector or commit id
+- `401 Unauthorized` - Admin token required
+- `404 Not Found` - Ledger not found, or nothing in its history matches the request
+- `409 Conflict` - A triple term on a ledger holding the commits spells an erased fact, or branches kept being created while the request was accepted (retry)
+- `422 Unprocessable Entity` - An affected commit cannot be erased: not a v4 SHA2-256 commit, or more than 50,000 operations. The occurrences are still removed from what the ledger serves.
+- `501 Not Implemented` - Erasure is unavailable here: memory or S3 storage, a query peer, no prover of this release, or erasure disabled
+
 ### POST /sweep
 
 Reclaim index artifacts that no index chain references. Admin-protected — requires the admin Bearer token when admin auth is enabled.
@@ -4124,6 +4273,71 @@ POST /sweep/plan
 | `orphans` | Every address that would be released, in full, so the set can be audited before running the destructive form |
 
 From the CLI, use `fluree sweep <ledger> --dry-run`.
+
+### Reasoning indexes
+
+Register a reasoning program on a branch and maintain its
+[reasoning index](../query/materialized-reasoning.md). All four routes take a
+JSON body, are admin-protected, and run where the ledger's writes do: a peer
+forwards them to the transaction server.
+
+| Route | Body | Does |
+|-------|------|------|
+| `POST /reasoning-indexes/register` | `{"ledger", "program"}` | Registers `program` (the reasoning keys a query would carry, plus an optional `graph`) and returns its `indexId`. A program the branch already has an active index for returns that index. Builds nothing. |
+| `POST /reasoning-indexes/refresh` | `{"ledger", "indexId"?}` | Brings the index, or every active index of the branch, to the branch's current commit, and deletes the files of indexes retired longer ago than the retention window. |
+| `POST /reasoning-indexes/list` | `{"ledger"}` | Returns the branch's indexes: each registration, its state and its published head. |
+| `POST /reasoning-indexes/retire` | `{"ledger", "indexId"}` | Stops the index from being served or refreshed. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/reasoning-indexes/register \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main", "program": {"reasoning": "owl2rl"}}'
+# => {"ledger": "mydb:main", "indexId": "01JC..."}
+
+curl -X POST http://localhost:8090/v1/fluree/reasoning-indexes/refresh \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main"}'
+```
+
+A refresh answers with one result per index, each naming what it did in
+`outcome`:
+
+```json
+{
+  "ledger": "mydb:main",
+  "results": [
+    {
+      "indexId": "01JC...",
+      "outcome": "published",
+      "generation": 1,
+      "kind": "rebuild",
+      "basisT": 12,
+      "stats": {"derivedOnly": 4, "derivedTotal": 4, "added": 4, "removed": 0, "closure": "full"}
+    }
+  ]
+}
+```
+
+The other outcomes are `current`, `failed`, `discarded`, `throttled`,
+`deferred`, `inFlight` and `newerEngine`; see
+[Refreshing](../query/materialized-reasoning.md#refreshing). A refresh that
+publishes nothing is still a `200`: read `outcome`.
+
+`list` adds `maintenanceFailures`, keyed by index id: the reason, attempt
+count, failure time and retry time of each refresh this server last failed.
+
+**Status Codes:**
+- `200 OK` — the request ran; for a refresh, see each result's `outcome`
+- `400 Bad Request` — invalid JSON, a malformed `indexId`, or a program that does not validate
+- `401/403` — admin auth required
+- `404 Not Found` — the ledger, or the index, does not exist
+
+From the CLI, [`fluree reasoning-indexes`](../cli/reasoning-indexes.md) does
+the same.
 
 ### POST /export/*ledger
 

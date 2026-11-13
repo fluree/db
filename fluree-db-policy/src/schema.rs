@@ -86,16 +86,15 @@ pub fn is_schema_flake(predicate: &Sid, object: &FlakeValue) -> bool {
 /// Predicate-axis subset of [`is_schema_flake`]: predicates that can make a
 /// flake a schema flake irrespective of its object.
 ///
-/// Used by [`PolicySet::covers_predicate`](crate::PolicySet::covers_predicate)
-/// so schema predicates are always reported as "covered" — keeping them on the
-/// per-flake path where the [`is_schema_flake`] bypass fires, instead of being
-/// constant-folded to an empty result under a default-deny policy.
+/// A scan of a predicate no restriction covers may be folded to empty under a
+/// deny default; a schema predicate's may not, since the [`is_schema_flake`]
+/// bypass keeps its schema flakes visible. Under an allow default the fold
+/// returns every flake, schema or not, so no exemption is needed there.
 ///
 /// `rdf:type`'s schema-ness depends on the object (only schema class/property
 /// objects qualify), but a query planner sees only the predicate, so `rdf:type`
-/// is treated as a schema predicate here. This is the safe over-covering
-/// direction: it forgoes the fast-path skip for `rdf:type` scans rather than
-/// risk constant-folding a genuine schema type-assertion.
+/// is treated as a schema predicate here: a deny default never folds an
+/// `rdf:type` scan, rather than risk hiding a genuine schema type-assertion.
 pub fn is_schema_predicate(predicate: &Sid) -> bool {
     is_rdfs_subclass_of(predicate)
         || is_rdfs_subproperty_of(predicate)

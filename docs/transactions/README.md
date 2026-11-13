@@ -52,6 +52,33 @@ Removing data from the database:
 - Retraction semantics
 - Time travel and retractions
 
+## Data Lifecycle
+
+A retraction removes a value from current state and keeps it in history. These features change how long a value lives; see [Data lifecycle](../concepts/data-lifecycle.md) for how to choose between them.
+
+### [Time to live (TTL)](ttl.md)
+
+Values that retract themselves:
+- `@ttl` and `@expiresAt` on a value, in JSON-LD, SPARQL, Turtle and Cypher
+- A default lifetime for a transaction or a predicate
+- Renewing and cancelling
+- How expiration runs, and its status endpoint
+
+### [History retention](history-retention.md)
+
+Control what history the ledger serves:
+- `f:noHistory`: keep only a predicate's current values in the index
+- Targeted removal: stop serving selected values, now and in history
+- Audit access to the commit log after a removal
+
+### [Permanent erasure](permanent-erasure.md)
+
+Destroy selected values under a zero-knowledge proof:
+- Requesting an erasure and following its job
+- The purge of original commits and derived copies
+- Clusters, archives, clones, pulls and pushes
+- What erasure does not guarantee
+
 ## Transaction Formats
 
 ### [Turtle Ingest](turtle.md)
@@ -106,6 +133,8 @@ Once committed, transactions are immutable:
 - Historical data is never modified
 - Complete audit trail preserved
 - Time travel enabled by immutability
+
+Nothing a transaction does changes history. The exceptions are deliberate and administrative: a [history rule or targeted removal](history-retention.md) limits what history is served, and a [permanent erasure](permanent-erasure.md) replaces a commit with a redacted copy that is proved to differ from the original only by the erased operations.
 
 ### Atomicity
 
@@ -362,5 +391,6 @@ Track transaction metrics:
 
 - [Getting Started: Write Data](../getting-started/quickstart-write.md) - Quickstart guide
 - [Concepts: Time Travel](../concepts/time-travel.md) - Temporal semantics
+- [Concepts: Data Lifecycle](../concepts/data-lifecycle.md) - Expiry, history retention and erasure
 - [API: POST /update](../api/endpoints.md#post-update) - HTTP endpoint details
 - [Indexing](../indexing-and-search/README.md) - Indexing and search

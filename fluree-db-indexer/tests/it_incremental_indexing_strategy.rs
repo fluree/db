@@ -87,6 +87,7 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
         leaflet_target_rows: 50, // avoid splits in this test
         leaf_target_rows: 200,   // irrelevant unless split
         collect_matched: false,
+        history_drop: None,
     };
 
     let fetched: std::cell::RefCell<Vec<ContentId>> = std::cell::RefCell::new(Vec::new());
@@ -158,7 +159,7 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
     assert!(hdr.total_rows >= 6, "expected row count to increase");
 
     // Sanity: branch CID matches the encoded bytes.
-    let expected_branch_cid = ContentId::from_hex_digest(
+    let expected_branch_cid = ContentId::from_address_digest(
         CODEC_FLUREE_INDEX_BRANCH,
         &fluree_db_core::sha256_hex(&update.branch_bytes),
     )
@@ -178,7 +179,7 @@ fn forward_dict_incremental_appends_new_packs_and_reuses_existing_refs() {
         PackBranchEntry {
             first_id: 0,
             last_id: 9,
-            pack_cid: ContentId::from_hex_digest(
+            pack_cid: ContentId::from_address_digest(
                 CODEC_FLUREE_DICT_BLOB,
                 &fluree_db_core::sha256_hex(b"pack0"),
             )
@@ -187,7 +188,7 @@ fn forward_dict_incremental_appends_new_packs_and_reuses_existing_refs() {
         PackBranchEntry {
             first_id: 10,
             last_id: 19,
-            pack_cid: ContentId::from_hex_digest(
+            pack_cid: ContentId::from_address_digest(
                 CODEC_FLUREE_DICT_BLOB,
                 &fluree_db_core::sha256_hex(b"pack1"),
             )

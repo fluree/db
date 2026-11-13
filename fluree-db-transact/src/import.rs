@@ -1054,6 +1054,9 @@ mod inner {
         } else {
             Vec::new()
         };
+        for entry in &txn_meta {
+            crate::ttl_input::refuse_imported_lifetime(entry.predicate_ns, &entry.predicate_name)?;
+        }
 
         // 6. Build envelope
         let ns_delta = state.ns_registry.take_delta();
@@ -1577,7 +1580,9 @@ mod inner {
         // always enforces. The bare `reifies` token covers both forms.
         let needs_lowering = jsonld.contains("@annotation")
             || jsonld.contains("@edge")
-            || jsonld.contains("@reifies");
+            || jsonld.contains("@reifies")
+            || jsonld.contains("@ttl")
+            || jsonld.contains("@expiresAt");
         if needs_lowering || jsonld.contains("reifies") {
             let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
             crate::parse::edge_annotations::run_user_authored_reifies_firewall(&doc, &top_ctx)?;

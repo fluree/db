@@ -41,8 +41,10 @@ pub mod model;
 pub mod multi_query;
 pub mod ontology;
 pub mod prefix;
+pub mod prover;
 pub mod query;
 pub mod query_stream;
+pub mod reasoning_indexes;
 pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;

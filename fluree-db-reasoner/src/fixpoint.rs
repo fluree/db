@@ -12,6 +12,7 @@ use fluree_db_core::clock::Instant;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::range::{RangeMatch, RangeTest};
+use fluree_db_core::RangeOptions;
 use fluree_db_core::{GraphDbRef, Sid};
 use fluree_vocab::jsonld_names::ID as JSONLD_ID;
 use fluree_vocab::namespaces::{JSON_LD, RDF};
@@ -28,7 +29,7 @@ use crate::execute::{
     fire_inverse, fire_range, fire_some_values_from, fire_some_values_from_filler,
     fire_some_values_from_inverse, fire_sub_property, fire_subclass, fire_symmetric,
     fire_transitive, fire_union_member, DeltaSet, DerivedSet, IdentityRuleContext,
-    IdentityRuleState, RuleContext,
+    IdentityRuleState, Known, OnDemand, ReadCache, ReadKey, RuleContext,
 };
 use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
@@ -48,57 +49,110 @@ pub async fn run_fixpoint(
     db: GraphDbRef<'_>,
     opts: &ReasoningOptions,
 ) -> Result<(Vec<Flake>, FrozenSameAs, ReasoningDiagnostics)> {
+    Ok(run(db, db, opts, None)
+        .await?
+        .expect("a full run always completes or caps"))
+}
+
+/// Maintain a closure under insertions: `db` holds a closed state (a
+/// previous closure's asserted and derived facts) plus `inserted`, the facts
+/// asserted since. `asserted` is the assertion-only view at the same commit,
+/// including any external schema, from which rule definitions are read.
+/// Returns only what the closure gains.
+///
+/// Every rule fires from a delta fact in each of its premise positions and
+/// joins the rest against everything known, so seeding the delta with just
+/// the insertions, against the closed state, finds every new derivation. The
+/// closed state is read on demand, as the delta's joins need it
+/// ([`run_on_demand`]).
+///
+/// `None` when the run cannot maintain the closure: the identity rules
+/// (`prp-fp`, `prp-ifp`, `prp-key`, `cls-maxc2`, `cls-maxqc`) group facts
+/// across rounds, `owl:sameAs` canonicalization rewrites facts already
+/// derived, and a run that outgrows [`crate::MaintenanceBounds`] stops. Callers then
+/// compute the closure in full.
+pub async fn run_fixpoint_incremental(
+    db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
+    inserted: &[Flake],
+    opts: &ReasoningOptions,
+) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
+    let start = Instant::now();
+    let out = run(db, asserted, opts, Some(inserted)).await?;
+    tracing::debug!(
+        returned_ms = start.elapsed().as_millis() as u64,
+        "OWL 2 RL incremental fixpoint returned"
+    );
+    Ok(out.map(|(flakes, _, diagnostics)| (flakes, diagnostics)))
+}
+
+/// Whether the program has a rule that derives `owl:sameAs`.
+fn uses_identity_rules(ontology: &OntologyRL, restrictions: &RestrictionIndex) -> bool {
+    !ontology.functional_properties().is_empty()
+        || !ontology.inverse_functional_properties().is_empty()
+        || ontology.classes_with_keys().next().is_some()
+        || restrictions.iter().any(|r| {
+            matches!(
+                r.restriction_type,
+                crate::restrictions::RestrictionType::MaxCardinality1 { .. }
+                    | crate::restrictions::RestrictionType::MaxQualifiedCardinality1 { .. }
+            )
+        })
+}
+
+async fn run(
+    db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
+    opts: &ReasoningOptions,
+    inserted: Option<&[Flake]>,
+) -> Result<Option<(Vec<Flake>, FrozenSameAs, ReasoningDiagnostics)>> {
     let budget = &opts.budget;
     let start = Instant::now();
     let mut diagnostics = ReasoningDiagnostics::default();
 
     // Extract OWL2-RL ontology (symmetric, transitive, inverse properties)
-    let ontology = OntologyRL::from_db_with_overlay(db).await?;
+    let ontology = OntologyRL::from_db_with_overlay(asserted).await?;
 
     // Extract OWL restrictions (hasValue, someValuesFrom, etc.)
-    let restrictions = extract_restrictions(db).await?;
+    let restrictions = extract_restrictions(asserted).await?;
 
     // Load sameAs assertions BEFORE checking if we have work to do
     // sameAs can exist even without symmetric/transitive/inverse declarations
     let mut same_as_tracker = SameAsTracker::new();
-    let same_as_pairs = load_same_as_assertions(db).await?;
+    let same_as_pairs = load_same_as_assertions(asserted).await?;
     let has_same_as = !same_as_pairs.is_empty();
+    if inserted.is_some() && (has_same_as || uses_identity_rules(&ontology, &restrictions)) {
+        return Ok(None);
+    }
     for (x, y) in &same_as_pairs {
         same_as_tracker.union(x, y);
     }
 
     // If no property rules, no restrictions, AND no sameAs assertions, no reasoning needed
     if ontology.is_empty() && restrictions.is_empty() && !has_same_as {
-        return Ok((
+        return Ok(Some((
             Vec::new(),
             FrozenSameAs::empty(),
             ReasoningDiagnostics::completed(0, 0, start.elapsed()),
-        ));
+        )));
     }
 
-    // If only sameAs (no property rules and no restrictions), generate sameAs flakes and return
-    // This ensures owl:sameAs is queryable even without property rules
+    // Equality alone: no rounds, only the equality rules.
     if ontology.is_empty() && restrictions.is_empty() {
         let frozen_same_as = same_as_tracker.finalize();
-        // Generate explicit sameAs flakes from equivalence classes (eq-sym,
-        // eq-trans), excluding pairs already asserted in the base data — the
-        // database serves those itself.
-        let base_pairs: hashbrown::HashSet<&(Sid, Sid)> = same_as_pairs.iter().collect();
-        let same_as_flakes: Vec<Flake> = generate_same_as_flakes(&frozen_same_as, db.t)
-            .into_iter()
-            .filter(|f| match &f.o {
-                fluree_db_core::value::FlakeValue::Ref(o) => {
-                    !base_pairs.contains(&(f.s.clone(), o.clone()))
-                }
-                _ => true,
-            })
-            .collect();
-        let flake_count = same_as_flakes.len();
-        return Ok((
-            same_as_flakes,
+        let mut derived = DerivedSet::new();
+        let capped = apply_equality(db, &frozen_same_as, &mut derived, db.t, opts, &start).await?;
+        interrupted(opts)?;
+        let mut diagnostics =
+            ReasoningDiagnostics::completed(0, derived.derived_len(), start.elapsed());
+        if let Some(reason) = capped {
+            diagnostics.mark_capped(reason, 0, derived.derived_len(), start.elapsed());
+        }
+        return Ok(Some((
+            derived.into_derived_flakes(),
             frozen_same_as,
-            ReasoningDiagnostics::completed(0, flake_count, start.elapsed()),
-        ));
+            diagnostics,
+        )));
     }
 
     // Compile the active ontology into trigger-indexed ground rules (A1.2).
@@ -106,8 +160,25 @@ pub async fn run_fixpoint(
     // dispatches each delta fact straight to the rules it can fire.
     let compiled = compile(&ontology, &restrictions, opts);
 
+    if let Some(inserted) = inserted {
+        return Ok(run_on_demand(
+            db,
+            opts,
+            inserted,
+            &ontology,
+            &restrictions,
+            &compiled,
+            &same_as_tracker,
+            start,
+        )
+        .await?
+        .map(|(flakes, diagnostics)| (flakes, FrozenSameAs::empty(), diagnostics)));
+    }
+
     // Seed initial delta with all base facts for relevant predicates
+    let extracted_ms = start.elapsed().as_millis() as u64;
     let mut delta = seed_initial_delta(db, &ontology, &restrictions).await?;
+    let seeded_ms = start.elapsed().as_millis() as u64;
 
     // Accumulated derived facts
     let mut derived = DerivedSet::new();
@@ -121,6 +192,7 @@ pub async fn run_fixpoint(
     for flake in delta.iter() {
         derived.register_base(flake);
     }
+    let joined_ms = start.elapsed().as_millis() as u64;
 
     // owl:sameAs SID for rule application
     let owl_same_as_sid = owl::same_as_sid();
@@ -248,7 +320,7 @@ pub async fn run_fixpoint(
         // Non-identity rules: produce property/type facts (not sameAs).
         let mut ctx = RuleContext {
             delta: &delta,
-            derived: &derived,
+            derived: Known::Resident(&derived),
             new_delta: &mut new_delta,
             same_as: &same_as_tracker,
             rdf_type_sid: &rdf_type_sid,
@@ -281,9 +353,13 @@ pub async fn run_fixpoint(
                     }
                 }
             }
-            if let Some(reason) =
-                budget_exceeded_sampled(budget, &start, ctx.derived, ctx.new_delta, &mut ticks)
-            {
+            if let Some(reason) = budget_exceeded_sampled(
+                budget,
+                &start,
+                ctx.derived.derived(),
+                ctx.new_delta,
+                &mut ticks,
+            ) {
                 in_round_cap = Some(reason);
                 break;
             }
@@ -299,7 +375,9 @@ pub async fn run_fixpoint(
             let chains = ontology.property_chains();
             for chain_idx in compiled.triggered_chains(delta.predicates()) {
                 apply_single_property_chain(&chains[chain_idx], &mut ctx);
-                if let Some(reason) = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta) {
+                if let Some(reason) =
+                    budget_exceeded(budget, &start, ctx.derived.derived(), ctx.new_delta)
+                {
                     in_round_cap = Some(reason);
                     break;
                 }
@@ -310,7 +388,7 @@ pub async fn run_fixpoint(
         // trigger); the derived-set check keeps it idempotent per iteration.
         if in_round_cap.is_none() && compiled.one_of_active() {
             apply_one_of_rule(&restrictions, &mut ctx);
-            in_round_cap = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta);
+            in_round_cap = budget_exceeded(budget, &start, ctx.derived.derived(), ctx.new_delta);
         }
 
         // If sameAs changed this iteration, canonicalize both delta and
@@ -351,23 +429,410 @@ pub async fn run_fixpoint(
         }
     }
 
-    // Finalize sameAs
     let frozen_same_as = same_as_tracker.finalize();
-
-    // Generate explicit sameAs flakes from equivalence classes (eq-sym, eq-trans)
-    // This makes owl:sameAs queryable just like any other predicate.
-    // For each equivalence class, emit: canonical sameAs x, x sameAs canonical for all x
-    let same_as_flakes = generate_same_as_flakes(&frozen_same_as, reasoning_t);
-    for flake in same_as_flakes {
-        derived.try_add(flake);
+    if !diagnostics.capped {
+        if let Some(reason) =
+            apply_equality(db, &frozen_same_as, &mut derived, reasoning_t, opts, &start).await?
+        {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+        }
     }
 
+    // A run cancelled after its last sampled check is not complete.
+    interrupted(opts)?;
     // Update diagnostics if not already capped
     if !diagnostics.capped {
         diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
     }
+    let total_ms = start.elapsed().as_millis() as u64;
+    let derived_len = derived.derived_len();
+    let derived_flakes = derived.into_derived_flakes();
+    tracing::debug!(
+        extract_ms = extracted_ms,
+        seed_scan_ms = seeded_ms - extracted_ms,
+        join_index_ms = joined_ms - seeded_ms,
+        rounds_ms = total_ms - joined_ms,
+        convert_ms = start.elapsed().as_millis() as u64 - total_ms,
+        rounds = iterations,
+        derived = derived_len,
+        "OWL 2 RL fixpoint phases"
+    );
 
-    Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
+    Ok(Some((derived_flakes, frozen_same_as, diagnostics)))
+}
+
+/// A piece of a round's work that can be run again: a delta fact's
+/// dispatch, a triggered property chain, or `cls-oo`.
+#[derive(Clone, Copy)]
+enum Unit {
+    Fact(usize),
+    Chain(usize),
+    OneOf,
+}
+
+/// What an on-demand run read and held, for its log.
+#[derive(Default)]
+struct OnDemandStats {
+    stages: usize,
+    reads: usize,
+    facts_read: usize,
+    peak_working_bytes: usize,
+}
+
+/// Why an on-demand run stops before its fixpoint.
+enum Stop {
+    /// A budget of the program ran out: the run is capped, as a full one
+    /// would be.
+    Capped(&'static str),
+    /// The run outgrew [`crate::MaintenanceBounds`]: the caller computes the
+    /// closure in full.
+    Outgrown,
+}
+
+/// The limits an on-demand run checks between work units and reads.
+struct Limits<'a> {
+    opts: &'a ReasoningOptions,
+    start: Instant,
+}
+
+impl Limits<'_> {
+    /// Cancellation, then the program's budget over `derived` and the
+    /// round's `candidates`, then the working bound over `working` bytes.
+    fn check(
+        &self,
+        derived: &DerivedSet,
+        candidates: &DeltaSet,
+        working: usize,
+        stats: &mut OnDemandStats,
+    ) -> Result<Option<Stop>> {
+        interrupted(self.opts)?;
+        stats.peak_working_bytes = stats.peak_working_bytes.max(working);
+        if let Some(reason) = budget_exceeded(&self.opts.budget, &self.start, derived, candidates) {
+            return Ok(Some(Stop::Capped(reason)));
+        }
+        if working > self.opts.maintenance.working_bytes {
+            tracing::debug!(working, "on-demand closure outgrew its working bound");
+            return Ok(Some(Stop::Outgrown));
+        }
+        Ok(None)
+    }
+}
+
+/// Maintain a closed state under `inserted`, reading the state as the
+/// rules' joins need it.
+///
+/// Each round runs its work units against what is known: reads already
+/// fetched from `db`, combined with the facts derived this run. A unit whose
+/// lookup is not fetched yet is discarded, the missing reads are fetched in
+/// one batch, and the unit runs again, so a property chain learns each link's
+/// key from the read before. A candidate conclusion `db` already holds is
+/// known, not gained.
+///
+/// Between every unit and every read the run checks cancellation, the
+/// program's budget and the working bound, which counts the reads held, the
+/// facts derived, the round's candidates, its pending reads and a unit's
+/// output. A budget caps the run; outgrowing `opts.maintenance` returns
+/// `None`, and the caller computes the closure in full.
+#[allow(clippy::too_many_arguments)]
+async fn run_on_demand(
+    db: GraphDbRef<'_>,
+    opts: &ReasoningOptions,
+    inserted: &[Flake],
+    ontology: &OntologyRL,
+    restrictions: &RestrictionIndex,
+    compiled: &crate::compile::CompiledRules,
+    same_as: &SameAsTracker,
+    start: Instant,
+) -> Result<Option<(Vec<Flake>, ReasoningDiagnostics)>> {
+    let limits = Limits { opts, start };
+    let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
+    let chains = ontology.property_chains();
+    let mut diagnostics = ReasoningDiagnostics::default();
+    let mut stats = OnDemandStats::default();
+    let mut derived = DerivedSet::new();
+    let mut cache = ReadCache::default();
+    let extracted_ms = start.elapsed().as_millis() as u64;
+
+    // The insertions are in the closed state: known, and the first delta.
+    let mut delta = DeltaSet::with_capacity(inserted.len());
+    for flake in inserted {
+        derived.register_base(flake);
+        delta.push(flake.clone());
+    }
+
+    let mut iterations = 0;
+    let mut capped: Option<&'static str> = None;
+    'rounds: while !delta.is_empty() {
+        opts.tracker
+            .consume_fuel(delta.len() as u64 * PER_ROW_MICRO_FUEL)?;
+        iterations += 1;
+
+        let facts: Vec<&Flake> = delta.iter().collect();
+        let mut pending: Vec<Unit> = (0..facts.len()).map(Unit::Fact).collect();
+        pending.extend(
+            compiled
+                .triggered_chains(delta.predicates())
+                .into_iter()
+                .map(Unit::Chain),
+        );
+        if compiled.one_of_active() {
+            pending.push(Unit::OneOf);
+        }
+
+        let mut new_delta = DeltaSet::new();
+        while !pending.is_empty() {
+            stats.stages += 1;
+            let mut misses = Vec::new();
+            let mut missed_bytes = 0;
+            let mut again = Vec::new();
+            for unit in pending {
+                let working = cache.bytes()
+                    + derived.approx_bytes()
+                    + new_delta.approx_bytes()
+                    + missed_bytes;
+                match limits.check(&derived, &new_delta, working, &mut stats)? {
+                    Some(Stop::Capped(reason)) => {
+                        capped = Some(reason);
+                        break 'rounds;
+                    }
+                    Some(Stop::Outgrown) => return Ok(None),
+                    None => {}
+                }
+                let view = OnDemand::new(&derived, &cache);
+                let mut out = DeltaSet::new();
+                let mut fired = ReasoningDiagnostics::default();
+                {
+                    let mut ctx = RuleContext {
+                        delta: &delta,
+                        derived: Known::OnDemand(&view),
+                        new_delta: &mut out,
+                        same_as,
+                        rdf_type_sid: &rdf_type_sid,
+                        t: db.t,
+                        diagnostics: &mut fired,
+                    };
+                    match unit {
+                        Unit::Fact(i) => {
+                            fire_delta_fact(compiled, ontology, restrictions, facts[i], &mut ctx);
+                        }
+                        Unit::Chain(c) => apply_single_property_chain(&chains[c], &mut ctx),
+                        Unit::OneOf => apply_one_of_rule(restrictions, &mut ctx),
+                    }
+                }
+                if view.missed() {
+                    let unit_misses = view.into_misses();
+                    missed_bytes += unit_misses.iter().map(ReadKey::approx_bytes).sum::<usize>();
+                    misses.extend(unit_misses);
+                    again.push(unit);
+                } else {
+                    let working = cache.bytes()
+                        + derived.approx_bytes()
+                        + new_delta.approx_bytes()
+                        + out.approx_bytes()
+                        + missed_bytes;
+                    if working > opts.maintenance.working_bytes {
+                        tracing::debug!(working, "on-demand closure outgrew its working bound");
+                        return Ok(None);
+                    }
+                    for flake in out.iter() {
+                        new_delta.push(flake.clone());
+                    }
+                    for (rule, n) in fired.rules_fired {
+                        *diagnostics.rules_fired.entry(rule).or_default() += n;
+                    }
+                }
+            }
+            match fetch(
+                db,
+                misses,
+                &mut cache,
+                iterations,
+                &limits,
+                (&derived, &new_delta, missed_bytes),
+                &mut stats,
+            )
+            .await?
+            {
+                Some(Stop::Capped(reason)) => {
+                    capped = Some(reason);
+                    break 'rounds;
+                }
+                Some(Stop::Outgrown) => return Ok(None),
+                None => {}
+            }
+            pending = again;
+        }
+
+        // Exact membership: a candidate the closed state already holds is
+        // known, and its consequences are already in that state.
+        let wanted: Vec<ReadKey> = new_delta
+            .iter()
+            .filter(|f| !derived.contains(&f.s, &f.p, &f.o))
+            .map(|f| ReadKey::Ps(f.p.clone(), f.s.clone()))
+            .collect();
+        let wanted_bytes = wanted.iter().map(ReadKey::approx_bytes).sum();
+        match fetch(
+            db,
+            wanted,
+            &mut cache,
+            iterations,
+            &limits,
+            (&derived, &new_delta, wanted_bytes),
+            &mut stats,
+        )
+        .await?
+        {
+            Some(Stop::Capped(reason)) => {
+                capped = Some(reason);
+                break 'rounds;
+            }
+            Some(Stop::Outgrown) => return Ok(None),
+            None => {}
+        }
+        let mut next = DeltaSet::new();
+        for flake in new_delta.iter() {
+            if derived.contains(&flake.s, &flake.p, &flake.o) {
+                continue;
+            }
+            let o = DerivedSet::object_hash(&flake.o);
+            let held = cache
+                .get(&ReadKey::Ps(flake.p.clone(), flake.s.clone()))
+                .is_some_and(|facts| facts.iter().any(|f| DerivedSet::object_hash(&f.o) == o));
+            if held {
+                derived.register_base(flake);
+            } else if derived.try_add(flake.clone()) {
+                next.push(flake.clone());
+            }
+        }
+        delta = next;
+        cache.evict_to(opts.maintenance.cache_bytes);
+    }
+
+    // Reaching the fixpoint late is no completion.
+    if capped.is_none() {
+        let working = cache.bytes() + derived.approx_bytes();
+        match limits.check(&derived, &DeltaSet::new(), working, &mut stats)? {
+            Some(Stop::Capped(reason)) => capped = Some(reason),
+            Some(Stop::Outgrown) => return Ok(None),
+            None => {}
+        }
+    }
+    match capped {
+        Some(reason) => {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+        }
+        None => diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed()),
+    }
+    let rounds_ms = start.elapsed().as_millis() as u64 - extracted_ms;
+    let derived_len = derived.derived_len();
+    let flakes = derived.into_derived_flakes();
+    tracing::debug!(
+        extract_ms = extracted_ms,
+        rounds_ms,
+        rounds = iterations,
+        stages = stats.stages,
+        reads = stats.reads,
+        facts_read = stats.facts_read,
+        peak_working_bytes = stats.peak_working_bytes,
+        derived = derived_len,
+        capped = capped.unwrap_or(""),
+        "OWL 2 RL on-demand closure"
+    );
+    Ok(Some((flakes, diagnostics)))
+}
+
+/// Dispatch one delta fact to the compiled rules it can fire.
+fn fire_delta_fact(
+    compiled: &crate::compile::CompiledRules,
+    ontology: &OntologyRL,
+    restrictions: &RestrictionIndex,
+    flake: &Flake,
+    ctx: &mut RuleContext<'_>,
+) {
+    for rule in compiled.property_rules_for(&flake.p) {
+        fire_property_rule(rule, ontology, restrictions, flake, ctx);
+    }
+    if &flake.p == ctx.rdf_type_sid {
+        if let fluree_db_core::value::FlakeValue::Ref(class) = &flake.o {
+            for rule in compiled.class_rules_for(class) {
+                fire_class_rule(rule, ontology, restrictions, flake, class, ctx);
+            }
+        }
+    }
+}
+
+/// Read `keys` from the closed state into `cache`, each once. Before every
+/// read the run's limits are checked, counting the cache and `held`: the
+/// facts derived, the round's candidates and the bytes of pending reads. A
+/// read may return only as many facts as the working bound has room for,
+/// and one that would return more stops the run; no part of it is kept.
+async fn fetch(
+    db: GraphDbRef<'_>,
+    mut keys: Vec<ReadKey>,
+    cache: &mut ReadCache,
+    round: usize,
+    limits: &Limits<'_>,
+    held: (&DerivedSet, &DeltaSet, usize),
+    stats: &mut OnDemandStats,
+) -> Result<Option<Stop>> {
+    let (derived, candidates, pending_bytes) = held;
+    let bounds = &limits.opts.maintenance;
+    let other = derived.approx_bytes() + candidates.approx_bytes() + pending_bytes;
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        if cache.contains_key(&key) {
+            continue;
+        }
+        if let Some(stop) = limits.check(derived, candidates, cache.bytes() + other, stats)? {
+            return Ok(Some(stop));
+        }
+        let room = bounds
+            .working_bytes
+            .saturating_sub(cache.bytes() + other + key.approx_bytes());
+        let max_facts = bounds.read_facts.min(room / std::mem::size_of::<Flake>());
+        let (index, wanted) = match &key {
+            ReadKey::Ps(p, s) => (
+                IndexType::Spot,
+                RangeMatch::subject_predicate(s.clone(), p.clone()),
+            ),
+            ReadKey::Po(p, o) => (
+                IndexType::Post,
+                RangeMatch::predicate_object(
+                    p.clone(),
+                    fluree_db_core::value::FlakeValue::Ref(o.clone()),
+                ),
+            ),
+        };
+        let facts = db
+            .range_with_opts(
+                index,
+                RangeTest::Eq,
+                wanted,
+                RangeOptions::default().with_flake_limit(max_facts + 1),
+            )
+            .await?;
+        if facts.len() > max_facts {
+            tracing::debug!(?key, max_facts, "on-demand read larger than its room");
+            return Ok(Some(Stop::Outgrown));
+        }
+        let facts: Vec<Flake> = facts
+            .into_iter()
+            .filter(|f| {
+                f.op && match &key {
+                    ReadKey::Ps(p, s) => &f.p == p && &f.s == s,
+                    ReadKey::Po(p, o) => {
+                        &f.p == p
+                            && matches!(&f.o, fluree_db_core::value::FlakeValue::Ref(x) if x == o)
+                    }
+                }
+            })
+            .collect();
+        stats.reads += 1;
+        stats.facts_read += facts.len();
+        cache.insert(key, facts, round);
+    }
+    limits.check(derived, candidates, cache.bytes() + other, stats)
 }
 
 /// Fails the run once the request it serves has been cancelled. A cancelled
@@ -685,62 +1150,149 @@ async fn seed_initial_delta(
     Ok(delta)
 }
 
-/// Generate explicit owl:sameAs flakes from the equivalence classes.
+/// The equality rules over the final equality sets: every member gets every
+/// member's facts (eq-rep-s, eq-rep-o), and every ordered pair of members is
+/// `owl:sameAs` (eq-sym, eq-trans).
 ///
-/// For each equivalence class with members [a, b, c, ...], generates:
-/// - a sameAs b, a sameAs c, ... (from canonical to all others)
-/// - b sameAs a, c sameAs a, ... (from all others back to canonical)
+/// The rounds keep facts at a set's representative, so joins meet on one id,
+/// and they read only the predicates rules use. This copies every fact naming
+/// a member, asserted or derived, to every member. Equality between
+/// predicates (eq-rep-p) is not applied.
 ///
-/// This is O(2n) flakes per class instead of O(n²) for full pairwise.
-/// Transitivity allows queries to derive any pair: if a=b and a=c, then b=c.
-///
-/// Note: This also generates reflexive flakes (x sameAs x) for each element,
-/// which matches OWL2-RL semantics.
-fn generate_same_as_flakes(frozen: &FrozenSameAs, t: i64) -> Vec<Flake> {
+/// Returns the budget that stopped it, if one did.
+async fn apply_equality(
+    db: GraphDbRef<'_>,
+    same_as: &FrozenSameAs,
+    derived: &mut DerivedSet,
+    t: i64,
+    opts: &ReasoningOptions,
+    start: &Instant,
+) -> Result<Option<&'static str>> {
     use fluree_db_core::value::FlakeValue;
 
-    let owl_same_as_sid = owl::same_as_sid();
-    let ref_dt = Sid::new(JSON_LD, JSONLD_ID);
-
-    let mut flakes = Vec::new();
-
-    // For each equivalence class
-    for (_root, members) in frozen.members_iter() {
-        if members.len() <= 1 {
-            continue; // Skip singleton classes
+    let mut set_of: hashbrown::HashMap<Sid, &[Sid]> = hashbrown::HashMap::new();
+    for (_, members) in same_as.members_iter() {
+        if members.len() > 1 {
+            for member in members {
+                set_of.insert(member.clone(), members);
+            }
         }
+    }
+    if set_of.is_empty() {
+        return Ok(None);
+    }
+    let owl_same_as = owl::same_as_sid();
+    let ref_dt = Sid::new(JSON_LD, JSONLD_ID);
+    let no_delta = DeltaSet::new();
+    let mut ticks = 0u32;
 
-        let canonical = &members[0]; // Members are sorted, first is canonical
+    // Asserted facts naming a member are registered as base, so a copy that
+    // is itself asserted is not emitted.
+    let mut sources: Vec<Flake> = Vec::new();
+    for member in set_of.keys() {
+        interrupted(opts)?;
+        let by_subject = RangeMatch {
+            s: Some(member.clone()),
+            ..Default::default()
+        };
+        let by_object = RangeMatch {
+            o: Some(FlakeValue::Ref(member.clone())),
+            ..Default::default()
+        };
+        for (index, range) in [(IndexType::Spot, by_subject), (IndexType::Opst, by_object)] {
+            for flake in db.range(index, RangeTest::Eq, range).await? {
+                if flake.op {
+                    derived.register_base(&flake);
+                    sources.push(flake);
+                }
+            }
+        }
+    }
+    interrupted(opts)?;
+    let names_a_member = |f: &Flake| {
+        set_of.contains_key(&f.s) || matches!(&f.o, FlakeValue::Ref(o) if set_of.contains_key(o))
+    };
+    sources.extend(
+        derived
+            .derived_flakes()
+            .filter(|f| names_a_member(f))
+            .cloned(),
+    );
 
-        // Generate flakes: canonical sameAs x, x sameAs canonical for each x
-        for member in members {
-            if member != canonical {
-                // canonical sameAs member
-                flakes.push(Flake::new(
-                    canonical.clone(),
-                    owl_same_as_sid.clone(),
-                    FlakeValue::Ref(member.clone()),
+    for (_, members) in same_as.members_iter() {
+        if members.len() < 2 {
+            continue;
+        }
+        for x in members {
+            for y in members.iter().filter(|y| *y != x) {
+                derived.try_add(Flake::new(
+                    x.clone(),
+                    owl_same_as.clone(),
+                    FlakeValue::Ref(y.clone()),
                     ref_dt.clone(),
                     t,
                     true,
                     None,
                 ));
-
-                // member sameAs canonical (symmetry)
-                flakes.push(Flake::new(
-                    member.clone(),
-                    owl_same_as_sid.clone(),
-                    FlakeValue::Ref(canonical.clone()),
-                    ref_dt.clone(),
-                    t,
-                    true,
-                    None,
-                ));
+                if let Some(reason) = equality_limit(opts, start, derived, &no_delta, &mut ticks)? {
+                    return Ok(Some(reason));
+                }
             }
         }
     }
 
-    flakes
+    for flake in sources.iter().filter(|f| f.p != owl_same_as) {
+        let subjects = set_of
+            .get(&flake.s)
+            .copied()
+            .unwrap_or(std::slice::from_ref(&flake.s));
+        let objects: Vec<FlakeValue> = match &flake.o {
+            FlakeValue::Ref(o) => match set_of.get(o) {
+                Some(members) => members.iter().cloned().map(FlakeValue::Ref).collect(),
+                None => vec![flake.o.clone()],
+            },
+            o => vec![o.clone()],
+        };
+        for s in subjects {
+            for o in &objects {
+                if s != &flake.s || o != &flake.o {
+                    derived.try_add(Flake::new(
+                        s.clone(),
+                        flake.p.clone(),
+                        o.clone(),
+                        flake.dt.clone(),
+                        t,
+                        true,
+                        flake.m.clone(),
+                    ));
+                    if let Some(reason) =
+                        equality_limit(opts, start, derived, &no_delta, &mut ticks)?
+                    {
+                        return Ok(Some(reason));
+                    }
+                }
+            }
+        }
+    }
+    interrupted(opts)?;
+    Ok(None)
+}
+
+/// [`apply_equality`]'s check after each fact it adds: one pair of large
+/// sets multiplies a fact many times over, so a check per source fact can
+/// overshoot a budget by the product. Cancellation is sampled with the clock.
+fn equality_limit(
+    opts: &ReasoningOptions,
+    start: &Instant,
+    derived: &DerivedSet,
+    no_delta: &DeltaSet,
+    ticks: &mut u32,
+) -> Result<Option<&'static str>> {
+    let reason = budget_exceeded_sampled(&opts.budget, start, derived, no_delta, ticks);
+    if ticks.is_multiple_of(CLOCK_SAMPLE_INTERVAL) {
+        interrupted(opts)?;
+    }
+    Ok(reason)
 }
 
 #[cfg(test)]

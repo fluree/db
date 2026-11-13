@@ -48,6 +48,7 @@ use crate::raft::integration::{
 };
 use crate::raft::liveness_monitor::{LivenessConfig, LivenessMonitor};
 use crate::raft::queued_transactor::QueuedTransactor;
+use crate::raft::state_machine::RefKey;
 use crate::{CachingCommitter, SubmittingCommitter};
 use fluree_db_api::{Fluree, IndexConfig};
 use fluree_db_core::ContentId;
@@ -140,6 +141,8 @@ pub struct EmbeddedRaftNode {
     worker_supervisor: CancellableTaskHandle,
     leader_watcher: CancellableTaskHandle,
     release_task: Option<(JoinHandle<()>, CancellationToken)>,
+    erasure_installer: (JoinHandle<()>, CancellationToken),
+    collect_loader: Option<(JoinHandle<()>, CancellationToken)>,
 }
 
 impl EmbeddedRaftNode {
@@ -171,6 +174,10 @@ impl EmbeddedRaftNode {
         if let Some(manager) = fluree.ledger_manager() {
             integration.attach_ledger_manager(Arc::clone(manager));
         }
+        // Its garbage is collected through the cluster, by its leader: set
+        // before releases replayed at startup reach the release task, which
+        // then deletes nothing.
+        fluree.set_collector(integration.nameservice() as _);
 
         // `QueuedTransactor` routes all five `Committer` methods
         // through `EnqueueCommand` plus the per-process waiter and
@@ -198,6 +205,53 @@ impl EmbeddedRaftNode {
             .map(|rx| spawn_release_task(Arc::clone(&fluree), rx));
 
         let nameservice = integration.nameservice();
+        // A cluster writes and admits SHA2-256 only: another hash needs
+        // every member, present and future, to read it, which membership
+        // does not yet record or enforce.
+        if fluree.configured_content_hash() != fluree_db_core::HashAlgorithm::Sha2_256 {
+            tracing::warn!(
+                configured = %fluree.configured_content_hash(),
+                "cluster nodes mint SHA2-256 content IDs; the configured content hash is not used"
+            );
+        }
+        fluree.set_content_hash_readers_confirmed(false);
+        // Historical reads confirm this replica's removal journal is
+        // current, and that it has installed the erasures it has applied.
+        fluree.set_retention_replicas(Arc::new(
+            crate::raft::nameservice::read_index::RaftReplicaSync(Arc::clone(&nameservice)),
+        ));
+        // This member's publications of erasures activate through the
+        // cluster.
+        fluree.set_erasure_activator(Arc::clone(&nameservice) as _);
+        // As leader it has steps proved on other members; as a member it
+        // proves those its leader hands it.
+        fluree.set_proving_members(Arc::clone(&nameservice) as _);
+        nameservice.prove_with(&fluree);
+        let erasure_installer = {
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(crate::raft::erasure::run_installer(
+                Arc::clone(&integration.erasure),
+                integration.shared_state.clone(),
+                Arc::new(EngineInstall(Arc::clone(&fluree))),
+                Arc::clone(&nameservice),
+                cancel.clone(),
+            ));
+            (task, cancel)
+        };
+        // This member's writes check what the cluster's collection
+        // condemned, sparing through the leader.
+        let collect_loader = fluree.condemned().map(|condemned| {
+            condemned.activate(Arc::clone(&nameservice) as _);
+            nameservice.checks_writes_from_now();
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(crate::raft::collect::run_loader(
+                Arc::clone(&fluree),
+                condemned,
+                integration.shared_state.clone(),
+                cancel.clone(),
+            ));
+            (task, cancel)
+        });
         let commits: Arc<dyn CommitPublisher> = Arc::clone(&nameservice) as _;
         // Same Arc upcast again so a follower-owned worker can ferry a
         // deterministic poison to the leader rather than spin on
@@ -245,6 +299,8 @@ impl EmbeddedRaftNode {
             worker_supervisor,
             leader_watcher,
             release_task,
+            erasure_installer,
+            collect_loader,
         }
     }
 
@@ -257,6 +313,13 @@ impl EmbeddedRaftNode {
         // Then the leader tasks. Resolves only after each in-flight one
         // has been abort-and-awaited, not merely signalled.
         self.leader_watcher.shutdown().await;
+        let (installer, cancel) = self.erasure_installer;
+        cancel.cancel();
+        let _ = installer.await;
+        if let Some((loader, cancel)) = self.collect_loader {
+            cancel.cancel();
+            let _ = loader.await;
+        }
         // Then the core, so no further apply can push releases into the
         // channel the drain below is about to close. Bounded: a wedged
         // core must not hold the drain hostage.
@@ -279,6 +342,32 @@ impl EmbeddedRaftNode {
 
 /// The per-node release loop: frees envelope blobs the state machine
 /// has finished with, then drains what is still buffered at shutdown.
+/// Installs an erasure activation into this node's engine; see
+/// [`Fluree::install_erasures`].
+struct EngineInstall(Arc<Fluree>);
+
+#[async_trait::async_trait]
+impl crate::raft::erasure::ErasureInstall for EngineInstall {
+    async fn install(
+        &self,
+        _number: u64,
+        activation: &crate::raft::state_machine::Activation,
+    ) -> Result<(), String> {
+        let holders: Vec<String> = activation.holders.iter().map(RefKey::ledger_id).collect();
+        self.0
+            .install_erasures(&activation.manifest, &holders)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn clean(&self, holders: &[String]) -> Result<(), String> {
+        self.0
+            .clean_after_purge(holders)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 fn spawn_release_task(
     fluree: Arc<Fluree>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, ContentId)>,
@@ -311,7 +400,15 @@ fn spawn_release_task(
 /// idempotent, so retrying a transient failure is safe — and without
 /// it a single blip leaks the blob permanently, since nothing
 /// re-proposes a release.
+///
+/// Where the cluster collects, the envelope is left to its collection,
+/// which alone deletes blobs there: this node may apply the release late,
+/// or again when it replays its log. Reconciliation finds it once nothing
+/// names it.
 pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
+    if fluree.collected_by_cluster().await {
+        return;
+    }
     const ATTEMPTS: u32 = 3;
     const BASE_BACKOFF: Duration = Duration::from_millis(100);
 

@@ -311,6 +311,22 @@ and create it again over the new ledger. See
 [When the Source Ledger Is Dropped](../indexing-and-search/bm25.md#when-the-source-ledger-is-dropped)
 and [Iceberg → Access policy](../graph-sources/iceberg.md#where-policies-live-the-model-ledger).
 
+#### 410 Gone
+
+`err:db/HistoryUnavailable`: the read needs history that a [targeted removal](../transactions/history-retention.md#targeted-removal) took out. This happens for a query as of an earlier point, a history range, or an export that could touch a removed occurrence. It also happens for a search of a full-text or vector index that has not yet synced past a removal.
+
+```json
+{
+  "error": "history unavailable: a removed occurrence of <https://example.org/email> on mydb:main falls in the requested range",
+  "status": 410,
+  "@type": "err:db/HistoryUnavailable"
+}
+```
+
+**How to Fix:**
+- Read as of the current head, or narrow the query to predicates and subjects the removal does not cover
+- For a search index, retry once it has synced
+
 #### 413 Payload Too Large
 
 The request was refused because of its size. The server emits **two distinct
@@ -549,6 +565,7 @@ of them indicate a fault in the request. The `@type` identifies the cause:
 | `err:db/NoveltyAtMax` | Novelty backpressure: in-memory novelty is at `reindex_max_bytes` (or this transaction would cross it, while still fitting once novelty drains). Clears when the indexer catches up. |
 | `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
 | `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
+| `err:db/ReplicaNotCurrent` | A locally applied erasure is not installed yet, or a fetched [removal journal](../transactions/history-retention.md#clusters) is older than a revision this node has learned. Retry after local installation or replication catches up. Write-side erasure coordination also uses this error when leader catch-up fails; ordinary reads make no leader round trip. |
 | `err:db/IndexNotLoaded` | The server has not loaded the ledger's index: it failed to load, or the one the server holds is older than the ledger's. The write was refused before it read or committed anything; the same request can succeed once the index loads. |
 | `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 

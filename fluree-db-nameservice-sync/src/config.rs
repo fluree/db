@@ -87,6 +87,10 @@ pub struct RemoteConfig {
     pub auth: RemoteAuth,
     /// Polling interval in seconds (for polling fallback)
     pub fetch_interval_secs: Option<u64>,
+    /// Accept permanent erasures this remote's history carries: they
+    /// remove values from history held here too, which nothing undoes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub erasure_authority: bool,
 }
 
 /// Maps a local ledger ID to a remote ledger ID for automatic sync
@@ -191,6 +195,7 @@ mod tests {
             },
             auth: RemoteAuth::default(),
             fetch_interval_secs: Some(30),
+            erasure_authority: false,
         };
 
         store.set_remote(&config).await.unwrap();
@@ -249,10 +254,12 @@ mod tests {
                 ..Default::default()
             },
             fetch_interval_secs: Some(60),
+            erasure_authority: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RemoteConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, origin());
+        assert!(deserialized.erasure_authority);
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "fluree-prover-methods"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+risc0-build = { version = "=3.0.6" }
+# The image id of a prebuilt guest (`FLUREE_PROVER_GUEST`), as risc0-build
+# computes it.
+risc0-binfmt = { version = "=3.0.5" }
+
+[package.metadata.risc0]
+methods = ["guest"]

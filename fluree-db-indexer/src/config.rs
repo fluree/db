@@ -36,6 +36,19 @@ pub trait LedgerConfigProvider: std::fmt::Debug + Send + Sync {
     async fn indexing_config(&self, ledger_id: &str) -> LedgerIndexingConfig;
 }
 
+/// A predicate whose history an index build leaves out, over
+/// `[from_t, until_t)` (`f:noHistory`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuppressedHistory {
+    pub predicate_iri: String,
+    /// The graph the rule is limited to; `None` for every data graph.
+    pub graph_iri: Option<String>,
+    /// Graphs a ledger-wide rule leaves alone.
+    pub except_graph_iris: Vec<String>,
+    pub from_t: i64,
+    pub until_t: Option<i64>,
+}
+
 /// Scope of a configured full-text property entry.
 ///
 /// Mirrors the `f:targetGraph` sentinels used in config graph writes:
@@ -324,6 +337,11 @@ pub struct IndexerConfig {
     /// [`IndexerConfig::with_ledger_config_provider`].
     pub ledger_config_provider: Option<Arc<dyn LedgerConfigProvider>>,
 
+    /// Predicates whose history retention leaves out of the index
+    /// (`f:noHistory`), refreshed per build from the ledger's removal
+    /// journal by the background worker's build observer. Empty by default.
+    pub history_suppression: Vec<SuppressedHistory>,
+
     /// Pre-discovered commit CIDs (`t`, cid) with `t > index_t`, sorted
     /// ascending by `t`, supplied by the nameservice's commit-CID index.
     ///
@@ -350,6 +368,13 @@ pub struct IndexerConfig {
     /// disk. `None` (default) = off. Not build output, so excluded from config
     /// identity.
     pub warm_cache_source: Option<Arc<dyn WarmCacheSource>>,
+
+    /// A reasoning index's derived facts, as a commit-codec blob whose `t` is
+    /// the window's last commit. A build resolves them after the window's
+    /// commits, as facts rather than a commit (no txn-meta), so the root it
+    /// writes holds the asserted state at that `t` merged with them. Only the
+    /// reasoning-index worker sets it.
+    pub derived_facts: Option<Arc<Vec<u8>>>,
 }
 
 /// Default run-sort budget: 256 MB.
@@ -409,11 +434,13 @@ impl Default for IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
             ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 }
@@ -447,11 +474,13 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
             ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 
@@ -478,11 +507,13 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
             ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 
@@ -509,11 +540,13 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
             ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 

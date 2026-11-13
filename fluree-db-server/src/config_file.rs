@@ -139,8 +139,16 @@ pub struct IndexingFileConfig {
     /// How often to sweep storage for instance folders no ledger references,
     /// in seconds. `0` never does.
     pub orphan_sweep_interval_secs: Option<u64>,
+    /// How often to reconcile each ledger's commit and transaction files in
+    /// the background, in seconds. `0` never does.
+    pub garbage_reconcile_interval_secs: Option<u64>,
+    /// How often the retention worker runs a pass over TTL-enabled ledgers,
+    /// in seconds.
+    pub retention_interval_secs: Option<u64>,
     /// Keep BM25 full-text indexes current automatically.
     pub bm25_auto_sync: Option<bool>,
+    /// Maintain registered reasoning indexes automatically (default false).
+    pub reasoning_index_auto_refresh: Option<bool>,
     /// Old index versions to retain before GC.
     pub gc_max_old_indexes: Option<u32>,
     /// Minimum age in minutes before an index version can be collected.
@@ -447,10 +455,13 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "iceberg_local_roots",
     "indexing_enabled",
     "bm25_auto_sync",
+    "reasoning_index_auto_refresh",
     "reindex_min_bytes",
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
     "orphan_sweep_interval_secs",
+    "garbage_reconcile_interval_secs",
+    "retention_interval_secs",
     "gc_max_old_indexes",
     "gc_min_time_mins",
     "gc_hard_max_old_indexes",
@@ -619,6 +630,11 @@ pub fn apply_to_server_config(
                 config.indexing_enabled = v;
             }
         }
+        if is_default("reasoning_index_auto_refresh") {
+            if let Some(v) = idx.reasoning_index_auto_refresh {
+                config.reasoning_index_auto_refresh = v;
+            }
+        }
         if is_default("bm25_auto_sync") {
             if let Some(v) = idx.bm25_auto_sync {
                 config.bm25_auto_sync = v;
@@ -642,6 +658,16 @@ pub fn apply_to_server_config(
         if is_default("orphan_sweep_interval_secs") {
             if let Some(v) = idx.orphan_sweep_interval_secs {
                 config.orphan_sweep_interval_secs = v;
+            }
+        }
+        if is_default("garbage_reconcile_interval_secs") {
+            if let Some(v) = idx.garbage_reconcile_interval_secs {
+                config.garbage_reconcile_interval_secs = v;
+            }
+        }
+        if is_default("retention_interval_secs") {
+            if let Some(v) = idx.retention_interval_secs {
+                config.retention_interval_secs = v;
             }
         }
         if is_default("gc_max_old_indexes") {
@@ -1342,6 +1368,7 @@ ttl_ms = 200
 
 [server.indexing]
 enabled = true
+reasoning_index_auto_refresh = true
 reindex_min_bytes = 200000
 reindex_max_bytes = 2000000
 gc_max_old_indexes = 3
@@ -1372,6 +1399,7 @@ default_policy_class = "ex:DefaultPolicy"
 
         let idx = server.indexing.unwrap();
         assert_eq!(idx.enabled, Some(true));
+        assert_eq!(idx.reasoning_index_auto_refresh, Some(true));
         assert_eq!(idx.reindex_min_bytes, Some(200_000));
         assert_eq!(idx.reindex_max_bytes, Some(2_000_000));
         assert_eq!(idx.gc_max_old_indexes, Some(3));
@@ -1433,8 +1461,11 @@ default_policy_class = "ex:DefaultPolicy"
                 reindex_min_bytes: Some(100_000),
                 indexer_catchup_interval_secs: None,
                 orphan_sweep_interval_secs: None,
+                garbage_reconcile_interval_secs: None,
+                retention_interval_secs: None,
                 reindex_max_bytes: Some(1_000_000),
                 bm25_auto_sync: None,
+                reasoning_index_auto_refresh: None,
                 gc_max_old_indexes: Some(5),
                 gc_min_time_mins: None,
                 gc_hard_max_old_indexes: None,
@@ -1449,8 +1480,11 @@ default_policy_class = "ex:DefaultPolicy"
                 reindex_min_bytes: None, // should NOT override
                 indexer_catchup_interval_secs: None,
                 orphan_sweep_interval_secs: None,
+                garbage_reconcile_interval_secs: None,
+                retention_interval_secs: None,
                 reindex_max_bytes: None, // should NOT override
                 bm25_auto_sync: None,
+                reasoning_index_auto_refresh: None,
                 gc_max_old_indexes: None, // should NOT override
                 gc_min_time_mins: None,
                 gc_hard_max_old_indexes: Some(40),

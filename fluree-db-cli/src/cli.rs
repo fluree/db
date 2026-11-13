@@ -1194,6 +1194,12 @@ pub enum Commands {
         action: RemoteAction,
     },
 
+    /// Install and check the prover that permanent erasure needs
+    Prover {
+        #[command(subcommand)]
+        action: ProverAction,
+    },
+
     /// Manage authentication tokens for remotes
     Auth {
         #[command(subcommand)]
@@ -1238,6 +1244,13 @@ pub enum Commands {
         /// Skip pulling binary index data (indexes are pulled by default)
         #[arg(long)]
         no_indexes: bool,
+
+        /// Accept the permanent erasures the ledger's origins carry, for this
+        /// pull: they remove values from history held here, which nothing
+        /// undoes. A named remote is designated with `fluree remote
+        /// erasure-authority` instead
+        #[arg(long)]
+        erasure_authority: bool,
     },
 
     /// Push a ledger to its upstream remote
@@ -1304,6 +1317,12 @@ pub enum Commands {
         /// needed — e.g., when cloning a large ledger for read-only query use.
         #[arg(long)]
         no_txns: bool,
+
+        /// Accept the permanent erasures the origin's history carries, for
+        /// this clone. A named remote is designated with `fluree remote
+        /// erasure-authority` instead
+        #[arg(long, requires = "origin")]
+        erasure_authority: bool,
     },
 
     /// Track a remote ledger (remote-only, no local data)
@@ -1340,6 +1359,18 @@ pub enum Commands {
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
+    },
+
+    /// Materialized reasoning: register a reasoning program on a branch, and
+    /// list, refresh or retire its reasoning indexes
+    ///
+    /// A reasoning index contains the branch's asserted facts together with a
+    /// program's derived facts, kept current in the background; reasoning
+    /// queries that match the program are answered from it.
+    #[command(name = "reasoning-indexes")]
+    ReasoningIndexes {
+        #[command(subcommand)]
+        action: ReasoningIndexesAction,
     },
 
     /// Reclaim index artifacts that no index chain references
@@ -1880,6 +1911,68 @@ pub enum DroppedAction {
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Reasoning-index subcommands.
+#[derive(Subcommand)]
+pub enum ReasoningIndexesAction {
+    /// Register a reasoning program for persistence
+    Register {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Reasoning modes, as a query's `reasoning` key (e.g. `owl2rl`)
+        #[arg(long, conflicts_with = "program")]
+        reasoning: Option<String>,
+
+        /// The whole program as JSON: the reasoning keys a query would carry
+        /// (`reasoning`, `rules`, `ontology`, `reasoningTime`, `@context`),
+        /// plus an optional `graph` IRI to reason against
+        #[arg(long)]
+        program: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show the branch's reasoning indexes
+    List {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Bring the branch's reasoning indexes up to its current commit now
+    Refresh {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Refresh only this index (its id)
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Stop an index from being served or refreshed
+    Retire {
+        /// The index's id
+        index: String,
+
+        /// Ledger name (defaults to active ledger)
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
@@ -3499,6 +3592,29 @@ pub enum InspectOutputFormat {
 }
 
 #[derive(Subcommand)]
+pub enum ProverAction {
+    /// Download this release's prover and install it beside `fluree`, where
+    /// a server finds it
+    Install {
+        /// Release to install from (default: this binary's)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Directory to install into (default: beside this binary)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Replace a prover already there
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Show the prover a server started here would use, and whether it
+    /// proves an image this release accepts
+    Status,
+}
+
+#[derive(Subcommand)]
 pub enum RemoteAction {
     /// Add a remote server
     Add {
@@ -3511,6 +3627,23 @@ pub enum RemoteAction {
         /// Authentication token (or @filepath to read from file)
         #[arg(long)]
         token: Option<String>,
+
+        /// Accept the permanent erasures this remote's history carries, on
+        /// clone and pull (see `remote erasure-authority`)
+        #[arg(long)]
+        erasure_authority: bool,
+    },
+
+    /// Whether clone and pull accept the permanent erasures a remote's
+    /// history carries. They remove values from history held here too, which
+    /// nothing undoes: designate only a remote trusted to authorize them.
+    ErasureAuthority {
+        /// Remote name
+        name: String,
+
+        /// `true` to accept its erasures, `false` to refuse them
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
     },
 
     /// Remove a remote
@@ -4555,16 +4688,19 @@ pub enum DocAction {
     ///
     /// Parses the file as `fluree doc parse` does, sends its text and
     /// structure with the ontology and catalog to the HTTP reader that
-    /// serves `--model` (`[doc.reader]`), and prints what it read: mentions
-    /// linked to catalog records, entities, and claims, each anchored to the
-    /// text's offsets. Needs no project; where there is one (or a global
-    /// config), its `[doc]` settings and caches are used. What the read was
-    /// billed goes to stderr.
+    /// serves `--model` (`[doc.reader]`), and prints its reading: a Fluree DB
+    /// transaction holding the run, the facts in the ontology's terms, the
+    /// claims behind them and the mentions (`--include`), each mention
+    /// anchored to the text's offsets. Needs no project; where there is one
+    /// (or a global config), its `[doc]` settings and caches are used. What
+    /// the read was billed, and each call's run, release and request ID, go
+    /// to stderr.
     ///
     /// Examples:
     ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
     ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
     ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    ///   fluree doc read memo.md --ontology onto.ttl --include none > facts.jsonld
     #[command(verbatim_doc_comment)]
     Read(DocReadArgs),
 
@@ -4644,6 +4780,13 @@ pub struct DocIngestArgs {
     #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
+    /// What a reader's answer holds besides the facts, which it always
+    /// holds: `claims` (the claim behind each fact), `mentions` (each
+    /// occurrence in the text and the record it links to), both, or `none`.
+    /// Default: `claims,mentions`
+    #[arg(long, value_name = "claims,mentions|claims|mentions|none")]
+    pub include: Option<String>,
+
     /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
     /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
     /// ledger, a graph source mapped over a table (`fluree iceberg|sql|delta
@@ -4654,7 +4797,8 @@ pub struct DocIngestArgs {
 
     /// What becomes of the relations the language model reports: `direct`
     /// writes an edge for every predicate the model admits, `reified` keeps
-    /// them as review nodes only, `off` extracts entities alone
+    /// them as review nodes only, `off` extracts entities alone. A reader's
+    /// facts always come with its reading (see `--include`)
     #[arg(long, value_enum, default_value_t = DocRelationMode::Direct)]
     pub relations: DocRelationMode,
 
@@ -4764,12 +4908,27 @@ pub struct DocReadArgs {
     #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
-    /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the
-    /// structure graph and the reading, each in a named graph
+    /// What the reading holds besides the facts, which it always holds:
+    /// `claims` (the claim behind each fact), `mentions` (each occurrence
+    /// in the text and the record it links to), both, or `none`
+    #[arg(
+        long,
+        value_name = "claims,mentions|claims|mentions|none",
+        default_value = "claims,mentions"
+    )]
+    pub include: String,
+
+    /// `jsonld` prints the reading as the reader wrote it, a Fluree DB
+    /// transaction (`fluree insert -f` takes it). A document read in
+    /// several calls is a transaction per call, so as `jsonld` it needs
+    /// `-o`, and each call goes to a file of its own. `trig` is the same as
+    /// TriG, the run in `<#txn-meta>`; `turtle` its statements without the
+    /// run
     #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
     pub format: DocReadFormat,
 
-    /// Write to this file instead of stdout
+    /// Write to this file instead of stdout. A JSON-LD reading of several
+    /// calls goes to a file per call named after it: `FILE-1.jsonld`, …
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 

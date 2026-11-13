@@ -102,6 +102,17 @@ impl ConfigLookup for RecordingLookups {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for RecordingLookups {
+    async fn get_reasoning_indexes(
+        &self,
+        id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+        self.record(Asked::Record, id);
+        self.inner.get_reasoning_indexes(id).await
+    }
+}
+
+#[async_trait]
 impl NameServiceLookup for RecordingLookups {
     async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
         self.record(Asked::Record, id);

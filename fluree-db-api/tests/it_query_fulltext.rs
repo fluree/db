@@ -863,7 +863,9 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
         .expect("read-write nameservice")
         .publish_index_allow_equal_fenced(
             ledger_id,
-            crate::support::fence_of(&fluree, ledger_id).await,
+            fluree_db_nameservice::WriteBasis::fenced(
+                crate::support::fence_of(&fluree, ledger_id).await,
+            ),
             result.index_t,
             &result.root_id,
         )
@@ -971,7 +973,9 @@ async fn fulltext_configured_property_first_build_via_provider() {
         .expect("read-write nameservice")
         .publish_index_allow_equal_fenced(
             ledger_id,
-            crate::support::fence_of(&fluree, ledger_id).await,
+            fluree_db_nameservice::WriteBasis::fenced(
+                crate::support::fence_of(&fluree, ledger_id).await,
+            ),
             result.index_t,
             &result.root_id,
         )
@@ -1070,7 +1074,9 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
         .expect("read-write nameservice")
         .publish_index_allow_equal_fenced(
             ledger_id,
-            crate::support::fence_of(&fluree, ledger_id).await,
+            fluree_db_nameservice::WriteBasis::fenced(
+                crate::support::fence_of(&fluree, ledger_id).await,
+            ),
             result.index_t,
             &result.root_id,
         )
@@ -1177,7 +1183,9 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         .expect("publisher")
         .publish_index_allow_equal_fenced(
             ledger_id,
-            crate::support::fence_of(&fluree, ledger_id).await,
+            fluree_db_nameservice::WriteBasis::fenced(
+                crate::support::fence_of(&fluree, ledger_id).await,
+            ),
             result.index_t,
             &result.root_id,
         )
@@ -1222,7 +1230,9 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         .expect("publisher")
         .publish_index_allow_equal_fenced(
             ledger_id,
-            crate::support::fence_of(&fluree, ledger_id).await,
+            fluree_db_nameservice::WriteBasis::fenced(
+                crate::support::fence_of(&fluree, ledger_id).await,
+            ),
             result.index_t,
             &result.root_id,
         )
@@ -1708,7 +1718,9 @@ async fn fulltext_configured_persisted_incremental_extends_arena() {
             .expect("publisher")
             .publish_index_allow_equal_fenced(
                 ledger_id,
-                crate::support::fence_of(&fluree, ledger_id).await,
+                fluree_db_nameservice::WriteBasis::fenced(
+                    crate::support::fence_of(&fluree, ledger_id).await,
+                ),
                 result.index_t,
                 &result.root_id,
             )

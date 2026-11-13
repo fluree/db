@@ -368,6 +368,18 @@ pub enum ApiError {
     #[error("{0}")]
     CommitNotFound(String),
 
+    /// A time-travel or history read needs history a targeted removal
+    /// suppressed — refused rather than answered from incomplete history
+    /// (410).
+    #[error("history unavailable: {0}")]
+    HistoryUnavailable(String),
+
+    /// A cluster replica cannot confirm it holds a retention-enabled
+    /// ledger's current removal journal, so it does not serve the ledger's
+    /// history (503, retryable).
+    #[error("replica not current: {0}")]
+    ReplicaNotCurrent(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
@@ -499,6 +511,17 @@ pub enum ApiError {
     /// The nameservice was polled and any available commits were applied,
     /// but the ledger's `t` is still below the caller's `min_t` threshold.
     /// The caller should decide whether to retry (with backoff) or give up.
+    #[error(
+        "No reasoning index of {ledger_id} answers this query at t={t} yet; it was asked for \
+         with reasoningFreshness \"strict\", which never reasons at query time"
+    )]
+    ReasoningIndexNotReady {
+        /// The ledger queried.
+        ledger_id: String,
+        /// The `t` of the snapshot queried.
+        t: i64,
+    },
+
     #[error("Ledger has not reached t={requested}, current t={current}")]
     AwaitTNotReached {
         /// The `t` value the caller asked for.
@@ -592,6 +615,19 @@ impl ApiError {
             self,
             ApiError::NameService(Conflict(_))
                 | ApiError::Transact(fluree_db_transact::TransactError::Nameservice(Conflict(_)))
+        )
+    }
+
+    /// Whether a commit lost to another writer: the head moved under it.
+    pub fn is_commit_conflict(&self) -> bool {
+        use fluree_db_transact::TransactError as TE;
+        matches!(
+            self,
+            ApiError::Transact(
+                TE::CommitConflict { .. }
+                    | TE::CommitIdMismatch { .. }
+                    | TE::PublishLostRace { .. }
+            )
         )
     }
 
@@ -730,6 +766,9 @@ impl ApiError {
             | ApiError::CommitNotFound(_)
             | ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
 
+            ApiError::HistoryUnavailable(_) => 410,
+            ApiError::ReplicaNotCurrent(_) => 503,
+
             ApiError::Parse(_)
             | ApiError::Batch(_)
             | ApiError::Config(_)
@@ -760,7 +799,7 @@ impl ApiError {
 
             // Read-after-write: the ledger has not caught up to the `t` the
             // caller asked for.
-            ApiError::AwaitTNotReached { .. } => 408,
+            ApiError::AwaitTNotReached { .. } | ApiError::ReasoningIndexNotReady { .. } => 408,
             ApiError::IndexTimeout(_) => 504,
 
             // 503 + retryable: capacity that clears on its own (the indexer
@@ -891,6 +930,7 @@ impl ApiError {
                 // Only a tracked query flattens a 408.
                 408 => errors::QUERY_CANCELLED,
                 409 => errors::COMMIT_CONFLICT,
+                410 => errors::HISTORY_UNAVAILABLE,
                 // The HTTP body-size cap. An oversized novelty delta is the
                 // other 413, and stays typed end to end so the two carry
                 // distinct codes.
@@ -902,6 +942,8 @@ impl ApiError {
 
             ApiError::GraphNotFound(_) => errors::GRAPH_NOT_FOUND,
             ApiError::CommitNotFound(_) => errors::COMMIT_NOT_FOUND,
+            ApiError::HistoryUnavailable(_) => errors::HISTORY_UNAVAILABLE,
+            ApiError::ReplicaNotCurrent(_) => errors::REPLICA_NOT_CURRENT,
             ApiError::NotFound(msg) => {
                 if msg.contains("Graph source") || msg.contains("graph source") {
                     errors::GRAPH_SOURCE_NOT_FOUND
@@ -958,6 +1000,7 @@ impl ApiError {
             ApiError::CypherLower(_) | ApiError::CypherUpdateLower(_) => errors::CYPHER_LOWER,
 
             ApiError::AwaitTNotReached { .. } => errors::READ_AFTER_WRITE_TIMEOUT,
+            ApiError::ReasoningIndexNotReady { .. } => errors::REASONING_INDEX_NOT_READY,
             ApiError::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
             ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
             ApiError::Query(e) => match e {
@@ -1239,7 +1282,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 50
+    const VARIANTS: usize = 53
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + 2 * cfg!(feature = "iceberg") as usize;
@@ -1506,6 +1549,16 @@ mod tests {
             ),
             (ApiError::GraphNotFound("g".into()), 404, GRAPH_NOT_FOUND),
             (ApiError::CommitNotFound("c".into()), 404, COMMIT_NOT_FOUND),
+            (
+                ApiError::HistoryUnavailable("h".into()),
+                410,
+                HISTORY_UNAVAILABLE,
+            ),
+            (
+                ApiError::ReplicaNotCurrent("r".into()),
+                503,
+                REPLICA_NOT_CURRENT,
+            ),
             (ApiError::http(404, "x"), 404, NOT_FOUND),
             (
                 ApiError::Indexer(IE::LedgerNotFound("db".into())),
@@ -1524,6 +1577,14 @@ mod tests {
                 },
                 408,
                 READ_AFTER_WRITE_TIMEOUT,
+            ),
+            (
+                ApiError::ReasoningIndexNotReady {
+                    ledger_id: "db:main".into(),
+                    t: 3,
+                },
+                408,
+                REASONING_INDEX_NOT_READY,
             ),
             (conflict(), 409, COMMIT_CONFLICT),
             (
@@ -1790,6 +1851,8 @@ mod tests {
                 | ApiError::NotFound(_)
                 | ApiError::GraphNotFound(_)
                 | ApiError::CommitNotFound(_)
+                | ApiError::HistoryUnavailable(_)
+                | ApiError::ReplicaNotCurrent(_)
                 | ApiError::LedgerExists(_)
                 | ApiError::NoveltyDeferred { .. }
                 | ApiError::MaterializePartial { .. }
@@ -1801,6 +1864,7 @@ mod tests {
                 | ApiError::IndexingDisabled
                 | ApiError::StorageInUse { .. }
                 | ApiError::AwaitTNotReached { .. }
+                | ApiError::ReasoningIndexNotReady { .. }
                 | ApiError::CommitContention { .. }
                 | ApiError::ReindexConflict { .. }
                 | ApiError::Policy(_)

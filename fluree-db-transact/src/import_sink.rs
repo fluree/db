@@ -598,6 +598,7 @@ mod inner {
                 place,
                 t,
             } = rec;
+            crate::ttl_input::refuse_imported_lifetime(p.namespace_code, &p.name)?;
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
             let dt_id = self.assign_datatype_id(dt)?;

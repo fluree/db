@@ -148,7 +148,7 @@ pub(crate) struct SequentialStager {
 type SequentialFactKey = (Option<Sid>, Sid, Sid, fluree_db_transact::FactTerm);
 
 impl SequentialStager {
-    pub(crate) fn new(ledger: LedgerState) -> Self {
+    pub(crate) fn new(ledger: LedgerState, policy: Option<&crate::PolicyContext>) -> Self {
         let final_t = ledger.t() + 1;
         Self {
             original: ledger.clone(),
@@ -164,7 +164,7 @@ impl SequentialStager {
             txn_meta: Vec::new(),
             last_ns_registry: None,
             union_ns_delta: std::collections::HashMap::new(),
-            governance: RequestGovernance::new(ledger.clone()),
+            governance: RequestGovernance::new(ledger.clone(), policy),
             nested: false,
             current: Some(ledger),
             scope: WriteScope::Subjects(FxHashSet::default()),
@@ -180,7 +180,7 @@ impl SequentialStager {
         Self {
             governance: request.clone(),
             nested: true,
-            ..Self::new(ledger)
+            ..Self::new(ledger, None)
         }
     }
 
@@ -190,7 +190,7 @@ impl SequentialStager {
     pub(crate) fn resume(ledger: LedgerState, governance: RequestGovernance) -> Self {
         Self {
             governance,
-            ..Self::new(ledger)
+            ..Self::new(ledger, None)
         }
     }
 
@@ -222,13 +222,19 @@ impl SequentialStager {
         fluree: &crate::Fluree,
         txn: Txn,
         index_config: Option<&IndexConfig>,
-        policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         advance: bool,
     ) -> Result<usize> {
         self.stage_with(advance, |state, request| async move {
             fluree
-                .stage_txn_governed(state, txn, index_config, policy, tracker, Some(&request))
+                .stage_txn_governed(
+                    state,
+                    txn,
+                    index_config,
+                    request.policy(),
+                    tracker,
+                    Some(&request),
+                )
                 .await
         })
         .await
@@ -561,10 +567,11 @@ impl SequentialStager {
         // graphs by IRI, so leaving one out renumbers nothing.
         graph_delta.retain(|_, iri| !netted_away.contains(&ns_registry.sid_for_iri(iri)));
 
-        let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?
+        let mut view = StagedLedger::new(self.original, self.folded, &reverse_graph)?
             .with_graph_drops(self.drops.into_iter().collect());
         if !self.nested {
-            guard_request_view(&view, &ns_registry, &graph_delta).await?;
+            let policy = self.governance.policy();
+            guard_request_view(&mut view, &ns_registry, &graph_delta, policy).await?;
         }
         Ok(StageResult {
             view,
@@ -730,15 +737,23 @@ pub(crate) struct RequestGovernance {
     config: ConfigRead,
     /// The model-ledger heads the request has read, shared by its clones.
     model_heads: Arc<parking_lot::Mutex<HashMap<LedgerId, crate::cross_ledger::ModelHead>>>,
+    /// The policy every operation, and the request's merged result, is
+    /// checked against.
+    policy: Option<Arc<crate::PolicyContext>>,
 }
 
 impl RequestGovernance {
-    pub(crate) fn new(state: LedgerState) -> Self {
+    pub(crate) fn new(state: LedgerState, policy: Option<&crate::PolicyContext>) -> Self {
         Self {
             state,
             config: ConfigRead::default(),
             model_heads: Arc::default(),
+            policy: policy.cloned().map(Arc::new),
         }
+    }
+
+    pub(crate) fn policy(&self) -> Option<&crate::PolicyContext> {
+        self.policy.as_deref()
     }
 
     /// The resolution context for one of the request's operations: it reads
@@ -771,22 +786,27 @@ impl RequestGovernance {
 /// before the request, so a request is judged by its result rather than by
 /// the order of its operations.
 async fn guard_request_view(
-    view: &StagedLedger,
+    view: &mut StagedLedger,
     ns: &NamespaceRegistry,
     graph_delta: &FxHashMap<fluree_db_core::GraphId, String>,
+    policy: Option<&crate::PolicyContext>,
 ) -> Result<()> {
-    crate::config_guard::validate_staged_config(
+    let refused = |e| {
+        ApiError::from(fluree_db_transact::TransactError::from(
+            StagedWriteError::from(e),
+        ))
+    };
+    let retention = crate::config_guard::validate_staged_config(
         view,
         ns,
         graph_delta,
         crate::config_guard::GuardScope::Authoring,
     )
     .await
-    .map_err(|e| {
-        ApiError::from(fluree_db_transact::TransactError::from(
-            StagedWriteError::from(e),
-        ))
-    })
+    .map_err(refused)?;
+    crate::retention::validate::check_staged(view, retention, policy, None, true)
+        .await
+        .map_err(refused)
 }
 
 /// The user graphs (the default graph and named graphs; never `#config` or
@@ -2345,7 +2365,17 @@ pub(crate) async fn check_staged_write(
     // An operation of a multi-operation request is guarded with the rest of
     // the request, on its merged view (`SequentialStager::finish`).
     if checks.request.is_none() {
-        crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard).await?;
+        let retention =
+            crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard)
+                .await?;
+        crate::retention::validate::check_staged(
+            view,
+            retention,
+            checks.policy,
+            checks.tracker,
+            checks.guard == crate::config_guard::GuardScope::Authoring,
+        )
+        .await?;
     }
     Ok(validated || unique_enforced)
 }
@@ -3823,7 +3853,7 @@ impl crate::Fluree {
         let request = match enclosing {
             Some(request) => request,
             None => {
-                own = RequestGovernance::new(ledger.clone());
+                own = RequestGovernance::new(ledger.clone(), policy);
                 &own
             }
         };
@@ -3864,11 +3894,11 @@ impl crate::Fluree {
         flakes.extend(flakes2);
 
         let reverse_graph: HashMap<fluree_db_core::Sid, GraphId> = HashMap::new();
-        let view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
+        let mut view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
             ApiError::internal(format!("merging staged Cypher MERGE branches: {e}"))
         })?;
         if enclosing.is_none() {
-            guard_request_view(&view, &ns_registry, &graph_delta).await?;
+            guard_request_view(&mut view, &ns_registry, &graph_delta, policy).await?;
         }
 
         Ok(StageResult {
@@ -3971,7 +4001,7 @@ impl crate::Fluree {
 
         let mut stager = match request {
             Some(request) => SequentialStager::within(ledger, request),
-            None => SequentialStager::new(ledger),
+            None => SequentialStager::new(ledger, policy),
         };
         let op_count = txns.len();
         for (i, txn) in txns.into_iter().enumerate() {
@@ -3980,7 +4010,7 @@ impl crate::Fluree {
             // ORIGINAL base).
             let advance = i + 1 < op_count;
             stager
-                .stage(self, txn, index_config, policy, tracker, advance)
+                .stage(self, txn, index_config, tracker, advance)
                 .await?;
         }
         stager.finish().await
@@ -4075,7 +4105,9 @@ impl crate::Fluree {
         // is preserved but serial latency is eliminated on fast paths.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, txn_json_for_commit)
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, txn_json_for_commit)
         } else {
             commit_opts
         };
@@ -4164,6 +4196,8 @@ impl crate::Fluree {
                 .map_err(fluree_db_transact::TransactError::from)?;
         }
 
+        #[cfg(feature = "native")]
+        let _reconciliation = self.hold_against_reconciliation(&view).await?;
         let content_store = self.content_store(&view.base().storage_namespace());
         let publisher = self.publisher()?;
         let (receipt, ledger) = commit_txn(
@@ -4172,7 +4206,7 @@ impl crate::Fluree {
             &content_store,
             publisher,
             index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await?;
         Ok((receipt, ledger))
@@ -4272,7 +4306,9 @@ impl crate::Fluree {
         // Spawn raw_txn upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
             commit_opts
         };
@@ -4368,7 +4404,9 @@ impl crate::Fluree {
         // Spawn raw Turtle upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {
             commit_opts
         };
@@ -4712,7 +4750,9 @@ impl crate::Fluree {
         // The raw transaction is the text, as for a Turtle insert.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {
             commit_opts
         };
@@ -4917,6 +4957,7 @@ impl crate::Fluree {
         let content_store = self.content_store(&ledger.storage_namespace());
         let commit_opts = CommitOpts::default()
             .identity(verified.did.clone())
+            .with_content_hash(self.content_hash())
             .with_raw_txn_spawned(content_store, raw_credential)
             .with_txn_signature(fluree_db_novelty::TxnSignature {
                 signer: verified.did.clone(),
@@ -5375,6 +5416,9 @@ mod tests {
                             blobs: pushed.blobs.clone(),
                             missing_blobs: Vec::new(),
                             merged_commits: Vec::new(),
+                            commit_ids: Vec::new(),
+                            merged_commit_ids: Vec::new(),
+                            ..Default::default()
                         },
                         &crate::GovernanceOptions::default(),
                         &fluree.default_index_config(),

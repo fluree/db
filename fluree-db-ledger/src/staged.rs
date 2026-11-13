@@ -212,6 +212,9 @@ pub struct StagedLedger {
     /// dictionaries know nothing of subjects and strings this transaction is
     /// introducing.
     dicts_cover_staged: bool,
+    /// Txn-meta the system records on the commit built from this view, next
+    /// to the caller's (the retention-control marker).
+    system_txn_meta: Vec<fluree_db_core::TxnMetaEntry>,
     /// [`OverlayProvider::list_predicates`]: the base novelty's and the
     /// staged flakes'.
     list_predicates: Option<Arc<std::collections::HashSet<Sid>>>,
@@ -267,10 +270,23 @@ impl StagedLedger {
             staged_epoch,
             content_version: fluree_db_core::overlay::next_overlay_content_version(),
             dicts_cover_staged: false,
+            system_txn_meta: Vec::new(),
             list_predicates,
             graph_drops: Vec::new(),
             base,
         })
+    }
+
+    /// Record `entry` on the commit built from this view, once.
+    pub fn push_system_txn_meta(&mut self, entry: fluree_db_core::TxnMetaEntry) {
+        if !self.system_txn_meta.contains(&entry) {
+            self.system_txn_meta.push(entry);
+        }
+    }
+
+    /// Take the txn-meta the system records on the commit built from this view.
+    pub fn take_system_txn_meta(&mut self) -> Vec<fluree_db_core::TxnMetaEntry> {
+        std::mem::take(&mut self.system_txn_meta)
     }
 
     /// Record that the staged transaction drops `g_ids`. The caller has

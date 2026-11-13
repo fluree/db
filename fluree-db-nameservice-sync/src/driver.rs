@@ -7,6 +7,7 @@ use crate::client::RemoteNameserviceClient;
 use crate::config::SyncConfigStore;
 use crate::error::{Result, SyncError};
 use fluree_db_core::LedgerId;
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{
     CasResult, Fence, NameServicePublisher, RefKind, RefPublisher, RefValue, RemoteName,
     RemoteTrackingStore, TrackingRecord,
@@ -227,7 +228,7 @@ impl SyncDriver {
                     .local
                     .compare_and_set_ref_fenced(
                         local_alias,
-                        fence,
+                        WriteBasis::fenced(fence),
                         RefKind::CommitHead,
                         None,
                         remote_commit,
@@ -242,7 +243,7 @@ impl SyncDriver {
                                 .local
                                 .compare_and_set_ref_fenced(
                                     local_alias,
-                                    fence,
+                                    WriteBasis::fenced(fence),
                                     RefKind::IndexHead,
                                     None,
                                     remote_index,
@@ -272,7 +273,12 @@ impl SyncDriver {
                     // Remote is ahead — fast-forward
                     let result = self
                         .local
-                        .fast_forward_commit_fenced(local_alias, fence, remote_commit, 3)
+                        .fast_forward_commit_fenced(
+                            local_alias,
+                            WriteBasis::fenced(fence),
+                            remote_commit,
+                            3,
+                        )
                         .await
                         .map_err(SyncError::Nameservice)?;
                     match result {
@@ -345,7 +351,7 @@ impl SyncDriver {
                 .local
                 .compare_and_set_ref_fenced(
                     ledger_id,
-                    fence,
+                    WriteBasis::fenced(fence),
                     RefKind::IndexHead,
                     current.as_ref(),
                     new,

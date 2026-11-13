@@ -28,6 +28,7 @@
 //! - [`build::commit_chain`]: Commit chain walking
 
 mod build;
+pub use build::rebuild::clear_rebuild_residue;
 pub mod config;
 pub mod drop;
 pub mod error;
@@ -48,22 +49,23 @@ pub mod stats;
 // Re-export main types
 pub use config::{
     ConfiguredFulltextProperty, ConfiguredFulltextScope, IndexerConfig, LedgerConfigProvider,
-    LedgerIndexingConfig, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
+    LedgerIndexingConfig, SuppressedHistory, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
     clean_garbage, current_sibling_heads, execute_sweep, nested_namespaces, nested_prefixes,
-    plan_garbage, plan_sweep, release_garbage_plan, shared_blob_policy_for,
+    plan_garbage, plan_sweep, plan_sweep_with, release_garbage_plan, shared_blob_policy_for,
     shared_refs_of_branches, siblings_of, write_garbage_record, BranchIndexHead,
-    CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord, SharedBlobPolicy,
-    SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES,
-    DEFAULT_MIN_TIME_GARBAGE_MINS,
+    CleanGarbageConfig, CleanGarbageResult, ExtraSweepFiles, GarbagePlan, GarbageRecord,
+    SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES,
+    DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
-    GcGuard, Housekeeping, IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation,
-    IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
+    BuildDirectives, BuildObserver, BuildTicket, GcGuard, Housekeeping, Housekeepings,
+    IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
+    IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
 };
 #[cfg(feature = "embedded-orchestrator")]
 pub use orchestrator::{
@@ -72,6 +74,9 @@ pub use orchestrator::{
 pub use stats::{IndexStatsHook, NoOpStatsHook, StatsArtifacts, StatsSummary};
 
 // Re-export build pipeline types
+pub use build::incremental::{
+    erase_index_events, incremental_index_erasing, ErasedEvent, IndexErasure,
+};
 pub use build::types::{UploadedDicts, UploadedIndexes};
 
 // Re-export build pipeline types
@@ -80,6 +85,7 @@ pub use run_index::build::build_from_commits::{
     BuildConfig, BuildResult, CommitInput, BUILD_STAGE_LINK_RUNS, BUILD_STAGE_MERGE,
     BUILD_STAGE_REMAP,
 };
+pub use run_index::build::incremental_resolve::pending_covers_range;
 
 use fluree_db_core::ContentStore;
 use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
@@ -101,10 +107,15 @@ pub struct IndexResult {
     /// `None` when the build went through the plain non-tracking API. An
     /// already-current build reports `Some(0.0)` if tracking was enabled.
     pub fuel: Option<f64>,
-    /// The fence of the branch record the build started from, which the
-    /// publication of this root presents: a branch dropped or replaced
-    /// during the build refuses it.
-    pub fence: Option<fluree_db_nameservice::Fence>,
+    /// What the publication of this root presents, from the branch record
+    /// the build started from: a branch dropped or replaced during the
+    /// build, or reached by an erasure, refuses it.
+    pub basis: fluree_db_nameservice::WriteBasis,
+    /// The earliest `t` among the commits this build read whose txn-meta
+    /// carries retention input. Whoever publishes the root registers the
+    /// branch for retention from this `t` first: once published, the index
+    /// covers those commits, and no later build reads them again.
+    pub retention_input_from_t: Option<i64>,
 }
 
 /// Statistics from index building
@@ -201,7 +212,8 @@ pub async fn build_index_for_record_with_tracker(
         // when tracking is enabled (no CAS work was done) so callers can
         // distinguish "no work" from "not tracked".
         if let Some(ref root_id) = record.index_head_id {
-            if record.index_t >= record.commit_t {
+            // Derived facts are folded in even when no commit is new.
+            if record.index_t >= record.commit_t && config.derived_facts.is_none() {
                 tracing::info!(
                     ledger_id = ledger_id,
                     index_t = record.index_t,
@@ -215,7 +227,8 @@ pub async fn build_index_for_record_with_tracker(
                     ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
                     stats: IndexStats::default(),
                     fuel,
-                    fence: None,
+                    basis: fluree_db_nameservice::WriteBasis::default(),
+                    retention_input_from_t: None,
                 });
             }
         }
@@ -297,7 +310,7 @@ pub async fn build_index_for_record_with_tracker(
     .instrument(span)
     .await
     .map(|result| IndexResult {
-        fence: record.fence,
+        basis: record.write_basis(),
         ..result
     })
 }
@@ -305,6 +318,38 @@ pub async fn build_index_for_record_with_tracker(
 /// Snapshot the tracker's current decimal fuel total, or `None` when fuel
 /// tracking was not enabled at this tracker (so callers can distinguish
 /// "no work" from "not tracked").
+/// Fold the commits after `record.index_t`, then `config.derived_facts`, into
+/// the root at `record.index_head_id`, incrementally only.
+///
+/// Unlike [`build_index_for_record`], a window the incremental path cannot
+/// apply is an error rather than a full rebuild: a reasoning index's fold
+/// carries only the derived facts that changed, which a rebuild from commits
+/// would not see.
+pub async fn fold_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    let tracker = fluree_db_core::tracking::Tracker::disabled();
+    let content_store: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
+    );
+    let root_id = record.index_head_id.as_ref().ok_or(IndexerError::NoIndex)?;
+    if !published_root_is_current(content_store.as_ref(), root_id).await? {
+        return Err(IndexerError::IncrementalAbort(
+            "the root to fold into is of an earlier format".to_string(),
+        ));
+    }
+    incremental_index(
+        content_store,
+        tracker,
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
 fn tally_fuel(tracker: &fluree_db_core::tracking::Tracker) -> Option<f64> {
     tracker.tally().and_then(|t| t.fuel)
 }
@@ -521,6 +566,7 @@ pub async fn index_novelty(
         novelty,
         config,
         replaced_cids,
+        Default::default(),
     )
     .await
 }
@@ -581,7 +627,7 @@ pub async fn publish_index_result(
     publisher
         .publish_index_fenced(
             &result.ledger_id,
-            result.fence,
+            result.basis.clone(),
             result.index_t,
             &result.root_id,
         )
@@ -623,7 +669,7 @@ mod publish_barrier_tests {
         async fn publish_index_fenced(
             &self,
             _ledger_id: &str,
-            _fence: Option<fluree_db_nameservice::Fence>,
+            _basis: fluree_db_nameservice::WriteBasis,
             _index_t: i64,
             _index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
@@ -659,7 +705,8 @@ mod publish_barrier_tests {
             ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
-            fence: None,
+            retention_input_from_t: None,
+            basis: fluree_db_nameservice::WriteBasis::default(),
         };
         publish_index_result(&store, &publisher, &result)
             .await

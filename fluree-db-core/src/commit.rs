@@ -236,9 +236,45 @@ pub struct Commit {
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<crate::ns_encoding::NsSplitMode>,
+
+    /// Set when the commit was read from a redacted replacement: `flakes`
+    /// are then only its surviving operations.
+    pub redaction: Option<Redaction>,
+}
+
+/// What a commit read from a redacted replacement no longer holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redaction {
+    /// The original slot of each flake in [`Commit::flakes`], ascending.
+    pub slots: Vec<u32>,
+    /// Operations in the original commit.
+    pub op_count: u32,
+    /// Signers of the original commit, as the redaction proof verified them.
+    pub signers: Vec<String>,
 }
 
 impl Commit {
+    /// Each flake with its operation slot in the original commit. Use this,
+    /// not the flake's position, wherever a slot names an occurrence: the
+    /// two differ once a commit has been redacted.
+    pub fn occurrences(&self) -> impl Iterator<Item = (u32, &Flake)> {
+        self.flakes.iter().enumerate().map(|(i, flake)| {
+            let slot = match &self.redaction {
+                Some(r) => r.slots[i],
+                None => i as u32,
+            };
+            (slot, flake)
+        })
+    }
+
+    /// The flake at original slot `slot`, if the commit still holds it.
+    pub fn at_slot(&self, slot: u32) -> Option<&Flake> {
+        match &self.redaction {
+            Some(r) => r.slots.binary_search(&slot).ok().map(|i| &self.flakes[i]),
+            None => self.flakes.get(slot as usize),
+        }
+    }
+
     /// Create a new commit (id is set to `None` until serialized and hashed)
     pub fn new(t: i64, flakes: Vec<Flake>) -> Self {
         Self {
@@ -255,6 +291,7 @@ impl Commit {
             graph_delta: HashMap::new(),
             graph_drops: Vec::new(),
             ns_split_mode: None,
+            redaction: None,
         }
     }
 
@@ -424,6 +461,15 @@ pub async fn load_commit_envelope_by_id<C: ContentStore + ?Sized>(
     Ok(envelope)
 }
 
+/// A failed read of commit `id`'s envelope. A missing commit stays
+/// [`Error::NotFound`], which callers take as nothing stored.
+fn envelope_read_error(id: &ContentId, e: Error) -> Error {
+    match e {
+        Error::NotFound(what) => Error::NotFound(format!("commit envelope {id}: {what}")),
+        other => Error::storage(format!("Failed to read commit envelope {id}: {other}")),
+    }
+}
+
 /// Internal sibling of [`load_commit_envelope_by_id`] that also reports the
 /// commit-blob version byte read from the header.
 ///
@@ -440,7 +486,7 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
     let probe = store
         .get_range(id, 0..ENVELOPE_PROBE_LEN)
         .await
-        .map_err(|e| Error::storage(format!("Failed to read commit envelope {id}: {e}")))?;
+        .map_err(|e| envelope_read_error(id, e))?;
 
     if probe.len() < HEADER_LEN {
         return Err(Error::invalid_commit(format!(
@@ -448,6 +494,18 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
             id,
             probe.len()
         )));
+    }
+
+    // An erased commit reads as its replacement, whose envelope sits after
+    // the original's CID and header: decode it whole.
+    if codec::replacement::is_replacement(&probe) {
+        let data = store
+            .get(id)
+            .await
+            .map_err(|e| envelope_read_error(id, e))?;
+        let envelope =
+            codec::read_commit_envelope(&data).map_err(|e| Error::invalid_commit(e.to_string()))?;
+        return Ok((envelope, codec::format::VERSION));
     }
 
     // Header byte 4 is the codec version; capture it before the envelope
@@ -466,11 +524,7 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
         store
             .get(id)
             .await
-            .map_err(|e| {
-                Error::storage(format!(
-                    "Failed to read oversized commit envelope {id}: {e}"
-                ))
-            })?
+            .map_err(|e| envelope_read_error(id, e))?
             .into_vec()
     };
 
@@ -1797,6 +1851,62 @@ mod tests {
     async fn store_commit(store: &MemoryContentStore, commit: &Commit) -> ContentId {
         let result = codec::write_commit(commit, false, None).unwrap();
         store.put(ContentKind::Commit, &result.bytes).await.unwrap()
+    }
+
+    /// A commit that is not stored reads as not found, so a caller can tell
+    /// it from a failed read.
+    #[tokio::test]
+    async fn a_missing_commits_envelope_is_not_found() {
+        let store = MemoryContentStore::new();
+        let missing = ContentId::new(ContentKind::Commit, b"never stored");
+        let read = load_commit_envelope_by_id(&store, &missing).await;
+        assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
+    }
+
+    /// A commit deleted between the header read and the full fetch of its
+    /// oversized envelope is not found either.
+    #[tokio::test]
+    async fn a_commit_gone_before_its_oversized_envelope_is_read_is_not_found() {
+        #[derive(Debug)]
+        struct Deleted;
+        #[async_trait::async_trait]
+        impl ContentStore for Deleted {
+            async fn has(&self, _id: &ContentId) -> Result<bool> {
+                Ok(false)
+            }
+            async fn get(&self, id: &ContentId) -> Result<crate::ContentBytes> {
+                Err(Error::not_found(id.to_string()))
+            }
+            async fn get_range(
+                &self,
+                _id: &ContentId,
+                _range: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>> {
+                let mut header = vec![0; codec::format::HEADER_LEN];
+                codec::format::CommitHeader {
+                    version: codec::format::VERSION,
+                    flags: 0,
+                    t: 1,
+                    op_count: 0,
+                    envelope_len: ENVELOPE_PROBE_LEN as u32,
+                    sig_block_len: 0,
+                }
+                .write_to(&mut header);
+                Ok(header)
+            }
+            async fn put(&self, _kind: ContentKind, _bytes: &[u8]) -> Result<ContentId> {
+                unimplemented!()
+            }
+            async fn put_with_id(&self, _id: &ContentId, _bytes: &[u8]) -> Result<()> {
+                unimplemented!()
+            }
+            async fn release(&self, _id: &ContentId) -> Result<()> {
+                unimplemented!()
+            }
+        }
+        let id = ContentId::new(ContentKind::Commit, b"deleted");
+        let read = load_commit_envelope_by_id(&Deleted, &id).await;
+        assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
     }
 
     #[cfg(feature = "credential")]

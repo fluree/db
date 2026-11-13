@@ -122,6 +122,16 @@ pub struct GraphDb {
     /// ([`LedgerState::instance_bits`]), which tells a ledger from one
     /// dropped before it under the same name; `0` when unknown.
     pub(crate) instance_bits: u128,
+    /// The commit whose state this view is, exactly: set for a branch's
+    /// state at its head, `None` for a staged, historical or assembled
+    /// view. A reasoning index answers only a view it names.
+    pub(crate) commit_id: Option<fluree_db_core::ContentId>,
+    /// The fence of the branch record the view was loaded from: which
+    /// incarnation of the branch it reads.
+    pub(crate) fence: Option<fluree_db_nameservice::Fence>,
+    /// That record's erasure generation: which erasures the view reads
+    /// with. An index built from the view presents it.
+    pub(crate) erasure_generation: u64,
 
     /// Graph ID within the ledger (0 = default graph).
     ///
@@ -259,6 +269,10 @@ pub struct GraphDb {
     /// drops `graph_source_id`), because the view's own id still names the
     /// graph source: see [`Self::member_kind`].
     pub(crate) over_graph_source: bool,
+    /// A view of an earlier point than its ledger's head: built from a
+    /// historical snapshot, or moved back with [`Self::as_of`]. Retention
+    /// checks such reads; a head view is current state.
+    pub(crate) historical: bool,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -280,6 +294,18 @@ impl std::fmt::Debug for GraphDb {
 // ============================================================================
 // Constructors
 // ============================================================================
+
+/// The fence of `state`'s branch record, when that record is the branch's
+/// own: a state built from another branch (a rebase replays onto its
+/// source's) carries the other branch's record.
+fn own_basis(state: &LedgerState) -> fluree_db_nameservice::WriteBasis {
+    state
+        .ns_record
+        .as_ref()
+        .filter(|record| record.ledger_id.as_str() == state.ledger_id())
+        .map(fluree_db_nameservice::NsRecord::write_basis)
+        .unwrap_or_default()
+}
 
 impl GraphDb {
     /// Create a base view from components.
@@ -308,6 +334,9 @@ impl GraphDb {
             t,
             ledger_id: ledger_id.into(),
             instance_bits: 0,
+            commit_id: None,
+            fence: None,
+            erasure_generation: 0,
             graph_id: 0,
             policy: None,
             policy_enforcer: None,
@@ -330,6 +359,7 @@ impl GraphDb {
             graph_source_id: None,
             graph_source_time: None,
             over_graph_source: false,
+            historical: false,
         }
     }
 
@@ -355,6 +385,10 @@ impl GraphDb {
             ledger.ledger_id(),
         );
         gdb.instance_bits = ledger.instance_bits();
+        gdb.commit_id = ledger.head_commit_id.clone();
+        let basis = own_basis(ledger);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
         // Extract binary_store from LedgerState's TypeErasedStore
@@ -392,7 +426,10 @@ impl GraphDb {
             view.snapshot.ledger_id.as_str(),
         );
         gdb.instance_bits = view.instance_bits();
+        gdb.fence = view.fence();
+        gdb.erasure_generation = view.erasure_generation();
         gdb.runtime_small_dicts = view.runtime_small_dicts().cloned();
+        gdb.historical = true;
         gdb
     }
 }
@@ -488,6 +525,9 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
+        let basis = own_basis(base);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.dict_novelty = Some(dict_novelty);
         gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
@@ -522,6 +562,9 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
+        let basis = own_basis(base);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.runtime_small_dicts = Some(base.runtime_small_dicts.clone());
         // Carry binary store from the base ledger state
         gdb.binary_store = base
@@ -552,6 +595,9 @@ impl GraphDb {
     pub fn as_of(mut self, t: i64) -> Self {
         if self.t != t {
             self.clear_config_resolution();
+        }
+        if t < self.t {
+            self.historical = true;
         }
         self.t = t;
         self
@@ -602,6 +648,129 @@ impl GraphDb {
 }
 
 // ============================================================================
+// Read state
+// ============================================================================
+
+/// The state a single-graph query read, kept on its result so a crawl
+/// renders from that state under the policy that judged the rows, whichever
+/// view the result is formatted with.
+///
+/// It holds the handles of a [`GraphDb`] that reading takes and none of its
+/// configuration, so carrying it costs a result a few reference counts: every
+/// query pays for it.
+#[derive(Clone)]
+pub struct ReadView {
+    /// The snapshot the query read: a served generation's, or the view's.
+    pub snapshot: Arc<LedgerSnapshot>,
+    /// The overlay the query read, with any derived facts merged over it.
+    pub overlay: Arc<dyn OverlayProvider>,
+    pub t: i64,
+    pub graph_id: GraphId,
+    novelty: Option<Arc<Novelty>>,
+    policy: Option<Arc<PolicyContext>>,
+    policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    binary_store: Option<Arc<BinaryIndexStore>>,
+    dict_novelty: Option<Arc<DictNovelty>>,
+    runtime_small_dicts: Option<Arc<RuntimeSmallDicts>>,
+}
+
+impl ReadView {
+    /// What a query that read `db` as it stands read.
+    pub(crate) fn of(db: &GraphDb) -> Self {
+        Self {
+            snapshot: Arc::clone(&db.snapshot),
+            overlay: Arc::clone(&db.overlay),
+            t: db.t,
+            graph_id: db.graph_id,
+            novelty: db.novelty.clone(),
+            policy: db.policy.clone(),
+            policy_enforcer: db.policy_enforcer.clone(),
+            binary_store: db.binary_store.clone(),
+            dict_novelty: db.dict_novelty.clone(),
+            runtime_small_dicts: db.runtime_small_dicts.clone(),
+        }
+    }
+
+    /// This state read through `overlay` instead.
+    pub(crate) fn reading(mut self, overlay: Arc<dyn OverlayProvider>) -> Self {
+        self.overlay = overlay;
+        self
+    }
+
+    /// A `GraphDbRef` over this state, as [`GraphDb::as_graph_db_ref`].
+    pub fn as_graph_db_ref(&self) -> GraphDbRef<'_> {
+        let db = GraphDbRef::new(&self.snapshot, self.graph_id, &*self.overlay, self.t);
+        match self.runtime_small_dicts.as_deref() {
+            Some(dicts) => db.with_runtime_small_dicts(dicts),
+            None => db,
+        }
+    }
+
+    /// The policy that judged the query's rows, if it ran under one.
+    pub fn policy(&self) -> Option<&PolicyContext> {
+        self.policy.as_deref()
+    }
+
+    /// As [`GraphDb::binary_graph`].
+    pub(crate) fn binary_graph(&self) -> Option<BinaryGraphView> {
+        binary_graph(
+            self.binary_store.as_ref(),
+            self.graph_id,
+            self.dict_novelty.as_ref(),
+            &self.snapshot,
+        )
+    }
+
+    /// Whether `view` reads this state under this policy, so that formatting
+    /// with `view` is formatting with this.
+    pub(crate) fn is(&self, view: &GraphDb) -> bool {
+        fn same<T: ?Sized>(a: &Arc<T>, b: &Arc<T>) -> bool {
+            std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+        }
+        same(&self.snapshot, &view.snapshot)
+            && same(&self.overlay, &view.overlay)
+            && self.t == view.t
+            && self.graph_id == view.graph_id
+            && match (&self.policy, &view.policy) {
+                (None, None) => true,
+                (Some(a), Some(b)) => same(a, b),
+                _ => false,
+            }
+    }
+
+    /// `base` reading this state: its configuration over these handles.
+    pub(crate) fn over(&self, base: &GraphDb) -> GraphDb {
+        let mut view = base.clone();
+        view.snapshot = Arc::clone(&self.snapshot);
+        view.overlay = Arc::clone(&self.overlay);
+        view.t = self.t;
+        view.graph_id = self.graph_id;
+        view.novelty = self.novelty.clone();
+        view.policy = self.policy.clone();
+        view.policy_enforcer = self.policy_enforcer.clone();
+        view.binary_store = self.binary_store.clone();
+        view.dict_novelty = self.dict_novelty.clone();
+        view.runtime_small_dicts = self.runtime_small_dicts.clone();
+        view
+    }
+}
+
+fn binary_graph(
+    store: Option<&Arc<BinaryIndexStore>>,
+    graph_id: GraphId,
+    dict_novelty: Option<&Arc<DictNovelty>>,
+    snapshot: &LedgerSnapshot,
+) -> Option<BinaryGraphView> {
+    store.map(|store| {
+        // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
+        // namespace table; `namespaces().clone()` would deep-copy the whole map
+        // on every query (a dominant per-query cost on large ledgers).
+        BinaryGraphView::with_novelty(Arc::clone(store), graph_id, dict_novelty.cloned())
+            .with_namespace_codes_fallback(Some(snapshot.shared_namespaces()))
+    })
+}
+
+// ============================================================================
 // Binary Store
 // ============================================================================
 
@@ -624,13 +793,12 @@ impl GraphDb {
     /// (novelty-only subjects/strings) resolve via watermark routing instead
     /// of failing against the persisted forward packs.
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
-        self.binary_store.as_ref().map(|store| {
-            // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
-            // namespace table; `namespaces().clone()` would deep-copy the whole map
-            // on every query (a dominant per-query cost on large ledgers).
-            BinaryGraphView::with_novelty(store.clone(), self.graph_id, self.dict_novelty.clone())
-                .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
-        })
+        binary_graph(
+            self.binary_store.as_ref(),
+            self.graph_id,
+            self.dict_novelty.as_ref(),
+            &self.snapshot,
+        )
     }
 }
 
@@ -807,6 +975,24 @@ impl GraphDb {
         self.policy = Some(policy);
         self.policy_enforcer = Some(enforcer);
         self
+    }
+
+    /// This view reading through `overlay`, which merges facts reasoning
+    /// derived over the view's own, under [`Self::with_reasoned_policy`].
+    pub(crate) fn reasoned(&self, overlay: Arc<dyn OverlayProvider>) -> Self {
+        let mut view = self.clone();
+        view.overlay = overlay;
+        view.with_reasoned_policy()
+    }
+
+    /// This view under its policy for a query that reads derived facts:
+    /// class policies select by the subject's reasoned classes. The policy
+    /// and its enforcer change together; a view without one is unchanged.
+    pub(crate) fn with_reasoned_policy(self) -> Self {
+        match self.policy.clone() {
+            Some(policy) => self.with_policy(Arc::new(policy.for_reasoned_query())),
+            None => self,
+        }
     }
 
     /// Remove policy enforcement from the view.

@@ -224,7 +224,10 @@ pub(crate) fn receipt_to_py<'py>(
     // A transaction that changes nothing writes no commit.
     let written = receipt.flake_count > 0;
     commit.set_item("id", written.then(|| receipt.commit_id.to_string()))?;
-    commit.set_item("digest", written.then(|| receipt.commit_id.digest_hex()))?;
+    commit.set_item(
+        "digest",
+        written.then(|| receipt.commit_id.address_digest()),
+    )?;
     commit.set_item("asserts", receipt.assert_count)?;
     commit.set_item("retracts", receipt.retract_count)?;
     Ok(commit)
@@ -651,7 +654,7 @@ impl Connection {
         commit.set_item("id", report.commit_id.as_ref().map(ToString::to_string))?;
         commit.set_item(
             "digest",
-            report.commit_id.as_ref().map(ContentId::digest_hex),
+            report.commit_id.as_ref().map(ContentId::address_digest),
         )?;
         commit.set_item("asserts", report.asserted)?;
         commit.set_item("retracts", report.retracted)?;
@@ -1172,7 +1175,7 @@ impl Connection {
         commit.set_item("id", report.commit_id.as_ref().map(ToString::to_string))?;
         commit.set_item(
             "digest",
-            report.commit_id.as_ref().map(ContentId::digest_hex),
+            report.commit_id.as_ref().map(ContentId::address_digest),
         )?;
         commit.set_item("asserts", 0)?;
         commit.set_item("retracts", report.retracted)?;
@@ -1202,7 +1205,7 @@ impl Connection {
         let commit = PyDict::new(py);
         commit.set_item("t", result.t)?;
         commit.set_item("id", result.commit_head_id.to_string())?;
-        commit.set_item("digest", result.commit_head_id.digest_hex())?;
+        commit.set_item("digest", result.commit_head_id.address_digest())?;
         commit.set_item("asserts", result.flake_count)?;
         commit.set_item("retracts", 0)?;
         Ok(commit)
@@ -1226,7 +1229,7 @@ fn commit_detail_to_py<'py>(
     let digest = detail
         .id
         .parse::<ContentId>()
-        .map(|cid| cid.digest_hex())
+        .map(|cid| cid.address_digest())
         .map_err(|e| fluree_error(e.to_string()))?;
     commit.set_item("digest", digest)?;
     commit.set_item("asserts", detail.asserts)?;

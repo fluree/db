@@ -451,6 +451,25 @@ impl IdbCache {
         transaction_done(&tx).await
     }
 
+    /// Drop every block and its metadata.
+    pub async fn clear(&self) {
+        let result: Result<(), JsValue> = async {
+            let names = Array::of2(&JsValue::from_str(BLOCKS), &JsValue::from_str(META));
+            let tx = self
+                .db
+                .transaction_with_str_sequence_and_mode(&names, IdbTransactionMode::Readwrite)?;
+            tx.object_store(BLOCKS)?.clear()?;
+            tx.object_store(META)?.clear()?;
+            *self.index.borrow_mut() = CacheIndex::new();
+            self.dirty.borrow_mut().clear();
+            transaction_done(&tx).await
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %js_text(e), "IndexedDB clear failed");
+        }
+    }
+
     /// Write batched last-access timestamps to `meta`.
     pub async fn flush_access_times(&self) {
         let dirty: Vec<(String, f64)> = self.dirty.borrow_mut().drain().collect();

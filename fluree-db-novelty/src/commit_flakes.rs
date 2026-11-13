@@ -21,8 +21,9 @@
 //! - `db#txn` - transaction CID string (xsd:string, optional)
 
 use chrono::DateTime;
+use fluree_db_core::commit_subject::{self, is_commit_sid};
 use fluree_db_core::{Flake, FlakeValue, Sid};
-use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, JSON_LD, XSD};
+use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, XSD};
 use fluree_vocab::{db, xsd_names};
 
 use crate::Commit;
@@ -35,7 +36,7 @@ use crate::Commit;
 /// default graph.
 pub fn stamp_graph_on_commit_flakes(flakes: &mut [Flake], graph_sid: &Sid) {
     for flake in flakes.iter_mut() {
-        if flake.g.is_none() && flake.s.namespace_code == FLUREE_COMMIT {
+        if flake.g.is_none() && is_commit_sid(&flake.s) {
             flake.g = Some(graph_sid.clone());
         }
     }
@@ -65,8 +66,7 @@ pub fn stamp_graph_on_commit_flakes(flakes: &mut [Flake], graph_sid: &Sid) {
 /// restricting to that keeps the check symmetric with the stamp above.
 #[inline]
 pub fn is_forged_commit_flake(flake: &Flake, txn_meta_graph_sid: &Sid) -> bool {
-    flake.s.namespace_code == FLUREE_COMMIT
-        && flake.g.as_ref().is_some_and(|g| g == txn_meta_graph_sid)
+    is_commit_sid(&flake.s) && flake.g.as_ref().is_some_and(|g| g == txn_meta_graph_sid)
 }
 
 /// Stamp generated commit metadata and drop blob-carried forgeries, in one
@@ -90,7 +90,7 @@ pub fn stamp_commit_flakes_dropping_forgeries(
 ) -> usize {
     let mut dropped = 0usize;
     flakes.retain_mut(|flake| {
-        if flake.s.namespace_code != FLUREE_COMMIT {
+        if !is_commit_sid(&flake.s) {
             return true;
         }
         match &flake.g {
@@ -155,9 +155,8 @@ fn iso_to_epoch_ms(iso: &str) -> i64 {
 /// This function creates flakes that represent commit metadata in the index,
 /// enabling efficient queries for commit information and CID-based time travel.
 ///
-/// The commit subject SID uses the CID's SHA-256 digest hex as the local name
-/// within the `FLUREE_COMMIT` namespace, preserving backward compatibility with
-/// SHA-based time travel queries.
+/// The commit subject is [`commit_sid`]: for a SHA2-256 commit, its digest hex
+/// in the `FLUREE_COMMIT` namespace, as SHA-based time travel expects.
 ///
 /// ## Important
 /// This must be safe to call during ledger load/replay. If a commit is missing
@@ -166,12 +165,10 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
     let Some(commit_id) = &commit.id else {
         return Vec::new();
     };
-    let hex = commit_id.digest_hex();
 
     let mut flakes = Vec::with_capacity(10);
 
-    // Build commit subject SID using CID digest hex
-    let commit_sid = Sid::new(FLUREE_COMMIT, &hex);
+    let commit_sid = commit_subject::commit_sid(commit_id);
 
     // Datatype SIDs
     let string_dt = Sid::new(XSD, xsd_names::STRING);
@@ -268,8 +265,7 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
 
     // 8. db#previous (reference to parent commits — one per parent)
     for prev_id in commit.parent_ids() {
-        let prev_hex = prev_id.digest_hex();
-        let prev_sid = Sid::new(FLUREE_COMMIT, &prev_hex);
+        let prev_sid = commit_subject::commit_sid(prev_id);
         flakes.push(Flake::new(
             commit_sid.clone(),
             Sid::new(FLUREE_DB, db::PREVIOUS),
@@ -339,6 +335,7 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
 mod tests {
     use super::*;
     use fluree_db_core::{ContentId, ContentKind};
+    use fluree_vocab::namespaces::FLUREE_COMMIT;
 
     fn make_test_content_id(kind: ContentKind, label: &str) -> ContentId {
         ContentId::new(kind, label.as_bytes())
@@ -417,9 +414,9 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_sid_uses_digest_hex() {
+    fn test_commit_sid_uses_address_digest() {
         let commit_id = make_test_content_id(ContentKind::Commit, "test-data");
-        let expected_hex = commit_id.digest_hex();
+        let expected_hex = commit_id.address_digest();
 
         let mut commit = Commit::new(1, vec![]);
         commit.id = Some(commit_id);

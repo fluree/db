@@ -391,13 +391,14 @@ async fn a_top_level_group_by_points_at_a_subquery() {
     assert!(err.to_string().contains("subquery"), "{err}");
 }
 
-/// Aggregation counts IRIs as stated. OWL 2 RL does not rewrite an asserted
-/// `owl:sameAs` into its aliases' facts, so each alias counts the
-/// transactions stated about it and none is counted twice. If equality
-/// handling ever merges aliases, this test is where the counting semantics
-/// get decided again.
+/// Aggregation counts over the entailed facts. Datalog alone applies no
+/// equality, so each alias counts the transactions stated about it. Under
+/// OWL 2 RL an alias holds every fact of the individual it names (eq-rep-o:
+/// `t1 ex:account acctA` and `acctA owl:sameAs acctB` entail
+/// `t1 ex:account acctB`), so each alias counts both transactions. Each
+/// transaction still counts once per group.
 #[tokio::test]
-async fn same_as_aliases_do_not_inflate_counts() {
+async fn same_as_aliases_count_the_individual_s_facts() {
     let (fluree, ledger) = load(
         "datalog/agg-same-as:main",
         &json!({
@@ -412,7 +413,7 @@ async fn same_as_aliases_do_not_inflate_counts() {
         Storage::NoveltyOnly,
     )
     .await;
-    for reasoning in [json!("datalog"), json!(["owl2rl", "datalog"])] {
+    for (reasoning, aliases) in [(json!("datalog"), 1), (json!(["owl2rl", "datalog"]), 2)] {
         let query = txn_counts_query(json!([{
             "@context": ctx(),
             "where": [["query", {
@@ -428,8 +429,8 @@ async fn same_as_aliases_do_not_inflate_counts() {
         assert_eq!(
             rows(&fluree, &ledger, &query).await,
             vec![
-                json!(["ex:acctA", 1]),
-                json!(["ex:acctB", 1]),
+                json!(["ex:acctA", aliases]),
+                json!(["ex:acctB", aliases]),
                 json!(["ex:acctC", 1])
             ],
             "{reasoning}"

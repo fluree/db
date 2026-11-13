@@ -15,6 +15,7 @@
 pub(crate) mod commit_chain;
 pub(crate) mod dict_extend;
 pub(crate) mod dicts;
+pub(crate) mod erase_dicts;
 pub(crate) mod fulltext;
 pub(crate) mod incremental;
 pub(crate) mod rebuild;

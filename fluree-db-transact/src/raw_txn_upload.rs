@@ -20,42 +20,37 @@
 //! An inline release on a failure path can therefore delete a blob that an
 //! already-published commit references, leaving a permanent dangling
 //! `commit.txn` pointer (observed in production: a retry's Drop-guard delete
-//! landed after the winning attempt's no-op re-put). So a dropped pending
-//! upload only cancels the in-flight task; a blob that already landed is left
-//! in place as an orphan.
+//! landed after the winning attempt's no-op re-put).
 //!
-//! # No reclaim exists yet
-//!
-//! **Nothing currently deletes an orphaned txn blob.** The only collector in
-//! the workspace is `fluree-db-indexer/src/gc/`, and its storage sweep
-//! deliberately excludes this content kind (`gc/sweep.rs` — "Commits,
-//! transactions, and config blobs are deliberately excluded"). The upload is
-//! spawned before staging, so every distinct body that fails validation,
-//! policy, or the novelty cap leaves a blob behind permanently. That is a
-//! known, accepted cost of removing the unsafe inline delete — not a solved
-//! problem.
-//!
-//! Reclaiming them safely needs a collector rooted in the commit chain
-//! (`fluree_db_api::verify_commit_chain` is the root-set walk), and it cannot
-//! simply sweep the `txn/` prefix: the raft queued transactor writes its
-//! in-flight `QueuedRequest` envelopes under `ContentKind::Txn` into the same
-//! per-ledger prefix and releases them itself, so a prefix sweep that only
-//! knows about commit-referenced CIDs would delete live queue entries.
+//! Where a collector runs (the store has a
+//! [`blob_pinner`](fluree_db_core::ContentStore::blob_pinner)), the upload
+//! pins the blob before storing it, the commit path holds the pin through
+//! publication, and a transaction that fails abandons it: the collector
+//! records the blob and deletes it once no commit names it and no writer
+//! pins it. Elsewhere a dropped pending upload only cancels the in-flight
+//! task, and a blob that already landed stays.
 
 use crate::error::Result;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::TransactError;
-use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use fluree_db_core::{BlobPin, ContentId, ContentKind, ContentStore, HashAlgorithm};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
+
+/// A stored body's id, with its pin where the store pins.
+type Uploaded = (ContentId, Option<BlobPin>);
 
 /// A raw-txn upload in flight or completed.
 ///
 /// See module docs for the lifecycle contract.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct PendingRawTxnUpload {
-    handle: Option<JoinHandle<Result<ContentId>>>,
+    handle: Option<JoinHandle<Result<Uploaded>>>,
+    /// The store pins, so a failed transaction sees the upload through.
+    pinned: bool,
+    /// The store's collection intents loaded before the upload stored.
+    intents_loaded: Option<u64>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,27 +59,60 @@ impl PendingRawTxnUpload {
     ///
     /// Serialization of `txn_json` happens inside the task so it doesn't add
     /// latency on the caller's path.
-    pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
+    pub fn spawn(
+        content_store: Arc<dyn ContentStore>,
+        txn_json: serde_json::Value,
+        alg: HashAlgorithm,
+    ) -> Self {
+        let pinner = content_store.blob_pinner();
+        let pinned = pinner.is_some();
+        let intents_loaded = content_store.intents_loaded();
         let handle = tokio::spawn(async move {
             let bytes = serde_json::to_vec(&txn_json)?;
-            let cid = content_store.put(ContentKind::Txn, &bytes).await?;
+            let (cid, pin) = match pinner {
+                Some(pinner) => {
+                    let cid = ContentId::new_with(alg, ContentKind::Txn, &bytes);
+                    let pin = pinner.pin(&cid).await;
+                    if let Err(e) = content_store.put_minted(&cid, &bytes).await {
+                        pin.abandon();
+                        return Err(e.into());
+                    }
+                    (cid, Some(pin))
+                }
+                None => (
+                    content_store
+                        .put_hashed(alg, ContentKind::Txn, &bytes)
+                        .await?,
+                    None,
+                ),
+            };
             tracing::info!(raw_txn_bytes = bytes.len(), raw_txn_cid = %cid, "raw txn stored");
-            Ok::<_, TransactError>(cid)
+            Ok::<_, TransactError>((cid, pin))
         });
         Self {
             handle: Some(handle),
+            pinned,
+            intents_loaded,
         }
     }
 
-    /// Await the upload and return the resulting ContentId.
-    pub async fn finish(mut self) -> Result<ContentId> {
+    /// How many collection intents the store had loaded before the upload
+    /// stored: what a write publishing it presents, at most. See
+    /// [`ContentStore::intents_loaded`].
+    pub fn intents_loaded(&self) -> Option<u64> {
+        self.intents_loaded
+    }
+
+    /// Await the upload: the blob's ContentId, and its pin when the store
+    /// pins, which the caller holds until a commit naming the blob is
+    /// published or abandons.
+    pub async fn finish(mut self) -> Result<Uploaded> {
         let handle = self
             .handle
             .take()
             .expect("handle present until finish/abort");
         match handle.await {
-            Ok(Ok(cid)) => Ok(cid),
-            Ok(Err(e)) => Err(e),
+            Ok(result) => result,
             Err(join_err) => Err(TransactError::RawTxnUpload(format!(
                 "upload task failed: {join_err}"
             ))),
@@ -95,10 +123,21 @@ impl PendingRawTxnUpload {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for PendingRawTxnUpload {
     fn drop(&mut self) {
-        // Cancel an upload still in flight. A blob that already landed stays
-        // in storage — see the module docs for why it must not be deleted.
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        // The transaction failed. A pinned upload is seen through and its
+        // blob abandoned; an unpinned one is cancelled, and a blob that
+        // already landed stays — see the module docs.
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) if self.pinned => {
+                runtime.spawn(async move {
+                    if let Ok(Ok((_, Some(pin)))) = handle.await {
+                        pin.abandon();
+                    }
+                });
+            }
+            _ => handle.abort(),
         }
     }
 }
@@ -118,28 +157,38 @@ impl std::fmt::Debug for PendingRawTxnUpload {
 /// stored before that, so `abort` and `Drop` have nothing to release.
 #[cfg(target_arch = "wasm32")]
 pub struct PendingRawTxnUpload {
-    deferred: Option<(Arc<dyn ContentStore>, serde_json::Value)>,
+    deferred: Option<(Arc<dyn ContentStore>, serde_json::Value, HashAlgorithm)>,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl PendingRawTxnUpload {
     /// Defer the upload (same signature as the native spawn; see type docs).
-    pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
+    pub fn spawn(
+        content_store: Arc<dyn ContentStore>,
+        txn_json: serde_json::Value,
+        alg: HashAlgorithm,
+    ) -> Self {
         Self {
-            deferred: Some((content_store, txn_json)),
+            deferred: Some((content_store, txn_json, alg)),
         }
     }
 
-    /// Run the upload now and return the resulting ContentId.
-    pub async fn finish(mut self) -> Result<ContentId> {
-        let (store, txn_json) = self
+    /// Nothing collects here.
+    pub fn intents_loaded(&self) -> Option<u64> {
+        None
+    }
+
+    /// Run the upload now and return the resulting ContentId. Nothing
+    /// collects here, so there is no pin.
+    pub async fn finish(mut self) -> Result<Uploaded> {
+        let (store, txn_json, alg) = self
             .deferred
             .take()
             .expect("deferred inputs present until finish/abort");
         let bytes = serde_json::to_vec(&txn_json)?;
-        let cid = store.put(ContentKind::Txn, &bytes).await?;
+        let cid = store.put_hashed(alg, ContentKind::Txn, &bytes).await?;
         tracing::info!(raw_txn_bytes = bytes.len(), "raw txn stored");
-        Ok(cid)
+        Ok((cid, None))
     }
 
     /// Nothing has been stored yet; just drop the deferred inputs.
@@ -154,5 +203,61 @@ impl std::fmt::Debug for PendingRawTxnUpload {
         f.debug_struct("PendingRawTxnUpload")
             .field("pending", &self.deferred.is_some())
             .finish()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use fluree_db_core::ContentBytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    /// A store that does not pin, whose writes wait for a permit.
+    #[derive(Debug)]
+    struct Gated {
+        permits: Semaphore,
+        landed: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for Gated {
+        async fn has(&self, _: &ContentId) -> fluree_db_core::Result<bool> {
+            Ok(false)
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<ContentBytes> {
+            Err(fluree_db_core::Error::not_found(id.to_string()))
+        }
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            let _permit = self.permits.acquire().await.unwrap();
+            self.landed.fetch_add(1, Ordering::SeqCst);
+            Ok(ContentId::new(kind, bytes))
+        }
+        async fn put_with_id(&self, _: &ContentId, _: &[u8]) -> fluree_db_core::Result<()> {
+            unimplemented!()
+        }
+        async fn release(&self, _: &ContentId) -> fluree_db_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_transaction_cancels_an_upload_nothing_collects() {
+        let store = Arc::new(Gated {
+            permits: Semaphore::new(0),
+            landed: AtomicUsize::new(0),
+        });
+        let pending = PendingRawTxnUpload::spawn(
+            store.clone(),
+            serde_json::json!({"insert": {}}),
+            HashAlgorithm::Sha2_256,
+        );
+        tokio::task::yield_now().await;
+        drop(pending);
+        store.permits.add_permits(1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.landed.load(Ordering::SeqCst), 0);
     }
 }

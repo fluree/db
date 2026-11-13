@@ -2,6 +2,7 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod audit;
 mod bm25;
 mod commits;
 mod context;
@@ -26,6 +27,7 @@ mod pack;
 mod policy_auth;
 mod push;
 pub(crate) mod query;
+mod reasoning_indexes;
 pub(crate) mod serving;
 mod show;
 mod sparql_protocol;
@@ -127,6 +129,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Deletes instance folders nothing references: storage-wide.
         .route("/dropped/sweep", post(ledger::sweep_orphans))
         .route("/reindex", post(ledger::reindex))
+        // Targeted query removal: retracts current occurrences through the
+        // ordered write path and publishes the removal journal, both
+        // leader-coordinated.
+        .route("/remove/*ledger", post(ledger::remove_occurrences_tail))
+        // Permanent erasure: the removal on every branch holding the
+        // occurrences, then proofs in the background.
+        .route("/erase/*ledger", post(ledger::erase_occurrences_tail))
         // Indexes pending commits and compacts the pooled delta, for
         // deployments without a long-running indexer.
         .route("/index", post(ledger::index))
@@ -152,6 +161,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `PublishGraphSource` / `PublishGraphSourceIndex` — so they have to
         // originate on the leader. Listing, inspection, and drop reuse the
         // graph-source fallbacks in `/ledgers`, `/info`, and `/drop`.
+        // Reasoning indexes publish their registrations and generations
+        // through the nameservice, so they originate on the leader.
+        .route(
+            "/reasoning-indexes/register",
+            post(reasoning_indexes::register),
+        )
+        .route("/reasoning-indexes/list", post(reasoning_indexes::list))
+        .route("/reasoning-indexes/retire", post(reasoning_indexes::retire))
+        .route(
+            "/reasoning-indexes/refresh",
+            post(reasoning_indexes::refresh),
+        )
         .route("/bm25/create", post(bm25::bm25_create))
         .route("/bm25/sync", post(bm25::bm25_sync))
         // Wholesale .flpack restore: creates a new ledger from a trusted
@@ -334,6 +355,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Ledger management (read-only)
         .route("/ledgers", get(ledger::list_ledgers))
         .route("/info/*ledger", get(ledger::info_ledger_tail))
+        .route("/retention/*ledger", get(ledger::retention_status_tail))
         .route("/exists/*ledger", get(ledger::exists_ledger_tail))
         .route("/branch/*ledger", get(ledger::list_branches))
         .route("/merge-preview/*ledger", get(ledger::merge_preview))
@@ -398,6 +420,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", get(events::events))
         // Storage proxy endpoints (for peer mode)
         .route("/storage/ns/:alias", get(storage_proxy::get_ns_record))
+        .route(
+            "/storage/config/:alias",
+            get(storage_proxy::get_config_record),
+        )
         .route("/storage/block", post(storage_proxy::get_block))
         .route(
             "/storage/objects/:cid",

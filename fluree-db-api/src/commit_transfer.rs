@@ -27,11 +27,13 @@ use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
 use fluree_db_core::Storage;
+use fluree_db_core::{BlobPinner, Unpublished};
 use fluree_db_core::{ContentAddressedWrite, ContentKind, Flake, GraphId, Sid, TXN_META_GRAPH_ID};
 use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::lifecycle::PendingLedger;
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{
     drop_forged_commit_flakes, generate_commit_flakes, is_forged_commit_flake,
@@ -106,7 +108,15 @@ pub struct RestoreResult {
     pub txn_blobs: usize,
     /// Index artifact blobs ingested (0 for a commits-only archive).
     pub index_artifacts: usize,
-    /// `t` the restored commit head was set to.
+    /// Permanently erased commits received as their erasures.
+    #[serde(default)]
+    pub erased_commits: usize,
+    /// Branches of other ledgers on this storage that held an original
+    /// those erasures erase, and were made to read as the erasures do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconciled: Vec<String>,
+    /// `t` of the restored commit head: the archive's, or the retraction
+    /// of values the lineage has since removed.
     pub commit_t: i64,
     /// `t` the restored index head was set to, when the archive carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,7 +129,9 @@ pub struct RestoreResult {
 /// Mirrors the integrity rules the pull path uses: a commit-v2 blob hashes
 /// over its canonical sub-range (so the digest is derived via
 /// `verify_commit_blob`), while every other content kind is a full-bytes
-/// SHA-256 verified against the CID. Reimplemented here (rather than reusing
+/// SHA-256 verified against the CID. An erased commit's replacement travels
+/// as an erasure frame, so one is never taken as a commit under the hash of
+/// its own bytes. Reimplemented here (rather than reusing
 /// `fluree-db-nameservice-sync::ingest_pack_frame`) so the API lib does not
 /// pull that crate's `reqwest` tree out of dev-dependencies.
 async fn ingest_cas_object<S: ContentAddressedWrite>(
@@ -128,44 +140,33 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
     bytes: &[u8],
     namespace: &StorageNamespace,
 ) -> Result<()> {
-    use fluree_db_core::commit::codec::verify_commit_blob;
-
     let kind = cid
         .content_kind()
         .ok_or_else(|| ApiError::http(400, format!("unknown content kind for CID {cid}")))?;
 
-    let is_commit_v2 = cid.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(b"FCV2");
-    let integrity_ok = if is_commit_v2 {
-        verify_commit_blob(bytes)
-            .map(|d| d == *cid)
-            .unwrap_or(false)
-    } else {
-        cid.verify(bytes)
-    };
-    if !integrity_ok {
+    if !object_matches(cid, bytes) {
         return Err(ApiError::http(
             400,
             format!("integrity check failed for {cid}"),
         ));
     }
 
-    // Commit-v2 blobs persist under their canonical (sub-range) digest; all
-    // other kinds use the CID digest directly.
-    let digest_hex = if kind == ContentKind::Commit {
-        verify_commit_blob(bytes)
-            .map(|d| d.digest_hex())
-            .map_err(|e| {
-                ApiError::internal(format!("failed to derive commit digest for {cid}: {e}"))
-            })?
-    } else {
-        cid.digest_hex()
-    };
-
+    // Verified against the CID, so the CID's digest is the object's address.
     storage
-        .content_write_bytes_with_hash(kind, namespace, &digest_hex, bytes)
+        .content_write_bytes_with_hash(kind, namespace, &cid.address_digest(), bytes)
         .await
         .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
     Ok(())
+}
+
+fn object_matches(cid: &ContentId, bytes: &[u8]) -> bool {
+    if cid.codec() != CODEC_FLUREE_COMMIT {
+        cid.verify(bytes)
+    } else if bytes.starts_with(b"FCV2") {
+        fluree_db_core::commit::codec::commit_blob_matches(cid, bytes)
+    } else {
+        !fluree_db_core::commit::codec::replacement::is_replacement(bytes) && cid.verify(bytes)
+    }
 }
 
 impl Serialize for Base64Bytes {
@@ -223,6 +224,73 @@ pub struct PushCommitsRequest {
     /// every such walk.
     #[serde(default)]
     pub merged_commits: Vec<Base64Bytes>,
+    /// The CIDs of `commits`, in order. Naming them keeps the identity of a
+    /// commit minted with a hash other than SHA2-256, which its bytes alone
+    /// do not say; without them each commit's CID is the SHA2-256 of its
+    /// bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_ids: Vec<ContentId>,
+    /// The CIDs of `merged_commits`, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_commit_ids: Vec<ContentId>,
+    /// Pack frames carrying permanently erased commits: their chains,
+    /// latest replacements, receipts and authorizations. An erased commit
+    /// of `commits` or `merged_commits` travels as empty bytes under its
+    /// named CID, and its chain here; so does the chain of an erased commit
+    /// the receiver holds, when it asked for it (see [`ERASURES_NEEDED`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub erasure_frames: Vec<Base64Bytes>,
+    /// Every erased commit of the history the receiver already has, with
+    /// its chain's digest: the receiver asks for the chains it lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_erasures: Vec<BaseErasure>,
+    /// The sender's retention section for the ledger (its removal journal),
+    /// merged into the receiver's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<serde_json::Value>,
+}
+
+impl PushCommitsRequest {
+    /// Whether the push carries removals in its retention section: what a
+    /// receiver that does not take the section loses.
+    pub fn carries_removals(&self) -> bool {
+        self.retention.as_ref().is_some_and(|section| {
+            crate::retention::registry::ArchivedRetention::parse(section)
+                .is_ok_and(|r| !r.journal.removals.is_empty())
+        })
+    }
+}
+
+/// An erased commit a push's receiver already has, as the sender holds its
+/// erasure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseErasure {
+    pub commit: ContentId,
+    /// SHA-256 digest of the chain.
+    pub digest: String,
+    /// The chain's step count: a receiver holding as many is not behind.
+    pub steps: usize,
+}
+
+/// What the principal behind a push may do beyond pushing commits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PushAuthority {
+    /// It may erase (what `POST /erase` needs): push erasures, and removals
+    /// the receiver's journal lacks.
+    pub erasures: bool,
+}
+
+/// How a push's receiver asks for erasure chains it lacks, in the message
+/// of its `409`: this prefix, then a JSON array of the commits' CIDs. A
+/// sender pushes their chains, then the push again (see [`erasures_needed`]
+/// and `Fluree::erasure_pushes`).
+pub const ERASURES_NEEDED: &str = "this server holds erased commits whose erasures it lacks: ";
+
+/// The commits a push's `409` asks erasure chains for, if it does.
+pub fn erasures_needed(message: &str) -> Option<Vec<ContentId>> {
+    let listed = &message[message.find(ERASURES_NEEDED)? + ERASURES_NEEDED.len()..];
+    let end = listed.find(']')?;
+    serde_json::from_str(&listed[..=end]).ok()
 }
 
 /// Response body for a successful push.
@@ -285,6 +353,8 @@ pub struct StagedPush {
     /// Indexing-needed hint carried through to the receipt and the
     /// background indexer trigger.
     pub indexing_status: IndexingStatus,
+    /// Pins on the blobs written, released once the head names them.
+    pub pins: Unpublished,
 }
 
 /// Push precomputed commits to a ledger (transaction server mode).
@@ -299,10 +369,79 @@ impl Fluree {
         opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<PushCommitsResponse> {
+        self.push_commits_with(
+            ledger_id,
+            request,
+            opts,
+            index_config,
+            PushAuthority::default(),
+        )
+        .await
+    }
+
+    /// [`Self::push_commits`], by a principal with `authority`.
+    pub async fn push_commits_with(
+        &self,
+        ledger_id: &str,
+        request: PushCommitsRequest,
+        opts: &GovernanceOptions,
+        index_config: &IndexConfig,
+        authority: PushAuthority,
+    ) -> Result<PushCommitsResponse> {
+        if request.commits.is_empty()
+            && request.merged_commits.is_empty()
+            && (!request.erasure_frames.is_empty()
+                || !request.base_erasures.is_empty()
+                || request.retention.is_some())
+        {
+            return self
+                .push_without_commits(ledger_id, request, index_config, authority)
+                .await;
+        }
         let staged = self
-            .prepare_push(ledger_id, request, opts, index_config)
+            .prepare_push_with(ledger_id, request, opts, index_config, authority)
             .await?;
         self.apply_push(staged).await
+    }
+
+    /// A push of no commits: erasures and the removal journal of history
+    /// `ledger_id` has (see [`Self::receive_pushed_erasures`]).
+    async fn push_without_commits(
+        &self,
+        ledger_id: &str,
+        mut request: PushCommitsRequest,
+        index_config: &IndexConfig,
+        authority: PushAuthority,
+    ) -> Result<PushCommitsResponse> {
+        let id = LedgerId::parse(ledger_id)?;
+        let record = self
+            .nameservice()
+            .lookup(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {id}")))?;
+        // Without history, there is nothing for them to apply to.
+        let Some(head) = record.commit_head_id else {
+            return Err(ApiError::http(400, "missing required field 'commits'"));
+        };
+        self.receive_pushed_erasures(&id, &mut request, authority)
+            .await?;
+        let state = self.ledger(id.as_str()).await?;
+        let head = state.head_commit_id.clone().unwrap_or(head);
+        Ok(PushCommitsResponse {
+            ledger: id.to_string(),
+            accepted: 0,
+            head: PushedHead {
+                t: state.t(),
+                commit_id: head,
+            },
+            indexing: IndexingStatus {
+                enabled: self.indexing_mode.is_enabled() && self.defaults_indexing_enabled(),
+                needed: state.should_reindex(index_config),
+                novelty_size: state.novelty_size(),
+                index_t: state.index_t(),
+                commit_t: state.t(),
+            },
+        })
     }
 
     /// Validate and write the push payload up to (but not including)
@@ -334,10 +473,36 @@ impl Fluree {
         opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<StagedPush> {
+        self.prepare_push_with(
+            ledger_id,
+            request,
+            opts,
+            index_config,
+            PushAuthority::default(),
+        )
+        .await
+    }
+
+    /// [`Self::prepare_push`], by a principal with `authority`. Erased
+    /// history the push carries is taken first, as a pull takes it (see
+    /// [`Self::receive_pushed_erasures`]); the erased commits it brings are
+    /// then validated as their replacements, stored as nothing.
+    pub async fn prepare_push_with(
+        &self,
+        ledger_id: &str,
+        mut request: PushCommitsRequest,
+        opts: &GovernanceOptions,
+        index_config: &IndexConfig,
+        authority: PushAuthority,
+    ) -> Result<StagedPush> {
         if request.commits.is_empty() {
             return Err(ApiError::http(400, "missing required field 'commits'"));
         }
         let ledger_id = &LedgerId::parse(ledger_id)?;
+        // Before the ledger's write lock: reconciling it takes that lock.
+        let erased = self
+            .receive_pushed_erasures(ledger_id, &mut request, authority)
+            .await?;
 
         // 0) Lock ledger state for write (serialize with transactions).
         let mut guard = self
@@ -366,7 +531,7 @@ impl Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&current_record);
 
         // 2) Decode commits and preflight strict sequencing.
-        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
+        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request, &erased)
             .map_err(PushError::into_api_error)?;
 
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
@@ -376,7 +541,9 @@ impl Fluree {
 
         // 2.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
-        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        let merged = decode_merged_commits(&request, &erased).map_err(PushError::into_api_error)?;
+        admit_bundle_hashes(self, decoded.iter().chain(&merged), &request.blobs)
+            .map_err(PushError::into_api_error)?;
         validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
         let content_store = self.branched_content_store(base_state.ledger_id()).await?;
         validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
@@ -653,8 +820,10 @@ impl Fluree {
         }
 
         // 5) Write required blobs and commit bytes to storage. Content
-        //    addressing makes these writes idempotent; orphan blobs on
-        //    a later apply failure are GC fodder.
+        //    addressing makes these writes idempotent; each stays pinned
+        //    until the head names it, and is abandoned to the garbage
+        //    collector if it never does.
+        let mut pins = Unpublished::new();
         let storage = self
             .backend()
             .admin_storage_cloned()
@@ -665,6 +834,7 @@ impl Fluree {
             &request.blobs,
             &decoded,
             &merged,
+            &mut pins,
         )
         .await
         .map_err(PushError::into_api_error)?;
@@ -672,14 +842,23 @@ impl Fluree {
         // Merged-in commits are written first. They are the parents, and a
         // failure part way through then leaves no stored commit whose parent
         // is absent.
-        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
-            .await
-            .map_err(PushError::into_api_error)?;
+        write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &merged,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
-        let stored_commits =
-            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
-                .await
-                .map_err(PushError::into_api_error)?;
+        let stored_commits = write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &decoded,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_head_id = final_head.commit_id.clone();
@@ -719,6 +898,7 @@ impl Fluree {
             write_guard: guard,
             final_state: new_state,
             indexing_status,
+            pins,
         })
     }
 
@@ -741,6 +921,7 @@ impl Fluree {
             mut write_guard,
             final_state,
             indexing_status,
+            pins,
         } = staged;
 
         let new_ref = RefValue {
@@ -752,14 +933,14 @@ impl Fluree {
             .publisher()?
             .compare_and_set_ref_fenced(
                 &ledger,
-                final_state.fence(),
+                final_state.write_basis(),
                 RefKind::CommitHead,
                 Some(&pre_push_head),
                 &new_ref,
             )
             .await?
         {
-            CasResult::Updated => {}
+            CasResult::Updated => pins.published(),
             CasResult::Conflict { actual } => {
                 return Err(ApiError::http(
                     409,
@@ -803,9 +984,81 @@ impl Fluree {
 struct PushCommitDecoded {
     commit: fluree_db_novelty::Commit,
     bytes: Vec<u8>,
-    /// SHA-256 hex digest used for content addressing. For v4 blobs this is
-    /// the hash of the full blob; for v3 it is the embedded trailing hash.
+    id: ContentId,
+    /// The commit's address digest (its CID's, algorithm included).
     digest_hex: String,
+    /// Permanently erased: `bytes` are its replacement, which a published
+    /// erasure stands for, and nothing is stored for it.
+    erased: bool,
+}
+
+/// The CID of a pushed commit: the one the sender names, checked against the
+/// bytes, or else the SHA2-256 of the bytes, all a sender that names none
+/// can have minted. A replacement is refused either way: one is taken only
+/// as a commit this instance holds erased, which callers check first.
+fn pushed_commit_id(
+    named: Option<&ContentId>,
+    bytes: &[u8],
+    what: &str,
+) -> std::result::Result<ContentId, PushError> {
+    if fluree_db_core::commit::codec::replacement::is_replacement(bytes) {
+        return Err(PushError::Invalid(format!(
+            "{what}: an erased commit's replacement, which no proof here covers"
+        )));
+    }
+    match named {
+        Some(id) if fluree_db_core::commit::codec::commit_blob_matches(id, bytes) => Ok(id.clone()),
+        Some(id) => Err(PushError::Invalid(format!(
+            "{what}: the bytes do not match the named CID {id}"
+        ))),
+        None => Ok(ContentId::new(ContentKind::Commit, bytes)),
+    }
+}
+
+/// Refuse a bundle holding content `fluree` does not admit (see
+/// [`Fluree::admits_content_id`]): its commits, the parents and
+/// transactions they reference, and the blobs riding with them.
+fn admit_bundle_hashes<'a>(
+    fluree: &Fluree,
+    commits: impl IntoIterator<Item = &'a PushCommitDecoded>,
+    blobs: &HashMap<String, Base64Bytes>,
+) -> std::result::Result<(), PushError> {
+    let refuse = |id: &ContentId| {
+        if fluree.admits_content_id(id) {
+            Ok(())
+        } else {
+            Err(PushError::Invalid(format!(
+                "{id} is not hashed with SHA2-256, the only hash this cluster admits"
+            )))
+        }
+    };
+    for decoded in commits {
+        refuse(&decoded.id)?;
+        for id in decoded.commit.parents.iter().chain(&decoded.commit.txn) {
+            refuse(id)?;
+        }
+    }
+    for key in blobs.keys() {
+        if let Ok(id) = key.parse::<ContentId>() {
+            refuse(&id)?;
+        }
+    }
+    Ok(())
+}
+
+/// The CIDs named for `count` pushed commits, if the sender named them.
+fn named_ids<'a>(
+    ids: &'a [ContentId],
+    count: usize,
+    what: &str,
+) -> std::result::Result<Option<&'a [ContentId]>, PushError> {
+    match ids.len() {
+        0 => Ok(None),
+        n if n == count => Ok(Some(ids)),
+        n => Err(PushError::Invalid(format!(
+            "{what} names {n} CIDs for {count} commits"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1016,31 +1269,46 @@ fn validate_graph_drop_targets(
 fn decode_and_validate_commit_chain(
     _ledger_id: &str,
     request: &PushCommitsRequest,
+    erased: &HashSet<ContentId>,
 ) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
     let mut out = Vec::with_capacity(request.commits.len());
 
     let mut prev_t: Option<i64> = None;
     let mut prev_hash: Option<String> = None;
+    let ids = named_ids(&request.commit_ids, request.commits.len(), "commit_ids")?;
 
     for (idx, b64) in request.commits.iter().enumerate() {
         let bytes = b64.0.clone();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
 
+        let named = ids.map(|ids| &ids[idx]);
+        let is_erased = named.is_some_and(|id| erased.contains(id));
+
         // Reject empty commits (no flakes) - keep semantics clear. A merge
         // commit is exempt: it records the merge even when the strategy
         // resolved every flake away, and dropping it would let the same
-        // branch be merged again. So is a commit that drops graphs: the drop
-        // is its change, and it retracts nothing.
-        if commit.flakes.is_empty() && commit.parents.len() < 2 && commit.graph_drops.is_empty() {
+        // branch be merged again. So is a commit that drops graphs (the drop
+        // is its change, and it retracts nothing), a commit recording only
+        // transaction metadata (an erasure's authorization), and an erased
+        // commit, all of whose operations an erasure may have removed.
+        if commit.flakes.is_empty()
+            && commit.txn_meta.is_empty()
+            && commit.parents.len() < 2
+            && commit.graph_drops.is_empty()
+            && !is_erased
+        {
             return Err(PushError::Invalid(format!(
                 "invalid commit[{idx}]: empty commit (no flakes)"
             )));
         }
 
-        // Derive the content digest hex for addressing.
-        // V4: CID = SHA-256(full blob). No embedded hash to verify.
-        let digest_hex = fluree_db_core::sha256_hex(&bytes);
+        let id = match named {
+            // Its replacement, read from the published erasure.
+            Some(id) if is_erased => id.clone(),
+            _ => pushed_commit_id(named, &bytes, &format!("commit[{idx}]"))?,
+        };
+        let digest_hex = id.address_digest();
 
         // Note: commit blobs are applied to the server-selected `ledger_id` via CAS.
         // We do not currently enforce a ledger identity embedded inside the commit bytes.
@@ -1066,7 +1334,7 @@ fn decode_and_validate_commit_chain(
             let ok = commit
                 .parents
                 .first()
-                .is_some_and(|r| r.digest_hex() == *prev_hash_hex);
+                .is_some_and(|r| r.address_digest() == *prev_hash_hex);
             if !ok {
                 return Err(PushError::Invalid(format!(
                     "commit chain previous mismatch at commit[{idx}]: expected previous digest '{prev_hash_hex}'"
@@ -1080,7 +1348,9 @@ fn decode_and_validate_commit_chain(
         out.push(PushCommitDecoded {
             commit,
             bytes,
+            id,
             digest_hex,
+            erased: is_erased,
         });
     }
 
@@ -1095,7 +1365,13 @@ fn decode_and_validate_commit_chain(
 /// them.
 fn decode_merged_commits(
     request: &PushCommitsRequest,
+    erased: &HashSet<ContentId>,
 ) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
+    let ids = named_ids(
+        &request.merged_commit_ids,
+        request.merged_commits.len(),
+        "merged_commit_ids",
+    )?;
     request
         .merged_commits
         .iter()
@@ -1105,11 +1381,19 @@ fn decode_merged_commits(
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
             refuse_merged_graph_drops(&commit, &format!("merged_commits[{idx}]"))?;
-            let digest_hex = fluree_db_core::sha256_hex(&bytes);
+            let named = ids.map(|ids| &ids[idx]);
+            let is_erased = named.is_some_and(|id| erased.contains(id));
+            let id = match named {
+                Some(id) if is_erased => id.clone(),
+                _ => pushed_commit_id(named, &bytes, &format!("merged_commits[{idx}]"))?,
+            };
+            let digest_hex = id.address_digest();
             Ok(PushCommitDecoded {
                 commit,
                 bytes,
+                id,
                 digest_hex,
+                erased: is_erased,
             })
         })
         .collect()
@@ -1132,14 +1416,14 @@ fn validate_merged_reachable(
     let mut stack: Vec<String> = chain
         .iter()
         .flat_map(|c| c.commit.parents.iter().skip(1))
-        .map(ContentId::digest_hex)
+        .map(ContentId::address_digest)
         .collect();
     while let Some(digest) = stack.pop() {
         let Some(c) = by_digest.get(digest.as_str()) else {
             continue;
         };
         if reached.insert(c.digest_hex.as_str()) {
-            stack.extend(c.commit.parents.iter().map(ContentId::digest_hex));
+            stack.extend(c.commit.parents.iter().map(ContentId::address_digest));
         }
     }
 
@@ -1177,7 +1461,7 @@ async fn validate_ancestry_present<S: fluree_db_core::ContentStore + ?Sized>(
 
     for c in chain.iter().chain(merged) {
         for parent in &c.commit.parents {
-            if bundled.contains(parent.digest_hex().as_str()) {
+            if bundled.contains(parent.address_digest().as_str()) {
                 continue;
             }
             let present = store
@@ -1273,7 +1557,8 @@ fn validate_required_blobs(
     Ok(())
 }
 
-/// The txn blob CIDs a bundle's commits reference.
+/// The txn blob CIDs a bundle's commits reference. An erased commit's
+/// travels with nothing: it holds what the erasure removed.
 fn required_txn_cids(
     decoded: &[PushCommitDecoded],
     merged: &[PushCommitDecoded],
@@ -1281,6 +1566,7 @@ fn required_txn_cids(
     decoded
         .iter()
         .chain(merged)
+        .filter(|c| !c.erased)
         .filter_map(|c| c.commit.txn.as_ref().map(ToString::to_string))
         .collect()
 }
@@ -1403,11 +1689,15 @@ async fn write_required_blobs<S>(
     provided: &HashMap<String, Base64Bytes>,
     decoded: &[PushCommitDecoded],
     merged: &[PushCommitDecoded],
+    pins: &mut Unpublished,
 ) -> std::result::Result<(), PushError>
 where
     S: Storage + Send + Sync,
 {
     let required = required_txn_cids(decoded, merged);
+    let pinner = storage
+        .blob_pins()
+        .map(|p| BlobPinner::new(p, namespace.clone()));
 
     for addr in &required {
         let txn_id: ContentId = addr
@@ -1435,7 +1725,8 @@ where
 
         // Write using the CID digest to ensure deterministic placement.
         // (digest hex matches the legacy CAS hash during the transition period)
-        let expected_hash = txn_id.digest_hex();
+        let expected_hash = txn_id.address_digest();
+        pins.pin(pinner.as_ref(), &txn_id).await;
         let _res = storage
             .content_write_bytes_with_hash(ContentKind::Txn, namespace, &expected_hash, &bytes)
             .await
@@ -1449,11 +1740,26 @@ async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + 
     storage: &S,
     namespace: &StorageNamespace,
     decoded: &[PushCommitDecoded],
+    pins: &mut Unpublished,
 ) -> std::result::Result<Vec<StoredCommit>, PushError> {
+    let pinner = storage
+        .blob_pins()
+        .map(|p| BlobPinner::new(p, namespace.clone()));
     let mut stored = Vec::with_capacity(decoded.len());
     for (idx, c) in decoded.iter().enumerate() {
+        // Its published erasure stands for it.
+        if c.erased {
+            stored.push(StoredCommit {
+                t: c.commit.t,
+                commit_id: c.id.clone(),
+            });
+            continue;
+        }
+        if let Some(id) = ContentId::from_address_digest(CODEC_FLUREE_COMMIT, &c.digest_hex) {
+            pins.pin(pinner.as_ref(), &id).await;
+        }
         let res = storage
-            .content_write_bytes(ContentKind::Commit, namespace, &c.bytes)
+            .content_write_bytes_with_hash(ContentKind::Commit, namespace, &c.digest_hex, &c.bytes)
             .await
             .map_err(|e| PushError::Internal(e.to_string()))?;
         if res.content_hash != c.digest_hex {
@@ -1462,8 +1768,8 @@ async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + 
                 idx, c.digest_hex, res.content_hash
             )));
         }
-        let commit_id =
-            ContentId::from_hex_digest(CODEC_FLUREE_COMMIT, &c.digest_hex).ok_or_else(|| {
+        let commit_id = ContentId::from_address_digest(CODEC_FLUREE_COMMIT, &c.digest_hex)
+            .ok_or_else(|| {
                 PushError::Internal(format!(
                     "commit[{}]: invalid content hash hex '{}'",
                     idx, c.digest_hex
@@ -1706,6 +2012,41 @@ pub struct ExportCommitsResponse {
     /// [`PushCommitsRequest::merged_commits`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_commits: Vec<Base64Bytes>,
+    /// The CIDs of `commits`, in order (see
+    /// [`PushCommitsRequest::commit_ids`]). A server predating them leaves
+    /// them empty, and each commit's CID is then the SHA2-256 of its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_ids: Vec<ContentId>,
+    /// The CIDs of `merged_commits`, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_commit_ids: Vec<ContentId>,
+}
+
+impl ExportCommitsResponse {
+    /// The CIDs of `commits` and of `merged_commits`, each checked against
+    /// its bytes: the ones the page names, or the SHA2-256 of the bytes on a
+    /// page from a server that names none.
+    pub fn ids(&self) -> Result<(Vec<ContentId>, Vec<ContentId>)> {
+        let resolve = |blobs: &[Base64Bytes], ids: &[ContentId], what: &str| {
+            let ids = named_ids(ids, blobs.len(), what).map_err(PushError::into_api_error)?;
+            blobs
+                .iter()
+                .enumerate()
+                .map(|(idx, b64)| {
+                    pushed_commit_id(ids.map(|ids| &ids[idx]), &b64.0, &format!("{what}[{idx}]"))
+                        .map_err(PushError::into_api_error)
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        Ok((
+            resolve(&self.commits, &self.commit_ids, "commit_ids")?,
+            resolve(
+                &self.merged_commits,
+                &self.merged_commit_ids,
+                "merged_commit_ids",
+            )?,
+        ))
+    }
 }
 
 /// Export a paginated range of commits from a ledger.
@@ -1731,6 +2072,7 @@ impl Fluree {
             .min(EXPORT_MAX_LIMIT);
 
         let ledger_id = handle.id();
+        self.ensure_read_ready(ledger_id).await?;
 
         // Read current head.
         let head_ref = self
@@ -1754,6 +2096,13 @@ impl Fluree {
                 "failed to build branched store for {ledger_id}: {e}"
             ))
         })?;
+
+        // A first page answers for the whole history.
+        #[cfg(feature = "native")]
+        if request.cursor_id.is_none() && request.cursor.is_none() {
+            self.refuse_erased_history(ledger_id, content_store.as_ref(), &head_commit_id)
+                .await?;
+        }
 
         // Determine start cursor CID.
         let start_cid: ContentId = if let Some(cid) = &request.cursor_id {
@@ -1779,6 +2128,7 @@ impl Fluree {
         }
 
         let mut commits = Vec::with_capacity(effective_limit);
+        let mut commit_ids = Vec::with_capacity(effective_limit);
         let mut blobs: HashMap<String, Base64Bytes> = HashMap::new();
         let mut missing_blobs: Vec<String> = Vec::new();
         let mut newest_t: Option<i64> = None;
@@ -1799,6 +2149,7 @@ impl Fluree {
             let raw_bytes = content_store.get(&current_cid).await.map_err(|e| {
                 ApiError::internal(format!("failed to read commit {current_cid}: {e}"))
             })?;
+            refuse_erased(&current_cid, &raw_bytes)?;
 
             // Lightweight decode: header + envelope only (skip ops decompression).
             let header = CommitHeader::read_from(&raw_bytes).map_err(|e| {
@@ -1824,6 +2175,7 @@ impl Fluree {
             oldest_t = Some(t);
 
             commits.push(Base64Bytes(raw_bytes.into_vec()));
+            commit_ids.push(current_cid.clone());
 
             // Collect referenced txn blob via ContentStore. A missing blob is
             // a provenance gap, not a chain break: report it and keep going.
@@ -1877,6 +2229,8 @@ impl Fluree {
             effective_limit,
             lineage: false,
             merged_commits: Vec::new(),
+            commit_ids,
+            merged_commit_ids: Vec::new(),
         })
     }
 }
@@ -1889,13 +2243,14 @@ async fn read_export_commits(
     cids: &[ContentId],
     blobs: &mut HashMap<String, Base64Bytes>,
     missing_blobs: &mut Vec<String>,
-) -> Result<Vec<(i64, Base64Bytes)>> {
+) -> Result<Vec<(i64, ContentId, Base64Bytes)>> {
     let mut out = Vec::with_capacity(cids.len());
     for cid in cids {
         let bytes = store
             .get(cid)
             .await
             .map_err(|e| ApiError::internal(format!("failed to read commit {cid}: {e}")))?;
+        refuse_erased(cid, &bytes)?;
         let envelope = fluree_db_core::commit::codec::read_commit_envelope(&bytes)
             .map_err(|e| ApiError::internal(format!("invalid commit {cid}: {e}")))?;
         if let Some(txn_cid) = &envelope.txn {
@@ -1921,7 +2276,7 @@ async fn read_export_commits(
                 }
             }
         }
-        out.push((envelope.t, Base64Bytes(bytes.into_vec())));
+        out.push((envelope.t, cid.clone(), Base64Bytes(bytes.into_vec())));
     }
     Ok(out)
 }
@@ -1959,16 +2314,21 @@ async fn export_lineage_page(
         ledger: ledger_id.to_string(),
         head_commit_id,
         head_t,
-        newest_t: commits.first().map_or(0, |(t, _)| *t),
-        oldest_t: commits.last().map_or(0, |(t, _)| *t),
+        newest_t: commits.first().map_or(0, |(t, _, _)| *t),
+        oldest_t: commits.last().map_or(0, |(t, _, _)| *t),
         count: commits.len(),
-        commits: commits.into_iter().map(|(_, bytes)| bytes).collect(),
+        commit_ids: commits.iter().map(|(_, id, _)| id.clone()).collect(),
+        commits: commits.into_iter().map(|(_, _, bytes)| bytes).collect(),
         blobs,
         missing_blobs,
         next_cursor_id: page.next,
         effective_limit: limit,
         lineage: true,
-        merged_commits: merged_commits.into_iter().map(|(_, bytes)| bytes).collect(),
+        merged_commit_ids: merged_commits.iter().map(|(_, id, _)| id.clone()).collect(),
+        merged_commits: merged_commits
+            .into_iter()
+            .map(|(_, _, bytes)| bytes)
+            .collect(),
     })
 }
 
@@ -2003,7 +2363,9 @@ impl Fluree {
     ///
     /// Writes commit and txn blobs without validation or novelty updates.
     /// Order doesn't matter — CAS writes are idempotent.
-    /// Call [`set_commit_head`] after all pages are imported.
+    /// Call [`set_commit_head`] after all pages are imported, holding
+    /// [`hold_garbage`](Self::hold_garbage) from before the first page until
+    /// then: nothing names these blobs before it.
     pub async fn import_commits_bulk(
         &self,
         handle: &LedgerHandle,
@@ -2016,13 +2378,28 @@ impl Fluree {
         let mut stored = 0usize;
         let mut blobs_stored = 0usize;
 
-        // Write commit blobs to local CAS (v4: CID = SHA-256 of full blob).
-        // A `lineage` page carries the commits its merges brought in
+        // Write commit blobs to local CAS, each under its CID's address. A
+        // `lineage` page carries the commits its merges brought in
         // separately. Clone stores them like any other.
-        for b64 in response.commits.iter().chain(&response.merged_commits) {
+        let (line_ids, merged_ids) = response.ids()?;
+        let blob_ids = response
+            .blobs
+            .keys()
+            .filter_map(|cid| cid.parse::<ContentId>().ok())
+            .collect::<Vec<_>>();
+        for id in line_ids.iter().chain(&merged_ids).chain(&blob_ids) {
+            self.admit_content_id(id)?;
+        }
+        let all = response.commits.iter().chain(&response.merged_commits);
+        for (id, b64) in line_ids.iter().chain(&merged_ids).zip(all) {
             let bytes = &b64.0;
             storage
-                .content_write_bytes(ContentKind::Commit, &namespace, bytes)
+                .content_write_bytes_with_hash(
+                    ContentKind::Commit,
+                    &namespace,
+                    &id.address_digest(),
+                    bytes,
+                )
                 .await
                 .map_err(|e| ApiError::internal(format!("failed to write commit blob: {e}")))?;
             stored += 1;
@@ -2051,7 +2428,7 @@ impl Fluree {
                     format!("txn CID does not match provided bytes: {cid_str}"),
                 ));
             }
-            let expected_hash = txn_id.digest_hex();
+            let expected_hash = txn_id.address_digest();
             storage
                 .content_write_bytes_with_hash(ContentKind::Txn, &namespace, &expected_hash, bytes)
                 .await
@@ -2075,10 +2452,11 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
-        let fence = handle.snapshot().await.fence();
+        self.admit_content_id(head_commit_id)?;
+        let basis = handle.snapshot().await.write_basis();
         self.set_ref(
             handle.id(),
-            fence,
+            basis,
             RefKind::CommitHead,
             head_commit_id,
             head_t,
@@ -2091,15 +2469,43 @@ impl Fluree {
     /// Points `IndexHead` at the given CID/t so that the next `ledger()` load
     /// picks up the pulled binary index. `IndexHead` uses `t >= current.t`
     /// monotonic guard (allows equal-t overwrites, unlike `CommitHead`).
+    ///
+    /// Not when this storage holds an erasure of a commit in the ledger's
+    /// history: the sender may have built its index from the original, so
+    /// the ledger builds its own from the replacements. Returns whether the
+    /// index was set.
     pub async fn set_index_head(
         &self,
         handle: &LedgerHandle,
         index_id: &ContentId,
         index_t: i64,
-    ) -> Result<()> {
-        let fence = handle.snapshot().await.fence();
-        self.set_ref(handle.id(), fence, RefKind::IndexHead, index_id, index_t)
-            .await
+    ) -> Result<bool> {
+        self.admit_content_id(index_id)?;
+        // The head the transfer set, which the handle may not hold yet.
+        #[cfg(feature = "native")]
+        if let Some(head) = self
+            .nameservice()
+            .lookup(handle.id())
+            .await?
+            .and_then(|record| record.commit_head_id)
+        {
+            let store = self.branched_content_store(handle.id()).await?;
+            if let Some(erased) = self
+                .erased_in_history(handle.id(), store.as_ref(), &head)
+                .await?
+            {
+                tracing::info!(
+                    ledger = %handle.id(),
+                    %erased,
+                    "a received index is not set: its history holds a commit erased here"
+                );
+                return Ok(false);
+            }
+        }
+        let basis = handle.snapshot().await.write_basis();
+        self.set_ref(handle.id(), basis, RefKind::IndexHead, index_id, index_t)
+            .await?;
+        Ok(true)
     }
 
     /// Point `kind` of `ledger_id`'s record at `id`/`t`, by compare-and-swap
@@ -2107,7 +2513,7 @@ impl Fluree {
     async fn set_ref(
         &self,
         ledger_id: &str,
-        fence: Option<fluree_db_nameservice::Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         id: &ContentId,
         t: i64,
@@ -2119,7 +2525,7 @@ impl Fluree {
         let current_ref = self.publisher()?.get_ref(ledger_id, kind).await?;
         match self
             .publisher()?
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, current_ref.as_ref(), &new_ref)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, current_ref.as_ref(), &new_ref)
             .await?
         {
             CasResult::Updated => Ok(()),
@@ -2162,12 +2568,34 @@ impl Fluree {
     where
         R: tokio::io::AsyncRead + Unpin + Send,
     {
+        // Boxed: moved by value through the scope, it would sit on the
+        // stack once per layer.
+        self.write_scope(Box::pin(self.restore_ledger_scoped(new_ledger_id, reader)))
+            .await
+    }
+
+    /// [`Self::restore_ledger`], in its write scope.
+    async fn restore_ledger_scoped<R>(
+        &self,
+        new_ledger_id: &str,
+        reader: &mut R,
+    ) -> Result<RestoreResult>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
         // Normalize to canonical `name:branch` form up front so the ingest,
         // content-store namespace, head finalization, and rollback all agree —
         // callers may pass a bare `name` (the CLI does), which `create_ledger`
         // would register as `name:main` while raw-id storage writes would land
         // in the wrong namespace.
         let new_ledger_id = LedgerId::parse(new_ledger_id)?;
+
+        // An erasure accepted or published meanwhile would miss the copy.
+        #[cfg(feature = "native")]
+        let _admission = match self.retention.erasure.get() {
+            Some(erasure) => Some(erasure.admission.write().await),
+            None => None,
+        };
 
         // A restore brings in a whole ledger, so it claims the whole name,
         // and nobody sees the ledger until its heads are in place.
@@ -2185,6 +2613,10 @@ impl Fluree {
         };
         if restored.is_err() {
             self.discard_restored(&pending).await;
+        }
+        #[cfg(feature = "native")]
+        if restored.is_ok() {
+            self.sweep_after_restore(new_ledger_id.name()).await;
         }
         restored
     }
@@ -2257,6 +2689,10 @@ impl Fluree {
         let mut txn_blobs = 0usize;
         let mut index_artifacts = 0usize;
         let mut ns_manifest: Option<serde_json::Value> = None;
+        // The genesis commit, which keys the lineage's journal checkpoint.
+        let mut lineage: Option<ContentId> = None;
+        #[cfg(feature = "native")]
+        let mut erasures = crate::retention::erasure::transfer::Received::default();
 
         // Concurrent CAS writer pool. Each future owns its `(cid, payload)` and
         // returns the byte count it frees on completion; errors propagate (and
@@ -2296,11 +2732,20 @@ impl Fluree {
                                             "invalid .flpack: Data frame before Header",
                                         ));
                                     }
+                                    self.admit_content_id(&cid)?;
                                     // Count at dispatch: any write failure aborts the
                                     // whole restore (and rolls it back), so only the
                                     // success path ever returns these counts.
                                     match cid.content_kind() {
-                                        Some(ContentKind::Commit) => commits += 1,
+                                        Some(ContentKind::Commit) => {
+                                            commits += 1;
+                                            if lineage.is_none()
+                                                && fluree_db_core::commit::codec::format::CommitHeader::read_from(&payload)
+                                                    .is_ok_and(|h| h.t == 1)
+                                            {
+                                                lineage = Some(cid.clone());
+                                            }
+                                        }
                                         Some(ContentKind::Txn) => txn_blobs += 1,
                                         _ => index_artifacts += 1,
                                     }
@@ -2345,6 +2790,23 @@ impl Fluree {
                                         400,
                                         format!(".flpack contains error frame: {msg}"),
                                     ));
+                                }
+                                erasure @ (PackFrame::Erasure(_)
+                                | PackFrame::Authorization(_)
+                                | PackFrame::ErasureArtifact { .. }) => {
+                                    if !saw_header {
+                                        return Err(ApiError::http(
+                                            400,
+                                            "invalid .flpack: erasure frame before Header",
+                                        ));
+                                    }
+                                    #[cfg(feature = "native")]
+                                    self.take_erasure_frame(erasure, &mut erasures).await?;
+                                    #[cfg(not(feature = "native"))]
+                                    {
+                                        drop(erasure);
+                                        return Err(cannot_hold_erasures());
+                                    }
                                 }
                                 PackFrame::End => {
                                     ended = true;
@@ -2400,6 +2862,7 @@ impl Fluree {
         // Resolve the head CIDs from the manifest, then verify they were
         // actually ingested before pointing the nameservice at them — a
         // truncated or mismatched archive must not yield a dangling head.
+        // Every part of the manifest is checked before anything acts on it.
         let content = self.content_store(&namespace);
 
         let commit_head_id = manifest
@@ -2409,7 +2872,15 @@ impl Fluree {
         let commit_cid: ContentId = commit_head_id
             .parse()
             .map_err(|e| ApiError::http(400, format!("invalid commit CID in manifest: {e}")))?;
-        if !content.has(&commit_cid).await.unwrap_or(false) {
+        #[cfg(feature = "native")]
+        let erased_commits = erasures.count();
+        #[cfg(not(feature = "native"))]
+        let erased_commits = 0;
+        #[cfg(feature = "native")]
+        let head_erased = erasures.holds(&commit_cid);
+        #[cfg(not(feature = "native"))]
+        let head_erased = false;
+        if !head_erased && !content.has(&commit_cid).await.unwrap_or(false) {
             return Err(ApiError::http(
                 400,
                 format!(".flpack manifest names commit head {commit_cid} that the archive did not contain"),
@@ -2420,9 +2891,90 @@ impl Fluree {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
+        let index_head = match manifest.get("index_head_id").and_then(|v| v.as_str()) {
+            Some(index_cid_str) => {
+                let index_cid: ContentId = index_cid_str.parse().map_err(|e| {
+                    ApiError::http(400, format!("invalid index CID in manifest: {e}"))
+                })?;
+                if erased_commits > 0 {
+                    return Err(ApiError::http(
+                        400,
+                        ".flpack with erased commits names an index, which may hold an erased value",
+                    ));
+                }
+                if !content.has(&index_cid).await.unwrap_or(false) {
+                    return Err(ApiError::http(
+                        400,
+                        format!(".flpack manifest names index head {index_cid} that the archive did not contain"),
+                    ));
+                }
+                let index_t = manifest
+                    .get("index_t")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                Some((index_cid, index_t))
+            }
+            None => None,
+        };
+
+        let default_context = match manifest.get("default_context_id").and_then(|v| v.as_str()) {
+            Some(ctx_cid_str) => {
+                let ctx_cid: ContentId = ctx_cid_str.parse().map_err(|e| {
+                    ApiError::http(400, format!("invalid default_context CID in manifest: {e}"))
+                })?;
+                if !content.has(&ctx_cid).await.unwrap_or(false) {
+                    return Err(ApiError::http(
+                        400,
+                        format!(".flpack manifest names default-context blob {ctx_cid} that the archive did not contain"),
+                    ));
+                }
+                let bytes = content.get(&ctx_cid).await.map_err(|e| {
+                    ApiError::internal(format!(
+                        "failed to read default context blob {ctx_cid}: {e}"
+                    ))
+                })?;
+                let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
+                })?;
+                Some(ctx_json)
+            }
+            None => None,
+        };
+
+        // The archive's journal, and what the lineage has suppressed since.
+        let archived = manifest
+            .get("retention")
+            .map(crate::retention::registry::ArchivedRetention::parse)
+            .transpose()?;
+
+        // Erased commits read as their replacements once their erasures are
+        // in, which is before anything reads the history.
+        #[cfg(feature = "native")]
+        let received = match erased_commits {
+            0 => None,
+            _ => {
+                let journal = archived.as_ref().map(|a| &a.journal);
+                Some(
+                    self.receive_erasures(
+                        erasures,
+                        crate::retention::erasure::transfer::Receiver::Restored(new_ledger_id),
+                        &namespace,
+                        content.as_ref(),
+                        &commit_cid,
+                        journal,
+                    )
+                    .await?,
+                )
+            }
+        };
+        #[cfg(feature = "native")]
+        if let Some(genesis) = received.as_ref().and_then(|r| r.genesis.clone()) {
+            lineage.get_or_insert(genesis);
+        }
+
         self.set_ref(
             new_ledger_id,
-            record.fence,
+            record.write_basis(),
             RefKind::CommitHead,
             &commit_cid,
             commit_t,
@@ -2430,21 +2982,7 @@ impl Fluree {
         .await?;
 
         let mut index_t_out = None;
-        if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
-            let index_cid: ContentId = index_cid_str
-                .parse()
-                .map_err(|e| ApiError::http(400, format!("invalid index CID in manifest: {e}")))?;
-            if !content.has(&index_cid).await.unwrap_or(false) {
-                return Err(ApiError::http(
-                    400,
-                    format!(".flpack manifest names index head {index_cid} that the archive did not contain"),
-                ));
-            }
-            let index_t = manifest
-                .get("index_t")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-
+        if let Some((index_cid, index_t)) = index_head {
             // The FIR6 index root embeds the *source* ledger_id as an inline
             // identity field. Loading it under a new name trips
             // `apply_loaded_db`'s identity check ("Index ledger_id '<src>' does
@@ -2482,19 +3020,22 @@ impl Fluree {
                                 "failed to write re-stamped index root: {e}"
                             ))
                         })?;
-                    ContentId::from_hex_digest(ContentKind::IndexRoot.to_codec(), &res.content_hash)
-                        .ok_or_else(|| {
-                            ApiError::internal(format!(
-                                "re-stamped index root produced an invalid content hash '{}'",
-                                res.content_hash
-                            ))
-                        })?
+                    ContentId::from_address_digest(
+                        ContentKind::IndexRoot.to_codec(),
+                        &res.content_hash,
+                    )
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "re-stamped index root produced an invalid content hash '{}'",
+                            res.content_hash
+                        ))
+                    })?
                 }
             };
 
             self.set_ref(
                 new_ledger_id,
-                record.fence,
+                record.write_basis(),
                 RefKind::IndexHead,
                 &head_index_cid,
                 index_t,
@@ -2504,37 +3045,43 @@ impl Fluree {
         }
 
         // Restore the ledger's stored default JSON-LD context, if the archive
-        // carried one. The blob was ingested above; re-point the new ledger's
-        // config at it so queries that omit an inline @context keep working.
-        if let Some(ctx_cid_str) = manifest.get("default_context_id").and_then(|v| v.as_str()) {
-            let ctx_cid: ContentId = ctx_cid_str.parse().map_err(|e| {
-                ApiError::http(400, format!("invalid default_context CID in manifest: {e}"))
-            })?;
-            if !content.has(&ctx_cid).await.unwrap_or(false) {
-                return Err(ApiError::http(
-                    400,
-                    format!(".flpack manifest names default-context blob {ctx_cid} that the archive did not contain"),
-                ));
-            }
-            let bytes = content.get(&ctx_cid).await.map_err(|e| {
-                ApiError::internal(format!(
-                    "failed to read default context blob {ctx_cid}: {e}"
-                ))
-            })?;
-            let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
-            })?;
-            // Re-points config + bumps configV via the standard CAS path; the
-            // re-put of the (content-addressed) blob is idempotent.
+        // carried one: re-point the new ledger's config at it so queries that
+        // omit an inline @context keep working. Re-points config + bumps
+        // configV via the standard CAS path; the re-put of the
+        // (content-addressed) blob is idempotent.
+        if let Some(ctx_json) = default_context {
             self.push_default_context(record, &ctx_json).await?;
         }
+        let retracted_t = self
+            .restore_retention(
+                record,
+                archived,
+                lineage.as_ref(),
+                std::slice::from_ref(record),
+                false,
+            )
+            .await?;
+        #[cfg(feature = "native")]
+        let reconciled = match received {
+            Some(received) => {
+                let head_t = retracted_t.unwrap_or(commit_t);
+                self.record_received_jobs(record, head_t, received.jobs, received.pending)
+                    .await?;
+                received.reconciled
+            }
+            None => Vec::new(),
+        };
+        #[cfg(not(feature = "native"))]
+        let reconciled = Vec::new();
 
         Ok(RestoreResult {
             ledger_id: new_ledger_id.to_string(),
             commits,
             txn_blobs,
             index_artifacts,
-            commit_t,
+            erased_commits,
+            reconciled,
+            commit_t: retracted_t.unwrap_or(commit_t),
             index_t: index_t_out,
         })
     }
@@ -2544,16 +3091,22 @@ impl Fluree {
     /// Validates the commit chain, verifies ancestry against the local head,
     /// writes blobs to CAS, advances `CommitHead`, and updates in-memory novelty.
     ///
-    /// `commits` must be ordered oldest → newest. `merged_commits` carries
-    /// the commits that merges in `commits` brought in, parents before
-    /// children. See [`PushCommitsRequest::merged_commits`].
+    /// `bundle.commits` must be ordered oldest → newest. `merged_commits`
+    /// carries the commits that merges in `commits` brought in, parents
+    /// before children. See [`PushCommitsRequest::merged_commits`].
     pub async fn import_commits_incremental(
         &self,
         ledger_id: &str,
-        commits: Vec<Base64Bytes>,
-        merged_commits: Vec<Base64Bytes>,
-        blobs: HashMap<String, Base64Bytes>,
+        bundle: PushCommitsRequest,
     ) -> Result<CommitImportResult> {
+        let PushCommitsRequest {
+            commits,
+            blobs,
+            merged_commits,
+            commit_ids,
+            merged_commit_ids,
+            ..
+        } = bundle;
         if commits.is_empty() {
             return Err(ApiError::http(400, "no commits to import"));
         }
@@ -2583,10 +3136,14 @@ impl Fluree {
             blobs: blobs.clone(),
             missing_blobs: Vec::new(),
             merged_commits,
+            commit_ids,
+            merged_commit_ids,
+            ..Default::default()
         };
 
-        // 3) Decode and validate chain.
-        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
+        // 3) Decode and validate chain. The export carries no erased commit.
+        let none = HashSet::new();
+        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request, &none)
             .map_err(PushError::into_api_error)?;
 
         // 4) Ancestry preflight: verify first commit's parent matches local head.
@@ -2599,7 +3156,9 @@ impl Fluree {
 
         // 4.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
-        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        let merged = decode_merged_commits(&request, &none).map_err(PushError::into_api_error)?;
+        admit_bundle_hashes(self, decoded.iter().chain(&merged), &request.blobs)
+            .map_err(PushError::into_api_error)?;
         validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
         let content_store = self.branched_content_store(base_state.ledger_id()).await?;
         validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
@@ -2611,6 +3170,7 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         // 6) Write blobs + commit bytes to local CAS.
+        let mut pins = Unpublished::new();
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
             ApiError::config("push_commits_strict requires a managed storage backend")
         })?;
@@ -2620,19 +3180,29 @@ impl Fluree {
             &request.blobs,
             &decoded,
             &merged,
+            &mut pins,
         )
         .await
         .map_err(PushError::into_api_error)?;
 
         // Parents before children, as in `prepare_push`.
-        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
-            .await
-            .map_err(PushError::into_api_error)?;
+        write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &merged,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
-        let stored_commits =
-            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
-                .await
-                .map_err(PushError::into_api_error)?;
+        let stored_commits = write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &decoded,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_ref = RefValue {
@@ -2674,14 +3244,14 @@ impl Fluree {
             .publisher()?
             .compare_and_set_ref_fenced(
                 new_state.ledger_id(),
-                new_state.fence(),
+                new_state.write_basis(),
                 RefKind::CommitHead,
                 Some(&current_ref),
                 &new_ref,
             )
             .await?
         {
-            CasResult::Updated => {}
+            CasResult::Updated => pins.published(),
             CasResult::Conflict { actual } => {
                 return Err(ApiError::http(
                     409,
@@ -2728,4 +3298,97 @@ impl Fluree {
             indexing: indexing_status,
         })
     }
+}
+
+#[cfg(not(feature = "native"))]
+impl Fluree {
+    /// Without erasure, a push carrying erased commits is refused.
+    async fn receive_pushed_erasures(
+        &self,
+        _ledger_id: &LedgerId,
+        request: &mut PushCommitsRequest,
+        _authority: PushAuthority,
+    ) -> Result<HashSet<ContentId>> {
+        let erased_commit = request
+            .commits
+            .iter()
+            .chain(&request.merged_commits)
+            .any(|c| c.0.is_empty());
+        if erased_commit || !request.erasure_frames.is_empty() {
+            return Err(cannot_hold_erasures());
+        }
+        Ok(HashSet::new())
+    }
+}
+
+impl Fluree {
+    /// Whether a push may carry the ledger's removal journal, with commits
+    /// or without: a cluster replicates its own.
+    pub fn takes_pushed_retention(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            self.retention.replicas.get().is_none()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this instance proves permanent erasures: one with file
+    /// storage and a prover, a single node or a cluster's member, not a
+    /// query peer. Taking erased commits by a transfer is another matter
+    /// ([`Self::can_hold_erasures`]).
+    pub fn can_prove_erasures(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            !self.nameservice_mode().is_read_only()
+                && self
+                    .retention
+                    .erasure
+                    .get()
+                    .is_some_and(|runtime| runtime.config.is_some())
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    }
+
+    /// Whether a transfer may bring this instance permanently erased
+    /// commits: a single node with file storage holds them.
+    pub fn can_hold_erasures(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            self.retention.erasure.get().is_some() && self.retention.replicas.get().is_none()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    }
+}
+
+/// A transfer brought erased commits to an instance that cannot hold them.
+pub(crate) fn cannot_hold_erasures() -> ApiError {
+    ApiError::http(
+        501,
+        "the transfer holds permanently erased commits, which this instance cannot store: \
+         that needs a single node with file storage",
+    )
+}
+
+/// Transfers carry commits as stored, and an erased commit is stored as its
+/// replacement, which no receiver accepts yet: refuse it by name.
+pub(crate) fn refuse_erased(cid: &ContentId, bytes: &[u8]) -> Result<()> {
+    if fluree_db_core::commit::codec::replacement::is_replacement(bytes) {
+        return Err(ApiError::http(
+            501,
+            format!(
+                "commit {cid} is permanently erased; transferring erased commits is not \
+                 supported yet"
+            ),
+        ));
+    }
+    Ok(())
 }

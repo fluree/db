@@ -129,6 +129,28 @@ pub async fn push_index_head(
     push_ref_inner(&state, &alias, RefKind::IndexHead, body).await
 }
 
+/// The answer to a ref push the nameservice refused. A cluster that
+/// collects garbage refuses a commit head no write checked, for good, so a
+/// retry gets the same answer: 501, naming the endpoint that takes commits.
+fn ref_push_error(
+    alias: &str,
+    kind: RefKind,
+    e: fluree_db_nameservice::NameServiceError,
+) -> ServerError {
+    match e {
+        fluree_db_nameservice::NameServiceError::ApplyRejected(why)
+            if kind == RefKind::CommitHead =>
+        {
+            ServerError::not_implemented(format!(
+                "setting a commit head by ref push on a cluster that collects garbage: {why}. \
+                 Push the commits with `POST /v1/fluree/push/{alias}`, which stores and \
+                 checks them in one request"
+            ))
+        }
+        e => ServerError::internal(format!("CAS operation failed: {e}")),
+    }
+}
+
 /// Shared implementation for push_commit_head and push_index_head
 async fn push_ref_inner(
     state: &AppState,
@@ -141,16 +163,17 @@ async fn push_ref_inner(
     })?;
 
     // Remote writers carry no fence yet, so the push presents the branch's
-    // current one: `expected` alone guards it against a concurrent writer.
-    let fence = ns
+    // current basis: `expected` alone guards it against a concurrent writer.
+    let basis = ns
         .lookup(alias)
         .await
         .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
-        .and_then(|record| record.fence);
+        .map(|record| record.write_basis())
+        .unwrap_or_default();
     let result = ns
-        .compare_and_set_ref_fenced(alias, fence, kind, body.expected.as_ref(), &body.new)
+        .compare_and_set_ref_fenced(alias, basis, kind, body.expected.as_ref(), &body.new)
         .await
-        .map_err(|e| ServerError::internal(format!("CAS operation failed: {e}")))?;
+        .map_err(|e| ref_push_error(alias, kind, e))?;
 
     match result {
         CasResult::Updated => {
@@ -249,5 +272,27 @@ pub async fn snapshot(
             ledgers,
             graph_sources: vec![],
         }))
+    }
+}
+
+#[cfg(test)]
+mod ref_push_error_tests {
+    use super::*;
+    use fluree_db_nameservice::NameServiceError;
+
+    #[test]
+    fn a_commit_head_a_collecting_cluster_refuses_is_501_naming_push() {
+        let refused = || NameServiceError::ApplyRejected("outside a write scope".into());
+        let e = ref_push_error("db:main", RefKind::CommitHead, refused());
+        assert_eq!(e.status_code(), axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            e.to_string().contains("POST /v1/fluree/push/db:main"),
+            "{e}"
+        );
+        let e = ref_push_error("db:main", RefKind::IndexHead, refused());
+        assert_eq!(
+            e.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

@@ -697,7 +697,15 @@ async fn a_transferred_write_brings_a_dropped_graph_back() {
         .await
         .expect("export dev's write");
     fluree
-        .import_commits_incremental(main, page.commits, page.merged_commits, page.blobs)
+        .import_commits_incremental(
+            main,
+            fluree_db_api::PushCommitsRequest {
+                commits: page.commits,
+                merged_commits: page.merged_commits,
+                blobs: page.blobs,
+                ..Default::default()
+            },
+        )
         .await
         .expect("import it into main");
 
@@ -751,8 +759,7 @@ async fn transfer(
                 fluree_db_api::PushCommitsRequest {
                     commits,
                     blobs,
-                    missing_blobs: Vec::new(),
-                    merged_commits: Vec::new(),
+                    ..Default::default()
                 },
                 &fluree_db_api::GovernanceOptions::default(),
                 &fluree.default_index_config(),
@@ -761,7 +768,14 @@ async fn transfer(
             .map(|_| ())
     } else {
         fluree
-            .import_commits_incremental(id, commits, Vec::new(), blobs)
+            .import_commits_incremental(
+                id,
+                fluree_db_api::PushCommitsRequest {
+                    commits,
+                    blobs,
+                    ..Default::default()
+                },
+            )
             .await
             .map(|_| ())
     }
@@ -1013,8 +1027,7 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
                     fluree_db_api::PushCommitsRequest {
                         commits: page.commits.clone(),
                         blobs: page.blobs.clone(),
-                        missing_blobs: Vec::new(),
-                        merged_commits: Vec::new(),
+                        ..Default::default()
                     },
                     &fluree_db_api::GovernanceOptions::default(),
                     &fluree.default_index_config(),
@@ -1025,9 +1038,11 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
             fluree
                 .import_commits_incremental(
                     &format!("{name}:pulled"),
-                    page.commits.clone(),
-                    Vec::new(),
-                    page.blobs.clone(),
+                    fluree_db_api::PushCommitsRequest {
+                        commits: page.commits.clone(),
+                        blobs: page.blobs.clone(),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .expect("pull");
@@ -1035,9 +1050,11 @@ async fn push_and_pull_apply_drops_as_the_writer_did() {
                 fluree
                     .import_commits_incremental(
                         &format!("{name}:paged"),
-                        vec![commit.clone()],
-                        Vec::new(),
-                        page.blobs.clone(),
+                        fluree_db_api::PushCommitsRequest {
+                            commits: vec![commit.clone()],
+                            blobs: page.blobs.clone(),
+                            ..Default::default()
+                        },
                     )
                     .await
                     .expect("pull a commit at a time");
@@ -1125,8 +1142,7 @@ async fn a_push_validates_a_commit_after_its_drop() {
             fluree_db_api::PushCommitsRequest {
                 commits: page.commits,
                 blobs: page.blobs,
-                missing_blobs: Vec::new(),
-                merged_commits: Vec::new(),
+                ..Default::default()
             },
             &fluree_db_api::GovernanceOptions::default(),
             &fluree.default_index_config(),
@@ -1196,8 +1212,7 @@ async fn a_push_that_drops_needs_an_identity_without_a_restricting_policy() {
                     fluree_db_api::PushCommitsRequest {
                         commits: page.commits,
                         blobs: page.blobs,
-                        missing_blobs: Vec::new(),
-                        merged_commits: Vec::new(),
+                        ..Default::default()
                     },
                     restricted,
                     &fluree.default_index_config(),

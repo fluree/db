@@ -324,6 +324,18 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// Bulk import does not apply lifetimes: its commits are not marked as
+    /// carrying retention input, so a lifetime in them would never expire
+    /// anything.
+    #[error(
+        "bulk import does not apply lifetimes (f:{predicate}); import the data without \
+         them, then write values that expire with a transaction"
+    )]
+    LifetimeImportUnsupported {
+        /// `ttl` or `expiresAt`.
+        predicate: String,
+    },
+
     /// A SPARQL/builder graph-management transfer (ADD/COPY/MOVE) named a
     /// source graph that has never been registered — a typo'd or never-written
     /// IRI. Per SPARQL 1.1 Update §3.2, ADD/COPY/MOVE from a nonexistent source

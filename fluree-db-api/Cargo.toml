@@ -46,6 +46,9 @@ shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
 graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
+# Entry points for other crates' tests, such as accepting an erasure on a
+# cluster member. Never enabled outside dev-dependencies.
+testing = []
 # Remote search client (HTTP client for remote search service)
 search-remote-client = ["dep:reqwest"]
 # Embedded vector search (HNSW-based approximate nearest neighbor)
@@ -112,6 +115,7 @@ xxhash-rust.workspace = true
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
+ulid = { workspace = true }
 # Fast integer formatting for TSV output (zero-alloc); doubles use the
 # canonical xsd:double writer from fluree-graph-ir
 itoa.workspace = true
@@ -346,6 +350,10 @@ path = "tests/it_reasoning_lane_cache.rs"
 [[test]]
 name = "grp_transact"
 path = "tests/grp_transact.rs"
+
+[[test]]
+name = "grp_retention"
+path = "tests/grp_retention.rs"
 
 # Own binary: installs a process-global tracing subscriber and asserts on every
 # `fluree::cow_probe` event the process emits, so it must not share a process
@@ -689,6 +697,10 @@ name = "it_select_star_deep_crawl_stack"
 path = "tests/it_select_star_deep_crawl_stack.rs"
 
 [[example]]
+name = "reasoning_index_spike"
+required-features = ["native"]
+
+[[example]]
 name = "sql_pushdown_lane_probe"
 required-features = ["sql", "native"]
 
@@ -731,6 +743,10 @@ harness = false
 
 [[bench]]
 name = "transact_commit"
+harness = false
+
+[[bench]]
+name = "content_hash"
 harness = false
 
 [[bench]]
@@ -783,6 +799,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_values_star"
+harness = false
+
+[[bench]]
+name = "query_hot_point_lookup"
 harness = false
 
 [[bench]]
@@ -866,6 +886,12 @@ name = "it_literal_identity"
 path = "tests/it_literal_identity.rs"
 required-features = ["native"]
 
+# Standalone: batched pair-join routing and the process-global fast-path switch.
+[[test]]
+name = "it_batched_pair_join"
+path = "tests/it_batched_pair_join.rs"
+required-features = ["native"]
+
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
 # switch AND asserts membership-join routing via span capture.
 [[test]]
@@ -883,15 +909,23 @@ required-features = ["native"]
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Test hooks: halting a ledger, and building incrementally without fallback.
 fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }
+# A native prover with fake receipts, for erasure workflow tests.
+fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 moka = { workspace = true }
+# Permanent erasure: the redaction transform (to check a request against
+# what the prover will do) and the proof verifier.
+fluree-db-redaction = { path = "../fluree-db-redaction", default-features = false, features = ["host-sha", "c-zstd"] }
+fluree-db-erasure = { path = "../fluree-db-erasure" }
 fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 tokio = { workspace = true }
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
 dirs = "5"
+# Cluster collection: each intent object's nonce.
+rand = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 fluree-db-transact = { path = "../fluree-db-transact" }

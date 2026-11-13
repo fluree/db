@@ -1032,3 +1032,142 @@ async fn incoming_reference_seek_keeps_base_overlay_lifecycle() {
     assert!(old.iter().any(|r| r.contains("drop")), "{old:?}");
     assert!(!old.iter().any(|r| r.contains("added")), "{old:?}");
 }
+
+/// Sorted `?v` values of a one-column query.
+fn column(jsonld: &Value) -> Vec<String> {
+    let mut v: Vec<String> = jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| match r {
+            Value::Array(cols) => cols[0].to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A probe pinning subject and predicate translates that predicate's novelty
+/// alone, and a reference object that object's alone, while keeping the op
+/// that cancels a base row. SPARQL and JSON-LD reach the same scan.
+#[tokio::test(flavor = "current_thread")]
+async fn bound_subject_window_narrows_to_predicate_and_reference() {
+    let (fluree, _dir) = new_fluree().await;
+    let ledger = fluree.create_ledger(LEDGER).await.expect("create");
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@graph": [{
+                "@id": "ex:hub",
+                "@type": "ex:Item",
+                "ex:link": [{"@id": "ex:a"}, {"@id": "ex:b"}],
+                "ex:label": "base"
+            }]}),
+        )
+        .await
+        .expect("seed");
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("index");
+    let indexed = fluree.ledger(LEDGER).await.expect("indexed ledger state");
+    let noise: Vec<Value> = (0..40)
+        .map(|i| json!({"@id": "ex:hub", format!("ex:noise{}", i % 4): i}))
+        .collect();
+    let mut inserts = noise;
+    inserts.push(json!({"@id": "ex:hub", "ex:link": {"@id": "ex:c"}}));
+    let updated = fluree
+        .update(
+            indexed,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:hub", "ex:link": {"@id": "ex:a"}},
+                "insert": inserts
+            }),
+        )
+        .await
+        .expect("novelty")
+        .ledger;
+    let view = crate::support::graphdb_from_ledger(&updated);
+    assert!(
+        view.snapshot.t > 0 && view.t > view.snapshot.t,
+        "fixture must be an indexed base with trailing novelty"
+    );
+
+    let select = |w: Value, var: &str| json!({"@context": ctx(), "select": [var], "where": w});
+    let links_sparql = "PREFIX ex: <http://example.org/>
+        SELECT ?l WHERE { ex:hub ex:link ?l }";
+    let links_jsonld = select(json!({"@id": "ex:hub", "ex:link": "?l"}), "?l");
+    let retracted_sparql = "PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:hub ex:link ex:a ; a ?t }";
+    let retracted_jsonld = select(
+        json!({"@id": "ex:hub", "ex:link": {"@id": "ex:a"}, "@type": "?t"}),
+        "?t",
+    );
+    let untouched_sparql = "PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:hub ex:link ex:b ; a ?t }";
+    let untouched_jsonld = select(
+        json!({"@id": "ex:hub", "ex:link": {"@id": "ex:b"}, "@type": "?t"}),
+        "?t",
+    );
+
+    for (name, input, rows, ops) in [
+        (
+            "s+p sparql",
+            QueryInput::Sparql(links_sparql),
+            vec!["\"ex:b\"", "\"ex:c\""],
+            2usize,
+        ),
+        (
+            "s+p json-ld",
+            QueryInput::JsonLd(&links_jsonld),
+            vec!["\"ex:b\"", "\"ex:c\""],
+            2,
+        ),
+        (
+            "retracted reference sparql",
+            QueryInput::Sparql(retracted_sparql),
+            vec![],
+            1,
+        ),
+        (
+            "retracted reference json-ld",
+            QueryInput::JsonLd(&retracted_jsonld),
+            vec![],
+            1,
+        ),
+        (
+            "untouched reference sparql",
+            QueryInput::Sparql(untouched_sparql),
+            vec!["\"ex:Item\""],
+            0,
+        ),
+        (
+            "untouched reference json-ld",
+            QueryInput::JsonLd(&untouched_jsonld),
+            vec!["\"ex:Item\""],
+            0,
+        ),
+    ] {
+        let (spans, guard) = span_capture::init_test_tracing();
+        let result = fluree.query(&view, input).await.expect(name);
+        let got = column(&result.to_jsonld(&view.snapshot).expect("rows"));
+        let translated: Vec<_> = spans
+            .find_spans("overlay_translate")
+            .iter()
+            .filter(|s| s.fields.get("bounded").map(String::as_str) == Some("true"))
+            .map(|s| s.fields.get("ops_len").cloned().unwrap_or_default())
+            .collect();
+        drop(guard);
+        assert_eq!(got, rows, "{name}");
+        assert!(
+            translated.contains(&ops.to_string()),
+            "{name}: expected a bounded translation of {ops} ops, saw {translated:?}"
+        );
+        assert!(
+            translated.iter().all(|n| n.parse::<usize>().unwrap() < 40),
+            "{name}: a window carried the unrelated novelty: {translated:?}"
+        );
+    }
+}

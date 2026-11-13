@@ -126,6 +126,15 @@ pub(crate) struct NsFileV2 {
     #[serde(rename = "f:fence", default, skip_serializing_if = "Option::is_none")]
     pub fence: Option<Fence>,
 
+    /// The branch's reasoning-indexes document; absent until an index is
+    /// registered.
+    #[serde(
+        rename = "f:reasoningIndexes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_indexes: Option<crate::ReasoningIndexes>,
+
     /// Fields this binary does not know, kept so that rewriting the record
     /// preserves what a newer binary added.
     #[serde(flatten)]
@@ -166,6 +175,7 @@ impl NsFileV2 {
             branch_point: None,
             branches: record.branches,
             fence: record.fence,
+            reasoning_indexes: None,
             extra: Default::default(),
         }
     }
@@ -214,6 +224,8 @@ impl NsFileV2 {
             storage_root: None,
             fence: self.fence,
             frozen: self.status == STATUS_FROZEN,
+            erasure_generation: 0,
+            config_version: self.config_v,
         };
         // READ-TIME merge rule: the index file wins at equal or higher t.
         if let Some(index_data) = index_file.filter(|f| f.fence == record.fence) {
@@ -284,6 +296,14 @@ impl NsFileV2 {
             cid: Some(id.to_string()),
             t: snapshot.index_t,
         });
+    }
+}
+
+/// The index a reset to `snapshot` leaves, written over a newer one.
+pub(crate) fn snapshot_index(snapshot: &crate::NsRecordSnapshot) -> IndexRef {
+    IndexRef {
+        cid: snapshot.index_head_id.as_ref().map(ToString::to_string),
+        t: snapshot.index_t,
     }
 }
 
@@ -461,6 +481,7 @@ mod tests {
             branch_point: None,
             branches: 0,
             fence: None,
+            reasoning_indexes: None,
             extra: Default::default(),
         }
     }

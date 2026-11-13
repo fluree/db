@@ -335,7 +335,9 @@ async fn build_commit_opts(
     };
     if let Some(raw_txn) = raw_txn_from_credential(credential) {
         let content_store = fluree.content_store(&handle.snapshot().await.storage_namespace());
-        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
+        commit_opts = commit_opts
+            .with_content_hash(fluree.content_hash())
+            .with_raw_txn_spawned(content_store, raw_txn);
     }
     commit_opts
 }

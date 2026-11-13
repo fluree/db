@@ -520,7 +520,11 @@ async fn build_direct_fluree(
             .clone()
             .unwrap_or_else(|| PathBuf::from(".fluree/storage"));
         let path_str = path.to_string_lossy().to_string();
-        FlureeBuilder::file(&path_str)
+        let builder = FlureeBuilder::file(&path_str);
+        match config.erasure_config() {
+            Some(erasure) => builder.with_erasure(erasure),
+            None => builder,
+        }
     };
 
     if !config.owns_storage_root() {
@@ -588,7 +592,10 @@ async fn build_direct_fluree(
     // Only the worker that owns catch-up runs its ticks. Under Raft that is
     // the leader-scope worker, which `Server::run` gives its own.
     if config.indexing_enabled && catchup_sweeps == CatchupSweeps::Owned {
-        fluree.start_lifecycle_housekeeping(config.orphan_sweep_interval());
+        fluree.start_maintenance(
+            config.housekeeping_options(),
+            Some(config.retention_options()),
+        );
     }
 
     tracing::info!(

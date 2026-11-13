@@ -248,6 +248,7 @@ impl<'a> ExportBuilder<'a> {
     /// Returns export statistics (triples written, rows skipped).
     pub async fn write_to<W: Write>(self, writer: &mut W) -> Result<ExportStats> {
         self.validate()?;
+        self.fluree.ensure_read_ready(&self.ledger_id).await?;
 
         let ledger = self.fluree.ledger(&self.ledger_id).await?;
 
@@ -281,6 +282,19 @@ impl<'a> ExportBuilder<'a> {
             Some(spec) => time_resolve::resolve_time_spec(&ledger, spec).await?,
             None => ledger.t(),
         };
+        // An export as of an earlier point reads every predicate.
+        if to_t < ledger.t() {
+            self.fluree
+                .refuse_suppressed_history(
+                    &ledger.snapshot.ledger_id,
+                    crate::retention::suppression::HistoricalRead {
+                        to_t,
+                        from_t: None,
+                        reads: || crate::retention::suppression::Reads::Everything,
+                    },
+                )
+                .await?;
+        }
 
         // Resolve the target graph if a specific graph was requested
         let target_graph = if self.graph_iri.is_some() {

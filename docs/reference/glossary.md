@@ -124,6 +124,50 @@ Also called: Upsert mode
 
 Update pattern for targeted modifications: match data (WHERE), remove old data (DELETE), add new data (INSERT).
 
+## Data Lifecycle Terms
+
+See [Data lifecycle](../concepts/data-lifecycle.md) for how these relate.
+
+### TTL (Time to Live)
+
+A lifetime on a value. When it ends, a background worker retracts the value with an ordinary commit. History keeps the value. See [Time to live](../transactions/ttl.md).
+
+### Retention Worker
+
+The background task that expires values, records `f:noHistory` rules and advances erasure jobs. It runs on the node that owns background maintenance: the server, or the Raft leader in a cluster.
+
+### `f:noHistory`
+
+A per-predicate rule in the ledger's config: the index keeps only the predicate's current values. No read is refused. See [History retention](../transactions/history-retention.md#fnohistory).
+
+### Occurrence
+
+One operation of one commit, an assertion or a retraction, named by the commit's ID and the operation's slot. Removals and erasures act on occurrences.
+
+### Targeted Removal
+
+An administrative request that stops the ledger serving selected occurrences, now and in history. The commit log keeps them for audit readers. See [History retention](../transactions/history-retention.md#targeted-removal).
+
+### Removal Journal
+
+A branch's record of its `f:noHistory` rules and removed occurrences, kept in its nameservice record. It never holds a removed value.
+
+### Permanent Erasure
+
+Replacing the commits that hold selected occurrences with redacted copies, under a zero-knowledge proof, then deleting the originals. See [Permanent erasure](../transactions/permanent-erasure.md).
+
+### Prover
+
+`fluree-prover`, the separate binary that makes an erasure's proofs. See [Running the erasure prover](../operations/erasure-prover.md).
+
+### Replacement
+
+The redacted copy of an erased commit. It keeps the original's ID, parents, `t` and surviving operations.
+
+### Purge
+
+The background phase after an erasure is published, which deletes the original commit files and every derived copy of the erased values from the node's storage.
+
 ## Index Terms
 
 ### SPOT Index

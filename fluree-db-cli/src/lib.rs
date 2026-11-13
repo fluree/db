@@ -639,6 +639,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Token { action } => commands::token::run(action),
 
+        Commands::Prover { action } => commands::prover::run(action).await,
+
         Commands::Remote { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::remote::run(action, &fluree_dir).await
@@ -678,9 +680,19 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::sync::run_fetch(&remote, &fluree_dir).await
         }
 
-        Commands::Pull { ledger, no_indexes } => {
+        Commands::Pull {
+            ledger,
+            no_indexes,
+            erasure_authority,
+        } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::sync::run_pull(ledger.as_deref(), no_indexes, &fluree_dir).await
+            commands::sync::run_pull(
+                ledger.as_deref(),
+                no_indexes,
+                erasure_authority,
+                &fluree_dir,
+            )
+            .await
         }
 
         Commands::Push { ledger } => {
@@ -710,6 +722,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             alias,
             no_indexes,
             no_txns,
+            erasure_authority,
         } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             if let Some(origin_uri) = origin {
@@ -724,8 +737,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     token.as_deref(),
                     &args[0],
                     alias.as_deref(),
-                    no_indexes,
-                    no_txns,
+                    commands::sync::OriginCloneOptions {
+                        no_indexes,
+                        no_txns,
+                        erasure_authority,
+                    },
                     &fluree_dir,
                 )
                 .await
@@ -763,6 +779,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Reindex { ledger, remote } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref()).await
+        }
+
+        Commands::ReasoningIndexes { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::reasoning_indexes::run(action, &fluree_dir).await
         }
 
         Commands::Sweep {

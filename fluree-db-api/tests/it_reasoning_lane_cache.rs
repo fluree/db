@@ -6,6 +6,9 @@
 //! tests, a sibling can evict it between two queries; the rebuild starts with
 //! no translations. Its own binary keeps the materializations alive here fewer
 //! than the cache holds.
+//!
+//! What index maintenance leaves in that cache is checked here for the same
+//! reason: an entry a sibling evicted would read as one never made.
 
 #![cfg(feature = "native")]
 
@@ -292,4 +295,70 @@ async fn a_deferred_plan_declining_mid_stream_keeps_every_row() {
         }
     }
     drop(guard);
+}
+
+/// Maintenance computes a closure to write it into a generation. Queries
+/// are then answered from the index, so nothing would read that closure
+/// from the reasoning cache again, where each entry holds a whole closure
+/// in memory: a refresh leaves none there. A query-time run of the same
+/// reasoning does.
+#[tokio::test]
+async fn a_refresh_leaves_no_closure_in_the_reasoning_cache() {
+    use fluree_db_api::RefreshOutcome;
+    let cache = fluree_db_query::reasoning::global_reasoning_cache();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-cache-refresh:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                {"@id": "ex:alice", "@type": "ex:Student"}
+            ]}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let people = json!({"@context": ctx(), "select": "?p", "reasoning": "owl2rl",
+        "where": {"@id": "?p", "@type": "ex:Person"}});
+
+    for program in [
+        json!({"reasoning": "owl2rl"}),
+        json!({"reasoning": "datalog", "rules": [{
+            "@context": ctx(),
+            "where": {"@id": "?s", "@type": "ex:Student"},
+            "insert": {"@id": "?s", "@type": "ex:Person"}
+        }]}),
+    ] {
+        let index = fluree
+            .register_reasoning_index(ledger_id, &program)
+            .await
+            .expect("register");
+        let outcome = fluree
+            .refresh_reasoning_index(ledger_id, &index)
+            .await
+            .expect("refresh");
+        assert!(
+            matches!(outcome, RefreshOutcome::Published { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            !cache.holds_ledger(ledger_id),
+            "the refresh of {program} left its closure in the reasoning cache"
+        );
+    }
+
+    // A commit the indexes have not reached: the query reasons for itself.
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:bob", "@type": "ex:Student"}),
+        )
+        .await
+        .expect("commit");
+    let view = fluree.db(ledger_id).await.expect("view");
+    let rows = query_rows(&fluree, &view, QueryInput::JsonLd(&people)).await;
+    assert_eq!(rows, vec![json!("ex:alice"), json!("ex:bob")]);
+    assert!(cache.holds_ledger(ledger_id));
 }

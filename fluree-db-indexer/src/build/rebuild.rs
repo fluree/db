@@ -39,6 +39,38 @@ fn dedicated_rebuild_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Where `ledger_id`'s rebuilds keep their session directories: a local
+/// scratch directory keyed by the ledger id, not a storage key.
+fn session_root(data_dir: Option<&std::path::Path>, ledger_id: &str) -> std::path::PathBuf {
+    let data_dir = data_dir.map_or_else(
+        || std::env::temp_dir().join("fluree-index"),
+        std::path::Path::to_path_buf,
+    );
+    let ledger_id_path = match fluree_db_core::LedgerId::parse(ledger_id) {
+        Ok(id) => format!("{}/{}", id.name(), id.branch()),
+        Err(_) => ledger_id.replace(':', "/"),
+    };
+    data_dir.join(ledger_id_path)
+}
+
+/// Remove `ledger_id`'s rebuild session directories, under `data_dir` (the
+/// system temp directory when `None`), whose process is no longer running:
+/// a crash's, holding plaintext ledger content. A directory not named for a
+/// process is left alone. Returns how many it removed.
+pub fn clear_rebuild_residue(
+    data_dir: Option<&std::path::Path>,
+    ledger_id: &str,
+) -> std::io::Result<usize> {
+    let root = session_root(data_dir, ledger_id);
+    let mut removed = 0;
+    for kind in ["tmp_import", "index"] {
+        removed += fluree_db_core::process::clear_ended(&root.join(kind), |name| {
+            name.split_once('-')?.0.parse().ok()
+        })?;
+    }
+    Ok(removed)
+}
+
 /// The rebuild's session directories, removed when dropped.
 ///
 /// Both trees hold plaintext ledger content — sorted commit runs, dictionaries,
@@ -109,7 +141,7 @@ where
     rebuild_from_store(commit_store, tracker, ledger_id, record, config)
         .await
         .map(|result| IndexResult {
-            fence: record.fence,
+            basis: record.write_basis(),
             ..result
         })
 }
@@ -134,30 +166,17 @@ where
         .clone()
         .ok_or(IndexerError::NoCommits)?;
 
-    // Determine output directory for binary index artifacts
-    let data_dir = config
-        .data_dir
-        .unwrap_or_else(|| std::env::temp_dir().join("fluree-index"));
-    // A local scratch directory keyed by the ledger id, not a storage key.
-    let ledger_id_path = match fluree_db_core::LedgerId::parse(ledger_id) {
-        Ok(id) => format!("{}/{}", id.name(), id.branch()),
-        Err(_) => ledger_id.replace(':', "/"),
-    };
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let run_dir = data_dir
-        .join(&ledger_id_path)
-        .join("tmp_import")
-        .join(&session_id);
+    let ledger_dir = session_root(config.data_dir.as_deref(), ledger_id);
+    // Named for this process, so another can tell a crash's left behind.
+    let session_id = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    let run_dir = ledger_dir.join("tmp_import").join(&session_id);
     // Scope the staging index dir to this rebuild's session too. Both dirs hold
     // ephemeral, content-addressed artifacts that are read back and uploaded to
     // the ContentStore; the canonical data lives in the CAS afterward. Without
     // the session_id, concurrent rebuilds of the same ledger share one on-disk
     // staging tree and a non-atomic `std::fs::write` can be observed mid-write
     // by the other rebuild's upload read-back, surfacing as a CID mismatch.
-    let index_dir = data_dir
-        .join(&ledger_id_path)
-        .join("index")
-        .join(&session_id);
+    let index_dir = ledger_dir.join("index").join(&session_id);
 
     tracing::info!(
         %head_commit_id,
@@ -390,7 +409,7 @@ where
                 }
 
                 let resolved = shared
-                    .resolve_commit_into_chunk(&bytes, &cid.digest_hex(), &mut chunk)
+                    .resolve_commit_into_chunk(&bytes, &cid.address_digest(), &mut chunk)
                     .map_err(|e| match e {
                         run_index::ResolverError::Unindexable(_) => {
                             IndexerError::Unindexable(format!("commit {cid}: {e}"))
@@ -437,6 +456,20 @@ where
                     fulltext_cursor = fulltext_end;
                     chunks.push(std::mem::take(&mut chunk));
                 }
+            }
+
+            // A reasoning index's derived facts follow the last commit, at its `t`.
+            if let Some(derived) = config.derived_facts.as_deref() {
+                let resolved = shared
+                    .resolve_derived_into_chunk(derived, &mut chunk)
+                    .map_err(|e| match e {
+                        run_index::ResolverError::Unindexable(_) => {
+                            IndexerError::Unindexable(format!("derived facts: {e}"))
+                        }
+                        e => IndexerError::StorageRead(e.to_string()),
+                    })?;
+                total_asserts += resolved.asserts as u64;
+                total_retracts += resolved.retracts as u64;
             }
 
             // Push final chunk if non-empty.
@@ -999,6 +1032,10 @@ where
                     build_progress: None,
                     stage_marker: None,
                     term_builder: None,
+                    history_drop: match build_pool {
+                        Some(_) => shared.pool_history_drop(&config.history_suppression),
+                        None => shared.history_drop_for(&config.history_suppression, g_id),
+                    },
                     pool: build_pool.clone(),
                 };
 
@@ -1472,9 +1509,45 @@ where
 
             drop(_span_v3);
 
-            Ok(result)
+            Ok(IndexResult {
+                retention_input_from_t: shared.retention_input_from_t,
+                ..result
+            })
         })
     })
     .await
     .map_err(|e| IndexerError::from_join("index build task", e))?
+}
+
+#[cfg(all(test, unix))]
+mod residue_tests {
+    use super::clear_rebuild_residue;
+
+    /// A process that has ended.
+    fn ended() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A rebuild's session directory is residue once its process has ended;
+    /// this process's, and one not named for a process, stay.
+    #[test]
+    fn only_sessions_of_ended_processes_are_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("docs/main");
+        let dead = root.join("tmp_import").join(format!("{}-a", ended()));
+        let ours = root.join("index").join(format!("{}-b", std::process::id()));
+        let legacy = root.join("index").join("7c1d0f3e-uuid");
+        for d in [&dead, &ours, &legacy] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        assert_eq!(
+            clear_rebuild_residue(Some(dir.path()), "docs:main").unwrap(),
+            1
+        );
+        assert!(!dead.exists() && ours.exists() && legacy.exists());
+    }
 }

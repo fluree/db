@@ -102,7 +102,17 @@ impl HttpOriginFetcher {
 
         match resp.status().as_u16() {
             200 => {
+                let erased = resp
+                    .headers()
+                    .get("X-Fluree-Content-Kind")
+                    .is_some_and(|kind| kind == fluree_db_core::pack::ERASURE_CONTENT_KIND);
                 let bytes = resp.bytes().await?;
+                if erased {
+                    return Err(SyncError::Erased {
+                        cid: cid_str,
+                        frames: bytes.to_vec(),
+                    });
+                }
                 Ok(bytes.to_vec())
             }
             404 => Err(SyncError::NotFound(cid_str)),
@@ -310,6 +320,7 @@ impl MultiOriginFetcher {
                     }
                     return Ok(bytes);
                 }
+                Err(erased @ SyncError::Erased { .. }) => return Err(erased),
                 Err(e) => {
                     if !matches!(e, SyncError::NotFound(_)) {
                         all_not_found = false;

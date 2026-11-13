@@ -93,6 +93,9 @@ pub(crate) struct CollectedCommitData {
     /// transaction-local numbers), so keys from different commits can
     /// collide while naming different graphs.
     pub(crate) graph_iris: BTreeSet<String>,
+    /// Some commit in the range carries retention input (a merge carries it
+    /// on: its values keep the lifetimes they began with).
+    pub(crate) retention_input: bool,
 }
 
 /// Which direction the new commit applies the range in.

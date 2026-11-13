@@ -138,15 +138,62 @@ pub async fn plan_sweep<S>(
 where
     S: Storage + Clone,
 {
+    plan_sweep_with(storage, backend, root, branches, &[], nested).await
+}
+
+/// Files a namespace keeps outside its `index/` that a sweep also reclaims:
+/// the folders to list, and the ids in them that are live.
+#[derive(Clone, Debug)]
+pub struct ExtraSweepFiles {
+    pub namespace: StorageNamespace,
+    pub folders: Vec<&'static str>,
+    pub live: Vec<ContentId>,
+}
+
+/// [`plan_sweep`], also listing `extra`'s folders and keeping their live
+/// files.
+pub async fn plan_sweep_with<S>(
+    storage: &S,
+    backend: &StorageBackend,
+    root: &StorageRoot,
+    branches: &[BranchIndexHead],
+    extra: &[ExtraSweepFiles],
+    nested: &[StorageNamespace],
+) -> Result<SweepPlan>
+where
+    S: Storage + Clone,
+{
     let method = storage.storage_method().to_string();
 
     // Walking the chains and listing the prefixes touch disjoint storage and
     // neither informs the other, so planning waits for the slower of the two
     // rather than their sum.
-    let (live, scanned) = futures::try_join!(
+    let (mut live, mut scanned) = futures::try_join!(
         live_addresses(backend, &method, branches),
         swept_addresses(storage, &method, root, branches, nested),
     )?;
+    for files in extra {
+        for id in &files.live {
+            let candidates = candidate_addresses(&method, &files.namespace, id);
+            if candidates.is_empty() {
+                return Err(IndexerError::StorageRead(format!(
+                    "cannot locate CID {id} (unrecognised codec {}); refusing to sweep",
+                    id.codec()
+                )));
+            }
+            live.extend(candidates);
+        }
+        for folder in &files.folders {
+            let prefix = format!(
+                "fluree:{method}://{}/{folder}/",
+                files.namespace.branch_prefix()
+            );
+            let listed = storage.list_prefix(&prefix).await.map_err(|e| {
+                IndexerError::StorageRead(format!("cannot list {prefix}: {e}; refusing to sweep"))
+            })?;
+            scanned.extend(listed);
+        }
+    }
 
     // The difference is only sound if the listing names files the way the
     // live set does. A listing in another form (a Windows path's `\` once)

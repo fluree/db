@@ -60,7 +60,7 @@ The CLI fetches this endpoint when a remote is added (`fluree remote add`) to au
 
 The optional `serving` object advertises the server-wide serving capabilities: `query` (the server executes queries) and `blocks` (the storage proxy serves raw replication content, enabling peer/local-compute mode). Per-ledger posture may further restrict either tier — the authoritative per-ledger view is the `serving` array on `GET /v1/fluree/storage/ns/{ledger-id}` responses (see [Query peers](../operations/query-peers.md)).
 
-The optional `push` object advertises push capabilities. `merged_commits: true` means the server implements [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger). The CLI pushes a history containing a merge only to a server that advertises it. A server that omits the object, or whose discovery cannot be read, is treated as not supporting it.
+The optional `push` object advertises push capabilities. `merged_commits: true` means the server implements [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger). The CLI pushes a history containing a merge only to a server that advertises it. `erasures: true` means a push may carry permanently erased commits, and the CLI pushes erased history only to a server that advertises it. A server that omits the object, or whose discovery cannot be read, is treated as not supporting it.
 
 The optional `import` object advertises `.flpack` import capabilities. See [Negotiated upload import](../api/endpoints.md#negotiated-upload-import-import-upload) for its fields. A server that omits it is treated as supporting direct import only.
 

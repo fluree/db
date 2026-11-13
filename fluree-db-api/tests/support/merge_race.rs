@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use fluree_db_core::ContentId;
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, Fence, GraphSourceLookup, GraphSourcePublisher,
@@ -134,6 +135,35 @@ impl ConfigLookup for PausingNameService {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for PausingNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+        self.inner.get_reasoning_indexes(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesPublisher for PausingNameService {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasoningIndexes,
+    ) -> Result<fluree_db_nameservice::ReasoningIndexesCasResult> {
+        self.inner
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.inner.max_reasoning_indexes_bytes()
+    }
+}
+
+#[async_trait]
 impl NameServiceLookup for PausingNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let record = self.inner.lookup(ledger_id).await?;
@@ -163,11 +193,11 @@ impl BranchLifecycle for PausingNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
         self.inner
-            .reset_head_fenced(ledger_id, fence, snapshot)
+            .reset_head_fenced(ledger_id, basis, snapshot)
             .await
     }
 
@@ -189,12 +219,12 @@ impl CommitPublisher for PausingNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, basis, commit_t, commit_id)
             .await
     }
 
@@ -208,7 +238,7 @@ impl IndexPublisher for PausingNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
@@ -222,7 +252,7 @@ impl IndexPublisher for PausingNameService {
             ));
         }
         self.inner
-            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_fenced(ledger_id, basis, index_t, index_id)
             .await
     }
 }
@@ -232,12 +262,12 @@ impl AdminPublisher for PausingNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         self.inner
-            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, basis, index_t, index_id)
             .await
     }
 }
@@ -247,7 +277,7 @@ impl RefPublisher for PausingNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -264,7 +294,7 @@ impl RefPublisher for PausingNameService {
             return Ok(CasResult::Conflict { actual });
         }
         self.inner
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, expected, new)
             .await
     }
 }
@@ -290,9 +320,10 @@ impl GraphSourcePublisher for PausingNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         self.inner
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await
     }
 
@@ -422,6 +453,14 @@ impl fluree_db_nameservice::BranchRecordStore for PausingNameService {
         fence: fluree_db_nameservice::Fence,
     ) -> Result<fluree_db_nameservice::FenceOutcome> {
         self.inner.freeze_record(ledger_id, fence).await
+    }
+
+    async fn thaw_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.thaw_record(ledger_id, fence).await
     }
 
     async fn delete_record(

@@ -56,6 +56,9 @@ pub struct BranchUpdateConfig {
     /// [`BranchUpdateMeta::matched`]. Fact identity is order-independent, so
     /// callers running all four sort orders enable this for one order only.
     pub collect_matched: bool,
+    /// History entries retention leaves out of this graph.
+    pub history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
     /// Pooled tree only: what the update does besides merging novelty.
     pub pool: PoolUpdate,
 }
@@ -155,6 +158,7 @@ where
         novelty_ops,
         superseded,
         superseded_ops,
+        &[],
         config,
         fetch_leaf,
         fetch_sidecar,
@@ -189,6 +193,7 @@ pub fn update_branch_streaming<B, F, G, S>(
     novelty_ops: &[u8],
     superseded: &[RunRecordV2],
     superseded_ops: &[u8],
+    erase: &[RunRecordV2],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -218,6 +223,7 @@ where
         novelty_ops,
         superseded,
         superseded_ops,
+        erase,
         &manifest,
         cmp,
     )?;
@@ -229,7 +235,7 @@ where
     // we run the byte-identical serial loop. Either path produces leaf_entries /
     // replaced-CID lists / sink emissions in ascending manifest index, so the
     // assembled branch bytes (and CID) are bit-identical to the serial version.
-    let touched_count = leaf_slices.iter().filter(|s| !s.novelty.is_empty()).count();
+    let touched_count = leaf_slices.iter().filter(|s| s.touched()).count();
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -257,28 +263,59 @@ fn slice_streams_to_leaves<'a>(
     novelty_ops: &'a [u8],
     superseded: &'a [RunRecordV2],
     superseded_ops: &'a [u8],
+    erase: &'a [RunRecordV2],
     manifest: &BranchManifest,
     cmp: fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
 ) -> io::Result<Vec<StreamSlices<'a>>> {
     let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, manifest, cmp)?;
     let superseded_slices = slice_novelty_to_leaves(superseded, superseded_ops, manifest, cmp)?;
+    let erase_slices = slice_keys_to_leaves(erase, manifest, cmp);
     Ok(novelty_slices
         .into_iter()
         .zip(superseded_slices)
-        .map(|((novelty, novelty_ops), (superseded, superseded_ops))| {
-            debug_assert!(
-                !novelty.is_empty() || superseded.is_empty(),
-                "a leaf without novelty cannot hold superseded events: every \
+        .zip(erase_slices)
+        .map(
+            |(((novelty, novelty_ops), (superseded, superseded_ops)), erase)| {
+                debug_assert!(
+                    !novelty.is_empty() || superseded.is_empty(),
+                    "a leaf without novelty cannot hold superseded events: every \
                      superseded identity routes with its winner"
-            );
-            StreamSlices {
-                novelty,
-                novelty_ops,
-                superseded,
-                superseded_ops,
-            }
-        })
+                );
+                StreamSlices {
+                    novelty,
+                    novelty_ops,
+                    superseded,
+                    superseded_ops,
+                    erase,
+                }
+            },
+        )
         .collect())
+}
+
+/// Slice keys alone to leaves, by the boundaries [`slice_novelty_to_leaves`]
+/// uses.
+fn slice_keys_to_leaves<'a>(
+    keys: &'a [RunRecordV2],
+    manifest: &BranchManifest,
+    cmp: fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
+) -> Vec<&'a [RunRecordV2]> {
+    let n_leaves = manifest.leaves.len();
+    let mut result = Vec::with_capacity(n_leaves);
+    let mut remaining = keys;
+    for i in 0..n_leaves {
+        if i + 1 < n_leaves {
+            let next_first = &manifest.leaves[i + 1].first_key;
+            let split =
+                remaining.partition_point(|rec| cmp(rec, next_first) == std::cmp::Ordering::Less);
+            let (this, rest) = remaining.split_at(split);
+            result.push(this);
+            remaining = rest;
+        } else {
+            result.push(remaining);
+        }
+    }
+    result
 }
 
 /// Which per-leaf CoW drain to run. Split out so tests can force either path and
@@ -442,6 +479,8 @@ fn make_leaf_update_input<'a>(
         leaflet_target_rows: config.leaflet_target_rows,
         leaf_target_rows,
         sidecar_bytes,
+        history_drop: config.history_drop.clone(),
+        rewrite_history: !slices.erase.is_empty(),
         pool: PoolMerge {
             purge: &config.pool.purge,
             tally: config.pool.tally,
@@ -516,7 +555,7 @@ where
 {
     for (i, slices) in leaf_slices.iter().enumerate() {
         let existing = &manifest.leaves[i];
-        if slices.novelty.is_empty() {
+        if !slices.touched() {
             acc.leaf_entries.push(existing.clone());
             continue;
         }
@@ -600,7 +639,7 @@ where
             .zip(&manifest.leaves[i..window_end])
             .enumerate()
         {
-            if slices.novelty.is_empty() {
+            if !slices.touched() {
                 continue;
             }
             let leaf_bytes = fetch_leaf(&existing.leaf_cid)?;
@@ -673,14 +712,16 @@ pub fn touched_leaf_refs(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
+    erase: &[RunRecordV2],
     order: RunSortOrder,
 ) -> io::Result<Vec<(ContentId, Option<ContentId>)>> {
     let manifest = read_branch_from_bytes(existing_branch_bytes)?;
     let cmp = cmp_v2_for_order(order);
     let slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp)?;
+    let erase_slices = slice_keys_to_leaves(erase, &manifest, cmp);
     let mut refs = Vec::new();
-    for (i, (nov_slice, _ops)) in slices.iter().enumerate() {
-        if !nov_slice.is_empty() {
+    for (i, ((nov_slice, _ops), erase)) in slices.iter().zip(&erase_slices).enumerate() {
+        if !nov_slice.is_empty() || !erase.is_empty() {
             let leaf = &manifest.leaves[i];
             refs.push((leaf.leaf_cid.clone(), leaf.sidecar_cid.clone()));
         }
@@ -751,7 +792,7 @@ fn slice_novelty_to_leaves<'a>(
 
 fn compute_branch_cid(bytes: &[u8]) -> ContentId {
     let hex_digest = fluree_db_core::sha256_hex(bytes);
-    ContentId::from_hex_digest(
+    ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
         &hex_digest,
     )
@@ -794,7 +835,7 @@ mod parity_tests {
     ) -> (BranchUpdateMeta, Vec<NewLeafBlob>) {
         let manifest = read_branch_from_bytes(branch_bytes).unwrap();
         let cmp = cmp_v2_for_order(config.order);
-        let slices = slice_streams_to_leaves(novelty, ops, &[], &[], &manifest, cmp).unwrap();
+        let slices = slice_streams_to_leaves(novelty, ops, &[], &[], &[], &manifest, cmp).unwrap();
         let mut blobs: Vec<NewLeafBlob> = Vec::new();
         let meta = drain_branch(
             &manifest,
@@ -874,6 +915,7 @@ mod parity_tests {
             leaflet_target_rows: 50,
             leaf_target_rows: 200,
             collect_matched: false,
+            history_drop: None,
         };
 
         let (serial_meta, serial_blobs) = run_mode(
@@ -975,6 +1017,7 @@ mod parity_tests {
             leaflet_target_rows: 50,
             leaf_target_rows: 200,
             collect_matched: false,
+            history_drop: None,
         };
 
         let serial = run_mode(

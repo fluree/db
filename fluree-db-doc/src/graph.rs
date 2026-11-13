@@ -36,6 +36,8 @@ pub struct ExtractionStamp {
     /// Predicates a reader wrote outside the pipeline's own
     /// ([`reader_predicates`]); recorded so a re-ingest takes back exactly these.
     pub reader_predicates: Vec<String>,
+    /// The named graph an HTTP reader's reading is committed in.
+    pub reading_graph: Option<String>,
 }
 
 /// `{document}-chunk-{n}`. Like the engine's `{document}-element-{n}`, it
@@ -80,6 +82,9 @@ pub fn document_node(
         node[vocab::MENTION_COUNT] = json!(x.mentions);
         node[vocab::ENTITY_COUNT] = json!(x.entities);
         node[vocab::RELATION_COUNT] = json!(x.relations);
+        if let Some(g) = &x.reading_graph {
+            node[vocab::READING_GRAPH] = json!({ "@id": g });
+        }
         if !x.reader_predicates.is_empty() {
             node[vocab::READER_PREDICATE] = x
                 .reader_predicates
@@ -647,6 +652,7 @@ mod tests {
                 entities: 1,
                 relations: 1,
                 reader_predicates: vec!["http://example.org/r#score".into()],
+                reading_graph: Some(format!("{doc_iri}/reading")),
             }),
         );
         let embeddings: Vec<Vec<f32>> = chunks.iter().map(|_| vec![0.0, 1.0, 0.0]).collect();

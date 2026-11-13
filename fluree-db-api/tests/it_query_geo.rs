@@ -441,7 +441,10 @@ async fn spatial_cell_subjects(fluree: &fluree_db_api::Fluree, id: &str) -> Vec<
         .into_iter()
         .chain(&spatial.leaflets)
     {
-        blobs.insert(cid.digest_hex(), store.get(cid).await.unwrap().into_vec());
+        blobs.insert(
+            cid.address_digest(),
+            store.get(cid).await.unwrap().into_vec(),
+        );
     }
     let snapshot =
         fluree_db_spatial::SpatialIndexSnapshot::load_from_cas(spatial_root, move |hash| {

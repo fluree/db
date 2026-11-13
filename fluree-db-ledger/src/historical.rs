@@ -37,7 +37,7 @@ use fluree_db_novelty::{
     generate_commit_flakes, stamp_commit_flakes_dropping_forgeries,
     trace_first_parent_commits_by_id, warn_if_forged_commit_flakes_dropped, Novelty,
 };
-use fluree_vocab::namespaces::{FLUREE_COMMIT, JSON_LD, RDF, XSD};
+use fluree_vocab::namespaces::{JSON_LD, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -90,6 +90,12 @@ pub struct HistoricalLedgerView {
     /// The bits of the instance the view belongs to; see
     /// [`LedgerState::instance_bits`](crate::LedgerState::instance_bits).
     instance_bits: u128,
+    /// Drawn once: the view never changes what its overlay yields.
+    content_version: u64,
+    /// The fence of the branch record it was loaded from.
+    fence: Option<fluree_db_nameservice::Fence>,
+    /// That record's erasure generation.
+    erasure_generation: u64,
 }
 
 impl HistoricalLedgerView {
@@ -193,6 +199,11 @@ impl HistoricalLedgerView {
             }
             None => (LedgerSnapshot::genesis(&record.ledger_id), 0),
         };
+        // An index copied from another branch names that branch, as the head
+        // load re-stamps (see `LedgerState::load`): the view is of this one.
+        if snapshot.ledger_id != record.ledger_id {
+            snapshot.ledger_id = record.ledger_id.clone();
+        }
 
         // Build novelty from commits between index_t and target_t.
         // When we are in overlay-only mode (use_index=false), this replays *all*
@@ -253,6 +264,9 @@ impl HistoricalLedgerView {
                 .as_ref()
                 .and_then(fluree_db_core::StorageRoot::instance_bits)
                 .unwrap_or(0),
+            content_version: fluree_db_core::overlay::next_overlay_content_version(),
+            fence: record.fence,
+            erasure_generation: record.erasure_generation,
         })
     }
 
@@ -336,7 +350,7 @@ impl HistoricalLedgerView {
             // namespace_codes which aren't fully applied until after the walk.
             let deferred_txn_meta = if !commit.txn_meta.is_empty() {
                 commit.id.as_ref().map(|cid| DeferredTxnMeta {
-                    commit_subject: Sid::new(FLUREE_COMMIT, cid.digest_hex()),
+                    commit_subject: fluree_db_core::commit_subject::commit_sid(cid),
                     entries: commit.txn_meta.clone(),
                     t: commit.t,
                 })
@@ -490,6 +504,9 @@ impl HistoricalLedgerView {
             runtime_small_dicts,
             to_t,
             instance_bits: 0,
+            content_version: fluree_db_core::overlay::next_overlay_content_version(),
+            fence: None,
+            erasure_generation: 0,
         }
     }
 
@@ -497,6 +514,18 @@ impl HistoricalLedgerView {
     /// at its name or a view built from components.
     pub fn instance_bits(&self) -> u128 {
         self.instance_bits
+    }
+
+    /// The fence of the branch record the view was loaded from; `None` for
+    /// a view built from components.
+    pub fn fence(&self) -> Option<fluree_db_nameservice::Fence> {
+        self.fence
+    }
+
+    /// The erasure generation of the branch record the view was loaded
+    /// from; 0 for a view built from components.
+    pub fn erasure_generation(&self) -> u64 {
+        self.erasure_generation
     }
 
     /// Get the time bound for this view
@@ -571,6 +600,10 @@ impl OverlayProvider for HistoricalLedgerView {
         self.overlay.as_ref().map(|n| n.epoch).unwrap_or(0)
     }
 
+    fn content_version(&self) -> Option<u64> {
+        Some(self.content_version)
+    }
+
     fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
         self.overlay
             .as_ref()
@@ -616,6 +649,18 @@ mod tests {
         content_store_for, ContentKind, ContentStore, FlakeValue, MemoryStorage, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
+
+    /// A view vouches for what its overlay yields, which never changes: one
+    /// content version for its life, and never another view's, since caches
+    /// keyed on it would otherwise answer for a different state.
+    #[test]
+    fn each_view_has_a_content_version_of_its_own() {
+        let a = HistoricalLedgerView::new(LedgerSnapshot::genesis("test:main"), None, 10);
+        let b = HistoricalLedgerView::new(LedgerSnapshot::genesis("test:main"), None, 10);
+        let version = a.content_version().expect("a view has a content version");
+        assert_eq!(a.content_version(), Some(version));
+        assert_ne!(b.content_version(), Some(version));
+    }
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
         Flake::new(

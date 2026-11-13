@@ -197,8 +197,11 @@ impl ReasoningOps {
              and up to 16 results are cached at once. If the host has memory for it, \
              raise the limit (f:reasoningMaxMemoryMb in ledger config, \"reasoningBudget\" \
              per query, or FLUREE_REASONING_MAX_MEMORY_MB); if not, run fewer reasoning \
-             workloads concurrently or narrow the rules and queries. Reported once per \
-             reasoning result."
+             workloads concurrently, narrow the rules and queries, or register a \
+             reasoning index, whose queries read the persisted derived facts and hold \
+             no result in memory (building one still computes the closure in memory; \
+             \"reasoningFreshness\": \"strict\" keeps a query from reasoning in memory \
+             when no generation can answer it). Reported once per reasoning result."
         );
     }
 }

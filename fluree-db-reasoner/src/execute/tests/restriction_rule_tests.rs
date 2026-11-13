@@ -55,7 +55,7 @@ fn test_has_value_backward_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -104,7 +104,7 @@ fn test_has_value_forward_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -153,7 +153,7 @@ fn test_has_value_forward_rule_no_match() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -205,7 +205,7 @@ fn test_some_values_from_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -266,7 +266,7 @@ fn test_all_values_from_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -327,7 +327,7 @@ fn test_all_values_from_rule_with_chain_property() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -390,7 +390,7 @@ fn test_all_values_from_rule_with_chain_across_delta_and_derived() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -508,7 +508,7 @@ fn test_intersection_backward_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -578,7 +578,7 @@ fn test_intersection_forward_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -637,7 +637,7 @@ fn test_union_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -686,7 +686,7 @@ fn test_one_of_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,

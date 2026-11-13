@@ -958,7 +958,7 @@ mod tests {
             Ok(id)
         }
         async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
-            let path = self.dir.join(format!("{}.blob", id.digest_hex()));
+            let path = self.dir.join(format!("{}.blob", id.address_digest()));
             std::fs::write(&path, bytes).unwrap();
             self.paths.lock().insert(id.clone(), path);
             Ok(())

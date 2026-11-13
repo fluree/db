@@ -1080,12 +1080,15 @@ fn is_cached_kind(kind: &ContentKind) -> bool {
         | ContentKind::AnnotationForwardBranch
         | ContentKind::AnnotationForwardLeaf
         | ContentKind::AnnotationReverseBranch
-        | ContentKind::AnnotationReverseLeaf => true,
+        | ContentKind::AnnotationReverseLeaf
+        | ContentKind::ReasoningManifest
+        | ContentKind::DerivedFacts => true,
         ContentKind::Commit
         | ContentKind::Txn
         | ContentKind::LedgerConfig
         | ContentKind::GraphSourceSnapshot
-        | ContentKind::GraphSourceMapping => false,
+        | ContentKind::GraphSourceMapping
+        | ContentKind::RetentionState => false,
     }
 }
 
@@ -1292,8 +1295,29 @@ impl ContentStore for CachedContentStore {
         self.inner.put(kind, bytes).await
     }
 
+    async fn put_hashed(
+        &self,
+        alg: crate::HashAlgorithm,
+        kind: crate::ContentKind,
+        bytes: &[u8],
+    ) -> crate::error::Result<ContentId> {
+        self.inner.put_hashed(alg, kind, bytes).await
+    }
+
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> crate::error::Result<()> {
         self.inner.put_with_id(id, bytes).await
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> crate::error::Result<()> {
+        self.inner.put_minted(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<crate::storage::BlobPinner> {
+        self.inner.blob_pinner()
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.inner.intents_loaded()
     }
 
     async fn prefetch(&self, id: &ContentId) -> crate::error::Result<()> {

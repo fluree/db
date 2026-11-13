@@ -872,6 +872,7 @@ mod tests {
                     ..Default::default()
                 },
                 fetch_interval_secs: None,
+                erasure_authority: false,
             })
             .await
             .unwrap();

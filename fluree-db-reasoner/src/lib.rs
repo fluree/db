@@ -8,6 +8,9 @@
 //! - Union-find based owl:sameAs equivalence tracking
 //! - Time/memory/fact budgets for termination control
 //!
+//! Reasoning indexes persist what this crate derives. A change to what it
+//! derives bumps `fluree_db_core::reasoning_index::ENGINE_SEMANTICS`.
+//!
 //! ## Key Types
 //!
 //! - [`ReasoningCache`]: LRU cache for derived facts, keyed by database state
@@ -91,6 +94,31 @@ pub struct ReasoningOptions {
     /// The request's tracker: each fact a round processes is charged as its
     /// fuel.
     pub tracker: Tracker,
+    /// Bounds on maintaining a closed state
+    /// ([`fixpoint::run_fixpoint_incremental`]).
+    pub maintenance: MaintenanceBounds,
+}
+
+/// How much a run maintaining a closed state may read and hold. Past any of
+/// these it stops, and the caller computes the closure in full.
+#[derive(Clone, Debug)]
+pub struct MaintenanceBounds {
+    /// Bytes of closed-state reads kept from one round to the next.
+    pub cache_bytes: usize,
+    /// Bytes of reads, candidate conclusions and derived facts held at once.
+    pub working_bytes: usize,
+    /// Facts one read may return.
+    pub read_facts: usize,
+}
+
+impl Default for MaintenanceBounds {
+    fn default() -> Self {
+        Self {
+            cache_bytes: 64 << 20,
+            working_bytes: 1 << 30,
+            read_facts: 1 << 20,
+        }
+    }
 }
 
 /// All rule identifiers accepted in [`ReasoningOptions::enabled_rules`]: the
@@ -234,6 +262,20 @@ pub async fn reason_owl2rl(
         return Ok(cached);
     }
 
+    let result = reason_owl2rl_uncached(db, opts).await?;
+    if let Some(key) = key {
+        cache.insert(key, result.clone());
+    }
+    Ok(result)
+}
+
+/// Compute a closure without reading or retaining a cross-query cache entry.
+/// Background maintenance uses this so large closures are released after writing.
+pub async fn reason_owl2rl_uncached(
+    db: GraphDbRef<'_>,
+    opts: &ReasoningOptions,
+) -> Result<Arc<ReasoningResult>> {
+    opts.validate()?;
     // Run fixpoint reasoning
     let (derived_flakes, same_as, diagnostics) = fixpoint::run_fixpoint(db, opts).await?;
 
@@ -246,12 +288,41 @@ pub async fn reason_owl2rl(
 
     let result = Arc::new(ReasoningResult::new(derived_overlay, diagnostics));
 
-    // Store in cache
-    if let Some(key) = key {
-        cache.insert(key, result.clone());
-    }
-
     Ok(result)
+}
+
+/// OWL 2 RL closure maintenance under insertions: what the closure of `db`
+/// gains when `db` holds a closed state plus `inserted`. `asserted` supplies
+/// definitions from assertion-only data at the same commit. `None` when the
+/// program cannot be maintained this way (see
+/// [`fixpoint::run_fixpoint_incremental`]). Never cached: the result describes
+/// a change, not a state.
+pub async fn reason_owl2rl_incremental(
+    db: GraphDbRef<'_>,
+    asserted: GraphDbRef<'_>,
+    inserted: &[fluree_db_core::Flake],
+    opts: &ReasoningOptions,
+) -> Result<Option<Arc<ReasoningResult>>> {
+    opts.validate()?;
+    let Some((derived_flakes, diagnostics)) =
+        fixpoint::run_fixpoint_incremental(db, asserted, inserted, opts).await?
+    else {
+        return Ok(None);
+    };
+    let start = fluree_db_core::clock::Instant::now();
+    let mut builder = DerivedFactsBuilder::with_capacity(derived_flakes.len());
+    for flake in derived_flakes {
+        builder.push(flake);
+    }
+    let derived_overlay = builder.build(FrozenSameAs::empty(), db.overlay.epoch());
+    tracing::debug!(
+        overlay_ms = start.elapsed().as_millis() as u64,
+        "OWL 2 RL incremental overlay"
+    );
+    Ok(Some(Arc::new(ReasoningResult::new(
+        derived_overlay,
+        diagnostics,
+    ))))
 }
 
 #[cfg(test)]

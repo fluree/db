@@ -180,9 +180,13 @@ impl Sleeper for DriverSleeper {
 /// ledger through `LedgerManager::notify` (between queries — a query in
 /// flight keeps its frozen view) and fan out to registered callbacks;
 /// retractions evict the cached ledger, as does a snapshot that does not
-/// name a cached ledger the subscription covers.
+/// name a cached ledger the subscription covers; a refresh evicts it too,
+/// and a snapshot after a missed one evicts every cached ledger.
 pub(crate) struct PeerHeadSink {
     pub(crate) fluree: Fluree,
+    /// The blocks this peer holds, which a refresh drops: they are cached
+    /// under CIDs a change in place leaves as they were.
+    pub(crate) cas: crate::cas::BrowserCasStorage,
     pub(crate) registry: std::sync::Arc<HeadRegistry>,
     /// The ledgers subscribed to; none subscribes to all.
     pub(crate) ledgers: Vec<fluree_db_api::LedgerId>,
@@ -197,10 +201,15 @@ impl HeadSink for PeerHeadSink {
             RemoteEvent::Connected => {
                 tracing::info!("head tracking connected");
             }
-            RemoteEvent::SnapshotComplete => {
+            RemoteEvent::SnapshotComplete { .. } => {
                 let (Some(named), Some(mgr)) = (named, self.fluree.ledger_manager()) else {
                     return;
                 };
+                if named.missed_refresh {
+                    tracing::info!("erasures changed on the remote while disconnected; refreshing");
+                    self.cas.invalidate().await;
+                    self.fluree.refresh_ledgers().await;
+                }
                 for id in mgr.cached_aliases().await {
                     let covered = self.ledgers.is_empty() || self.ledgers.contains(&id);
                     if covered && !named.ledgers.contains(&id) {
@@ -210,6 +219,7 @@ impl HeadSink for PeerHeadSink {
                 }
             }
             RemoteEvent::LedgerUpdated(record) => {
+                self.fluree.observe_nameservice_record(&record);
                 let change = HeadChange {
                     ledger_id: record.ledger_id.to_string(),
                     commit_t: record.commit_t,
@@ -238,6 +248,11 @@ impl HeadSink for PeerHeadSink {
             RemoteEvent::LedgerRetracted { ledger_id, .. } => {
                 tracing::info!(ledger_id = %ledger_id, "ledger retracted on the remote");
                 self.fluree.disconnect_ledger(&ledger_id).await;
+            }
+            RemoteEvent::LedgerRefresh { ledger_id, .. } => {
+                tracing::info!(ledger_id = %ledger_id, "ledger history changed on the remote");
+                self.cas.invalidate().await;
+                self.fluree.refresh_ledger(&ledger_id).await;
             }
             RemoteEvent::GraphSourceUpdated(record) => {
                 tracing::debug!(graph_source_id = %record.graph_source_id, "graph-source head event ignored (unsupported in the browser peer)");

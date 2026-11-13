@@ -237,11 +237,11 @@ async fn localstack_s3_and_dynamodb_smoke() {
 
     // Publish index head
     let index_id = test_index_id("index:1");
-    let fence =
-        fluree_db_nameservice::testing::current_fence(aws.nameservice_arc().as_ref(), alias)
+    let basis =
+        fluree_db_nameservice::testing::current_basis(aws.nameservice_arc().as_ref(), alias)
             .await
             .unwrap();
-    aws.publish_index(alias, fence, 1, &index_id)
+    aws.publish_index(alias, basis, 1, &index_id)
         .await
         .expect("publish_index should succeed");
 
@@ -853,7 +853,7 @@ async fn nameservice_graph_source_publisher() {
 
     // publish_graph_source_index
     let gs_index_id_1 = test_index_id("gs-index:1");
-    ns.publish_graph_source_index("search-bm25", "main", &gs_index_id_1, 1)
+    ns.publish_graph_source_index("search-bm25", "main", &gs_index_id_1, 1, &[])
         .await
         .unwrap();
     let gs = ns
@@ -865,7 +865,7 @@ async fn nameservice_graph_source_publisher() {
     assert_eq!(gs.index_t, 1);
 
     // Monotonic: stale index ignored
-    ns.publish_graph_source_index("search-bm25", "main", &test_index_id("stale:0"), 0)
+    ns.publish_graph_source_index("search-bm25", "main", &test_index_id("stale:0"), 0, &[])
         .await
         .unwrap();
     let gs = ns
