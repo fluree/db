@@ -2002,3 +2002,333 @@ async fn an_unbound_graph_variable_ranges_over_named_sources_under_their_own_pol
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// A governed source honors its model's override control
+// ---------------------------------------------------------------------------
+
+const ADMIN: &str = "did:key:admin";
+
+/// A model ledger holding a deny on `ex:Person` (`f:AccessPolicy`), a grant of
+/// `ex:name` to the `ex:ReaderPolicy` class, and an identity assigned that
+/// class, with `override` (Turtle triples about `<urn:cfg:policy>`, or none)
+/// as its policy defaults' override control.
+async fn override_model(fluree: &fluree_db_api::Fluree, id: &str, override_ttl: Option<&str>) {
+    let ledger = fluree.create_ledger(id).await.expect("model ledger");
+    let r = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class" },
+                    { "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false },
+                    { "@id": "ex:readNames", "@type": "ex:ReaderPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }],
+                      "f:onProperty": [{ "@id": "ex:name" }], "f:allow": true },
+                    { "@id": "did:example:known", "f:policyClass": { "@id": "ex:ReaderPolicy" } }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model");
+    if let Some(ttl) = override_ttl {
+        let cfg = format!(
+            r"@prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{id}#config> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                {ttl}
+            }}"
+        );
+        fluree
+            .stage_owned(r.ledger)
+            .upsert_turtle(&cfg)
+            .execute()
+            .await
+            .expect("model config");
+    }
+}
+
+/// The override controls the tests compare: none (overrides allowed), none
+/// at all permitted, and permitted only for the server identity `ADMIN`.
+fn override_variants() -> [(&'static str, Option<String>); 3] {
+    [
+        ("no override control", None),
+        (
+            "OverrideNone",
+            Some("<urn:cfg:policy> f:overrideControl f:OverrideNone .".to_string()),
+        ),
+        (
+            "IdentityRestricted(admin)",
+            Some(format!(
+                "<urn:cfg:policy> f:overrideControl <urn:cfg:oc> .
+                 <urn:cfg:oc> f:controlMode f:IdentityRestricted .
+                 <urn:cfg:oc> f:allowedIdentities <{ADMIN}> ."
+            )),
+        ),
+    ]
+}
+
+/// A request in the tests: options in the body (JSON-LD `opts`, SPARQL
+/// connection options), an optional server-verified identity, or the root
+/// policy context.
+struct OverrideCaller {
+    label: &'static str,
+    opts: Option<Value>,
+    server: Option<&'static str>,
+    root: bool,
+}
+
+fn override_callers() -> Vec<OverrideCaller> {
+    let c = |label, opts, server, root| OverrideCaller {
+        label,
+        opts,
+        server,
+        root,
+    };
+    vec![
+        c("anonymous", None, None, false),
+        c(
+            "default-allow:true",
+            Some(json!({ "default-allow": true })),
+            None,
+            false,
+        ),
+        c(
+            "unknown identity",
+            Some(json!({ "identity": "did:example:unknown" })),
+            None,
+            false,
+        ),
+        c(
+            "unknown identity + default-allow:true",
+            Some(json!({ "identity": "did:example:unknown", "default-allow": true })),
+            None,
+            false,
+        ),
+        c(
+            "unknown identity + default-allow:true, server identity admin",
+            Some(json!({ "identity": "did:example:unknown", "default-allow": true })),
+            Some(ADMIN),
+            false,
+        ),
+        c(
+            "known identity",
+            Some(json!({ "identity": "did:example:known" })),
+            None,
+            false,
+        ),
+        c(
+            "known identity + default-allow:true",
+            Some(json!({ "identity": "did:example:known", "default-allow": true })),
+            None,
+            false,
+        ),
+        c("root", None, None, true),
+    ]
+}
+
+/// `?s ex:name ?n` against `source` by `caller`: JSON-LD and SPARQL, each
+/// reading it directly and as a named graph beside the native ledger.
+async fn override_surfaces(
+    fluree: &fluree_db_api::Fluree,
+    source: &str,
+    caller: &OverrideCaller,
+) -> Vec<(&'static str, Result<usize, String>)> {
+    use fluree_db_api::{GovernanceOptions, PolicyContext, PolicyWrapper, QueryExecutionOptions};
+    let pattern = json!({ "@id": "?s", "ex:name": "?n" });
+    let execution = QueryExecutionOptions {
+        server_identity: caller.server.map(fluree_db_api::VerifiedIdentity::new),
+        ..Default::default()
+    };
+    let jsonld = |mut q: Value| {
+        let execution = execution.clone();
+        async move {
+            q["@context"] = context();
+            q["select"] = json!(["?s", "?n"]);
+            if let Some(o) = &caller.opts {
+                q["opts"] = o.clone();
+            }
+            let mut b = fluree.query_from().jsonld(&q).execution_options(execution);
+            if caller.root {
+                b = b.policy(PolicyContext::new(PolicyWrapper::root(), None));
+            }
+            b.execute_formatted()
+                .await
+                .map(|v| result_len(&v))
+                .map_err(|e| e.to_string())
+        }
+    };
+    let sparql = |text: String| async move {
+        let mut b = fluree.query_from().sparql(&text);
+        if caller.root {
+            b = b.policy(PolicyContext::new(PolicyWrapper::root(), None));
+        } else if caller.opts.is_some() || caller.server.is_some() {
+            let mut opts = match &caller.opts {
+                Some(o) => GovernanceOptions::from_json(&json!({ "opts": o })).expect("opts"),
+                None => GovernanceOptions::default(),
+            };
+            opts.server_identity = caller.server.map(fluree_db_api::VerifiedIdentity::new);
+            b = b.connection_opts(opts);
+        }
+        b.execute_formatted()
+            .await
+            .map(|v| result_len(&v))
+            .map_err(|e| e.to_string())
+    };
+    let inner = "?s <http://example.org/name> ?n";
+    vec![
+        (
+            "JSON-LD direct",
+            jsonld(json!({ "from": source, "where": pattern.clone() })).await,
+        ),
+        (
+            "JSON-LD from-named",
+            jsonld(json!({ "from": NATIVE, "from-named": [source],
+                           "where": [["graph", source, pattern.clone()]] }))
+            .await,
+        ),
+        (
+            "SPARQL direct",
+            sparql(format!("SELECT ?s ?n FROM <{source}> WHERE {{ {inner} }}")).await,
+        ),
+        (
+            "SPARQL FROM NAMED",
+            sparql(format!(
+                "SELECT ?s ?n FROM <{NATIVE}> FROM NAMED <{source}> \
+                 WHERE {{ GRAPH <{source}> {{ {inner} }} }}"
+            ))
+            .await,
+        ),
+    ]
+}
+
+/// A governed graph source honors its model ledger's override control, as a
+/// native ledger honors its own: under `f:OverrideNone` no request replaces
+/// the source's policy defaults (an unknown identity sending
+/// `default-allow: true` reads nothing), under `f:IdentityRestricted` only the
+/// listed server-verified identity may, and a model that sets none behaves as
+/// before (overrides allowed). An identity whose class the model assigns, and
+/// the root policy, read the same whatever the model sets. Iceberg and SQL
+/// sources; JSON-LD and SPARQL; direct and as a named graph.
+#[tokio::test]
+async fn a_governed_source_honors_its_model_override_control() {
+    let fluree = setup().await;
+    // Rows per caller under (no override control, OverrideNone,
+    // IdentityRestricted(admin)).
+    let want: [(&str, [usize; 3]); 8] = [
+        ("anonymous", [0, 0, 0]),
+        ("default-allow:true", [0, 0, 0]),
+        ("unknown identity", [0, 0, 0]),
+        ("unknown identity + default-allow:true", [5, 0, 0]),
+        (
+            "unknown identity + default-allow:true, server identity admin",
+            [5, 0, 5],
+        ),
+        ("known identity", [5, 5, 5]),
+        ("known identity + default-allow:true", [5, 5, 5]),
+        ("root", [5, 5, 5]),
+    ];
+    let mut table = Vec::new();
+    let mut wrong = Vec::new();
+    for (column, (variant, ttl)) in override_variants().iter().enumerate() {
+        let model = format!("override-model-{column}:main");
+        override_model(&fluree, &model, ttl.as_deref()).await;
+        for source in sources_with_model(&fluree, &format!("override-gs-{column}"), &model).await {
+            for caller in override_callers() {
+                let expect = want
+                    .iter()
+                    .find(|(label, _)| *label == caller.label)
+                    .map(|(_, rows)| rows[column])
+                    .expect("expected rows for every caller");
+                for (surface, got) in override_surfaces(&fluree, &source, &caller).await {
+                    table.push(format!(
+                        "{variant} | {source} | {} | {surface} | {got:?}",
+                        caller.label
+                    ));
+                    if got != Ok(expect) {
+                        wrong.push(format!(
+                            "{variant} {source} [{}] {surface}: {got:?}, want {expect}",
+                            caller.label
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("OVERRIDE-MATRIX\n{}", table.join("\n"));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The same callers against native ledgers that hold the same policies and
+/// identity themselves, with the same override control in their own config:
+/// wherever identity-mode applies (an identity in the request), a governed
+/// source answers as its native twin does.
+#[tokio::test]
+async fn a_governed_source_and_its_native_twin_agree_under_override_control() {
+    let fluree = setup().await;
+    let mut wrong = Vec::new();
+    let mut table = Vec::new();
+    for (column, (variant, ttl)) in override_variants().iter().enumerate() {
+        let model = format!("twin-model-{column}:main");
+        override_model(&fluree, &model, ttl.as_deref()).await;
+        // The native twin: the model's policies and identity, plus the people.
+        let twin = format!("override-twin-{column}:main");
+        override_model(&fluree, &twin, ttl.as_deref()).await;
+        let ledger = fluree.ledger(&twin).await.expect("twin");
+        let people: Vec<Value> = (1..=5)
+            .map(|id| {
+                json!({
+                    "@id": format!("http://example.org/person/{id}"),
+                    "@type": "http://example.org/Person",
+                    "http://example.org/name": format!("p{id}"),
+                })
+            })
+            .collect();
+        fluree
+            .insert(ledger, &json!({ "@graph": people }))
+            .await
+            .expect("seed twin");
+        let sources = sources_with_model(&fluree, &format!("twin-gs-{column}"), &model).await;
+        for caller in override_callers() {
+            // Identity-mode: an identity in the request. (A request with no
+            // identity selects no stored policy on a native ledger, while a
+            // model applies its access policies to it: that difference
+            // predates override control and is not compared here.)
+            let identity_mode = caller
+                .opts
+                .as_ref()
+                .is_some_and(|o| o.get("identity").is_some());
+            if !identity_mode {
+                continue;
+            }
+            let native = override_surfaces(&fluree, &twin, &caller).await;
+            let native_direct = native[0].1.clone();
+            for source in &sources {
+                for (surface, got) in override_surfaces(&fluree, source, &caller).await {
+                    table.push(format!(
+                        "{variant} | {source} | {} | {surface} | {got:?} | native {native_direct:?}",
+                        caller.label
+                    ));
+                    if got != native_direct {
+                        wrong.push(format!(
+                            "{variant} {source} [{}] {surface}: {got:?}, native twin {native_direct:?}",
+                            caller.label
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("OVERRIDE-TWIN\n{}", table.join("\n"));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
