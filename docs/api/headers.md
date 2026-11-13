@@ -220,7 +220,7 @@ its metrics in the response body and in these headers:
 | `x-fdb-fuel` | Fuel consumed |
 | `x-fdb-policy` | Per-policy statistics, as base64-encoded JSON |
 | `x-fdb-policy-enforcement` | JSON, sent only when policy governed the request |
-| `x-fdb-reasoning` | JSON, sent only when a reasoning mode ran; `"capped": true` means results may be incomplete |
+| `x-fdb-reasoning` | JSON, sent only when a reasoning mode ran; `"capped": true` means results may be incomplete, and `index` names the [reasoning index](../query/materialized-reasoning.md) generation that answered, when one did |
 
 Query responses carry no transaction-time, commit, `ETag` or `Cache-Control` headers. Read a
 ledger's current `t` from [`GET /info/<ledger>`](endpoints.md).

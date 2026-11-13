@@ -17,16 +17,18 @@ fluree reasoning-indexes retire <ID> [-l <LEDGER>] [--remote <NAME>]
 
 | Action | Description |
 |--------|-------------|
-| `reasoning-indexes register` | Register a program. `--reasoning owl2rl` names reasoning modes as a query's `reasoning` key would; `--program` takes the whole program as JSON (`reasoning`, `rules`, `ontology`, `reasoningTime`, `@context`, and an optional `graph` IRI to reason against). Registering a program that is already active returns its existing index. |
-| `reasoning-indexes list` | Show the branch's indexes: each one's program, state and published generation. |
-| `reasoning-indexes refresh` | Bring the branch's indexes up to its current commit now, rather than waiting for the background worker. `--index <ID>` refreshes one. |
-| `reasoning-indexes retire` | Stop serving and refreshing an index. Its files stay until a cleanup pass removes them. |
+| `reasoning-indexes register` | Register a program. `--reasoning owl2rl` names reasoning modes as a query's `reasoning` key would; `--program` takes the whole program as JSON (`reasoning`, `rules`, `ontology`, `reasoningTime`, `reasoningBudget`, `@context`, and an optional `graph` IRI to reason against). Registering a program that is already active returns its existing index. |
+| `reasoning-indexes list` | Show the branch's indexes: each one's program, state and published generation, and the refreshes that last failed. |
+| `reasoning-indexes refresh` | Bring the branch's indexes up to its current commit now. `--index <ID>` refreshes one. Nothing refreshes an index on its own unless the server runs with `--reasoning-index-auto-refresh`. |
+| `reasoning-indexes retire` | Stop serving and refreshing an index. Its files are deleted by the server's worker, or by the next `refresh` of the branch, once the retention window has passed. |
 
 ## Description
 
 A reasoning index holds a branch's asserted facts together with the facts a registered program derives from them. A reasoning query whose program matches an index, at the index's commit, is answered from the index; any other query reasons at query time, as before. A branch holds at most eight active indexes.
 
-See [Materialized reasoning](../query/materialized-reasoning.md) for which queries an index answers, freshness modes, storage and retention.
+A registered index answers nothing until a refresh has published its first generation.
+
+See [Materialized reasoning](../query/materialized-reasoning.md) for which queries an index answers, what a refresh reports, freshness modes, storage and retention.
 
 ## Examples
 

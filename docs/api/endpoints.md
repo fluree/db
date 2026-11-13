@@ -4274,6 +4274,71 @@ POST /sweep/plan
 
 From the CLI, use `fluree sweep <ledger> --dry-run`.
 
+### Reasoning indexes
+
+Register a reasoning program on a branch and maintain its
+[reasoning index](../query/materialized-reasoning.md). All four routes take a
+JSON body, are admin-protected, and run where the ledger's writes do: a peer
+forwards them to the transaction server.
+
+| Route | Body | Does |
+|-------|------|------|
+| `POST /reasoning-indexes/register` | `{"ledger", "program"}` | Registers `program` (the reasoning keys a query would carry, plus an optional `graph`) and returns its `indexId`. A program the branch already has an active index for returns that index. Builds nothing. |
+| `POST /reasoning-indexes/refresh` | `{"ledger", "indexId"?}` | Brings the index, or every active index of the branch, to the branch's current commit, and deletes the files of indexes retired longer ago than the retention window. |
+| `POST /reasoning-indexes/list` | `{"ledger"}` | Returns the branch's indexes: each registration, its state and its published head. |
+| `POST /reasoning-indexes/retire` | `{"ledger", "indexId"}` | Stops the index from being served or refreshed. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/reasoning-indexes/register \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main", "program": {"reasoning": "owl2rl"}}'
+# => {"ledger": "mydb:main", "indexId": "01JC..."}
+
+curl -X POST http://localhost:8090/v1/fluree/reasoning-indexes/refresh \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main"}'
+```
+
+A refresh answers with one result per index, each naming what it did in
+`outcome`:
+
+```json
+{
+  "ledger": "mydb:main",
+  "results": [
+    {
+      "indexId": "01JC...",
+      "outcome": "published",
+      "generation": 1,
+      "kind": "rebuild",
+      "basisT": 12,
+      "stats": {"derivedOnly": 4, "derivedTotal": 4, "added": 4, "removed": 0, "closure": "full"}
+    }
+  ]
+}
+```
+
+The other outcomes are `current`, `failed`, `discarded`, `throttled`,
+`deferred`, `inFlight` and `newerEngine`; see
+[Refreshing](../query/materialized-reasoning.md#refreshing). A refresh that
+publishes nothing is still a `200`: read `outcome`.
+
+`list` adds `maintenanceFailures`, keyed by index id: the reason, attempt
+count, failure time and retry time of each refresh this server last failed.
+
+**Status Codes:**
+- `200 OK` — the request ran; for a refresh, see each result's `outcome`
+- `400 Bad Request` — invalid JSON, a malformed `indexId`, or a program that does not validate
+- `401/403` — admin auth required
+- `404 Not Found` — the ledger, or the index, does not exist
+
+From the CLI, [`fluree reasoning-indexes`](../cli/reasoning-indexes.md) does
+the same.
+
 ### POST /export/*ledger
 
 Return ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). Server-side equivalent of `fluree export`.
