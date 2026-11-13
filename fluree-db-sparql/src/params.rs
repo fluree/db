@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use fluree_graph_ir::JsonNumber;
 use serde_json::Value as JsonValue;
 
 use crate::ast::annotation::{Annotation, AnnotationVerb, ReifierId, TripleTerm};
@@ -165,10 +166,11 @@ impl Value {
                 return Err(ParamError::new(name, "is null, which is not an RDF term"));
             }
             JsonValue::Bool(b) => LiteralValue::Boolean(*b),
-            JsonValue::Number(n) => match n.as_i64() {
-                Some(i) => LiteralValue::Integer(i),
-                None if n.is_u64() => LiteralValue::BigInteger(Arc::from(n.to_string())),
-                None => LiteralValue::Double(n.as_f64().unwrap_or(f64::NAN)),
+            JsonValue::Number(n) => match JsonNumber::read(n) {
+                Some(JsonNumber::Integer(i)) => LiteralValue::Integer(i),
+                Some(JsonNumber::BigInteger(digits)) => LiteralValue::BigInteger(Arc::from(digits)),
+                Some(JsonNumber::Double(f)) => LiteralValue::Double(f),
+                None => LiteralValue::Double(f64::NAN),
             },
             JsonValue::String(s) => LiteralValue::Simple(Arc::from(s.as_str())),
             JsonValue::Array(_) => {
@@ -919,6 +921,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_number_is_typed_by_its_value_as_in_a_json_ld_insert() {
+        let params: serde_json::Value =
+            serde_json::from_str(r#"{"a": 1.0, "b": 1e3, "c": 18446744073709551615, "d": 2.5}"#)
+                .unwrap();
+        let ast = substituted("SELECT * WHERE { ?s <p> $a, $b, $c, $d }", params).unwrap();
+        let GraphPattern::Bgp { patterns, .. } = &select(&ast).where_clause.pattern else {
+            panic!("expected a BGP")
+        };
+        let values: Vec<&LiteralValue> = patterns
+            .iter()
+            .map(|t| match &t.object {
+                Term::Literal(Literal { value, .. }) => value,
+                other => panic!("expected a literal, got {other:?}"),
+            })
+            .collect();
+        assert!(matches!(values[0], LiteralValue::Integer(1)));
+        assert!(matches!(values[1], LiteralValue::Integer(1000)));
+        assert!(
+            matches!(values[2], LiteralValue::BigInteger(d) if d.as_ref() == "18446744073709551615")
+        );
+        assert!(matches!(values[3], LiteralValue::Double(d) if *d == 2.5));
     }
 
     #[test]

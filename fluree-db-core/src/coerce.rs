@@ -622,27 +622,28 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
 
     // Number → Integer family
     if xsd::is_integer_family(datatype_iri) {
-        if let Some(i) = n.as_i64() {
-            validate_integer_range(i, datatype_iri)?;
-            return Ok(FlakeValue::Long(i));
-        } else if let Some(f) = n.as_f64() {
-            // Check if it's an integer value
-            if f.fract() != 0.0 {
+        use fluree_graph_ir::JsonNumber;
+        match JsonNumber::read(n) {
+            Some(JsonNumber::Integer(i)) => {
+                validate_integer_range(i, datatype_iri)?;
+                return Ok(FlakeValue::Long(i));
+            }
+            Some(JsonNumber::BigInteger(digits)) => {
+                return parse_string_to_integer(&digits, datatype_iri);
+            }
+            Some(JsonNumber::Double(f)) if f.fract() != 0.0 => {
                 return Err(CoercionError::incompatible(
                     &format!("non-integer {f}"),
                     datatype_iri,
                     Some("Value must be a whole number."),
                 ));
             }
-            // Integral double - convert to Long
-            if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                let as_i64 = f as i64;
-                validate_integer_range(as_i64, datatype_iri)?;
-                return Ok(FlakeValue::Long(as_i64));
+            Some(JsonNumber::Double(f)) => {
+                return Err(CoercionError::new(format!(
+                    "Number {f} is out of range for {datatype_iri}"
+                )));
             }
-            return Err(CoercionError::new(format!(
-                "Number {f} is out of range for {datatype_iri}"
-            )));
+            None => {}
         }
     }
 
@@ -976,6 +977,33 @@ mod tests {
         let result = coerce_json_value(&json, xsd::INTEGER);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), FlakeValue::Long(42)));
+    }
+
+    #[test]
+    fn a_typed_integer_past_i64_is_kept_exact() {
+        let json: serde_json::Value = serde_json::from_str("18446744073709551615").unwrap();
+        let FlakeValue::BigInt(b) = coerce_json_value(&json, xsd::INTEGER).unwrap() else {
+            panic!("expected a BigInt");
+        };
+        assert_eq!(b.to_string(), "18446744073709551615");
+        assert!(coerce_json_value(&json, xsd::LONG).is_err());
+        assert!(coerce_json_value(&json, xsd::UNSIGNED_LONG).is_ok());
+
+        // 2^63 spelled as a float is past i64 too, not saturated to i64::MAX.
+        let json: serde_json::Value = serde_json::from_str("9223372036854775808.0").unwrap();
+        assert!(coerce_json_value(&json, xsd::LONG).is_err());
+        let FlakeValue::BigInt(b) = coerce_json_value(&json, xsd::INTEGER).unwrap() else {
+            panic!("expected a BigInt");
+        };
+        assert_eq!(b.to_string(), "9223372036854775808");
+
+        let json: serde_json::Value = serde_json::from_str("7.0").unwrap();
+        assert!(matches!(
+            coerce_json_value(&json, xsd::INT),
+            Ok(FlakeValue::Long(7))
+        ));
+        let json: serde_json::Value = serde_json::from_str("7.5").unwrap();
+        assert!(coerce_json_value(&json, xsd::INTEGER).is_err());
     }
 
     #[test]

@@ -102,3 +102,85 @@ async fn a_whole_number_is_stored_as_an_integer_however_it_is_spelled() {
         ["a", "d", "e", "f", "g", "h"].map(|name| json!(ex(name)))
     );
 }
+
+/// A typed integer past i64 is kept exact, as the untyped one is.
+#[tokio::test]
+async fn a_typed_integer_past_i64_is_kept_exact() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("tx/number-typed-big:main")
+        .await
+        .expect("genesis");
+    let doc = parsed(
+        r#"{
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "@id": "ex:s",
+            "ex:a": {"@value": 18446744073709551615, "@type": "xsd:integer"},
+            "ex:b": {"@value": 18446744073709551615, "@type": "xsd:unsignedLong"}
+        }"#,
+    );
+    let ledger = fluree.insert(ledger, &doc).await.expect("insert").ledger;
+    let query = r"PREFIX ex: <http://example.org/>
+        SELECT (STR(?v) AS ?text) WHERE { ex:s ?p ?v } ORDER BY ?p";
+    let out = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("sparql query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        out,
+        json!([["18446744073709551615"], ["18446744073709551615"]])
+    );
+
+    let too_big = parsed(
+        r#"{
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "@id": "ex:s",
+            "ex:c": {"@value": 18446744073709551615, "@type": "xsd:long"}
+        }"#,
+    );
+    assert!(fluree.insert(ledger, &too_big).await.is_err());
+}
+
+/// A removal's selector reads a bare number as a transaction does, so an
+/// integer past i64 names the integer stored, not the double it rounds to.
+#[tokio::test]
+async fn a_removal_selector_reads_a_big_integer_exactly() {
+    use fluree_db_api::retention::{FactSelector, RemovalRequest};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "tx/number-selector:main";
+    let ledger = fluree.create_ledger(id).await.expect("genesis");
+    let doc = parsed(
+        r#"{
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:b": [18446744073709551615, 2.5]
+        }"#,
+    );
+    fluree.insert(ledger, &doc).await.expect("insert");
+    let receipt = fluree
+        .remove_occurrences(
+            id,
+            RemovalRequest {
+                occurrences: vec![],
+                matching: vec![FactSelector {
+                    subject: "http://example.org/s".into(),
+                    predicate: "http://example.org/b".into(),
+                    graph: None,
+                    object: Some(parsed("18446744073709551615")),
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+    assert!(receipt.retracted_t.is_some(), "{receipt:?}");
+    let ledger = fluree.ledger(id).await.expect("load");
+    let query = r"PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:s ex:b ?v }";
+    let out = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("sparql query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(out, json!([[2.5]]));
+}
