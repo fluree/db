@@ -41,7 +41,7 @@ use crate::ir::R2rmlPattern;
 use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::R2rmlPolicyGate;
-use crate::r2rml::ColumnBatchStream;
+use crate::r2rml::{ColumnBatchStream, ScanOrder};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{
@@ -49,9 +49,10 @@ use fluree_db_r2rml::mapping::{
     TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
-    canonical_join, expand_template, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_predicate_from_batch, materialize_subject_from_batch, parent_key_insert_keep_min,
-    reverse_subject_template, RdfTerm,
+    canonical_join, expand_template, fill_join_key_from_batch, get_join_key_from_batch,
+    materialize_object_from_batch, materialize_predicate_from_batch,
+    materialize_subject_from_batch, parent_key_insert_keep_min, reverse_subject_template, RdfTerm,
+    TemplateReverser,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -64,6 +65,337 @@ use std::sync::Arc;
 /// Maps parent join key (as `Vec<String>`) to materialized parent subject IRI.
 /// The key is a composite key of all parent columns specified in join conditions.
 pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
+
+/// A parent lookup holding every parent row's key. Only a full read of the
+/// parent table ([`build_parent_lookup`]) makes one, and the caches that share
+/// a lookup across windows, child batches and operators (the operator's
+/// `parent_lookup_cache`, the query's `r2rml_parent_memo`) hold only this
+/// type, so a lookup built from a key-filtered read is never served as whole.
+#[derive(Debug)]
+pub struct CompleteParentLookup(ParentLookup);
+
+impl CompleteParentLookup {
+    fn lookup(&self) -> &ParentLookup {
+        &self.0
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// How one RefObjectMap's parent is resolved for the rows of a scan.
+#[derive(Debug)]
+enum ParentIndex {
+    /// Every parent row's key.
+    Complete(Arc<CompleteParentLookup>),
+    /// Only the keys the scan's windows have asked for so far (#2239).
+    Partial(Box<PartialParentIndex>),
+}
+
+impl ParentIndex {
+    fn lookup(&self) -> &ParentLookup {
+        match self {
+            Self::Complete(complete) => complete.lookup(),
+            Self::Partial(partial) => &partial.lookup,
+        }
+    }
+}
+
+/// A parent index built by semi-join probes (#2239): for a window of
+/// referencing rows, the parent is read with the window's unresolved join
+/// keys pushed as filters, and the rows of those keys are folded in. A
+/// provider may apply the filters exactly, only partly, or not at all (it may
+/// prune files by their bounds alone), but never drops a row the filters
+/// keep: every row of a probed key comes back, so its keep-min is exact, and
+/// a probed key nothing came back for is absent from the parent (a dangling
+/// FK, never probed again). A row of another key may come back too, but not
+/// necessarily with every other row of its key, so it is not folded.
+///
+/// Like a [`CompleteParentLookup`], it is a fact about the parent alone,
+/// keyed like it by [`LookupCacheKey`]: it holds no referencing columns, so
+/// every RefObjectMap and TriplesMap resolving through one parent shares it.
+/// Which keys a window needs is the caller's to say, from the join columns of
+/// every RefObjectMap that will read the window's rows through it
+/// ([`ParentJoins`]).
+#[derive(Debug)]
+struct PartialParentIndex {
+    /// The resolved keys present in the parent.
+    lookup: ParentLookup,
+    /// Every resolved key: in `lookup`, or absent from the parent.
+    resolved: HashSet<Vec<String>>,
+    /// The key-filtered reads each referencing map's windows have made, by
+    /// the map's IRI. The index is shared, but each map's probes are bounded
+    /// on their own ([`Self::worth_probing`]): a probe that is cheap for one
+    /// map stays cheap however much another map has probed.
+    spent: HashMap<String, ProbeSpend>,
+    /// Bytes charged to the query's memory budget for `lookup` and
+    /// `resolved`, released when the index is given up for a whole read.
+    charged: usize,
+    source: ParentSource,
+}
+
+/// The key-filtered reads of a parent one referencing map has made.
+#[derive(Debug, Default, Clone, Copy)]
+struct ProbeSpend {
+    probes: usize,
+    /// Data files those reads were planned to read (when the provider says).
+    files: u64,
+}
+
+/// What reading a parent by its join columns takes: everything a
+/// [`LookupCacheKey`] fixes, and nothing about the map that references it.
+#[derive(Debug, Clone)]
+struct ParentSource {
+    parent_tm_iri: String,
+    parent_table: String,
+    /// The parent's join columns and subject columns.
+    projection: Vec<String>,
+    /// The parent's join columns, in the canonical order the lookup is keyed in.
+    parent_cols: Vec<String>,
+}
+
+impl ParentSource {
+    fn new(parent_tm: &TriplesMap, parent_cols: Vec<String>) -> Option<Self> {
+        let parent_table = parent_tm.table_name()?.to_string();
+        // Columns needed from the parent: join columns + subject template
+        // columns (+ rr:column if the subject uses one).
+        let mut projection: Vec<String> = parent_cols.clone();
+        projection.extend(parent_tm.subject_map.template_columns.iter().cloned());
+        if let Some(ref col) = parent_tm.subject_map.column {
+            projection.push(col.clone());
+        }
+        projection.sort();
+        projection.dedup();
+        Some(Self {
+            parent_tm_iri: parent_tm.iri.clone(),
+            parent_table,
+            projection,
+            parent_cols,
+        })
+    }
+}
+
+impl PartialParentIndex {
+    fn new(source: ParentSource) -> Self {
+        Self {
+            lookup: ParentLookup::new(),
+            resolved: HashSet::new(),
+            spent: HashMap::new(),
+            charged: 0,
+            source,
+        }
+    }
+
+    /// Charge `bytes` this index retains to the query's memory budget.
+    fn charge(&mut self, ctx: &ExecutionContext<'_>, bytes: usize) -> Result<()> {
+        if scan_mem_accounting_enabled() {
+            ctx.record_alloc(bytes);
+            self.charged = self.charged.saturating_add(bytes);
+            ctx.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Drop what the probes built, and release its charge: the index is
+    /// replaced by a whole read, which is charged on its own.
+    fn forget(&mut self, ctx: &ExecutionContext<'_>) {
+        self.lookup = ParentLookup::new();
+        self.resolved = HashSet::new();
+        ctx.release(std::mem::take(&mut self.charged));
+    }
+
+    /// The join keys `window`'s rows hold that are not resolved yet, read
+    /// through each of `child_joins` (the referencing table's join columns of
+    /// every RefObjectMap that reads the window through this parent, each
+    /// aligned with the parent's join columns), or `None` once there are more
+    /// than `cap`. The set lives for one window and holds at most `cap` + 1
+    /// keys, so it is not charged to the query's memory budget.
+    fn missing_keys(
+        &self,
+        window: &[ColumnBatch],
+        child_joins: &[Vec<String>],
+        cap: usize,
+    ) -> Option<HashSet<Vec<String>>> {
+        let mut missing: HashSet<Vec<String>> = HashSet::new();
+        let mut key = Vec::with_capacity(self.source.parent_cols.len());
+        for child_cols in child_joins {
+            for batch in window {
+                for row in 0..batch.num_rows {
+                    // A null join column joins nothing.
+                    if fill_join_key_from_batch(child_cols, batch, row, &mut key)
+                        && !self.resolved.contains(key.as_slice())
+                        && !missing.contains(key.as_slice())
+                    {
+                        missing.insert(key.clone());
+                        if missing.len() > cap {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Some(missing)
+    }
+
+    /// The parent filters reading the rows of `keys`: one per parent join
+    /// column, keeping the values that column takes in `keys` (exact for a
+    /// one-column key, a superset for several).
+    fn key_filters(&self, keys: &HashSet<Vec<String>>) -> Vec<crate::r2rml::ScanFilter> {
+        self.source
+            .parent_cols
+            .iter()
+            .enumerate()
+            .map(|(i, column)| {
+                let values: std::collections::BTreeSet<&str> =
+                    keys.iter().map(|key| key[i].as_str()).collect();
+                key_set_filter(column, values.into_iter().map(str::to_string).collect())
+            })
+            .collect()
+    }
+
+    /// Whether reading the parent by these keys, for a window of `map`'s
+    /// rows, can cost less than reading it whole. With the keyed read's
+    /// planned file counts: when it skips files, and every keyed read `map`
+    /// has made so far plus this one reads fewer files than the whole table,
+    /// so the reads a map's windows make before (perhaps) reading the parent
+    /// whole never add up to more than one whole read. Without them: once per
+    /// map, so a map whose later window needs more keys reads the parent whole
+    /// after at most one read that did not suffice.
+    ///
+    /// Counted per map: what another map's probes read is sunk cost, not a
+    /// reason to refuse this one. The choice for this window is between this
+    /// probe and a whole read now, and a probe that skips files is the cheaper
+    /// of the two whatever was read before. The budget only caps how much one
+    /// map's sequence of windows can read before giving up; the worst case is
+    /// one whole read's worth of probes per referencing map, plus one whole
+    /// read, which then serves every map.
+    fn worth_probing(&self, map: &str, counts: Option<crate::r2rml::ScanFileCounts>) -> bool {
+        let spent = self.spent.get(map).copied().unwrap_or_default();
+        match counts {
+            Some(counts) => {
+                counts.pruned > 0 && spent.files + counts.selected < counts.selected + counts.pruned
+            }
+            None => spent.probes == 0,
+        }
+    }
+
+    /// Record a keyed read for `map` planned to read `files` data files.
+    fn spend(&mut self, map: &str, files: u64) {
+        let spent = self.spent.entry(map.to_string()).or_default();
+        spent.probes += 1;
+        spent.files += files;
+    }
+
+    /// Read the parent rows of `keys` through `filters` (from
+    /// [`Self::key_filters`]) and fold them in.
+    async fn probe(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        provider: &dyn super::R2rmlTableProvider,
+        graph_source_id: &str,
+        parent_tm: &TriplesMap,
+        keys: HashSet<Vec<String>>,
+        filters: Vec<crate::r2rml::ScanFilter>,
+    ) -> Result<()> {
+        tracing::debug!(
+            parent = %self.source.parent_tm_iri,
+            keys = keys.len(),
+            "R2RML parent: reading the rows of a window's join keys"
+        );
+        let mut stream = scan_for_lookup(
+            provider,
+            graph_source_id,
+            &self.source.parent_table,
+            &self.source.projection,
+            &filters,
+            parent_as_of_t(ctx),
+        )
+        .await?;
+        loop {
+            ctx.check_cancelled()?;
+            let Some(batch) = stream.next().await else {
+                break;
+            };
+            let batch = batch?;
+            // Charged like a full build's batch: a provider that applies no
+            // filter returns the whole parent here.
+            self.charge(ctx, batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES))?;
+            fold_parent_batch(
+                &mut self.lookup,
+                parent_tm,
+                &self.source.parent_cols,
+                &batch,
+                Some(&keys),
+            );
+        }
+        // Each resolved key is held too, present or not (at most the push
+        // cap per probe).
+        self.charge(ctx, keys.len().saturating_mul(PARENT_ENTRY_EST_BYTES))?;
+        self.resolved.extend(keys);
+        Ok(())
+    }
+}
+
+/// An `Eq` (one value) or `In` (several) filter keeping `column`'s rows whose
+/// raw value is one of `values`, each read against the column's own type the
+/// way a subject template's key is ([`crate::r2rml::ScanValue::TemplateKey`]).
+fn key_set_filter(column: &str, mut values: Vec<String>) -> crate::r2rml::ScanFilter {
+    if values.len() == 1 {
+        crate::r2rml::ScanFilter {
+            column: column.to_string(),
+            op: crate::r2rml::ScanCmpOp::Eq,
+            value: crate::r2rml::ScanValue::TemplateKey(values.remove(0)),
+        }
+    } else {
+        crate::r2rml::ScanFilter {
+            column: column.to_string(),
+            op: crate::r2rml::ScanCmpOp::In,
+            value: crate::r2rml::ScanValue::Set(
+                values
+                    .into_iter()
+                    .map(crate::r2rml::ScanValue::TemplateKey)
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Read a table whose rows are folded into a structure that holds the same
+/// contents whatever order the rows arrive in: a parent lookup (keep-min on a
+/// duplicate key), a dimension map, a semi-join key set. Such a read owes no
+/// row order, so it asks for [`ScanOrder::Any`] and each data file is folded
+/// as its read finishes, even inside a sliced query. The query's own row order
+/// comes from its main scan, never from these reads.
+pub(crate) async fn scan_for_lookup(
+    provider: &dyn super::R2rmlTableProvider,
+    graph_source_id: &str,
+    table_name: &str,
+    projection: &[String],
+    filters: &[crate::r2rml::ScanFilter],
+    as_of_t: Option<i64>,
+) -> Result<ColumnBatchStream> {
+    provider
+        .scan_table_ordered(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            None,
+            as_of_t,
+            ScanOrder::Any,
+        )
+        .await
+}
+
+/// The `as_of_t` a parent table is read at.
+fn parent_as_of_t(ctx: &ExecutionContext<'_>) -> Option<i64> {
+    if ctx.explicit_dataset().is_some() {
+        None
+    } else {
+        Some(ctx.to_t)
+    }
+}
 
 /// Composite key for caching a parent lookup: `(parent_tm_iri, sorted_parent_join_cols)`.
 type LookupCacheKey = (String, Vec<String>);
@@ -93,12 +425,12 @@ pub type R2rmlParentMemoKey = (String, String, Vec<String>, Option<i64>);
 /// window via the q015 fact-as-parent guard).
 #[derive(Default)]
 pub struct R2rmlParentMemoInner {
-    map: HashMap<R2rmlParentMemoKey, Arc<ParentLookup>>,
+    map: HashMap<R2rmlParentMemoKey, Arc<CompleteParentLookup>>,
     total_rows: usize,
 }
 
 impl R2rmlParentMemoInner {
-    fn get(&self, key: &R2rmlParentMemoKey) -> Option<Arc<ParentLookup>> {
+    fn get(&self, key: &R2rmlParentMemoKey) -> Option<Arc<CompleteParentLookup>> {
         self.map.get(key).cloned()
     }
 
@@ -108,7 +440,7 @@ impl R2rmlParentMemoInner {
     fn try_insert(
         &mut self,
         key: R2rmlParentMemoKey,
-        lookup: &Arc<ParentLookup>,
+        lookup: &Arc<CompleteParentLookup>,
         total_cap: usize,
     ) -> bool {
         if self.map.contains_key(&key) {
@@ -170,7 +502,14 @@ struct RefShortcut {
 ///   a composite render could transpose columns. Refused for the MVP (auto-
 ///   generated Iceberg mappings are single-column FK → PK); composite falls back
 ///   to the scan, which stays authoritative.
+/// - the parent's logical table is an `rr:sqlQuery`, which may keep only some of
+///   its table's rows: a FK to a row the query excludes is not "dangling" (the
+///   relaxation above), it names a subject the mapping does not emit, and only
+///   the parent scan knows which rows those are.
 fn build_ref_shortcut(parent_tm: &TriplesMap, rom: &RefObjectMap) -> Option<RefShortcut> {
+    if parent_tm.sql_query().is_some() {
+        return None;
+    }
     let sm = &parent_tm.subject_map;
     if sm.column.is_some() || sm.constant.is_some() || !sm.generates_iri() {
         return None;
@@ -248,6 +587,15 @@ fn topk_pushdown_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_TOPK_PUSHDOWN"))
 }
 
+/// Whether a scan is narrowed by keys its input already holds (#2239): the
+/// subject IRIs a child window binds, reversed through a map's subject
+/// template into key-column filters. Read once from `FLUREE_R2RML_KEY_PUSHDOWN`
+/// (family falsy spellings); off scans every map's table unfiltered by them.
+fn key_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_KEY_PUSHDOWN"))
+}
+
 /// F-AUD-3 kill switch: whether the non-aggregate scan/crawl path records its
 /// materialized windows and fact-parent lookup builds against the query memory
 /// budget. Default ON (`FLUREE_SCAN_MEM_ACCOUNTING`, family falsy spellings via
@@ -298,21 +646,40 @@ enum JoinPlan {
     },
 }
 
+/// For each parent a TriplesMap's RefObjectMaps resolve through, the distinct
+/// join columns of the map's table those RefObjectMaps read it by, each
+/// aligned with the parent's join columns. Two RefObjectMaps of one map can
+/// share a parent and its join columns through different columns of their own
+/// (a ship-to and a bill-to address), so a key is resolved for all of them.
+type ParentJoins = HashMap<LookupCacheKey, Vec<Vec<String>>>;
+
+/// Record that a RefObjectMap reads `key`'s parent through `child_cols`.
+fn add_parent_join(joins: &mut ParentJoins, key: LookupCacheKey, child_cols: Vec<String>) {
+    let cols = joins.entry(key).or_default();
+    if !cols.contains(&child_cols) {
+        cols.push(child_cols);
+    }
+}
+
 /// One TriplesMap's streaming scan state: the live batch stream from the table
-/// scan, the parent lookups for its RefObjectMap joins, and the precomputed join
+/// scan, the parents its RefObjectMap joins read, and the precomputed join
 /// plan against the buffered child. Batches are pulled in bounded windows and
 /// dropped after materializing, so the whole table is never resident.
 struct TmStream {
     tm_iri: String,
     stream: ColumnBatchStream,
     exhausted: bool,
-    /// Parent (dimension) lookups for this TriplesMap's RefObjectMap POMs, keyed
-    /// by `(parent TriplesMap IRI, join_cols)` ([`LookupCacheKey`]). `Arc`-shared
-    /// so a lookup memoized on the operator's `parent_lookup_cache` (PR-4) is
-    /// reused across child batches without a re-scan or a clone.
-    parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>>,
+    /// The parents this TriplesMap's RefObjectMap POMs resolve through
+    /// ([`ScanProgress::parents`]), with the columns of this map's table each
+    /// is read by: a probe-built parent resolves, per window of this map's
+    /// rows, the keys every one of them holds.
+    parent_joins: ParentJoins,
+    /// Rows pulled past a window's size, read first by the next window (a
+    /// window is cut to its size while a parent is resolved by probes, so the
+    /// keys it probes are its own).
+    pending: Option<ColumnBatch>,
     /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
-    /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
+    /// skipped (trusted browse crawl only). Keyed identically to `parent_joins`;
     /// a given `LookupCacheKey` populates exactly one of the two maps.
     ref_shortcuts: HashMap<LookupCacheKey, RefShortcut>,
     join: JoinPlan,
@@ -325,6 +692,13 @@ struct TmStream {
 struct ScanProgress {
     child_batch: Batch,
     child_schema: Vec<VarId>,
+    /// Parent (dimension) lookups for the RefObjectMap POMs of every
+    /// TriplesMap in `tms`, keyed by `(parent TriplesMap IRI, join_cols)`
+    /// ([`LookupCacheKey`]): one per key, whichever maps and columns reference
+    /// it. A complete lookup is `Arc`-shared so one memoized on the operator's
+    /// `parent_lookup_cache` (PR-4) is reused across child batches without a
+    /// re-scan or a clone.
+    parents: HashMap<LookupCacheKey, ParentIndex>,
     tms: Vec<TmStream>,
     tm_idx: usize,
     window_rows: usize,
@@ -378,6 +752,99 @@ fn tm_passes_star_prune(
     true
 }
 
+/// What a child window's subject IRIs say about one map's table scan (#2239).
+#[derive(Debug)]
+enum SubjectKeys {
+    /// Nothing: the window's subjects are unknown, or the map's subject is not
+    /// a reversible IRI template.
+    Unknown,
+    /// No subject the window binds is one the map's template can produce, so
+    /// the map yields no row the join keeps.
+    NoneProducible,
+    /// Filters on the template's key columns keeping every row whose subject
+    /// the window binds: one per column, exact for a one-column key and a
+    /// superset for several (the join stays the exact check).
+    Filters(Vec<crate::r2rml::ScanFilter>),
+}
+
+impl SubjectKeys {
+    /// Derive `triples_map`'s keys from `iris`, the distinct subjects a child
+    /// window binds.
+    fn of(triples_map: &TriplesMap, iris: &[Arc<str>]) -> Self {
+        let subject = &triples_map.subject_map;
+        // Only a template subject that mints IRIs: a constant or column subject
+        // takes precedence over a template, and a blank node never equals an IRI
+        // the child binds but is not what the template text reverses either.
+        if subject.constant.is_some()
+            || subject.column.is_some()
+            || subject.term_type != TermType::Iri
+        {
+            return Self::Unknown;
+        }
+        let Some(reverser) = subject.template.as_deref().and_then(TemplateReverser::new) else {
+            return Self::Unknown;
+        };
+        let mut columns: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut producible = false;
+        for iri in iris {
+            // An IRI that does not reverse is one this template cannot produce
+            // (see `TemplateReverser`): it narrows nothing and adds no key.
+            let Some(values) = reverser.reverse(iri) else {
+                continue;
+            };
+            producible = true;
+            for (column, raw) in values {
+                columns.entry(column).or_default().insert(raw);
+            }
+        }
+        if !producible {
+            return Self::NoneProducible;
+        }
+        Self::Filters(
+            columns
+                .into_iter()
+                .map(|(column, raws)| {
+                    let mut raws: Vec<crate::r2rml::ScanValue> = raws
+                        .into_iter()
+                        .map(crate::r2rml::ScanValue::TemplateKey)
+                        .collect();
+                    if raws.len() == 1 {
+                        crate::r2rml::ScanFilter {
+                            column,
+                            op: crate::r2rml::ScanCmpOp::Eq,
+                            value: raws.remove(0),
+                        }
+                    } else {
+                        crate::r2rml::ScanFilter {
+                            column,
+                            op: crate::r2rml::ScanCmpOp::In,
+                            value: crate::r2rml::ScanValue::Set(raws),
+                        }
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+/// What a scan of one `(table, projection)` has taught this operator about
+/// pushing child keys into it (the perf guard of #2239). A pushed scan is
+/// filtered, so it bypasses the scan cache that replays a small table across
+/// child windows; pushing every window would re-read a small table each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPushSeen {
+    /// A window's keys were pushed; the table's size is unknown.
+    Pushed,
+    /// Too large to cache (its known row count says so, or an unfiltered scan
+    /// overflowed the cache window): the table is re-read every window
+    /// anyway, so pushing never costs a read.
+    Large,
+    /// Its known row count fits the cache window: read it unfiltered once,
+    /// and every later window replays it.
+    Small,
+}
+
 /// R2RML scan operator for `Pattern::R2rml`.
 ///
 /// Scans an Iceberg table through an R2RML mapping and produces RDF term bindings.
@@ -418,7 +885,7 @@ pub struct R2rmlScanOperator {
     /// PR-4: cross-child-batch parent-lookup memoization. A correlated join
     /// (OPTIONAL / ref) re-enters `build_progress` per child batch; without this
     /// the (dimension) parent tables are re-scanned every batch (q008: 123+
-    /// parent scans, DNF → 8 scans with the memo). Keyed like `parent_lookups`:
+    /// parent scans, DNF → 8 scans with the memo). Keyed like `ScanProgress::parents`:
     /// `(parent TriplesMap IRI, join_cols)` — the TM IRI, NOT the parent table
     /// name. Two parent TMs over one table can render different subject IRIs
     /// from the same join key (different subject templates), so a table-name
@@ -430,7 +897,20 @@ pub struct R2rmlScanOperator {
     /// by `FLUREE_R2RML_PARENT_MEMO`. (q050 is NOT fixed by this: its
     /// correlated OPTIONAL rebuilds the whole operator per row, resetting any
     /// operator-scoped cache — that's PR-4b.)
-    parent_lookup_cache: HashMap<LookupCacheKey, Arc<ParentLookup>>,
+    parent_lookup_cache: HashMap<LookupCacheKey, Arc<CompleteParentLookup>>,
+    /// Parent indexes resolved by probes, kept from one child window's scan to
+    /// the next so a resolved key is not probed again. Keyed like the
+    /// complete lookups: an index holds only what the parent holds for the
+    /// keys resolved, so the next scan serves it to every map that reads that
+    /// parent, by whatever columns.
+    partial_parents: HashMap<LookupCacheKey, Box<PartialParentIndex>>,
+    /// Per `(table, projection)`: what pushing child keys into its scan has
+    /// taught this operator (see [`KeyPushSeen`]).
+    key_push_seen: HashMap<(String, Vec<String>), KeyPushSeen>,
+    /// Whether this operator narrows its scans by keys its input holds (#2239).
+    /// Read once from [`key_pushdown_enabled`] at construction, per operator
+    /// like `parent_memo`, so a test can drive both regimes in one process.
+    key_pushdown: bool,
     /// Whether cross-batch parent memoization is on for this operator. Read once
     /// from `parent_memo_enabled()` at construction (per-operator, not a global
     /// `OnceLock`), so a test can drive both regimes deterministically in one
@@ -461,6 +941,12 @@ pub struct R2rmlScanOperator {
     /// View-policy gate, built at open when a non-root policy is active. `None`
     /// = unfiltered scan (see `r2rml::policy`).
     policy_gate: Option<R2rmlPolicyGate>,
+    /// The row order the main table scan owes the query (see [`ScanOrder`]):
+    /// deterministic unless the planner set `Any` for a query with no slice.
+    /// Parent lookups always scan deterministically. Overridden to
+    /// deterministic at run time when the execution context requires it (see
+    /// [`ExecutionContext::deterministic_scans`]).
+    scan_order: ScanOrder,
     /// State
     state: OperatorState,
 }
@@ -535,13 +1021,33 @@ impl R2rmlScanOperator {
             child_pending: None,
             scan_cache: HashMap::new(),
             parent_lookup_cache: HashMap::new(),
+            key_push_seen: HashMap::new(),
+            partial_parents: HashMap::new(),
+            key_pushdown: key_pushdown_enabled(),
             parent_memo: parent_memo_enabled(),
             row_budget: None,
             emitted: 0,
             topk: None,
             consumed_filter,
             policy_gate: None,
+            scan_order: ScanOrder::Deterministic,
             state: OperatorState::Created,
+        }
+    }
+
+    /// Set the row order the main table scan owes the query (the planner's
+    /// [`PlanningContext::scan_order`](crate::temporal_mode::PlanningContext)).
+    pub fn with_scan_order(mut self, order: ScanOrder) -> Self {
+        self.scan_order = order;
+        self
+    }
+
+    /// The order the main table scan runs in under `ctx`.
+    fn main_scan_order(&self, ctx: &ExecutionContext<'_>) -> ScanOrder {
+        if ctx.deterministic_scans {
+            ScanOrder::Deterministic
+        } else {
+            self.scan_order
         }
     }
 
@@ -648,11 +1154,17 @@ impl R2rmlScanOperator {
     /// gate `build_scan_filters` uses. The scan-side prune uses only this primary
     /// column; the `SortOperator` above still applies the exact compound order +
     /// LIMIT, so a `None` here is only a missed optimization, never wrong.
-    fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
+    fn resolve_topk_directive(
+        &self,
+        triples_map: &TriplesMap,
+        scan_filters: &[crate::r2rml::ScanFilter],
+    ) -> Option<crate::r2rml::ScanTopK> {
         let (sort_var, k, ascending) = self.topk?;
-        // SOUNDNESS (heap feed): decline when a residual filter the operator
-        // enforces after the scan is present — the heap would see pre-filter rows.
-        if topk_residual_filter_present(&self.pattern) {
+        // SOUNDNESS (heap feed): decline when a row the scan emits may still be
+        // dropped before this operator's output — the heap would see rows that
+        // are not in the result. (A join with a child that binds a produced
+        // variable drops rows too; `set_topk` records no directive for that.)
+        if topk_feed_may_drop_rows(&self.pattern, scan_filters) {
             return None;
         }
         // The view-policy gate is a residual filter too: it drops rows AFTER the
@@ -685,16 +1197,101 @@ impl R2rmlScanOperator {
             return None;
         };
         let col = value_pushdown_column(&pom.object_map)?;
+        let Some(required_columns) = topk_required_columns(&self.pattern, triples_map) else {
+            tracing::debug!(
+                triples_map = %triples_map.iri,
+                "r2rml topk declined: a star member's value may be missing from a non-null row"
+            );
+            return None;
+        };
         Some(crate::r2rml::ScanTopK {
             sort_column: col.to_string(),
             k,
             ascending,
             order: term_order(&pom.object_map)?,
+            required_columns,
         })
     }
 
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
         pattern_scan_filters(&self.pattern, triples_map)
+    }
+
+    /// The distinct IRIs a child window binds this pattern's subject variable
+    /// to, or `None` when they cannot narrow the scan: key pushdown is off, the
+    /// subject is not a variable the child binds, a row leaves it unbound (that
+    /// row joins every produced row), a binding cannot be read as an IRI, or
+    /// there are more than the push cap. A row binding a literal, or a poisoned
+    /// one, joins no produced subject and adds nothing.
+    fn child_subject_iris(
+        &self,
+        child_schema: &[VarId],
+        child_batch: &Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> Option<Vec<Arc<str>>> {
+        if !self.key_pushdown {
+            return None;
+        }
+        let var = self.pattern.subject_var?;
+        let pos = child_schema.iter().position(|v| *v == var)?;
+        let cap = super::in_pushdown_max();
+        let mut iris: HashSet<Arc<str>> = HashSet::new();
+        for binding in child_batch.column_by_idx(pos)? {
+            let iri: Arc<str> = match binding {
+                Binding::Iri(iri) | Binding::IriMatch { iri, .. } => Arc::clone(iri),
+                Binding::Sid { sid, .. } => Arc::from(ctx.decode_sid(sid)?),
+                Binding::Lit { .. } | Binding::EncodedLit { .. } | Binding::Poisoned => continue,
+                _ => return None,
+            };
+            iris.insert(iri);
+            if iris.len() > cap {
+                return None;
+            }
+        }
+        Some(iris.into_iter().collect())
+    }
+
+    /// Whether to push child keys into a scan of `cache_key` that would
+    /// otherwise be cached (the perf guard of #2239): not when the table is
+    /// already cached (the replay reads nothing). Otherwise by its size, when
+    /// the provider already knows its row count: a table too large to cache
+    /// takes the keys every window, one that fits is read unfiltered once and
+    /// replayed. With no known count: the first window pushes, and a later one
+    /// pushes only once the table is known to be too large to cache; until
+    /// then it reads the table unfiltered, which caches a small one for every
+    /// window after it or shows that it is large. Either way at most one read
+    /// more than the best choice, and never more than an unpushed scan, which
+    /// reads the table every window it is not cached.
+    async fn key_push_wanted(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        provider: &dyn super::R2rmlTableProvider,
+        cache_key: &(String, Vec<String>),
+    ) -> Result<bool> {
+        if self.scan_cache.contains_key(cache_key) {
+            return Ok(false);
+        }
+        if !self.key_push_seen.contains_key(cache_key) {
+            let known = provider
+                .known_row_count(
+                    &self.pattern.graph_source_id,
+                    &cache_key.0,
+                    parent_as_of_t(ctx),
+                )
+                .await?;
+            if let Some(rows) = known {
+                let seen = if rows > materialize_window_rows() as u64 {
+                    KeyPushSeen::Large
+                } else {
+                    KeyPushSeen::Small
+                };
+                self.key_push_seen.insert(cache_key.clone(), seen);
+            }
+        }
+        Ok(match self.key_push_seen.get(cache_key) {
+            None | Some(KeyPushSeen::Large) => true,
+            Some(KeyPushSeen::Pushed | KeyPushSeen::Small) => false,
+        })
     }
 
     /// Materialize one window of a TriplesMap's produced column batches into
@@ -706,7 +1303,7 @@ impl R2rmlScanOperator {
         &self,
         triples_map: &TriplesMap,
         batches: &[ColumnBatch],
-        parent_lookups: &HashMap<LookupCacheKey, Arc<ParentLookup>>,
+        parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
         ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
         ctx: &ExecutionContext<'_>,
     ) -> Result<MaterializedRows> {
@@ -988,7 +1585,13 @@ impl R2rmlScanOperator {
             .filter(|v| child_schema.contains(v))
             .collect();
 
+        // #2239: the subjects this child window binds, to narrow each map's scan
+        // to their template keys.
+        let child_subjects = self.child_subject_iris(&child_schema, &child_batch, ctx);
+
         let mut tms: Vec<TmStream> = Vec::with_capacity(triples_maps.len());
+        // One index per parent key, shared by every map below that references it.
+        let mut parents: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
 
         for triples_map in &triples_maps {
@@ -997,6 +1600,25 @@ impl R2rmlScanOperator {
             // + plan) per map here without returning to `next_batch`.
             ctx.check_cancelled()?;
             if !seen.insert(triples_map.iri.clone()) {
+                continue;
+            }
+
+            let subject_keys = child_subjects
+                .as_deref()
+                .map_or(SubjectKeys::Unknown, |iris| {
+                    SubjectKeys::of(triples_map, iris)
+                });
+            // Not scanning the map also skips what a provider records on a
+            // scan, such as the snapshot a table was read at (the build
+            // watermark of a materialize session). A query reads no row of
+            // the table and needs no record of it; a materialize build scans
+            // every map's table through its own driver, never through this
+            // skip.
+            if matches!(subject_keys, SubjectKeys::NoneProducible) {
+                tracing::debug!(
+                    triples_map = %triples_map.iri,
+                    "R2RML scan: TriplesMap skipped, its subject template produces none of the subjects the child binds"
+                );
                 continue;
             }
 
@@ -1069,7 +1691,32 @@ impl R2rmlScanOperator {
 
             // Scan the table, pushing resolved FILTER predicates for file pruning
             // (column resolution needs the mapping, so it happens here).
-            let scan_filters = self.build_scan_filters(triples_map);
+            let mut scan_filters = self.build_scan_filters(triples_map);
+            let cache_key = (table_name.to_string(), projection.clone());
+            if let SubjectKeys::Filters(keys) = subject_keys {
+                // A scan the cache would hold (unfiltered, unbudgeted, no top-k)
+                // takes the keys only when the perf guard says so; any other
+                // scan bypasses the cache already, so the keys cost nothing.
+                let would_cache = scan_cache_enabled()
+                    && scan_filters.is_empty()
+                    && self.row_budget.is_none()
+                    && self.topk.is_none();
+                if !would_cache
+                    || self
+                        .key_push_wanted(ctx, table_provider, &cache_key)
+                        .await?
+                {
+                    tracing::debug!(
+                        triples_map = %triples_map.iri,
+                        key_columns = keys.len(),
+                        "R2RML scan: pushing the child window's subject keys"
+                    );
+                    self.key_push_seen
+                        .entry(cache_key.clone())
+                        .or_insert(KeyPushSeen::Pushed);
+                    scan_filters.extend(keys);
+                }
+            }
             let as_of_t = if ctx.explicit_dataset().is_some() {
                 None
             } else {
@@ -1109,34 +1756,36 @@ impl R2rmlScanOperator {
             // load-bearing invariant is one-directional: NO path that could return
             // a pruned subset (`self.topk.is_some()`) is ever cacheable, so a
             // pruned result can never poison the `(table, projection)` cache.
-            let main_scan_topk = self.resolve_topk_directive(triples_map);
+            let main_scan_topk = self.resolve_topk_directive(triples_map, &scan_filters);
             let cacheable = scan_cache_enabled()
                 && scan_filters.is_empty()
                 && self.row_budget.is_none()
                 && self.topk.is_none();
-            let cache_key = (table_name.to_string(), projection.clone());
+            let scan_order = self.main_scan_order(ctx);
             let stream: ColumnBatchStream = if !cacheable {
                 table_provider
-                    .scan_table(
+                    .scan_table_ordered(
                         &self.pattern.graph_source_id,
                         table_name,
                         &projection,
                         &scan_filters,
                         main_scan_topk.as_ref(),
                         as_of_t,
+                        scan_order,
                     )
                     .await?
             } else if let Some(cached) = self.scan_cache.get(&cache_key) {
                 replay_stream(Arc::clone(cached))
             } else {
                 let fresh = table_provider
-                    .scan_table(
+                    .scan_table_ordered(
                         &self.pattern.graph_source_id,
                         table_name,
                         &projection,
                         &scan_filters,
                         main_scan_topk.as_ref(),
                         as_of_t,
+                        scan_order,
                     )
                     .await?;
                 match collect_scan_capped(fresh, materialize_window_rows(), ctx).await? {
@@ -1146,6 +1795,8 @@ impl R2rmlScanOperator {
                         replay_stream(arc)
                     }
                     CollectedScan::Overflow(prefix, remainder) => {
+                        self.key_push_seen
+                            .insert(cache_key.clone(), KeyPushSeen::Large);
                         Box::pin(futures::stream::iter(prefix.into_iter().map(Ok)).chain(remainder))
                     }
                 }
@@ -1155,7 +1806,7 @@ impl R2rmlScanOperator {
             // predicate filter. Parent (dimension) tables are small and consumed
             // whole into the lookup, so they are not streamed.
             let parent_memo = self.parent_memo;
-            let mut parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>> = HashMap::new();
+            let mut parent_joins = ParentJoins::new();
             let mut ref_shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
             // Trusted browse crawl (`trust_fk_refs`) over the injected TRUE-wildcard
             // scan (`?s ?p ?o`): render RefObjectMap objects by templating the
@@ -1221,16 +1872,21 @@ impl R2rmlScanOperator {
                     // probe only when the child-declared order happened to agree with
                     // the parent-sorted order — a multi-column FK where they disagree
                     // transposed the probe key and silently dropped every edge.
-                    let (parent_join_cols, _child_join_cols) = canonical_join(rom)?;
+                    let (parent_join_cols, child_join_cols) = canonical_join(rom)?;
                     let lookup_key: LookupCacheKey =
                         (rom.parent_triples_map.clone(), parent_join_cols.clone());
 
-                    // A given key populates exactly one of the two maps; skip if
-                    // either already holds it (else the 2nd POM sharing a parent
-                    // re-introduces the parent scan we removed).
-                    if parent_lookups.contains_key(&lookup_key)
-                        || ref_shortcuts.contains_key(&lookup_key)
-                    {
+                    // A shortcut renders from the row's own columns, whichever
+                    // RefObjectMap reads it.
+                    if ref_shortcuts.contains_key(&lookup_key) {
+                        continue;
+                    }
+                    // A parent already opened (by an earlier POM of this map, or
+                    // another map of this scan) is shared, not re-read; this POM
+                    // adds its own join columns, so a parent resolved by probes
+                    // resolves the keys this POM's rows hold too (#2239).
+                    if parents.contains_key(&lookup_key) {
+                        add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                         continue;
                     }
 
@@ -1243,7 +1899,11 @@ impl R2rmlScanOperator {
                     // cached scan-lookup is never mixed with a shortcut key.
                     if parent_memo {
                         if let Some(cached) = self.parent_lookup_cache.get(&lookup_key) {
-                            parent_lookups.insert(lookup_key, Arc::clone(cached));
+                            parents.insert(
+                                lookup_key.clone(),
+                                ParentIndex::Complete(Arc::clone(cached)),
+                            );
+                            add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                             continue;
                         }
                     }
@@ -1273,7 +1933,8 @@ impl R2rmlScanOperator {
                         if let Some(cached) = hit {
                             self.parent_lookup_cache
                                 .insert(lookup_key.clone(), Arc::clone(&cached));
-                            parent_lookups.insert(lookup_key, cached);
+                            parents.insert(lookup_key.clone(), ParentIndex::Complete(cached));
+                            add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                             continue;
                         }
                     }
@@ -1303,87 +1964,39 @@ impl R2rmlScanOperator {
                         }
                     }
 
-                    let parent_table = match parent_tm.table_name() {
-                        Some(name) => name,
-                        None => {
-                            tracing::warn!(
-                                parent = %rom.parent_triples_map,
-                                "Parent TriplesMap has no logical table, skipping"
-                            );
-                            continue;
-                        }
+                    let Some(source) = ParentSource::new(parent_tm, parent_join_cols) else {
+                        tracing::warn!(
+                            parent = %rom.parent_triples_map,
+                            "Parent TriplesMap has no logical table, skipping"
+                        );
+                        continue;
                     };
-
-                    // Columns needed from the parent: join columns + subject
-                    // template columns (+ rr:column if the subject uses one).
-                    let mut parent_projection: Vec<String> = parent_join_cols.clone();
-                    parent_projection
-                        .extend(parent_tm.subject_map.template_columns.iter().cloned());
-                    if let Some(ref col) = parent_tm.subject_map.column {
-                        parent_projection.push(col.clone());
-                    }
-                    parent_projection.sort();
-                    parent_projection.dedup();
-
-                    let as_of_t = if ctx.explicit_dataset().is_some() {
-                        None
-                    } else {
-                        Some(ctx.to_t)
-                    };
-                    // Parent (dimension) tables are small; collect the stream
-                    // fully into the lookup rather than streaming it.
-                    let parent_stream = table_provider
-                        .scan_table(
-                            &self.pattern.graph_source_id,
-                            parent_table,
-                            &parent_projection,
-                            &[],
-                            None,
-                            as_of_t,
+                    // #2239: with key pushdown on, the parent is read by the keys
+                    // each window of this scan needs (see `resolve_parent_keys`),
+                    // not whole up front: a `LIMIT` or a key-filtered scan needs
+                    // a handful of its rows. The keys an earlier child window
+                    // resolved are kept: the index holds nothing of the map or
+                    // the columns that read it, so it serves every one.
+                    let index = if self.key_pushdown {
+                        ParentIndex::Partial(
+                            self.partial_parents
+                                .remove(&lookup_key)
+                                .unwrap_or_else(|| Box::new(PartialParentIndex::new(source))),
                         )
-                        .await?;
-                    let parent_batches = collect_stream(parent_stream, ctx).await?;
-
-                    let lookup = Arc::new(build_parent_lookup(
-                        ctx,
-                        parent_tm,
-                        &parent_join_cols,
-                        parent_batches,
-                    )?);
-                    // Memoize across child batches unless the lookup exceeds one
-                    // materialize window — a fact-as-parent (q015) is used for this
-                    // batch but NOT retained, falling through to today's per-batch
-                    // rebuild so the cache can't grow unbounded. The window is
-                    // env-tunable (`FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS`), so
-                    // raising it also raises what each memo key may retain —
-                    // intentional (both bound the same working-set notion), but a
-                    // window bump knowingly buys a bigger cache.
-                    if parent_memo && lookup.len() <= materialize_window_rows() {
-                        self.parent_lookup_cache
-                            .insert(lookup_key.clone(), Arc::clone(&lookup));
-                        // PR-8b: also publish to the query-scoped memo so a later
-                        // operator rebuild reuses it. Refused (silently falling
-                        // through to a per-batch rebuild) if it would push the memo
-                        // past its total-rows cap — bounding cross-parent
-                        // accumulation the per-operator cache never had.
-                        let as_of_t = if ctx.explicit_dataset().is_some() {
-                            None
-                        } else {
-                            Some(ctx.to_t)
-                        };
-                        let ctx_key: R2rmlParentMemoKey = (
-                            self.pattern.graph_source_id.clone(),
-                            rom.parent_triples_map.clone(),
-                            parent_join_cols.clone(),
-                            as_of_t,
-                        );
-                        ctx.r2rml_parent_memo.lock().unwrap().try_insert(
-                            ctx_key,
-                            &lookup,
-                            parent_memo_total_cap_rows(),
-                        );
-                    }
-                    parent_lookups.insert(lookup_key, lookup);
+                    } else {
+                        ParentIndex::Complete(
+                            self.build_complete_parent(
+                                ctx,
+                                table_provider,
+                                parent_tm,
+                                &source,
+                                &lookup_key,
+                            )
+                            .await?,
+                        )
+                    };
+                    parents.insert(lookup_key.clone(), index);
+                    add_parent_join(&mut parent_joins, lookup_key, child_join_cols);
                 }
             }
 
@@ -1393,7 +2006,8 @@ impl R2rmlScanOperator {
                 tm_iri: triples_map.iri.clone(),
                 stream,
                 exhausted: false,
-                parent_lookups,
+                parent_joins,
+                pending: None,
                 ref_shortcuts,
                 join,
             });
@@ -1416,10 +2030,163 @@ impl R2rmlScanOperator {
         Ok(Some(ScanProgress {
             child_batch,
             child_schema,
+            parents,
             tms,
             tm_idx: 0,
             window_rows,
         }))
+    }
+
+    /// Read `source`'s parent whole into a [`CompleteParentLookup`], and keep
+    /// it for later child batches and operators unless it exceeds one
+    /// materialize window — a fact-as-parent (q015) is used here but NOT
+    /// retained, falling through to a per-batch rebuild so the caches can't
+    /// grow unbounded. The window is env-tunable
+    /// (`FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS`), so raising it also raises what
+    /// each memo key may retain — intentional (both bound the same working-set
+    /// notion), but a window bump knowingly buys a bigger cache.
+    async fn build_complete_parent(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        provider: &dyn super::R2rmlTableProvider,
+        parent_tm: &TriplesMap,
+        source: &ParentSource,
+        lookup_key: &LookupCacheKey,
+    ) -> Result<Arc<CompleteParentLookup>> {
+        let stream = scan_for_lookup(
+            provider,
+            &self.pattern.graph_source_id,
+            &source.parent_table,
+            &source.projection,
+            &[],
+            parent_as_of_t(ctx),
+        )
+        .await?;
+        let lookup =
+            Arc::new(build_parent_lookup(ctx, parent_tm, &source.parent_cols, stream).await?);
+        if self.parent_memo && lookup.len() <= materialize_window_rows() {
+            self.parent_lookup_cache
+                .insert(lookup_key.clone(), Arc::clone(&lookup));
+            // PR-8b: also publish to the query-scoped memo so a later operator
+            // rebuild reuses it. Refused (silently falling through to a
+            // per-batch rebuild) if it would push the memo past its total-rows
+            // cap — bounding cross-parent accumulation the per-operator cache
+            // never had.
+            let ctx_key: R2rmlParentMemoKey = (
+                self.pattern.graph_source_id.clone(),
+                source.parent_tm_iri.clone(),
+                source.parent_cols.clone(),
+                parent_as_of_t(ctx),
+            );
+            ctx.r2rml_parent_memo.lock().unwrap().try_insert(
+                ctx_key,
+                &lookup,
+                parent_memo_total_cap_rows(),
+            );
+        }
+        Ok(lookup)
+    }
+
+    /// Resolve every join key `window`'s rows hold in each partial parent
+    /// index (#2239), before the window materializes against them: through
+    /// each parent `joins` names (the window's map's), by each of the columns
+    /// it names. The keys not yet resolved are probed when there are few
+    /// enough to push and a keyed read is worth it
+    /// ([`PartialParentIndex::worth_probing`], counted for `map`, the
+    /// window's); otherwise the parent is read whole once and the index
+    /// becomes complete for every map, so a scan never reads a parent whole
+    /// more than once.
+    async fn resolve_parent_keys(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        parents: &mut HashMap<LookupCacheKey, ParentIndex>,
+        map: &str,
+        joins: &ParentJoins,
+        window: &[ColumnBatch],
+    ) -> Result<()> {
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or_else(|| QueryError::Internal("R2RML mapping not loaded".to_string()))?
+            .clone();
+        let provider = ctx.r2rml_table_provider.ok_or_else(|| {
+            QueryError::InvalidQuery("R2RML table provider not configured".to_string())
+        })?;
+        for (lookup_key, child_joins) in joins {
+            let Some(index) = parents.get_mut(lookup_key) else {
+                continue;
+            };
+            let ParentIndex::Partial(partial) = index else {
+                continue;
+            };
+            let parent_tm = mapping.get(&partial.source.parent_tm_iri).ok_or_else(|| {
+                QueryError::Internal(format!(
+                    "Parent TriplesMap '{}' missing from mapping mid-scan",
+                    partial.source.parent_tm_iri
+                ))
+            })?;
+            let mut probe = None;
+            if let Some(keys) = partial.missing_keys(window, child_joins, super::in_pushdown_max())
+            {
+                if keys.is_empty() {
+                    continue;
+                }
+                let filters = partial.key_filters(&keys);
+                let counts = provider
+                    .scan_file_counts(
+                        &self.pattern.graph_source_id,
+                        &partial.source.parent_table,
+                        &filters,
+                        parent_as_of_t(ctx),
+                    )
+                    .await?;
+                if partial.worth_probing(map, counts) {
+                    partial.spend(map, counts.map_or(0, |c| c.selected));
+                    probe = Some((keys, filters));
+                }
+            }
+            match probe {
+                Some((keys, filters)) => {
+                    partial
+                        .probe(
+                            ctx,
+                            provider,
+                            &self.pattern.graph_source_id,
+                            parent_tm,
+                            keys,
+                            filters,
+                        )
+                        .await?;
+                }
+                None => {
+                    tracing::debug!(
+                        parent = %partial.source.parent_tm_iri,
+                        map,
+                        "R2RML parent: reading the parent whole"
+                    );
+                    let source = partial.source.clone();
+                    // The whole read replaces what the probes built: free that
+                    // first, and its charge, so the parent is never held (or
+                    // charged) twice.
+                    partial.forget(ctx);
+                    let complete = self
+                        .build_complete_parent(ctx, provider, parent_tm, &source, lookup_key)
+                        .await?;
+                    *index = ParentIndex::Complete(complete);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep a finished scan's probe-built parent indexes for the next child
+    /// window's scan: one per key, whichever maps read it.
+    fn retire_progress(&mut self, progress: ScanProgress) {
+        for (key, index) in progress.parents {
+            if let ParentIndex::Partial(partial) = index {
+                self.partial_parents.insert(key, partial);
+            }
+        }
     }
 
     /// Pull and materialize the next window from the in-flight scan and emit its
@@ -1443,7 +2210,7 @@ impl R2rmlScanOperator {
 
         while progress.tm_idx < progress.tms.len() {
             let i = progress.tm_idx;
-            if progress.tms[i].exhausted {
+            if progress.tms[i].exhausted && progress.tms[i].pending.is_none() {
                 progress.tm_idx += 1;
                 continue;
             }
@@ -1458,6 +2225,14 @@ impl R2rmlScanOperator {
                 // load-bearing poll for a runaway streaming scan of a large fact
                 // table — a pure relaxed-atomic flag read, unmeasurable here.
                 ctx.check_cancelled()?;
+                if let Some(batch) = progress.tms[i].pending.take() {
+                    rows += batch.num_rows;
+                    window.push(batch);
+                    continue;
+                }
+                if progress.tms[i].exhausted {
+                    break;
+                }
                 match progress.tms[i].stream.next().await {
                     Some(batch) => {
                         let batch = batch?;
@@ -1469,6 +2244,35 @@ impl R2rmlScanOperator {
                         break;
                     }
                 }
+            }
+
+            // #2239: a parent resolved by probes reads the keys of this window's
+            // rows, so cut the window to its size: under a `LIMIT 5` it is five
+            // rows, not the whole Parquet batch the first pull returned.
+            let probing = progress.tms[i]
+                .parent_joins
+                .keys()
+                .any(|key| matches!(progress.parents.get(key), Some(ParentIndex::Partial(_))));
+            if probing && rows > progress.window_rows {
+                if let Some(last) = window.pop() {
+                    let keep = last.num_rows - (rows - progress.window_rows);
+                    let head: Vec<usize> = (0..keep).collect();
+                    let tail: Vec<usize> = (keep..last.num_rows).collect();
+                    progress.tms[i].pending = Some(last.filter_by_indices(&tail));
+                    if keep > 0 {
+                        window.push(last.filter_by_indices(&head));
+                    }
+                }
+            }
+            if probing && !window.is_empty() {
+                self.resolve_parent_keys(
+                    ctx,
+                    &mut progress.parents,
+                    &progress.tms[i].tm_iri,
+                    &progress.tms[i].parent_joins,
+                    &window,
+                )
+                .await?;
             }
 
             if window.is_empty() {
@@ -1489,7 +2293,7 @@ impl R2rmlScanOperator {
             } = self.materialize_window(
                 triples_map,
                 &window,
-                &progress.tms[i].parent_lookups,
+                &progress.parents,
                 &progress.tms[i].ref_shortcuts,
                 ctx,
             )?;
@@ -1570,28 +2374,6 @@ impl R2rmlScanOperator {
         }
         Ok(false)
     }
-}
-
-/// Drain a [`ColumnBatchStream`] fully into a vector. Used for small dimension
-/// (parent) tables whose entire contents become a lookup.
-async fn collect_stream(
-    mut stream: ColumnBatchStream,
-    ctx: &ExecutionContext<'_>,
-) -> Result<Vec<ColumnBatch>> {
-    let mut out = Vec::new();
-    loop {
-        // T3.1a: cancellation checkpoint before decoding the next batch, so a
-        // deadline/abort stops a parent-dimension drain mid-sweep instead of
-        // materializing the whole table into the lookup first. (The main
-        // streaming scan already polls per-batch in `next_batch`; this closes the
-        // collect-into-lookup helpers that drained a scan without a checkpoint.)
-        ctx.check_cancelled()?;
-        match stream.next().await {
-            Some(batch) => out.push(batch?),
-            None => break,
-        }
-    }
-    Ok(out)
 }
 
 /// Whether the correlated inner-scan cache is enabled. Read once from
@@ -1938,13 +2720,104 @@ fn value_pushdown_column(om: &ObjectMap) -> Option<&str> {
 /// heap is fed the scan's EMITTED rows; a residual filter means those include
 /// rows that don't survive to the result, so the k-th bound would ride too high
 /// and prune files whose qualifying rows belong in the true top-k. When true, the
-/// top-k pushdown MUST be declined (→ full sort). Pushed `scan_filters` are NOT
-/// residual — the reader applies them, so the emitted batch is already filtered.
+/// top-k pushdown MUST be declined (→ full sort).
 fn topk_residual_filter_present(pattern: &R2rmlPattern) -> bool {
     pattern.consumed_filter.is_some()
         || pattern.object_constant.is_some()
         || pattern.subject_constant.is_some()
         || !pattern.star_constraints.is_empty()
+}
+
+/// Whether a row a scan EMITS may fail to reach this operator's output, which
+/// makes the scan-side top-k unsound: its heap is fed the emitted rows, so a
+/// row dropped later can hold the k-th bound above the true top-k and prune
+/// files holding the rows that belong there.
+///
+/// Three ways a row is dropped after the scan:
+/// - a residual filter the operator enforces per row
+///   ([`topk_residual_filter_present`]);
+/// - the join with the child, when the child binds a variable this scan
+///   produces: a produced row that matches no child row is dropped. A
+///   `VALUES` block, an earlier pattern, or the seed of a sub-select or GRAPH
+///   scope arrives as the child. That is known when the plan is built, so
+///   `set_topk` records no directive for such a scan (it then stays eligible
+///   for the scan cache); with no shared variable the join is a cross product
+///   and drops nothing;
+/// - any pushed scan filter. Each restates a condition enforced elsewhere
+///   ([`pattern_scan_filters`]), and the provider may apply it exactly,
+///   partly, or not at all: the Parquet reader skips a comparison on an
+///   unprojected column or one whose literal does not compare exactly with
+///   the column, row filtering can be switched off
+///   (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`), and other providers apply only
+///   what they can state exactly. No provider promises the emitted rows are
+///   exactly the filtered rows, so a pushed filter counts as residual here.
+///   This arm is defence in depth: no plan reaches it today. Every source of
+///   a scan filter is a condition the first two arms already decline on or
+///   that keeps the directive from being recorded: a FILTER comparison or a
+///   single-variable `VALUES` set pushed to the scan stays in the plan as a
+///   `FilterOperator` or a join, neither of which passes a top-k down (a
+///   FILTER the scan consumed is a residual filter); a constant object, star
+///   constraint or constant subject is a residual filter; and the subject keys
+///   a child window binds come from a child that binds a produced variable.
+///
+/// One more is handled elsewhere: a row whose subject or star member is
+/// NULL mints no solution (the directive names those columns,
+/// [`topk_required_columns`], and the heap skips such a row).
+fn topk_feed_may_drop_rows(
+    pattern: &R2rmlPattern,
+    scan_filters: &[crate::r2rml::ScanFilter],
+) -> bool {
+    topk_residual_filter_present(pattern) || !scan_filters.is_empty()
+}
+
+/// The columns a row of `triples_map` must hold non-null to yield a solution
+/// of `pattern`, for [`crate::r2rml::ScanTopK::required_columns`]; `None` when
+/// no set of columns says so.
+///
+/// A row yields a solution when it mints a subject and, for a same-subject
+/// star, a value for every member. A subject is minted from non-null columns
+/// (every placeholder of a template, or its one column; a constant needs
+/// none). A member yields a value when its one object map does: a column or a
+/// template from non-null columns, a constant always. A member with several
+/// object maps yields one when any of them does, which no single set of
+/// columns states, and a reference yields one only when its key matches a
+/// parent row, which no column of this table states: both are `None`.
+fn topk_required_columns(pattern: &R2rmlPattern, triples_map: &TriplesMap) -> Option<Vec<String>> {
+    let mut columns: Vec<String> = Vec::new();
+    let sm = &triples_map.subject_map;
+    if sm.constant.is_none() {
+        if let Some(column) = &sm.column {
+            columns.push(column.clone());
+        } else if let Some(template) = &sm.template {
+            columns.extend(extract_template_columns(template));
+        }
+    }
+    let members = pattern
+        .predicate_filter
+        .iter()
+        .filter(|_| pattern.object_var.is_some())
+        .map(String::as_str)
+        .chain(pattern.star_bindings.iter().map(|(p, _)| p.as_str()));
+    for pred in members {
+        let mut poms = triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|pom| pom.predicate_map.as_constant() == Some(pred));
+        let (Some(pom), None) = (poms.next(), poms.next()) else {
+            return None;
+        };
+        match &pom.object_map {
+            ObjectMap::Column { column, .. } => columns.push(column.clone()),
+            ObjectMap::Template { template, .. } => {
+                columns.extend(extract_template_columns(template));
+            }
+            ObjectMap::Constant { .. } => {}
+            ObjectMap::RefObjectMap(_) => return None,
+        }
+    }
+    columns.sort();
+    columns.dedup();
+    Some(columns)
 }
 
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
@@ -2221,7 +3094,7 @@ fn materialize_pom_object(
     pom: &PredicateObjectMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
 ) -> Result<Option<RdfTerm>> {
     if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
@@ -2261,7 +3134,7 @@ fn materialize_pom_object(
         }
         Ok(parent_lookups
             .get(&lookup_key)
-            .and_then(|l| l.get(&child_key))
+            .and_then(|index| index.lookup().get(&child_key))
             .cloned())
     } else {
         Ok(materialize_object_from_batch(
@@ -2427,7 +3300,7 @@ fn row_passes_star_constraints(
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     star_constraint_canon: &[Option<String>],
 ) -> Result<bool> {
@@ -2476,7 +3349,7 @@ fn materialize_batch(
     pattern: &R2rmlPattern,
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
-    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
@@ -2497,7 +3370,7 @@ fn materialize_batch_rows(
     pattern: &R2rmlPattern,
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
-    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
     derive_row_classes: bool,
@@ -2556,7 +3429,7 @@ fn derived_row_classes(
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
 ) -> Result<Vec<String>> {
     let mut classes = Vec::new();
@@ -2588,7 +3461,7 @@ fn materialize_row(
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
     object_constant_canon: Option<&str>,
@@ -2900,78 +3773,44 @@ fn materialize_row(
     Ok(())
 }
 
-/// Build a parent lookup table for RefObjectMap joins.
-///
-/// Scans the parent TriplesMap's table and builds a HashMap mapping
-/// parent join key → parent subject IRI.
-///
-/// # Arguments
-///
-/// * `parent_tm` - The parent TriplesMap
-/// * `parent_columns` - Column names used in join conditions (from parent side)
-/// * `batches` - Column batches from scanning the parent table
-///
-/// # Returns
-///
-/// HashMap mapping join key (as `Vec<String>`) to parent subject `RdfTerm`.
-fn build_parent_lookup(
+/// Read a parent table's whole `stream` into a lookup, folding each batch in as
+/// it arrives (so only the lookup and one batch are resident, never the
+/// parent's raw batches alongside the lookup built from them).
+async fn build_parent_lookup(
     ctx: &ExecutionContext<'_>,
     parent_tm: &TriplesMap,
     parent_columns: &[String],
-    batches: Vec<ColumnBatch>,
-) -> Result<ParentLookup> {
+    mut stream: ColumnBatchStream,
+) -> Result<CompleteParentLookup> {
     let mut lookup = ParentLookup::new();
     let mut dup_key_collisions = 0u64;
-
-    for batch in batches {
+    loop {
+        // T3.1a: cancellation checkpoint before decoding the next batch, so a
+        // deadline/abort stops a parent read mid-sweep instead of folding the
+        // whole table into the lookup first.
+        ctx.check_cancelled()?;
+        let Some(batch) = stream.next().await else {
+            break;
+        };
+        let batch = batch?;
         // F-AUD-3 site A2: the fact-as-parent hazard (V2) — a RefObjectMap whose
-        // parent is a FACT table transiently builds a full parent-sized map (tens of
-        // millions of entries) here, unbounded by the memo cap, which only refuses to
-        // RETAIN an over-window lookup AFTER it is fully built. Account each batch's
-        // worst-case contribution and checkpoint inside the build loop so a
-        // budget-exceeding build aborts typed (`MemoryBudgetExceeded`) BEFORE the
-        // whole map is resident, instead of OOMing. `num_rows` over-counts skipped
-        // (null-subject / null-key) rows — deliberately conservative. Unlike the A1
-        // scan window (released on hand-off), this charge is NOT released: the lookup
-        // is genuinely retained for the whole join, so the cumulative charge correctly
-        // equals its resident footprint.
+        // parent is a FACT table builds a full parent-sized map (tens of
+        // millions of entries) here, unbounded by the memo cap, which only
+        // refuses to RETAIN an over-window lookup AFTER it is fully built.
+        // Account each batch's worst-case contribution and checkpoint inside the
+        // build loop so a budget-exceeding build aborts typed
+        // (`MemoryBudgetExceeded`) BEFORE the whole map is resident, instead of
+        // OOMing. `num_rows` over-counts skipped (null-subject / null-key) rows —
+        // deliberately conservative. Unlike the A1 scan window (released on
+        // hand-off), this charge is NOT released: the lookup is genuinely
+        // retained for the whole join, so the cumulative charge correctly equals
+        // its resident footprint.
         if scan_mem_accounting_enabled() {
             ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
             ctx.checkpoint()?;
         }
-        for row_idx in 0..batch.num_rows {
-            // Materialize parent subject
-            let subject_term =
-                match materialize_subject_from_batch(&parent_tm.subject_map, &batch, row_idx) {
-                    Ok(Some(term)) => term,
-                    Ok(None) => continue, // Null subject - skip
-                    Err(e) => {
-                        tracing::warn!(
-                            parent_tm = %parent_tm.iri,
-                            row_idx,
-                            error = %e,
-                            "Failed to materialize parent subject, skipping row"
-                        );
-                        continue;
-                    }
-                };
-
-            // Extract join key from parent row
-            let key = match get_join_key_from_batch(parent_columns, &batch, row_idx) {
-                Some(k) => k,
-                None => continue, // Null in join key - skip
-            };
-
-            // Deterministic keep-min on a duplicate join key (shared with the
-            // materialize twin builder via `parent_key_insert_keep_min`), so the
-            // virtual path and the twin resolve the SAME parent and both are
-            // reproducible regardless of scan / IO-completion order — NOT the old
-            // scan-order-dependent last-wins. The true R2RML fan-out (one edge per
-            // matching parent) is a tracked shared-path follow-up.
-            if parent_key_insert_keep_min(&mut lookup, key, subject_term) {
-                dup_key_collisions += 1;
-            }
-        }
+        dup_key_collisions +=
+            fold_parent_batch(&mut lookup, parent_tm, parent_columns, &batch, None);
     }
 
     tracing::debug!(
@@ -2981,7 +3820,58 @@ fn build_parent_lookup(
         "Built parent lookup table for RefObjectMap join"
     );
 
-    Ok(lookup)
+    Ok(CompleteParentLookup(lookup))
+}
+
+/// Fold one batch of a parent table into `lookup`: each row's join key maps to
+/// its subject, and a duplicate key keeps the minimum subject. With `only`,
+/// a row whose key is not in it is skipped. Returns the number of
+/// duplicate-key collisions.
+fn fold_parent_batch(
+    lookup: &mut ParentLookup,
+    parent_tm: &TriplesMap,
+    parent_columns: &[String],
+    batch: &ColumnBatch,
+    only: Option<&HashSet<Vec<String>>>,
+) -> u64 {
+    let mut dup_key_collisions = 0u64;
+    for row_idx in 0..batch.num_rows {
+        // Extract join key from parent row
+        let key = match get_join_key_from_batch(parent_columns, batch, row_idx) {
+            Some(k) => k,
+            None => continue, // Null in join key - skip
+        };
+        if only.is_some_and(|only| !only.contains(&key)) {
+            continue;
+        }
+
+        // Materialize parent subject
+        let subject_term =
+            match materialize_subject_from_batch(&parent_tm.subject_map, batch, row_idx) {
+                Ok(Some(term)) => term,
+                Ok(None) => continue, // Null subject - skip
+                Err(e) => {
+                    tracing::warn!(
+                        parent_tm = %parent_tm.iri,
+                        row_idx,
+                        error = %e,
+                        "Failed to materialize parent subject, skipping row"
+                    );
+                    continue;
+                }
+            };
+
+        // Deterministic keep-min on a duplicate join key (shared with the
+        // materialize twin builder via `parent_key_insert_keep_min`), so the
+        // virtual path and the twin resolve the SAME parent and both are
+        // reproducible regardless of scan / IO-completion order — NOT the old
+        // scan-order-dependent last-wins. The true R2RML fan-out (one edge per
+        // matching parent) is a tracked shared-path follow-up.
+        if parent_key_insert_keep_min(lookup, key, subject_term) {
+            dup_key_collisions += 1;
+        }
+    }
+    dup_key_collisions
 }
 
 #[async_trait]
@@ -3017,6 +3907,21 @@ impl Operator for R2rmlScanOperator {
         // pre-item-8 DESC-only scan. The planner offers ASC unconditionally so
         // the SQL pushdown lane, whose ORDER BY columns are required by
         // construction, is not tied to this scan's switch.
+        //
+        // Not recorded when the child binds a variable this scan produces: the
+        // scan joins each produced row to the child rows that agree with it, so
+        // the join drops rows the top-k heap has already seen (see
+        // `topk_feed_may_drop_rows`), and the child's own top-k may sit in
+        // files the table-wide bound skipped. Left unrecorded rather than
+        // declined at scan time, so the scan stays eligible for the scan cache.
+        if self
+            .pattern
+            .produced_vars()
+            .iter()
+            .any(|v| self.child.schema().contains(v))
+        {
+            return;
+        }
         let Some(primary) = ordering.first() else {
             return;
         };
@@ -3134,6 +4039,8 @@ impl Operator for R2rmlScanOperator {
                     .await?;
                 if more {
                     self.progress = Some(progress);
+                } else {
+                    self.retire_progress(progress);
                 }
                 continue;
             }
@@ -3187,6 +4094,7 @@ impl Operator for R2rmlScanOperator {
         self.child_pending = None;
         self.scan_cache.clear();
         self.parent_lookup_cache.clear();
+        self.partial_parents.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -3203,11 +4111,30 @@ mod tests {
     use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
     use fluree_db_r2rml::materialize::RdfTerm;
 
+    fn stream_of(batches: Vec<ColumnBatch>) -> ColumnBatchStream {
+        Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+    }
+
+    /// [`build_parent_lookup`] over `batches`, synchronously.
+    fn build_lookup(
+        ctx: &ExecutionContext<'_>,
+        parent_tm: &TriplesMap,
+        parent_columns: &[String],
+        batches: Vec<ColumnBatch>,
+    ) -> Result<CompleteParentLookup> {
+        futures::executor::block_on(build_parent_lookup(
+            ctx,
+            parent_tm,
+            parent_columns,
+            stream_of(batches),
+        ))
+    }
+
     /// T3.1a: a cancelled query must stop a parent-dimension drain up front
     /// (return `Cancelled`) instead of materializing the whole table into the
     /// lookup. Without the checkpoint the empty stream would drain to `Ok`.
     #[tokio::test]
-    async fn collect_stream_bails_on_cancelled_query() {
+    async fn a_parent_build_bails_on_cancelled_query() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
         let snapshot = LedgerSnapshot::genesis("test:main");
@@ -3216,8 +4143,9 @@ mod tests {
         cancellation.cancel();
         let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
         let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        let parent_tm = TriplesMap::new("#P", "p").with_subject_template("http://ex/p/{K}");
         assert!(matches!(
-            collect_stream(stream, &ctx).await,
+            build_parent_lookup(&ctx, &parent_tm, &["K".to_string()], stream).await,
             Err(QueryError::Cancelled { .. })
         ));
     }
@@ -3246,7 +4174,7 @@ mod tests {
     /// checkpoint, leaving the remaining four unread. Without the per-iteration
     /// `check_cancelled()` the loop would drain all five (poll count 5).
     #[tokio::test]
-    async fn collect_stream_stops_a_drain_loop_mid_sweep() {
+    async fn a_parent_build_stops_mid_sweep() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{LedgerSnapshot, QueryCancellation};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
@@ -3284,7 +4212,8 @@ mod tests {
         }));
 
         let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
-        let result = collect_stream(stream, &ctx).await;
+        let parent_tm = TriplesMap::new("#P", "p").with_subject_template("http://ex/p/{K}");
+        let result = build_parent_lookup(&ctx, &parent_tm, &["K".to_string()], stream).await;
         assert!(
             matches!(result, Err(QueryError::Cancelled { .. })),
             "a mid-sweep cancel must stop the drain, got {result:?}"
@@ -3521,7 +4450,7 @@ mod tests {
         // One batch of rows is enough — the per-batch record_alloc crosses the ceiling
         // before any row is inserted, so the build aborts on the first batch.
         let batch = single_col_batch("ID", vec![Some(1), Some(2), Some(3)]);
-        let err = build_parent_lookup(&ctx, &parent_tm, &["ID".to_string()], vec![batch])
+        let err = build_lookup(&ctx, &parent_tm, &["ID".to_string()], vec![batch])
             .expect_err("the fact-parent build must trip the 1-byte budget");
         assert!(
             matches!(err, QueryError::MemoryBudgetExceeded { .. }),
@@ -3588,11 +4517,13 @@ mod tests {
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
-        let lookup = Arc::new(
-            build_parent_lookup(&ctx, &parent_tm, &parent_cols, vec![parent_batch]).unwrap(),
+        let lookup =
+            Arc::new(build_lookup(&ctx, &parent_tm, &parent_cols, vec![parent_batch]).unwrap());
+        let mut lookups: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
+        lookups.insert(
+            ("#Zone".to_string(), parent_cols.clone()),
+            ParentIndex::Complete(lookup),
         );
-        let mut lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
-        lookups.insert(("#Zone".to_string(), parent_cols.clone()), lookup);
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         // Child row c_hi=99 (-> z_zone), c_lo=10 (-> a_area); child-DECLARED order is
@@ -3647,10 +4578,9 @@ mod tests {
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = crate::var_registry::VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
-        let lookup =
-            build_parent_lookup(&ctx, &parent_tm, &["JK".to_string()], vec![batch]).unwrap();
+        let lookup = build_lookup(&ctx, &parent_tm, &["JK".to_string()], vec![batch]).unwrap();
         assert_eq!(
-            lookup.get(&["1".to_string()][..]),
+            lookup.lookup().get(&["1".to_string()][..]),
             Some(&RdfTerm::iri("http://ex/customer/a")),
             "keep-min must bind the lexicographically smaller subject on a dup join key"
         );
@@ -3691,6 +4621,1521 @@ mod tests {
         assert!(topk_residual_filter_present(&star_constraint));
     }
 
+    /// The columns a top-k's bound requires non-null: the subject's (every
+    /// placeholder, read from the template itself) and each star member's;
+    /// none for a constant. A member no column decides (a reference, or a
+    /// predicate with two object maps) gives none at all, so the directive is
+    /// declined.
+    #[test]
+    fn topk_required_columns_name_what_a_solution_needs() {
+        use fluree_db_r2rml::mapping::{PredicateMap, RefObjectMap, SubjectMap};
+        let pom = |p: &str, om: ObjectMap| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(p),
+            object_map: om,
+        };
+        let tm = TriplesMap::new("#V", "versions")
+            .with_subject_template("http://ex/v/{id}/{from}")
+            .with_predicate_object(pom("http://ex/amount", ObjectMap::column("AMT")))
+            .with_predicate_object(pom("http://ex/city", ObjectMap::column("CITY")))
+            .with_predicate_object(pom(
+                "http://ex/label",
+                ObjectMap::template("L-{code}", vec!["code".to_string()]),
+            ))
+            .with_predicate_object(pom("http://ex/kind", ObjectMap::constant_literal("v")))
+            .with_predicate_object(pom(
+                "http://ex/owner",
+                ObjectMap::RefObjectMap(RefObjectMap::new("#P", "OWNER", "ID")),
+            ))
+            .with_predicate_object(pom("http://ex/alias", ObjectMap::column("A1")))
+            .with_predicate_object(pom("http://ex/alias", ObjectMap::column("A2")));
+        assert!(
+            tm.subject_map.template_columns.is_empty(),
+            "built without them"
+        );
+        let base = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+            .with_predicate("http://ex/amount");
+        let cols = |pattern: &R2rmlPattern| topk_required_columns(pattern, &tm);
+        assert_eq!(
+            cols(&base),
+            Some(vec![
+                "AMT".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        let star = |pred: &str| {
+            base.clone()
+                .with_star_bindings(vec![(pred.to_string(), VarId(2))])
+        };
+        assert_eq!(
+            cols(&star("http://ex/city")),
+            Some(vec![
+                "AMT".to_string(),
+                "CITY".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(&star("http://ex/label")),
+            Some(vec![
+                "AMT".to_string(),
+                "code".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(&star("http://ex/kind")),
+            Some(vec![
+                "AMT".to_string(),
+                "from".to_string(),
+                "id".to_string()
+            ])
+        );
+        assert_eq!(
+            cols(&star("http://ex/owner")),
+            None,
+            "a reference may dangle"
+        );
+        assert_eq!(cols(&star("http://ex/alias")), None, "two object maps");
+
+        let mut constant = tm.clone();
+        constant.subject_map = SubjectMap::constant("http://ex/the");
+        assert_eq!(
+            topk_required_columns(&base, &constant),
+            Some(vec!["AMT".to_string()])
+        );
+    }
+
+    /// `set_topk` records no directive for a scan whose child binds a variable
+    /// the scan produces: the join with the child drops the produced rows it
+    /// does not match, after the heap saw them. Unrecorded (rather than
+    /// declined at scan time), the scan stays eligible for the scan cache. A
+    /// root scan and a child sharing no variable (a cross product, which every
+    /// produced row survives) record it.
+    #[test]
+    fn topk_is_not_recorded_when_the_child_binds_a_produced_var() {
+        use crate::seed::{BatchReplayOperator, EmptyOperator};
+        use crate::sort::SortSpec;
+        let (order, total) = (VarId(1), VarId(2));
+        let pattern =
+            R2rmlPattern::new("gs:main", order, Some(total)).with_predicate("http://ex/orderTotal");
+        let child_binding = |var: VarId| -> BoxedOperator {
+            Box::new(BatchReplayOperator::new(
+                Arc::from(vec![var].into_boxed_slice()),
+                Vec::new(),
+            ))
+        };
+        let topk_of = |child: BoxedOperator| {
+            let mut op = R2rmlScanOperator::new(child, pattern.clone());
+            op.set_topk(&[SortSpec::desc(total)], 3);
+            op.topk
+        };
+        assert_eq!(
+            topk_of(Box::<EmptyOperator>::default()),
+            Some((total, 3, false)),
+            "a root scan records the directive"
+        );
+        assert_eq!(
+            topk_of(child_binding(VarId(9))),
+            Some((total, 3, false)),
+            "a child sharing no variable records it"
+        );
+        assert_eq!(
+            topk_of(child_binding(order)),
+            None,
+            "the child binds the subject"
+        );
+        assert_eq!(
+            topk_of(child_binding(total)),
+            None,
+            "the child binds the sort variable"
+        );
+    }
+
+    /// The scan-side top-k reaches `scan_table` only when every row the scan
+    /// emits reaches this operator's output. A child that binds a variable the
+    /// scan produces (a `VALUES` block, an earlier pattern) drops the produced
+    /// rows it does not match, and a pushed filter may be applied only partly
+    /// by the reader; either would feed the heap rows that are not in the
+    /// result, so its k-th bound could prune files holding the true top-k.
+    #[test]
+    fn topk_reaches_the_scan_only_when_every_emitted_row_is_output() {
+        use crate::ir::adapters::ScanPushdown;
+        use crate::r2rml::{R2rmlTableProvider, ScanCmpOp, ScanValue};
+        use crate::seed::{BatchReplayOperator, EmptyOperator};
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        /// Records whether each scan received a top-k directive.
+        #[derive(Debug, Default)]
+        struct TopkRecorder {
+            topk: Mutex<Vec<bool>>,
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for TopkRecorder {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                self.topk.lock().unwrap().push(topk.is_some());
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "ID".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    field_id: 1,
+                }]));
+                let batch = ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        let tm = TriplesMap::new("#Person", "people")
+            .with_subject_template("http://ex/person/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/id"),
+                object_map: ObjectMap::column("ID"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let base =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))).with_predicate("http://ex/id");
+
+        // Whether `scan_table` saw a top-k for `ORDER BY DESC(?id) LIMIT 2` over
+        // `pattern`, under a child of `child_schema` passing `child_batch`.
+        let scan_saw_topk =
+            |pattern: R2rmlPattern, child: BoxedOperator, child_batch: Batch| -> bool {
+                let provider = TopkRecorder::default();
+                {
+                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                    ctx.r2rml_table_provider = Some(&provider);
+                    let mut op = R2rmlScanOperator::new(child, pattern);
+                    op.mapping = Some(Arc::clone(&mapping));
+                    op.set_topk(&[crate::sort::SortSpec::desc(VarId(1))], 2);
+                    futures::executor::block_on(op.build_progress(&ctx, child_batch))
+                        .expect("build_progress");
+                }
+                let seen = provider.topk.lock().unwrap();
+                assert_eq!(seen.len(), 1, "one scan of the one table");
+                seen[0]
+            };
+
+        assert!(
+            scan_saw_topk(
+                base.clone(),
+                Box::<EmptyOperator>::default(),
+                Batch::single_empty()
+            ),
+            "under the seed every emitted row is output: the top-k is pushed"
+        );
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let child_batch = Batch::new(
+            Arc::clone(&schema),
+            vec![vec![Binding::iri("http://ex/person/1")]],
+        )
+        .unwrap();
+        assert!(
+            !scan_saw_topk(
+                base.clone(),
+                Box::new(BatchReplayOperator::new(schema, Vec::new())),
+                child_batch
+            ),
+            "a child binding the subject drops unmatched rows: no top-k"
+        );
+
+        let mut pushed = base.clone();
+        pushed.scan_filters.push(ScanPushdown {
+            var: VarId(1),
+            op: ScanCmpOp::In,
+            value: ScanValue::Set(vec![ScanValue::Int(5), ScanValue::Int(2500)]),
+        });
+        assert!(
+            !scan_saw_topk(
+                pushed,
+                Box::<EmptyOperator>::default(),
+                Batch::single_empty()
+            ),
+            "a pushed filter the reader may apply only partly: no top-k"
+        );
+    }
+
+    /// A provider for the key-pushdown tests: records each scan's table and
+    /// filters, and returns one batch of `ID` (and `B`) values, unfiltered (the
+    /// operator's join is the exact check).
+    mod key_push {
+        use super::*;
+        use crate::r2rml::{R2rmlTableProvider, ScanCmpOp, ScanFilter};
+        use crate::seed::BatchReplayOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        pub(super) struct Recorder {
+            pub scans: Mutex<Vec<(String, Vec<ScanFilter>)>>,
+            /// The row count the provider reports knowing, if any.
+            pub known_rows: Option<u64>,
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for Recorder {
+            async fn known_row_count(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _as_of_t: Option<i64>,
+            ) -> Result<Option<u64>> {
+                Ok(self.known_rows)
+            }
+
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                filters: &[ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                self.scans
+                    .lock()
+                    .unwrap()
+                    .push((table_name.to_string(), filters.to_vec()));
+                let field = |name: &str, id| FieldInfo {
+                    name: name.to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    field_id: id,
+                };
+                let schema = Arc::new(BatchSchema::new(vec![field("ID", 1), field("B", 2)]));
+                let ids: Vec<Option<i64>> = (1..=5).map(Some).collect();
+                let bs: Vec<Option<i64>> = (1..=5).map(|i| Some(i * 10)).collect();
+                let batch =
+                    ColumnBatch::new(schema, vec![Column::Int64(ids), Column::Int64(bs)]).unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        fn people(template: &str) -> Arc<CompiledR2rmlMapping> {
+            let tm = TriplesMap::new("#Person", "people")
+                .with_subject_template(template)
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/id"),
+                    object_map: ObjectMap::column("ID"),
+                });
+            Arc::new(CompiledR2rmlMapping::new(vec![tm]))
+        }
+
+        fn subjects(bindings: Vec<Binding>) -> Batch {
+            let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+            Batch::new(schema, vec![bindings]).unwrap()
+        }
+
+        /// Scan `?s ex:id ?id` under one child batch binding `?s`; the scans
+        /// the provider saw and the `(?s, ?id)` rows produced.
+        type Scans = Vec<(String, Vec<ScanFilter>)>;
+
+        pub(super) fn run(template: &str, child: Batch) -> (Scans, Vec<(String, i64)>) {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let provider = Recorder::default();
+            let mut rows = Vec::new();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                let schema = child.schema_arc();
+                let mut replay = BatchReplayOperator::new(Arc::clone(&schema), vec![child]);
+                futures::executor::block_on(replay.open(&ctx)).unwrap();
+                let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/id");
+                let mut op = R2rmlScanOperator::new(Box::new(replay), pattern);
+                op.mapping = Some(people(template));
+                op.state = OperatorState::Open;
+                while let Some(batch) = futures::executor::block_on(op.next_batch(&ctx)).unwrap() {
+                    for row in 0..batch.len() {
+                        let s = batch.column(VarId(0)).unwrap()[row].clone();
+                        let id = batch.column(VarId(1)).unwrap()[row].clone();
+                        let Binding::Iri(s) = s else { panic!("{s:?}") };
+                        let Binding::Lit { val, .. } = id else {
+                            panic!("{id:?}")
+                        };
+                        // An un-annotated column reads as its lexical text.
+                        let fluree_db_core::FlakeValue::String(id) = val else {
+                            panic!("{val:?}")
+                        };
+                        rows.push((s.to_string(), id.parse().unwrap()));
+                    }
+                }
+            }
+            rows.sort();
+            let scans = provider.scans.into_inner().unwrap();
+            (scans, rows)
+        }
+
+        fn keys(filter: &ScanFilter) -> (String, ScanCmpOp, Vec<String>) {
+            let raw = |v: &ScanValue| match v {
+                ScanValue::TemplateKey(k) => k.clone(),
+                other => panic!("not a template key: {other:?}"),
+            };
+            let values = match &filter.value {
+                ScanValue::Set(members) => members.iter().map(raw).collect(),
+                other => vec![raw(other)],
+            };
+            (filter.column.clone(), filter.op, values)
+        }
+
+        /// The subjects a child window binds narrow the scan to their template
+        /// keys: an IRI the template cannot produce and a literal add none,
+        /// duplicates collapse, and the answers are the join's as before.
+        #[test]
+        fn a_bound_subject_set_pushes_its_keys() {
+            let child = subjects(vec![
+                Binding::iri("http://ex/person/2"),
+                Binding::iri("http://ex/person/4"),
+                Binding::iri("http://other/9"),
+                Binding::lit(
+                    fluree_db_core::FlakeValue::Long(3),
+                    fluree_db_core::Sid::new(2, "long"),
+                ),
+                Binding::iri("http://ex/person/2"),
+            ]);
+            let (scans, rows) = run("http://ex/person/{ID}", child);
+            assert_eq!(scans.len(), 1);
+            let pushed: Vec<_> = scans[0].1.iter().map(keys).collect();
+            assert_eq!(
+                pushed,
+                [(
+                    "ID".to_string(),
+                    ScanCmpOp::In,
+                    vec!["2".to_string(), "4".to_string()]
+                )]
+            );
+            assert_eq!(
+                rows,
+                [
+                    ("http://ex/person/2".to_string(), 2),
+                    ("http://ex/person/2".to_string(), 2),
+                    ("http://ex/person/4".to_string(), 4),
+                ]
+            );
+        }
+
+        /// When no subject the child binds is one the map's template produces,
+        /// the map yields nothing the join keeps: its table is not read.
+        #[test]
+        fn a_map_producing_none_of_the_subjects_is_not_scanned() {
+            let child = subjects(vec![
+                Binding::iri("http://other/2"),
+                Binding::iri("http://ex/person/"),
+            ]);
+            let (scans, rows) = run("http://ex/person/{ID}/x", child);
+            assert!(scans.is_empty(), "{scans:?}");
+            assert!(rows.is_empty());
+        }
+
+        /// A row leaving the subject unbound joins every produced row, so
+        /// nothing is pushed; nor through a template that cannot be reversed.
+        #[test]
+        fn an_unbound_subject_or_an_irreversible_template_pushes_nothing() {
+            let child = subjects(vec![Binding::iri("http://ex/person/2"), Binding::Unbound]);
+            let (scans, rows) = run("http://ex/person/{ID}", child);
+            assert!(scans[0].1.is_empty(), "{scans:?}");
+            assert_eq!(rows.len(), 5 + 1, "the unbound row joins all five");
+
+            let child = subjects(vec![Binding::iri("http://ex/person/2;20")]);
+            let (scans, rows) = run("http://ex/person/{ID};{B}", child);
+            assert!(scans[0].1.is_empty(), "{scans:?}");
+            assert_eq!(rows, [("http://ex/person/2;20".to_string(), 2)]);
+        }
+
+        /// A composite key pushes one filter per column: the per-column sets
+        /// keep a superset of the bound pairs, and the join keeps the pairs.
+        #[test]
+        fn a_composite_key_pushes_one_filter_per_column() {
+            let child = subjects(vec![
+                Binding::iri("http://ex/p/1/10"),
+                Binding::iri("http://ex/p/3/40"),
+            ]);
+            let (scans, rows) = run("http://ex/p/{ID}/{B}", child);
+            let mut pushed: Vec<_> = scans[0].1.iter().map(keys).collect();
+            pushed.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                pushed,
+                [
+                    (
+                        "B".to_string(),
+                        ScanCmpOp::In,
+                        vec!["10".to_string(), "40".to_string()]
+                    ),
+                    (
+                        "ID".to_string(),
+                        ScanCmpOp::In,
+                        vec!["1".to_string(), "3".to_string()]
+                    ),
+                ]
+            );
+            assert_eq!(rows, [("http://ex/p/1/10".to_string(), 1)]);
+        }
+
+        /// A row count the provider already knows decides the push without the
+        /// learning detour: a table too large to cache takes the keys every
+        /// window; one that fits is read unfiltered once and replayed.
+        #[test]
+        fn a_known_row_count_decides_the_push() {
+            let pushes = |known_rows: u64| -> Vec<bool> {
+                let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+                let vars = VarRegistry::new();
+                let provider = Recorder {
+                    known_rows: Some(known_rows),
+                    ..Recorder::default()
+                };
+                {
+                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                    ctx.r2rml_table_provider = Some(&provider);
+                    let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                        .with_predicate("http://ex/id");
+                    let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+                    let child = BatchReplayOperator::new(schema, Vec::new());
+                    let mut op = R2rmlScanOperator::new(Box::new(child), pattern);
+                    op.mapping = Some(people("http://ex/person/{ID}"));
+                    for k in 1..=3 {
+                        let child = subjects(vec![Binding::iri(format!("http://ex/person/{k}"))]);
+                        futures::executor::block_on(op.build_progress(&ctx, child)).unwrap();
+                    }
+                }
+                let scans = provider.scans.into_inner().unwrap();
+                scans.iter().map(|(_, f)| !f.is_empty()).collect()
+            };
+            let large = materialize_window_rows() as u64 + 1;
+            assert_eq!(
+                pushes(large),
+                [true, true, true],
+                "too large to cache: every window"
+            );
+            assert_eq!(
+                pushes(10),
+                [false],
+                "fits: read once unfiltered, then replayed"
+            );
+        }
+
+        /// The perf guard: a table the scan cache would hold is pushed into on
+        /// the first child window only. The second reads it unfiltered, which
+        /// caches it (it is small), and the third replays the cache without a
+        /// scan. Once the table is known to be too large to cache, every window
+        /// pushes.
+        #[test]
+        fn a_cacheable_table_is_pushed_into_once_then_cached() {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let provider = Recorder::default();
+            let large_scans = {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                let new_op = || {
+                    let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                        .with_predicate("http://ex/id");
+                    let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+                    let child = BatchReplayOperator::new(schema, Vec::new());
+                    let mut op = R2rmlScanOperator::new(Box::new(child), pattern);
+                    op.mapping = Some(people("http://ex/person/{ID}"));
+                    op
+                };
+                let mut op = new_op();
+                for k in 1..=3 {
+                    let child = subjects(vec![Binding::iri(format!("http://ex/person/{k}"))]);
+                    futures::executor::block_on(op.build_progress(&ctx, child)).unwrap();
+                }
+                let small = provider.scans.lock().unwrap().len();
+                let mut op = new_op();
+                let projection = vec!["ID".to_string()];
+                op.key_push_seen
+                    .insert(("people".to_string(), projection), KeyPushSeen::Large);
+                for k in 1..=2 {
+                    let child = subjects(vec![Binding::iri(format!("http://ex/person/{k}"))]);
+                    futures::executor::block_on(op.build_progress(&ctx, child)).unwrap();
+                }
+                provider.scans.lock().unwrap().len() - small
+            };
+            let scans = provider.scans.into_inner().unwrap();
+            let pushed: Vec<bool> = scans.iter().map(|(_, f)| !f.is_empty()).collect();
+            assert_eq!(
+                pushed,
+                [true, false, true, true],
+                "window 1 pushes, 2 reads to cache, 3 replays; a large table pushes every window"
+            );
+            assert_eq!(large_scans, 2);
+        }
+    }
+
+    /// The parent of a RefObjectMap read by the keys each window needs (#2239).
+    mod parent_probe {
+        use super::*;
+        use crate::r2rml::{R2rmlTableProvider, ScanCmpOp, ScanFilter};
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, RefObjectMap, TriplesMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        /// `orders` (OID, CUST_ID) referencing `customers` (ID, VID): every
+        /// customer `ID` has two rows (`VID` = 10·ID+1 and 10·ID+2, the larger
+        /// first), so a key's keep-min is the `VID` ending in 1. The provider
+        /// applies `Eq`/`In` key filters exactly, as the reader does.
+        #[derive(Debug)]
+        struct Tables {
+            cust_ids: Vec<i64>,
+            /// A second reference from `orders` to `customers`, `BILL_ID`.
+            bill_ids: Option<Vec<i64>>,
+            /// `suppliers` (SID, SUPP_CUST) rows' references to `customers`.
+            supp_cust: Vec<i64>,
+            customers: Vec<i64>,
+            /// Each `customers` data file's `ID` bounds (min, max), when the
+            /// provider reports scan file counts: a file is read when a key
+            /// falls within its bounds, as min/max pruning decides.
+            files: Option<Vec<(i64, i64)>>,
+            /// `customers` as data files of `(ID, VID)` rows, read the way a
+            /// provider that prunes by file bounds alone reads them: a keyed
+            /// read returns every row of each file whose `ID` bounds admit a
+            /// key, not only the keys' rows. Replaces `customers` and `files`.
+            customer_files: Option<Vec<Vec<(i64, i64)>>>,
+            scans: Mutex<Vec<(String, Vec<ScanFilter>)>>,
+            /// The order each read through `scan_table_ordered` asked for; a
+            /// read through plain `scan_table` records nothing here.
+            orders: Mutex<Vec<(String, crate::r2rml::ScanOrder)>>,
+        }
+        impl Tables {
+            fn new(cust_ids: Vec<i64>, customers: Vec<i64>) -> Self {
+                Self {
+                    cust_ids,
+                    bill_ids: None,
+                    supp_cust: Vec::new(),
+                    customers,
+                    files: None,
+                    customer_files: None,
+                    scans: Mutex::new(Vec::new()),
+                    orders: Mutex::new(Vec::new()),
+                }
+            }
+            fn with_files(mut self, files: Vec<(i64, i64)>) -> Self {
+                self.files = Some(files);
+                self
+            }
+            fn with_bill_ids(mut self, bill_ids: Vec<i64>) -> Self {
+                self.bill_ids = Some(bill_ids);
+                self
+            }
+            fn with_suppliers(mut self, supp_cust: Vec<i64>) -> Self {
+                self.supp_cust = supp_cust;
+                self
+            }
+            fn with_customer_files(mut self, files: Vec<Vec<(i64, i64)>>) -> Self {
+                self.customer_files = Some(files);
+                self
+            }
+            /// The `customer_files` a read through `filters` selects, by
+            /// their `ID` bounds.
+            fn selected_customer_files(&self, filters: &[ScanFilter]) -> Vec<&Vec<(i64, i64)>> {
+                let keys: Vec<i64> = filtered_keys(filters)
+                    .iter()
+                    .map(|k| k.parse().unwrap())
+                    .collect();
+                self.customer_files
+                    .iter()
+                    .flatten()
+                    .filter(|file| {
+                        let lo = file.iter().map(|r| r.0).min().unwrap();
+                        let hi = file.iter().map(|r| r.0).max().unwrap();
+                        filters.is_empty() || keys.iter().any(|k| lo <= *k && *k <= hi)
+                    })
+                    .collect()
+            }
+        }
+        fn keeps(filters: &[ScanFilter], column: &str, value: i64) -> bool {
+            filters.iter().filter(|f| f.column == column).all(|f| {
+                let raw = |v: &ScanValue| match v {
+                    ScanValue::TemplateKey(k) => k.clone(),
+                    other => panic!("not a key: {other:?}"),
+                };
+                match (&f.op, &f.value) {
+                    (ScanCmpOp::Eq, v) => raw(v) == value.to_string(),
+                    (ScanCmpOp::In, ScanValue::Set(members)) => {
+                        members.iter().any(|m| raw(m) == value.to_string())
+                    }
+                    other => panic!("unexpected filter {other:?}"),
+                }
+            })
+        }
+        fn i64_batch(columns: Vec<(&str, Vec<i64>)>) -> ColumnBatch {
+            let fields = columns
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| FieldInfo {
+                    name: (*name).to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    field_id: i as i32 + 1,
+                })
+                .collect();
+            let cols = columns
+                .into_iter()
+                .map(|(_, v)| Column::Int64(v.into_iter().map(Some).collect()))
+                .collect();
+            ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).unwrap()
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for Tables {
+            async fn scan_file_counts(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                filters: &[ScanFilter],
+                _as_of_t: Option<i64>,
+            ) -> Result<Option<crate::r2rml::ScanFileCounts>> {
+                if let Some(files) = &self.customer_files {
+                    let selected = self.selected_customer_files(filters).len() as u64;
+                    return Ok(Some(crate::r2rml::ScanFileCounts {
+                        selected,
+                        pruned: files.len() as u64 - selected,
+                    }));
+                }
+                let Some(files) = &self.files else {
+                    return Ok(None);
+                };
+                let keys: Vec<i64> = filtered_keys(filters)
+                    .iter()
+                    .map(|k| k.parse().unwrap())
+                    .collect();
+                let selected = files
+                    .iter()
+                    .filter(|(lo, hi)| keys.iter().any(|k| lo <= k && k <= hi))
+                    .count() as u64;
+                Ok(Some(crate::r2rml::ScanFileCounts {
+                    selected,
+                    pruned: files.len() as u64 - selected,
+                }))
+            }
+
+            async fn scan_table_ordered(
+                &self,
+                graph_source_id: &str,
+                table_name: &str,
+                projection: &[String],
+                filters: &[ScanFilter],
+                topk: Option<&crate::r2rml::ScanTopK>,
+                as_of_t: Option<i64>,
+                order: crate::r2rml::ScanOrder,
+            ) -> Result<ColumnBatchStream> {
+                self.orders
+                    .lock()
+                    .unwrap()
+                    .push((table_name.to_string(), order));
+                self.scan_table(
+                    graph_source_id,
+                    table_name,
+                    projection,
+                    filters,
+                    topk,
+                    as_of_t,
+                )
+                .await
+            }
+
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                filters: &[ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                self.scans
+                    .lock()
+                    .unwrap()
+                    .push((table_name.to_string(), filters.to_vec()));
+                let batch = if table_name == "orders" {
+                    let n = self.cust_ids.len() as i64;
+                    let mut columns = vec![
+                        ("OID", (1..=n).collect()),
+                        ("CUST_ID", self.cust_ids.clone()),
+                    ];
+                    if let Some(bill_ids) = &self.bill_ids {
+                        columns.push(("BILL_ID", bill_ids.clone()));
+                    }
+                    i64_batch(columns)
+                } else if table_name == "suppliers" {
+                    let n = self.supp_cust.len() as i64;
+                    i64_batch(vec![
+                        ("SID", (1..=n).collect()),
+                        ("SUPP_CUST", self.supp_cust.clone()),
+                    ])
+                } else if self.customer_files.is_some() {
+                    let rows: Vec<(i64, i64)> = self
+                        .selected_customer_files(filters)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    i64_batch(vec![
+                        ("ID", rows.iter().map(|r| r.0).collect()),
+                        ("VID", rows.iter().map(|r| r.1).collect()),
+                    ])
+                } else {
+                    let mut ids = Vec::new();
+                    let mut vids = Vec::new();
+                    for &id in &self.customers {
+                        for vid in [10 * id + 2, 10 * id + 1] {
+                            if keeps(filters, "ID", id) {
+                                ids.push(id);
+                                vids.push(vid);
+                            }
+                        }
+                    }
+                    i64_batch(vec![("ID", ids), ("VID", vids)])
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        fn mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/customer"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CUST_ID",
+                        "ID",
+                    )),
+                });
+            let customers = TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://ex/customer/{VID}");
+            Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]))
+        }
+
+        type Scans = Vec<(String, Vec<ScanFilter>)>;
+
+        /// `?o ex:customer ?c` (under `LIMIT budget`): the `customers` scans and
+        /// the `(?o, ?c)` rows, in output order.
+        fn run(
+            tables: &Tables,
+            budget: Option<usize>,
+            key_pushdown: bool,
+        ) -> Vec<(String, String)> {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            ctx.r2rml_table_provider = Some(tables);
+            let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                .with_predicate("http://ex/customer");
+            let mut seed = EmptyOperator::new();
+            futures::executor::block_on(seed.open(&ctx)).unwrap();
+            let mut op = R2rmlScanOperator::new(Box::new(seed), pattern);
+            op.mapping = Some(mapping());
+            op.key_pushdown = key_pushdown;
+            op.state = OperatorState::Open;
+            if let Some(budget) = budget {
+                op.set_row_budget(budget);
+            }
+            let mut rows = Vec::new();
+            while let Some(batch) = futures::executor::block_on(op.next_batch(&ctx)).unwrap() {
+                for row in 0..batch.len() {
+                    let term = |v| match &batch.column(VarId(v)).unwrap()[row] {
+                        Binding::Iri(iri) => iri.to_string(),
+                        other => panic!("{other:?}"),
+                    };
+                    rows.push((term(0), term(1)));
+                }
+            }
+            if let Some(budget) = budget {
+                rows.truncate(budget);
+            }
+            rows
+        }
+
+        fn customer_scans(tables: &Tables) -> Scans {
+            tables
+                .scans
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| t == "customers")
+                .cloned()
+                .collect()
+        }
+
+        fn filtered_keys(filters: &[ScanFilter]) -> Vec<String> {
+            let mut keys: Vec<String> = filters
+                .iter()
+                .flat_map(|f| match &f.value {
+                    ScanValue::Set(members) => members.clone(),
+                    other => vec![other.clone()],
+                })
+                .map(|v| match v {
+                    ScanValue::TemplateKey(k) => k,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        /// A probed parent answers exactly as a parent read whole, under every
+        /// `LIMIT`: keep-min on a duplicate key is unchanged (each probe returns
+        /// every parent row of each key it keeps), and a dangling FK still
+        /// joins nothing.
+        #[test]
+        fn a_probed_parent_answers_as_a_parent_read_whole() {
+            // Keys 1..=7 exist; 90 and 91 dangle.
+            let cust_ids = vec![90, 3, 3, 91, 7, 1, 2, 90, 5, 6, 4, 1];
+            let customers: Vec<i64> = (1..=7).collect();
+            for budget in [None, Some(1), Some(2), Some(5), Some(100)] {
+                let whole = run(
+                    &Tables::new(cust_ids.clone(), customers.clone()),
+                    budget,
+                    false,
+                );
+                let probed = run(
+                    &Tables::new(cust_ids.clone(), customers.clone()),
+                    budget,
+                    true,
+                );
+                assert_eq!(probed, whole, "LIMIT {budget:?}");
+            }
+            let whole = run(&Tables::new(cust_ids, customers), None, false);
+            assert_eq!(whole.len(), 9, "nine orders reference an existing customer");
+            assert!(
+                whole.iter().all(|(_, c)| c.ends_with('1')),
+                "keep-min binds the smaller subject: {whole:?}"
+            );
+        }
+
+        /// A parent read, by key or whole, folds into a lookup that holds the
+        /// same contents in any read order, so it asks for no order, while the
+        /// main scan of a sliced query keeps its fixed order. Every `customers`
+        /// read goes through `scan_table_ordered` with `ScanOrder::Any`.
+        #[test]
+        fn parent_reads_ask_for_no_order() {
+            use crate::r2rml::ScanOrder;
+            let cust_ids = vec![90, 3, 3, 91, 7, 1, 2, 90, 5, 6, 4, 1];
+            let mut probed = false;
+            let mut whole = false;
+            for (budget, key_pushdown) in [
+                (Some(2), true),
+                (None, true),
+                (Some(2), false),
+                (None, false),
+            ] {
+                let tables = Tables::new(cust_ids.clone(), (1..=7).collect());
+                run(&tables, budget, key_pushdown);
+                let scans = customer_scans(&tables);
+                probed |= scans.iter().any(|(_, f)| !f.is_empty());
+                whole |= scans.iter().any(|(_, f)| f.is_empty());
+                let orders = tables.orders.lock().unwrap().clone();
+                let parent: Vec<ScanOrder> = orders
+                    .iter()
+                    .filter(|(t, _)| t == "customers")
+                    .map(|(_, o)| *o)
+                    .collect();
+                assert_eq!(
+                    parent,
+                    vec![ScanOrder::Any; scans.len()],
+                    "LIMIT {budget:?}, key pushdown {key_pushdown}: every parent read asks \
+                     for no order"
+                );
+                let main: Vec<ScanOrder> = orders
+                    .iter()
+                    .filter(|(t, _)| t == "orders")
+                    .map(|(_, o)| *o)
+                    .collect();
+                assert!(
+                    !main.is_empty() && main.iter().all(|o| *o == ScanOrder::Deterministic),
+                    "LIMIT {budget:?}: the main scan keeps its fixed order: {orders:?}"
+                );
+            }
+            assert!(probed && whole, "both a probe and a whole read were made");
+        }
+
+        /// Under `LIMIT 2` the parent is read for the keys of the first two
+        /// referencing rows only, once; a window whose keys are all resolved
+        /// reads nothing more.
+        #[test]
+        fn a_limit_reads_only_its_window_keys_from_the_parent() {
+            let tables = Tables::new(vec![3, 5, 3, 6, 7], (1..=7).collect());
+            let rows = run(&tables, Some(2), true);
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "http://ex/order/1".to_string(),
+                        "http://ex/customer/31".to_string()
+                    ),
+                    (
+                        "http://ex/order/2".to_string(),
+                        "http://ex/customer/51".to_string()
+                    ),
+                ]
+            );
+            let scans = customer_scans(&tables);
+            assert_eq!(scans.len(), 1, "{scans:?}");
+            assert_eq!(filtered_keys(&scans[0].1), ["3", "5"]);
+        }
+
+        /// A window with more unresolved keys than the push cap reads the
+        /// parent whole, once, and the index is complete from then on.
+        #[test]
+        fn a_window_past_the_cap_reads_the_parent_whole() {
+            let n = crate::r2rml::in_pushdown_max() as i64 + 1;
+            let tables = Tables::new((1..=n).collect(), (1..=n).collect());
+            let rows = run(&tables, None, true);
+            assert_eq!(rows.len(), n as usize);
+            let scans = customer_scans(&tables);
+            assert_eq!(scans.len(), 1, "{scans:?}");
+            assert!(scans[0].1.is_empty(), "read whole: {scans:?}");
+        }
+
+        /// Under `LIMIT 1` with dangling first rows the windows grow (1, 4, 16
+        /// rows): orders 1..=20 reference customers 90..=94, which no parent row
+        /// holds, and order 21 references customer 2.
+        fn dangling_first() -> Vec<i64> {
+            let mut cust_ids = vec![90, 91, 90, 92, 93];
+            cust_ids.extend(std::iter::repeat_n(94, 15));
+            cust_ids.push(2);
+            cust_ids
+        }
+
+        fn found_order_21(rows: &[(String, String)]) {
+            assert_eq!(
+                rows,
+                [(
+                    "http://ex/order/21".to_string(),
+                    "http://ex/customer/21".to_string()
+                )]
+            );
+        }
+
+        /// A provider that cannot say what a keyed read costs gets one probe: a
+        /// later window that needs more keys reads the parent whole, so the
+        /// scan reads the parent at most once more than a whole read.
+        #[test]
+        fn without_file_counts_a_parent_is_probed_once() {
+            let tables = Tables::new(dangling_first(), (1..=7).collect());
+            found_order_21(&run(&tables, Some(1), true));
+            let scans = customer_scans(&tables);
+            let keys: Vec<Vec<String>> = scans.iter().map(|(_, f)| filtered_keys(f)).collect();
+            assert_eq!(
+                keys,
+                [vec!["90".to_string()], vec![]],
+                "the first row's key, then the parent read whole"
+            );
+        }
+
+        /// With file counts, a keyed read that skips files is made while all
+        /// keyed reads together read fewer files than the whole table: here
+        /// each customer sits in its own file, so every window probes, a
+        /// dangling key (in no file) is resolved once and never probed again,
+        /// and the parent is never read whole.
+        #[test]
+        fn a_clustered_parent_is_probed_while_probes_read_less_than_it() {
+            let files = (1..=7).map(|id| (id, id)).collect();
+            let tables = Tables::new(dangling_first(), (1..=7).collect()).with_files(files);
+            found_order_21(&run(&tables, Some(1), true));
+            let scans = customer_scans(&tables);
+            let keys: Vec<Vec<String>> = scans.iter().map(|(_, f)| filtered_keys(f)).collect();
+            assert_eq!(
+                keys,
+                [
+                    vec!["90".to_string()],
+                    vec!["91".into(), "92".into(), "93".into()],
+                    vec!["2".into(), "94".into()],
+                ],
+                "each window probes only its unresolved keys"
+            );
+        }
+
+        /// Keyed reads stop before they add up to a whole read: customers 2, 4,
+        /// 6 and 8 sit in four files of two ids each, and the first windows
+        /// reference ids those files' bounds admit but no row holds. The first
+        /// probe reads one file, the second two; a third reading one more
+        /// would make four of four, so the parent is read whole instead.
+        #[test]
+        fn probes_stop_before_they_read_as_much_as_the_whole_parent() {
+            let mut cust_ids = vec![1, 3, 5, 3, 5];
+            cust_ids.extend(std::iter::repeat_n(7, 15));
+            cust_ids.push(8);
+            let files = vec![(1, 2), (3, 4), (5, 6), (7, 8)];
+            let tables = Tables::new(cust_ids, vec![2, 4, 6, 8]).with_files(files);
+            let rows = run(&tables, Some(1), true);
+            assert_eq!(
+                rows,
+                [(
+                    "http://ex/order/21".to_string(),
+                    "http://ex/customer/81".to_string()
+                )]
+            );
+            let scans = customer_scans(&tables);
+            let keys: Vec<Vec<String>> = scans.iter().map(|(_, f)| filtered_keys(f)).collect();
+            assert_eq!(
+                keys,
+                [vec!["1".to_string()], vec!["3".into(), "5".into()], vec![]],
+                "two probes (1 + 2 of 4 files), then the parent read whole"
+            );
+        }
+
+        /// With file counts, a keyed read that skips no file (every file's
+        /// bounds span the keys, as in an unclustered parent) is not made: the
+        /// parent is read whole at once, as without key pushdown.
+        #[test]
+        fn an_unclustered_parent_is_read_whole_at_once() {
+            let files = vec![(1, 100), (1, 100)];
+            let tables = Tables::new(dangling_first(), (1..=7).collect()).with_files(files);
+            found_order_21(&run(&tables, Some(1), true));
+            let scans = customer_scans(&tables);
+            assert_eq!(scans.len(), 1, "{scans:?}");
+            assert!(scans[0].1.is_empty(), "read whole: {scans:?}");
+        }
+
+        /// A provider that prunes by file bounds alone returns, for a probed
+        /// key, rows of other keys from the files it reads, without the rows
+        /// of those keys in files it skipped. Folded, such a key would be
+        /// resolved from part of its rows: here customer 5's rows sit in both
+        /// files, and a probe for the dangling 4 reads only the first, whose
+        /// 5 is not the smaller subject. Only the probed keys' rows are
+        /// folded, so 5 is read with all its rows and keeps the same subject
+        /// as a whole read.
+        #[test]
+        fn a_probe_folds_only_the_keys_it_probed() {
+            let tables = || {
+                Tables::new(vec![4, 5], Vec::new())
+                    .with_customer_files(vec![vec![(3, 31), (5, 52)], vec![(5, 51), (6, 61)]])
+            };
+            let pattern = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/customer")
+            };
+            for budget in [None, Some(1)] {
+                let whole = run_pattern(&tables(), mapping(), pattern(), None, budget, false);
+                assert_eq!(
+                    whole,
+                    [vec![
+                        "http://ex/order/2".to_string(),
+                        "http://ex/customer/51".to_string()
+                    ]],
+                    "keep-min over both files"
+                );
+                let probed = run_pattern(&tables(), mapping(), pattern(), None, budget, true);
+                assert_eq!(probed, whole, "LIMIT {budget:?}");
+            }
+        }
+
+        /// When the probes stop paying off and the parent is read whole,
+        /// what they built is dropped and its charge released: the query is
+        /// left charged for the whole read alone, as without key pushdown,
+        /// never for the probes on top of it. Here (no file counts) one
+        /// window probes two keys, one of them present, and the next reads
+        /// the parent whole.
+        #[test]
+        fn a_whole_read_after_probes_is_charged_alone() {
+            let tables = || Tables::new(vec![3, 90, 91, 92, 2, 5], (1..=7).collect());
+            let pattern = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/customer")
+            };
+            let (whole, whole_charged) =
+                run_pattern_charged(&tables(), mapping(), pattern(), None, Some(2), false);
+            let probed_tables = tables();
+            let (probed, probed_charged) =
+                run_pattern_charged(&probed_tables, mapping(), pattern(), None, Some(2), true);
+            assert_eq!(probed, whole);
+            let keys: Vec<Vec<String>> = customer_scans(&probed_tables)
+                .iter()
+                .map(|(_, f)| filtered_keys(f))
+                .collect();
+            assert_eq!(
+                keys,
+                [vec!["3".to_string(), "90".to_string()], vec![]],
+                "a probe, then the parent read whole"
+            );
+            assert_eq!(
+                whole_charged,
+                14 * PARENT_ENTRY_EST_BYTES,
+                "the whole read's 14 rows"
+            );
+            assert_eq!(probed_charged, whole_charged);
+        }
+
+        fn customer_ref(column: &str) -> ObjectMap {
+            ObjectMap::RefObjectMap(RefObjectMap::new("#Customer", column, "ID"))
+        }
+
+        fn customers_map() -> TriplesMap {
+            TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://ex/customer/{VID}")
+        }
+
+        /// `orders` references `customers` twice by the same parent column,
+        /// through two columns of its own: `ex:shipTo` by `CUST_ID`, `ex:billTo`
+        /// by `BILL_ID`.
+        fn ship_bill_mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/shipTo"),
+                    object_map: customer_ref("CUST_ID"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/billTo"),
+                    object_map: customer_ref("BILL_ID"),
+                });
+            Arc::new(CompiledR2rmlMapping::new(vec![orders, customers_map()]))
+        }
+
+        /// `orders` (by `CUST_ID`) and `suppliers` (by `SUPP_CUST`) both
+        /// reference `customers` by `ex:address`.
+        fn two_maps_mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/address"),
+                    object_map: customer_ref("CUST_ID"),
+                });
+            let suppliers = TriplesMap::new("#Supplier", "suppliers")
+                .with_subject_template("http://ex/supplier/{SID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/address"),
+                    object_map: customer_ref("SUPP_CUST"),
+                });
+            Arc::new(CompiledR2rmlMapping::new(vec![
+                orders,
+                suppliers,
+                customers_map(),
+            ]))
+        }
+
+        /// Run `pattern` over `mapping` and `tables`: every output row's
+        /// bindings in schema order, in output order. With `child_rows`, the
+        /// scan's input is that many rows binding an unrelated variable, each
+        /// its own child window (so its own scan, and the parents' indexes are
+        /// carried from one to the next); without, a single seed row.
+        fn run_pattern(
+            tables: &Tables,
+            mapping: Arc<CompiledR2rmlMapping>,
+            pattern: R2rmlPattern,
+            child_rows: Option<usize>,
+            budget: Option<usize>,
+            key_pushdown: bool,
+        ) -> Vec<Vec<String>> {
+            run_pattern_charged(tables, mapping, pattern, child_rows, budget, key_pushdown).0
+        }
+
+        /// [`run_pattern`], and the bytes still charged to the query's
+        /// memory budget once the scan is done.
+        fn run_pattern_charged(
+            tables: &Tables,
+            mapping: Arc<CompiledR2rmlMapping>,
+            pattern: R2rmlPattern,
+            child_rows: Option<usize>,
+            budget: Option<usize>,
+            key_pushdown: bool,
+        ) -> (Vec<Vec<String>>, usize) {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars)
+                .with_cancellation(fluree_db_core::QueryCancellation::new());
+            ctx.r2rml_table_provider = Some(tables);
+            let child: BoxedOperator = match child_rows {
+                None => Box::new(EmptyOperator::new()),
+                Some(n) => {
+                    let schema: Arc<[VarId]> = Arc::from(vec![VarId(9)].into_boxed_slice());
+                    let rows = (1..=n)
+                        .map(|w| Binding::iri(format!("http://ex/window/{w}")))
+                        .collect();
+                    let batch = Batch::new(Arc::clone(&schema), vec![rows]).unwrap();
+                    Box::new(crate::seed::BatchReplayOperator::new(schema, vec![batch]))
+                }
+            };
+            let mut op = R2rmlScanOperator::new(child, pattern);
+            futures::executor::block_on(op.child.open(&ctx)).unwrap();
+            op.mapping = Some(mapping);
+            op.key_pushdown = key_pushdown;
+            op.state = OperatorState::Open;
+            if let Some(budget) = budget {
+                op.set_row_budget(budget);
+            }
+            if child_rows.is_some() {
+                op.child_window = FlushSchedule::fixed(1);
+            }
+            let schema = op.schema().to_vec();
+            let mut rows = Vec::new();
+            while let Some(batch) = futures::executor::block_on(op.next_batch(&ctx)).unwrap() {
+                for row in 0..batch.len() {
+                    rows.push(
+                        schema
+                            .iter()
+                            .map(|&v| match &batch.column(v).unwrap()[row] {
+                                Binding::Iri(iri) => iri.to_string(),
+                                other => format!("{other:?}"),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            if let Some(budget) = budget {
+                rows.truncate(budget);
+            }
+            let charged = ctx.mem_used();
+            (rows, charged)
+        }
+
+        /// Each customer in its own data file, so a keyed read always skips
+        /// files and probes are made while they read less than the whole.
+        fn one_file_per_customer(tables: Tables) -> Tables {
+            let files = tables.customers.iter().map(|&id| (id, id)).collect();
+            tables.with_files(files)
+        }
+
+        /// Two RefObjectMaps of one map read one parent by the same parent
+        /// column through different columns of their own. The probe-built
+        /// index is shared, so it must resolve the keys of both: under a star
+        /// and a variable predicate, which hold both, the answers are a whole
+        /// read's under every `LIMIT`, with and without file counts.
+        #[test]
+        fn two_references_to_one_parent_resolve_both_columns_keys() {
+            // Ship-to and bill-to keys differ; 90 and 91 dangle, and
+            // customers 8 to 12 are referenced by neither (their files are
+            // the ones a keyed read skips).
+            let cust_ids = vec![1, 2, 3, 90, 4];
+            let bill_ids = vec![5, 6, 7, 1, 91];
+            let tables = |files: bool| {
+                let tables = Tables::new(cust_ids.clone(), (1..=12).collect())
+                    .with_bill_ids(bill_ids.clone());
+                if files {
+                    one_file_per_customer(tables)
+                } else {
+                    tables
+                }
+            };
+            let star = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/shipTo")
+                    .with_star_bindings(vec![("http://ex/billTo".to_string(), VarId(2))])
+            };
+            let wildcard = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))).with_predicate_var(VarId(2))
+            };
+            for (label, pattern, answers) in [
+                ("star", star as fn() -> R2rmlPattern, 3),
+                ("variable predicate", wildcard, 8),
+            ] {
+                for files in [false, true] {
+                    for budget in [None, Some(1), Some(2), Some(5)] {
+                        let whole = run_pattern(
+                            &tables(files),
+                            ship_bill_mapping(),
+                            pattern(),
+                            None,
+                            budget,
+                            false,
+                        );
+                        let probed = run_pattern(
+                            &tables(files),
+                            ship_bill_mapping(),
+                            pattern(),
+                            None,
+                            budget,
+                            true,
+                        );
+                        assert_eq!(probed, whole, "{label}, files {files}, LIMIT {budget:?}");
+                        if budget.is_none() {
+                            assert_eq!(whole.len(), answers, "{label}: {whole:?}");
+                        }
+                    }
+                }
+            }
+            // One keyed read of the parent serves both columns' keys.
+            let tables = tables(true);
+            run_pattern(&tables, ship_bill_mapping(), star(), None, None, true);
+            let keys: Vec<Vec<String>> = customer_scans(&tables)
+                .iter()
+                .map(|(_, f)| filtered_keys(f))
+                .collect();
+            let want: Vec<String> = ["1", "2", "3", "4", "5", "6", "7", "90", "91"]
+                .map(String::from)
+                .to_vec();
+            assert_eq!(keys, [want], "one probe for both columns");
+        }
+
+        /// Two maps reference one parent by the same parent column, each
+        /// through a column of its own table, over several child windows: the
+        /// probe-built index carried from one window's scan to the next serves
+        /// both maps, by each map's own columns, and each window probes only
+        /// what is new. Each map gets its own probe (the budget without file
+        /// counts is one probe per map).
+        #[test]
+        fn two_maps_to_one_parent_resolve_their_own_keys_across_child_windows() {
+            let tables = |files: bool| {
+                let tables =
+                    Tables::new(vec![1, 2, 3], (1..=7).collect()).with_suppliers(vec![4, 5, 90]);
+                if files {
+                    one_file_per_customer(tables)
+                } else {
+                    tables
+                }
+            };
+            let pattern = || {
+                R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/address")
+            };
+            let sorted = |mut rows: Vec<Vec<String>>| {
+                rows.sort();
+                rows
+            };
+            let whole = sorted(run_pattern(
+                &tables(false),
+                two_maps_mapping(),
+                pattern(),
+                Some(3),
+                None,
+                false,
+            ));
+            assert_eq!(whole.len(), 3 * 5, "three windows of 3 + 2: {whole:?}");
+            for files in [false, true] {
+                for budget in [None, Some(2), Some(4), Some(9)] {
+                    let probed = run_pattern(
+                        &tables(files),
+                        two_maps_mapping(),
+                        pattern(),
+                        Some(3),
+                        budget,
+                        true,
+                    );
+                    // The maps' scan order is the mapping's, which a `LIMIT`
+                    // answer follows: compare as sets, all of them without it.
+                    let label = format!("files {files}, LIMIT {budget:?}: {probed:?}");
+                    match budget {
+                        None => assert_eq!(sorted(probed), whole, "{label}"),
+                        Some(k) => {
+                            assert_eq!(probed.len(), k, "{label}");
+                            assert!(probed.iter().all(|r| whole.contains(r)), "{label}");
+                        }
+                    }
+                }
+            }
+            let probes = |files: bool| {
+                let tables = tables(files);
+                run_pattern(&tables, two_maps_mapping(), pattern(), Some(3), None, true);
+                let mut keys: Vec<Vec<String>> = customer_scans(&tables)
+                    .iter()
+                    .map(|(_, f)| filtered_keys(f))
+                    .collect();
+                keys.sort();
+                keys
+            };
+            let strings =
+                |keys: &[&str]| keys.iter().copied().map(String::from).collect::<Vec<_>>();
+            assert_eq!(
+                probes(true),
+                [strings(&["1", "2", "3"]), strings(&["4", "5", "90"])],
+                "each map's keys are probed once, in the first window"
+            );
+            assert_eq!(
+                probes(false),
+                [strings(&["1", "2", "3"]), strings(&["4", "5", "90"])],
+                "one probe per map"
+            );
+        }
+
+        /// A map's probes are refused by its own budget, never by another
+        /// map's: map B keeps probing while its own reads stay under the whole
+        /// table (10 files) although A's and B's together do not, and is
+        /// refused only once B's alone would reach it.
+        #[test]
+        fn a_map_is_refused_a_probe_by_its_own_budget_only() {
+            let customers = customers_map();
+            let mut index = PartialParentIndex::new(
+                ParentSource::new(&customers, vec!["ID".to_string()]).unwrap(),
+            );
+            let counts = |selected| {
+                Some(crate::r2rml::ScanFileCounts {
+                    selected,
+                    pruned: 10 - selected,
+                })
+            };
+            assert!(index.worth_probing("A", counts(6)));
+            index.spend("A", 6);
+            assert!(
+                index.worth_probing("B", counts(4)),
+                "A's six files are not B's"
+            );
+            index.spend("B", 4);
+            assert!(index.worth_probing("B", counts(5)), "B: 4 + 5 < 10");
+            index.spend("B", 5);
+            assert!(
+                !index.worth_probing("B", counts(1)),
+                "B: 9 + 1 reaches the whole"
+            );
+            assert!(index.worth_probing("A", counts(3)), "A: 6 + 3 < 10");
+            assert!(
+                !index.worth_probing("A", counts(4)),
+                "A: 6 + 4 reaches the whole"
+            );
+            assert!(
+                !index.worth_probing("C", counts(10)),
+                "a read that skips no file"
+            );
+            // Without file counts: one probe per map.
+            assert!(index.worth_probing("C", None));
+            index.spend("C", 0);
+            assert!(!index.worth_probing("C", None));
+            assert!(index.worth_probing("D", None));
+        }
+
+        /// The probe budget is each map's own: here each map's keyed read
+        /// skips files and reads fewer than the whole parent, but the two
+        /// together read all of it. Each probes; neither is pushed into a
+        /// whole read, which would cost far more than its own probe, by what
+        /// the other map spent.
+        #[test]
+        fn each_map_referencing_a_parent_keeps_its_own_probe_budget() {
+            let tables = one_file_per_customer(
+                Tables::new(vec![1, 2, 3, 4, 5, 6], (1..=10).collect())
+                    .with_suppliers(vec![7, 8, 9, 10]),
+            );
+            let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                .with_predicate("http://ex/address");
+            let rows = run_pattern(&tables, two_maps_mapping(), pattern, None, None, true);
+            assert_eq!(rows.len(), 10);
+            let mut keys: Vec<Vec<String>> = customer_scans(&tables)
+                .iter()
+                .map(|(_, f)| filtered_keys(f))
+                .collect();
+            keys.sort();
+            let sorted = |ids: std::ops::RangeInclusive<i64>| {
+                let mut keys: Vec<String> = ids.map(|id| id.to_string()).collect();
+                keys.sort();
+                keys
+            };
+            assert_eq!(
+                keys,
+                [sorted(1..=6), sorted(7..=10)],
+                "both probe, no whole read"
+            );
+        }
+    }
+
     fn pom(pred: &str, col: &str) -> PredicateObjectMap {
         PredicateObjectMap {
             predicate_map: PredicateMap::constant(pred),
@@ -3727,12 +6172,12 @@ mod tests {
         // already-present key stays idempotent. The cap is passed directly to keep
         // the test env-hermetic (no FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS).
         let mut memo = R2rmlParentMemoInner::default();
-        let lookup = |n: usize| -> std::sync::Arc<ParentLookup> {
+        let lookup = |n: usize| -> std::sync::Arc<CompleteParentLookup> {
             let mut m = ParentLookup::new();
             for i in 0..n {
                 m.insert(vec![i.to_string()], RdfTerm::iri(format!("http://ex/{i}")));
             }
-            std::sync::Arc::new(m)
+            std::sync::Arc::new(CompleteParentLookup(m))
         };
         let key = |s: &str| -> R2rmlParentMemoKey {
             (
@@ -3829,6 +6274,18 @@ mod tests {
         assert!(
             build_ref_shortcut(&parent_bnode, &rom).is_none(),
             "blank-node subject must be refused"
+        );
+
+        // Reject: a parent over an `rr:sqlQuery`, whose WHERE may exclude the row
+        // a child's FK names.
+        let mut parent_query =
+            TriplesMap::new("#Account", "accounts").with_subject_template("http://ex/account/{id}");
+        parent_query.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(
+            "SELECT * FROM accounts WHERE is_current = 1",
+        );
+        assert!(
+            build_ref_shortcut(&parent_query, &rom).is_none(),
+            "a query-backed parent must keep the parent scan"
         );
     }
 
@@ -4535,7 +6992,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let lookups: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -4577,7 +7034,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let lookups: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -4633,7 +7090,7 @@ mod tests {
         let batch = single_col_batch("STORE_KEY", vec![Some(7)]);
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let lookups: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         // `?s ?p ?o` with a folded const-object constraint storeKey==7 (SATISFIED):
@@ -4863,7 +7320,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let lookups: HashMap<LookupCacheKey, ParentIndex> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -5071,6 +7528,9 @@ mod tests {
                 let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
                 op.mapping = Some(Arc::clone(&mapping));
                 op.parent_memo = memo;
+                // The parent read whole when the scan opens: the regime the
+                // memo serves (a probed parent is read per window instead).
+                op.key_pushdown = false;
 
                 for _ in 0..5 {
                     futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))
@@ -5182,6 +7642,7 @@ mod tests {
             let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
             op.mapping = Some(Arc::clone(mapping));
             op.parent_memo = true;
+            op.key_pushdown = false;
             futures::executor::block_on(op.build_progress(ctx, Batch::single_empty()))
                 .expect("build_progress");
             // `op` dropped here → its per-operator `parent_lookup_cache` is gone; only

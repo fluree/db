@@ -322,6 +322,12 @@ pub struct ExecutionContext<'a> {
     /// present-but-dangling FK differs (templated vs omitted). Read only for the
     /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
     pub trust_fk_refs: bool,
+    /// When true, every graph-source table scan emits a fixed row order, even
+    /// where the planner found no LIMIT or OFFSET in the query (see
+    /// [`crate::r2rml::ScanOrder`]). For a caller that slices the answer itself,
+    /// outside the query: the graph-source browse crawl pages subjects after the
+    /// query returns. Default `false`.
+    pub deterministic_scans: bool,
     /// Most pairs a property path may compute before returning its first
     /// row — one whose endpoints are both free or both constant; past it the
     /// path fails with [`QueryError::ResourceLimit`]. `None` (the default)
@@ -566,6 +572,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -632,6 +639,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -702,6 +710,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -761,6 +770,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -819,6 +829,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -879,6 +890,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -1075,6 +1087,12 @@ impl<'a> ExecutionContext<'a> {
     /// `QueryExecutionOptions::trust_fk_refs` on the graph-source crawl path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// See [`ExecutionContext::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
         self
     }
 
@@ -1791,6 +1809,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1860,6 +1879,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1930,6 +1950,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,

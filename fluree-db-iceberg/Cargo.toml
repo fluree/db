@@ -26,6 +26,8 @@ aws = [
     # here — a non-`aws` build compiles neither.
     "dep:arrow",
     "parquet/arrow",
+    # The row filter's set membership (`IN`) hashes every row of a scan.
+    "dep:hashbrown",
     # Google identity: service-account JWT assertions (RS256) and the
     # Workload Identity Federation subject token (a SigV4-signed AWS
     # GetCallerIdentity request). The metadata server and gcloud user ADC need
@@ -120,9 +122,12 @@ reqwest012 = { package = "reqwest", version = "0.12", default-features = false, 
 # `aws` feature). `default-features = false` drops the unused csv/json readers
 # (compile-time only; LTO already strips them from the binary).
 arrow = { workspace = true, optional = true }
+hashbrown = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+fluree-test-support = { path = "../fluree-test-support" }
 wiremock = "0.6"
 http.workspace = true
 

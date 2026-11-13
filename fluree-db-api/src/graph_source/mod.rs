@@ -339,6 +339,9 @@ mod ephemeral;
 mod r2rml_materialize;
 
 #[cfg(feature = "iceberg")]
+pub(crate) mod row_filter;
+
+#[cfg(feature = "iceberg")]
 pub mod surface;
 
 #[cfg(feature = "sql")]

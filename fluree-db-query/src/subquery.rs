@@ -372,7 +372,14 @@ impl SubqueryOperator {
                 || subquery.grouping.is_some()
                 || !pass_through_ok);
 
-        let join_mode = if must_evaluate_once {
+        // Per-row mode seeds only `join_keys`, so with none every parent row
+        // runs the same body from the same empty seed and gets the same rows.
+        // Evaluating it once and joining is then the same answer at any parent
+        // size, sliced or not: a slice cuts that one evaluation either way.
+        // (A pinned import is always a join key, so none is lost here.)
+        let seeds_nothing = join_keys.is_empty();
+
+        let join_mode = if must_evaluate_once || seeds_nothing {
             true
         } else {
             // Evaluate-once + hash-join only when there is no inner slice and
@@ -991,7 +998,7 @@ impl SubqueryOperator {
 const SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS: usize = 8;
 
 /// Variables bound in *every* solution of `patterns` — produced by a top-level
-/// required pattern (triple / property path), or exported by a slice-free nested
+/// required pattern (triple / property path / R2RML scan), or exported by a slice-free nested
 /// sub-SELECT whose own body always-binds them. NOT vars bound only inside a
 /// `UNION` branch or `OPTIONAL` (conditional), nor a sub-SELECT's pass-throughs.
 /// These are the only correlation variables safe to use as evaluate-once
@@ -1004,6 +1011,11 @@ pub(crate) fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
             Pattern::Triple(_) | Pattern::ListView(_) | Pattern::PropertyPath(_) => {
                 produced.extend(p.produced_vars());
             }
+            // An R2RML scan: a graph-source sub-select body, lowered by the
+            // rewrite. It binds its variables in every row it emits, like the
+            // triples it replaces, with the one exception its own method
+            // leaves out.
+            Pattern::R2rml(rp) => produced.extend(rp.always_bound_vars()),
             // A nested sub-SELECT binds the SELECT vars its own body always
             // binds, so those are always-bound here too. A slice would make
             // per-row seeding of such a var result-sensitive, so skip it then.
@@ -1031,6 +1043,35 @@ mod tests {
     use crate::ir::SubqueryPattern;
     use crate::seed::SeedOperator;
     use crate::var_registry::VarId;
+
+    /// A graph-source sub-select body is R2RML scans after the rewrite. Their
+    /// variables are hash-join keys like a triple's, so a JSON-LD sub-select
+    /// joining on one is seeded per outer row with it rather than reading the
+    /// table per outer row unseeded. A type variable fused into a wildcard is
+    /// the exception: over a classless map it is left unbound.
+    #[test]
+    fn r2rml_scans_produce_their_always_bound_vars() {
+        use crate::ir::R2rmlPattern;
+        let (s, o, p, t, x) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let star = R2rmlPattern::new("gs:main", s, Some(o))
+            .with_predicate("http://example.org/customer")
+            .with_star_bindings(vec![("http://example.org/amount".into(), x)]);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(star)]),
+            HashSet::from([s, o, x])
+        );
+        let typed = R2rmlPattern::new("gs:main", s, None).with_type_var(t);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(typed)]),
+            HashSet::from([s, t])
+        );
+        let mut crawl = R2rmlPattern::new("gs:main", s, Some(o)).with_type_var(t);
+        crawl.predicate_var = Some(p);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(crawl)]),
+            HashSet::from([s, o, p])
+        );
+    }
 
     #[tokio::test]
     async fn materialized_join_matches_partial_keys_without_reviving_poisoned_rows() {
@@ -1376,6 +1417,64 @@ mod tests {
                 assert_eq!(ctx.mem_used(), baseline + 123);
             }
         }
+    }
+
+    /// A sliced correlated sub-select runs per parent row, seeded with its join
+    /// keys. One that seeds nothing (no shared variable, or one bound only in
+    /// an OPTIONAL) would rerun the same body from the same empty seed for
+    /// every parent row, so it is evaluated once instead.
+    #[test]
+    fn a_slice_that_seeds_nothing_is_evaluated_once() {
+        use crate::ir::{Ref, Term, TriplePattern};
+        use fluree_db_core::Sid;
+        let (c, o, a) = (VarId(0), VarId(1), VarId(2));
+        let triple = |s, p: &str, o| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(100, p)),
+                Term::Var(o),
+            ))
+        };
+        let plan = |select: Vec<VarId>, patterns: Vec<Pattern>| {
+            // Three parent rows binding ?c: not an identity parent.
+            let parent = Batch::new(
+                Arc::from(vec![c]),
+                vec![vec![Binding::Unbound, Binding::Unbound, Binding::Unbound]],
+            )
+            .unwrap();
+            SubqueryOperator::new(
+                Box::new(crate::seed::BatchReplayOperator::new(
+                    Arc::from(vec![c]),
+                    vec![parent],
+                )),
+                SubqueryPattern::new(select, patterns).with_limit(2),
+                None,
+                PlanningContext::current(),
+            )
+        };
+
+        let seeded = plan(
+            vec![c, o, a],
+            vec![triple(o, "customer", c), triple(o, "amount", a)],
+        );
+        assert_eq!(seeded.join_keys, vec![c]);
+        assert!(!seeded.join_mode, "a slice per seeded parent row");
+
+        let unshared = plan(vec![o, a], vec![triple(o, "amount", a)]);
+        assert!(unshared.correlation_vars.is_empty());
+        assert!(unshared.join_mode, "no shared variable: evaluated once");
+
+        let optional = plan(
+            vec![c, o, a],
+            vec![
+                triple(o, "amount", a),
+                Pattern::Optional(vec![triple(o, "customer", c)]),
+            ],
+        );
+        assert_eq!(optional.correlation_vars, vec![c]);
+        assert!(optional.join_keys.is_empty());
+        assert_eq!(optional.reconcile_vars, vec![c]);
+        assert!(optional.join_mode, "seeds nothing: evaluated once");
     }
 
     /// Verifies that correlation uses SELECT vars, not internal pattern vars.

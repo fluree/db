@@ -259,7 +259,7 @@ impl crate::Fluree {
                 &graph_source_id,
                 &config.mapping,
                 config.mapping_media_type.as_deref(),
-                false,
+                super::r2rml::SqlQueryPolicy::Refuse,
             )
             .await?;
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
@@ -507,8 +507,8 @@ impl DeltaSource {
     ) -> QueryResult<(Placement, DeltaTable, DeltaSnapshot)> {
         if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
             return Err(QueryError::InvalidQuery(format!(
-                "Graph source '{}': rr:sqlQuery logical tables are only supported by SQL \
-                 graph sources",
+                "Graph source '{}': rr:sqlQuery logical tables are not supported by Delta \
+                 graph sources; use rr:tableName",
                 self.graph_source_id
             )));
         }

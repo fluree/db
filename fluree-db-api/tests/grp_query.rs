@@ -81,3 +81,5 @@ mod it_reserved_graph_contract;
 mod it_service_cross_ledger_iri;
 #[path = "it_union_fact_identity.rs"]
 mod it_union_fact_identity;
+#[path = "it_unordered_output_order.rs"]
+mod it_unordered_output_order;
