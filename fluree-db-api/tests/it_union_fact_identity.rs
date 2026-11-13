@@ -473,10 +473,9 @@ GRAPH <urn:s2> {
 "#;
 
 /// A string object bound by the left row, joined across a union. The
-/// bound-object lane keys string terms, but over a union it probes ref
-/// objects only and leaves a row on a string object to the per-row scan,
-/// which reads the union: the answer is the facts', before and after
-/// indexing, with fast paths on and off.
+/// bound-object lane keys string terms, and over a union it walks every
+/// member for them and keeps one match per fact, as for a ref: the answer is
+/// the facts', before and after indexing, with fast paths on and off.
 #[tokio::test]
 async fn a_string_object_joins_across_a_union_once_per_fact() {
     let fluree = FlureeBuilder::memory().without_indexing().build_memory();

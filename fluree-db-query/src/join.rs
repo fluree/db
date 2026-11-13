@@ -3424,18 +3424,26 @@ impl NestedLoopJoinOperator {
         if let Some(union) = self.union_plans() {
             // Over a union each member's walk keeps its matches' list
             // positions, and one match per fact of the union is kept
-            // (`Self::object_matches_union`). It probes ref objects: a left
-            // row on any other object goes to the per-row scan, which reads
-            // the union.
+            // (`Self::object_matches_union`). The members share one store
+            // and its dictionary novelty, so a ref or string object's key is
+            // one key in every member. A left row on any other object goes to
+            // the per-row scan, which reads the union.
             let ref_type = fluree_db_core::o_type::OType::IRI_REF.as_u16();
             for group in &groups {
-                if group.o_type != ref_type {
+                if group.o_type != ref_type && !object_probe_covers(group.o_type) {
                     for &list in &group.lists {
                         streamed.set(list as usize, list_count);
                     }
                     continue;
                 }
-                for m in self.object_matches_union(ctx, &store, p_id, &group.keys, &union.plans)? {
+                for m in self.object_matches_union(
+                    ctx,
+                    &store,
+                    p_id,
+                    group.o_type,
+                    &group.keys,
+                    &union.plans,
+                )? {
                     let Binding::EncodedSid { s_id, .. } = m.object else {
                         return Err(QueryError::Internal(
                             "a union object probe matched a subject that is not an encoded ref"
@@ -3558,6 +3566,7 @@ impl NestedLoopJoinOperator {
         ctx: &ExecutionContext<'_>,
         store: &Arc<BinaryIndexStore>,
         p_id: u32,
+        o_type: u16,
         objs: &[u64],
         plans: &[ProbeLanePlan],
     ) -> Result<Vec<UnionMatch>> {
@@ -3577,9 +3586,7 @@ impl NestedLoopJoinOperator {
                 continue;
             };
             let mut probe_ops = match plan {
-                ProbeLanePlan::Merge(ops) => {
-                    ObjectProbeOps::for_type(ops, fluree_db_core::o_type::OType::IRI_REF.as_u16())
-                }
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::for_type(ops, o_type),
                 _ => None,
             };
             // Charged as the one-graph lane charges: per match, by the flush.
@@ -3588,6 +3595,7 @@ impl NestedLoopJoinOperator {
                 store,
                 branch,
                 p_id,
+                o_type,
                 objs,
                 probe_ops.as_mut(),
                 true,
@@ -4470,7 +4478,8 @@ pub(crate) fn for_each_object_probe_match(
     Ok(leaflets_read)
 }
 
-/// The union probe's walk: OPST, handing over each match's list position,
+/// The union probe's walk over objects of `o_type`: OPST, handing over each
+/// match's list position,
 /// which a union's fact identity keys on ([`union_keep`]). The one-graph
 /// lanes walk POST ([`for_each_object_probe_match`]), which hands over a run's
 /// subjects alone.
@@ -4490,6 +4499,7 @@ fn for_each_object_probe_match_by_fact(
     store: &BinaryIndexStore,
     branch: &fluree_db_binary_index::BranchManifest,
     p_id: u32,
+    o_type: u16,
     objs: &[u64],
     mut probe_ops: Option<&mut ObjectProbeOps>,
     with_list_index: bool,
@@ -4500,12 +4510,10 @@ fn for_each_object_probe_match_by_fact(
     };
     use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
     use fluree_db_binary_index::RunSortOrder;
-    use fluree_db_core::o_type::OType;
 
     if objs.is_empty() {
         return Ok(());
     }
-    let iri_ref = OType::IRI_REF.as_u16();
     let cmp = cmp_v2_for_order(RunSortOrder::Opst);
 
     // Collect leaf indices for all object keys.
@@ -4517,7 +4525,7 @@ fn for_each_object_probe_match_by_fact(
             p_id,
             t: 0,
             o_i: 0,
-            o_type: iri_ref,
+            o_type,
             g_id: ctx.binary_g_id,
         };
         let max_key = RunRecordV2 {
@@ -4526,7 +4534,7 @@ fn for_each_object_probe_match_by_fact(
             p_id,
             t: u32::MAX,
             o_i: u32::MAX,
-            o_type: iri_ref,
+            o_type,
             g_id: ctx.binary_g_id,
         };
         let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
@@ -4551,7 +4559,7 @@ fn for_each_object_probe_match_by_fact(
             if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                 continue;
             }
-            if entry.o_type_const.is_some() && entry.o_type_const != Some(iri_ref) {
+            if entry.o_type_const.is_some() && entry.o_type_const != Some(o_type) {
                 continue;
             }
 
@@ -4609,7 +4617,7 @@ fn for_each_object_probe_match_by_fact(
                 // which is extremely rare for OPST; fall back to row-scan in that case.
                 for row in 0..batch.row_count {
                     let ot = batch.o_type.get_or(row, 0);
-                    if ot != iri_ref {
+                    if ot != o_type {
                         continue;
                     }
                     let pid = batch.p_id.get_or(row, 0);
@@ -4639,7 +4647,7 @@ fn for_each_object_probe_match_by_fact(
 
             // Fast path: if o_type/p_id are const and already filtered by leaflet
             // metadata, we can skip per-row checks.
-            let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == iri_ref;
+            let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == o_type;
             let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
 
             // Start scanning at the first possible match within this leaflet.
@@ -4672,7 +4680,7 @@ fn for_each_object_probe_match_by_fact(
                 for r in row..run_end {
                     if !ot_const_ok {
                         let ot = batch.o_type.get_or(r, 0);
-                        if ot != iri_ref {
+                        if ot != o_type {
                             continue;
                         }
                     }
