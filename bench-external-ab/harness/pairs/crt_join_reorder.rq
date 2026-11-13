@@ -1,0 +1,9 @@
+# crt_join_reorder — shape-equivalent (no verbatim corpus member; blends q012 join +
+# q008 fact->dim chain + p3-style dim filter). OrderLine->order->customer(Enterprise),
+# OrderLine->product(current); SUM(quantity) integer.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cat (SUM(?qty) AS ?u)
+WHERE { ?ol a edw:OrderLine ; edw:quantity ?qty ; edw:order ?o ; edw:product ?p .
+        ?o edw:customer ?c . ?c edw:segment "Enterprise" .
+        ?p edw:category ?cat ; edw:isCurrent true . }
+GROUP BY ?cat ORDER BY DESC(?u) ?cat
