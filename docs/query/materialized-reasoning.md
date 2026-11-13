@@ -228,9 +228,13 @@ retention; it can be several times the asserted branch size. Each of the up to
 eight active programs can incur this cost and maintenance work after commits.
 
 A generation's manifest and artifacts are synced before its head is published,
-including publication retries. An unreadable generation falls back to
-query-time reasoning, emits a rate-limited warning, and requests maintenance.
-A refresh validates the current manifest/root before declaring it current.
+including publication retries. A generation that fails to read falls back to
+query-time reasoning and emits a rate-limited warning; when it is the head,
+maintenance is asked to look at it. A refresh checks the head before declaring
+it current. A head whose manifest or root is absent or does not decode is
+repaired at once. One that failed a read is read again and repaired only if
+that fails too, so a storage timeout does not cost a recompute; a refresh that
+cannot read a file still in place fails and is retried.
 Repair rebuilds at the same commit and can detach a broken manifest chain;
 a persisted retention deadline defers both sweeping and shared-dictionary
 reclamation after detaching the chain, including across restarts. This protects

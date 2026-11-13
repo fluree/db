@@ -109,6 +109,28 @@ impl ReasoningIndexState {
             == Some(manifest)
     }
 
+    /// Note that `manifest`, an index's head, did not read. One failed read
+    /// does not show a head to be broken: the next refresh reads it again,
+    /// and rebuilds only when that fails too. Returns whether this is news.
+    pub(super) fn suspect(
+        &self,
+        ledger: &str,
+        index: &ReasoningIndexId,
+        manifest: &ContentId,
+    ) -> bool {
+        self.loaded
+            .lock()
+            .0
+            .pop(&(ledger.to_string(), index.clone(), manifest.clone()));
+        self.repairs
+            .lock()
+            .insert((ledger.to_string(), index.clone()), manifest.clone())
+            .as_ref()
+            != Some(manifest)
+    }
+
+    /// [`Self::suspect`] a head a query could not be served from, and have
+    /// maintenance look at it.
     pub(super) fn request_repair(
         &self,
         ledger: &str,
@@ -116,15 +138,7 @@ impl ReasoningIndexState {
         manifest: &ContentId,
         reason: String,
     ) {
-        self.loaded
-            .lock()
-            .0
-            .pop(&(ledger.to_string(), index.clone(), manifest.clone()));
-        let mut repairs = self.repairs.lock();
-        let key = (ledger.to_string(), index.clone());
-        if repairs.get(&key) != Some(manifest) {
-            repairs.insert(key, manifest.clone());
-            drop(repairs);
+        if self.suspect(ledger, index, manifest) {
             self.record_failure(ledger, index, reason);
             self.note_registered(ledger);
         }

@@ -185,14 +185,10 @@ impl Fluree {
                 .await;
             let historical = match historical {
                 Ok(generation) => generation,
+                // A commit or an older manifest that did not read: nothing
+                // here says the head is broken.
                 Err(error) => {
                     self.reasoning_index_state.warn_serving(ledger_id, &error);
-                    self.reasoning_index_state.request_repair(
-                        ledger_id,
-                        index_id,
-                        &published.manifest,
-                        error.to_string(),
-                    );
                     continue;
                 }
             };
@@ -209,11 +205,13 @@ impl Fluree {
                 Ok(generation) => generation,
                 Err(error) => {
                     self.reasoning_index_state.warn_serving(ledger_id, &error);
-                    if let Some(head) = &entry.head {
+                    // An older generation can be released between listing
+                    // and loading it; only the head is expected to read.
+                    if entry.head.as_ref().map(|head| &head.manifest) == Some(&manifest_id) {
                         self.reasoning_index_state.request_repair(
                             ledger_id,
                             index_id,
-                            &head.manifest,
+                            &manifest_id,
                             error.to_string(),
                         );
                     }
@@ -323,7 +321,7 @@ impl Fluree {
         Ok(None)
     }
 
-    async fn loaded_generation(
+    pub(super) async fn loaded_generation(
         &self,
         record: &NsRecord,
         index_id: &ReasoningIndexId,

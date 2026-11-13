@@ -526,6 +526,28 @@ impl Fluree {
         outcome
     }
 
+    /// Whether the generation a head names loads, with the chain of
+    /// retained generations behind it.
+    async fn head_reads(
+        &self,
+        record: &NsRecord,
+        index_id: &ReasoningIndexId,
+        manifest: &ContentId,
+    ) -> bool {
+        if let Err(error) = self.loaded_generation(record, index_id, manifest).await {
+            tracing::warn!(index = %index_id, %error, "published generation did not load");
+            return false;
+        }
+        let index_cs = self.backend().content_store(
+            &record
+                .storage_namespace()
+                .reasoning_index(index_id.as_str()),
+        );
+        fluree_db_indexer::gc::reasoning_indexes::index_generations(index_cs.as_ref(), manifest)
+            .await
+            .is_ok()
+    }
+
     async fn refresh_index_exclusive(
         &self,
         ledger_id: &str,
@@ -613,12 +635,14 @@ impl Fluree {
                     engine,
                 });
             }
-            if self
-                .reasoning_index_state
-                .needs_repair(ledger_id, index_id, &published.manifest)
-                || load_previous(index_cs.as_ref(), &published.manifest)
-                    .await
-                    .is_err()
+            let suspected =
+                self.reasoning_index_state
+                    .needs_repair(ledger_id, index_id, &published.manifest);
+            if head_is_gone(index_cs.as_ref(), &published.manifest).await
+                || (suspected
+                    && !self
+                        .head_reads(&record, index_id, &published.manifest)
+                        .await)
             {
                 repair = Some(published.manifest.clone());
                 tracing::warn!(ledger = ledger_id, index = %index_id, "published generation unreadable; rebuilding");
@@ -662,10 +686,15 @@ impl Fluree {
             .await
             {
                 Ok(generations) => generations,
+                // The head's own manifest is in place, so this is a read
+                // that failed or a manifest behind it that does not decode.
+                // The next refresh tells which, by reading the chain again.
                 Err(error) => {
-                    tracing::warn!(ledger = ledger_id, index = %index_id, %error, "retained generation chain unreadable; rebuilding");
-                    repair = Some(published.manifest.clone());
-                    Vec::new()
+                    self.reasoning_index_state
+                        .suspect(ledger_id, index_id, &published.manifest);
+                    return Err(ApiError::internal(format!(
+                        "retained generation chain unreadable: {error}"
+                    )));
                 }
             };
             let plan = fluree_db_indexer::gc::reasoning_indexes::plan_generation_release(
@@ -697,21 +726,12 @@ impl Fluree {
         ));
         let previous = match &entry.head {
             Some(p) if p.revision == revision && p.settled == settled && repair.is_none() => {
-                match load_previous(index_cs.as_ref(), &p.manifest).await {
-                    Ok(prev) => {
-                        let line = Line::walk(
-                            branch_store.as_ref(),
-                            &basis.commit,
-                            p.basis.t.min(basis.t),
-                        )
-                        .await?;
-                        line.is_ancestor(&p.basis, &basis).then_some(prev)
-                    }
-                    Err(e) => {
-                        tracing::warn!(index = %index_id, error = %e, "previous generation unreadable; rebuilding");
-                        None
-                    }
-                }
+                // The head was found in place above, so a failure here is
+                // a read to try again, not a reason to compute from nothing.
+                let prev = load_previous(index_cs.as_ref(), &p.manifest).await?;
+                let line = Line::walk(branch_store.as_ref(), &basis.commit, p.basis.t.min(basis.t))
+                    .await?;
+                line.is_ancestor(&p.basis, &basis).then_some(prev)
             }
             _ => None,
         };
@@ -1430,6 +1450,20 @@ async fn previous_derived(
         .into_iter()
         .map(|flake| (graph_of(db, flake.g.as_ref()), flake))
         .collect())
+}
+
+/// Whether the manifest a head names, or the root that manifest names, is
+/// absent or does not decode: a head no retry reads. A read that fails with
+/// the file in place says nothing about the head.
+async fn head_is_gone(store: &dyn ContentStore, manifest_id: &ContentId) -> bool {
+    let bytes = match store.get(manifest_id).await {
+        Ok(bytes) => bytes,
+        Err(_) => return matches!(store.has(manifest_id).await, Ok(false)),
+    };
+    match ReasoningManifest::decode(&bytes) {
+        Ok(manifest) => matches!(store.has(&manifest.root).await, Ok(false)),
+        Err(_) => true,
+    }
 }
 
 async fn load_previous(store: &dyn ContentStore, manifest_id: &ContentId) -> Result<Previous> {
@@ -3583,6 +3617,36 @@ mod tests {
         )
         .await
         .is_ok());
+    }
+
+    /// One read of a head that failed is not a broken head: the refresh
+    /// reads it again and, finding it whole, keeps it and the generations
+    /// retained behind it.
+    #[tokio::test]
+    async fn a_head_that_reads_again_is_not_rebuilt() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/suspect-head:main";
+        let (index, _) = students(&fluree, id).await;
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+        let (manifest, _) = head_manifest(&fluree, id, &index).await;
+        fluree.reasoning_index_state.request_repair(
+            id,
+            &index,
+            &manifest,
+            "a read that timed out".into(),
+        );
+        assert!(fluree.reasoning_index_failures(id).contains_key(&index));
+
+        assert!(matches!(
+            fluree.refresh_reasoning_index(id, &index).await.unwrap(),
+            RefreshOutcome::Current { generation: 1 }
+        ));
+        assert_eq!(head_manifest(&fluree, id, &index).await.0, manifest);
+        assert!(fluree.reasoning_index_failures(id).is_empty());
+        assert!(!fluree
+            .reasoning_index_state
+            .needs_repair(id, &index, &manifest));
+        assert_eq!(alice_classes(&fluree, id).await.1, Some(1));
     }
 
     #[tokio::test]
