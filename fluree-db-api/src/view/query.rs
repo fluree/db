@@ -1774,10 +1774,11 @@ impl Fluree {
             }
         }
         let reads = || {
+            use crate::retention::suppression::{reads_of, with_policy_reads, Reads};
             if executable.reasoning.modes.has_any_enabled() {
-                crate::retention::suppression::Reads::Everything
+                Reads::Everything
             } else {
-                crate::retention::suppression::reads_of(parsed, encoded_with)
+                with_policy_reads(reads_of(parsed, encoded_with), db.policy(), encoded_with)
             }
         };
         let (from_t, to_t) = match history_range {

@@ -62,6 +62,41 @@ pub(crate) fn reads_of(query: &Query, snapshot: &LedgerSnapshot) -> Reads {
     }
 }
 
+/// `reads` with what `policy`'s view policies read as they decide each row:
+/// a condition's (`f:query`) patterns, and a class policy's subjects'
+/// `rdf:type`. Both run as of the read's point, so they read history as the
+/// query's own patterns do. A condition whose patterns cannot be told reads
+/// everything.
+pub(crate) fn with_policy_reads(
+    reads: Reads,
+    policy: Option<&fluree_db_policy::PolicyContext>,
+    snapshot: &LedgerSnapshot,
+) -> Reads {
+    let Reads::Facts(mut facts) = reads else {
+        return reads;
+    };
+    let Some(policy) = policy.filter(|p| !p.wrapper.is_root()) else {
+        return Reads::Facts(facts);
+    };
+    for restriction in &policy.wrapper.view().restrictions {
+        if restriction.class_policy {
+            facts.push(Fact::Of(None, fluree_vocab::rdf::TYPE.to_string()));
+        }
+        if let fluree_db_policy::PolicyValue::Query(condition) = &restriction.value {
+            let mut bounded = true;
+            let told = fluree_db_query::policy::for_each_condition_pattern(
+                condition,
+                snapshot,
+                &mut |pattern| bounded &= read_by(pattern, snapshot, &mut facts),
+            );
+            if !(told && bounded) {
+                return Reads::Everything;
+            }
+        }
+    }
+    Reads::Facts(facts)
+}
+
 fn iri(r: &Ref, snapshot: &LedgerSnapshot) -> Option<String> {
     match r {
         Ref::Var(_) => None,

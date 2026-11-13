@@ -3467,3 +3467,133 @@ async fn a_solution_modifier_cannot_read_removed_history() {
         );
     }
 }
+
+/// A policy's `f:query` condition runs as of the read's point, so what it
+/// reads counts toward the refusal: a read of an innocent fact under a
+/// condition that reads a removed one is refused, as reading that directly
+/// is. A condition that reads no removed predicate leaves the read answered.
+#[tokio::test]
+async fn a_policy_condition_counts_toward_what_a_read_reads() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-policy-condition").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@old"},
+            {"@id": "ex:bob", "ex:name": "Bob"}
+        ]}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    let read = |condition: JsonValue| {
+        json!({
+            "@context": ctx(),
+            "from": format!("{id}@t:{t1}"),
+            "opts": {
+                "default-allow": false,
+                "policy": [{"@id": "ex:gate", "f:action": "f:view", "f:query": condition}]
+            },
+            "select": "?n",
+            "where": {"@id": "ex:bob", "ex:name": "?n"}
+        })
+    };
+    let jsonld = |condition: JsonValue| JsonValue::String(condition.to_string());
+    for condition in [
+        jsonld(json!({"where": {
+            "@id": "http://example.org/alice",
+            "http://example.org/email": "a@old"
+        }})),
+        json!({
+            "@type": "f:sparql",
+            "@value": "ASK { <http://example.org/alice> <http://example.org/email> ?e \
+                       FILTER(STRSTARTS(?e, \"a@\")) }"
+        }),
+    ] {
+        let result = fluree.query_connection(&read(condition.clone())).await;
+        assert!(
+            matches!(result, Err(ApiError::HistoryUnavailable(_))),
+            "{condition}: {result:?}"
+        );
+    }
+
+    let names = jsonld(json!({"where": {"@id": "?$this", "http://example.org/name": "?n"}}));
+    let result = fluree
+        .query_connection(&read(names))
+        .await
+        .expect("a condition reading nothing removed is answered");
+    let ledger = fluree.ledger(&id).await.unwrap();
+    assert_eq!(result.to_jsonld(&ledger.snapshot).unwrap(), json!(["Bob"]));
+}
+
+/// A class policy decides a subject's visibility from its classes as of the
+/// read's point, so every read it governs reads `rdf:type`: with a removed
+/// type, whether a subject is hidden at that point would tell the removed
+/// class.
+#[tokio::test]
+async fn a_class_policy_counts_as_a_read_of_types() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-class-policy").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Secret", "ex:name": "Alice"},
+            {"@id": "ex:carol", "@type": "ex:Secret", "ex:name": "Carol"},
+            {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"}
+        ]}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(
+            &id,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: fluree_vocab::rdf::TYPE.into(),
+                    graph: None,
+                    object: Some(json!({"@id": "http://example.org/Secret"})),
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+    // Class policies cover the properties the index's class statistics
+    // give a class; `ex:name`, shared with `ex:Person`, is checked per
+    // subject.
+    reindex(&fluree, &id).await;
+    let read = |from: String| {
+        json!({
+            "@context": ctx(),
+            "from": from,
+            "opts": {"default-allow": true, "policy": [{
+                "@id": "ex:deny-secrets",
+                "@type": "f:AccessPolicy",
+                "f:action": {"@id": "f:view"},
+                "f:onClass": [{"@id": "http://example.org/Secret"}],
+                "f:allow": false
+            }]},
+            "select": "?n",
+            "where": {"@id": "?s", "ex:name": "?n"}
+        })
+    };
+    let ledger = fluree.ledger(&id).await.unwrap();
+    let head = fluree
+        .query_connection(&read(id.clone()))
+        .await
+        .expect("a read at the head is answered");
+    assert_eq!(
+        crate::support::normalize_rows(&head.to_jsonld(&ledger.snapshot).unwrap()),
+        crate::support::normalize_rows(&json!(["Alice", "Bob"]))
+    );
+    let result = fluree.query_connection(&read(format!("{id}@t:{t1}"))).await;
+    assert!(
+        matches!(result, Err(ApiError::HistoryUnavailable(_))),
+        "{:?}",
+        result.map(|r| r.to_jsonld(&ledger.snapshot).unwrap())
+    );
+}
