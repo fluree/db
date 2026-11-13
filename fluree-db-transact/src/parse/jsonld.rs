@@ -2298,20 +2298,16 @@ fn parse_literal_value_with_meta(
                 }
                 // Canonicalizing here gives one term per value, regardless
                 // of how the writer serialized it (#1781). A string `@value`
-                // holds an already serialized document, so it is
-                // canonicalized in place when it parses and stored as written
-                // when it does not.
-                let json_string = match val {
-                    Value::String(s) => {
-                        fluree_graph_ir::canonicalize_json(s).unwrap_or_else(|_| s.clone())
-                    }
-                    _ => fluree_graph_ir::canonicalize_json_value(val),
+                // holds an already serialized document, parsed as `INSERT
+                // DATA` and a Turtle transaction parse `"…"^^rdf:JSON`: one
+                // that is not JSON fails the write with their error.
+                let value = match val {
+                    Value::String(s) => crate::value_convert::typed_lexical(s, rdf::JSON)?,
+                    _ => FlakeValue::Json(fluree_graph_ir::canonicalize_json_value(val)),
                 };
                 let datatype_sid = ns_registry.sid_for_iri(rdf::JSON);
-                return Ok(
-                    ParsedValue::new(TemplateTerm::Value(FlakeValue::Json(json_string)))
-                        .with_dtc(DatatypeConstraint::Explicit(datatype_sid)),
-                );
+                return Ok(ParsedValue::new(TemplateTerm::Value(value))
+                    .with_dtc(DatatypeConstraint::Explicit(datatype_sid)));
             }
 
             // Handle @vector shorthand: "@vector" or full IRI both route
@@ -2778,6 +2774,39 @@ mod tests {
             .map(|(ctx, coerced, _)| format!("{coerced} under {ctx}"))
             .collect();
         assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// A string `@value` under `@json` (or `rdf:JSON`) is a serialized
+    /// document: one that parses is stored canonicalized, and one that does
+    /// not fails the write with the error `INSERT DATA` gives.
+    #[test]
+    fn a_json_literal_string_must_be_json() {
+        let ctx = json!({"ex": "http://example.org/",
+                         "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"});
+        let write = |value: Value, ty: &str| {
+            parse_doc(
+                &json!({"@context": ctx, "@id": "ex:s",
+                        "ex:d": {"@value": value, "@type": ty}}),
+                TxnType::Insert,
+            )
+            .map(|txn| format!("{:?}", txn.insert_templates[0].object))
+            .map_err(|e| e.to_string())
+        };
+        for ty in ["@json", "rdf:JSON"] {
+            assert_eq!(
+                write(json!("{\"b\": 1, \"a\": 2}"), ty),
+                Ok(format!(
+                    "{:?}",
+                    TemplateTerm::Value(FlakeValue::Json(r#"{"a":2,"b":1}"#.into()))
+                )),
+                "{ty}"
+            );
+            let refused = write(json!("not json"), ty).expect_err(ty);
+            assert!(
+                refused.contains("Cannot parse 'not json' as rdf:JSON"),
+                "{ty}: {refused}"
+            );
+        }
     }
 
     /// `rdf:type` as a key writes the type `@type` would, also as a list,

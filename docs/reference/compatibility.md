@@ -16,6 +16,8 @@ Fluree implements the W3C RDF 1.1 specification:
 - Blank nodes
 - RDF datasets
 
+**Deviation (ill-typed literals):** RDF 1.1 admits a literal whose lexical form is not in its datatype's lexical space, such as `"xyz"^^xsd:integer`, as a literal that denotes no value. Fluree stores typed values rather than lexical forms, so every transaction refuses one. Bulk import keeps one as text under its datatype. See [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype).
+
 **Specification:** https://www.w3.org/TR/rdf11-concepts/
 
 ### RDF 1.2
@@ -598,6 +600,28 @@ an optional field on the terminal `end` record). It is additive and present
 only when a non-root policy context governed the request, so clients that
 ignore unknown fields are unaffected. See
 [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
+
+#### Every transaction refuses an ill-typed literal (breaking)
+
+A typed literal whose lexical form is not in its datatype's lexical space, such as `"landed"^^xsd:integer` or `"300"^^xsd:byte`, is now refused by every transaction with the error `INSERT DATA` and the JSON-LD insert already gave ("Cannot parse 'landed' as integer"), and nothing is committed. These used to store it as text under its datatype:
+
+- an update that builds one at run time (`STRDT`, `STRDT(CONCAT(..))`, JSON-LD `str-dt`), and an `INSERT … WHERE` that copies one a ledger holds;
+- Turtle, TriG and N-Triples insert and upsert, the TriG insert fallback, graph insert and graph sync;
+- a JSON-LD value object typed `@json` (or `rdf:JSON`) whose string `@value` is not JSON.
+
+Bulk import (`fluree create --from`, `fluree graph import`) still keeps such a literal as text under its datatype, so data that carries one can be loaded as written that way. A ledger that holds an ill-typed literal keeps it, reads it back with its datatype, and can delete it through a variable ([Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)).
+
+JSON-LD results (a select and a graph crawl) print such a stored literal with its `@type`: `{"@value": "landed", "@type": "xsd:integer"}`. Under a datatype JSON-LD infers from a JSON number or boolean (`xsd:integer`, `xsd:double`, `xsd:boolean`, …) it used to print as a bare string, which reads back as an `xsd:string`. An `rdf:JSON` literal whose text is not JSON prints the same way, `{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`, in JSON-LD, typed JSON and agent JSON results; a query returning one used to fail with "Invalid JSON in @json value". A valid JSON literal prints as before.
+
+#### Bulk import stored wrong `rdf:JSON` and `xsd:duration` values (data integrity)
+
+Every release since 4.0.0 indexed the `rdf:JSON` and `xsd:duration` values of a bulk import (`fluree create --from`, and `fluree graph import` since it was added) under the wrong dictionary entry. A query read back some other text the ledger held instead of the value: a string from another statement, a file name, a hash, different from one import to the next. A JSON-LD or SPARQL result that included such a JSON value could fail with "Invalid JSON in @json value". Ledgers built by transactions were not affected. Imports now store these values as written.
+
+A ledger built or extended by an import in an earlier release, with `rdf:JSON` or `xsd:duration` values, still holds the wrong entries in its index. The ledger's commits hold the values as written, so [`fluree reindex`](../cli/reindex.md), which rebuilds the index from the commits, repairs it; a re-import is not needed. Reindex even if the ledger has been written to since the import. A value an update copied out of such a ledger before the repair (an `INSERT … WHERE` that bound it) was written with the wrong text, and a reindex does not change it.
+
+#### Bulk import keeps an out-of-range bounded integer as text
+
+A bulk import stored an out-of-range value of a bounded integer type, such as `"300"^^xsd:byte`, as the number 300 under `xsd:byte`. It now keeps it as text under its datatype, as it keeps every other literal that is not a value of its datatype (see [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)), so it no longer compares equal to a number. A transaction refuses it ("Value 300 is out of range for byte").
 
 ## Supported Data Formats
 

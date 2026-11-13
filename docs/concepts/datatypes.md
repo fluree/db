@@ -263,7 +263,7 @@ Two consequences are worth knowing:
 - **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
 - **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
 
-`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written, and it reads back as typed text (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
 
 Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
 
@@ -458,12 +458,27 @@ Numeric types (long, double, bigint, decimal) are mutually comparable via automa
 ### Text That Is Not a Value of Its Datatype
 
 A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
-built-in datatype but is not one of its values. JSON-LD transactions and
-SPARQL UPDATE reject it wherever it is written as a constant, in a DELETE as
-in an INSERT or a WHERE, naming the datatype in the error. Turtle
-transactions and bulk import keep it, as RDF allows: the literal is stored with
-its text and its datatype and reads back exactly as written, but it is not a
-date or a number, so it never equals one.
+built-in datatype but is not one of its values. Every transaction refuses it,
+naming the datatype in the error ("Cannot parse '2024-02-30' as xsd:date"),
+and commits nothing:
+
+- JSON-LD transactions and SPARQL UPDATE, wherever it is written as a
+  constant, in a DELETE as in an INSERT or a WHERE;
+- an update that builds one at run time (`STRDT`, JSON-LD `str-dt`), or that
+  copies one a ledger holds (`INSERT … WHERE`);
+- Turtle, TriG and N-Triples transactions, insert and upsert, graph insert
+  and graph sync.
+
+Bulk import (`fluree create --from`, `fluree graph import`) keeps it, as RDF
+allows, so a dataset from elsewhere loads in one pass: the literal is stored
+with its text and its datatype and reads back exactly as written, with its
+datatype (in JSON-LD results, `{"@value": "300", "@type": "xsd:byte"}`), but
+it is not a date or a number, so it never equals one. An `rdf:JSON` literal
+that is not JSON is kept as written too, and reads back as the typed literal
+it is, not as JSON: `"not json"^^rdf:JSON` in SPARQL results and RDF text,
+`{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`
+in JSON-LD. An `f:embeddingVector` literal that is not a vector fails the
+import, as it fails a transaction.
 
 To remove a stored one, bind it through a variable, or replace the
 property's values with an [upsert](../transactions/upsert.md) or a

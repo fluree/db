@@ -1252,7 +1252,11 @@ pub fn remap_v2_record<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
         DecodeKind::IriRef => {
             record.o_key = subject_remap.get(record.o_key as usize)?;
         }
-        DecodeKind::StringDict => {
+        // Every o_type whose key is a string-dictionary id: strings, and also
+        // `rdf:JSON` and `xsd:duration`, which keep their text there. A key
+        // left chunk-local reads back as whatever string holds that id in
+        // the global dictionary.
+        _ if o_type.is_string_keyed() => {
             record.o_key = string_remap.get(record.o_key as usize)? as u64;
         }
         _ => {}
@@ -1933,6 +1937,36 @@ mod tests {
             lang_id: 0,
             i: LIST_INDEX_NONE,
         }
+    }
+
+    /// Every o_type whose key is a string-dictionary id has it remapped from
+    /// chunk-local to global, `rdf:JSON` and `xsd:duration` as well as
+    /// strings; an inline value is left as it is.
+    #[test]
+    fn remap_v2_record_remaps_every_string_keyed_o_type() {
+        use fluree_db_core::o_type::OType;
+        let subjects: Vec<u64> = vec![40];
+        let strings: Vec<u32> = vec![11, 12, 13];
+        let remapped = |o_type: OType, o_key: u64| {
+            let mut record =
+                RunRecordV2::new(0, SubjectId::from_u64(0), 1, o_type, o_key, u32::MAX, 1);
+            remap_v2_record(&mut record, &subjects, &strings, None).unwrap();
+            (record.s_id.as_u64(), record.o_key)
+        };
+        for (o_type, local) in [
+            (OType::XSD_STRING, 0),
+            (OType::RDF_JSON, 1),
+            (OType::XSD_DURATION, 2),
+        ] {
+            assert!(o_type.is_string_keyed(), "{o_type:?}");
+            assert_eq!(
+                remapped(o_type, local),
+                (40, u64::from(strings[local as usize])),
+                "{o_type:?}"
+            );
+        }
+        let inline = ObjKey::encode_i64(7).as_u64();
+        assert_eq!(remapped(OType::XSD_INTEGER, inline), (40, inline));
     }
 
     #[test]
