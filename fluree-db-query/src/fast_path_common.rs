@@ -449,10 +449,16 @@ pub(crate) fn driver_subject_boundaries(
 /// (`DictOverlay::assign_numbig_handle`), a novelty value reuses a base arena
 /// handle only when the predicate's base arena is non-empty (already reported
 /// here), and novelty *list* rows need a row-level check in the overlay lane.
+///
+/// `replay_to` is the read's `t` when it is below the index's. The flags and
+/// the type constant describe a leaflet's live rows; history newer than the
+/// read can hold list rows or arena handles, so a leaflet the read replays is
+/// unsafe.
 pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    replay_to: Option<i64>,
 ) -> Result<bool> {
     use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
@@ -461,10 +467,11 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
             .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            let replays = entry.replays_history(replay_to);
+            if (entry.row_count == 0 && !replays) || entry.p_const != Some(p_id) {
                 continue;
             }
-            if entry.flags & HAS_O_I != 0 {
+            if replays || entry.flags & HAS_O_I != 0 {
                 return Ok(true);
             }
             match entry.o_type_const {
@@ -2812,8 +2819,7 @@ pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneOutput {
     /// Encoded bindings. Eager callers are owed decoded ones (a datalog rule
-    /// head built from an encoded binding derives nothing), so admission
-    /// declines them.
+    /// head rejects an encoded binding), so admission declines them.
     Encoded,
     /// Decoded bindings under eager materialization, as the per-row scan
     /// emits, or no bindings at all.
