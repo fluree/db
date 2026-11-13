@@ -32,7 +32,7 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::clock::Instant;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -52,8 +52,13 @@ pub struct GroupByOperator {
     in_schema: Arc<[VarId]>,
     /// Operator state
     state: OperatorState,
-    /// Accumulated groups: group_key -> list of complete rows
-    groups: HashMap<Vec<Binding>, Vec<Vec<Binding>>>,
+    /// Accumulated groups: group_key -> list of complete rows.
+    ///
+    /// Fx-hashed, so the groups are emitted in an order fixed by the input
+    /// rows: a query with no ORDER BY pages its groups with LIMIT/OFFSET
+    /// without skipping or repeating one. A std `HashMap` seeds each instance
+    /// at random and emitted them in a different order on every execution.
+    groups: FxHashMap<Vec<Binding>, Vec<Vec<Binding>>>,
     /// Iterator for emitting grouped results
     emit_iter: Option<std::vec::IntoIter<GroupEntry>>,
     /// Indices of group key columns in the schema
@@ -95,7 +100,7 @@ impl GroupByOperator {
             child,
             in_schema: schema,
             state: OperatorState::Created,
-            groups: HashMap::new(),
+            groups: FxHashMap::default(),
             emit_iter: None,
             group_key_indices,
             out_schema: None,
@@ -125,11 +130,8 @@ impl GroupByOperator {
     /// For each group:
     /// - Group key columns keep their single value
     /// - Non-grouped columns become Grouped(Vec<Binding>)
-    fn transform_groups(&self) -> Vec<(Vec<Binding>, Vec<Vec<Binding>>)> {
-        self.groups
-            .iter()
-            .map(|(key, rows)| (key.clone(), rows.clone()))
-            .collect()
+    fn transform_groups(&mut self) -> Vec<(Vec<Binding>, Vec<Vec<Binding>>)> {
+        std::mem::take(&mut self.groups).into_iter().collect()
     }
 
     /// Build an output row from a group.

@@ -862,6 +862,7 @@ impl Fluree {
             include_system_facts: executable.query.include_system_facts,
             cypher_vocab: executable.query.cypher_vocab.clone(),
             trust_fk_refs: options.trust_fk_refs,
+            deterministic_scans: options.deterministic_scans,
             ..Default::default()
         };
         #[cfg(feature = "vector")]
@@ -1049,6 +1050,7 @@ impl Fluree {
             include_system_facts: executable.query.include_system_facts,
             cypher_vocab: executable.query.cypher_vocab.clone(),
             trust_fk_refs: options.trust_fk_refs,
+            deterministic_scans: options.deterministic_scans,
             ..Default::default()
         };
         #[cfg(feature = "vector")]

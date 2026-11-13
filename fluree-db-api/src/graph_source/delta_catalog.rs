@@ -18,7 +18,7 @@ use serde::Serialize;
 use super::delta::{open_placed, DeltaCreateConfig};
 use super::iceberg_generate::{emit_options, validate_base_namespace, GenerateOptions};
 use super::iceberg_validate::{
-    compile_for_validate, cross_check_live, LiveColumn, ValidateR2rmlResponse, Wording,
+    compile_for_validate, cross_check_live, LiveColumn, QueryTables, ValidateR2rmlResponse, Wording,
 };
 use super::R2rmlMappingInput;
 use crate::Result;
@@ -466,6 +466,7 @@ impl crate::Fluree {
             &schemas,
             &unread,
             DELTA_WORDING,
+            QueryTables::Alias,
         ));
         diagnostics.extend(unmappable_columns(&compiled, &schemas));
 
@@ -819,7 +820,13 @@ mod tests {
             "main.sales.returns".to_string(),
             "Unity Catalog, table 'main.sales.returns': not found (404)".to_string(),
         )]);
-        let mut found = cross_check_live(&compiled, &schemas, &unread, DELTA_WORDING);
+        let mut found = cross_check_live(
+            &compiled,
+            &schemas,
+            &unread,
+            DELTA_WORDING,
+            QueryTables::Alias,
+        );
         found.extend(unmappable_columns(&compiled, &schemas));
         let of = |code: DiagCode| -> Vec<&Diagnostic> {
             found.iter().filter(|d| d.code == code).collect()

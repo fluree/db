@@ -1107,7 +1107,7 @@ impl HashAnnotationEdgeProbeOperator {
         view: Option<&fluree_db_binary_index::BinaryGraphView>,
         driving: &std::collections::HashSet<GroupKeyOwned>,
         keep_all: bool,
-    ) -> Result<HashMap<GroupKeyOwned, Vec<SweptEdge>>> {
+    ) -> Result<FxHashMap<GroupKeyOwned, Vec<SweptEdge>>> {
         let dicts = view.map(crate::object_binding::TermDicts::of_view);
         let mut op = crate::execute::build_where_operators_seeded(
             None,
@@ -1116,7 +1116,10 @@ impl HashAnnotationEdgeProbeOperator {
             None,
             &self.planning,
         )?;
-        let mut edges: HashMap<GroupKeyOwned, Vec<SweptEdge>> = HashMap::new();
+        // Fx-hashed: a driving row with an unbound subject takes every swept
+        // edge in this map's order, so a std map (seeded at random per
+        // instance) answered those rows in a different order on each run.
+        let mut edges: FxHashMap<GroupKeyOwned, Vec<SweptEdge>> = FxHashMap::default();
         op.open(ctx).await?;
         while let Some(batch) = op.next_batch(ctx).await? {
             ctx.check_cancelled()?;

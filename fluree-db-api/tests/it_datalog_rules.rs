@@ -3065,3 +3065,52 @@ async fn datalog_cyclic_query_joins_derived_facts_on_an_indexed_ledger() {
     .await;
     assert_eq!(json!(rows), both_triangles());
 }
+
+/// A rule body plans through the same path as a query: its `NOT EXISTS` reads
+/// the ledger's default graph after a `GRAPH` block as before one.
+#[tokio::test]
+async fn a_rule_body_negation_after_a_graph_block_reads_the_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, "datalog/negation-after-graph"))
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               ex:a ex:parent ex:b . ex:b ex:parent ex:c . ex:a ex:blocked ex:c .
+               ex:d ex:parent ex:e . ex:e ex:parent ex:f .
+               GRAPH ex:stage { ex:m ex:note "staged" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let rule = json!({
+        "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+        "@id": "ex:grandparentRule",
+        "f:rule": {
+            "@type": "@json",
+            "@value": {
+                "@context": {"ex": "http://example.org/"},
+                "where": [
+                    ["graph", "ex:stage", {"@id": "?m", "ex:note": "?n"}],
+                    {"@id": "?x", "ex:parent": {"@id": "?y"}},
+                    {"@id": "?y", "ex:parent": {"@id": "?z"}},
+                    ["not-exists", {"@id": "?x", "ex:blocked": {"@id": "?z"}}]
+                ],
+                "insert": {"@id": "?x", "ex:grandparent": {"@id": "?z"}}
+            }
+        }
+    });
+    let ledger = fluree.insert(ledger, &rule).await.expect("rule").ledger;
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?x", "?z"],
+        "where": {"@id": "?x", "ex:grandparent": "?z"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(normalize_rows(&rows), vec![json!(["ex:d", "ex:f"])]);
+}

@@ -47,7 +47,7 @@ use fluree_db_core::{
     range_with_overlay, DatatypeConstraint, Flake, FlakeValue, IndexType, LedgerSnapshot,
     RangeMatch, RangeOptions, RangeTest, Sid,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -856,8 +856,12 @@ impl PropertyPathOperator {
         // (predicate-indexed) and merge them into one adjacency map — for an
         // alternation path `(a|b)*` the closure spans both predicates' edges.
         let graphs = ctx.path_graphs()?;
-        let mut adj: std::collections::HashMap<Sid, Vec<Sid>> = std::collections::HashMap::new();
-        let mut nodes: HashSet<Sid> = HashSet::new();
+        // Fx-hashed: the closure below emits its pairs in `nodes` order, which
+        // is then fixed by the edges read, so an unordered answer pages with
+        // LIMIT/OFFSET without skipping or repeating a pair. A std set seeds
+        // each instance at random.
+        let mut adj: FxHashMap<Sid, Vec<Sid>> = FxHashMap::default();
+        let mut nodes: FxHashSet<Sid> = FxHashSet::default();
         let mut edge = |s: Sid, o: Sid| {
             nodes.insert(s.clone());
             nodes.insert(o.clone());
@@ -1093,9 +1097,12 @@ impl PropertyPathOperator {
     /// objects of all step predicates. This is the domain over which a `*`/`?`
     /// zero-length match pairs each node with itself (mirrors how the simple-path
     /// closure tracks both subjects and objects).
-    async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<HashSet<Sid>> {
+    ///
+    /// Fx-hashed for the same reason as the closure's node set: the caller
+    /// emits a self-pair per node in this set's order.
+    async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<FxHashSet<Sid>> {
         let graphs = ctx.path_graphs()?;
-        let mut nodes: HashSet<Sid> = HashSet::new();
+        let mut nodes: FxHashSet<Sid> = FxHashSet::default();
         let all_preds = self.pattern.predicates.iter().chain(
             self.pattern
                 .sequence_steps
