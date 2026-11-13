@@ -8,6 +8,7 @@
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::R2rmlCreateConfig;
+use crate::graph_source::file_read::spawn_file_read;
 use crate::graph_source::iceberg_catalog::storage_query_error;
 use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
 use crate::graph_source::storage::{plan_storage, CatalogGrant, StoragePlan};
@@ -5064,6 +5065,9 @@ impl EmitOrder {
 ///
 /// `read` builds one file's read; it runs on its own task, so up to
 /// `concurrency` reads progress in parallel while the consumer drains them.
+/// Dropping the stream aborts the reads in flight ([`spawn_file_read`]), so a
+/// scan dropped early (its LIMIT is met, or the query is cancelled) leaves no
+/// read running to the end of its file.
 pub(crate) fn read_files_in_order<R, Fut>(
     mut tasks: Vec<FileScanTask>,
     order: EmitOrder,
@@ -5092,9 +5096,7 @@ where
             let read = read
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tokio::spawn(read)
-                .await
-                .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+            spawn_file_read(read).await
         }
     });
     let concurrency = concurrency.max(1);
@@ -8259,6 +8261,38 @@ mod emit_order_tests {
             EmitOrder::SmallestFirst
         );
         assert_eq!(EmitOrder::for_query(ScanOrder::Any), EmitOrder::Completion);
+    }
+
+    /// Dropping a scan's stream aborts the reads it has in flight and starts
+    /// no more, in every emit order: `buffered` and `buffer_unordered` alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_scan_stream_aborts_the_reads_in_flight() {
+        use crate::graph_source::file_read::test_reads::{endless_read, wait_for};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for order in [
+            EmitOrder::AsListed,
+            EmitOrder::SmallestFirst,
+            EmitOrder::Completion,
+        ] {
+            let (started, dropped) = (Arc::<AtomicUsize>::default(), Arc::default());
+            let tasks = (0..16).map(task).collect();
+            let mut stream = read_files_in_order(tasks, order, 4, {
+                let (started, dropped) = (Arc::clone(&started), Arc::clone(&dropped));
+                move |_task| endless_read(&started, &dropped)
+            });
+            assert!(futures::poll!(stream.next()).is_pending(), "{order:?}");
+            wait_for(&started, 4).await;
+
+            drop(stream);
+            wait_for(&dropped, 4).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                4,
+                "{order:?}: no read starts after the drop"
+            );
+        }
     }
 
     /// A read error is emitted at its file's place in the emit order, after

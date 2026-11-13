@@ -336,6 +336,9 @@ mod iceberg_validate;
 mod ephemeral;
 
 #[cfg(feature = "iceberg")]
+mod file_read;
+
+#[cfg(feature = "iceberg")]
 mod r2rml_materialize;
 
 #[cfg(feature = "iceberg")]
