@@ -3820,19 +3820,37 @@ impl FlureeR2rmlProvider<'_> {
         // per namespace level. Without it two namespaces holding a same-named
         // table collide on the table name. A root with no directory for the
         // namespace is the flat layout below (a Snowflake-style copy, where the
-        // namespace names no directory at all).
-        let mut searched_namespace_dir = None;
+        // namespace names no directory at all). A directory that is itself a
+        // table (a flat root's `sales/` for a mapping naming `sales.orders`)
+        // is no namespace either. A namespace directory is authoritative: a
+        // table missing from it is a miss, never a match on a stray
+        // `<root>/<table>`.
         if let Some(ns_dir) = self
             .resolve_namespace_dir(&root, &listing, &table_id.namespace, lt_key, plan)
             .await?
         {
             let ns_listing = self.warehouse_listing(&ns_dir, lt_key, plan).await?;
-            let candidates =
-                fluree_db_iceberg::catalog::warehouse_table_dir_candidates(requested, &ns_listing);
-            match candidates.as_slice() {
-                [one] => return Ok(format!("{ns_dir}/{}", one.trim_end_matches('/'))),
-                [] => searched_namespace_dir = Some(ns_dir),
-                many => {
+            let candidates = if listing_is_single_table(&ns_listing) {
+                None
+            } else {
+                Some(fluree_db_iceberg::catalog::warehouse_table_dir_candidates(
+                    requested,
+                    &ns_listing,
+                ))
+            };
+            match candidates.as_deref() {
+                None => {}
+                Some([one]) => return Ok(format!("{ns_dir}/{}", one.trim_end_matches('/'))),
+                Some([]) => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "warehouse-root resolution for table '{table_id}': no directory under \
+                         namespace directory {ns_dir} matches '{requested}' (matched on the name \
+                         before '.', case-insensitive). Found {} directories: [{}]",
+                        ns_listing.len(),
+                        ns_listing.join(", ")
+                    )));
+                }
+                Some(many) => {
                     return Err(QueryError::InvalidQuery(format!(
                         "warehouse-root resolution for table '{table_id}': AMBIGUOUS under \
                          {ns_dir} — {} directories match: [{}]",
@@ -3861,11 +3879,8 @@ impl FlureeR2rmlProvider<'_> {
                     if listing_is_single_table(&listing) {
                         return Ok(table_location.to_string());
                     }
-                    let also = searched_namespace_dir
-                        .map(|d| format!(" (also not found under namespace directory {d})"))
-                        .unwrap_or_default();
                     return Err(QueryError::InvalidQuery(format!(
-                        "warehouse-root resolution for table '{}': {e}{also}",
+                        "warehouse-root resolution for table '{}': {e}",
                         table_id.table
                     )));
                 }

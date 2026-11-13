@@ -125,6 +125,18 @@ const TWO_SITES_R2RML: &str = r#"
             rr:predicate ex:name ;
             rr:objectMap [ rr:column "name" ]
         ] .
+
+    <http://example.org/mapping#GluePeople>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "glue.people" ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/glue/person/{id}" ;
+            rr:class ex:GluePerson
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
 "#;
 
 /// A root laid out `<root>/<namespace>/<table>` holds a same-named table in
@@ -150,6 +162,17 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
     copy_dir_all(
         &fixtures_dir().join("silver/people_backlog"),
         &staging.path().join("eu/west/people"),
+    );
+    // Hive, Glue and Spark write a namespace directory as `<ns>.db/`.
+    copy_dir_all(
+        &fixtures_dir().join("silver/people"),
+        &staging.path().join("glue.db/people"),
+    );
+    // A stray table at the root, which a namespace directory must never fall
+    // back to.
+    copy_dir_all(
+        &fixtures_dir().join("silver/people_window"),
+        &staging.path().join("people"),
     );
     let root = format!("file://{}", staging.path().display());
 
@@ -185,6 +208,11 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
     assert_eq!(count("ex:SouthPerson").await, 3000, "south.people rows");
     // Same row count as `south`; the snapshot pins below tell the two apart.
     assert_eq!(count("ex:EuWestPerson").await, 3000, "eu.west.people rows");
+    assert_eq!(
+        count("ex:GluePerson").await,
+        5,
+        "glue.people rows (glue.db/)"
+    );
 
     // The scan/pin entry point resolves by namespace too.
     let provider = FlureeR2rmlProvider::new(&fluree);
@@ -207,8 +235,8 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
         "a two-level namespace pins its own table"
     );
 
-    // A namespace directory that lacks the table is a miss, not a match on
-    // another namespace's same-named table.
+    // A namespace directory is authoritative: one that lacks the table is a
+    // miss naming that directory, not a match on the stray `<root>/people`.
     std::fs::create_dir_all(staging.path().join("east")).expect("empty namespace dir");
     let fluree = FlureeBuilder::memory().build_memory();
     let mapping = TWO_SITES_R2RML.replace("south.people", "east.people");
@@ -220,10 +248,30 @@ async fn same_table_name_in_two_namespaces_resolves_by_namespace() {
         .expect("create graph source");
     let missing = FlureeR2rmlProvider::new(&fluree)
         .current_snapshot_id("east-site:main", "east.people")
-        .await;
+        .await
+        .expect_err("east.people must not resolve to the stray root-level table");
     assert!(
-        missing.is_err(),
-        "east.people must not resolve to another namespace's table, got: {missing:?}"
+        missing.to_string().contains("namespace directory"),
+        "the miss names the namespace directory searched: {missing}"
+    );
+
+    // A namespace with no directory at all is the flat layout, and does read
+    // the root-level table.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = TWO_SITES_R2RML.replace("south.people", "flat.people");
+    let config = R2rmlCreateConfig::new_direct("flat-site", &root, &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+    let flat = FlureeR2rmlProvider::new(&fluree)
+        .current_snapshot_id("flat-site:main", "flat.people")
+        .await
+        .expect("flat.people resolves to <root>/people");
+    assert_eq!(
+        flat, south,
+        "the root-level table is the south fixture's copy"
     );
 }
 
