@@ -1138,9 +1138,10 @@ impl CyclicBgpOperator {
     /// every edge). With novelty present, probing stays allowed when every
     /// edge's resolved ops are mergeable (empty → `None`, non-empty →
     /// `Some(ops)` merged per probed subject); any unmergeable edge
-    /// (translation failure, novelty-only predicate), or eager materialization,
-    /// disables probes for the cascade — full scans, which merge through the
-    /// overlay cursor, are unaffected. Historical snapshots keep probes off:
+    /// (translation failure, novelty-only predicate) disables probes for the
+    /// cascade — full scans, which merge through the overlay cursor, are
+    /// unaffected. An eager caller is admitted like any other: every row the
+    /// operator emits is decoded for it at emit. Historical snapshots keep probes off:
     /// the seek reads latest base state with no replay.
     fn compute_probe_overlay_state(
         &self,
@@ -1159,7 +1160,7 @@ impl CyclicBgpOperator {
         let mut ops_per_edge = Vec::with_capacity(n);
         for edge in self.plan.edges.iter() {
             let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-            match subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)? {
+            match subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::DecodesForEager)? {
                 ProbeLanePlan::Clean => ops_per_edge.push(None),
                 ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
                 ProbeLanePlan::Decline => {
