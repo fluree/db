@@ -545,6 +545,61 @@ where
     .await
 }
 
+/// A branch's reasoning-indexes document, read from its main file: `None` when
+/// the record is missing or deleted, an empty document when none was written.
+pub(crate) async fn read_reasoning_indexes<S>(
+    storage: &S,
+    main_key: &str,
+) -> Result<Option<crate::ReasoningIndexes>>
+where
+    S: StorageRead + ?Sized,
+{
+    let Some(bytes) = read_bytes(storage, main_key).await? else {
+        return Ok(None);
+    };
+    let file: NsFileV2 = deserialize_json(&bytes)?;
+    if file.is_deleted() {
+        return Ok(None);
+    }
+    Ok(Some(file.reasoning_indexes.unwrap_or_default()))
+}
+
+/// Compare-and-swap a branch's reasoning-indexes document in its main file,
+/// checked against the fence and the document's version only.
+pub(crate) async fn push_reasoning_indexes<S>(
+    storage: &S,
+    main_key: &str,
+    ledger_id: &str,
+    fence: Option<Fence>,
+    expected_v: i64,
+    new: &crate::ReasoningIndexes,
+) -> Result<crate::ReasoningIndexesCasResult>
+where
+    S: StorageCas + ?Sized,
+{
+    let new = new.clone();
+    let outcome = storage
+        .compare_and_swap(main_key, move |bytes| {
+            let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
+            if !main_admits(existing.as_ref(), fence) {
+                return Ok(CasAction::Abort(Err(FenceRefused)));
+            }
+            let mut file = existing.expect("admitted, so present");
+            let current = file.reasoning_indexes.clone().unwrap_or_default();
+            if let Some(conflict) = crate::reasoning_indexes_conflict(&current, expected_v, &new) {
+                return Ok(CasAction::Abort(Ok(conflict)));
+            }
+            file.reasoning_indexes = Some(new.clone());
+            Ok(CasAction::Write(serialize_json(&file)?))
+        })
+        .await?;
+    match outcome {
+        CasOutcome::Written => Ok(crate::ReasoningIndexesCasResult::Updated),
+        CasOutcome::Aborted(Ok(result)) => Ok(result),
+        CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+    }
+}
+
 /// Whether a write presenting `fence` may change the main file `current`,
 /// its bytes as read: a live record [`admits`](NsFileV2::admits) it, and a
 /// missing or deleted one takes nothing, since publication never creates a

@@ -2059,6 +2059,10 @@ fn content_path_from_prefixes(
             format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/mapping/{hash_hex}.ttl")
         }
         ContentKind::RetentionState => format!("{prefix}/retention/{hash_hex}.frs"),
+        // Outside `index/`: the sweep lists a head's `index/` and reclaims what
+        // its roots do not reach, and no root reaches these.
+        ContentKind::ReasoningManifest => format!("{prefix}/manifests/{hash_hex}.frm1"),
+        ContentKind::DerivedFacts => format!("{prefix}/derived/{hash_hex}.fds1"),
         // Forward-compatibility: unknown kinds go to a generic blob directory
         #[allow(unreachable_patterns)]
         _ => format!("{prefix}/blob/{hash_hex}.bin"),

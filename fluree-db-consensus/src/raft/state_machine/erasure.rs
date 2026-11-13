@@ -306,7 +306,8 @@ pub(super) fn adds_holders(command: &Command) -> bool {
         | Command::Erasure(_)
         | Command::Collect(_)
         | Command::ClearFrozenIndex { .. }
-        | Command::RewriteGraphSourceIndex { .. } => false,
+        | Command::RewriteGraphSourceIndex { .. }
+        | Command::PushReasoningIndexes { .. } => false,
         Command::Fenced { command, .. }
         | Command::AtGeneration { command, .. }
         | Command::Seen { command, .. } => adds_holders(command),
@@ -1190,7 +1191,10 @@ mod tests {
         state.membership_index = 7;
         let bytes = state.to_snapshot().unwrap();
         assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
-        assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());
+        assert!(
+            NameServiceState::from_snapshot(NameServiceState::cut_within_erasure_state(&bytes))
+                .is_err()
+        );
     }
 
     /// Log entries are positional: these variants can only be appended.
@@ -1259,6 +1263,9 @@ mod tests {
 
         // A damaged one is refused, not restored as the older layout
         // without its erasure state.
-        assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());
+        assert!(
+            NameServiceState::from_snapshot(NameServiceState::cut_within_erasure_state(&bytes))
+                .is_err()
+        );
     }
 }

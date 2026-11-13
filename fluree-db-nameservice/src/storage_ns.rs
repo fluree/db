@@ -1683,6 +1683,51 @@ where
 }
 
 #[async_trait]
+impl<S> crate::ReasoningIndexesLookup for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = self.ns_key(&ledger_name, &branch);
+        crate::ns_cas::read_reasoning_indexes(&self.storage, &key).await
+    }
+}
+
+#[async_trait]
+impl<S> crate::ReasoningIndexesPublisher for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = self.ns_key(&ledger_name, &branch);
+        crate::ns_cas::push_reasoning_indexes(
+            &self.storage,
+            &key,
+            ledger_id,
+            fence,
+            expected_v,
+            new,
+        )
+        .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[async_trait]
 impl<S> ConfigLookup for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,

@@ -607,6 +607,23 @@ pub struct ReasoningTally {
     /// a rule called either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_time: Option<String>,
+    /// Set when a persisted reasoning index answered the query instead of
+    /// query-time reasoning: which index, which generation, and its basis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<Box<ReasoningIndexTally>>,
+}
+
+/// The reasoning index that served a query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningIndexTally {
+    pub index_id: String,
+    pub generation: u64,
+    /// The `t` of the commit the generation was computed from: the `t` the
+    /// whole query read at.
+    pub basis_t: i64,
+    /// That commit's content id.
+    pub basis_commit: String,
 }
 
 fn format_time_ms(duration: Duration) -> String {

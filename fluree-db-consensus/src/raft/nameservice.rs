@@ -2875,6 +2875,81 @@ impl ConfigPublisher for RaftNameService {
     }
 }
 
+fn heads_from_stored(
+    stored: Option<&crate::raft::state_machine::StoredReasoningIndexes>,
+) -> Result<fluree_db_nameservice::ReasoningIndexes> {
+    match stored {
+        Some(stored) if !stored.json.is_empty() => serde_json::from_str(&stored.json)
+            .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}"))),
+        _ => Ok(fluree_db_nameservice::ReasoningIndexes::default()),
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for RaftNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let canonical = format_ledger_id(&name, &branch);
+        let state = self.state.read().await;
+        let branch_registered = state
+            .ledgers
+            .get(&name)
+            .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+        if !branch_registered {
+            return Ok(None);
+        }
+        heads_from_stored(state.reasoning_indexes.get(&canonical)).map(Some)
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesPublisher for RaftNameService {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasoningIndexes,
+    ) -> Result<fluree_db_nameservice::ReasoningIndexesCasResult> {
+        use fluree_db_nameservice::ReasoningIndexesCasResult;
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let json = serde_json::to_string(new)
+            .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}")))?;
+        let cmd = fenced_command(
+            ledger_id,
+            SmCommand::PushReasoningIndexes {
+                ledger_id: format_ledger_id(&name, &branch),
+                expected_v,
+                new: crate::raft::state_machine::StoredReasoningIndexes { v: new.v, json },
+            },
+            fence,
+        )?;
+        let response = self.submit_lifecycle(cmd).await?;
+        check_fence_response(&response, ledger_id)?;
+        match response {
+            SmResponse::ReasoningIndexesUpdated => Ok(ReasoningIndexesCasResult::Updated),
+            SmResponse::ReasoningIndexesConflict { actual } => {
+                Ok(ReasoningIndexesCasResult::Conflict {
+                    actual: match actual {
+                        Some(stored) => Some(heads_from_stored(Some(&stored))?),
+                        None => None,
+                    },
+                })
+            }
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for PushReasoningIndexes: {other:?}"
+            ))),
+        }
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Two test surfaces here:
@@ -3468,6 +3543,7 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
+                index: None,
             }),
             sql: None,
             sql_elided: None,
@@ -3554,6 +3630,7 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
+                index: None,
             }),
             sql: None,
             sql_elided: None,
@@ -3820,6 +3897,7 @@ mod tests {
             capped_rules: vec!["ex:rule".to_string()],
             pending_rules: vec!["ex:later".to_string()],
             evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
+            index: None,
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -3912,7 +3990,9 @@ mod tests {
             capped_rules: rt_capped_rules,
             pending_rules: rt_pending_rules,
             evaluation_time: rt_evaluation_time,
+            index: rt_index,
         } = rt_reasoning.expect("reasoning Some on round-trip");
+        assert_eq!(rt_index, None);
         // Not carried by the recorded mirror: adding them would change the
         // wire form of records already in the log.
         assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());

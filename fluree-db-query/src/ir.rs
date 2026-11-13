@@ -73,7 +73,7 @@ pub use query::{
     ConstructTemplate, ListEntryVars, PostValues, Query, QueryOutput, Restriction,
     TemplateReification, UngroupedProjection,
 };
-pub use reasoning::{ReasoningConfig, ReasoningModes};
+pub use reasoning::{ReasoningConfig, ReasoningFreshness, ReasoningModes};
 pub use term_components::{
     lower_reified_link, lower_term_object, lower_term_value, Component, TermComponentsPattern,
 };

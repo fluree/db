@@ -183,12 +183,17 @@ impl Fluree {
         )?;
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
+            .await?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         // 4. Execute against merged dataset
-        let batches = self
+        let (batches, derived) = self
             .execute_dataset_internal(dataset, &vars, &executable, &tracker, &options)
             .await?;
 
@@ -201,7 +206,8 @@ impl Fluree {
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        );
+        )
+        .with_dataset_read_view(dataset, derived);
         result.advisories = advisories;
         Ok(result)
     }
@@ -297,12 +303,17 @@ impl Fluree {
         )?;
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
+            .await?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         // 4. Execute against merged dataset
-        let batches = self
+        let (batches, derived) = self
             .execute_dataset_internal_with_r2rml(
                 dataset,
                 &vars,
@@ -324,7 +335,8 @@ impl Fluree {
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        );
+        )
+        .with_dataset_read_view(dataset, derived);
         result.advisories = advisories;
         Ok(result)
     }
@@ -439,13 +451,19 @@ impl Fluree {
         // Report the error's own status, as the single-view tracked path
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
         // Execute with tracking
-        let batches = self
+        let (batches, derived) = self
             .execute_dataset_tracked(dataset, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
@@ -461,7 +479,8 @@ impl Fluree {
             dataset.result_t(),
             None,
             primary.binary_graph(),
-        );
+        )
+        .with_dataset_read_view(dataset, derived);
 
         // CONSTRUCT/DESCRIBE graph results must be formatted as JSON-LD.
         if query_result.output.construct_template().is_some()
@@ -547,12 +566,18 @@ impl Fluree {
         // Report the error's own status, as the single-view tracked path
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
-        let executable = self
+        let mut executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_dataset_from_reasoning_index(dataset, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let dataset = served.as_ref().unwrap_or(dataset);
+        let primary = dataset.primary().unwrap_or(primary);
 
-        let batches = self
+        let (batches, derived) = self
             .execute_dataset_tracked_with_r2rml(
                 dataset,
                 &vars,
@@ -574,7 +599,8 @@ impl Fluree {
             dataset.result_t(),
             None,
             primary.binary_graph(),
-        );
+        )
+        .with_dataset_read_view(dataset, derived);
 
         if query_result.output.construct_template().is_some()
             && format_config.format != crate::format::OutputFormat::JsonLd
@@ -644,6 +670,27 @@ impl Fluree {
             }
         }
 
+        // Hydration currently retains one graph's policy and read state.
+        // With multiple graphs, that cannot safely enforce each graph's
+        // derived-class policies. Refuse before serving or reasoning.
+        if dataset.any_non_root_policy()
+            && executable.reasoning.modes.has_any_enabled()
+            && executable.query.output.has_hydration()
+        {
+            let runtime = self
+                .runtime_dataset(dataset, executable.query.union_default_graph)
+                .await?;
+            if runtime.default_graphs().len() != 1 || !dataset.named.is_empty() {
+                return Err(ApiError::Query(
+                    fluree_db_query::QueryError::UnsupportedFeature(
+                        "a multi-graph crawl in a reasoning query under a view policy; \
+                         use a single-graph view, select variables, or query without reasoning"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+
         // The query was lowered against the primary's namespace table.
         let history_range = dataset.history_time_range();
         let encoded_with = dataset.primary().map(|primary| &primary.snapshot);
@@ -673,7 +720,10 @@ impl Fluree {
         executable: &ExecutableQuery,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> Result<Vec<crate::Batch>> {
+    ) -> Result<(
+        Vec<crate::Batch>,
+        Option<std::sync::Arc<fluree_db_query::reasoning::DerivedFactsOverlay>>,
+    )> {
         let noop = crate::NoOpR2rmlProvider::new();
         self.execute_dataset_internal_with_r2rml(
             dataset,
@@ -701,13 +751,17 @@ impl Fluree {
         tracker: &Tracker,
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
-    ) -> Result<Vec<crate::Batch>> {
+    ) -> Result<(
+        Vec<crate::Batch>,
+        Option<std::sync::Arc<fluree_db_query::reasoning::DerivedFactsOverlay>>,
+    )> {
         let mut sink = crate::view::stream_query::CollectSink::default();
-        self.execute_dataset_into_with_r2rml(
-            dataset, vars, executable, tracker, r2rml, options, &mut sink,
-        )
-        .await?;
-        Ok(sink.batches)
+        let derived = self
+            .execute_dataset_into_with_r2rml(
+                dataset, vars, executable, tracker, r2rml, options, &mut sink,
+            )
+            .await?;
+        Ok((sink.batches, derived))
     }
 
     /// Sink-generic core shared by the buffered
@@ -726,7 +780,7 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
         sink: &mut S,
-    ) -> Result<()> {
+    ) -> Result<Option<std::sync::Arc<fluree_db_query::reasoning::DerivedFactsOverlay>>> {
         // As in `execute_dataset_tracked_with_r2rml`: recorded before execution
         // and aggregated across every graph. This is also the streaming dataset
         // producer's path, so the NDJSON `end` record carries the same state.
@@ -887,9 +941,11 @@ impl Fluree {
         }
 
         let exec_db = db.with_t(to_t);
+        let derived = prepared.derived_overlay.clone();
         fluree_db_query::execute::execute_prepared_streaming(exec_db, vars, prepared, config, sink)
             .await
-            .map_err(query_error_to_api_error)
+            .map_err(query_error_to_api_error)?;
+        Ok(derived)
     }
 
     /// Execute against dataset with tracking.
@@ -902,7 +958,13 @@ impl Fluree {
         executable: &ExecutableQuery,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+    ) -> std::result::Result<
+        (
+            Vec<crate::Batch>,
+            Option<std::sync::Arc<fluree_db_query::reasoning::DerivedFactsOverlay>>,
+        ),
+        fluree_db_query::QueryError,
+    > {
         let noop = crate::NoOpR2rmlProvider::new();
         self.execute_dataset_tracked_with_r2rml(
             dataset,
@@ -926,7 +988,13 @@ impl Fluree {
         tracker: &Tracker,
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
-    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+    ) -> std::result::Result<
+        (
+            Vec<crate::Batch>,
+            Option<std::sync::Arc<fluree_db_query::reasoning::DerivedFactsOverlay>>,
+        ),
+        fluree_db_query::QueryError,
+    > {
         // See `execute_view_tracked_with_r2rml`: recorded before execution, and
         // aggregated across every graph the dataset can read.
         tracker.record_policy_enforcement(dataset.policy_enforcement());
@@ -1077,7 +1145,9 @@ impl Fluree {
         }
 
         let exec_db = db.with_t(to_t);
-        execute_prepared(exec_db, vars, prepared, config).await
+        let derived = prepared.derived_overlay.clone();
+        let batches = execute_prepared(exec_db, vars, prepared, config).await?;
+        Ok((batches, derived))
     }
 }
 

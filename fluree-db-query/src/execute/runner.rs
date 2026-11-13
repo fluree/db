@@ -380,6 +380,24 @@ pub async fn prepare_execution_with_config(
                 config.request,
             )
             .await?;
+            // `exact` asks for the complete answer: a capped closure is an
+            // error, not a result.
+            if reasoning.freshness == crate::ir::ReasoningFreshness::Exact {
+                if let Some(reason) = &derived_outcome.failed {
+                    return Err(crate::error::QueryError::Internal(format!(
+                        "{reason}, and the query asked for an exact answer \
+                         (reasoningFreshness \"exact\")"
+                    )));
+                }
+                if let Some(diag) = derived_outcome.diagnostics.as_ref().filter(|d| d.capped) {
+                    return Err(crate::error::QueryError::ResourceLimit(format!(
+                        "reasoning was capped ({}) and the query asked for an exact answer \
+                         (reasoningFreshness \"exact\"); raise the reasoning budget, or \
+                         register the program as a reasoning index",
+                        diag.capped_reason.as_deref().unwrap_or("budget")
+                    )));
+                }
+            }
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome
@@ -971,6 +989,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             capped_rules: diag.capped_rules.clone(),
             pending_rules: diag.pending_rules.clone(),
             evaluation_time: diag.evaluation_time.clone(),
+            index: None,
         });
     }
 
@@ -1071,6 +1090,13 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx = ctx.with_cancellation(cancellation);
     }
     if let Some(enforcer) = config.policy_enforcer {
+        // Class statistics describe asserted data; with derived facts a
+        // class policy must be selected by the subject's reasoned classes.
+        let enforcer = if reasoning_overlay.is_some() {
+            Arc::new(enforcer.for_reasoned_view())
+        } else {
+            enforcer
+        };
         ctx = ctx.with_policy_enforcer(enforcer);
     }
     ctx.policy_source = config.policy_source;

@@ -93,6 +93,15 @@ Administrative operations:
 - Backup and restore
 - Maintenance operations
 
+### [Running the erasure prover](erasure-prover.md)
+
+Operate the prover that [permanent erasure](../transactions/permanent-erasure.md) needs:
+- Installing it (`fluree prover install`, the `-erasure` Docker image, mirrors)
+- Checking that a server will take erasure requests
+- Memory and CPU sizing, and keeping proofs from slowing transactions
+- A dedicated proving node on a Raft cluster
+- Upgrades and troubleshooting
+
 ### [Query peers and replication](query-peers.md)
 
 Run the Fluree server as a read-only query peer:

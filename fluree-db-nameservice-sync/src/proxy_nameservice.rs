@@ -304,6 +304,18 @@ impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for ProxyNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        _ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+        Err(NameServiceError::storage(
+            "get_reasoning_indexes not supported in proxy mode".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
 impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let url = self.ns_url(ledger_id);

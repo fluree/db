@@ -70,6 +70,12 @@ pub const CODEC_FLUREE_ANNOTATION_REVERSE_LEAF: u64 = FLUREE_CODEC_BASE + 20;
 /// Retention schedule blob (FRS1): a branch's derived expiry schedule.
 pub const CODEC_FLUREE_RETENTION_STATE: u64 = FLUREE_CODEC_BASE + 21;
 
+/// Multicodec for reasoning-index generation manifests (FRM1).
+pub const CODEC_FLUREE_REASONED_MANIFEST: u64 = FLUREE_CODEC_BASE + 22;
+
+/// Multicodec for a reasoning index's derived-only fact sets (FDS1).
+pub const CODEC_FLUREE_DERIVED_FACTS: u64 = FLUREE_CODEC_BASE + 23;
+
 // Legacy codec constants (pre-V3 format). Kept for backward-compatible CID
 // resolution — existing ledgers may have index artifacts stored under these
 // codecs in the nameservice.
@@ -168,6 +174,10 @@ pub enum ContentKind {
     /// Retention schedule blob (FRS1): the expiry schedule a branch's
     /// retention worker derived from its commits, with its watermark.
     RetentionState,
+    /// Reasoning-index generation manifest (FRM1).
+    ReasoningManifest,
+    /// A reasoning index's derived-only fact set (FDS1).
+    DerivedFacts,
 }
 
 // ============================================================================
@@ -201,7 +211,9 @@ impl ContentKind {
             | ContentKind::AnnotationForwardBranch
             | ContentKind::AnnotationForwardLeaf
             | ContentKind::AnnotationReverseBranch
-            | ContentKind::AnnotationReverseLeaf => true,
+            | ContentKind::AnnotationReverseLeaf
+            | ContentKind::ReasoningManifest
+            | ContentKind::DerivedFacts => true,
         }
     }
 
@@ -228,6 +240,8 @@ impl ContentKind {
             ContentKind::AnnotationReverseBranch => CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
             ContentKind::AnnotationReverseLeaf => CODEC_FLUREE_ANNOTATION_REVERSE_LEAF,
             ContentKind::RetentionState => CODEC_FLUREE_RETENTION_STATE,
+            ContentKind::ReasoningManifest => CODEC_FLUREE_REASONED_MANIFEST,
+            ContentKind::DerivedFacts => CODEC_FLUREE_DERIVED_FACTS,
         }
     }
 
@@ -258,6 +272,8 @@ impl ContentKind {
             CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH => Some(ContentKind::AnnotationReverseBranch),
             CODEC_FLUREE_ANNOTATION_REVERSE_LEAF => Some(ContentKind::AnnotationReverseLeaf),
             CODEC_FLUREE_RETENTION_STATE => Some(ContentKind::RetentionState),
+            CODEC_FLUREE_REASONED_MANIFEST => Some(ContentKind::ReasoningManifest),
+            CODEC_FLUREE_DERIVED_FACTS => Some(ContentKind::DerivedFacts),
             // Legacy codecs (pre-V3 format) — map to current content kinds so
             // CIDs stored by older builds can still be resolved.
             CODEC_LEGACY_INDEX_ROOT => Some(ContentKind::IndexRoot),
@@ -288,6 +304,8 @@ impl ContentKind {
             ContentKind::AnnotationReverseBranch => "annotation-reverse-branch",
             ContentKind::AnnotationReverseLeaf => "annotation-reverse-leaf",
             ContentKind::RetentionState => "retention-state",
+            ContentKind::ReasoningManifest => "reasoning-manifest",
+            ContentKind::DerivedFacts => "derived-facts",
         }
     }
 }

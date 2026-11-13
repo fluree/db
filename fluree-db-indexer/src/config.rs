@@ -368,6 +368,13 @@ pub struct IndexerConfig {
     /// disk. `None` (default) = off. Not build output, so excluded from config
     /// identity.
     pub warm_cache_source: Option<Arc<dyn WarmCacheSource>>,
+
+    /// A reasoning index's derived facts, as a commit-codec blob whose `t` is
+    /// the window's last commit. A build resolves them after the window's
+    /// commits, as facts rather than a commit (no txn-meta), so the root it
+    /// writes holds the asserted state at that `t` merged with them. Only the
+    /// reasoning-index worker sets it.
+    pub derived_facts: Option<Arc<Vec<u8>>>,
 }
 
 /// Default run-sort budget: 256 MB.
@@ -433,6 +440,7 @@ impl Default for IndexerConfig {
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 }
@@ -472,6 +480,7 @@ impl IndexerConfig {
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 
@@ -504,6 +513,7 @@ impl IndexerConfig {
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 
@@ -536,6 +546,7 @@ impl IndexerConfig {
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
+            derived_facts: None,
         }
     }
 

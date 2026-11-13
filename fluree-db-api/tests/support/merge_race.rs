@@ -135,6 +135,35 @@ impl ConfigLookup for PausingNameService {
 }
 
 #[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for PausingNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+        self.inner.get_reasoning_indexes(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesPublisher for PausingNameService {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasoningIndexes,
+    ) -> Result<fluree_db_nameservice::ReasoningIndexesCasResult> {
+        self.inner
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.inner.max_reasoning_indexes_bytes()
+    }
+}
+
+#[async_trait]
 impl NameServiceLookup for PausingNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let record = self.inner.lookup(ledger_id).await?;

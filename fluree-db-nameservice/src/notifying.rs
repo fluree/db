@@ -463,6 +463,41 @@ where
     }
 }
 
+#[async_trait]
+impl<N> crate::ReasoningIndexesLookup for NotifyingNameService<N>
+where
+    N: crate::ReasoningIndexesLookup,
+{
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
+        self.inner.get_reasoning_indexes(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<N> crate::ReasoningIndexesPublisher for NotifyingNameService<N>
+where
+    N: crate::ReasoningIndexesPublisher,
+{
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
+        self.inner
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.inner.max_reasoning_indexes_bytes()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ConfigPublisher — notify after a successful CAS
 // ---------------------------------------------------------------------------

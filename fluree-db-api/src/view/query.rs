@@ -472,7 +472,7 @@ impl Fluree {
         // execution completes, so it cannot be re-run transparently and is
         // excluded on residency-mode peers.
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-        let (batches, plan_ms, exec_ms) = {
+        let (batches, plan_ms, exec_ms, read_view) = {
             let _ = &tracker;
             let residency_cs = residency_content_store(db);
             let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
@@ -514,7 +514,7 @@ impl Fluree {
             }
         };
         #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
-        let (batches, plan_ms, exec_ms) = self
+        let (batches, plan_ms, exec_ms, read_view) = self
             .plan_and_execute_round(db, &vars, &parsed, &tracker, &options)
             .await?;
 
@@ -530,10 +530,11 @@ impl Fluree {
             vars,
             parsed,
             batches,
-            Some(db.t),
-            Some(db.overlay.clone()),
-            db.binary_graph(),
-        ))
+            Some(read_view.t),
+            None,
+            read_view.binary_graph(),
+        )
+        .reading(read_view))
     }
 
     /// Execute a Cypher (openCypher 9 subset) query against a GraphDb.
@@ -734,14 +735,23 @@ impl Fluree {
         tracker: &Tracker,
     ) -> Result<QueryResult> {
         let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(tracker))
+            .await?;
+        let db = served.as_ref().unwrap_or(db);
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
-        let batches = self
-            .execute_view_internal(db, &vars, &executable, tracker, options)
+        let noop = crate::NoOpR2rmlProvider::new();
+        let r2rml = crate::R2rmlProviders {
+            provider: &noop,
+            table_provider: &noop,
+        };
+        let (batches, reasoned_overlay) = self
+            .execute_view_read(db, &vars, &executable, tracker, r2rml, options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -752,14 +762,16 @@ impl Fluree {
             "cypher query phases"
         );
 
-        Ok(build_query_result(
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        ))
+        );
+        result = result.with_read_view(db, reasoned_overlay);
+        Ok(result)
     }
 
     /// Execute a query against a GraphDb with explicit R2RML providers.
@@ -865,13 +877,17 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
         // 2. Build executable with optional reasoning override
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(tracker))
+            .await?;
+        let db = served.as_ref().unwrap_or(db);
 
         // 4. Execute
-        let batches = self
-            .execute_view_internal_with_r2rml(
+        let (batches, read) = self
+            .execute_view_read(
                 db,
                 &vars,
                 &executable,
@@ -893,6 +909,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
+        result = result.with_read_view(db, read);
         mark_graph_source_result(&mut result, db);
         Ok(result)
     }
@@ -1103,13 +1120,18 @@ impl Fluree {
         // ledger's config defaults, so a fault in the config graph surfaces
         // here; a blanket 400 would tell the caller their request was bad
         // when nothing about the request is.
-        let executable =
+        let mut executable =
             Box::pin(self.build_executable_for_view(db, &parsed, options.server_identity.as_ref()))
                 .await
                 .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let db = served.as_ref().unwrap_or(db);
 
         // Execute with tracking
-        let batches =
+        let (batches, read) =
             Box::pin(self.execute_view_tracked(db, &vars, &executable, &tracker, &options))
                 .await
                 .map_err(|e| {
@@ -1125,7 +1147,8 @@ impl Fluree {
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        );
+        )
+        .with_read_view(db, read);
 
         // CONSTRUCT/DESCRIBE graph results must be formatted as JSON-LD.
         if query_result.output.construct_template().is_some()
@@ -1252,12 +1275,17 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(&tracker))
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let db = served.as_ref().unwrap_or(db);
 
-        let batches = self
+        let (batches, read) = self
             .execute_view_tracked_with_r2rml(db, &vars, &executable, &tracker, r2rml, &options)
             .await
             .map_err(|e| {
@@ -1273,6 +1301,7 @@ impl Fluree {
             Some(db.overlay.clone()),
             db.binary_graph(),
         );
+        query_result = query_result.with_read_view(db, read);
         mark_graph_source_result(&mut query_result, db);
 
         if query_result.output.construct_template().is_some()
@@ -1523,7 +1552,7 @@ impl Fluree {
     /// schema bundle is attached to `options.schema_bundle` so the runner
     /// can layer it as a `SchemaBundleOverlay` at prep time.
     /// Plan and execute one round against a given fuel tracker, returning the
-    /// batches plus the plan/exec timings.
+    /// batches, the plan/exec timings and the state the round read.
     ///
     /// Both cfg arms of the query entry path call this, so they differ only
     /// in the retry wrapper around it and cannot drift apart. That matters
@@ -1542,22 +1571,119 @@ impl Fluree {
         parsed: &fluree_db_query::ir::Query,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> Result<(Vec<crate::Batch>, f64, f64)> {
+    ) -> Result<(Vec<crate::Batch>, f64, f64, super::ReadView)> {
         let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self
+        let mut executable = self
             .build_executable_for_view(db, parsed, options.server_identity.as_ref())
+            .await?;
+        let served = self
+            .serve_from_reasoning_index(db, &mut executable, Some(tracker))
             .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
-        let batches = self
-            .execute_view_internal(db, vars, &executable, tracker, options)
+        let db = served.as_ref().unwrap_or(db);
+        let noop = crate::NoOpR2rmlProvider::new();
+        let (batches, read) = self
+            .execute_view_read(
+                db,
+                vars,
+                &executable,
+                tracker,
+                crate::R2rmlProviders {
+                    provider: &noop,
+                    table_provider: &noop,
+                },
+                options,
+            )
             .await?;
+        let read_view = match read {
+            Some(overlay) => super::ReadView::of(&db.reasoned(overlay)),
+            None => super::ReadView::of(db),
+        };
         Ok((
             batches,
             plan_ms,
             exec_start.elapsed().as_secs_f64() * 1000.0,
+            read_view,
         ))
+    }
+
+    /// [`Self::serve_from_reasoning_index`] for a dataset: served only when
+    /// every member is a graph of the primary view's ledger at its `t`, so
+    /// the head, which holds every graph, can stand in for all of them.
+    pub(crate) async fn serve_dataset_from_reasoning_index(
+        &self,
+        dataset: &crate::view::DataSetDb,
+        executable: &mut ExecutableQuery,
+        tracker: Option<&Tracker>,
+    ) -> Result<Option<crate::view::DataSetDb>> {
+        let Some(primary) = dataset.primary() else {
+            return Ok(None);
+        };
+        let within_ledger = dataset
+            .default
+            .iter()
+            .chain(dataset.named.values())
+            .all(|v| {
+                v.ledger_id == primary.ledger_id
+                    && v.t == primary.t
+                    && v.commit_id == primary.commit_id
+                    && v.instance_bits == primary.instance_bits
+            });
+        if dataset.is_history_mode() || !within_ledger {
+            if executable.reasoning.modes.freshness
+                == fluree_db_query::ir::ReasoningFreshness::Strict
+                && crate::reasoning_index::program::materializes(&executable.reasoning)
+            {
+                return Err(ApiError::ReasoningIndexNotReady {
+                    ledger_id: primary.ledger_id.to_string(),
+                    t: primary.t,
+                });
+            }
+            return Ok(None);
+        }
+        let Some(served) = self
+            .reasoning_index_for(
+                primary,
+                &executable.reasoning,
+                // A root primary says nothing about the other members.
+                dataset.any_non_root_policy(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let state = &served.generation.state;
+        let mut swapped = dataset.clone();
+        for view in swapped.default.iter_mut().chain(swapped.named.values_mut()) {
+            *view = crate::reasoning_index::serve::generation_view(view, state);
+        }
+        executable.reasoning =
+            crate::reasoning_index::program::served_reasoning(&executable.reasoning);
+        record_served(tracker, served.tally);
+        Ok(Some(swapped))
+    }
+
+    /// Swap in a reasoning index when one can answer `executable` against
+    /// `db`: the generation's view to run it against, with reasoning turned off
+    /// and the index reported in the tracker's reasoning slot.
+    pub(crate) async fn serve_from_reasoning_index(
+        &self,
+        db: &GraphDb,
+        executable: &mut ExecutableQuery,
+        tracker: Option<&Tracker>,
+    ) -> Result<Option<GraphDb>> {
+        let Some(served) = self
+            .reasoning_index_for(db, &executable.reasoning, !db.is_root())
+            .await?
+        else {
+            return Ok(None);
+        };
+        executable.reasoning =
+            crate::reasoning_index::program::served_reasoning(&executable.reasoning);
+        record_served(tracker, served.tally);
+        Ok(Some(served.view))
     }
 
     /// Build an executable for a single view.
@@ -1584,6 +1710,22 @@ impl Fluree {
             self.reads_union_default_graph(&db, parsed.union_default_graph)
                 .await?,
         );
+
+        // A union is a multi-graph dataset even when the caller supplied one
+        // view. Hydration cannot yet retain each member's reasoned read state.
+        if !db.is_root()
+            && executable.query.union_default_graph == Some(true)
+            && executable.reasoning.modes.has_any_enabled()
+            && executable.query.output.has_hydration()
+        {
+            return Err(ApiError::Query(
+                fluree_db_query::QueryError::UnsupportedFeature(
+                    "a multi-graph crawl in a reasoning query under a view policy; \
+                     use a single-graph view, select variables, or query without reasoning"
+                        .to_string(),
+                ),
+            ));
+        }
 
         self.refuse_suppressed_view_history(&db, parsed, &executable, None, &db.snapshot)
             .await?;
@@ -1691,15 +1833,17 @@ impl Fluree {
                 // wrapper modes come from config mode strings and never carry
                 // a budget, so anything dropped here is silently lost and the
                 // query's own ceiling never applies.
-                let (max_facts, max_seconds, max_memory_mb) = (
+                let (max_facts, max_seconds, max_memory_mb, freshness) = (
                     executable.reasoning.modes.max_facts,
                     executable.reasoning.modes.max_seconds,
                     executable.reasoning.modes.max_memory_mb,
+                    executable.reasoning.modes.freshness,
                 );
                 executable.reasoning.modes = effective.clone();
                 executable.reasoning.modes.max_facts = max_facts;
                 executable.reasoning.modes.max_seconds = max_seconds;
                 executable.reasoning.modes.max_memory_mb = max_memory_mb;
+                executable.reasoning.modes.freshness = freshness;
             }
         }
 
@@ -2021,6 +2165,26 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
+        self.execute_view_read(db, vars, executable, tracker, r2rml, options)
+            .await
+            .map(|(batches, _)| batches)
+    }
+
+    /// [`Self::execute_view_internal_with_r2rml`], also returning the overlay
+    /// the query read when reasoning derived facts: the view's own with the
+    /// derived facts merged over it.
+    async fn execute_view_read(
+        &self,
+        db: &GraphDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
+    ) -> Result<(
+        Vec<crate::Batch>,
+        Option<std::sync::Arc<dyn fluree_db_core::OverlayProvider>>,
+    )> {
         let db_ref = db.as_graph_db_ref();
         let union = super::union_default_dataset(db, executable);
         // Single-graph view: no dataset-level history detection — current state.
@@ -2058,9 +2222,16 @@ impl Fluree {
         );
         config.dataset = union.as_ref();
 
-        execute_prepared(db_ref, vars, prepared, config)
+        let read = prepared.derived_overlay.clone().map(|derived| {
+            std::sync::Arc::new(fluree_db_query::ReasoningOverlay::shared(
+                std::sync::Arc::clone(&db.overlay),
+                derived,
+            )) as std::sync::Arc<dyn fluree_db_core::OverlayProvider>
+        });
+        let batches = execute_prepared(db_ref, vars, prepared, config)
             .await
-            .map_err(query_error_to_api_error)
+            .map_err(query_error_to_api_error)?;
+        Ok((batches, read))
     }
 
     /// Execute against a GraphDb with policy awareness (tracked variant).
@@ -2073,7 +2244,13 @@ impl Fluree {
         executable: &ExecutableQuery,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+    ) -> std::result::Result<
+        (
+            Vec<crate::Batch>,
+            Option<std::sync::Arc<dyn fluree_db_core::OverlayProvider>>,
+        ),
+        fluree_db_query::QueryError,
+    > {
         let noop = crate::NoOpR2rmlProvider::new();
         self.execute_view_tracked_with_r2rml(
             db,
@@ -2097,7 +2274,13 @@ impl Fluree {
         tracker: &Tracker,
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
-    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+    ) -> std::result::Result<
+        (
+            Vec<crate::Batch>,
+            Option<std::sync::Arc<dyn fluree_db_core::OverlayProvider>>,
+        ),
+        fluree_db_query::QueryError,
+    > {
         // Record whether policy governs this request, before executing: the
         // state comes from the prepared view, so it is reported even when
         // execution returns no rows or fails part-way.
@@ -2136,7 +2319,14 @@ impl Fluree {
         );
         config.dataset = union.as_ref();
 
-        execute_prepared(db_ref, vars, prepared, config).await
+        let read = prepared.derived_overlay.clone().map(|derived| {
+            std::sync::Arc::new(fluree_db_query::ReasoningOverlay::shared(
+                std::sync::Arc::clone(&db.overlay),
+                derived,
+            )) as std::sync::Arc<dyn fluree_db_core::OverlayProvider>
+        });
+        let batches = execute_prepared(db_ref, vars, prepared, config).await?;
+        Ok((batches, read))
     }
 }
 
@@ -2858,5 +3048,22 @@ mod graph_source_guard_tests {
             .expect("a native ledger must still evaluate `edge+`");
         let rows: usize = result.batches.iter().map(fluree_db_query::Batch::len).sum();
         assert_eq!(rows, 2, "`edge+` from n1 reaches n2 and n3");
+    }
+}
+
+/// Report in the tracker's reasoning slot that a reasoning index answered.
+fn record_served(tracker: Option<&Tracker>, tally: fluree_db_core::ReasoningIndexTally) {
+    if let Some(tracker) = tracker {
+        tracker.record_reasoning(fluree_db_core::ReasoningTally {
+            capped: false,
+            capped_reason: None,
+            derived_facts: 0,
+            iterations: 0,
+            duration_ms: 0,
+            capped_rules: Vec::new(),
+            pending_rules: Vec::new(),
+            evaluation_time: None,
+            index: Some(Box::new(tally)),
+        });
     }
 }

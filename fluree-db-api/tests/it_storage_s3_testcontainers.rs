@@ -917,6 +917,7 @@ async fn dynamodb_lists_bindings_and_dropped_ledgers_in_batches() {
             .unwrap();
         let entry = DroppedLedger {
             extra: Default::default(),
+            reasoning_indexes: Default::default(),
             instance: instance.clone(),
             state: DroppedState::Dropped,
             dropped_at: 0,
@@ -958,6 +959,7 @@ async fn dynamodb_dropped_entry_at_the_cap_is_written() {
     let instance = fluree_db_core::InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
     let mut entry = DroppedLedger {
         extra: Default::default(),
+        reasoning_indexes: Default::default(),
         instance: instance.clone(),
         state: DroppedState::Dropped,
         dropped_at: 0,
@@ -1119,4 +1121,336 @@ async fn dynamodb_refuses_a_newer_format() {
     assert!(fluree_db_nameservice::lifecycle::create_ledger(&ns, &id)
         .await
         .is_err());
+}
+
+/// A fresh Fluree over `bucket` and `table`, sharing nothing in memory with
+/// another built the same way.
+async fn s3_dynamodb_fluree(
+    sdk_config: &aws_config::SdkConfig,
+    bucket: &str,
+    table: &str,
+) -> Fluree {
+    let storage = S3Storage::new(
+        sdk_config,
+        S3Config {
+            bucket: bucket.to_string(),
+            prefix: Some("reasoning".to_string()),
+            endpoint: None,
+            force_path_style: None,
+            timeout_ms: Some(30_000),
+            max_retries: None,
+            retry_base_delay_ms: None,
+            retry_max_delay_ms: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .expect("S3Storage::new");
+    let nameservice = DynamoDbNameService::new(
+        sdk_config,
+        DynamoDbConfig {
+            table_name: table.to_string(),
+            region: None,
+            endpoint: None,
+            timeout_ms: Some(30_000),
+        },
+    )
+    .await
+    .expect("DynamoDbNameService::new");
+    build_fluree(storage, nameservice)
+}
+
+/// People an owl2rl query finds, and the generation that served it.
+async fn reasoned_people(fluree: &Fluree, id: &str) -> (Vec<serde_json::Value>, Option<u64>) {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?p",
+        "where": {"@id": "?p", "@type": "ex:Person"},
+        "reasoning": "owl2rl"
+    });
+    let resp = fluree
+        .graph(id)
+        .query()
+        .jsonld(&query)
+        .track_all()
+        .execute_tracked()
+        .await
+        .expect("query");
+    (
+        support::normalize_rows(&resp.result),
+        resp.reasoning.and_then(|r| r.index).map(|h| h.generation),
+    )
+}
+
+async fn head_manifest(
+    fluree: &Fluree,
+    id: &str,
+    index: &fluree_db_core::reasoning_index::ReasoningIndexId,
+) -> fluree_db_core::ContentId {
+    fluree.reasoning_indexes(id).await.unwrap().indexes[index]
+        .head
+        .clone()
+        .expect("a head")
+        .manifest
+}
+
+/// A reasoning index on S3 and DynamoDB: generations land in the bucket and
+/// heads on the branch's status item; a fresh process serves them; retention
+/// releases superseded generations; and cleanup deletes a retired index's
+/// files and entry.
+// Multi-threaded for the reason the collector test above gives: an insert
+// after a build probes the persisted dictionaries synchronously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reasoning_index_lifecycle_on_s3_and_dynamodb() {
+    use fluree_db_api::reasoning_index::{GenerationRetention, RefreshOutcome};
+
+    let (_lock, _container, endpoint) = start_localstack("s3,dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let (bucket, table) = ("fluree-reasoning", "fluree-reasoning-ns");
+    ensure_bucket(&sdk_config, bucket).await;
+    ensure_dynamodb_table(&sdk_config, table).await;
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    });
+    let student =
+        |name: &str| json!({"@context": ctx, "@id": format!("ex:{name}"), "@type": "ex:Student"});
+    let published = |outcome: RefreshOutcome| match outcome {
+        RefreshOutcome::Published { generation, .. } => generation,
+        other => panic!("expected a published generation, got {other:?}"),
+    };
+
+    let fluree = s3_dynamodb_fluree(&sdk_config, bucket, table).await;
+    let id = "reasoning-s3:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                    {"@id": "ex:alice", "@type": "ex:Student"},
+                    {"@id": "ex:bob", "@type": "ex:Person"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .expect("register");
+    assert_eq!(
+        published(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        1
+    );
+    assert_eq!(
+        reasoned_people(&fluree, id).await,
+        (vec![json!("ex:alice"), json!("ex:bob")], Some(1))
+    );
+    let ledger = fluree
+        .insert(ledger, &student("carol"))
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        published(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        2
+    );
+    drop((fluree, ledger));
+
+    let three = vec![json!("ex:alice"), json!("ex:bob"), json!("ex:carol")];
+    let fluree = s3_dynamodb_fluree(&sdk_config, bucket, table).await;
+    assert_eq!(reasoned_people(&fluree, id).await, (three.clone(), Some(2)));
+
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree
+        .backend()
+        .content_store(&record.storage_namespace().reasoning_index(index.as_str()));
+    let second = head_manifest(&fluree, id, &index).await;
+    fluree.set_reasoning_index_retention(GenerationRetention {
+        min_age_ms: 0,
+        max_generations_in_guard: 8,
+    });
+    let ledger = fluree.ledger(id).await.unwrap();
+    let _ledger = fluree
+        .insert(ledger, &student("dave"))
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        published(fluree.refresh_reasoning_index(id, &index).await.unwrap()),
+        3
+    );
+    assert!(
+        !store.has(&second).await.unwrap(),
+        "the superseded generation is released"
+    );
+    assert!(store
+        .has(&head_manifest(&fluree, id, &index).await)
+        .await
+        .unwrap());
+    let (people, served) = reasoned_people(&fluree, id).await;
+    assert_eq!((people.len(), served), (4, Some(3)));
+
+    let index_keys = || async {
+        list_object_keys(&sdk_config, bucket)
+            .await
+            .into_iter()
+            .filter(|k| k.contains(&format!("@reasoning/{index}")))
+            .count()
+    };
+    assert!(index_keys().await > 0);
+    fluree.retire_reasoning_index(id, &index).await.unwrap();
+    assert_eq!(
+        fluree.clean_retired_reasoning_indexes(id).await.unwrap(),
+        vec![index.clone()]
+    );
+    assert_eq!(
+        index_keys().await,
+        0,
+        "the retired index's files are deleted"
+    );
+    assert!(fluree
+        .reasoning_indexes(id)
+        .await
+        .unwrap()
+        .indexes
+        .is_empty());
+    let (people, served) = reasoned_people(&fluree, id).await;
+    assert_eq!((people.len(), served), (4, None));
+}
+
+/// DynamoDB holds a branch's reasoning-indexes document on its status item,
+/// so the document has a size limit. A registration is refused unless the
+/// document fits with room for every index's head and retirement; a refused
+/// one leaves the document as it was; and a push past the limit is refused
+/// before it writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamodb_reasoning_indexes_keep_within_their_size_limit() {
+    use fluree_db_api::reasoning_index::{RefreshOutcome, ENTRY_GROWTH_BYTES};
+    use fluree_db_nameservice::{NameServiceError, ReasoningIndexesPublisher};
+
+    const LIMIT: usize = 8_000;
+    let (_lock, _container, endpoint) = start_localstack("s3,dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let (bucket, table) = ("fluree-sized", "fluree-sized-ns");
+    ensure_bucket(&sdk_config, bucket).await;
+    ensure_dynamodb_table(&sdk_config, table).await;
+    let storage = S3Storage::new(
+        &sdk_config,
+        S3Config {
+            bucket: bucket.to_string(),
+            prefix: Some("sized".to_string()),
+            endpoint: None,
+            force_path_style: None,
+            timeout_ms: Some(30_000),
+            max_retries: None,
+            retry_base_delay_ms: None,
+            retry_max_delay_ms: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .expect("S3Storage::new");
+    let ns =
+        DynamoDbNameService::from_client(aws_sdk_dynamodb::Client::new(&sdk_config), table.into())
+            .with_max_reasoning_indexes_bytes(LIMIT);
+    let fluree = build_fluree(storage, ns.clone());
+
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    });
+    let ledger = fluree.create_ledger("sized:main").await.expect("create");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+                    {"@id": "ex:alice", "@type": "ex:Student"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+    // A program `n` bytes longer for every byte of `n`.
+    let padded = |n: usize| {
+        json!({
+            "reasoning": "owl2rl",
+            "@context": {"pad": format!("http://example.org/{}", "x".repeat(n))}
+        })
+    };
+    let doc_bytes = |doc: &fluree_db_api::ReasoningIndexes| serde_json::to_vec(doc).unwrap().len();
+    for branch in ["probe", "fits", "over"] {
+        fluree
+            .create_branch("sized", branch, None, None)
+            .await
+            .expect("branch");
+    }
+
+    fluree
+        .register_reasoning_index("sized:probe", &padded(100))
+        .await
+        .expect("a small program fits");
+    let probe = doc_bytes(&fluree.reasoning_indexes("sized:probe").await.unwrap());
+    let fits = 100 + (LIMIT - ENTRY_GROWTH_BYTES - probe);
+
+    let err = fluree
+        .register_reasoning_index("sized:over", &padded(fits + 1))
+        .await
+        .expect_err("one byte over is refused");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::NameService(NameServiceError::TooLarge(_))
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.status_code(), 400);
+    let over = fluree.reasoning_indexes("sized:over").await.unwrap();
+    assert_eq!((over.v, over.indexes.len()), (0, 0), "nothing was written");
+
+    let index = fluree
+        .register_reasoning_index("sized:fits", &padded(fits))
+        .await
+        .expect("a program at the limit fits");
+    assert!(matches!(
+        fluree
+            .refresh_reasoning_index("sized:fits", &index)
+            .await
+            .unwrap(),
+        RefreshOutcome::Published { .. }
+    ));
+    fluree
+        .retire_reasoning_index("sized:fits", &index)
+        .await
+        .expect("retiring fits");
+    let grown = fluree.reasoning_indexes("sized:fits").await.unwrap();
+    assert!(doc_bytes(&grown) <= LIMIT, "{} bytes", doc_bytes(&grown));
+
+    // The store refuses a larger document itself, before it writes.
+    let mut larger = grown.clone();
+    larger.v += 1;
+    let entry = larger.indexes.values_mut().next().unwrap();
+    entry.registration.program = padded(LIMIT);
+    let fence = fluree
+        .nameservice()
+        .lookup("sized:fits")
+        .await
+        .unwrap()
+        .unwrap()
+        .fence;
+    let refused = ns
+        .push_reasoning_indexes_fenced("sized:fits", fence, grown.v, &larger)
+        .await;
+    assert!(
+        matches!(refused, Err(NameServiceError::TooLarge(_))),
+        "{refused:?}"
+    );
+    assert_eq!(fluree.reasoning_indexes("sized:fits").await.unwrap(), grown);
 }

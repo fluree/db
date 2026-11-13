@@ -115,6 +115,7 @@ xxhash-rust.workspace = true
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
+ulid = { workspace = true }
 # Fast integer formatting for TSV output (zero-alloc); doubles use the
 # canonical xsd:double writer from fluree-graph-ir
 itoa.workspace = true
@@ -696,6 +697,10 @@ name = "it_select_star_deep_crawl_stack"
 path = "tests/it_select_star_deep_crawl_stack.rs"
 
 [[example]]
+name = "reasoning_index_spike"
+required-features = ["native"]
+
+[[example]]
 name = "sql_pushdown_lane_probe"
 required-features = ["sql", "native"]
 
@@ -797,6 +802,10 @@ name = "query_hot_values_star"
 harness = false
 
 [[bench]]
+name = "query_hot_point_lookup"
+harness = false
+
+[[bench]]
 name = "query_overlay_matrix"
 harness = false
 
@@ -875,6 +884,12 @@ required-features = ["native"]
 [[test]]
 name = "it_literal_identity"
 path = "tests/it_literal_identity.rs"
+required-features = ["native"]
+
+# Standalone: batched pair-join routing and the process-global fast-path switch.
+[[test]]
+name = "it_batched_pair_join"
+path = "tests/it_batched_pair_join.rs"
 required-features = ["native"]
 
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill

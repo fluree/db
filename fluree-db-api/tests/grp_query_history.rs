@@ -17,3 +17,5 @@ mod it_query_history_sparql;
 mod it_query_time_travel;
 #[path = "it_query_time_travel_bgp.rs"]
 mod it_query_time_travel_bgp;
+#[path = "it_query_time_travel_mixed_types.rs"]
+mod it_query_time_travel_mixed_types;

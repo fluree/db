@@ -738,3 +738,108 @@ async fn owl2rl_hasvalue_class_to_property_entailment() {
         "mass1 should have inferred hasUnit kg via hasValue backward entailment, got {results:?}"
     );
 }
+
+/// Two properties each declared the other's inverse, with a restriction on one
+/// of them. Resolving the restriction's property once followed the cycle until
+/// the nesting limit failed the whole OWL 2 RL pass, losing even the unrelated
+/// subclass entailment.
+#[tokio::test]
+async fn owl2rl_restriction_on_mutually_inverse_properties() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/mutual-inverse").await;
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            {"@id": "ex:p", "owl:inverseOf": {"@id": "ex:q"}},
+            {"@id": "ex:q", "owl:inverseOf": {"@id": "ex:p"}},
+            {"@id": "ex:R", "@type": "owl:Restriction",
+             "owl:onProperty": {"@id": "ex:p"},
+             "owl:someValuesFrom": {"@id": "ex:Thing"},
+             "rdfs:subClassOf": {"@id": "ex:Hub"}},
+            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}},
+            {"@id": "ex:b", "@type": "ex:Thing"},
+            {"@id": "ex:x", "@type": "ex:Student"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+    let cases = [
+        (
+            json!({"@id": "ex:x", "@type": "?v"}),
+            vec![json!("ex:Person"), json!("ex:Student")],
+        ),
+        (
+            json!({"@id": "ex:a", "@type": "?v"}),
+            vec![json!("ex:Hub"), json!("ex:R")],
+        ),
+        (json!({"@id": "ex:b", "ex:q": "?v"}), vec![json!("ex:a")]),
+    ];
+    for (where_, expected) in cases {
+        let q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?v",
+            "where": where_,
+            "reasoning": "owl2rl"
+        });
+        let rows = normalize_rows(
+            &support::query_jsonld(&fluree, &ledger, &q)
+                .await
+                .unwrap()
+                .to_jsonld(&ledger.snapshot)
+                .unwrap(),
+        );
+        assert_eq!(rows, expected, "{where_}");
+    }
+}
+
+/// A property chain through one of two mutually inverse properties: the chain
+/// element resolves to the other's inverse, and the chain still fires.
+#[tokio::test]
+async fn owl2rl_chain_through_mutually_inverse_properties() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/edge/mutual-inverse-chain").await;
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            {"@id": "ex:p", "owl:inverseOf": {"@id": "ex:q"}},
+            {"@id": "ex:q", "owl:inverseOf": {"@id": "ex:p"}},
+            {"@id": "ex:r", "owl:propertyChainAxiom": {"@list": [{"@id": "ex:p"}, {"@id": "ex:s"}]}},
+            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:s": {"@id": "ex:c"}},
+            {"@id": "ex:x", "@type": "ex:Student"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+    let cases = [
+        (
+            json!({"@id": "ex:x", "@type": "?v"}),
+            vec![json!("ex:Person"), json!("ex:Student")],
+        ),
+        (json!({"@id": "ex:a", "ex:r": "?v"}), vec![json!("ex:c")]),
+    ];
+    for (where_, expected) in cases {
+        let q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?v",
+            "where": where_,
+            "reasoning": "owl2rl"
+        });
+        let rows = normalize_rows(
+            &support::query_jsonld(&fluree, &ledger, &q)
+                .await
+                .unwrap()
+                .to_jsonld(&ledger.snapshot)
+                .unwrap(),
+        );
+        assert_eq!(rows, expected, "{where_}");
+    }
+}

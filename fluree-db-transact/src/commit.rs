@@ -1733,6 +1733,17 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl fluree_db_nameservice::ReasoningIndexesLookup for LosePublishRaceNameService {
+        async fn get_reasoning_indexes(
+            &self,
+            ledger_id: &str,
+        ) -> fluree_db_nameservice::Result<Option<fluree_db_nameservice::ReasoningIndexes>>
+        {
+            self.inner.get_reasoning_indexes(ledger_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl RefPublisher for LosePublishRaceNameService {
         async fn compare_and_set_ref_fenced(
             &self,

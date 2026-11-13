@@ -486,6 +486,15 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_BM25_AUTO_SYNC", default_value_t = server_defaults::DEFAULT_BM25_AUTO_SYNC)]
     pub bm25_auto_sync: bool,
 
+    /// Maintain registered reasoning indexes automatically. Without this,
+    /// registrations advance only through the explicit refresh endpoint.
+    #[arg(
+        long,
+        env = "FLUREE_REASONING_INDEX_AUTO_REFRESH",
+        default_value_t = false
+    )]
+    pub reasoning_index_auto_refresh: bool,
+
     /// Novelty size (bytes) that triggers background reindexing (soft threshold)
     #[arg(long, env = "FLUREE_REINDEX_MIN_BYTES", default_value_t = server_defaults::DEFAULT_REINDEX_MIN_BYTES)]
     pub reindex_min_bytes: usize,
@@ -1032,6 +1041,7 @@ impl Default for ServerConfig {
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
             bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,
+            reasoning_index_auto_refresh: false,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
             gc_max_old_indexes: None,
@@ -2000,5 +2010,29 @@ mod mcp_auth_tests {
             );
             assert!(guarded.validate(false, &no_events).is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_worker_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn reasoning_maintenance_is_opt_in() {
+        assert!(!ServerConfig::default().reasoning_index_auto_refresh);
+        let config =
+            ServerConfig::try_parse_from(["fluree-server", "--reasoning-index-auto-refresh"])
+                .unwrap();
+        assert!(config.reasoning_index_auto_refresh);
+        let command = ServerConfig::command();
+        let flag = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "reasoning_index_auto_refresh")
+            .unwrap();
+        assert_eq!(
+            flag.get_env().unwrap(),
+            "FLUREE_REASONING_INDEX_AUTO_REFRESH"
+        );
     }
 }

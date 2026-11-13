@@ -20,7 +20,7 @@ use crate::same_as::SameAsTracker;
 use crate::types::{ChainElement, PropertyExpression};
 
 use super::delta::DeltaSet;
-use super::derived::DerivedSet;
+use super::known::Known;
 use super::util::{ref_dt, IdentityRuleContext, RuleContext};
 
 // ============================================================================
@@ -66,7 +66,7 @@ fn get_all_objects_for_subject(
     predicate: &Sid,
     subject: &Sid,
     delta: &DeltaSet,
-    derived: &DerivedSet,
+    derived: Known<'_>,
     same_as: &SameAsTracker,
 ) -> HashSet<Sid> {
     let mut objects = HashSet::new();
@@ -91,7 +91,7 @@ fn get_all_subjects_for_object(
     predicate: &Sid,
     object: &Sid,
     delta: &DeltaSet,
-    derived: &DerivedSet,
+    derived: Known<'_>,
     same_as: &SameAsTracker,
 ) -> HashSet<Sid> {
     let mut subjects = HashSet::new();
@@ -115,7 +115,7 @@ fn collect_property_values(
     property: &PropertyExpression,
     subject: &Sid,
     delta: &DeltaSet,
-    derived: &DerivedSet,
+    derived: Known<'_>,
     same_as: &SameAsTracker,
 ) -> Vec<Sid> {
     let Some(path) = property_expression_path(property, false) else {
@@ -475,7 +475,7 @@ fn collect_entity_types(
     entity: &Sid,
     canonical: &Sid,
     delta: &DeltaSet,
-    derived: &DerivedSet,
+    derived: Known<'_>,
     rdf_type_sid: &Sid,
 ) -> HashSet<Sid> {
     let mut types: HashSet<Sid> = HashSet::new();

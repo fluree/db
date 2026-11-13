@@ -147,6 +147,8 @@ pub struct IndexingFileConfig {
     pub retention_interval_secs: Option<u64>,
     /// Keep BM25 full-text indexes current automatically.
     pub bm25_auto_sync: Option<bool>,
+    /// Maintain registered reasoning indexes automatically (default false).
+    pub reasoning_index_auto_refresh: Option<bool>,
     /// Old index versions to retain before GC.
     pub gc_max_old_indexes: Option<u32>,
     /// Minimum age in minutes before an index version can be collected.
@@ -453,6 +455,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "iceberg_local_roots",
     "indexing_enabled",
     "bm25_auto_sync",
+    "reasoning_index_auto_refresh",
     "reindex_min_bytes",
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
@@ -625,6 +628,11 @@ pub fn apply_to_server_config(
         if is_default("indexing_enabled") {
             if let Some(v) = idx.enabled {
                 config.indexing_enabled = v;
+            }
+        }
+        if is_default("reasoning_index_auto_refresh") {
+            if let Some(v) = idx.reasoning_index_auto_refresh {
+                config.reasoning_index_auto_refresh = v;
             }
         }
         if is_default("bm25_auto_sync") {
@@ -1360,6 +1368,7 @@ ttl_ms = 200
 
 [server.indexing]
 enabled = true
+reasoning_index_auto_refresh = true
 reindex_min_bytes = 200000
 reindex_max_bytes = 2000000
 gc_max_old_indexes = 3
@@ -1390,6 +1399,7 @@ default_policy_class = "ex:DefaultPolicy"
 
         let idx = server.indexing.unwrap();
         assert_eq!(idx.enabled, Some(true));
+        assert_eq!(idx.reasoning_index_auto_refresh, Some(true));
         assert_eq!(idx.reindex_min_bytes, Some(200_000));
         assert_eq!(idx.reindex_max_bytes, Some(2_000_000));
         assert_eq!(idx.gc_max_old_indexes, Some(3));
@@ -1455,6 +1465,7 @@ default_policy_class = "ex:DefaultPolicy"
                 retention_interval_secs: None,
                 reindex_max_bytes: Some(1_000_000),
                 bm25_auto_sync: None,
+                reasoning_index_auto_refresh: None,
                 gc_max_old_indexes: Some(5),
                 gc_min_time_mins: None,
                 gc_hard_max_old_indexes: None,
@@ -1473,6 +1484,7 @@ default_policy_class = "ex:DefaultPolicy"
                 retention_interval_secs: None,
                 reindex_max_bytes: None, // should NOT override
                 bm25_auto_sync: None,
+                reasoning_index_auto_refresh: None,
                 gc_max_old_indexes: None, // should NOT override
                 gc_min_time_mins: None,
                 gc_hard_max_old_indexes: Some(40),

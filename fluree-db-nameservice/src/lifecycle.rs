@@ -20,8 +20,19 @@ use fluree_db_core::{ContentId, InstanceId, LedgerId, LedgerName, StorageRoot};
 use std::collections::BTreeMap;
 
 /// A backend the protocols can drive.
-pub trait LifecycleStore: LedgerRegistry + BranchRecordStore + ConfigPublisher {}
-impl<T: LedgerRegistry + BranchRecordStore + ConfigPublisher + ?Sized> LifecycleStore for T {}
+pub trait LifecycleStore:
+    LedgerRegistry + BranchRecordStore + ConfigPublisher + crate::ReasoningIndexesPublisher
+{
+}
+impl<
+        T: LedgerRegistry
+            + BranchRecordStore
+            + ConfigPublisher
+            + crate::ReasoningIndexesPublisher
+            + ?Sized,
+    > LifecycleStore for T
+{
+}
 
 /// Compare-and-swap retries before an operation gives up on a contended
 /// binding.
@@ -955,10 +966,11 @@ fn dropped_entry(
     name: &LedgerName,
     binding: &NameBinding,
     hard: bool,
-    records: Vec<NsRecord>,
+    (records, reasoning_indexes): CopiedRecords,
     configs: Option<BTreeMap<String, ConfigValue>>,
 ) -> DroppedLedger {
     DroppedLedger {
+        reasoning_indexes,
         extra: crate::binding::ExtraFields::new(),
         instance: binding.instance.clone(),
         state: if hard {
@@ -981,8 +993,9 @@ async fn records_to_copy<S: LifecycleStore + ?Sized>(
     store: &S,
     name: &LedgerName,
     binding: &NameBinding,
-) -> Result<Vec<NsRecord>> {
+) -> Result<CopiedRecords> {
     let mut records = Vec::with_capacity(binding.branches.len());
+    let mut heads = std::collections::BTreeMap::new();
     for b in binding.branches.iter().filter(|b| !b.creating) {
         let id = name.with_branch(&b.branch)?;
         if let Some(mut record) = store
@@ -990,14 +1003,30 @@ async fn records_to_copy<S: LifecycleStore + ?Sized>(
             .await?
             .filter(|r| r.fence == Some(b.fence))
         {
+            // A record kept from before the id grammar: no request can name
+            // its branch, so nothing gave it a reasoning index.
+            if LedgerId::parse(id.as_ref()).is_ok() {
+                if let Some(doc) = store
+                    .get_reasoning_indexes(id.as_str())
+                    .await?
+                    .filter(|doc| !doc.is_empty())
+                {
+                    heads.insert(record.branch.clone(), doc);
+                }
+            }
             record.storage_root = None;
             record.retracted = b.dropped;
             records.push(record);
         }
     }
-    Ok(records)
+    Ok((records, heads))
 }
 
+/// The branch records a drop keeps, and their reasoning-indexes documents.
+type CopiedRecords = (
+    Vec<NsRecord>,
+    std::collections::BTreeMap<String, crate::ReasoningIndexes>,
+);
 /// The configs a soft drop of `binding`'s ledger copies into its entry, by
 /// branch: each copied record's, when it has one. A hard drop keeps none,
 /// since nothing restores it, and a branch dropped before its ledger none,
@@ -1349,7 +1378,9 @@ where
         record.frozen = record.retracted;
         record.retracted = false;
         match insert_fenced(store, &record).await {
-            Ok(()) => {}
+            Ok(()) => {
+                restore_reasoning_indexes(store, &entry, &record).await?;
+            }
             // A record from before name bindings holds the key, and is never
             // deleted to make room: no attempt can finish this restore, and
             // left half done it would hold the name with nothing able to
@@ -1390,6 +1421,37 @@ where
     }
     cas_dropped(store, instance, Some(version), None).await?;
     Ok(Some(records))
+}
+
+/// Write a restored branch's reasoning-indexes document back, under its fresh
+/// fence. A restore repeated after a crash finds it already written.
+async fn restore_reasoning_indexes<S: LifecycleStore + ?Sized>(
+    store: &S,
+    entry: &DroppedLedger,
+    record: &NsRecord,
+) -> Result<()> {
+    let Some(saved) = entry.reasoning_indexes.get(&record.branch) else {
+        return Ok(());
+    };
+    let doc = crate::ReasoningIndexes {
+        v: 1,
+        indexes: saved.indexes.clone(),
+    };
+    match store
+        .push_reasoning_indexes_fenced(record.ledger_id.as_str(), record.fence, 0, &doc)
+        .await?
+    {
+        crate::ReasoningIndexesCasResult::Updated => Ok(()),
+        crate::ReasoningIndexesCasResult::Conflict {
+            actual: Some(actual),
+        } if actual.indexes == doc.indexes => Ok(()),
+        crate::ReasoningIndexesCasResult::Conflict { .. } => {
+            Err(NameServiceError::conflict(format!(
+                "the reasoning indexes of {} changed while it was being restored",
+                record.ledger_id
+            )))
+        }
+    }
 }
 
 /// Write `config` as the config of `record`, reinstated by a restore and not
@@ -1724,6 +1786,7 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
     let instance = legacy_instance(name);
     let entry = DroppedLedger {
         extra: crate::binding::ExtraFields::new(),
+        reasoning_indexes: Default::default(),
         instance: instance.clone(),
         state: DroppedState::Dropped,
         dropped_at: now_ms(),
@@ -1863,6 +1926,35 @@ mod tests {
                 0 => None,
                 max => Some(max),
             }
+        }
+    }
+
+    #[async_trait]
+    impl crate::ReasoningIndexesLookup for TestStore {
+        async fn get_reasoning_indexes(
+            &self,
+            ledger_id: &str,
+        ) -> Result<Option<crate::ReasoningIndexes>> {
+            self.inner.get_reasoning_indexes(ledger_id).await
+        }
+    }
+
+    #[async_trait]
+    impl crate::ReasoningIndexesPublisher for TestStore {
+        async fn push_reasoning_indexes_fenced(
+            &self,
+            ledger_id: &str,
+            fence: Option<Fence>,
+            expected_v: i64,
+            new: &crate::ReasoningIndexes,
+        ) -> Result<crate::ReasoningIndexesCasResult> {
+            self.inner
+                .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+                .await
+        }
+
+        fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+            self.inner.max_reasoning_indexes_bytes()
         }
     }
 
@@ -2172,6 +2264,86 @@ mod tests {
         let entry = store.get_dropped(&instance).await.unwrap().unwrap().value;
         assert_eq!(entry.state, DroppedState::Dropped);
         assert!(store.get_binding("mydb").await.unwrap().is_none());
+    }
+
+    /// A branch's reasoning-indexes document travels in the dropped entry, so
+    /// it counts toward the cap: an entry that fits without it is refused
+    /// with it, before anything is written.
+    #[tokio::test]
+    async fn a_reasoning_document_counts_toward_the_entry_cap() {
+        use crate::{ReasoningIndexesLookup as _, ReasoningIndexesPublisher as _};
+        use std::sync::atomic::Ordering;
+        let store = TestStore::default();
+        let name = LedgerName::parse("mydb").unwrap();
+        let created = create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        let bare = dropped_entry(
+            &name,
+            &binding,
+            false,
+            records_to_copy(&store, &name, &binding).await.unwrap(),
+            Some(Default::default()),
+        );
+        let bare = serde_json::to_vec(&bare).unwrap().len();
+
+        let doc = crate::ReasoningIndexes {
+            v: 1,
+            indexes: [(
+                fluree_db_core::reasoning_index::ReasoningIndexId::parse(
+                    "01JC0000000000000000000000",
+                )
+                .unwrap(),
+                fluree_db_core::reasoning_index::ReasoningIndexEntry {
+                    registration: fluree_db_core::reasoning_index::Registration {
+                        revision: 1,
+                        semantics: fluree_db_core::reasoning_index::SemanticKey {
+                            program: fluree_db_core::ContentId::new(
+                                fluree_db_core::ContentKind::LedgerConfig,
+                                b"program",
+                            ),
+                            reasoned_graph: None,
+                            clock: fluree_db_core::reasoning_index::ClockPolicy::SnapshotCommitTime,
+                        },
+                        program: serde_json::json!({"reasoning": "owl2rl"}),
+                        state: fluree_db_core::reasoning_index::RegistrationState::Active,
+                    },
+                    floor: Default::default(),
+                    head: None,
+                },
+            )]
+            .into(),
+        };
+        store
+            .push_reasoning_indexes_fenced("mydb:main", created.fence, 0, &doc)
+            .await
+            .unwrap();
+
+        store.max_entry.store(bare + 8, Ordering::SeqCst);
+        let err = drop_ledger(&store, &name, false).await.unwrap_err();
+        assert!(matches!(err, NameServiceError::TooLarge(_)), "{err}");
+        assert!(store
+            .get_binding("mydb")
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .is_active());
+        assert!(!store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+        assert_eq!(
+            store.get_reasoning_indexes("mydb:main").await.unwrap(),
+            Some(doc.clone())
+        );
+
+        store.max_entry.store(0, Ordering::SeqCst);
+        let instance = drop_ledger(&store, &name, false)
+            .await
+            .unwrap()
+            .expect("dropped")
+            .instance;
+        let entry = store.get_dropped(&instance).await.unwrap().unwrap().value;
+        assert_eq!(entry.reasoning_indexes.get("main"), Some(&doc));
     }
 
     /// A name held by a create that stopped reads as absent, so its refusal

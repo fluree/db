@@ -13,6 +13,33 @@ Once an erasure is published, a [purge](#purge) deletes the original commit file
 of what the request removed that this node's storage holds: transaction documents, index files,
 derived search indexes and scratch files.
 
+This page is the reference. To run an erasure step by step, start with the
+[permanent erasure cookbook](../guides/cookbook-erasure.md); to install and size the prover, see
+[Running the erasure prover](../operations/erasure-prover.md).
+
+## When to use it
+
+Use erasure when data has to be destroyed, not only hidden:
+
+- a data subject's request to be forgotten, or a retention schedule that requires destruction;
+- a credential, key or other secret that was written into a ledger;
+- data loaded by mistake that you have no right to hold;
+- a contract or ruling that requires proof the data is gone from the system of record.
+
+It is the most expensive of the retention features: it needs a prover and file storage, takes
+minutes to hours to complete, and can never be undone. Prefer a lighter tool where one is enough:
+
+| You need | Use |
+|---|---|
+| A value to stop appearing in current queries | A [retraction](retractions.md), or [TTL](ttl.md) to schedule one |
+| Less history kept for a high-churn predicate | [`f:noHistory`](history-retention.md#fnohistory) |
+| A value withheld from every query, with the commit log kept for audit | [Targeted removal](history-retention.md#targeted-removal) |
+| The value gone from the commits and from disk | Permanent erasure |
+
+An erasure begins with a targeted removal, so readers stop seeing the value when the request is
+accepted, well before the proofs finish. [Data lifecycle](../concepts/data-lifecycle.md) compares
+the four in more depth.
+
 ## What erasure does not guarantee
 
 - **A guessed value can be confirmed on an unsigned commit.** The original commit's CID stays as its
@@ -59,8 +86,8 @@ To make erasure as strong as it can be on a ledger that may need it:
   occurrences in the request too. One written after the request was accepted holds its publication
   back, with the same explanation in the job's `lastError`, and an erasure received from another
   server, by a restore or a transfer, is refused with `409` while a ledger here holding its commits has
-  one. A triple
-  term spelling another fact with the same value, such as another subject's, is left as it is.
+  one. A triple term spelling another fact with the same value, such as another subject's, is left as
+  it is.
 
 ## Requesting an erasure
 
@@ -172,7 +199,9 @@ publishing an erasure wait for it, so the ledgers a pass purges stay those it fo
    full-text value or triple term), or is a string, JSON value or duration in a ledger with triple
    terms, which may spell it too. Full-text (BM25) and vector indexes over a holding branch that read
    an erased property (each request records the properties it erases when it is accepted) are rebuilt
-   from scratch; one that reads none of them never held the value and keeps its index. Every such
+   from scratch; one that reads none of them never held the value and keeps its index. A
+   [reasoning index](../query/materialized-reasoning.md#erasure-and-removal) of a holding branch
+   is a copy of its facts: its generations are discarded, and built again at its next refresh. Every such
    index loses the files its current index does not use, which an earlier index of the same name may
    have left, and one dropped before the purge loses all of its files. A soft-dropped ledger that
    holds an erased commit has its indexes deleted, and restoring it rebuilds them before it serves.
@@ -410,6 +439,9 @@ and timings, but not its requester, `commits`, properties or `lastError`.
 
 ## Server configuration
 
+[Running the erasure prover](../operations/erasure-prover.md) is the operator's guide to what this
+section summarizes: installing, checking, sizing and isolating the prover.
+
 The prover, `fluree-prover`, is a separate binary released with each version: install it with
 [`fluree prover install`](../cli/prover.md), which puts it beside `fluree`, or run the server's
 container image tagged `-erasure`, which includes it. Only a server that takes erasure requests needs
@@ -418,6 +450,9 @@ proves an image the release accepts; a prover that does not answer within ten se
 It logs whether erasure is available and why not, and its discovery document reports
 `erasure.proving`. Without a prover of its release, the server runs and refuses erasure requests
 (`501`).
+
+Each flag also has an environment variable: `FLUREE_ERASURE_PROVER`, `FLUREE_DISABLE_ERASURE`,
+`FLUREE_ERASURE_SCRATCH_DIR`, `FLUREE_ERASURE_PROVER_THREADS` and `FLUREE_ERASURE_PROVER_TIMEOUT_SECS`.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -505,3 +540,14 @@ the full measurements.
   memory of other processes that follow no refresh until they restart, and values in the original CID
   itself (see
   [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.
+
+## Related documentation
+
+- [Cookbook: permanent erasure](../guides/cookbook-erasure.md): an erasure from start to finish, with variations and troubleshooting
+- [Running the erasure prover](../operations/erasure-prover.md): installing, sizing and isolating the prover
+- [`fluree prover`](../cli/prover.md): the CLI command
+- [Data lifecycle](../concepts/data-lifecycle.md): choosing between expiry, history rules, removal and erasure
+- [History retention](history-retention.md): targeted removal, which every erasure begins with
+- [`POST /erase`](../api/endpoints.md#post-eraseledger-id) and [`GET /retention`](../api/endpoints.md#get-retentionledger-id): the endpoints
+- [Raft clusters](../operations/raft-clusters.md#garbage-collection-and-permanent-erasure): erasure and garbage collection on a cluster
+- [ZK redaction feasibility study](../design/zk-redaction-feasibility.md): the proof design and its measurements

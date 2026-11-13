@@ -9,6 +9,7 @@ description = "OWL2-RL reasoning engine for Fluree DB"
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-vocab = { path = "../fluree-vocab" }
+tracing = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 lru = { workspace = true }

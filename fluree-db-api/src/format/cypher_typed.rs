@@ -129,7 +129,25 @@ pub(crate) async fn typed_table(
         .map(|&v| result.vars.name(v).to_string())
         .collect();
 
-    let mut hydrator = NodeHydrator::new(view, compactor, result.binary_graph.as_ref());
+    // A reasoning query's nodes render from the state its rows were read
+    // and judged in. The batched lane reads the index alone, so it is off.
+    let read;
+    let view = match &result.read_view {
+        Some(state) if !state.is(view) => {
+            read = state.over(view);
+            &read
+        }
+        _ => view,
+    };
+    let reasoned;
+    let (view, gv) = match &result.reasoned_overlay {
+        Some(overlay) => {
+            reasoned = view.reasoned(Arc::clone(overlay));
+            (&reasoned, None)
+        }
+        None => (view, result.binary_graph.as_ref()),
+    };
+    let mut hydrator = NodeHydrator::new(view, compactor, gv);
 
     // Prefetch pass: the engine has already produced the subject list, so
     // the remaining work is a bulk read, not N point probes. Subjects that

@@ -196,6 +196,11 @@ impl Fluree {
                     let why = format!("{branch} is dropped but not yet frozen");
                     return self.block(&jobs, report, why).await;
                 }
+                // Its reasoning indexes hold a copy of its facts, and
+                // nothing loads them either.
+                if let Some(record) = self.nameservice().lookup(branch).await? {
+                    report.deleted += self.delete_reasoning_files(&record).await?;
+                }
             }
             let clock = Instant::now();
             let captured = self.capture_erased(&plan).await?;
@@ -218,6 +223,11 @@ impl Fluree {
                             }
                             Erased::Nothing => {}
                         }
+                        // A reasoning index is a second copy of the branch's
+                        // facts, which neither rewrite reaches: its
+                        // generations go, and are built again from the
+                        // branch as it now reads.
+                        report.deleted += self.discard_reasoning_generations(branch).await?;
                     }
                     report.sources += self.rebuild_sources(&plan.rebuilt_sources).await?;
                     report.timings.index += clock.elapsed();

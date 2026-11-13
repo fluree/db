@@ -184,13 +184,19 @@ storage. This means:
 - **Time-travel safe** — querying a historical point in time materializes based
   on that point's data and schema.
 
+A program can also be registered for **materialized reasoning**: a
+**reasoning index**, refreshed on request or by a background worker, holds the branch's
+asserted facts together with the program's derived facts, so matching
+queries skip materialization entirely. See
+[Materialized reasoning](../query/materialized-reasoning.md).
+
 ### owl:sameAs and identity
 
 When OWL 2 RL is enabled, the engine tracks `owl:sameAs` equivalences using an
-efficient union-find data structure. If two resources are determined to be the
-same (via functional properties, inverse functional properties, or `owl:hasKey`),
-all their facts are merged under a canonical representative. Queries
-transparently resolve through these equivalences.
+efficient union-find data structure. Resources can be asserted the same, or
+determined to be (via functional properties, inverse functional properties, or
+`owl:hasKey`). Each of them then holds all of their facts, so a query naming
+any one of them sees the combined set.
 
 ## What to read next
 

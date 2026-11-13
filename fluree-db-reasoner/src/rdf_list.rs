@@ -60,7 +60,7 @@ pub async fn collect_chain_elements(
     for members in collect_list_elements(db, values).await? {
         let mut chain = Vec::with_capacity(members.len());
         for member in &members {
-            chain.push(resolve_chain_element(db, member, 0).await?);
+            chain.push(resolve_chain_element(db, member, Vec::new()).await?);
         }
         chains.push(chain);
     }
@@ -79,16 +79,17 @@ pub async fn collect_chain_elements(
 /// - `_:b1 owl:inverseOf P` → `ChainElement { property: P, is_inverse: true }`
 /// - `_:b2 owl:inverseOf _:b1` where `_:b1 owl:inverseOf P` → `ChainElement { property: P, is_inverse: false }`
 ///
-/// The `depth` parameter tracks recursion to prevent infinite loops on malformed data.
+/// `passed` holds the properties already followed, which bounds the walk:
+/// see [`resolve_property_expression_inner`] for why a cycle ends it.
 fn resolve_chain_element<'a>(
     db: GraphDbRef<'a>,
     element_sid: &'a Sid,
-    depth: usize,
+    passed: Vec<Sid>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ChainElement>> + Send + 'a>> {
     Box::pin(async move {
         const MAX_INVERSE_DEPTH: usize = 10;
 
-        if depth >= MAX_INVERSE_DEPTH {
+        if passed.len() >= MAX_INVERSE_DEPTH {
             return Err(ReasonerError::Internal(format!(
                 "owl:inverseOf nesting exceeds maximum depth of {MAX_INVERSE_DEPTH}"
             )));
@@ -113,8 +114,12 @@ fn resolve_chain_element<'a>(
 
         if let Some(inverse_flake) = inverse_flakes.first() {
             if let FlakeValue::Ref(target_sid) = &inverse_flake.o {
-                // This is an owl:inverseOf expression - recursively resolve the target
-                let inner = resolve_chain_element(db, target_sid, depth + 1).await?;
+                if target_sid == element_sid || passed.contains(target_sid) {
+                    return Ok(ChainElement::direct(element_sid.clone()));
+                }
+                let mut passed = passed;
+                passed.push(element_sid.clone());
+                let inner = resolve_chain_element(db, target_sid, passed).await?;
                 // Toggle the inverse flag (double inverse normalization)
                 return Ok(inner.with_inverse_toggle());
             }
@@ -148,19 +153,24 @@ pub async fn resolve_property_expression(
     db: GraphDbRef<'_>,
     property_sid: &Sid,
 ) -> Result<PropertyExpression> {
-    resolve_property_expression_inner(db, property_sid, 0).await
+    resolve_property_expression_inner(db, property_sid, Vec::new()).await
 }
 
-/// Inner implementation with depth tracking for recursion safety.
+/// `passed` holds the properties already followed through `owl:inverseOf`.
+///
+/// `p owl:inverseOf q` on named properties is an axiom, `p ≡ q⁻`, so it may
+/// be followed, but declaring it both ways (or `p owl:inverseOf p`) makes a
+/// cycle. The walk ends at a property whose inverse it already passed, which
+/// it takes as named: `p` resolves to `q⁻`, and `q` stays `q`.
 fn resolve_property_expression_inner<'a>(
     db: GraphDbRef<'a>,
     property_sid: &'a Sid,
-    depth: usize,
+    passed: Vec<Sid>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PropertyExpression>> + Send + 'a>> {
     Box::pin(async move {
         const MAX_DEPTH: usize = 10;
 
-        if depth >= MAX_DEPTH {
+        if passed.len() >= MAX_DEPTH {
             return Err(ReasonerError::Internal(format!(
                 "Property expression nesting exceeds maximum depth of {MAX_DEPTH}"
             )));
@@ -186,9 +196,12 @@ fn resolve_property_expression_inner<'a>(
         for flake in &node_flakes {
             if flake.p == inverse_of_sid {
                 if let FlakeValue::Ref(target_sid) = &flake.o {
-                    // Recursively resolve the target
-                    let inner =
-                        resolve_property_expression_inner(db, target_sid, depth + 1).await?;
+                    if target_sid == property_sid || passed.contains(target_sid) {
+                        return Ok(PropertyExpression::named(property_sid.clone()));
+                    }
+                    let mut passed = passed;
+                    passed.push(property_sid.clone());
+                    let inner = resolve_property_expression_inner(db, target_sid, passed).await?;
                     // Apply inverse (with double-inverse normalization)
                     return Ok(PropertyExpression::inverse(inner));
                 }

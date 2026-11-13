@@ -1239,6 +1239,7 @@ async fn incremental_index_with(
         fulltext_configured_properties: config.fulltext_configured_properties.clone(),
         pending_commit_cids: config.pending_commit_cids.clone(),
         commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
+        derived_facts: config.derived_facts.clone(),
     };
     let mut novelty = resolve_incremental_commits_v6(
         content_store.clone(),

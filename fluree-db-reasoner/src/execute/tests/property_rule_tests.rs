@@ -36,7 +36,7 @@ fn test_symmetric_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -79,7 +79,7 @@ fn test_transitive_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -134,7 +134,7 @@ fn test_domain_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -199,7 +199,7 @@ fn test_domain_rule_sets_dt_id_even_for_literal_objects() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -250,7 +250,7 @@ fn test_range_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -314,7 +314,7 @@ fn test_range_rule_ignores_literals() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -362,7 +362,7 @@ fn test_sub_property_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -419,7 +419,7 @@ fn test_sub_property_rule_transitive_chain() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -476,7 +476,7 @@ fn test_property_chain_rule() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -536,7 +536,7 @@ fn test_property_chain_rule_with_derived() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -604,7 +604,7 @@ fn test_property_chain_rule_with_inverse() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -680,7 +680,7 @@ fn test_property_chain_rule_inverse_last_requires_forward_inverse_lookup() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -746,7 +746,7 @@ fn test_property_chain_rule_inverse_first_requires_backward_inverse_lookup() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,
@@ -806,7 +806,7 @@ fn test_property_chain_rule_length_3() {
 
     let mut ctx = RuleContext {
         delta: &delta,
-        derived: &derived,
+        derived: Known::Resident(&derived),
         new_delta: &mut new_delta,
         same_as: &same_as,
         rdf_type_sid: &rdf_type_sid,

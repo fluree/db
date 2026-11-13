@@ -139,6 +139,7 @@
 //! as a disk limit.
 
 pub(crate) mod collector;
+pub mod reasoning_indexes;
 mod record;
 mod siblings;
 mod sweep;
@@ -151,8 +152,8 @@ pub use siblings::{
     current_sibling_heads, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
 };
 pub use sweep::{
-    execute_sweep, nested_namespaces, nested_prefixes, plan_sweep, BranchIndexHead, SweepPlan,
-    SweepResult,
+    execute_sweep, nested_namespaces, nested_prefixes, plan_sweep, plan_sweep_with,
+    BranchIndexHead, ExtraSweepFiles, SweepPlan, SweepResult,
 };
 
 use crate::error::Result;

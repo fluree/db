@@ -524,7 +524,14 @@ pub enum NsLookupResult {
 /// implement the lookup surface without claiming write capability.
 #[async_trait]
 pub trait NameServiceLookup:
-    GraphSourceLookup + RefLookup + StatusLookup + ConfigLookup + Debug + Send + Sync
+    GraphSourceLookup
+    + RefLookup
+    + StatusLookup
+    + ConfigLookup
+    + ReasoningIndexesLookup
+    + Debug
+    + Send
+    + Sync
 {
     /// Look up a ledger by its ledger ID (e.g. "mydb:main")
     ///
@@ -1519,6 +1526,67 @@ pub trait ConfigPublisher: ConfigLookup {
     ) -> Result<ConfigCasResult>;
 }
 
+// ---------------------------------------------------------------------------
+// Reasoning indexes
+// ---------------------------------------------------------------------------
+
+pub use fluree_db_core::reasoning_index::ReasoningIndexes;
+
+/// Result of a compare-and-swap on a branch's reasoning-indexes document.
+///
+/// A conflict is not an error: `actual` is the document as it stands (`None`
+/// when the branch record does not exist), and the caller rebuilds its
+/// update from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasoningIndexesCasResult {
+    Updated,
+    Conflict { actual: Option<ReasoningIndexes> },
+}
+
+/// Read access to each branch's reasoning-indexes document.
+#[async_trait]
+pub trait ReasoningIndexesLookup: Debug + Send + Sync {
+    /// The branch's document. `Some` with `v == 0` when the branch exists
+    /// but no index was ever registered; `None` when the branch record does
+    /// not exist (or is a tombstone).
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>>;
+}
+
+/// Compare-and-swap on a branch's reasoning-indexes document.
+///
+/// Backends check only the version and the fence: the update lands when the
+/// stored document's `v` equals `expected_v` and `new.v > expected_v`, and is
+/// refused with [`NameServiceError::Fenced`] unless the record carries
+/// `fence` and is not frozen. Publication rules (eligibility, basis,
+/// progress) run above the nameservice, in
+/// [`fluree_db_core::reasoning_index::admit`].
+#[async_trait]
+pub trait ReasoningIndexesPublisher: ReasoningIndexesLookup {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult>;
+
+    /// The largest reasoning-indexes document this store holds, in bytes of
+    /// its JSON; `None` for no limit. A larger push is refused before it
+    /// writes anything.
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize>;
+}
+
+/// The version check every backend applies to a reasoning-indexes push.
+pub(crate) fn reasoning_indexes_conflict(
+    current: &ReasoningIndexes,
+    expected_v: i64,
+    new: &ReasoningIndexes,
+) -> Option<ReasoningIndexesCasResult> {
+    (current.v != expected_v || new.v <= current.v).then(|| ReasoningIndexesCasResult::Conflict {
+        actual: Some(current.clone()),
+    })
+}
+
 /// A dynamically-dispatched nameservice with full read-write capability.
 ///
 /// This is the complete set of nameservice traits needed for full read-write
@@ -1535,6 +1603,7 @@ pub trait NameServicePublisher:
     + GraphSourcePublisher
     + StatusPublisher
     + ConfigPublisher
+    + ReasoningIndexesPublisher
     + LedgerRegistry
     + BranchRecordStore
 {
@@ -1547,6 +1616,7 @@ impl<T> NameServicePublisher for T where
         + GraphSourcePublisher
         + StatusPublisher
         + ConfigPublisher
+        + ReasoningIndexesPublisher
         + LedgerRegistry
         + BranchRecordStore
 {
@@ -1681,6 +1751,16 @@ where
 {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         (**self).get_config(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<T> ReasoningIndexesLookup for Arc<T>
+where
+    T: ReasoningIndexesLookup + ?Sized,
+{
+    async fn get_reasoning_indexes(&self, ledger_id: &str) -> Result<Option<ReasoningIndexes>> {
+        (**self).get_reasoning_indexes(ledger_id).await
     }
 }
 
@@ -1882,6 +1962,28 @@ where
         (**self)
             .push_status_fenced(ledger_id, fence, expected, new)
             .await
+    }
+}
+
+#[async_trait]
+impl<T> ReasoningIndexesPublisher for Arc<T>
+where
+    T: ReasoningIndexesPublisher + ?Sized,
+{
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &ReasoningIndexes,
+    ) -> Result<ReasoningIndexesCasResult> {
+        (**self)
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        (**self).max_reasoning_indexes_bytes()
     }
 }
 
@@ -2167,6 +2269,12 @@ mod tests {
     #[async_trait]
     impl ConfigLookup for RefOnlyNs {
         async fn get_config(&self, _: &str) -> Result<Option<ConfigValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl ReasoningIndexesLookup for RefOnlyNs {
+        async fn get_reasoning_indexes(&self, _: &str) -> Result<Option<ReasoningIndexes>> {
             Ok(None)
         }
     }

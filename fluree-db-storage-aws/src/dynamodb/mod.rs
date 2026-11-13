@@ -56,7 +56,13 @@ pub struct DynamoDbConfig {
 pub struct DynamoDbNameService {
     client: Client,
     table_name: String,
+    max_reasoning_indexes_bytes: usize,
 }
+
+/// The largest reasoning-indexes document written, in bytes of its JSON. It
+/// shares the status item, which DynamoDB caps at 400 KB with its attribute
+/// names and the status fields, so it leaves room for those.
+pub const MAX_REASONING_INDEXES_BYTES: usize = 300_000;
 
 /// An item whose id even the persisted grammar refuses is skipped: its
 /// storage path can alias another ledger's (see `LedgerId::from_persisted_parts`).
@@ -103,12 +109,24 @@ impl DynamoDbNameService {
         Ok(Self {
             client,
             table_name: config.table_name,
+            max_reasoning_indexes_bytes: MAX_REASONING_INDEXES_BYTES,
         })
     }
 
     /// Create from a pre-built client (for testing).
     pub fn from_client(client: Client, table_name: String) -> Self {
-        Self { client, table_name }
+        Self {
+            client,
+            table_name,
+            max_reasoning_indexes_bytes: MAX_REASONING_INDEXES_BYTES,
+        }
+    }
+
+    /// Hold reasoning-indexes documents to `bytes` rather than
+    /// [`MAX_REASONING_INDEXES_BYTES`].
+    pub fn with_max_reasoning_indexes_bytes(mut self, bytes: usize) -> Self {
+        self.max_reasoning_indexes_bytes = bytes;
+        self
     }
 }
 
@@ -2028,6 +2046,125 @@ impl StatusPublisher for DynamoDbNameService {
                 "DynamoDB UpdateItem failed: {e}"
             ))),
         }
+    }
+}
+
+// ─── Reasoning indexes (on the status item) ───────────────────────────────────
+
+impl DynamoDbNameService {
+    fn reasoning_indexes_of(
+        item: &Item,
+    ) -> std::result::Result<fluree_db_nameservice::ReasoningIndexes, NameServiceError> {
+        match item.get(ATTR_REASONING_INDEXES).and_then(|v| v.as_s().ok()) {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}"))),
+            None => Ok(fluree_db_nameservice::ReasoningIndexes::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for DynamoDbNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<fluree_db_nameservice::ReasoningIndexes>, NameServiceError>
+    {
+        let pk = Self::normalize(ledger_id)?;
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
+        match response.item() {
+            Some(item) => Self::reasoning_indexes_of(item).map(Some),
+            None if self.meta_exists(&pk).await? => {
+                Ok(Some(fluree_db_nameservice::ReasoningIndexes::default()))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesPublisher for DynamoDbNameService {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &fluree_db_nameservice::ReasoningIndexes,
+    ) -> std::result::Result<fluree_db_nameservice::ReasoningIndexesCasResult, NameServiceError>
+    {
+        use fluree_db_nameservice::{ReasoningIndexesCasResult, ReasoningIndexesLookup as _};
+        let pk = Self::normalize(ledger_id)?;
+        let conflict = |actual| Ok(ReasoningIndexesCasResult::Conflict { actual });
+        if new.v <= expected_v {
+            return conflict(self.get_reasoning_indexes(ledger_id).await?);
+        }
+        let json = serde_json::to_string(new)
+            .map_err(|e| NameServiceError::storage(format!("reasoning-indexes document: {e}")))?;
+        if json.len() > self.max_reasoning_indexes_bytes {
+            return Err(NameServiceError::TooLarge(format!(
+                "{ledger_id}'s reasoning-indexes document would take {} bytes, more than the {} \
+                 this nameservice holds",
+                json.len(),
+                self.max_reasoning_indexes_bytes
+            )));
+        }
+        // `fenced_update_item` parenthesizes this; DynamoDB refuses `((…))`.
+        let version_clause = if expected_v == 0 {
+            "attribute_not_exists(#rv) OR #rv = :expected_v"
+        } else {
+            "#rv = :expected_v"
+        };
+        let request = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(SK_STATUS.to_string()));
+        let result = lifecycle::fenced_update_item(request, Some(version_clause), fence)
+            .update_expression("SET #rh = :doc, #rv = :new_v, #ua = :now")
+            .expression_attribute_names("#rh", ATTR_REASONING_INDEXES)
+            .expression_attribute_names("#rv", ATTR_REASONING_INDEXES_V)
+            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+            .expression_attribute_values(":expected_v", AttributeValue::N(expected_v.to_string()))
+            .expression_attribute_values(":new_v", AttributeValue::N(new.v.to_string()))
+            .expression_attribute_values(":doc", AttributeValue::S(json))
+            .expression_attribute_values(
+                ":now",
+                AttributeValue::N(Self::now_epoch_ms().to_string()),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(ReasoningIndexesCasResult::Updated),
+            Err(e) if Self::is_conditional_check_failed(&e) => {
+                if self.fence_refuses(&pk, SK_STATUS, fence).await? {
+                    return Err(NameServiceError::fenced(ledger_id));
+                }
+                conflict(self.get_reasoning_indexes(ledger_id).await?)
+            }
+            Err(e) => Err(NameServiceError::storage(format!(
+                "DynamoDB UpdateItem failed: {}",
+                aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+            ))),
+        }
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        Some(self.max_reasoning_indexes_bytes)
     }
 }
 

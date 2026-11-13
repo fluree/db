@@ -55,17 +55,17 @@ pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
     clean_garbage, current_sibling_heads, execute_sweep, nested_namespaces, nested_prefixes,
-    plan_garbage, plan_sweep, release_garbage_plan, shared_blob_policy_for,
+    plan_garbage, plan_sweep, plan_sweep_with, release_garbage_plan, shared_blob_policy_for,
     shared_refs_of_branches, siblings_of, write_garbage_record, BranchIndexHead,
-    CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord, SharedBlobPolicy,
-    SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES,
-    DEFAULT_MIN_TIME_GARBAGE_MINS,
+    CleanGarbageConfig, CleanGarbageResult, ExtraSweepFiles, GarbagePlan, GarbageRecord,
+    SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES,
+    DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
-    BuildDirectives, BuildObserver, GcGuard, Housekeeping, Housekeepings, IndexCompletion,
-    IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot, IndexerHandle,
-    IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
+    BuildDirectives, BuildObserver, BuildTicket, GcGuard, Housekeeping, Housekeepings,
+    IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
+    IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
 };
 #[cfg(feature = "embedded-orchestrator")]
 pub use orchestrator::{
@@ -212,7 +212,8 @@ pub async fn build_index_for_record_with_tracker(
         // when tracking is enabled (no CAS work was done) so callers can
         // distinguish "no work" from "not tracked".
         if let Some(ref root_id) = record.index_head_id {
-            if record.index_t >= record.commit_t {
+            // Derived facts are folded in even when no commit is new.
+            if record.index_t >= record.commit_t && config.derived_facts.is_none() {
                 tracing::info!(
                     ledger_id = ledger_id,
                     index_t = record.index_t,
@@ -317,6 +318,38 @@ pub async fn build_index_for_record_with_tracker(
 /// Snapshot the tracker's current decimal fuel total, or `None` when fuel
 /// tracking was not enabled at this tracker (so callers can distinguish
 /// "no work" from "not tracked").
+/// Fold the commits after `record.index_t`, then `config.derived_facts`, into
+/// the root at `record.index_head_id`, incrementally only.
+///
+/// Unlike [`build_index_for_record`], a window the incremental path cannot
+/// apply is an error rather than a full rebuild: a reasoning index's fold
+/// carries only the derived facts that changed, which a rebuild from commits
+/// would not see.
+pub async fn fold_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    let tracker = fluree_db_core::tracking::Tracker::disabled();
+    let content_store: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
+    );
+    let root_id = record.index_head_id.as_ref().ok_or(IndexerError::NoIndex)?;
+    if !published_root_is_current(content_store.as_ref(), root_id).await? {
+        return Err(IndexerError::IncrementalAbort(
+            "the root to fold into is of an earlier format".to_string(),
+        ));
+    }
+    incremental_index(
+        content_store,
+        tracker,
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
 fn tally_fuel(tracker: &fluree_db_core::tracking::Tracker) -> Option<f64> {
     tracker.tally().and_then(|t| t.fuel)
 }

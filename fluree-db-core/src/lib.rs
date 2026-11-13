@@ -77,6 +77,7 @@ pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
 pub mod rdf_list;
+pub mod reasoning_index;
 pub mod runtime_small_dicts;
 pub mod same_t;
 pub mod schema_hierarchy;
@@ -251,8 +252,8 @@ pub use storage::{
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
 pub use tracking::{
-    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningTally, Tracker,
-    TrackingOptions, TrackingTally,
+    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningIndexTally,
+    ReasoningTally, Tracker, TrackingOptions, TrackingTally,
 };
 pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,

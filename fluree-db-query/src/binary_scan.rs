@@ -1933,9 +1933,12 @@ impl BinaryScanOperator {
     /// - Likewise every such op shares its predicate, and `cmp_psot` orders by
     ///   predicate first.
     ///
-    /// Only ONE term is pinned and every other component spans its full range,
-    /// so the window is always a superset of the pattern's matches; the cursor's
-    /// own `overlay_window_for_range` and row filters remain the correctness
+    /// A subject window also pins the predicate when it is bound, and beneath
+    /// a predicate a reference object: SPOT keeps each of those contiguous and
+    /// every op of a fact shares them. Without the predicate the object is
+    /// scattered across the subject's predicates and does not narrow. A window
+    /// is always a superset of the pattern's matches; the cursor's own
+    /// `overlay_window_for_range` and row filters remain the correctness
     /// backstop, exactly as they are for the whole-overlay product.
     ///
     /// Literal objects are deliberately NOT used to narrow, even on OPST — but
@@ -1965,6 +1968,7 @@ impl BinaryScanOperator {
     fn bounded_overlay_walk(
         s_sid: &Option<Sid>,
         p_sid: &Option<Sid>,
+        object: Option<&FlakeValue>,
     ) -> Option<BoundedOverlayWalk> {
         use fluree_db_core::flake::FlakeMeta;
 
@@ -1972,26 +1976,17 @@ impl BinaryScanOperator {
         // sorts strictly below any real flake, so nothing is skipped. `rhs` is
         // inclusive and maxes every trailing component. Mirrors
         // `overlay_walk_bounds` / `predicate_walk_bounds`.
-        let bracket = |lead_min: Sid, lead_max: Sid, index: IndexType| {
-            let (s_min, p_min, s_max, p_max) = match index {
-                IndexType::Spot => (lead_min, Sid::min(), lead_max, Sid::max()),
-                _ => (Sid::min(), lead_min, Sid::max(), lead_max),
-            };
+        let bracket = |index: IndexType,
+                       (s_min, s_max): (Sid, Sid),
+                       (p_min, p_max): (Sid, Sid),
+                       (o_min, o_max): (FlakeValue, FlakeValue)| {
             BoundedOverlayWalk {
                 index,
-                first: Flake::new(
-                    s_min,
-                    p_min,
-                    FlakeValue::min(),
-                    Sid::min(),
-                    i64::MIN,
-                    false,
-                    None,
-                ),
+                first: Flake::new(s_min, p_min, o_min, Sid::min(), i64::MIN, false, None),
                 rhs: Flake::new(
                     s_max,
                     p_max,
-                    FlakeValue::max(),
+                    o_max,
                     Sid::max(),
                     i64::MAX,
                     true,
@@ -1999,14 +1994,29 @@ impl BinaryScanOperator {
                 ),
             }
         };
+        let any_object = || (FlakeValue::min(), FlakeValue::max());
 
         // Prefer the subject: it is the more selective term in practice, and it
         // is the one the bound-subject write/probe shapes pin.
         if let Some(s) = s_sid.as_ref() {
-            return Some(bracket(s.clone(), s.clone(), IndexType::Spot));
+            let (p, o) = match p_sid.as_ref() {
+                Some(p) => (
+                    (p.clone(), p.clone()),
+                    object
+                        .and_then(Self::reference_object_bounds)
+                        .unwrap_or_else(any_object),
+                ),
+                None => ((Sid::min(), Sid::max()), any_object()),
+            };
+            return Some(bracket(IndexType::Spot, (s.clone(), s.clone()), p, o));
         }
         if let Some(p) = p_sid.as_ref() {
-            return Some(bracket(p.clone(), p.clone(), IndexType::Psot));
+            return Some(bracket(
+                IndexType::Psot,
+                (Sid::min(), Sid::max()),
+                (p.clone(), p.clone()),
+                any_object(),
+            ));
         }
         None
     }
@@ -2019,12 +2029,11 @@ impl BinaryScanOperator {
     /// holds every flake the scan's handle compare can match.
     /// Literal objects keep the existing whole-graph fallback: their scan
     /// match semantics can exceed a single comparator equality class.
-    fn bounded_object_walk(
-        object: Option<&FlakeValue>,
-        predicate: Option<&Sid>,
-    ) -> Option<BoundedOverlayWalk> {
-        let (lo, hi) = match object? {
-            FlakeValue::Ref(sid) => (FlakeValue::Ref(sid.clone()), FlakeValue::Ref(sid.clone())),
+    fn reference_object_bounds(object: &FlakeValue) -> Option<(FlakeValue, FlakeValue)> {
+        match object {
+            FlakeValue::Ref(sid) => {
+                Some((FlakeValue::Ref(sid.clone()), FlakeValue::Ref(sid.clone())))
+            }
             FlakeValue::TripleTerm(term) => {
                 let bound = |o: FlakeValue, dt: Sid| {
                     FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
@@ -2035,13 +2044,20 @@ impl BinaryScanOperator {
                         lang: None,
                     }))
                 };
-                (
+                Some((
                     bound(FlakeValue::min(), Sid::min()),
                     bound(FlakeValue::max(), Sid::max()),
-                )
+                ))
             }
-            _ => return None,
-        };
+            _ => None,
+        }
+    }
+
+    fn bounded_object_walk(
+        object: Option<&FlakeValue>,
+        predicate: Option<&Sid>,
+    ) -> Option<BoundedOverlayWalk> {
+        let (lo, hi) = Self::reference_object_bounds(object?)?;
         Some(BoundedOverlayWalk {
             // POST leads with predicate, then object value/datatype; OPST
             // leads with object value/datatype. Both brackets span all dt
@@ -3041,7 +3057,7 @@ impl Operator for BinaryScanOperator {
             } else {
                 None
             }
-            .or_else(|| Self::bounded_overlay_walk(&s_sid, &p_sid));
+            .or_else(|| Self::bounded_overlay_walk(&s_sid, &p_sid, self.bound_o.as_ref()));
 
             let translate_span = tracing::debug_span!(
                 "overlay_translate",
@@ -5249,7 +5265,7 @@ mod bounded_overlay_walk_tests {
 
                 for k in 0..7 {
                     let s = sid(100, &format!("s{k}"));
-                    let w = BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &None)
+                    let w = BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &None, None)
                         .expect("subject bracket");
                     assert_eq!(w.index, IndexType::Spot);
                     let expected: Vec<Flake> =
@@ -5261,9 +5277,32 @@ mod bounded_overlay_walk_tests {
                     );
                 }
 
+                for (i, j) in (0..7).flat_map(|i| (0..5).map(move |j| (i, j))) {
+                    let s = sid(100, &format!("s{i}"));
+                    let p = sid(101, &format!("p{j}"));
+                    let w = BinaryScanOperator::bounded_overlay_walk(
+                        &Some(s.clone()),
+                        &Some(p.clone()),
+                        None,
+                    )
+                    .expect("subject+predicate bracket");
+                    assert_eq!(w.index, IndexType::Spot);
+                    let expected: Vec<Flake> = sorted(
+                        all.iter()
+                            .filter(|f| f.s == s && f.p == p)
+                            .cloned()
+                            .collect(),
+                    );
+                    assert_eq!(
+                        sorted(walk(&n, Some(&w), to_t)),
+                        expected,
+                        "subject+predicate window mismatch (seed {seed}, to_t {to_t}, s{i}, p{j})"
+                    );
+                }
+
                 for k in 0..5 {
                     let p = sid(101, &format!("p{k}"));
-                    let w = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p.clone()))
+                    let w = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p.clone()), None)
                         .expect("predicate bracket");
                     assert_eq!(w.index, IndexType::Psot);
                     let expected: Vec<Flake> =
@@ -5284,7 +5323,7 @@ mod bounded_overlay_walk_tests {
     #[test]
     fn bounded_walk_on_absent_subject_is_empty() {
         let n = build_novelty(99, 10, 8);
-        let w = BinaryScanOperator::bounded_overlay_walk(&Some(sid(100, "nope")), &None)
+        let w = BinaryScanOperator::bounded_overlay_walk(&Some(sid(100, "nope")), &None, None)
             .expect("subject bracket");
         assert!(walk(&n, Some(&w), i64::MAX).is_empty());
         assert!(!walk(&n, None, i64::MAX).is_empty(), "fixture non-empty");
@@ -5414,6 +5453,100 @@ mod bounded_overlay_walk_tests {
         }
     }
 
+    /// One subject and predicate, several reference values with full
+    /// assert/retract histories and datatypes: the window is exactly the bound
+    /// value's history, not a neighbouring value's or another predicate's.
+    #[test]
+    fn subject_predicate_reference_window_keeps_fact_histories() {
+        let mut novelty = Novelty::new(0);
+        let graphs = HashMap::new();
+        let s = sid(100, "s");
+        let p = sid(101, "p");
+        let target = FlakeValue::Ref(sid(102, "target"));
+        for t in 1..=6 {
+            let mut flakes = Vec::new();
+            for (dt, list_index) in [("dt0", 0), ("dt1", 1)] {
+                let fact = |s: &Sid, p: &Sid, o: FlakeValue| {
+                    Flake::new(
+                        s.clone(),
+                        p.clone(),
+                        o,
+                        sid(103, dt),
+                        t,
+                        t % 2 == 1,
+                        Some(FlakeMeta::with_index(list_index)),
+                    )
+                };
+                flakes.push(fact(&s, &p, target.clone()));
+                flakes.push(fact(&s, &p, FlakeValue::Ref(sid(102, "target-next"))));
+                flakes.push(fact(&s, &p, FlakeValue::Ref(sid(102, "target-prev"))));
+                flakes.push(fact(&s, &sid(101, "q"), target.clone()));
+                flakes.push(fact(&sid(100, "t"), &p, target.clone()));
+            }
+            novelty.apply_commit(flakes, t, &graphs).expect("commit");
+        }
+        let walk_bound = BinaryScanOperator::bounded_overlay_walk(
+            &Some(s.clone()),
+            &Some(p.clone()),
+            Some(&target),
+        )
+        .expect("bracket");
+        assert_eq!(walk_bound.index, IndexType::Spot);
+        let events = |flakes: Vec<Flake>| {
+            sorted(flakes)
+                .into_iter()
+                .map(|f| {
+                    let (t, op) = (f.t, f.op);
+                    (f, t, op) // Flake equality alone intentionally ignores t/op.
+                })
+                .collect::<Vec<_>>()
+        };
+        for to_t in [1, 2, 3, 6, i64::MAX] {
+            let expected: Vec<Flake> = walk(&novelty, None, to_t)
+                .into_iter()
+                .filter(|f| f.s == s && f.p == p && f.o == target)
+                .collect();
+            assert!(!expected.is_empty());
+            assert_eq!(
+                events(walk(&novelty, Some(&walk_bound), to_t)),
+                events(expected)
+            );
+        }
+        let absent = FlakeValue::Ref(sid(102, "absent"));
+        let walk_absent =
+            BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &Some(p), Some(&absent))
+                .expect("bracket");
+        assert!(walk(&novelty, Some(&walk_absent), i64::MAX).is_empty());
+    }
+
+    /// A literal object does not narrow beneath subject+predicate: `Long(5)`
+    /// and `Double(5.0)` both stay in the window, as do all other values.
+    #[test]
+    fn subject_predicate_window_keeps_every_literal() {
+        let mut novelty = Novelty::new(0);
+        let graphs = HashMap::new();
+        let (s, p) = (sid(100, "s"), sid(101, "p"));
+        let flakes = [
+            (FlakeValue::Long(5), "integer"),
+            (FlakeValue::Double(5.0), "double"),
+            (FlakeValue::Long(6), "integer"),
+            (FlakeValue::String("5".into()), "string"),
+        ]
+        .into_iter()
+        .map(|(o, dt)| Flake::new(s.clone(), p.clone(), o, sid(2, dt), 1, true, None))
+        .collect();
+        novelty.apply_commit(flakes, 1, &graphs).expect("commit");
+        for bound in [FlakeValue::Long(5), FlakeValue::Double(5.0)] {
+            let w = BinaryScanOperator::bounded_overlay_walk(
+                &Some(s.clone()),
+                &Some(p.clone()),
+                Some(&bound),
+            )
+            .expect("bracket");
+            assert_eq!(walk(&novelty, Some(&w), i64::MAX).len(), 4);
+        }
+    }
+
     #[test]
     fn object_window_does_not_narrow_literal_match_semantics() {
         for value in [
@@ -5427,14 +5560,17 @@ mod bounded_overlay_walk_tests {
         assert!(BinaryScanOperator::bounded_object_walk(None, None).is_none());
     }
 
-    /// The bracket must not be sensitive to a bound object: on SPOT with a bound
-    /// subject the window still holds every predicate/object for that subject,
-    /// so an object-typed pattern can never lose a novelty retraction.
+    /// Beneath no predicate an object does not narrow: SPOT scatters it across
+    /// the subject's predicates, so the window holds every predicate/object
+    /// for that subject and an object-typed pattern can never lose a novelty
+    /// retraction.
     #[test]
-    fn subject_bracket_ignores_bound_object() {
+    fn subject_bracket_without_predicate_ignores_bound_object() {
         let n = build_novelty(7, 10, 9);
         let s = sid(100, "s3");
-        let w = BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &None).expect("bracket");
+        let object = FlakeValue::Ref(sid(100, "s1"));
+        let w = BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &None, Some(&object))
+            .expect("bracket");
         let got = walk(&n, Some(&w), i64::MAX);
         let distinct_objects: std::collections::HashSet<_> =
             got.iter().map(|f| f.o.clone()).collect();
@@ -5573,19 +5709,24 @@ mod bounded_overlay_walk_tests {
     /// deliberately excluded.
     #[test]
     fn declines_when_no_sid_or_pid_is_bound() {
-        assert!(BinaryScanOperator::bounded_overlay_walk(&None, &None).is_none());
+        assert!(BinaryScanOperator::bounded_overlay_walk(&None, &None, None).is_none());
     }
 
     /// With both bound, the subject wins (the more selective term in practice).
     #[test]
     fn prefers_subject_over_predicate() {
-        let w =
-            BinaryScanOperator::bounded_overlay_walk(&Some(sid(100, "s1")), &Some(sid(101, "p1")))
-                .expect("bracket");
+        let w = BinaryScanOperator::bounded_overlay_walk(
+            &Some(sid(100, "s1")),
+            &Some(sid(101, "p1")),
+            None,
+        )
+        .expect("bracket");
         assert_eq!(w.index, IndexType::Spot);
-        // The SPOT bracket pins the SUBJECT as its leading term.
+        // The SPOT bracket leads with the subject, then the predicate.
         assert_eq!(w.first.s, sid(100, "s1"));
         assert_eq!(w.rhs.s, sid(100, "s1"));
+        assert_eq!(w.first.p, sid(101, "p1"));
+        assert_eq!(w.rhs.p, sid(101, "p1"));
     }
 }
 
@@ -5976,10 +6117,20 @@ mod tests {
         // both its arms (subject/SPOT and predicate/PSOT) construct `rhs`
         // through the same closure, but assert each so de-fusing them can't
         // drop the pin from one.
-        let walk = BinaryScanOperator::bounded_overlay_walk(&Some(s), &None)
+        let walk = BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &None, None)
             .expect("bound subject must produce a bracketed walk");
         assert_pinned("bounded_overlay_walk (subject bracket)", &walk.rhs);
-        let walk = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p.clone()))
+        let object = FlakeValue::Ref(Sid::new(7, "target"));
+        for bound in [None, Some(&object)] {
+            let walk =
+                BinaryScanOperator::bounded_overlay_walk(&Some(s.clone()), &Some(p.clone()), bound)
+                    .expect("bound subject and predicate must produce a bracketed walk");
+            assert_pinned(
+                "bounded_overlay_walk (subject+predicate bracket)",
+                &walk.rhs,
+            );
+        }
+        let walk = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p.clone()), None)
             .expect("bound predicate must produce a bracketed walk");
         assert_pinned("bounded_overlay_walk (predicate bracket)", &walk.rhs);
 

@@ -111,6 +111,7 @@ pub mod policy_view;
 pub mod profile;
 pub mod query;
 pub mod rdf;
+pub mod reasoning_index;
 mod rebase;
 pub mod remote_service;
 pub mod retention;
@@ -273,7 +274,7 @@ pub use tx::{
 pub use tx_builder::{GraphPayload, OwnedTransactBuilder, RefTransactBuilder, Staged};
 pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
-    ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
+    ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput, ReadView,
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
 };
 
@@ -373,6 +374,10 @@ pub use fluree_db_iceberg::DeleteConvention;
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
+pub use fluree_db_core::reasoning_index::ReasoningIndexes;
+pub use reasoning_index::GenerationRetention;
+#[cfg(not(target_arch = "wasm32"))]
+pub use reasoning_index::{ReasoningIndexWorker, RefreshOutcome};
 
 #[cfg(feature = "iceberg")]
 pub use materialize_worker::{
@@ -834,6 +839,19 @@ impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().get_config(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::ReasoningIndexesLookup for NameServiceMode {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<
+        Option<fluree_db_nameservice::ReasoningIndexes>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().get_reasoning_indexes(ledger_id).await
     }
 }
 
@@ -3714,6 +3732,7 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             identity,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            reasoning_index_state: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             leader_indexer: Arc::default(),
             retention,
@@ -4095,6 +4114,8 @@ pub struct Fluree {
     identity: fluree_db_iceberg::IdentityContext,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
+    /// Reasoning indexes being refreshed, and generations loaded for serving.
+    reasoning_index_state: Arc<reasoning_index::ReasoningIndexState>,
     /// On a cluster member: the indexer its leader role builds with.
     #[cfg(not(target_arch = "wasm32"))]
     leader_indexer: Arc<admin::LeaderIndexer>,
@@ -4184,6 +4205,7 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            reasoning_index_state: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             leader_indexer: Arc::default(),
             retention,
@@ -5511,6 +5533,7 @@ impl Fluree {
         self.expire_erasures();
         for holder in holders {
             self.disconnect_ledger(holder).await;
+            self.reasoning_index_state.forget_loaded(holder);
         }
         self.clear_decoded();
         if let Some(runtime) = self.retention.erasure.get() {

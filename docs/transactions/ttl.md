@@ -4,6 +4,27 @@ A value can carry a lifetime. When the lifetime ends, a background retention wor
 
 TTL is opt-in per ledger. A ledger that never writes a lifetime and never configures one takes the same write and query paths it always has: nothing checks expiry while you transact or query.
 
+## When to use it
+
+Use TTL for data with a known end, so that no client has to remember to delete it:
+
+- sessions, one-time codes and short-lived tokens;
+- locks, leases and presence flags that should lapse unless renewed;
+- cached or derived values that go stale;
+- offers, holds and reservations with a deadline;
+- readings and events kept for a fixed window ("30 days of telemetry").
+
+TTL automates a delete, and nothing more. It does not remove the value from history or the commit log, and it is eventual: a value can outlive its deadline by a retention pass. It is the wrong tool when:
+
+| You need | Use |
+|---|---|
+| The expired value gone from time travel too | TTL together with [`f:noHistory`](history-retention.md#fnohistory) on the predicate |
+| A value unreadable at an exact instant | A deadline checked in the query or a [policy](../security/policy-in-queries.md) |
+| A specific value withdrawn now, history included | [Targeted removal](history-retention.md#targeted-removal) |
+| The data destroyed | [Permanent erasure](permanent-erasure.md) |
+
+[Data lifecycle](../concepts/data-lifecycle.md) compares these, and the [retention cookbook](../guides/cookbook-retention.md#time-to-live) has worked examples.
+
 ## Giving a value a lifetime
 
 A lifetime is named `ttl` and a deadline `expiresAt` everywhere: `@ttl` and `@expiresAt` in JSON-LD shorthand, `f:ttl` and `f:expiresAt` in annotations, transaction defaults and config, and `fluree.ttl` and `fluree.expiresAt` in Cypher. A lifetime is whole seconds or a fixed duration such as `"PT1H"` on every surface.
@@ -212,4 +233,10 @@ Commits and annotations written before a ledger's first TTL-aware write are not 
 - **List occurrences** cannot carry annotations, so they cannot carry a TTL.
 - **Not erasure.** Expiration retracts current state. History, the commit log and backups still hold the value. To stop serving a value's history, see [History retention](history-retention.md).
 
-See [Setting groups: retention defaults](../ledger-config/setting-groups.md#retention-defaults) for the config schema.
+## Related documentation
+
+- [Cookbook: expiring data and trimming history](../guides/cookbook-retention.md): sessions, leases, deadlines, property defaults, and checking that expiry runs
+- [Setting groups: retention defaults](../ledger-config/setting-groups.md#retention-defaults): the config schema
+- [History retention](history-retention.md): `f:noHistory` and targeted removal
+- [Data lifecycle](../concepts/data-lifecycle.md): choosing between expiry, history rules, removal and erasure
+- [Edge annotations](../concepts/edge-annotations.md): where a TTL instruction is stored

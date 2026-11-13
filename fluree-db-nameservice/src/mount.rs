@@ -279,6 +279,19 @@ impl ConfigLookup for CompositeNameService {
     }
 }
 
+#[async_trait]
+impl crate::ReasoningIndexesLookup for CompositeNameService {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
+        match self.mount_for(ledger_id) {
+            Some((mount, remote)) => mount.lookup.get_reasoning_indexes(remote).await,
+            None => self.local.get_reasoning_indexes(ledger_id).await,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Write surface: reject mounted aliases, delegate the rest to local
 // ---------------------------------------------------------------------------
@@ -504,6 +517,28 @@ impl ConfigPublisher for CompositeNameService {
         self.local
             .push_config_fenced(ledger_id, fence, expected, new)
             .await
+    }
+}
+
+#[async_trait]
+impl crate::ReasoningIndexesPublisher for CompositeNameService {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected_v: i64,
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.local.max_reasoning_indexes_bytes()
     }
 }
 

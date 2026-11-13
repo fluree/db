@@ -473,11 +473,15 @@ No. Querying a historical state uses the same indexes as querying the current st
 Yes — immutability means retracted values are preserved. Storage grows with the number of changes, not just the current state size. For most workloads this is negligible.
 
 **Can I delete history?**
-No. Immutability is a core guarantee. If you need to remove data for compliance (e.g., GDPR right to erasure), contact the Fluree team about data compaction options.
+Not with a transaction: a delete is a retraction, and history keeps the value. Three administrative features change what history holds, each opt-in. [`f:noHistory`](../transactions/history-retention.md#fnohistory) keeps only a predicate's current values in the index. A [targeted removal](../transactions/history-retention.md#targeted-removal) makes the ledger refuse historical reads of chosen values (`410`), with the commit log kept for audit. [Permanent erasure](../transactions/permanent-erasure.md) destroys chosen values, for a right-to-erasure request for example, and proves the rest of each commit is unchanged. See [Data lifecycle](../concepts/data-lifecycle.md) to choose, and the [retention](cookbook-retention.md) and [erasure](cookbook-erasure.md) cookbooks for the steps.
+
+**Why did a historical query return `410 HistoryUnavailable`, or fewer values than I expected?**
+The ledger uses one of those features. A `410` means the read could return a value a removal or erasure took out. That includes any read of the past with a variable predicate, such as `?s ?p ?o` or `fluree history <entity>` without `-p`: name the predicates and it is answered again (see [what still works in history](cookbook-retention.md#what-still-works-in-history-afterwards)). Fewer values, with no error, means the predicate is under an `f:noHistory` rule. `GET /v1/fluree/retention/{ledger}` shows a ledger's rules and how many removals it has.
 
 ## Related documentation
 
 - [Time Travel Concepts](../concepts/time-travel.md) — Architecture, event vs. recorded axis, read-after-write
+- [Data lifecycle](../concepts/data-lifecycle.md) — What expiry, history rules, removal and erasure change about reading the past
 - [SPARQL Reference](../query/sparql.md#history-queries) — RDF-star history syntax
 - [JSON-LD Query](../query/jsonld-query.md) — `@t` / `@op` annotations
 - [Datasets and named graphs](../query/datasets.md) — Structured `from`, `txn-meta`

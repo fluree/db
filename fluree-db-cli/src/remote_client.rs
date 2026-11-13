@@ -2199,6 +2199,26 @@ impl RemoteLedgerClient {
         self.post_ledger_op(&url, ledger, "sweep").await
     }
 
+    /// A reasoning-index operation: `POST {base_url}/reasoning-indexes/{op}` with
+    /// `{"ledger", ...body}`.
+    pub async fn reasoning_indexes(
+        &self,
+        op: &str,
+        ledger: &str,
+        mut body: serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("reasoning-indexes/{op}"));
+        body["ledger"] = serde_json::Value::String(ledger.to_string());
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+            Self::REINDEX_TIMEOUT,
+        )
+        .await
+    }
+
     /// POST a `{"ledger": ...}` body to an admin operation and decode the
     /// response.
     ///

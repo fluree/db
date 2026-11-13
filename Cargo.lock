@@ -3475,6 +3475,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "ulid",
  "wasm-bindgen-futures",
  "wiremock",
  "xxhash-rust",
@@ -4247,6 +4248,7 @@ dependencies = [
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -774,7 +774,25 @@ pub async fn release_garbage_plan(
     let shared_blobs = match sibling_candidates {
         Some(candidates) => {
             match super::current_sibling_heads(nameservice, ledger_id, candidates).await {
-                Ok(siblings) => super::shared_blob_policy_for(backend, &siblings, ledger_id).await,
+                Ok(siblings) => {
+                    let policy = super::shared_blob_policy_for(backend, &siblings, ledger_id).await;
+                    // Reasoning indexes of this branch and its siblings share the
+                    // dictionaries too, through every retained generation.
+                    let mut participants = siblings;
+                    participants.push(super::BranchIndexHead {
+                        ledger_id: ledger_id.clone(),
+                        namespace: namespace.clone(),
+                        index_head_id: Some(head.clone()),
+                    });
+                    with_reasoning_index_refs(
+                        policy,
+                        backend,
+                        nameservice,
+                        &participants,
+                        ledger_id,
+                    )
+                    .await
+                }
                 Err(e) => {
                     tracing::warn!(
                         ledger_id = %ledger_id,
@@ -789,6 +807,46 @@ pub async fn release_garbage_plan(
     };
     let store = backend.content_store(&namespace);
     plan.release(store.as_ref(), &head, &shared_blobs).await
+}
+
+/// `policy` with the dictionary blobs of `participants`' reasoning indexes
+/// added to what is referenced elsewhere; deferred when a head cannot be
+/// read.
+async fn with_reasoning_index_refs(
+    policy: SharedBlobPolicy,
+    backend: &fluree_db_core::StorageBackend,
+    nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
+    participants: &[super::BranchIndexHead],
+    ledger_id: &fluree_db_core::LedgerId,
+) -> SharedBlobPolicy {
+    let SharedBlobPolicy::Release {
+        mut referenced_elsewhere,
+    } = policy
+    else {
+        return SharedBlobPolicy::Defer;
+    };
+    match super::reasoning_indexes::shared_refs_of_branch_indexes(
+        backend,
+        nameservice,
+        participants,
+    )
+    .await
+    {
+        Ok(head_refs) => {
+            referenced_elsewhere.extend(head_refs);
+            SharedBlobPolicy::Release {
+                referenced_elsewhere,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                ledger_id = %ledger_id,
+                error = %e,
+                "could not read a reasoning index; deferring shared blobs this pass"
+            );
+            SharedBlobPolicy::Defer
+        }
+    }
 }
 
 /// Collect the whole prev-index chain, newest root first.

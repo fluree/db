@@ -8,6 +8,8 @@ mod encryption_rotation_http;
 mod export_omission_headers;
 #[path = "graph_store_http.rs"]
 mod graph_store_http;
+#[path = "reasoning_indexes_routes.rs"]
+mod reasoning_indexes_routes;
 // GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
 // this module only compiles when it is on.
 #[cfg(feature = "graphql")]

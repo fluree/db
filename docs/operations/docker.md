@@ -18,6 +18,8 @@ The official image (`fluree/server`) ships the `fluree` binary on a slim Debian 
 
 **Entrypoint behavior:** on first start, if `/var/lib/fluree/.fluree/` does not exist, the entrypoint runs `fluree init` to create a default `.fluree/config.toml` and `.fluree/storage/` directory. Subsequent starts skip init. Any arguments passed to `docker run` after the image name are forwarded to `fluree server run`, so you can append CLI flags (e.g. `--log-level debug`) directly. Server flags that `fluree server run` doesn't take itself go after `--` (e.g. `fluree/server:latest -- --cache-max-mb 4096`); see [Configuration](configuration.md).
 
+**Image variants:** each release also publishes `fluree/server:<version>-erasure` (and `latest-erasure`), the same image with the `fluree-prover` binary beside `fluree`. Run it on a server that takes [permanent erasure](../transactions/permanent-erasure.md) requests; see [Running the erasure prover](erasure-prover.md) for its memory and CPU needs. The standard image runs without a prover and refuses erasure requests.
+
 ## Quick Start
 
 ```bash

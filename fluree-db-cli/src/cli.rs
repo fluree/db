@@ -1361,6 +1361,18 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Materialized reasoning: register a reasoning program on a branch, and
+    /// list, refresh or retire its reasoning indexes
+    ///
+    /// A reasoning index contains the branch's asserted facts together with a
+    /// program's derived facts, kept current in the background; reasoning
+    /// queries that match the program are answered from it.
+    #[command(name = "reasoning-indexes")]
+    ReasoningIndexes {
+        #[command(subcommand)]
+        action: ReasoningIndexesAction,
+    },
+
     /// Reclaim index artifacts that no index chain references
     ///
     /// Deletes orphaned index blobs left behind by earlier reindexes and
@@ -1899,6 +1911,68 @@ pub enum DroppedAction {
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Reasoning-index subcommands.
+#[derive(Subcommand)]
+pub enum ReasoningIndexesAction {
+    /// Register a reasoning program for persistence
+    Register {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Reasoning modes, as a query's `reasoning` key (e.g. `owl2rl`)
+        #[arg(long, conflicts_with = "program")]
+        reasoning: Option<String>,
+
+        /// The whole program as JSON: the reasoning keys a query would carry
+        /// (`reasoning`, `rules`, `ontology`, `reasoningTime`, `@context`),
+        /// plus an optional `graph` IRI to reason against
+        #[arg(long)]
+        program: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show the branch's reasoning indexes
+    List {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Bring the branch's reasoning indexes up to its current commit now
+    Refresh {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Refresh only this index (its id)
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Stop an index from being served or refreshed
+    Retire {
+        /// The index's id
+        index: String,
+
+        /// Ledger name (defaults to active ledger)
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]

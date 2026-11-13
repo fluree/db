@@ -73,6 +73,35 @@ impl<S> std::fmt::Debug for PausedBeforeInsert<'_, S> {
 }
 
 #[async_trait]
+impl<S: LifecycleStore> crate::ReasoningIndexesLookup for PausedBeforeInsert<'_, S> {
+    async fn get_reasoning_indexes(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<crate::ReasoningIndexes>> {
+        self.inner.get_reasoning_indexes(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ReasoningIndexesPublisher for PausedBeforeInsert<'_, S> {
+    async fn push_reasoning_indexes_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<crate::Fence>,
+        expected_v: i64,
+        new: &crate::ReasoningIndexes,
+    ) -> Result<crate::ReasoningIndexesCasResult> {
+        self.inner
+            .push_reasoning_indexes_fenced(ledger_id, fence, expected_v, new)
+            .await
+    }
+
+    fn max_reasoning_indexes_bytes(&self) -> Option<usize> {
+        self.inner.max_reasoning_indexes_bytes()
+    }
+}
+
+#[async_trait]
 impl<S: LifecycleStore> LedgerRegistry for PausedBeforeInsert<'_, S> {
     async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
         self.inner.get_binding(name).await
@@ -1441,6 +1470,22 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         "push_config",
         missing,
     );
+    let heads = store
+        .get_reasoning_indexes(id)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    let next_heads = crate::ReasoningIndexes {
+        v: heads.v + 1,
+        ..heads.clone()
+    };
+    assert_refused(
+        store
+            .push_reasoning_indexes_fenced(id, fence, heads.v, &next_heads)
+            .await,
+        "push_reasoning_indexes",
+        missing,
+    );
 }
 
 /// Every write to a branch record presents the fence its writer loaded: a
@@ -2244,6 +2289,166 @@ pub async fn a_dropped_branch_reads_as_absent<S: crate::NameServicePublisher>(st
     }
     assert!(store.get_status("mydb:main").await.unwrap().is_none());
     assert!(store.get_config("mydb:main").await.unwrap().is_none());
+    assert!(store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A sample reasoning-indexes document with one active index.
+fn sample_heads(v: i64, revision: u64) -> crate::ReasoningIndexes {
+    use fluree_db_core::reasoning_index::{
+        ClockPolicy, ErasureEpoch, ReasoningIndexEntry, ReasoningIndexId, Registration,
+        RegistrationState, SemanticKey,
+    };
+    let mut indexes = std::collections::BTreeMap::new();
+    indexes.insert(
+        ReasoningIndexId::parse("01JC0000000000000000000000").unwrap(),
+        ReasoningIndexEntry {
+            registration: Registration {
+                revision,
+                semantics: SemanticKey {
+                    program: cid(fluree_db_core::ContentKind::LedgerConfig, "program"),
+                    reasoned_graph: None,
+                    clock: ClockPolicy::SnapshotCommitTime,
+                },
+                program: serde_json::json!({"reasoning": "owl2rl"}),
+                state: RegistrationState::Active,
+            },
+            floor: ErasureEpoch(0),
+            head: None,
+        },
+    );
+    crate::ReasoningIndexes { v, indexes }
+}
+
+/// A soft-dropped ledger keeps each branch's reasoning-indexes document in its
+/// entry, and a restore writes it back under the fresh fence; the old fence
+/// takes no write.
+pub async fn reasoning_indexes_survive_drop_and_restore<S: crate::NameServicePublisher>(store: &S) {
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let doc = sample_heads(1, 3);
+    store
+        .push_reasoning_indexes_fenced("mydb:main", created.fence, 0, &doc)
+        .await
+        .unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.entry.reasoning_indexes.get("main"), Some(&doc));
+    assert!(store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .is_none());
+
+    let restored = lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let fence = restored[0].fence;
+    let back = store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.indexes, doc.indexes);
+    assert_fenced(
+        store
+            .push_reasoning_indexes_fenced(
+                "mydb:main",
+                created.fence,
+                back.v,
+                &sample_heads(back.v + 1, 4),
+            )
+            .await,
+        "push_reasoning_indexes with the fence from before the drop",
+    );
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, back.v, &sample_heads(back.v + 1, 4))
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Updated
+    );
+}
+
+/// A branch's reasoning-indexes document swaps on its version under the
+/// branch fence; a conflict carries the document as it stands, and commit
+/// and index publication leave it alone.
+pub async fn reasoning_indexes_swap_on_version<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::IndexRoot;
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence;
+    let unborn = store
+        .get_reasoning_indexes("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unborn.v, 0);
+    assert!(unborn.indexes.is_empty());
+
+    let first = sample_heads(1, 1);
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 0, &first)
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Updated
+    );
+    // A writer that read v=0 loses, and is handed the current document.
+    let stale = sample_heads(1, 7);
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 0, &stale)
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Conflict {
+            actual: Some(first.clone())
+        }
+    );
+    // The version must advance.
+    assert!(matches!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 1, &sample_heads(1, 2))
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Conflict { .. }
+    ));
+
+    advance_commit(store, "mydb:main", fence, 1).await;
+    store
+        .publish_index_fenced(
+            "mydb:main",
+            WriteBasis::fenced(fence),
+            1,
+            &cid(IndexRoot, "i1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_reasoning_indexes("mydb:main").await.unwrap(),
+        Some(first.clone())
+    );
+
+    let second = sample_heads(2, 2);
+    assert_eq!(
+        store
+            .push_reasoning_indexes_fenced("mydb:main", fence, 1, &second)
+            .await
+            .unwrap(),
+        crate::ReasoningIndexesCasResult::Updated
+    );
+    assert_eq!(
+        store.get_reasoning_indexes("mydb:main").await.unwrap(),
+        Some(second)
+    );
+    assert!(store
+        .get_reasoning_indexes("other:main")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Fields a later version wrote into a binding survive this version's
@@ -2332,6 +2537,8 @@ where
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
+    reasoning_indexes_swap_on_version(&make().await).await;
+    reasoning_indexes_survive_drop_and_restore(&make().await).await;
     a_ledger_drop_takes_a_legacy_branch_with_it(&make().await).await;
 }
 
@@ -2404,6 +2611,8 @@ macro_rules! lifecycle_conformance_tests {
             an_unmirrored_branch_with_children_is_kept,
             a_rerun_migration_binds_late_legacy_records,
             a_rerun_migration_keeps_a_stopped_branch_drop_dropped,
+            reasoning_indexes_swap_on_version,
+            reasoning_indexes_survive_drop_and_restore,
             a_ledger_drop_takes_a_legacy_branch_with_it,
         );
     };

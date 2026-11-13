@@ -4205,6 +4205,16 @@ mod source_lookups_fail {
     }
 
     #[async_trait]
+    impl fluree_db_nameservice::ReasoningIndexesLookup for SourceLookupsFail {
+        async fn get_reasoning_indexes(
+            &self,
+            id: &str,
+        ) -> Result<Option<fluree_db_nameservice::ReasoningIndexes>> {
+            self.0.get_reasoning_indexes(id).await
+        }
+    }
+
+    #[async_trait]
     impl NameServiceLookup for SourceLookupsFail {
         async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
             self.0.lookup(id).await

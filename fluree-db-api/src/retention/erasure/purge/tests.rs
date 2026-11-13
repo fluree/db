@@ -906,6 +906,88 @@ async fn a_sync_does_not_publish_a_file_a_release_took() {
 }
 
 /// The files under `root` holding `needle`.
+async fn entry_of(
+    fluree: &Fluree,
+    ledger_id: &str,
+    index: &fluree_db_core::reasoning_index::ReasoningIndexId,
+) -> fluree_db_core::reasoning_index::ReasoningIndexEntry {
+    let doc = fluree.reasoning_indexes(ledger_id).await.unwrap();
+    doc.indexes[index].clone()
+}
+
+/// A reasoning index keeps a copy of its branch's facts in generations of
+/// its own, which no rewrite of the branch's index reaches, and which keep
+/// the dictionaries they name alive. A purge discards them: no file keeps
+/// the erased value, a generation built before the erasure can no longer
+/// be published, and the index is built again from the branch as it now
+/// reads.
+#[tokio::test]
+async fn a_purge_discards_the_reasoning_generations_of_a_holder() {
+    use crate::reasoning_index::RefreshOutcome;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/reasoned").await.unwrap();
+    let id = "t/reasoned:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@context": {"ex": "http://example.org/",
+                     "rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+        "@graph": [
+            {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+            {"@id": "ex:alice", "@type": "ex:Student", "ex:email": "a@secret"}
+        ]}),
+    )
+    .await;
+    let index = fluree
+        .register_reasoning_index(id, &json!({"reasoning": "owl2rl"}))
+        .await
+        .unwrap();
+    let published = |outcome: &RefreshOutcome| matches!(outcome, RefreshOutcome::Published { .. });
+    let first = fluree.refresh_reasoning_index(id, &index).await.unwrap();
+    assert!(published(&first), "{first:?}");
+    // The generation's leaves name the value by its place in the ledger's
+    // shared dictionaries, which stay for as long as a generation reaches
+    // them.
+    assert!(holding(dir.path(), "a@secret")
+        .iter()
+        .any(|f| f.to_string_lossy().contains("/@shared/dicts/")));
+    let before = entry_of(&fluree, id, &index).await;
+    assert!(before.head.is_some());
+
+    erase(&fluree, id, email("alice", "a@secret")).await;
+    let report = fluree.run_purge_pass(id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let after = entry_of(&fluree, id, &index).await;
+    assert!(after.head.is_none(), "{after:?}");
+    assert!(after.floor > before.floor, "{after:?}");
+
+    // Built again, at the epoch the purge raised the floor to, and served.
+    let again = fluree.refresh_reasoning_index(id, &index).await.unwrap();
+    assert!(published(&again), "{again:?}");
+    let rebuilt = entry_of(&fluree, id, &index).await;
+    assert_eq!(rebuilt.head.expect("published").basis.epoch, after.floor);
+    let response = fluree
+        .graph(id)
+        .query()
+        .jsonld(&json!({
+            "select": "?s",
+            "where": {"@id": "?s", "@type": "http://example.org/Person"},
+            "reasoning": "owl2rl"
+        }))
+        .track_all()
+        .execute_tracked()
+        .await
+        .unwrap();
+    assert!(response.reasoning.unwrap().index.is_some());
+}
+
 fn holding(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     let mut dirs = vec![root.to_path_buf()];

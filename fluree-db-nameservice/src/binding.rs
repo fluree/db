@@ -311,6 +311,15 @@ pub struct DroppedLedger {
     /// restore then has none to reinstate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configs: Option<std::collections::BTreeMap<String, ConfigValue>>,
+    /// Each branch's reasoning-indexes document, by branch, as it was when the
+    /// ledger was dropped; a restore writes it back under the fresh fences.
+    /// The heads' files stay under the instance root meanwhile.
+    #[serde(
+        rename = "reasoningIndexes",
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub reasoning_indexes: std::collections::BTreeMap<String, crate::ReasoningIndexes>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -327,6 +336,8 @@ struct DroppedLedgerFields {
     branches: Vec<NsRecord>,
     #[serde(default)]
     configs: Option<std::collections::BTreeMap<String, ConfigValue>>,
+    #[serde(rename = "reasoningIndexes", default)]
+    reasoning_indexes: std::collections::BTreeMap<String, crate::ReasoningIndexes>,
     #[serde(flatten)]
     extra: ExtraFields,
 }
@@ -343,6 +354,7 @@ impl From<DroppedLedgerFields> for DroppedLedger {
             root_branch: f.root_branch,
             branches: f.branches,
             configs: f.configs,
+            reasoning_indexes: f.reasoning_indexes,
         }
     }
 }
@@ -679,6 +691,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                 ),
+                reasoning_indexes: Default::default(),
             };
             let json = serde_json::to_string(&entry).unwrap();
             assert_eq!(serde_json::from_str::<DroppedLedger>(&json).unwrap(), entry);
@@ -702,6 +715,7 @@ mod tests {
             root_branch: "main".into(),
             branches: vec![record],
             configs: Some(Default::default()),
+            reasoning_indexes: Default::default(),
         };
         let mut json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["configs"], json!({}));

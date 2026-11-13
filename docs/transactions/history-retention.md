@@ -9,6 +9,22 @@ Neither is erasure: the commit log, backups and copies of the log still hold the
 
 Ledgers that use neither feature behave exactly as before. `f:noHistory` changes only what the index holds: queries take the same paths, and commit log reads need no extra permission unless a removal was made.
 
+## When to use each
+
+| | `f:noHistory` | Targeted removal |
+|---|---|---|
+| Purpose | Stop accumulating history nobody reads | Withdraw specific values from everything the ledger serves |
+| Typical data | Counters, heartbeats, last-seen times, sync cursors, cached scores | A secret written to the wrong field, another customer's data, a value under a takedown order |
+| Scope | A predicate, ledger-wide or per graph | Chosen occurrences of chosen facts |
+| Set by | Ledger config, as a standing rule | An admin request, once |
+| Historical reads | Answered, with less in them | Refused with `410` where they could return the value |
+| Raw commit access | Unchanged | Needs an audit permission from then on |
+| Undone by | Turning the rule off, for history written afterwards | Nothing |
+
+Use `f:noHistory` for cost: a predicate that changes constantly makes the index grow with every change, and time travel over it is rarely meaningful. Use targeted removal for exposure: a value that must not be read again, where the commit log should stay intact and auditable. If the value has to be destroyed, not only withheld, use [permanent erasure](permanent-erasure.md), which starts with a removal.
+
+The [retention cookbook](../guides/cookbook-retention.md) has worked examples of both, and [Data lifecycle](../concepts/data-lifecycle.md) compares them with TTL and erasure.
+
 ## `f:noHistory`
 
 Set `f:noHistory true` on a predicate's entry in the ledger's [retention defaults](../ledger-config/setting-groups.md#retention-defaults):
@@ -62,19 +78,24 @@ The [geospatial](../indexing-and-search/geospatial.md#s2-spatial-index-complex-g
 
 ## Targeted removal
 
-`POST /v1/fluree/remove/{ledger}` removes selected occurrences. The endpoint is admin-protected. The request selects facts, or names occurrences directly:
+`POST /v1/fluree/remove/{ledger}` removes selected occurrences. The endpoint is admin-protected: where the server requires admin authentication, send an admin token, whose identity is recorded with the removal. The request selects facts, or names occurrences directly:
 
-```json
-{
-  "matching": [
-    {
-      "subject": "https://example.org/alice",
-      "predicate": "https://example.org/email",
-      "object": "alice@old.example"
-    }
-  ]
-}
+```bash
+curl -X POST http://localhost:8090/v1/fluree/remove/mydb:main \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin token>' \
+  -d '{
+    "matching": [
+      {
+        "subject": "https://example.org/alice",
+        "predicate": "https://example.org/email",
+        "object": "alice@old.example"
+      }
+    ]
+  }'
 ```
+
+From Rust, use `Fluree::remove_occurrences(ledger_id, request)`. There is no dry run, and a removal cannot be undone: query the ledger's history for the fact first, and check the selectors against what it returns.
 
 | Field | Description |
 |---|---|
@@ -102,7 +123,9 @@ The removal is complete when the request returns: the journal records it and the
 After the removal:
 
 - Current queries no longer see the value, because it was retracted.
-- A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`. A Cypher query, and a query under the RDF list view (`rdfLists`), reads properties its patterns do not name, so at an earlier point either is refused when any removal covers that point. A read whose pattern has a different constant subject is still answered, as is one that never touches the predicate. This stays true after the occurrence's commit is [permanently erased](permanent-erasure.md), since the journal records the occurrence's subject itself.
+- A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`: a read as of an earlier point, or a history range, that falls in the occurrence's span and whose patterns could touch it. This stays true after the occurrence's commit is [permanently erased](permanent-erasure.md), since the journal records the occurrence's subject itself.
+- A historical read that cannot be tied to named predicates is refused whenever any removal covers its point or range, whatever subject it asks about. That is a pattern with a variable predicate (`?s ?p ?o`), a graph crawl (`select {"?s": ["*"]}`), a wildcard or multi-step property path, a Cypher query, a query under the RDF list view (`rdfLists`), and a query under reasoning. `fluree history <entity>` without `-p` is such a read.
+- A historical read whose patterns name their predicates is still answered when none of them is a removed predicate, or when the pattern's subject is a constant other than the removed occurrence's. So is every read as of the head, and every read at a point outside the removed occurrences' spans.
 - Other occurrences of the fact are unaffected. So is the same value asserted again later: that is a new occurrence.
 
 ## Search indexes and exports
@@ -202,3 +225,12 @@ A targeted removal becomes visible to historical reads when its journal update p
 Incremental pulls must synchronize changes to commits the receiver already holds, even when both heads are equal. Origin-based CLI pulls use an erasure-aware pack discovery round before falling back to individual object fetches. An origin that cannot provide that discovery produces an error instead of an “already up to date” claim; configure a pack-capable origin to continue.
 
 New erasure maps record the namespaces holding each original at publication, and later copies register their addresses. An unrelated ledger's transfer therefore performs no probes for those erased commits. Older maps without ownership metadata retain conservative discovery probes.
+
+## Related documentation
+
+- [Cookbook: expiring data and trimming history](../guides/cookbook-retention.md): worked examples of `f:noHistory` and targeted removal
+- [Data lifecycle](../concepts/data-lifecycle.md): choosing between expiry, history rules, removal and erasure
+- [Time to live (TTL)](ttl.md): expiring current values
+- [Permanent erasure](permanent-erasure.md): replacing the commits themselves
+- [Setting groups: retention defaults](../ledger-config/setting-groups.md#retention-defaults): the config schema
+- [Authentication: audit scopes](../security/authentication.md#scope-claims): the claims raw reads need after a removal

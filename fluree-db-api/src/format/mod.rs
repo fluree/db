@@ -364,6 +364,10 @@ pub fn format_results(
     snapshot: &LedgerSnapshot,
     config: &FormatterConfig,
 ) -> Result<JsonValue> {
+    let snapshot = result
+        .read_view
+        .as_ref()
+        .map_or(snapshot, |v| v.snapshot.as_ref());
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(
         config.format,
@@ -568,10 +572,14 @@ fn format_ask(result: &QueryResult, config: &FormatterConfig) -> Option<Result<J
 ///
 /// A `serde_json::Value` containing the formatted results
 ///
-/// # Policy Support
+/// # The state and policy a crawl renders from
 ///
-/// When `policy` is `Some`, hydration queries filter flakes according to view policies.
-/// When `policy` is `None`, no filtering is applied (zero overhead for the common case).
+/// A result a view query produced carries the state it read
+/// ([`QueryResult::read_view`]), and is formatted from that state under the
+/// policy that judged its rows, in place of `db` and `policy`: a crawl cannot
+/// show what the query's own policy hid, whichever view the caller passes.
+/// `policy` decides only for a result whose query ran under none, where
+/// `Some` filters the flakes hydration fetches and `None` filters nothing.
 pub async fn format_results_async(
     result: &QueryResult,
     context: &ParsedContext,
@@ -580,6 +588,15 @@ pub async fn format_results_async(
     policy: Option<&fluree_db_policy::PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
+    let db = result
+        .read_view
+        .as_ref()
+        .map_or(db, crate::view::ReadView::as_graph_db_ref);
+    let policy = result
+        .read_view
+        .as_ref()
+        .and_then(|v| v.policy())
+        .or(policy);
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(config.format, OutputFormat::Tsv | OutputFormat::Csv) {
         return Err(FormatError::InvalidBinding(format!(
@@ -677,7 +694,8 @@ pub async fn format_results_async(
 /// ledger's own policy (issue #1259). Non-hydration output (flat SELECT,
 /// CONSTRUCT, ASK) is dict-independent for cross-ledger IRIs — those carry
 /// `IriMatch.iri` — so it formats against the dataset's primary view exactly as
-/// before.
+/// before. A one-graph dataset formats as [`format_results_async`] does for
+/// its graph, from the state the query read.
 pub async fn format_results_async_dataset(
     result: &QueryResult,
     context: &ParsedContext,
@@ -701,6 +719,22 @@ pub async fn format_results_async_dataset(
             return Err(FormatError::InvalidBinding(
                 "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
             ));
+        }
+        // A one-graph dataset's query records the state it read, with the
+        // policy that judged its rows: its crawl renders from that state, as
+        // the single-view formatter does, not from the member as stored.
+        let one_graph =
+            dataset.default.len() == 1 && dataset.named.is_empty() && !dataset.is_history_mode();
+        if let (true, Some(_), Some(primary)) = (one_graph, &result.read_view, dataset.primary()) {
+            return format_results_async(
+                result,
+                context,
+                primary.as_graph_db_ref(),
+                config,
+                primary.policy(),
+                tracker,
+            )
+            .await;
         }
         let v = hydration::format_async_dataset(result, dataset, context, config, tracker).await?;
         return if result.output.is_select_one() {
@@ -737,10 +771,11 @@ pub async fn format_results_async_dataset(
 ///
 /// Required for hydration queries. For other queries, can use sync version.
 ///
-/// # Policy Support
+/// # The state and policy a crawl renders from
 ///
-/// When `policy` is `Some`, hydration queries filter flakes according to view policies.
-/// When `policy` is `None`, no filtering is applied (zero overhead).
+/// As [`format_results_async`]: a result that carries the state its query
+/// read is formatted from it, under the policy that judged its rows. `policy`
+/// decides only for a result whose query ran under none.
 pub async fn format_results_string_async(
     result: &QueryResult,
     context: &ParsedContext,
@@ -873,6 +908,8 @@ mod tests {
             batches: vec![],
             binary_graph: None,
             from_graph_source: false,
+            reasoned_overlay: None,
+            read_view: None,
             advisories: Vec::new(),
         }
     }
@@ -1040,6 +1077,8 @@ mod tests {
             batches: vec![batch],
             binary_graph: None,
             from_graph_source: false,
+            reasoned_overlay: None,
+            read_view: None,
             advisories: Vec::new(),
         }
     }

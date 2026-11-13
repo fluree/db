@@ -63,7 +63,8 @@ per-call, two checks repeat **per statement**:
 The verified identity (`fluree.identity` claim, else `sub`) drives
 [data policies](../guides/cookbook-policies.md) exactly as over HTTP:
 reads are policy-filtered per flake (including node hydration for
-`RETURN n`), writes enforce `f:modify` at staging, and the identity is
+`RETURN n`, which under reasoning renders the labels and properties the
+query derived), writes enforce `f:modify` at staging, and the identity is
 recorded as `f:identity` on commits for provenance. Bolt deliberately
 carries **no policy knobs** (HTTP's `policy-class` / `default-allow`
 headers have no Bolt equivalent): policy derives entirely from the

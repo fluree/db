@@ -564,6 +564,11 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             );
         }
 
+        if let Some(raw) = self.ast.pragmas.reasoning_freshness.as_deref() {
+            modes.freshness = fluree_db_query::ir::ReasoningFreshness::parse(raw.trim())
+                .map_err(|e| LowerError::invalid_pragma("reasoning-freshness", e, self.ast.span))?;
+        }
+
         if modes == ReasoningModes::default() {
             return Ok(ReasoningConfig::default());
         }

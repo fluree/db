@@ -2344,7 +2344,6 @@ async fn streaming_graph_source_uses_real_r2rml_provider() {
     let (tx, mut rx) = mpsc::channel(1024);
     fluree
         .run_stream_query(
-            ledger,
             plan,
             Tracker::disabled(),
             QueryExecutionOptions::default(),

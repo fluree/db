@@ -117,6 +117,11 @@ pub const ATTR_STATUS_META: &str = "status_meta";
 // ── Common attributes ───────────────────────────────────────────────────────
 /// Last update timestamp (epoch milliseconds)
 pub const ATTR_UPDATED_AT_MS: &str = "updated_at_ms";
+/// The branch's reasoning-indexes document, as JSON, on the status item: it
+/// carries the branch fence and frozen flag, and exists for every record.
+pub const ATTR_REASONING_INDEXES: &str = "reasoning_indexes";
+/// The reasoning-indexes document's compare-and-swap version; absent = 0.
+pub const ATTR_REASONING_INDEXES_V: &str = "reasoning_indexes_v";
 /// Schema version number
 pub const ATTR_SCHEMA: &str = "schema";
 /// Current schema version

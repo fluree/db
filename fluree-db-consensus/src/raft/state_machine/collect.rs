@@ -343,6 +343,7 @@ mod tests {
         spare(&mut state, 0, "x");
         let bytes = state.to_snapshot().unwrap();
         assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
-        assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());
+        let damaged = NameServiceState::cut_within_erasure_state(&bytes);
+        assert!(NameServiceState::from_snapshot(damaged).is_err());
     }
 }

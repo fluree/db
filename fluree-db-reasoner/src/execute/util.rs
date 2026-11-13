@@ -18,6 +18,7 @@ use hashbrown::HashMap;
 
 use super::delta::DeltaSet;
 use super::derived::DerivedSet;
+use super::known::Known;
 use crate::same_as::SameAsTracker;
 use crate::ReasoningDiagnostics;
 
@@ -60,7 +61,7 @@ pub struct IdentityRuleState {
 /// * `diagnostics` - Diagnostic counters for rule firings
 pub struct RuleContext<'a> {
     pub delta: &'a DeltaSet,
-    pub derived: &'a DerivedSet,
+    pub derived: Known<'a>,
     pub new_delta: &'a mut DeltaSet,
     pub same_as: &'a SameAsTracker,
     pub rdf_type_sid: &'a Sid,

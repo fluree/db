@@ -99,6 +99,7 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             capped_rules: Vec::new(),
             pending_rules: Vec::new(),
             evaluation_time: None,
+            index: None,
         }
     }
 }
@@ -562,6 +563,19 @@ pub struct NameServiceState {
     /// The log index of the membership in force: what a check of every
     /// member, such as collection's enabling, is bound to.
     pub membership_index: u64,
+    /// Per-`name:branch` reasoning-indexes documents, as JSON. Appended after
+    /// every field above, so a snapshot taken before them still decodes
+    /// through [`NameServiceStateV3`].
+    pub reasoning_indexes: HashMap<String, StoredReasoningIndexes>,
+}
+
+/// A branch's reasoning-indexes document: its compare-and-swap version and the
+/// document as JSON, which postcard cannot carry structurally (it holds
+/// internally tagged enums and open JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReasoningIndexes {
+    pub v: i64,
+    pub json: String,
 }
 
 /// A name binding or dropped-ledger entry: its version, and the value as
@@ -636,34 +650,6 @@ struct NameServiceStateV1 {
     configured_voters: BTreeSet<NodeId>,
 }
 
-impl From<NameServiceStateV1> for NameServiceState {
-    fn from(v1: NameServiceStateV1) -> Self {
-        Self {
-            refs: v1.refs,
-            ledgers: v1.ledgers,
-            retracted: v1.retracted,
-            idempotency: v1.idempotency,
-            queues: v1.queues,
-            next_queue_id: v1.next_queue_id,
-            recently_cleared: v1.recently_cleared,
-            evicted_idempotency_count: v1.evicted_idempotency_count,
-            queue_config: v1.queue_config,
-            status: v1.status,
-            config: v1.config,
-            graph_sources: v1.graph_sources,
-            worker_eligible_voters: v1.worker_eligible_voters,
-            configured_voters: v1.configured_voters,
-            bindings: HashMap::new(),
-            dropped: HashMap::new(),
-            fences: HashMap::new(),
-            erasure: ErasureState::default(),
-            collect: CollectState::default(),
-            erasure_cleanup: CleanupState::default(),
-            membership_index: 0,
-        }
-    }
-}
-
 /// [`NameServiceState`] as snapshotted before erasure state.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
@@ -687,9 +673,65 @@ struct NameServiceStateV2 {
     fences: HashMap<RefKey, FenceState>,
 }
 
+/// [`NameServiceState`] as snapshotted before reasoning indexes.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV3 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+    bindings: HashMap<String, VersionedJson>,
+    dropped: HashMap<String, VersionedJson>,
+    fences: HashMap<RefKey, FenceState>,
+    erasure: ErasureState,
+    collect: CollectState,
+    erasure_cleanup: CleanupState,
+    membership_index: u64,
+}
+
+impl From<NameServiceStateV3> for NameServiceState {
+    fn from(v3: NameServiceStateV3) -> Self {
+        Self {
+            refs: v3.refs,
+            ledgers: v3.ledgers,
+            retracted: v3.retracted,
+            idempotency: v3.idempotency,
+            queues: v3.queues,
+            next_queue_id: v3.next_queue_id,
+            recently_cleared: v3.recently_cleared,
+            evicted_idempotency_count: v3.evicted_idempotency_count,
+            queue_config: v3.queue_config,
+            status: v3.status,
+            config: v3.config,
+            graph_sources: v3.graph_sources,
+            worker_eligible_voters: v3.worker_eligible_voters,
+            configured_voters: v3.configured_voters,
+            bindings: v3.bindings,
+            dropped: v3.dropped,
+            fences: v3.fences,
+            erasure: v3.erasure,
+            collect: v3.collect,
+            erasure_cleanup: v3.erasure_cleanup,
+            membership_index: v3.membership_index,
+            reasoning_indexes: HashMap::new(),
+        }
+    }
+}
+
 impl From<NameServiceStateV2> for NameServiceState {
     fn from(v2: NameServiceStateV2) -> Self {
-        Self {
+        NameServiceStateV3 {
             refs: v2.refs,
             ledgers: v2.ledgers,
             retracted: v2.retracted,
@@ -712,6 +754,32 @@ impl From<NameServiceStateV2> for NameServiceState {
             erasure_cleanup: CleanupState::default(),
             membership_index: 0,
         }
+        .into()
+    }
+}
+
+impl From<NameServiceStateV1> for NameServiceState {
+    fn from(v1: NameServiceStateV1) -> Self {
+        NameServiceStateV2 {
+            refs: v1.refs,
+            ledgers: v1.ledgers,
+            retracted: v1.retracted,
+            idempotency: v1.idempotency,
+            queues: v1.queues,
+            next_queue_id: v1.next_queue_id,
+            recently_cleared: v1.recently_cleared,
+            evicted_idempotency_count: v1.evicted_idempotency_count,
+            queue_config: v1.queue_config,
+            status: v1.status,
+            config: v1.config,
+            graph_sources: v1.graph_sources,
+            worker_eligible_voters: v1.worker_eligible_voters,
+            configured_voters: v1.configured_voters,
+            bindings: HashMap::new(),
+            dropped: HashMap::new(),
+            fences: HashMap::new(),
+        }
+        .into()
     }
 }
 
@@ -966,6 +1034,14 @@ pub enum Command {
         branch: String,
         index_id: ContentId,
         index_t: i64,
+    },
+    /// Compare-and-swap a branch's reasoning-indexes document on its version.
+    /// Always wrapped in [`Command::Fenced`]. (Appended: variants are
+    /// positional in the log.)
+    PushReasoningIndexes {
+        ledger_id: String,
+        expected_v: i64,
+        new: StoredReasoningIndexes,
     },
 }
 
@@ -1651,6 +1727,13 @@ pub enum Response {
     /// [`CollectCommand::Enable`] checked the members of a membership since
     /// replaced (`current` is its log index); nothing changed.
     MembershipMoved { current: u64 },
+    /// [`Command::PushReasoningIndexes`] wrote the document.
+    ReasoningIndexesUpdated,
+    /// [`Command::PushReasoningIndexes`] found another version; `actual` is
+    /// `None` when the branch is not registered.
+    ReasoningIndexesConflict {
+        actual: Option<StoredReasoningIndexes>,
+    },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1744,6 +1827,16 @@ impl NameServiceState {
         .expect("a state encodes")
     }
 
+    /// `snapshot`, of a state with no reasoning indexes, cut short within
+    /// its erasure state: without the empty reasoning-indexes map appended
+    /// after it (one byte), and one byte more. Cut after the erasure state
+    /// exactly, it would be a whole snapshot of the layout before, and
+    /// restore the same state.
+    #[cfg(test)]
+    pub(crate) fn cut_within_erasure_state(snapshot: &[u8]) -> &[u8] {
+        &snapshot[..snapshot.len() - 2]
+    }
+
     /// Restore state machine state from snapshot bytes produced by
     /// [`Self::to_snapshot`].
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
@@ -1760,8 +1853,9 @@ impl NameServiceState {
         }
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => whole::<NameServiceStateV2>(bytes)
+            Err(e) => whole::<NameServiceStateV3>(bytes)
                 .map(Self::from)
+                .or_else(|| whole::<NameServiceStateV2>(bytes).map(Self::from))
                 .or_else(|| whole::<NameServiceStateV1>(bytes).map(Self::from))
                 .ok_or(e.into()),
         }
@@ -1846,6 +1940,7 @@ fn fenced_branch(command: &Command) -> Option<RefKey> {
         Command::CompareAndSetRef(args) => Some(RefKey::new(&args.ledger_id, &args.branch)),
         Command::PushStatus { ledger_id, .. } => of_id(ledger_id),
         Command::PushConfig(args) => of_id(&args.ledger_id),
+        Command::PushReasoningIndexes { ledger_id, .. } => of_id(ledger_id),
         _ => None,
     }
 }
@@ -1909,6 +2004,11 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             } = *args;
             apply_versioned_push(&state.ledgers, &mut state.config, ledger_id, expected, new)
         }
+        Command::PushReasoningIndexes {
+            ledger_id,
+            expected_v,
+            new,
+        } => apply_push_reasoning_indexes(state, ledger_id, expected_v, new),
         Command::PublishGraphSource {
             name,
             branch,
@@ -2169,6 +2269,7 @@ fn delete_branch(
     state.fences.remove(&key);
     state.status.remove(&full);
     state.config.remove(&full);
+    state.reasoning_indexes.remove(&full);
     if let Some(ledger) = state.ledgers.get_mut(&key.ledger_name) {
         ledger.branches.retain(|b| b != &key.branch);
         if ledger.branches.is_empty() {
@@ -2909,6 +3010,38 @@ fn apply_versioned_push<T: VersionedValue>(
     }
     values.insert(ledger_id, new);
     T::updated()
+}
+
+/// [`Command::PushReasoningIndexes`]: the version check only. An absent
+/// document reads as version 0; the publication rules run in the proposer.
+fn apply_push_reasoning_indexes(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    expected_v: i64,
+    new: StoredReasoningIndexes,
+) -> Response {
+    let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
+        return Response::ReasoningIndexesConflict { actual: None };
+    };
+    let registered = state
+        .ledgers
+        .get(&name)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !registered {
+        return Response::ReasoningIndexesConflict { actual: None };
+    }
+    let current = state.reasoning_indexes.get(&ledger_id).cloned();
+    let current_v = current.as_ref().map_or(0, |c| c.v);
+    if current_v != expected_v || new.v <= current_v {
+        return Response::ReasoningIndexesConflict {
+            actual: Some(current.unwrap_or(StoredReasoningIndexes {
+                v: 0,
+                json: String::new(),
+            })),
+        };
+    }
+    state.reasoning_indexes.insert(ledger_id, new);
+    Response::ReasoningIndexesUpdated
 }
 
 fn apply_publish_graph_source(
@@ -4494,6 +4627,62 @@ mod tests {
         );
         let restored = NameServiceState::from_snapshot(&state.to_snapshot().unwrap()).unwrap();
         assert_eq!(restored.bindings.len(), 1);
+    }
+
+    /// A snapshot taken with erasure state and before reasoning indexes
+    /// restores whole, its erasure state included.
+    #[test]
+    fn pre_reasoning_indexes_snapshot_restores() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 1);
+        state.membership_index = 9;
+        let v3 = NameServiceStateV3 {
+            refs: state.refs.clone(),
+            ledgers: state.ledgers.clone(),
+            retracted: state.retracted.clone(),
+            idempotency: state.idempotency.clone(),
+            queues: state.queues.clone(),
+            next_queue_id: state.next_queue_id,
+            recently_cleared: state.recently_cleared.clone(),
+            evicted_idempotency_count: state.evicted_idempotency_count,
+            queue_config: state.queue_config,
+            status: state.status.clone(),
+            config: state.config.clone(),
+            graph_sources: state.graph_sources.clone(),
+            worker_eligible_voters: state.worker_eligible_voters.clone(),
+            configured_voters: state.configured_voters.clone(),
+            bindings: state.bindings.clone(),
+            dropped: state.dropped.clone(),
+            fences: state.fences.clone(),
+            erasure: state.erasure.clone(),
+            collect: state.collect.clone(),
+            erasure_cleanup: state.erasure_cleanup.clone(),
+            membership_index: state.membership_index,
+        };
+        let bytes = postcard::to_allocvec(&v3).unwrap();
+        assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
+
+        // A document pushed into the current layout survives a snapshot.
+        let response = apply(
+            &mut state,
+            Command::PushReasoningIndexes {
+                ledger_id: "test/db:main".into(),
+                expected_v: 0,
+                new: StoredReasoningIndexes {
+                    v: 1,
+                    json: "{\"v\":1}".into(),
+                },
+            },
+            7,
+        );
+        assert_eq!(response, Response::ReasoningIndexesUpdated);
+        let bytes = state.to_snapshot().unwrap();
+        let restored = NameServiceState::from_snapshot(&bytes).unwrap();
+        assert_eq!(restored.reasoning_indexes.len(), 1);
+        // A damaged one is refused, not restored as the layout before
+        // without its documents.
+        assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());
     }
 
     // -------------------------------------------------------------

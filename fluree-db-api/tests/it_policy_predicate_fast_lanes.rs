@@ -5,8 +5,9 @@
 //! used to decline unconditionally. Now a lane that reads exactly one
 //! statically known predicate stays on when the view set provably cannot
 //! touch that predicate (`covers_predicate` is false and the default allows),
-//! short-circuits to empty when it cannot touch it and the default denies,
-//! and falls back to the filtered path otherwise.
+//! short-circuits to empty when it cannot touch it and the default denies
+//! (unless it is a schema predicate such as `rdf:type`, whose schema facts
+//! stay visible), and falls back to the filtered path otherwise.
 //!
 //! Every case pins routing with the `fast-path outcome` stamps, not just the
 //! answer: the filtered fallback computes the same rows, so a lane that
@@ -25,10 +26,12 @@ use serde_json::{json, Value as JsonValue};
 
 const LEDGER: &str = "policy/predicate-lanes:main";
 const EX: &str = "http://example.org/ns/";
+const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const SCAN_SITE: &str = "policy_predicate_scan";
 const PROBE_SITE: &str = "policy_predicate_probe";
 
-/// Three people over a persisted index: two plain users and one admin.
+/// Three people over a persisted index: two plain users and one admin, and
+/// one schema fact (`ex:User a rdfs:Class`).
 async fn indexed_people() -> Fluree {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = genesis_ledger(&fluree, LEDGER).await;
@@ -41,8 +44,9 @@ async fn indexed_people() -> Fluree {
         .insert_with_opts(
             ledger,
             &json!({
-                "@context": {"ex": EX},
+                "@context": {"ex": EX, "rdfs": RDFS},
                 "@graph": [
+                    {"@id": "ex:User", "@type": "rdfs:Class"},
                     {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice", "ex:age": 30, "ex:ssn": "111"},
                     {"@id": "ex:bob", "@type": "ex:User", "ex:name": "Bob", "ex:age": 25, "ex:ssn": "222"},
                     {"@id": "ex:carol", "@type": "ex:Admin", "ex:name": "Carol", "ex:age": 41, "ex:ssn": "333"}
@@ -198,6 +202,36 @@ fn row_count(rows: &JsonValue) -> usize {
     rows.as_array().map(Vec::len).unwrap_or(0)
 }
 
+/// `query` under `view`, asserting no policy lane declined and one proceeded,
+/// on either site: for joins, whose type pattern may be scanned or probed.
+async fn run_unfiltered(
+    fluree: &Fluree,
+    view: &GraphDb,
+    store: &SpanStore,
+    query: impl Into<QueryInput<'_>>,
+    label: &str,
+) -> JsonValue {
+    let before = store.find_events("fast-path outcome").len();
+    let result = fluree
+        .query(view, query)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+    let rows = result.to_jsonld(&view.snapshot).expect("jsonld");
+    let seen: Vec<String> = [SCAN_SITE, PROBE_SITE]
+        .iter()
+        .flat_map(|site| outcomes(store, before, site))
+        .collect();
+    assert!(
+        seen.iter().any(|o| o == "proceed") && !seen.iter().any(|o| o == "fallback:gate_declined"),
+        "{label}: every policy lane must fire; stamps: {seen:?}"
+    );
+    rows
+}
+
+fn type_scan(class: &str) -> JsonValue {
+    json!({"@context": {"ex": EX, "rdfs": RDFS}, "select": "?s", "where": {"@id": "?s", "@type": class}})
+}
+
 /// A property rule on `ex:ssn` under an allow default: scans and probes of
 /// other predicates keep their raw-row lanes; `ex:ssn` and a wildcard
 /// predicate fall back and are filtered.
@@ -309,6 +343,112 @@ async fn property_rule_sparql_twin() {
     )
     .await;
     assert_eq!(row_count(&ssn), 0, "{ssn}");
+
+    drop(guard);
+}
+
+/// `rdf:type` is a schema predicate, but under an allow default only a rule
+/// reaching it covers it: a property rule elsewhere leaves type scans, and the
+/// joins over them, on their lanes. Schema type facts are among the rows.
+#[tokio::test(flavor = "current_thread")]
+async fn property_rule_keeps_type_lanes() {
+    let fluree = indexed_people().await;
+    let view = policed_view(&fluree, deny_ssn(), true).await;
+    let (store, guard) = init_test_tracing();
+
+    let users = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("ex:User"),
+        SCAN_SITE,
+        Lane::MustFire,
+        "scan a ex:User",
+    )
+    .await;
+    assert_eq!(row_count(&users), 2, "{users}");
+
+    let users = run(
+        &fluree,
+        &view,
+        &store,
+        QueryInput::Sparql("SELECT ?s WHERE { ?s a <http://example.org/ns/User> }"),
+        SCAN_SITE,
+        Lane::MustFire,
+        "sparql scan a ex:User",
+    )
+    .await;
+    assert_eq!(row_count(&users), 2, "{users}");
+
+    let classes = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("rdfs:Class"),
+        SCAN_SITE,
+        Lane::MustFire,
+        "scan a rdfs:Class",
+    )
+    .await;
+    assert_eq!(row_count(&classes), 1, "{classes}");
+
+    let names = run_unfiltered(
+        &fluree,
+        &view,
+        &store,
+        QueryInput::Sparql(
+            "SELECT ?n WHERE { ?s a <http://example.org/ns/User> . ?s <http://example.org/ns/name> ?n }",
+        ),
+        "users' names",
+    )
+    .await;
+    let names = names.to_string();
+    assert!(
+        names.contains("Alice") && names.contains("Bob") && !names.contains("Carol"),
+        "{names}"
+    );
+
+    drop(guard);
+}
+
+/// A rule on `rdf:type` covers it: type scans take the filtered path, which
+/// hides instance types and keeps the schema type fact.
+#[tokio::test(flavor = "current_thread")]
+async fn rule_on_rdf_type_keeps_type_scans_filtered() {
+    let fluree = indexed_people().await;
+    let policy = json!([{
+        "@id": format!("{EX}denyTypes"),
+        "f:action": "f:view",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"}],
+        "f:allow": false
+    }]);
+    let view = policed_view(&fluree, policy, true).await;
+    let (store, guard) = init_test_tracing();
+
+    let users = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("ex:User"),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan a ex:User under a rule on rdf:type",
+    )
+    .await;
+    assert_eq!(row_count(&users), 0, "{users}");
+
+    let classes = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("rdfs:Class"),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan a rdfs:Class under a rule on rdf:type",
+    )
+    .await;
+    assert_eq!(row_count(&classes), 1, "{classes}");
 
     drop(guard);
 }
@@ -463,6 +603,30 @@ async fn class_rule_declines_covered_predicate() {
         "class rule must hide the admin: {names}"
     );
 
+    // The rule also covers `rdf:type` (the class's own facts).
+    let admins = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("ex:Admin"),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan a ex:Admin under class rule",
+    )
+    .await;
+    assert_eq!(row_count(&admins), 0, "{admins}");
+    let users = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("ex:User"),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan a ex:User under class rule",
+    )
+    .await;
+    assert_eq!(row_count(&users), 2, "{users}");
+
     drop(guard);
 }
 
@@ -504,6 +668,31 @@ async fn deny_default_short_circuits_untouched_predicate() {
     )
     .await;
     assert_eq!(row_count(&ages), 0, "{ages}");
+
+    // `rdf:type` is untouched too, but its schema facts stay visible under a
+    // deny default: filtered, not folded to empty.
+    let classes = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("rdfs:Class"),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan a rdfs:Class under deny default",
+    )
+    .await;
+    assert_eq!(row_count(&classes), 1, "{classes}");
+    let users = run(
+        &fluree,
+        &view,
+        &store,
+        &type_scan("ex:User"),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan a ex:User under deny default",
+    )
+    .await;
+    assert_eq!(row_count(&users), 0, "{users}");
 
     drop(guard);
 }

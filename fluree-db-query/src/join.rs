@@ -46,6 +46,12 @@ use tracing::Instrument;
 /// Emit a debug flush summary only when the batched existence probe did non-trivial
 /// work; the per-join success path is otherwise far too noisy for perf captures.
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
+
+/// Routing-stamp site for the batched subject–object pair join (see
+/// `fast_path_outcome`): `proceed` when a join of that shape runs batched,
+/// `fallback:kill_switch` or `fallback:gate_declined` when it runs per row.
+/// Rows whose object is not a reference take the per-row path either way.
+pub const BATCHED_PAIR_JOIN_SITE: &str = "batched-pair-join";
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 /// Entries the decoded-key memo holds before it starts over.
 const BATCHED_KEY_MEMO_CAP: usize = 1 << 18;
@@ -755,6 +761,29 @@ fn is_batched_subject_exists_eligible(
 
     has_subject_bind && pred_fixed && obj_fixed && no_obj_bind && no_constraint
 }
+
+/// Check if the right pattern is eligible for a batched subject–object pair
+/// join: `(?s, fixed_p, ?o)` with both `?s` and `?o` bound from the left, the
+/// step that closes a cycle (`?x :advisor ?y . ?y :teacherOf ?z . ?x
+/// :takesCourse ?z`). The per-row path opens one scan per left row for it.
+///
+/// Only the shape is checked here. Rows whose object is not a reference take
+/// the per-row path at runtime, since the lane matches by reference id and
+/// literals keep the scan's term rules.
+fn is_batched_pair_eligible(
+    bind_instructions: &[BindInstruction],
+    right_pattern: &TriplePattern,
+    has_object_bounds: bool,
+) -> bool {
+    let bound = |position| bind_instructions.iter().any(|b| b.position == position);
+    bound(PatternPosition::Subject)
+        && bound(PatternPosition::Object)
+        && right_pattern.p.is_sid()
+        && matches!(&right_pattern.s, Ref::Var(_))
+        && matches!(&right_pattern.o, Term::Var(_))
+        && !has_object_bounds
+        && right_pattern.dtc.is_none()
+}
 /// Bind-join operator for nested-loop join
 ///
 /// For each row from the left operator, substitutes bound variables into
@@ -829,6 +858,12 @@ pub struct NestedLoopJoinOperator {
     batched_object_eligible: bool,
     /// Whether this join is eligible for batched subject existence join
     batched_exists_eligible: bool,
+    /// Whether this join is eligible for the batched subject–object pair join
+    /// ([`is_batched_pair_eligible`])
+    batched_pair_eligible: bool,
+    /// The object id of each `batched_accumulator` entry, in step with it,
+    /// for the pair join
+    batched_pair_objects: Vec<u64>,
     /// Column index in left batch for the subject binding (batched mode)
     subject_left_col: Option<usize>,
     /// Column index in left batch for the object binding (batched object mode)
@@ -1059,15 +1094,22 @@ impl NestedLoopJoinOperator {
         let batched_exists_eligible = !batched_eligible
             && !batched_object_eligible
             && is_batched_subject_exists_eligible(&bind_instructions, &right_pattern);
-        let subject_left_col = if batched_eligible || batched_exists_eligible {
-            bind_instructions
-                .iter()
-                .find(|b| b.position == PatternPosition::Subject)
-                .map(|b| b.left_col)
-        } else {
-            None
-        };
-        let object_left_col = if batched_object_eligible {
+        let batched_pair_eligible = !batched_eligible
+            && !batched_object_eligible
+            && !batched_exists_eligible
+            && wildcard_direction.is_none()
+            && right_scan_inline_ops.is_empty()
+            && is_batched_pair_eligible(&bind_instructions, &right_pattern, has_bounds);
+        let subject_left_col =
+            if batched_eligible || batched_exists_eligible || batched_pair_eligible {
+                bind_instructions
+                    .iter()
+                    .find(|b| b.position == PatternPosition::Subject)
+                    .map(|b| b.left_col)
+            } else {
+                None
+            };
+        let object_left_col = if batched_object_eligible || batched_pair_eligible {
             bind_instructions
                 .iter()
                 .find(|b| b.position == PatternPosition::Object)
@@ -1075,15 +1117,18 @@ impl NestedLoopJoinOperator {
         } else {
             None
         };
-        let batched_predicate =
-            if batched_eligible || batched_object_eligible || batched_exists_eligible {
-                match &right_pattern.p {
-                    Ref::Sid(sid) => Some(sid.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        let batched_predicate = if batched_eligible
+            || batched_object_eligible
+            || batched_exists_eligible
+            || batched_pair_eligible
+        {
+            match &right_pattern.p {
+                Ref::Sid(sid) => Some(sid.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         Self {
             left,
@@ -1111,6 +1156,8 @@ impl NestedLoopJoinOperator {
             batched_eligible,
             batched_object_eligible,
             batched_exists_eligible,
+            batched_pair_eligible,
+            batched_pair_objects: Vec::new(),
             hide_list_members: false,
             subject_left_col,
             object_left_col,
@@ -1145,6 +1192,7 @@ impl NestedLoopJoinOperator {
         self.batched_eligible = false;
         self.batched_object_eligible = false;
         self.batched_exists_eligible = false;
+        self.batched_pair_eligible = false;
         self.wildcard_direction = None;
         self
     }
@@ -1472,7 +1520,11 @@ impl Operator for NestedLoopJoinOperator {
         if !self.batched_overlay_deferred {
             self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
         }
-        let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        let pair_lane = self.batched_pair_eligible && !crate::fast_paths_disabled();
+        let use_batched = (self.batched_eligible
+            || self.batched_object_eligible
+            || self.batched_exists_eligible
+            || pair_lane)
                 && ctx.binary_store.is_some()
                 && (self.batched_overlay_deferred
                     || !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline))
@@ -1481,6 +1533,8 @@ impl Operator for NestedLoopJoinOperator {
                 // does. Multi-ledger eager rows also need `IriMatch`
                 // provenance, which only the per-row path stamps.
                 && !(ctx.eager_materialization && ctx.is_multi_ledger())
+                // The pair lane does not decode what it emits.
+                && !(ctx.eager_materialization && self.batched_pair_eligible)
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
@@ -1506,6 +1560,21 @@ impl Operator for NestedLoopJoinOperator {
                 active_graph_count,
                 "nested loop join runtime path"
             );
+            if self.batched_pair_eligible {
+                use crate::fast_path_outcome::{
+                    stamp_fast_path, FastPathFallback, FastPathOutcome,
+                };
+                stamp_fast_path(
+                    BATCHED_PAIR_JOIN_SITE,
+                    if use_batched {
+                        FastPathOutcome::Proceed
+                    } else if !pair_lane {
+                        FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
+                    } else {
+                        FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+                    },
+                );
+            }
             self.logged_runtime_mode = true;
         }
 
@@ -1657,11 +1726,12 @@ impl Operator for NestedLoopJoinOperator {
                 // - Subject-batched: key is subject s_id (bound to right subject).
                 // - Object-batched: key is object s_id (bound to right object).
                 let left_col = self.batched_left_col();
+                let mut pair_object = None;
                 let resolved: Option<(u16, u64)> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
                     let binding = left_batch.get_by_col(left_row, left_col);
                     let iri_ref = OType::IRI_REF.as_u16();
-                    match binding {
+                    let key = match binding {
                         // A term handle keys OPST like a ref; per row it would
                         // decode the term only for the scan to re-derive it.
                         // The wildcard cursor reads refs only.
@@ -1686,7 +1756,23 @@ impl Operator for NestedLoopJoinOperator {
                                 .then_some(&mut self.batched_key_memo);
                             resolve_left_key(ctx, memo, binding).map(|k| (iri_ref, k))
                         }
-                    }
+                    };
+                    key.filter(|_| {
+                        // The pair join matches a reference object by id; any
+                        // other object (a literal, unbound) keeps the per-row
+                        // path and its term rules.
+                        if !self.batched_pair_eligible {
+                            return true;
+                        }
+                        pair_object =
+                            match left_batch.get_by_col(left_row, self.object_left_col.unwrap()) {
+                                object @ (Binding::EncodedSid { .. } | Binding::Sid { .. }) => {
+                                    resolve_left_key(ctx, None, object)
+                                }
+                                _ => None,
+                            };
+                        pair_object.is_some()
+                    })
                 };
 
                 if let Some((o_type, key)) = resolved {
@@ -1700,6 +1786,9 @@ impl Operator for NestedLoopJoinOperator {
                     }
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
+                    if let Some(object) = pair_object {
+                        self.batched_pair_objects.push(object);
+                    }
                     if self.batched_accumulator.len() >= self.flush_schedule.size() {
                         ctx.check_cancelled()?;
                         self.flush_batched_accumulator_for_ctx(ctx, false).await?;
@@ -2155,6 +2244,7 @@ impl NestedLoopJoinOperator {
     /// stay: the backlog drains before another flush can clear them.
     fn reroute_accumulator_per_row(&mut self) {
         self.batched_keys_unresolved = false;
+        self.batched_pair_objects.clear();
         self.per_row_backlog.extend(
             self.batched_accumulator
                 .drain(..)
@@ -2227,6 +2317,15 @@ impl NestedLoopJoinOperator {
                     to_t = ctx.to_t,
                 ))
                 .await
+        } else if self.batched_pair_eligible {
+            self.flush_batched_pair_accumulator_binary(ctx)
+                .instrument(tracing::debug_span!(
+                    "join_flush_batched_pair_binary",
+                    accum_len,
+                    batch_size = ctx.batch_size,
+                    to_t = ctx.to_t,
+                ))
+                .await
         } else {
             self.flush_batched_accumulator_binary(ctx)
                 .instrument(tracing::debug_span!(
@@ -2242,6 +2341,7 @@ impl NestedLoopJoinOperator {
     /// Clear all batched accumulator state after a flush or early return.
     fn clear_batched_state(&mut self) {
         self.batched_accumulator.clear();
+        self.batched_pair_objects.clear();
         // Backlog rows still read their stored batches; the backlog drains
         // before any further left row, so the next flush clears them.
         if self.per_row_backlog.is_empty() {
@@ -2274,6 +2374,7 @@ impl NestedLoopJoinOperator {
             let subject_lane_only = self.batched_eligible
                 && !self.batched_object_eligible
                 && !self.batched_exists_eligible
+                && !self.batched_pair_eligible
                 && self.wildcard_direction.is_none();
             return Ok(if subject_lane_only {
                 crate::fast_path_common::pooled_probe_lane(ctx, preds)
@@ -2310,7 +2411,10 @@ impl NestedLoopJoinOperator {
         if let Some(plan) = admitted {
             return Ok(plan);
         }
-        if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        if !(self.batched_eligible
+            || self.batched_object_eligible
+            || self.batched_exists_eligible
+            || self.batched_pair_eligible)
         {
             return Ok(ProbeLanePlan::Decline);
         }
@@ -2637,9 +2741,9 @@ impl NestedLoopJoinOperator {
                         .filter(|w| !w.is_empty());
                     for row in rows {
                         matched_rows += 1;
-                        let o_type_val = entry
-                            .o_type_const
-                            .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                        // The batch's column, not `entry.o_type_const`: a
+                        // replayed leaflet can hold rows of another type.
+                        let o_type_val = batch.o_type.get_or(row, 0);
                         let o_key_val = batch.o_key.get(row);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                             let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
@@ -3432,6 +3536,98 @@ impl NestedLoopJoinOperator {
         }
         Ok(())
     }
+
+    /// Batched subject–object pair join: count each accumulated row's
+    /// `(subject, object)` pair in PSOT and emit the row once per live
+    /// matching flake, as the per-row scan would (list positions repeat a
+    /// pair; duplicate left rows each emit).
+    async fn flush_batched_pair_accumulator_binary(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<()> {
+        if self.batched_accumulator.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(
+            self.batched_accumulator.len(),
+            self.batched_pair_objects.len()
+        );
+        let store = ctx.binary_store.as_ref().unwrap().clone();
+        let entry_pairs: Vec<(u64, u64)> = self
+            .batched_accumulator
+            .iter()
+            .zip(&self.batched_pair_objects)
+            .map(|(&(_, _, s_id), &o_id)| (s_id, o_id))
+            .collect();
+        let mut pairs = entry_pairs.clone();
+        pairs.sort_unstable();
+        pairs.dedup();
+
+        let mut probe_ops = match &self.batched_overlay_mode {
+            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+            _ => None,
+        };
+        let PairProbe {
+            counts,
+            leaves_opened,
+            leaflets_loaded,
+        } = batched_pair_probe_binary(
+            ctx,
+            &store,
+            self.batched_predicate
+                .as_ref()
+                .expect("batched predicate set"),
+            &pairs,
+            probe_ops.as_mut(),
+        )?;
+
+        let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); entry_pairs.len()];
+        let mut matched_rows: u64 = 0;
+        for (accum_idx, pair) in entry_pairs.iter().enumerate() {
+            let at = pairs
+                .binary_search(pair)
+                .expect("pair of an accumulated row");
+            if counts[at] == 0 {
+                continue;
+            }
+            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+            let left_batch = self.stored_left_batches.get(batch_idx).ok_or_else(|| {
+                QueryError::Internal("batched pair join: left batch missing".into())
+            })?;
+            for _ in 0..counts[at] {
+                let mut combined = Vec::with_capacity(self.combined_schema.len());
+                for col in 0..self.left_schema.len() {
+                    combined.push(left_batch.get_by_col(row_idx, col).clone());
+                }
+                if !apply_inline(
+                    &self.inline_ops,
+                    &self.combined_schema,
+                    &mut combined,
+                    Some(ctx),
+                )? {
+                    continue;
+                }
+                scatter[accum_idx].push(combined);
+                matched_rows += 1;
+            }
+        }
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched pair flush merged novelty overlay"
+            );
+        }
+        tracing::debug!(
+            accum_len = entry_pairs.len(),
+            pairs = pairs.len(),
+            leaves_opened,
+            leaflets_loaded,
+            matched_rows,
+            "join batched pair flush complete"
+        );
+        self.emit_scatter_to_output(scatter, ctx.batch_size)
+    }
 }
 
 fn term_matches_probe_value(
@@ -4170,9 +4366,9 @@ fn batched_subject_probe_binary_uncharged(
                     .filter(|w| !w.is_empty());
 
                 for row in rows {
-                    let o_type_val = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                    // The batch's column, not `entry.o_type_const`: a
+                    // replayed leaflet can hold rows of another type.
+                    let o_type_val = batch.o_type.get_or(row, 0);
                     let o_key_val = batch.o_key.get(row);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                         let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
@@ -4245,6 +4441,187 @@ fn batched_subject_probe_binary_uncharged(
     }
 
     Ok(out)
+}
+
+/// What [`batched_pair_probe_binary`] found and read.
+struct PairProbe {
+    /// Live rows holding each requested pair, in `pairs` order.
+    counts: Vec<u32>,
+    leaves_opened: usize,
+    leaflets_loaded: usize,
+}
+
+/// For each `(subject, reference object)` pair of `pairs` (sorted,
+/// deduplicated), the number of live rows of `pred_sid` holding it: base
+/// PSOT rows the overlay does not retract, then novelty-only asserts when
+/// `probe_ops` merges some. Above one only for list positions.
+///
+/// Reads none of a subject's other objects: it opens only the leaves a
+/// lookup of each pair selects (as the per-row scan's cursor does), loads a
+/// leaflet only when its key range holds a wanted pair, and finds each
+/// pair's rows by binary search within its subject's run, so a high-degree
+/// subject costs a seek, not its neighbourhood, and distant pairs do not
+/// open the leaves between them.
+fn batched_pair_probe_binary(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+    pairs: &[(u64, u64)],
+    mut probe_ops: Option<&mut ProbeOps>,
+) -> Result<PairProbe> {
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+    };
+    use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
+
+    let mut probe = PairProbe {
+        counts: vec![0u32; pairs.len()],
+        leaves_opened: 0,
+        leaflets_loaded: 0,
+    };
+    if pairs.is_empty() {
+        return Ok(probe);
+    }
+    if store.is_pooled(ctx.binary_g_id) {
+        return Err(QueryError::Internal(
+            "batched pair join reached a pooled graph, which its admission declines".into(),
+        ));
+    }
+    let merging = probe_ops.is_some();
+    let Some(p_id) = p_id_or_none(store, pred_sid, || Ok(merging))? else {
+        return Ok(probe);
+    };
+    let counts = &mut probe.counts;
+    let iri_ref = OType::IRI_REF.as_u16();
+    // Pairs share `p_id` and `o_type`, so this orders them as `(s, o)` does.
+    let wanted = |&(s_id, o_id): &(u64, u64)| (p_id, s_id, iri_ref, o_id);
+    let prefix = |r: &RunRecordV2| (r.p_id, r.s_id.as_u64(), r.o_type, r.o_key);
+
+    if let Some(branch) = branch_or_none(store, ctx.binary_g_id, RunSortOrder::Psot, merging)? {
+        let bound = |&(s_id, o_id): &(u64, u64), o_i: u64, t: u32| RunRecordV2 {
+            s_id: SubjectId::from_u64(s_id),
+            o_key: o_id,
+            p_id,
+            t,
+            o_i,
+            o_type: iri_ref,
+            g_id: ctx.binary_g_id,
+        };
+        let cmp = cmp_v2_for_order(RunSortOrder::Psot);
+        // Sorted pairs select ascending leaf ranges.
+        let mut leaves: Vec<usize> = Vec::new();
+        for pair in pairs {
+            let range = branch.find_leaves_in_range(
+                &bound(pair, 0, 0),
+                &bound(pair, LIST_INDEX_NONE, u32::MAX),
+                cmp,
+            );
+            let after = leaves.last().map_or(0, |&l| l + 1);
+            leaves.extend(range.start.max(after)..range.end);
+        }
+        let need_replay = ctx.to_t < store.max_t();
+        let replay_to = need_replay.then_some(ctx.to_t);
+        let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+        let proj = ColumnProjection::all();
+
+        for leaf_idx in leaves {
+            ctx.check_cancelled()?;
+            let leaf = prepare_leaf_for_scan(store, &branch.leaves[leaf_idx], need_replay)?;
+            probe.leaves_opened += 1;
+            for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
+                ctx.check_cancelled()?;
+                let needs_history_replay =
+                    need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+                if entry.row_count == 0 && !needs_history_replay {
+                    continue;
+                }
+                if entry.p_const.is_some() && entry.p_const != Some(p_id) {
+                    continue;
+                }
+                // Rows a history replay restores can lie outside the keys.
+                let (lo, hi) = if needs_history_replay {
+                    (0, pairs.len())
+                } else {
+                    let first = prefix(&read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key));
+                    let last = prefix(&read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key));
+                    (
+                        pairs.partition_point(|pair| wanted(pair) < first),
+                        pairs.partition_point(|pair| wanted(pair) <= last),
+                    )
+                };
+                if lo >= hi {
+                    continue;
+                }
+
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+                probe.leaflets_loaded += 1;
+                ctx.check_cancelled()?;
+                let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
+                if p_start == p_end {
+                    continue;
+                }
+                // The batch's own column: a replayed leaflet can hold rows of
+                // a type its current `o_type_const` does not name.
+                let object_at = |row: usize| (batch.o_type.get_or(row, 0), batch.o_key.get(row));
+                let mut runs = SubjectRuns::new(&batch, p_start, p_end);
+                let mut i = lo;
+                while i < hi {
+                    let s_id = pairs[i].0;
+                    let next = i + pairs[i..hi].partition_point(|pair| pair.0 == s_id);
+                    let rows = runs.next_run(s_id);
+                    let window = probe_ops
+                        .as_ref()
+                        .map(|p| p.subject_window(s_id))
+                        .filter(|w| !w.is_empty());
+                    // A subject's rows order by `(o_type, o_key, o_i)`.
+                    let mut from = rows.start;
+                    for (k, &(_, o_id)) in pairs.iter().enumerate().take(next).skip(i) {
+                        let target = (iri_ref, o_id);
+                        let start = from
+                            + partition_rows(rows.end - from, |r| object_at(from + r) < target);
+                        let end = start
+                            + partition_rows(rows.end - start, |r| object_at(start + r) <= target);
+                        for row in start..end {
+                            if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &window) {
+                                let o_i = batch.o_i.get_or(row, LIST_INDEX_NONE);
+                                if probe.base_row_fate(win, p_id, iri_ref, o_id, o_i)
+                                    == RowFate::Drop
+                                {
+                                    continue;
+                                }
+                            }
+                            counts[k] += 1;
+                        }
+                        from = end;
+                    }
+                    i = next;
+                }
+            }
+        }
+    }
+
+    // Novelty-only asserts of the probed pairs. A requested pair's base rows
+    // were all visited above, so its re-asserts are already consumed.
+    if let Some(probe) = probe_ops {
+        let mut i = 0;
+        while i < pairs.len() {
+            let s_id = pairs[i].0;
+            let next = i + pairs[i..].partition_point(|pair| pair.0 == s_id);
+            let objects = &pairs[i..next];
+            probe.drain_asserts_for_subject(s_id, |op| {
+                if op.o_type == iri_ref {
+                    if let Ok(k) = objects.binary_search_by_key(&op.o_key, |&(_, o_id)| o_id) {
+                        counts[i + k] += 1;
+                    }
+                }
+                Ok(())
+            })?;
+            i = next;
+        }
+    }
+
+    charge_probe_rows(ctx, counts.iter().map(|&n| n as usize).sum())?;
+    Ok(probe)
 }
 
 /// Walk a batch of subjects across several predicates in SPOT order,
@@ -5334,9 +5711,72 @@ mod tests {
         assert!(!join.batched_eligible);
         assert!(!join.batched_object_eligible);
         assert!(join.batched_exists_eligible);
+        assert!(!join.batched_pair_eligible);
         assert_eq!(join.subject_left_col, Some(0));
         assert!(join.object_left_col.is_none());
         assert!(join.right_new_vars.is_empty());
+    }
+
+    #[test]
+    fn test_join_enables_batched_pair_only_with_both_ends_bound() {
+        struct MockOp;
+        #[async_trait]
+        impl Operator for MockOp {
+            fn schema(&self) -> &[VarId] {
+                &[]
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+        }
+        let join = |left: Vec<VarId>, s: VarId, o: VarId, bounds: Option<ObjectBounds>| {
+            NestedLoopJoinOperator::new(
+                Box::new(MockOp),
+                Arc::from(left.into_boxed_slice()),
+                TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(Sid::new(100, "takesCourse")),
+                    Term::Var(o),
+                ),
+                bounds,
+                Vec::new(),
+                EmitMask::ALL,
+                crate::temporal_mode::TemporalMode::Current,
+            )
+        };
+
+        let closing = join(vec![VarId(0), VarId(1), VarId(2)], VarId(0), VarId(2), None);
+        assert!(closing.batched_pair_eligible);
+        assert!(!closing.batched_eligible);
+        assert!(!closing.batched_object_eligible);
+        assert!(!closing.batched_exists_eligible);
+        assert_eq!(closing.subject_left_col, Some(0));
+        assert_eq!(closing.object_left_col, Some(2));
+        assert!(closing.right_new_vars.is_empty());
+
+        let self_loop = join(vec![VarId(0)], VarId(0), VarId(0), None);
+        assert!(self_loop.batched_pair_eligible);
+        assert_eq!(self_loop.subject_left_col, Some(0));
+        assert_eq!(self_loop.object_left_col, Some(0));
+
+        let object_free = join(vec![VarId(0)], VarId(0), VarId(1), None);
+        assert!(!object_free.batched_pair_eligible);
+        assert!(object_free.batched_eligible);
+
+        let bounded = join(
+            vec![VarId(0), VarId(1)],
+            VarId(0),
+            VarId(1),
+            Some(ObjectBounds::new()),
+        );
+        assert!(!bounded.batched_pair_eligible);
+
+        let listed = join(vec![VarId(0), VarId(1)], VarId(0), VarId(1), None).hiding_list_members();
+        assert!(!listed.batched_pair_eligible);
     }
 
     #[test]

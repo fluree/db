@@ -90,6 +90,8 @@ pub struct HistoricalLedgerView {
     /// The bits of the instance the view belongs to; see
     /// [`LedgerState::instance_bits`](crate::LedgerState::instance_bits).
     instance_bits: u128,
+    /// Drawn once: the view never changes what its overlay yields.
+    content_version: u64,
     /// The fence of the branch record it was loaded from.
     fence: Option<fluree_db_nameservice::Fence>,
     /// That record's erasure generation.
@@ -262,6 +264,7 @@ impl HistoricalLedgerView {
                 .as_ref()
                 .and_then(fluree_db_core::StorageRoot::instance_bits)
                 .unwrap_or(0),
+            content_version: fluree_db_core::overlay::next_overlay_content_version(),
             fence: record.fence,
             erasure_generation: record.erasure_generation,
         })
@@ -501,6 +504,7 @@ impl HistoricalLedgerView {
             runtime_small_dicts,
             to_t,
             instance_bits: 0,
+            content_version: fluree_db_core::overlay::next_overlay_content_version(),
             fence: None,
             erasure_generation: 0,
         }
@@ -596,6 +600,10 @@ impl OverlayProvider for HistoricalLedgerView {
         self.overlay.as_ref().map(|n| n.epoch).unwrap_or(0)
     }
 
+    fn content_version(&self) -> Option<u64> {
+        Some(self.content_version)
+    }
+
     fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
         self.overlay
             .as_ref()
@@ -641,6 +649,18 @@ mod tests {
         content_store_for, ContentKind, ContentStore, FlakeValue, MemoryStorage, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
+
+    /// A view vouches for what its overlay yields, which never changes: one
+    /// content version for its life, and never another view's, since caches
+    /// keyed on it would otherwise answer for a different state.
+    #[test]
+    fn each_view_has_a_content_version_of_its_own() {
+        let a = HistoricalLedgerView::new(LedgerSnapshot::genesis("test:main"), None, 10);
+        let b = HistoricalLedgerView::new(LedgerSnapshot::genesis("test:main"), None, 10);
+        let version = a.content_version().expect("a view has a content version");
+        assert_eq!(a.content_version(), Some(version));
+        assert_ne!(b.content_version(), Some(version));
+    }
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
         Flake::new(
