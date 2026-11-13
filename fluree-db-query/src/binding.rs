@@ -112,7 +112,8 @@ pub enum Binding {
         /// Only populated in history mode when both assertions and retractions are returned.
         op: Option<bool>,
         /// Optional predicate ID from binary index (metadata, excluded from eq/hash).
-        /// Set when early-materializing novelty values in BinaryScanOperator.
+        /// Set by every BinaryScanOperator lane that reads a stored predicate:
+        /// materialized cursor rows and decoded flakes alike.
         /// Used by `fulltext()` to identify the correct per-predicate arena/stats.
         p_id: Option<u32>,
     },
