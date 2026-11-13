@@ -364,30 +364,37 @@ pub fn warehouse_table_dir_candidates<'a>(
 
 /// Resolve one namespace level to its directory among `dir_names`, for a
 /// warehouse laid out `<root>/<namespace>/<table>`. Matches the WHOLE directory
-/// name (a namespace directory carries no `.suffix`), preferring an exact-case
-/// match and otherwise accepting a unique case-insensitive one. `Ok(None)` when
-/// no directory carries the name — the flat `<root>/<table>` layout. Two
+/// name, `<level>` or the Hive/Glue/Spark spelling `<level>.db` (a table
+/// directory's random `.suffix` never matches), preferring an exact-case match
+/// and otherwise accepting a unique case-insensitive one. `Ok(None)` when no
+/// directory carries the name — the flat `<root>/<table>` layout. Two
 /// directories differing only in case, neither exact, is a fail-loud error.
 pub fn match_warehouse_namespace_dir(level: &str, dir_names: &[String]) -> Result<Option<String>> {
     let want = level.trim();
     let name = |d: &'_ String| d.trim_end_matches('/').to_string();
-    if let Some(exact) = dir_names.iter().map(name).find(|d| d == want) {
-        return Ok(Some(exact));
+    for want in [want.to_string(), format!("{want}.db")] {
+        if let Some(exact) = dir_names.iter().map(name).find(|d| *d == want) {
+            return Ok(Some(exact));
+        }
+        let folded: Vec<String> = dir_names
+            .iter()
+            .map(name)
+            .filter(|d| d.eq_ignore_ascii_case(&want))
+            .collect();
+        match folded.as_slice() {
+            [] => continue,
+            [one] => return Ok(Some(one.clone())),
+            many => {
+                return Err(IcebergError::Catalog(format!(
+                    "namespace '{level}' is AMBIGUOUS under the warehouse root — {} directories \
+                     match: [{}]",
+                    many.len(),
+                    many.join(", ")
+                )))
+            }
+        }
     }
-    let folded: Vec<String> = dir_names
-        .iter()
-        .map(name)
-        .filter(|d| d.eq_ignore_ascii_case(want))
-        .collect();
-    match folded.as_slice() {
-        [] => Ok(None),
-        [one] => Ok(Some(one.clone())),
-        many => Err(IcebergError::Catalog(format!(
-            "namespace '{level}' is AMBIGUOUS under the warehouse root — {} directories match: [{}]",
-            many.len(),
-            many.join(", ")
-        ))),
-    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -475,6 +482,25 @@ mod warehouse_tests {
         // A suffixed table directory is not a namespace directory.
         assert_eq!(match_warehouse_namespace_dir("site3", &d).unwrap(), None);
         assert_eq!(match_warehouse_namespace_dir("site9", &d).unwrap(), None);
+    }
+
+    #[test]
+    fn namespace_dir_matches_the_hive_db_spelling() {
+        let d = dirs(&["north.db/", "South.db/", "sales/", "sales.db/"]);
+        assert_eq!(
+            match_warehouse_namespace_dir("north", &d).unwrap(),
+            Some("north.db".to_string())
+        );
+        assert_eq!(
+            match_warehouse_namespace_dir("SOUTH", &d).unwrap(),
+            Some("South.db".to_string())
+        );
+        // The bare directory wins over its `.db` twin.
+        assert_eq!(
+            match_warehouse_namespace_dir("sales", &d).unwrap(),
+            Some("sales".to_string())
+        );
+        assert_eq!(match_warehouse_namespace_dir("west", &d).unwrap(), None);
     }
 
     #[test]
