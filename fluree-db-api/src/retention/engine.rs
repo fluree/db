@@ -1184,9 +1184,11 @@ impl Fluree {
             retractions.extend(flakes);
             retired += 1;
         }
-        retractions
-            .sort_by(|a, b| (&a.g, &a.s, &a.p, &a.dt, &a.o).cmp(&(&b.g, &b.s, &b.p, &b.dt, &b.o)));
-        retractions.dedup_by(|a, b| FactKey::of(a) == FactKey::of(b));
+        // A list holds a value once per position: each is its own flake.
+        retractions.sort_by(|a, b| {
+            (&a.g, &a.s, &a.p, &a.dt, &a.o, &a.m).cmp(&(&b.g, &b.s, &b.p, &b.dt, &b.o, &b.m))
+        });
+        retractions.dedup_by(|a, b| FactKey::of(a) == FactKey::of(b) && a.m == b.m);
         Ok(RetentionBatch {
             expected_t: head_t,
             retractions,

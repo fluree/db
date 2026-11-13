@@ -364,6 +364,39 @@ async fn reasserting_an_unchanged_value_does_not_renew_but_an_explicit_ttl_does(
     );
 }
 
+/// A list holds a value once per position. All of them expire with it.
+#[tokio::test]
+async fn a_value_a_list_holds_twice_expires_whole() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-list").await;
+    insert(
+        &fluree,
+        &id,
+        json!({
+            "@context": ctx(),
+            "@graph": [{"@id": "ex:r", "ex:samples": {"@list": [1, 1, 2, 1]}}],
+            "f:ttl": 60
+        }),
+    )
+    .await;
+    let start = now_ms();
+    fluree.run_retention_at(&id, start).await.expect("pass");
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:r", "ex:samples").await.len(),
+        4
+    );
+    for _ in 0..2 {
+        fluree
+            .run_retention_at(&id, start + 61_000)
+            .await
+            .expect("pass");
+    }
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:r", "ex:samples").await,
+        Vec::<JsonValue>::new()
+    );
+}
+
 #[tokio::test]
 async fn sparql_annotation_and_transaction_default_schedule_too() {
     let fluree = FlureeBuilder::memory().build_memory();
