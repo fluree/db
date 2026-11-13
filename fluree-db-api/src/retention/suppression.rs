@@ -254,9 +254,18 @@ impl Suppression {
         self.applies.iter().any(|a| !a)
     }
 
-    /// The predicate of a removal that a read of `reads`, as of `to` (or
-    /// over `[from, to]` when not a `point`), could need.
-    fn removal_needed(&self, reads: &Reads, from: i64, to: i64, point: bool) -> Option<&str> {
+    /// Whether a read of `reads`, as of `to` (or over `[from, to]` when not a
+    /// `point`), could need a removed occurrence: `Some`, with the removal's
+    /// predicate when the read named that predicate itself. Which property of
+    /// a subject was removed is audit data, so a read of every property is
+    /// not told.
+    fn removal_needed(
+        &self,
+        reads: &Reads,
+        from: i64,
+        to: i64,
+        point: bool,
+    ) -> Option<Option<&str>> {
         let covered = |i: &usize| {
             let removal = &self.journal.removals[*i];
             if point {
@@ -276,25 +285,21 @@ impl Suppression {
                     .is_some_and(|spans| spans.iter().any(covered))
         };
         match reads {
-            Reads::Everything => self
-                .removed
-                .iter()
-                .find(|(_, of)| any(of))
-                .map(|(p, _)| p.as_str()),
+            Reads::Everything => self.removed.values().any(any).then_some(None),
             Reads::Facts(facts) => facts.iter().find_map(|fact| match fact {
                 Fact::Of(None, predicate) => {
                     let (predicate, of) = self.removed.get_key_value(predicate)?;
-                    any(of).then_some(predicate.as_str())
+                    any(of).then_some(Some(predicate.as_str()))
                 }
                 Fact::Of(Some(subject), predicate) => {
                     let (predicate, of) = self.removed.get_key_value(predicate)?;
-                    about(of, subject).then_some(predicate.as_str())
+                    about(of, subject).then_some(Some(predicate.as_str()))
                 }
                 Fact::About(subject) => self
                     .removed
-                    .iter()
-                    .find(|(_, of)| about(of, subject))
-                    .map(|(p, _)| p.as_str()),
+                    .values()
+                    .any(|of| about(of, subject))
+                    .then_some(None),
             }),
         }
     }
@@ -875,12 +880,16 @@ impl Fluree {
         }
         let (from, to) = (read.from_t.unwrap_or(read.to_t), read.to_t);
         let point = read.from_t.is_none();
-        if let Some(predicate) = suppression.removal_needed(&(read.reads)(), from, to, point) {
-            return Err(ApiError::HistoryUnavailable(format!(
+        match suppression.removal_needed(&(read.reads)(), from, to, point) {
+            Some(Some(predicate)) => Err(ApiError::HistoryUnavailable(format!(
                 "a removed occurrence of <{predicate}> on {ledger_id} falls in the requested range"
-            )));
+            ))),
+            Some(None) => Err(ApiError::HistoryUnavailable(format!(
+                "a removed occurrence this read could reach on {ledger_id} falls in the \
+                 requested range"
+            ))),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -1004,5 +1013,30 @@ mod tests {
         let elsewhere =
             Suppression::new(journal(vec![removal(None, "c1")]), String::new(), &[false]);
         assert!(!refuses(&elsewhere, Reads::Everything, 30));
+    }
+
+    /// A refusal names the removed predicate only to a read that named it:
+    /// which property of a subject was removed is audit data.
+    #[test]
+    fn a_refusal_names_only_the_predicate_the_read_named() {
+        let carol = Suppression::new(
+            Journal {
+                removals: vec![removal(Some("ex:carol"), "c1")],
+                ..Default::default()
+            },
+            String::new(),
+            &[true],
+        );
+        let needed = |r: Reads| carol.removal_needed(&r, 30, 30, true);
+        assert_eq!(
+            needed(reads(&[(Some("ex:carol"), "ex:likes")])),
+            Some(Some("ex:likes"))
+        );
+        assert_eq!(needed(reads(&[(None, "ex:likes")])), Some(Some("ex:likes")));
+        assert_eq!(
+            needed(Reads::Facts(vec![Fact::About("ex:carol".to_string())])),
+            Some(None)
+        );
+        assert_eq!(needed(Reads::Everything), Some(None));
     }
 }
