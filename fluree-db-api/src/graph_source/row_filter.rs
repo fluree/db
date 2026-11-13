@@ -72,6 +72,8 @@ impl QueryRefusal {
 /// message a read would give, naming the map:
 ///
 /// - the query is in the restricted subset;
+/// - every key declared on it (`f:key`) is over columns it selects
+///   ([`check_declared_keys_selected`]);
 /// - its select list holds every column the map reads ([`check_select_list`]);
 /// - given `schema`, its `FROM` table's, every column it names exists, exactly
 ///   as written, and each literal types against its column
@@ -88,6 +90,7 @@ pub(crate) fn check_query_map(
         return Ok(None);
     };
     let select = parse_restricted(sql).map_err(|e| QueryRefusal::other(e).of_map(tm))?;
+    check_declared_keys_selected(tm, sql, &select).map_err(QueryRefusal::other)?;
     check_select_list(compiled, tm, &select).map_err(QueryRefusal::other)?;
     if let Some(schema) = schema {
         typed_row_filter(&select, schema).map_err(|e| e.of_map(tm))?;
@@ -146,6 +149,21 @@ impl LogicalScan {
             .is_some_and(|select| !select.conditions.is_empty())
     }
 
+    /// Whether the logical table's rows carry `column`: every column of the
+    /// table for an `rr:tableName` or `SELECT *`, and only the select list's
+    /// otherwise. A key over a column the query does not select is not one of
+    /// the logical table's keys.
+    pub(crate) fn selects(&self, column: &str) -> bool {
+        match self
+            .select
+            .as_ref()
+            .and_then(|select| select.columns.as_ref())
+        {
+            Some(columns) => columns.iter().any(|c| c == column),
+            None => true,
+        }
+    }
+
     /// The row filter typed against `schema`, or `None` when the logical
     /// table keeps every row. See [`typed_row_filter`].
     pub(crate) fn row_filter(
@@ -195,10 +213,11 @@ pub(crate) fn unsupported_query_message(sql: &str, why: &UnsupportedSql) -> Stri
 }
 
 /// Refuse a mapping whose `rr:sqlQuery` logical tables are not all in the
-/// restricted subset, or whose select lists leave out a column their maps
-/// read: the checks of [`check_query_map`] that need no schema. Registration
-/// runs them before anything is stored, then the rest once it has loaded
-/// the tables.
+/// restricted subset, whose select lists leave out a column their maps read,
+/// or that declare a key (`f:key`) over a column the query does not select:
+/// the checks of [`check_query_map`] that need no schema. Registration runs
+/// them before anything is stored, then the rest once it has loaded the
+/// tables.
 pub(crate) fn check_restricted_queries(compiled: &CompiledR2rmlMapping) -> Result<(), String> {
     for tm in query_maps(compiled) {
         check_query_map(compiled, tm, None).map_err(|e| e.message)?;
@@ -216,6 +235,32 @@ pub(crate) fn query_maps(compiled: &CompiledR2rmlMapping) -> Vec<&TriplesMap> {
         .collect();
     maps.sort_unstable_by(|a, b| a.iri.cmp(&b.iri));
     maps
+}
+
+/// Refuse a key declared (`f:key`) on an `rr:sqlQuery` over a column the
+/// query does not select: it is no key of the logical table.
+fn check_declared_keys_selected(
+    tm: &TriplesMap,
+    sql: &str,
+    select: &RestrictedSelect,
+) -> Result<(), String> {
+    let Some(columns) = &select.columns else {
+        return Ok(());
+    };
+    match tm
+        .declared_keys
+        .iter()
+        .flatten()
+        .find(|name| !columns.contains(name))
+    {
+        Some(name) => Err(format!(
+            "triples map <{}>: f:key on rr:sqlQuery \"{}\" names column \"{name}\", which the \
+             query does not select",
+            tm.iri,
+            sql.trim()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Refuse a select list that leaves out a column the map reads.
@@ -601,12 +646,18 @@ mod tests {
     }
 
     fn mapping(sql: &str) -> CompiledR2rmlMapping {
+        keyed_mapping(sql, "")
+    }
+
+    /// `key` follows the query on the logical table (`; f:key ( ... )`).
+    fn keyed_mapping(sql: &str, key: &str) -> CompiledR2rmlMapping {
         let ttl = format!(
             r#"@base <http://example.org/> .
             @prefix rr: <http://www.w3.org/ns/r2rml#> .
             @prefix ex: <http://example.org/> .
+            @prefix f: <https://ns.flur.ee/db#> .
             <#Customer> a rr:TriplesMap ;
-                rr:logicalTable [ rr:sqlQuery """{sql}""" ] ;
+                rr:logicalTable [ rr:sqlQuery """{sql}""" {key} ] ;
                 rr:subjectMap [ rr:template "http://example.org/customer/{{customer_id}}" ] ;
                 rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ."#
         );
@@ -681,6 +732,29 @@ mod tests {
         let message = check_restricted_queries(&compiled).expect_err("customer_key not selected");
         assert!(
             message.contains("selects id, but the map reads customer_key"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn registration_refuses_a_key_the_query_does_not_select() {
+        let key = r#"; f:key ( "customer_id" )"#;
+        for sql in [
+            "SELECT * FROM t WHERE a = 1",
+            "SELECT customer_id, name FROM t WHERE a = 1",
+            "SELECT name, customer_id FROM t",
+        ] {
+            assert!(
+                check_restricted_queries(&keyed_mapping(sql, key)).is_ok(),
+                "{sql}"
+            );
+        }
+        let message =
+            check_restricted_queries(&keyed_mapping("SELECT name FROM t WHERE a = 1", key))
+                .expect_err("customer_id is not selected");
+        assert!(
+            message.contains("\"customer_id\", which the query does not select")
+                && message.contains("Customer>"),
             "{message}"
         );
     }

@@ -158,6 +158,11 @@ that it lacks a mapped column. The source is registered either way and the
 first query reports the underlying error. A table name that cannot be
 placed (no `--table` entry and no `--root`) is an error.
 
+An `advisory:` line on standard error names each triples map no `f:key`
+proves subject-unique (a Delta table reports no key of its own), with the
+`f:key` that would: queries over it remove repeated solutions as they read
+(see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)).
+
 ## fluree delta browse / preview / verify / generate / validate
 
 The read-only commands that lead up to `map` on Unity Catalog. None registers
@@ -192,7 +197,10 @@ answer as is.
 | | `--no-joins`: keep foreign keys as plain values |
 
 `generate` writes the mapping to standard output or `--output`, and what it
-decided — a key it chose, a column it passed over — to standard error.
+decided — a key it chose, a column it passed over — to standard error, with
+an `advisory:` line for each map the generated mapping leaves without a key
+(a generator writes no `f:key`; add one where the subject's columns identify
+a row). `validate` reports the same advisories.
 `verify` exits non-zero when the table cannot be read, and `validate` when the
 mapping has an error, so a script can gate on either.
 

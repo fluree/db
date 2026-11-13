@@ -170,6 +170,10 @@ pub struct DeltaMapResponse {
     pub table_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_warnings: Vec<String>,
+    /// Advisories about the mapping as queries will read it: a `keylessMap`
+    /// for each map no key proves subject-unique, which queries deduplicate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_api::Diagnostic>,
 }
 
 /// Map Delta tables as a graph source
@@ -227,6 +231,7 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
                 table_versions: result.table_versions,
                 table_warnings: result.table_warnings,
                 model_warnings: result.model_warnings,
+                diagnostics: result.diagnostics,
             }),
         ))
     }

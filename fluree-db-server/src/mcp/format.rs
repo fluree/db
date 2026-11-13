@@ -51,15 +51,28 @@ pub fn format_data_model_markdown(alias: &str, info: &JsonValue) -> String {
         if let Some(classes) = stats.get("classes").and_then(|v| v.as_object()) {
             lines.push(format!("- Classes: {}", classes.len()));
 
-            // Total instances (sum of all class counts)
+            // Total instances (sum of all class counts). A virtual dataset
+            // reports `count: null` for a class it cannot count exactly; the
+            // total then covers the counted classes only, and says so.
             let total_instances: i64 = classes
                 .values()
                 .filter_map(|c| c.get("count").and_then(serde_json::Value::as_i64))
                 .sum();
-            lines.push(format!(
-                "- Total instances: {}",
-                format_number(total_instances)
-            ));
+            let uncounted = classes
+                .values()
+                .filter(|c| c.get("count").and_then(serde_json::Value::as_i64).is_none())
+                .count();
+            if uncounted == 0 {
+                lines.push(format!(
+                    "- Total instances: {}",
+                    format_number(total_instances)
+                ));
+            } else {
+                lines.push(format!(
+                    "- Total instances: {} (counted classes only; {uncounted} not counted exactly)",
+                    format_number(total_instances)
+                ));
+            }
         }
 
         // Count properties
@@ -76,15 +89,17 @@ pub fn format_data_model_markdown(alias: &str, info: &JsonValue) -> String {
         }
 
         // Virtual (query-in-place) datasets derive their counts from source table
-        // metadata (≈ table row counts), not exact per-property / distinct-value
-        // statistics, so flag them as coarse estimates for the reading model. Only
-        // emitted for virtual sources — native output stays byte-identical.
+        // metadata. A count is shown only where the metadata proves it exact;
+        // elsewhere the reading model sees an upper bound ("at most") or
+        // "not counted". Only emitted for virtual sources — native output stays
+        // byte-identical.
         if is_virtual_source(info) {
             lines.push(String::new());
             lines.push(
-                "> Note: This is a virtual (query-in-place) dataset. Instance and property \
-                 counts shown below are COARSE ESTIMATES derived from source table metadata \
-                 (approximate row counts), not exact distinct-value statistics."
+                "> Note: This is a virtual (query-in-place) dataset. Counts come from \
+                 source table metadata: a number is exact; \"at most N\" is an upper bound \
+                 where the metadata cannot prove the exact count (the true count may be \
+                 lower); \"not counted\" means no bound is known either."
                     .to_string(),
             );
         }
@@ -99,17 +114,12 @@ pub fn format_data_model_markdown(alias: &str, info: &JsonValue) -> String {
             lines.push("## Classes".to_string());
             lines.push(String::new());
 
-            // Sort classes by instance count descending
+            // Sort classes by instance count descending (an upper bound where
+            // the count is not known exactly)
             let mut class_vec: Vec<_> = classes.iter().collect();
             class_vec.sort_by(|a, b| {
-                let count_a =
-                    a.1.get("count")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0);
-                let count_b =
-                    b.1.get("count")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0);
+                let count_a = count_or_bound(a.1).unwrap_or(0);
+                let count_b = count_or_bound(b.1).unwrap_or(0);
                 count_b.cmp(&count_a)
             });
 
@@ -159,6 +169,25 @@ fn is_virtual_source(info: &JsonValue) -> bool {
     })
 }
 
+/// An entry's `count`, else its `count-upper-bound` (a virtual count that is
+/// not known exactly).
+fn count_or_bound(entry: &JsonValue) -> Option<i64> {
+    entry
+        .get("count")
+        .and_then(JsonValue::as_i64)
+        .or_else(|| entry.get("count-upper-bound").and_then(JsonValue::as_i64))
+}
+
+/// A class's instance count as text: the number when known, else "at most
+/// `bound`", else "not counted". A native count is always known.
+fn describe_instances(count: Option<i64>, bound: Option<i64>) -> String {
+    match (count, bound) {
+        (Some(c), _) => format!("{} instances", format_number(c)),
+        (None, Some(b)) => format!("at most {} instances", format_number(b)),
+        (None, None) => "instances not counted".to_string(),
+    }
+}
+
 /// Format a single class and its properties
 fn format_class(
     lines: &mut Vec<String>,
@@ -166,15 +195,15 @@ fn format_class(
     class_data: &JsonValue,
     max_properties: usize,
 ) {
-    let count = class_data
-        .get("count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
+    let count = class_data.get("count").and_then(JsonValue::as_i64);
+    let bound = class_data
+        .get("count-upper-bound")
+        .and_then(JsonValue::as_i64);
 
     lines.push(format!(
-        "### {} — {} instances",
+        "### {} — {}",
         class_iri,
-        format_number(count)
+        describe_instances(count, bound)
     ));
 
     // Subclass relationships
@@ -242,24 +271,39 @@ fn format_property(lines: &mut Vec<String>, index: usize, prop_iri: &str, prop_d
 
     let mut type_info: Vec<String> = Vec::new();
 
-    // Data types
+    // Data types (a virtual count that is not known exactly is `null`: the
+    // datatype is still listed)
     if let Some(types) = prop_data.get("types").and_then(|v| v.as_object()) {
         for (dtype, count) in types {
-            if let Some(c) = count.as_i64() {
-                type_info.push(format!("{} ({})", dtype, format_number(c)));
+            match count.as_i64() {
+                Some(c) => type_info.push(format!("{} ({})", dtype, format_number(c))),
+                None => type_info.push(dtype.clone()),
             }
         }
     }
 
-    // Reference classes
+    // Reference classes (a virtual reference is never counted exactly: its
+    // entry is `null`, with a bound in `ref-classes-upper-bound` when it has one)
     let refs_obj = prop_data
         .get("ref-classes")
         .or_else(|| prop_data.get("refs"))
         .and_then(|v| v.as_object());
+    let ref_bounds = prop_data
+        .get("ref-classes-upper-bound")
+        .and_then(|v| v.as_object());
     if let Some(refs) = refs_obj {
         for (ref_class, count) in refs {
-            if let Some(c) = count.as_i64() {
-                type_info.push(format!("→ {} ({})", ref_class, format_number(c)));
+            let bound = ref_bounds
+                .and_then(|b| b.get(ref_class))
+                .and_then(JsonValue::as_i64);
+            match (count.as_i64(), bound) {
+                (Some(c), _) => {
+                    type_info.push(format!("→ {} ({})", ref_class, format_number(c)));
+                }
+                (None, Some(b)) => {
+                    type_info.push(format!("→ {} (at most {})", ref_class, format_number(b)));
+                }
+                (None, None) => type_info.push(format!("→ {ref_class}")),
             }
         }
     }
@@ -374,9 +418,9 @@ mod tests {
         assert!(markdown.contains("## Classes"));
         assert!(markdown.contains("### http://example.org/Person — 100 instances"));
         assert!(markdown.contains("1. http://example.org/name"));
-        // Native (non-virtual) info has no `source` block, so no coarse-estimate
-        // note is emitted — native markdown stays byte-identical.
-        assert!(!markdown.contains("COARSE ESTIMATES"));
+        // Native (non-virtual) info has no `source` block, so no virtual
+        // counts note is emitted — native markdown stays byte-identical.
+        assert!(!markdown.contains("virtual (query-in-place) dataset"));
     }
 
     #[test]
@@ -418,12 +462,53 @@ mod tests {
 
         let markdown = format_data_model_markdown("sales:main", &info);
 
-        // The coarse-estimate note appears within the statistics section.
+        // The note on how to read virtual counts appears within the
+        // statistics section.
         assert!(
-            markdown.contains("COARSE ESTIMATES"),
-            "virtual dataset markdown missing the coarse-estimate note:\n{markdown}"
+            markdown.contains("\"at most N\" is an upper bound"),
+            "virtual dataset markdown missing the counts note:\n{markdown}"
         );
         assert!(markdown.contains("virtual (query-in-place) dataset"));
+    }
+
+    #[test]
+    fn test_format_data_model_virtual_counts_not_known_exactly() {
+        let info = json!({
+            "source": { "virtual": true, "type": "Iceberg" },
+            "stats": {
+                "classes": {
+                    "http://ex.org/Customer": {
+                        "count": null,
+                        "count-upper-bound": 30,
+                        "properties": {
+                            "http://ex.org/name": { "types": { "xsd:string": null } }
+                        }
+                    },
+                    "http://ex.org/Order": {
+                        "count": 7,
+                        "properties": {
+                            "http://ex.org/customer": {
+                                "types": { "@id": null },
+                                "ref-classes": { "http://ex.org/Customer": null },
+                                "ref-classes-upper-bound": { "http://ex.org/Customer": 7 }
+                            }
+                        }
+                    },
+                    "http://ex.org/Tag": { "count": null, "properties": {} }
+                }
+            }
+        });
+        let markdown = format_data_model_markdown("crm:main", &info);
+        for needle in [
+            "### http://ex.org/Customer — at most 30 instances",
+            "### http://ex.org/Order — 7 instances",
+            "### http://ex.org/Tag — instances not counted",
+            "- Total instances: 7 (counted classes only; 2 not counted exactly)",
+            "xsd:string",
+            "→ http://ex.org/Customer (at most 7)",
+        ] {
+            assert!(markdown.contains(needle), "missing {needle:?}:\n{markdown}");
+        }
     }
 
     #[test]

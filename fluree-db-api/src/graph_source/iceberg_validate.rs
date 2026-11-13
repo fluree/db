@@ -51,7 +51,10 @@ use fluree_db_iceberg::metadata::Schema;
 use fluree_db_iceberg::FieldType;
 use fluree_db_r2rml::emit::{DiagCode, Diagnostic, Severity};
 use fluree_db_r2rml::loader::R2rmlLoader;
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, RestrictedSelect, TriplesMap};
+use fluree_db_r2rml::mapping::{
+    CompiledR2rmlMapping, KeyColumn, ObjectMap, RestrictedSelect, SubjectKeyProof, TableKeys,
+    TriplesMap,
+};
 
 use super::row_filter::{check_query_map, query_maps};
 
@@ -146,7 +149,7 @@ const ICEBERG_WORDING: Wording = Wording {
 pub(crate) enum QueryTables {
     /// The query's alias, as a table name: a source that refuses queries
     /// reports the alias as a table it cannot find.
-    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "delta", feature = "sql")), allow(dead_code))]
     Alias,
     /// The `FROM` table of a query in the restricted subset an Iceberg source
     /// evaluates (see [`super::row_filter`]); a query outside it is an error.
@@ -460,7 +463,322 @@ pub(crate) fn cross_check_live(
         }
     }
 
+    diagnostics.extend(declared_key_diagnostics(compiled, schemas, queries));
     diagnostics
+}
+
+/// Every declared key column (`f:key`) checked against its table's schema as
+/// an Iceberg query checks it before refusing: a column the table lacks, or
+/// one spelled with other casing, is [`DiagCode::ColumnNotFound`] /
+/// [`DiagCode::CasingMismatch`]; one whose values cannot identify a row
+/// (floating-point, nested, unreadable) is [`DiagCode::NonKeyTypeSkipped`].
+/// A key on an `rr:sqlQuery` logical table is checked against the query's
+/// `FROM` table, and a column its select list leaves out is
+/// [`DiagCode::ColumnNotFound`] too. All errors, once per logical table and
+/// column however many maps read it. A table with no schema already has its
+/// [`DiagCode::TableNotFound`].
+fn declared_key_diagnostics(
+    compiled: &CompiledR2rmlMapping,
+    schemas: &HashMap<String, Vec<LiveColumn>>,
+    queries: QueryTables,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    // Logical table name (a table, or a query's alias) -> the table its rows
+    // come from, and the query's select list when it has one.
+    let mut tables: std::collections::BTreeMap<&str, (String, Option<Vec<String>>)> =
+        std::collections::BTreeMap::new();
+    for tm in compiled.triples_maps.values() {
+        let Some(logical) = tm.table_name() else {
+            continue;
+        };
+        let Some(table) = source_table(tm, queries) else {
+            continue;
+        };
+        let selected = match (queries, tm.sql_query()) {
+            (QueryTables::FromTable, Some(sql)) => {
+                RestrictedSelect::parse(sql).ok().and_then(|s| s.columns)
+            }
+            _ => None,
+        };
+        tables.entry(logical).or_insert((table, selected));
+    }
+    for (logical, (table, selected)) in tables {
+        let Some(schema) = schemas.get(&table) else {
+            continue;
+        };
+        let on = if logical == table {
+            format!("'{table}'")
+        } else {
+            format!("the rr:sqlQuery over '{table}'")
+        };
+        let table = table.as_str();
+        let keys = compiled.declared_keys(logical);
+        let columns: BTreeSet<&str> = keys.iter().flatten().map(String::as_str).collect();
+        for name in columns {
+            let unselected = selected
+                .as_ref()
+                .is_some_and(|selected| !selected.iter().any(|c| c == name));
+            let (code, message) = match resolve_column(schema, name) {
+                ColumnResolution::Exact(_) | ColumnResolution::Casing(_) if unselected => (
+                    DiagCode::ColumnNotFound,
+                    format!(
+                        "f:key on {on} names column '{name}', which the query does not \
+                         select."
+                    ),
+                ),
+                ColumnResolution::Missing => (
+                    DiagCode::ColumnNotFound,
+                    format!(
+                        "f:key on {on} names column '{name}', which the table does not \
+                         have."
+                    ),
+                ),
+                ColumnResolution::Casing(ci) => (
+                    DiagCode::CasingMismatch,
+                    format!(
+                        "f:key on {on} names column '{name}', which the schema spells \
+                         '{}'; a key column must match exactly.",
+                        ci.name
+                    ),
+                ),
+                ColumnResolution::Exact(ci)
+                    if fluree_db_r2rml::mapping::usable_in_key(ci.field_type.as_ref()) =>
+                {
+                    continue
+                }
+                ColumnResolution::Exact(ci) => (
+                    DiagCode::NonKeyTypeSkipped,
+                    match &ci.field_type {
+                        Some(ty) => format!(
+                            "f:key on {on} names column '{name}' of type {ty:?}; a \
+                             floating-point value cannot identify a row (NaN is unequal to \
+                             itself)."
+                        ),
+                        None => format!(
+                            "f:key on {on} names column '{name}', whose type is nested \
+                             or not one values are read from."
+                        ),
+                    },
+                ),
+            };
+            diagnostics.push(Diagnostic::new(
+                Severity::Error,
+                code,
+                table.to_string(),
+                Some(name.to_string()),
+                message,
+            ));
+        }
+    }
+    diagnostics
+}
+
+/// Where a source lets an operator state a table's key besides `f:key`, for
+/// the remedy a [`DiagCode::KeylessMap`] advisory gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyRemedy {
+    /// `f:key`, or the table's identifier fields (Iceberg).
+    DeclareOrIdentifierFields,
+    /// `f:key`: the source reports no key of its own (Delta), or only the one
+    /// its registration probe verified (SQL).
+    #[cfg_attr(
+        not(any(feature = "delta", feature = "sql")),
+        allow(dead_code, reason = "only Delta and SQL sources report it")
+    )]
+    Declare,
+}
+
+/// What a query over a map no key proves subject-unique does, and costs.
+const DEDUPLICATES: &str = "queries over it remove repeated solutions as they run. That is \
+     correct, but a COUNT, a same-subject star or an ORDER BY ... LIMIT over it reads more of \
+     the table, and the solutions it has seen are held against the query's memory budget";
+
+/// An advisory ([`DiagCode::KeylessMap`]) for each map whose subjects no
+/// known key of its logical table proves unique
+/// ([`TriplesMap::subject_unique_under`]): queries over it take the
+/// deduplicating lanes. It names the map and, where a key could prove it, the
+/// columns and how to declare them.
+///
+/// `keys` holds each logical table's keys (by [`TriplesMap::table_name`]) as
+/// a query unites them: the mapping's `f:key` with what the source reports.
+/// A map whose table is absent is skipped: its keys could not be learned,
+/// and the caller reports why elsewhere. One advisory per map, in IRI order.
+pub(crate) fn keyless_map_diagnostics(
+    compiled: &CompiledR2rmlMapping,
+    keys: &HashMap<String, TableKeys>,
+    queries: QueryTables,
+    remedy: KeyRemedy,
+) -> Vec<Diagnostic> {
+    let mut tms: Vec<&TriplesMap> = compiled.triples_maps.values().collect();
+    tms.sort_by(|a, b| a.iri.cmp(&b.iri));
+    let mut diagnostics = Vec::new();
+    for tm in tms {
+        let Some(table_keys) = tm.table_name().and_then(|t| keys.get(t)) else {
+            continue;
+        };
+        if tm.subject_unique_under(table_keys) {
+            continue;
+        }
+        // The table the other diagnostics name: an Iceberg query's FROM
+        // table; none for a query alias, which names nothing an operator
+        // wrote.
+        let table = source_table(tm, queries)
+            .filter(|t| !fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(t));
+        let on = match (&table, tm.sql_query()) {
+            (Some(t), Some(_)) => format!("its rr:sqlQuery logical table (over '{t}')"),
+            (Some(t), None) => format!("its logical table '{t}'"),
+            (None, _) => "its rr:sqlQuery logical table".to_string(),
+        };
+        let message = match tm.subject_key_proof() {
+            SubjectKeyProof::KeyWithin(columns) => {
+                let listed = columns.join(", ");
+                let known = if table_keys.is_empty() {
+                    "it has no known key".to_string()
+                } else {
+                    let known: Vec<String> = table_keys
+                        .iter()
+                        .map(|key| format!("({})", key.join(", ")))
+                        .collect();
+                    format!("its known keys are {}", known.join(", "))
+                };
+                let declaration: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+                let (identify, them) = match columns.as_slice() {
+                    [one] => (
+                        format!("{one} identifies"),
+                        "it the table's identifier field",
+                    ),
+                    _ => (
+                        format!("({listed}) together identify"),
+                        "them the table's identifier fields",
+                    ),
+                };
+                let or_fields = match remedy {
+                    KeyRemedy::DeclareOrIdentifierFields => format!(", or make {them}"),
+                    KeyRemedy::Declare => String::new(),
+                };
+                format!(
+                    "TriplesMap <{}>: no key of {on} lies within its subject's columns \
+                     ({listed}), and {known}, so {DEDUPLICATES}. If {identify} a row, declare \
+                     `f:key ( {} )` on its logical table{or_fields}.",
+                    tm.iri,
+                    declaration.join(" ")
+                )
+            }
+            SubjectKeyProof::RunTogether => format!(
+                "TriplesMap <{}>: its subject template can run two values together (no \
+                 character the IRI escape always encodes, such as '/', separates two of its \
+                 placeholders), so no key of {on} can prove its subjects unique, and \
+                 {DEDUPLICATES}. Separate each pair of placeholders with '/' and declare a key \
+                 over its columns to prove it.",
+                tm.iri
+            ),
+            SubjectKeyProof::NotFromColumns => format!(
+                "TriplesMap <{}>: its subject is not built from the row's columns (a constant, \
+                 or a term with no column or template), so no key of {on} can prove its \
+                 subjects unique, and {DEDUPLICATES}.",
+                tm.iri
+            ),
+        };
+        diagnostics.push(Diagnostic {
+            severity: Severity::Advisory,
+            code: DiagCode::KeylessMap,
+            table,
+            column: None,
+            message,
+        });
+    }
+    diagnostics
+}
+
+/// Each logical table's keys as an Iceberg query would learn them, from the
+/// metadata preview a dry-run reads: the mapping's `f:key` united with the
+/// identifier fields of the table a map reads ([`identifier_fields_key`]),
+/// counted only where the logical table's query selects them. A table the
+/// preview did not resolve is left out (it has its `TableNotFound`).
+///
+/// [`identifier_fields_key`]: super::r2rml::identifier_fields_key
+pub(crate) fn preview_table_keys(
+    compiled: &CompiledR2rmlMapping,
+    schemas: &HashMap<String, TableSchema>,
+) -> HashMap<String, TableKeys> {
+    let mut keys = HashMap::new();
+    for tm in compiled.triples_maps.values() {
+        let Some(logical) = tm.table_name() else {
+            continue;
+        };
+        let Some(schema) = source_table(tm, QueryTables::FromTable).and_then(|t| schemas.get(&t))
+        else {
+            continue;
+        };
+        let selected = tm
+            .sql_query()
+            .and_then(|sql| RestrictedSelect::parse(sql).ok())
+            .and_then(|select| select.columns);
+        let selects = |name: &str| {
+            selected
+                .as_ref()
+                .is_none_or(|s| s.iter().any(|c| c == name))
+        };
+        let column = |name: &str| match schema.columns.iter().find(|c| c.name == name) {
+            Some(c) if selects(name) => KeyColumn::Typed(c.field_type),
+            _ => KeyColumn::Absent,
+        };
+        let names: Option<Vec<String>> = schema
+            .identifier_field_ids
+            .iter()
+            .map(|id| {
+                schema
+                    .columns
+                    .iter()
+                    .find(|c| c.field_id == *id)
+                    .map(|c| c.name.clone())
+            })
+            .collect();
+        let reported = super::r2rml::identifier_fields_key(schema.format_version, names, column);
+        keys.insert(
+            logical.to_string(),
+            compiled.declared_keys(logical).with_reported(reported),
+        );
+    }
+    keys
+}
+
+/// Each logical table's keys from the mapping's `f:key` alone: what a
+/// source that reports no key of its own (Delta) queries under.
+#[cfg_attr(
+    not(feature = "delta"),
+    allow(
+        dead_code,
+        reason = "only Delta sources query under declared keys alone"
+    )
+)]
+pub(crate) fn declared_table_keys(compiled: &CompiledR2rmlMapping) -> HashMap<String, TableKeys> {
+    compiled
+        .triples_maps
+        .values()
+        .filter_map(|tm| tm.table_name())
+        .map(|table| (table.to_string(), compiled.declared_keys(table)))
+        .collect()
+}
+
+/// [`keyless_map_diagnostics`] over a generated mapping's Turtle, with the
+/// keys `keys` finds for it. A generator writes no `f:key`, so this tells
+/// the operator, before the mapping is saved, which maps its queries will
+/// deduplicate. Turtle that does not compile gets none (the generator's
+/// output always does).
+pub(crate) fn keyless_generated_maps(
+    turtle: &str,
+    keys: impl FnOnce(&CompiledR2rmlMapping) -> HashMap<String, TableKeys>,
+    queries: QueryTables,
+    remedy: KeyRemedy,
+) -> Vec<Diagnostic> {
+    match R2rmlLoader::from_turtle(turtle).and_then(R2rmlLoader::compile) {
+        Ok(compiled) => keyless_map_diagnostics(&compiled, &keys(&compiled), queries, remedy),
+        Err(e) => {
+            tracing::debug!(error = %e, "generated mapping did not compile; no key advisories");
+            Vec::new()
+        }
+    }
 }
 
 /// Compile the Turtle for validation, or produce the `compiled_ok = false` response
@@ -628,7 +946,8 @@ fn validated_tables(compiled: &CompiledR2rmlMapping) -> BTreeSet<String> {
 }
 
 /// The dry-run's response for a compiled mapping, given the tables it reads
-/// and the schemas of those that loaded.
+/// and the schemas of those that loaded: the cross-check's diagnostics, and an
+/// advisory for each map whose subjects no known key proves unique.
 fn validated(
     compiled: &CompiledR2rmlMapping,
     table_names: BTreeSet<String>,
@@ -636,11 +955,18 @@ fn validated(
     read_schemas: &HashMap<String, Schema>,
     load_errors: &HashMap<String, String>,
 ) -> ValidateR2rmlResponse {
+    let mut diagnostics = cross_check_mapping(compiled, schemas, read_schemas, load_errors);
+    diagnostics.extend(keyless_map_diagnostics(
+        compiled,
+        &preview_table_keys(compiled, schemas),
+        QueryTables::FromTable,
+        KeyRemedy::DeclareOrIdentifierFields,
+    ));
     ValidateR2rmlResponse {
         compiled_ok: true,
         triples_map_count: compiled.len(),
         table_names: table_names.into_iter().collect(),
-        diagnostics: cross_check_mapping(compiled, schemas, read_schemas, load_errors),
+        diagnostics,
     }
 }
 
@@ -911,6 +1237,104 @@ mod tests {
                 .any(|d| d.message.contains("but the map reads NAME")),
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn a_key_on_a_query_is_checked_against_its_table_and_select_list() {
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), dim_store_schema());
+        let on_query = |sql: &str, key: &[&str]| {
+            let mut tm = dim_store_map().with_declared_key(key.iter().copied());
+            tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(sql);
+            CompiledR2rmlMapping::new(vec![tm])
+        };
+        for sql in [
+            "SELECT * FROM DW.DIM_STORE WHERE NAME IS NOT NULL",
+            "SELECT STORE_KEY, NAME FROM DW.DIM_STORE",
+        ] {
+            let diags = cross_check_mapping(&on_query(sql, &["STORE_KEY"]), &schemas, &no_errors());
+            assert!(diags.is_empty(), "{sql}: {diags:?}");
+        }
+        let diags = cross_check_mapping(
+            &on_query("SELECT NAME FROM DW.DIM_STORE", &["STORE_KEY"]),
+            &schemas,
+            &no_errors(),
+        );
+        let key: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.column.as_deref() == Some("STORE_KEY"))
+            .collect();
+        assert_eq!(key.len(), 1, "{diags:?}");
+        assert_eq!(key[0].code, DiagCode::ColumnNotFound);
+        assert_eq!(key[0].table.as_deref(), Some("DW.DIM_STORE"));
+        assert!(
+            key[0]
+                .message
+                .contains("the rr:sqlQuery over 'DW.DIM_STORE'")
+                && key[0].message.contains("does not select"),
+            "{:?}",
+            key[0]
+        );
+        let diags = cross_check_mapping(
+            &on_query("SELECT * FROM DW.DIM_STORE", &["STORE_ID"]),
+            &schemas,
+            &no_errors(),
+        );
+        assert!(
+            diags.iter().any(|d| d.code == DiagCode::ColumnNotFound
+                && d.column.as_deref() == Some("STORE_ID")
+                && d.message.contains("which the table does not have")),
+            "a key over a column the FROM table lacks: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn declared_key_columns_are_checked_like_a_query_checks_them() {
+        // Two maps over one table, each declaring keys: one diagnostic per
+        // table and column, whichever map declared it.
+        let mut schema = dim_store_schema();
+        schema
+            .columns
+            .push(col("RATING", FieldType::Float64, false, Some(0.0)));
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), schema);
+        let keyed = |iri: &str, key: &[&str]| {
+            let mut tm = dim_store_map().with_declared_key(key.iter().copied());
+            tm.iri = iri.to_string();
+            tm
+        };
+        let compiled = CompiledR2rmlMapping::new(vec![
+            keyed("<#A>", &["STORE_KEY"]),
+            keyed("<#B>", &["STORE_KEY", "NAME"]),
+        ]);
+        let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+        assert!(diags.is_empty(), "usable key columns are clean: {diags:?}");
+
+        let compiled = CompiledR2rmlMapping::new(vec![
+            keyed("<#A>", &["STORE_ID"]),
+            keyed("<#B>", &["store_key", "RATING"]),
+            keyed("<#C>", &["STORE_ID"]),
+        ]);
+        let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+        let by_column = |name: &str| -> Vec<&Diagnostic> {
+            diags
+                .iter()
+                .filter(|d| d.column.as_deref() == Some(name))
+                .collect()
+        };
+        let missing = by_column("STORE_ID");
+        assert_eq!(missing.len(), 1, "{diags:?}");
+        assert_eq!(missing[0].code, DiagCode::ColumnNotFound);
+        let casing = by_column("store_key");
+        assert_eq!(casing.len(), 1, "{diags:?}");
+        assert_eq!(casing[0].code, DiagCode::CasingMismatch);
+        let float = by_column("RATING");
+        assert_eq!(float.len(), 1, "{diags:?}");
+        assert_eq!(float[0].code, DiagCode::NonKeyTypeSkipped);
+        for d in missing.iter().chain(&casing).chain(&float) {
+            assert_eq!(d.severity, Severity::Error, "{d:?}");
+            assert!(d.message.contains("f:key on 'DW.DIM_STORE'"), "{d:?}");
+        }
     }
 
     #[test]
@@ -1199,5 +1623,178 @@ mod tests {
                 col("STORE_KEY", FieldType::Int64, false, Some(0.0)),
             ],
         )
+    }
+
+    // ----- keyless maps (`keylessMap`) -----
+
+    /// `DW.DIM_STORE` with `STORE_KEY` as field 1 and `NAME` as field 2, and
+    /// `identifier` as its identifier field ids, at `format_version`.
+    fn identified_dim_store(identifier: Vec<i32>, format_version: i32) -> TableSchema {
+        let mut s = dim_store_schema();
+        for (i, c) in s.columns.iter_mut().enumerate() {
+            c.field_id = i32::try_from(i).unwrap() + 1;
+        }
+        s.identifier_field_ids = identifier;
+        s.format_version = format_version;
+        s
+    }
+
+    /// The `keylessMap` advisories a dry-run gives `maps` over `table`.
+    fn keyless(maps: Vec<TriplesMap>, table: TableSchema) -> Vec<Diagnostic> {
+        let compiled = CompiledR2rmlMapping::new(maps);
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), table);
+        keyless_map_diagnostics(
+            &compiled,
+            &preview_table_keys(&compiled, &schemas),
+            QueryTables::FromTable,
+            KeyRemedy::DeclareOrIdentifierFields,
+        )
+    }
+
+    /// A map no key proves subject-unique is named, with the `f:key` that
+    /// would prove it, as an advisory, never an error.
+    #[test]
+    fn a_keyless_map_is_advised_with_its_remedy() {
+        let diags = keyless(vec![dim_store_map()], identified_dim_store(vec![], 2));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let d = &diags[0];
+        assert_eq!(
+            (d.severity, d.code, d.table.as_deref()),
+            (
+                Severity::Advisory,
+                DiagCode::KeylessMap,
+                Some("DW.DIM_STORE")
+            )
+        );
+        for part in [
+            "TriplesMap <<#DimStore>>",
+            "(STORE_KEY)",
+            "it has no known key",
+            "remove repeated solutions",
+            r#"If STORE_KEY identifies a row, declare `f:key ( "STORE_KEY" )` on its logical table, or make it the table's identifier field."#,
+        ] {
+            assert!(d.message.contains(part), "{part}: {}", d.message);
+        }
+        assert!(!has_error(&diags));
+    }
+
+    /// A key from any route that covers the subject silences it: a declared
+    /// one, or the table's identifier fields while the format honors them.
+    #[test]
+    fn a_map_with_key_evidence_is_not_advised() {
+        let declared = dim_store_map().with_declared_key(["STORE_KEY"]);
+        assert!(keyless(vec![declared], identified_dim_store(vec![], 2)).is_empty());
+        assert!(keyless(vec![dim_store_map()], identified_dim_store(vec![1], 2)).is_empty());
+        assert!(keyless(vec![dim_store_map()], identified_dim_store(vec![1], 3)).is_empty());
+        // A version 4 reader ignores identifier fields.
+        assert_eq!(
+            keyless(vec![dim_store_map()], identified_dim_store(vec![1], 4)).len(),
+            1
+        );
+        // A template covering the key beside another column is unique too.
+        let mut wide = dim_store_map();
+        wide.subject_map.template = Some("http://ex/store/{STORE_KEY}/{NAME}".to_string());
+        assert!(keyless(vec![wide], identified_dim_store(vec![1], 2)).is_empty());
+    }
+
+    /// A key the subject does not cover leaves the map advised, naming the
+    /// keys it has; a template that runs values together says so.
+    #[test]
+    fn a_key_the_subject_cannot_use_is_named() {
+        let diags = keyless(vec![dim_store_map()], identified_dim_store(vec![2], 2));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("its known keys are (NAME)"),
+            "{}",
+            diags[0].message
+        );
+
+        let mut merged = dim_store_map().with_declared_key(["STORE_KEY", "NAME"]);
+        merged.subject_map.template = Some("http://ex/store/{STORE_KEY}-{NAME}".to_string());
+        let diags = keyless(vec![merged], identified_dim_store(vec![], 2));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("can run two values together"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    /// Over a filtered logical table, the identifier fields count only when
+    /// the query selects them.
+    #[test]
+    fn identifier_fields_count_where_the_query_selects_them() {
+        let over = |sql: &str| {
+            let mut tm = dim_store_map();
+            tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(sql);
+            keyless(vec![tm], identified_dim_store(vec![1], 2))
+        };
+        assert!(over("SELECT * FROM DW.DIM_STORE WHERE NAME IS NOT NULL").is_empty());
+        assert!(over("SELECT STORE_KEY, NAME FROM DW.DIM_STORE WHERE NAME IS NOT NULL").is_empty());
+        let diags = over("SELECT NAME FROM DW.DIM_STORE WHERE NAME IS NOT NULL");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .contains("its rr:sqlQuery logical table (over 'DW.DIM_STORE')"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    /// A table the preview did not resolve gets no advisory: its keys are
+    /// unknown, and it has its `TableNotFound`.
+    #[test]
+    fn an_unresolved_table_is_not_advised() {
+        let compiled = CompiledR2rmlMapping::new(vec![dim_store_map()]);
+        let keys = preview_table_keys(&compiled, &HashMap::new());
+        assert!(keys.is_empty());
+        assert!(keyless_map_diagnostics(
+            &compiled,
+            &keys,
+            QueryTables::FromTable,
+            KeyRemedy::DeclareOrIdentifierFields
+        )
+        .is_empty());
+    }
+
+    /// Delta's remedy is the declaration alone, and a generated mapping (no
+    /// `f:key`) is advised before it is saved.
+    #[test]
+    fn a_generated_mapping_without_keys_is_advised() {
+        let turtle = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://ex/mapping#Orders> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "sales.orders" ] ;
+                rr:subjectMap [ rr:template "http://ex/order/{order_id}" ] ;
+                rr:predicateObjectMap [ rr:predicate <http://ex/total> ;
+                                        rr:objectMap [ rr:column "total" ] ] .
+        "#;
+        let diags = keyless_generated_maps(
+            turtle,
+            declared_table_keys,
+            QueryTables::Alias,
+            KeyRemedy::Declare,
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .ends_with(r#"declare `f:key ( "order_id" )` on its logical table."#),
+            "{}",
+            diags[0].message
+        );
+        let keyed = turtle.replace(
+            r#"rr:tableName "sales.orders" ]"#,
+            r#"rr:tableName "sales.orders" ; <https://ns.flur.ee/db#key> ( "order_id" ) ]"#,
+        );
+        assert!(keyless_generated_maps(
+            &keyed,
+            declared_table_keys,
+            QueryTables::Alias,
+            KeyRemedy::Declare
+        )
+        .is_empty());
     }
 }

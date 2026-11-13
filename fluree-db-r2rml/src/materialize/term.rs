@@ -213,6 +213,39 @@ fn is_always_escaped(c: char) -> bool {
         | ':' | '@')
 }
 
+/// Whether `c` never appears in the output of [`iri_escape`]: it is always
+/// percent-encoded, and it is not `%`, which starts every encoding the escape
+/// writes. A template's literal text holding one between two placeholders
+/// marks exactly where the first value's encoding ends.
+fn is_hard_separator(c: char) -> bool {
+    is_always_escaped(c) && c != '%'
+}
+
+/// Whether distinct values of a template's columns always expand to distinct
+/// strings ([`expand_template`], [`expand_template_from_batch`]).
+///
+/// The escape is injective on each value, so the template is injective when
+/// every value's encoding can be delimited: the literal text between each
+/// pair of adjacent placeholders holds at least one character the escape
+/// never writes ([`is_hard_separator`]). The first such character after a
+/// value's start then lies in that literal text, which fixes the value's
+/// length. Adjacent placeholders (`{a}{b}`) and separators the escape can
+/// also write inside a value (`-`, `.`, `_`, `~`, the sub-delimiters, `:`,
+/// `@`, and `%`) are not injective: `{a}-{b}` expands `("x-y", "z")` and
+/// `("x", "y-z")` alike. A template with at most one placeholder is
+/// injective.
+pub fn template_is_injective(template: &str) -> bool {
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+    let spans: Vec<(usize, usize)> = PLACEHOLDER_RE
+        .find_iter(template)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    spans
+        .windows(2)
+        .all(|w| template[w[0].1..w[1].0].chars().any(is_hard_separator))
+}
+
 /// Percent-decode a value produced by [`iri_escape`] back to its raw bytes.
 /// Inverse of the `%XX` encoding; returns `None` on a malformed escape or on
 /// bytes that are not valid UTF-8.
@@ -1652,6 +1685,78 @@ mod tests {
                 let term = materialize_object_from_batch(&om, &batch, row).unwrap();
                 assert_eq!(term, lex.clone().map(RdfTerm::string), "{col:?} row {row}");
             }
+        }
+    }
+
+    /// `template_is_injective` against the expansion itself: over every pair
+    /// of short values from an alphabet holding the characters the escape
+    /// treats differently, a template it calls injective never expands two
+    /// distinct pairs to one string, and each one it refuses here does.
+    #[test]
+    fn template_injectivity_matches_the_expansion() {
+        let alphabet = ['a', '1', '-', '.', ':', ';', '%', '/', ' ', '\u{e9}'];
+        let mut values = vec![String::new()];
+        for &c in &alphabet {
+            values.push(c.to_string());
+            for &d in &alphabet {
+                values.push(format!("{c}{d}"));
+            }
+        }
+        let expand = |template: &str, a: &str, b: &str| {
+            let row: HashMap<String, Option<String>> = [
+                ("a".to_string(), Some(a.to_string())),
+                ("b".to_string(), Some(b.to_string())),
+            ]
+            .into_iter()
+            .collect();
+            expand_template(template, &row).expect("both columns bound")
+        };
+        // Values for `b` only when the template reads it: a column the
+        // template does not read would "collide" with itself.
+        let collides = |template: &str| {
+            let bs: &[String] = if template.contains("{b}") {
+                &values
+            } else {
+                &values[..1]
+            };
+            let mut seen: HashMap<String, (&str, &str)> = HashMap::new();
+            for a in &values {
+                for b in bs {
+                    let out = expand(template, a, b);
+                    if let Some(prev) = seen.insert(out, (a, b)) {
+                        if prev != (a.as_str(), b.as_str()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        let injective = [
+            "http://ex/{a}/{b}",
+            "http://ex/{a}-/{b}",
+            "http://ex/{a}#{b}",
+            "http://ex/{a} {b}",
+            "http://ex/{a}\u{e9}{b}",
+            "http://ex/{a}",
+            "http://ex/{a}/x",
+        ];
+        for t in injective {
+            assert!(template_is_injective(t), "{t}");
+            assert!(!collides(t), "{t} called injective but two pairs collide");
+        }
+        let merging = [
+            "http://ex/{a}{b}",
+            "http://ex/{a}-{b}",
+            "http://ex/{a}.{b}",
+            "http://ex/{a}:{b}",
+            "http://ex/{a};{b}",
+            "http://ex/{a}%2F{b}",
+            "http://ex/{a}a{b}",
+        ];
+        for t in merging {
+            assert!(!template_is_injective(t), "{t}");
+            assert!(collides(t), "{t} refused, and two pairs do collide");
         }
     }
 }

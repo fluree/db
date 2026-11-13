@@ -27,6 +27,17 @@
 //!   "999", "1000", …) and `xsd:boolean` (`btext`: "1", "true", …), and a
 //!   double column holding -0.0 and 0.0.
 //!
+//! Under `tests/fixtures/iceberg/sets/`, in their own namespace, tables whose
+//! rows mint the same triple more than once (R2RML set semantics; see the
+//! `sets.*` block of the script below):
+//!
+//! - `customers_history` — several versions per customer, no key covering
+//!   `customer_id` alone, in two files.
+//! - `customers_current` — one row per customer; `customer_id` is an Iceberg
+//!   identifier field.
+//! - `orders` — references `customers_history`; one exact duplicate row, one
+//!   copy in each file.
+//!
 //! The fixtures' metadata carries the ABSOLUTE paths they were written under
 //! (`file:///tmp/...`), so reading them from a checkout also proves the
 //! relocated-table location remap: the provider infers `metadata.location →
@@ -45,6 +56,22 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/versions fluree-db-api/tests/fixtures/iceberg/silver/versions
 //! cp -r /tmp/fluree-local-iceberg/silver/tombstones fluree-db-api/tests/fixtures/iceberg/silver/tombstones
 //! ```
+//!
+//! The `sets` tables were written under `/tmp/fluree-local-iceberg-sets`, the
+//! path their metadata records. The script deletes and rewrites its whole
+//! warehouse argument, and every run mints new file names and snapshot ids,
+//! so give it its own directory and copy only the tables you mean to replace:
+//!
+//! ```bash
+//! python3 scripts/local/write_local_iceberg_table.py /tmp/fluree-local-iceberg-sets
+//! rm -rf fluree-db-api/tests/fixtures/iceberg/sets/{customers_history,customers_current,orders}
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/customers_history fluree-db-api/tests/fixtures/iceberg/sets/customers_history
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/customers_current fluree-db-api/tests/fixtures/iceberg/sets/customers_current
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/orders fluree-db-api/tests/fixtures/iceberg/sets/orders
+//! ```
+//!
+//! The `sql-sqlite` extra is what brings `sqlalchemy`, which the script's SQL
+//! catalog needs; install it in a virtualenv if the system Python lacks it.
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
 //! fixture to run those tests against any table with the same shape.
@@ -1572,7 +1599,8 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
     let location = table_location();
     allow_fixture_roots();
     let fluree = FlureeBuilder::memory().build_memory();
-    let config = R2rmlCreateConfig::new_direct("topk-people", &location, PEOPLE_R2RML)
+    let mapping = keyed_by_id(PEOPLE_R2RML, "silver.people");
+    let config = R2rmlCreateConfig::new_direct("topk-people", &location, &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -4328,6 +4356,19 @@ const WINDOW_PEOPLE_R2RML: &str = r#"
         ] .
 "#;
 
+/// `mapping` with `id` declared the key of `table`'s logical table. A
+/// scan-side top-k counts rows, so it runs only over a map whose rows cannot
+/// repeat a triple; the top-k tests below declare the key their fixtures hold
+/// so the decline they pin is theirs, not the missing key's.
+fn keyed_by_id(mapping: &str, table: &str) -> String {
+    let keyed = mapping.replace(
+        &format!(r#"rr:tableName "{table}" ]"#),
+        &format!(r#"rr:tableName "{table}" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#),
+    );
+    assert_ne!(keyed, mapping, "the key was spliced in");
+    keyed
+}
+
 /// The ids (in answer order) of the first column named `id` in a SPARQL or
 /// JSON-LD result.
 fn answer_ids(result: &serde_json::Value) -> Vec<i64> {
@@ -4394,7 +4435,8 @@ async fn order_by_limit_over_a_scan_its_input_binds_answers_the_bound_rows() {
         "file://{}/tests/fixtures/iceberg/silver",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("topk-cell", &root, PERSON_CELL_TOPK_R2RML)
+    let mapping = keyed_by_id(PERSON_CELL_TOPK_R2RML, "silver.people_window");
+    let config = R2rmlCreateConfig::new_direct("topk-cell", &root, &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -4455,6 +4497,70 @@ async fn order_by_limit_over_a_scan_its_input_binds_answers_the_bound_rows() {
     );
 }
 
+/// A scan-side top-k counts the rows it reads, so it runs only over a map
+/// whose rows cannot repeat a triple. `people_window` declares no key: the
+/// top-k is declined and every file is read, to the same answer the keyed
+/// map gives after reading only the file holding the top ids.
+#[tokio::test]
+async fn a_top_k_over_a_keyless_map_reads_every_file() {
+    allow_fixture_roots();
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let keyed = keyed_by_id(WINDOW_PEOPLE_R2RML, "silver.people_window");
+    for (name, mapping) in [
+        ("topk-keyless", WINDOW_PEOPLE_R2RML),
+        ("topk-keyed", keyed.as_str()),
+    ] {
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, &location, mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+    }
+    for (name, prunes) in [("topk-keyless", false), ("topk-keyed", true)] {
+        let before = store.find_events("scan-side top-k prune").len();
+        let sparql = format!(
+            "SELECT ?id FROM <{name}:main> WHERE {{ ?s <http://example.org/id> ?id }} \
+             ORDER BY DESC(?id) LIMIT 2"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+        assert_eq!(answer_ids(&result), [3000, 2999], "{name}: {result}");
+        let jsonld = serde_json::json!({
+            "from": format!("{name}:main"),
+            "select": ["?id"],
+            "where": {"@id": "?s", "http://example.org/id": "?id"},
+            "orderBy": "(desc ?id)",
+            "limit": 2,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {name}: {e}"));
+        assert_eq!(
+            answer_ids(&result),
+            [3000, 2999],
+            "JSON-LD {name}: {result}"
+        );
+        let pruned = store.find_events("scan-side top-k prune")[before..]
+            .iter()
+            .any(|e| e.fields.get("files_pruned").is_some_and(|n| n != "0"));
+        assert_eq!(pruned, prunes, "{name}: whether the top-k pruned files");
+    }
+}
+
 /// `ORDER BY … LIMIT k` over a scan whose rows are joined to its input (a
 /// `VALUES` block, here) answers the top k of the JOINED rows. The scan-side
 /// top-k keeps the k best rows the reader returns and skips every file that
@@ -4471,7 +4577,8 @@ async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
         "file://{}/tests/fixtures/iceberg/silver/people_window",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_PEOPLE_R2RML)
+    let mapping = keyed_by_id(WINDOW_PEOPLE_R2RML, "silver.people_window");
+    let config = R2rmlCreateConfig::new_direct("topk-window", &location, &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -4652,10 +4759,10 @@ async fn a_values_subject_set_answers_its_subjects() {
 
 /// `people_window.id` references `cells.i32`, whose values 9 and 10 each sit
 /// on two rows (cells 2 and 4, cells 5 and 7) and whose 2 and 100 sit on one;
-/// every other person's reference dangles. The join keeps the smaller cell
-/// for a duplicated key and drops a dangling reference, whether the parent is
-/// read whole (no LIMIT: the first window holds 3,000 keys) or by the keys of
-/// a `LIMIT`'s first rows or a `VALUES` block's subjects.
+/// every other person's reference dangles. The join reaches both cells of a
+/// duplicated key and drops a dangling reference, whether the parent is read
+/// whole (no LIMIT: the first window holds 3,000 keys) or by the keys of a
+/// `LIMIT`'s first rows or a `VALUES` block's subjects.
 const PERSON_CELL_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
@@ -4696,12 +4803,19 @@ async fn a_referencing_map_keeps_its_answers_when_the_parent_is_read_by_key() {
     let cell = |id: u32| format!("http://example.org/cell/{id}");
     let all = vec![
         vec![person(10), cell(5)],
+        vec![person(10), cell(7)],
         vec![person(100), cell(6)],
         vec![person(2), cell(1)],
         vec![person(9), cell(2)],
+        vec![person(9), cell(4)],
     ];
     let values = [person(9), person(10), person(11)];
-    let values_answer = vec![vec![person(10), cell(5)], vec![person(9), cell(2)]];
+    let values_answer = vec![
+        vec![person(10), cell(5)],
+        vec![person(10), cell(7)],
+        vec![person(9), cell(2)],
+        vec![person(9), cell(4)],
+    ];
 
     let mut wrong = Vec::new();
     for (label, sparql_where, jsonld_values, limit) in [
@@ -4881,6 +4995,247 @@ async fn a_parent_probe_plans_its_file_counts_from_the_kept_list() {
     assert_eq!(ask_jsonld().await, bound, "JSON-LD VALUES");
     let limited = ask(String::new(), " LIMIT 2").await;
     assert!(twins(&limited), "SPARQL LIMIT 2: {limited:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Table keys over the `sets` fixtures: what an Iceberg source reports, and a
+// declared `f:key` checked against the pinned snapshot's schema.
+// ---------------------------------------------------------------------------
+
+/// `sets.customers_current` (customer_id an Iceberg identifier field) and
+/// `sets.customers_history` (no identifier field) minting the same subjects;
+/// `history_table_extra` follows the history table's name on its logical
+/// table (an `f:key`, or nothing).
+fn sets_customers_r2rml(history_table_extra: &str) -> String {
+    format!(
+        r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/mapping#Current>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_current" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/customer/{{customer_id}}" ;
+                rr:class ex:Customer
+            ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+        <http://example.org/mapping#History>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_history" {history_table_extra} ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/customer/{{customer_id}}" ;
+                rr:class ex:Customer
+            ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#
+    )
+}
+
+/// A graph source `alias` over the committed `sets` tables (a warehouse root:
+/// each table name resolves to its directory), mapped by `mapping`.
+async fn sets_source(alias: &str, mapping: &str) -> fluree_db_api::Fluree {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/sets",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config =
+        R2rmlCreateConfig::new_direct(alias, &root, mapping).with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create sets graph source");
+    fluree
+}
+
+#[tokio::test]
+async fn an_iceberg_identifier_field_is_a_table_key() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider, R2rmlTableProvider};
+    let fluree = sets_source("sets-keys", &sets_customers_r2rml("")).await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let gs = "sets-keys:main";
+
+    assert_eq!(
+        provider
+            .table_keys(gs, "sets.customers_current", None)
+            .await
+            .expect("keys of customers_current"),
+        Some(vec![vec!["customer_id".to_string()]])
+    );
+    assert_eq!(
+        provider
+            .table_keys(gs, "sets.customers_history", None)
+            .await
+            .expect("keys of customers_history"),
+        None
+    );
+
+    // Through the one way a lane obtains keys: the current table's subjects
+    // are unique, the history table's are not.
+    let mapping = provider.compiled_mapping(gs, None).await.expect("mapping");
+    for (table, unique) in [
+        ("sets.customers_current", true),
+        ("sets.customers_history", false),
+    ] {
+        let keys = effective_table_keys(&provider, &mapping, gs, table, None)
+            .await
+            .expect("effective keys");
+        let tm = mapping.find_maps_for_table(table)[0];
+        assert_eq!(tm.subject_unique_under(&keys), unique, "{table}: {keys:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_declared_key_unites_with_what_the_table_reports() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider};
+    // The history table's natural key carries the version column, so it does
+    // not make the per-customer subject unique.
+    let fluree = sets_source(
+        "sets-declared",
+        &sets_customers_r2rml(r#"; f:key ( "customer_id" "valid_from" )"#),
+    )
+    .await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let gs = "sets-declared:main";
+    let mapping = provider.compiled_mapping(gs, None).await.expect("mapping");
+    let keys = effective_table_keys(&provider, &mapping, gs, "sets.customers_history", None)
+        .await
+        .expect("a usable declared key");
+    assert_eq!(
+        keys,
+        fluree_db_r2rml::TableKeys::new([["customer_id", "valid_from"]])
+    );
+    let history = mapping.find_maps_for_table("sets.customers_history")[0];
+    assert!(!history.subject_unique_under(&keys));
+}
+
+#[tokio::test]
+async fn a_declared_key_the_table_cannot_hold_is_refused() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider, R2rmlTableProvider};
+    // A column the snapshot lacks (a misspelling, or other casing).
+    for (key, says) in [
+        (
+            r#"( "customer_idx" )"#,
+            r#"column "customer_idx", which the table does not have"#,
+        ),
+        (
+            r#"( "Customer_ID" )"#,
+            r#"column "Customer_ID", which the table does not have"#,
+        ),
+    ] {
+        let alias = format!("sets-bad-{}", key.len());
+        let fluree = sets_source(&alias, &sets_customers_r2rml(&format!("; f:key {key}"))).await;
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        let gs = format!("{alias}:main");
+        let err = provider
+            .table_keys(&gs, "sets.customers_history", None)
+            .await
+            .expect_err("a key the table cannot hold refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(says) && msg.contains("sets.customers_history"),
+            "{key}: {msg}"
+        );
+        // The choke point every lane goes through refuses too, rather than
+        // falling back to the declaration.
+        let mapping = provider.compiled_mapping(&gs, None).await.expect("mapping");
+        assert!(
+            effective_table_keys(&provider, &mapping, &gs, "sets.customers_history", None)
+                .await
+                .is_err()
+        );
+        // A table that declares nothing is unaffected.
+        assert!(provider
+            .table_keys(&gs, "sets.customers_current", None)
+            .await
+            .is_ok());
+    }
+
+    // A floating-point column, on silver.people's `score`.
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = PEOPLE_R2RML.replace(
+        r#"rr:logicalTable [ rr:tableName "silver.people" ]"#,
+        r#"rr:logicalTable [ rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "score" ) ]"#,
+    );
+    assert_ne!(mapping, PEOPLE_R2RML, "the key was spliced in");
+    let config = R2rmlCreateConfig::new_direct("people-float-key", table_location(), &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("registration compiles the mapping; the schema is checked at query time");
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let msg = provider
+        .table_keys("people-float-key:main", "silver.people", None)
+        .await
+        .expect_err("a floating-point key refuses")
+        .to_string();
+    assert!(
+        msg.contains(r#"column "score" of type Float64"#) && msg.contains("floating-point"),
+        "{msg}"
+    );
+}
+
+/// A graph source's answer streams out of the GRAPH scope that reads it, one
+/// batch at a time, rather than being held whole and handed on as one batch:
+/// the 3,000 rows of `people_window` arrive in batches no larger than the
+/// batch size, through a FROM, on SPARQL and JSON-LD.
+#[tokio::test]
+async fn a_graph_sources_answer_streams_in_batches() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("streamed-people", &location, WINDOW_PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let sizes = |result: &fluree_db_api::QueryResult| -> Vec<usize> {
+        result
+            .batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .collect()
+    };
+    let check = |label: &str, sizes: Vec<usize>| {
+        assert_eq!(sizes.iter().sum::<usize>(), 3000, "{label}: {sizes:?}");
+        assert!(
+            sizes.len() > 1 && sizes.iter().all(|&n| n <= 1000),
+            "{label}: the answer came in batches of {sizes:?}"
+        );
+    };
+
+    let sparql = "PREFIX ex: <http://example.org/> SELECT ?s ?n \
+                  FROM <streamed-people:main> WHERE { ?s ex:name ?n }";
+    let result = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .expect("FROM");
+    check("SPARQL FROM", sizes(&result));
+    let jsonld = serde_json::json!({
+        "from": "streamed-people:main",
+        "select": ["?s", "?n"],
+        "where": {"@id": "?s", "http://example.org/name": "?n"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute()
+        .await
+        .expect("JSON-LD FROM");
+    check("JSON-LD FROM", sizes(&result));
 }
 
 /// `silver.cells` references `silver.people_window` by its `id` twice, through
@@ -5559,8 +5914,8 @@ async fn unordered_grouped_pages_are_the_same_on_every_execution() {
 
 /// `people_paged` references `people_window` twice. `ex:peer` joins by
 /// `score` (`id % 100`), so each key sits on 30 parent rows spread over all
-/// five files and the join keeps the smallest `peer` IRI. `ex:twin` joins by
-/// `id`: one parent row per key, in files of disjoint `id` ranges.
+/// five files, and a person joins each of their 30 `peer` subjects. `ex:twin`
+/// joins by `id`: one parent row per key, in files of disjoint `id` ranges.
 const PAGED_REFERENCES_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
@@ -5598,10 +5953,10 @@ const PAGED_REFERENCES_R2RML: &str = r#"
 /// A paged unordered query over a referencing map returns the same pages on
 /// every execution, on SPARQL and JSON-LD. The parent's reads ask for no order
 /// (they fold into a lookup whose contents do not depend on it), so the rows
-/// come in the child's sliced scan order, each with its keep-min parent, and
-/// the pages partition exactly that answer in two fresh instances. `ex:peer`
-/// reads the parent whole (every file holds every key); `ex:twin` reads it by
-/// the keys of each page's rows.
+/// come in the child's sliced scan order, each row followed by every parent
+/// subject its key matches in subject order, and the pages partition exactly
+/// that answer in two fresh instances. `ex:peer` reads the parent whole (every
+/// file holds every key); `ex:twin` reads it by the keys of each page's rows.
 #[tokio::test]
 async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution() {
     allow_fixture_roots();
@@ -5609,28 +5964,28 @@ async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution(
     let order = paged_scan_order(&silver.join("people_paged"));
     let root = format!("file://{}", silver.display());
     let parent = |kind: &str, id: i64| format!("http://example.org/{kind}/{id}");
-    let mut keep_min: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    // Each score's peers, in the order a key's parent subjects are joined.
+    let mut peers: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
     for id in 1..=3000 {
-        let iri = parent("peer", id);
-        let kept = keep_min.entry(id % 100).or_insert_with(|| iri.clone());
-        if iri < *kept {
-            *kept = iri;
-        }
+        peers.entry(id % 100).or_default().push(parent("peer", id));
+    }
+    for subjects in peers.values_mut() {
+        subjects.sort();
     }
     let expected = |predicate: &str| -> Vec<(String, String)> {
         order
             .iter()
-            .map(|&id| {
-                let object = if predicate == "peer" {
-                    keep_min[&(id % 100)].clone()
+            .flat_map(|&id| {
+                let subject = person(u32::try_from(id).expect("an id"));
+                let objects = if predicate == "peer" {
+                    peers[&(id % 100)].clone()
                 } else {
-                    parent("twin", id)
+                    vec![parent("twin", id)]
                 };
-                (person(u32::try_from(id).expect("an id")), object)
+                objects.into_iter().map(move |o| (subject.clone(), o))
             })
             .collect()
     };
-    const PAGE: usize = 500;
 
     for run in 0..2 {
         let fluree = FlureeBuilder::memory().build_memory();
@@ -5643,13 +5998,16 @@ async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution(
             .expect("create graph source");
         for predicate in ["peer", "twin"] {
             let iri = format!("http://example.org/{predicate}");
+            let want = expected(predicate);
+            // 30 `peer` rows per person: pages of 4,500 keep it to 20 queries.
+            let page = if predicate == "peer" { 4_500 } else { 500 };
             let mut sparql_pages = Vec::new();
             let mut jsonld_pages = Vec::new();
-            for k in 0..order.len().div_ceil(PAGE) {
+            for k in 0..want.len().div_ceil(page) {
                 let sparql = format!(
                     "SELECT ?s ?o FROM <paged-refs:main> WHERE {{ ?s <{iri}> ?o }} \
-                     LIMIT {PAGE} OFFSET {}",
-                    k * PAGE
+                     LIMIT {page} OFFSET {}",
+                    k * page
                 );
                 let rows = fluree
                     .query_from()
@@ -5672,8 +6030,8 @@ async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution(
                     "from": "paged-refs:main",
                     "select": ["?s", "?o"],
                     "where": {"@id": "?s", iri.as_str(): "?o"},
-                    "limit": PAGE,
-                    "offset": k * PAGE,
+                    "limit": page,
+                    "offset": k * page,
                 });
                 let rows = fluree
                     .query_from()
@@ -5691,11 +6049,12 @@ async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution(
                         }),
                 );
             }
-            let want = expected(predicate);
             assert!(
                 sparql_pages == want,
                 "SPARQL ex:{predicate}, run {run}: the pages are the child's scan order with \
-                 each row's keep-min parent; first difference at {:?}",
+                 each row's parent subjects in order; {} rows of {}, first difference at {:?}",
+                sparql_pages.len(),
+                want.len(),
                 sparql_pages.iter().zip(&want).position(|(a, b)| a != b)
             );
             assert!(
