@@ -88,7 +88,9 @@ pub enum RefreshOutcome {
     /// retention window as it may; publication waits for them to age out.
     #[serde(rename_all = "camelCase")]
     Throttled { in_guard: usize },
-    /// A storage sweep of the ledger is running; a later refresh retries.
+    /// Left for a later refresh: a sweep or collection of the ledger is
+    /// running, the branch moved on while this was computed, or a failed
+    /// refresh is waiting out its backoff or for its inputs to change.
     Deferred { reason: String },
     /// The index is published under newer engine semantics than this
     /// instance runs, so only an instance at least as new refreshes it. After
@@ -272,7 +274,9 @@ impl Fluree {
     }
 
     /// Retire an index: from now on workers are refused and queries stop being
-    /// served from it. Its files stay until a cleanup pass removes them.
+    /// served from it. Its files are deleted by the maintenance that runs
+    /// once the retention window has passed: the worker's, or a refresh of
+    /// the branch.
     pub async fn retire_reasoning_index(
         &self,
         ledger_id: &str,
@@ -444,12 +448,19 @@ impl Fluree {
         Ok(files.len())
     }
 
-    /// Bring every active index of the branch up to its current commit.
+    /// Bring every active index of the branch up to its current commit, and
+    /// delete the files of the indexes retired longer ago than the
+    /// retention window: where no worker runs, this is the branch's
+    /// maintenance.
     pub async fn refresh_reasoning_indexes(
         &self,
         ledger_id: &str,
     ) -> Result<Vec<(ReasoningIndexId, RefreshOutcome)>> {
-        self.refresh_indexes(ledger_id, false).await
+        let outcomes = self.refresh_indexes(ledger_id, false).await?;
+        if let Err(error) = self.clean_retired_reasoning_indexes(ledger_id).await {
+            tracing::warn!(ledger = ledger_id, %error, "retired reasoning indexes not cleaned");
+        }
+        Ok(outcomes)
     }
 
     pub(super) async fn refresh_indexes(
@@ -2821,6 +2832,35 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        assert!(fluree
+            .reasoning_indexes(id)
+            .await
+            .unwrap()
+            .indexes
+            .is_empty());
+    }
+
+    /// Automatic maintenance is off unless a server asks for it, so the
+    /// refresh a caller asks for is what deletes a retired index's files
+    /// once its retention window has passed.
+    #[tokio::test]
+    async fn a_refresh_of_the_branch_deletes_what_a_retired_index_left() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let id = "reasoning-indexes/retired-cleanup:main";
+        let (index, _) = students(&fluree, id).await;
+        fluree.refresh_reasoning_index(id, &index).await.unwrap();
+        fluree.retire_reasoning_index(id, &index).await.unwrap();
+
+        // Inside the window a reader may still hold the generation.
+        fluree.refresh_reasoning_indexes(id).await.unwrap();
+        assert!(!index_files(&fluree, id, &index).await.is_empty());
+
+        fluree.set_reasoning_index_retention(super::super::GenerationRetention {
+            min_age_ms: 0,
+            ..Default::default()
+        });
+        fluree.refresh_reasoning_indexes(id).await.unwrap();
+        assert_eq!(index_files(&fluree, id, &index).await, Vec::<String>::new());
         assert!(fluree
             .reasoning_indexes(id)
             .await
