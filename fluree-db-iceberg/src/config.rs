@@ -152,7 +152,9 @@ impl IcebergGsConfig {
     ///
     /// For `Direct` catalog configs, if no explicit `table` config is set,
     /// the table identifier is derived from the last two path segments of
-    /// `table_location` (e.g., `s3://bucket/warehouse/ns/table` → `ns.table`).
+    /// `table_location` (e.g., `s3://bucket/warehouse/ns/table` → `ns.table`),
+    /// the bucket counting as one (`s3://bucket/lake` → `bucket.lake`). A
+    /// single-segment location (`s3://bucket`) takes the namespace `default`.
     pub fn table_identifier(&self) -> Result<TableIdentifier> {
         let id_str = self.table.identifier();
         if !id_str.is_empty() {
@@ -167,15 +169,24 @@ impl IcebergGsConfig {
                 .trim_start_matches("gs://")
                 .trim_start_matches("file://");
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if segments.len() >= 3 {
-                // segments[0] = bucket, segments[1..n-2] = warehouse path,
-                // segments[n-2] = namespace, segments[n-1] = table
-                let ns = segments[segments.len() - 2];
-                let table = segments[segments.len() - 1];
-                return Ok(TableIdentifier {
-                    namespace: ns.to_string(),
-                    table: table.to_string(),
-                });
+            // The last segment names the table and the one before it the
+            // namespace; for an object-store location one level under its
+            // bucket that is the bucket. A lone segment (a bucket, or a
+            // top-level directory) has no parent to name one.
+            match segments.as_slice() {
+                [.., ns, table] => {
+                    return Ok(TableIdentifier {
+                        namespace: (*ns).to_string(),
+                        table: (*table).to_string(),
+                    });
+                }
+                [table] => {
+                    return Ok(TableIdentifier {
+                        namespace: "default".to_string(),
+                        table: (*table).to_string(),
+                    });
+                }
+                [] => {}
             }
         }
 
@@ -1153,6 +1164,27 @@ mod tests {
         let table_id = config.table_identifier().unwrap();
         assert_eq!(table_id.namespace, "ns");
         assert_eq!(table_id.table, "table");
+    }
+
+    /// A Direct location shallower than `bucket/…/ns/table` still yields an
+    /// identifier: a warehouse root one level under its bucket, or the bucket
+    /// itself, has to be registrable.
+    #[test]
+    fn direct_identifier_derives_from_a_shallow_location() {
+        let id = |location: &str| {
+            let config = IcebergGsConfig {
+                table: TableConfig::Identifier(String::new()),
+                ..aws_sdk_config(CatalogConfig::direct(location), "")
+            };
+            config.validate().unwrap();
+            let id = config.table_identifier().unwrap();
+            (id.namespace, id.table)
+        };
+        let pair = |ns: &str, table: &str| (ns.to_string(), table.to_string());
+        assert_eq!(id("s3://bucket/wh/lake"), pair("wh", "lake"));
+        assert_eq!(id("s3://bucket/lake"), pair("bucket", "lake"));
+        assert_eq!(id("s3://bucket/lake/"), pair("bucket", "lake"));
+        assert_eq!(id("s3://bucket"), pair("default", "bucket"));
     }
 
     // ── AWS Glue / S3 Tables ──

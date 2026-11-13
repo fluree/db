@@ -1496,13 +1496,9 @@ pub enum Commands {
         #[arg(long)]
         allow_mor_deletes: bool,
 
-        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
-        /// parent row. By default the build is refused: the twin would bake one
-        /// deterministically-chosen parent per key (the lexicographically smallest)
-        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
-        /// does not yet emit. With this flag the twin builds anyway and records the
-        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
-        /// Default: fail closed.
+        /// No effect; accepted for compatibility. A foreign-key parent join key
+        /// that matches more than one parent row gives one edge per distinct
+        /// parent subject, as R2RML specifies, so no source is refused for it.
         #[arg(long)]
         allow_duplicate_parent_keys: bool,
 
@@ -4054,8 +4050,9 @@ pub struct SqlMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Accept subject keys the registration probe finds non-unique (the
-    /// probe still warns; the pushdown lane then runs over them)
+    /// Skip the duplicate-subject probe: no table is refused, and queries
+    /// answer with set semantics wherever no declared key proves a map's
+    /// subjects unique
     #[arg(long)]
     pub allow_duplicate_subjects: bool,
 }
@@ -4101,7 +4098,11 @@ pub struct IcebergMapArgs {
     /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
     /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
     /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
-    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// on the name. A root holding a directory per namespace
+    /// (`<root>/<namespace>/<table>`, or Hive/Glue's `<namespace>.db/`) is
+    /// searched there and only there, so a table missing from its namespace
+    /// directory is an error; a root with no such directory ignores the
+    /// namespace. Warehouse mode is auto-detected when the
     /// location's leaf directory does not name the requested table; a bare
     /// single-table location resolves as before. (A table named exactly after its
     /// parent directory would read as single-table.) No catalog/OAuth flags are

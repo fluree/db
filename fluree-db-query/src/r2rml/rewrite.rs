@@ -28,6 +28,7 @@ use crate::binding::Binding;
 use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
+use crate::r2rml::set_semantics::TableKeyEvidence;
 use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
@@ -358,9 +359,15 @@ pub fn r2rml_unsupported_pattern_error(graph_iri: &str, count: usize) -> crate::
 /// * `snapshot` - Database for Sid-to-IRI conversion
 /// * `mapping` - The compiled R2RML mapping, when available. Used to decide
 ///   whether a same-subject `rdf:type` may be safely fused into a star scan
-///   (see [`class_fusion_is_safe`]). `None` disables class fusion — always
-///   correct, just less optimal — so callers that can cheaply load the mapping
-///   should pass it.
+///   (see [`class_fusion_is_safe`]). `None` disables class fusion and the
+///   fusion of a star's members — always correct, just less optimal — so
+///   callers that can cheaply load the mapping should pass it.
+/// * `keys` - What is known about the keys of the mapping's tables. Fusing a
+///   star's members, or a constant member onto a crawl wildcard, reads them
+///   from one row, which answers over the graph only when each subject is one
+///   row's ([`one_row_per_subject`]); an unanswered question is recorded in
+///   `keys` for the caller to fetch and rewrite again
+///   ([`rewrite_patterns_for_r2rml_source`] does).
 /// * `crawl_active` - Whether this rewrite serves a graph-source subgraph "browse"
 ///   crawl (sourced from `ExecutionContext::trust_fk_refs`, which only the crawl
 ///   sets). When `true`, a lone projected type-var (`?s a ?type`) co-located with
@@ -385,6 +392,7 @@ pub fn rewrite_patterns_for_r2rml(
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
     mapping: Option<&CompiledR2rmlMapping>,
+    keys: &TableKeyEvidence,
     reasoning_active: bool,
     crawl_active: bool,
 ) -> R2rmlRewriteResult {
@@ -489,6 +497,7 @@ pub fn rewrite_patterns_for_r2rml(
                         graph_source_id,
                         snapshot,
                         mapping,
+                        keys,
                         reasoning_active,
                         crawl_active,
                     );
@@ -516,6 +525,7 @@ pub fn rewrite_patterns_for_r2rml(
                         graph_source_id,
                         snapshot,
                         mapping,
+                        keys,
                         reasoning_active,
                         crawl_active,
                     );
@@ -715,6 +725,31 @@ pub fn rewrite_patterns_for_r2rml(
             }
         }
 
+        // A fused star reads all its members from one row. Where several rows
+        // mint one subject, the graph pairs each object of one member with
+        // each object of another across those rows, and matches a constant
+        // member on any of them; the fused scan pairs and matches within each
+        // row alone, and misses solutions. Members fuse only when every map
+        // the star reads mints each subject from one row; otherwise they run
+        // as separate scans, which the engine joins on the subject.
+        let fuses_members = var_members.len() > 1 || !const_members.is_empty();
+        if fuses_members
+            && !one_row_per_subject(
+                mapping,
+                keys,
+                var_members
+                    .iter()
+                    .chain(&const_members)
+                    .filter_map(|p| p.predicate_filter.as_deref()),
+            )
+        {
+            for m in var_members.into_iter().chain(const_members) {
+                result_patterns.push(Pattern::R2rml(m));
+                origins.push(origin);
+            }
+            continue;
+        }
+
         let star_constraints: Vec<(String, ObjectConstant)> = const_members
             .into_iter()
             .filter_map(|m| Some((m.predicate_filter?, m.object_constant?)))
@@ -881,8 +916,18 @@ pub fn rewrite_patterns_for_r2rml(
             ),
             _ => false,
         });
+        // A folded constant keeps a wildcard row only when that ROW holds it,
+        // while the graph keeps every triple of a subject holding it on any of
+        // its rows: fold only where each subject is one row's.
+        let per_subject = one_row_per_subject(
+            mapping,
+            keys,
+            const_members
+                .iter()
+                .filter_map(|m| m.predicate_filter.as_deref()),
+        );
         match wildcard {
-            Some(idx) if !cannot_rise => {
+            Some(idx) if !cannot_rise && per_subject => {
                 origins[idx] = origins[idx].min(written);
                 if let Pattern::R2rml(rp) = &mut result_patterns[idx] {
                     for m in const_members {
@@ -1340,6 +1385,93 @@ fn bound_besides_subject(p: &R2rmlPattern) -> impl Iterator<Item = VarId> + '_ {
 }
 
 /// The subject var of a regular-predicate R2RML pattern that can join a
+/// Whether every subject a same-subject star over `predicates` can match is
+/// minted from one row, so a scan reading the star's members from one row
+/// sees all of a subject's objects. A map providing all of them (a map
+/// missing one yields no star row) must mint each of its subjects from one
+/// row, and no two such maps may mint one subject from rows of their own: a
+/// subject both mint has a row in each, and the graph pairs one row's objects
+/// with the other's. Two covering maps pass when their subjects are provably
+/// disjoint, or when they read the same row and mint every member alike (one
+/// set of triples, held once). `false` without a mapping, or while a map's
+/// table keys are unknown (recorded in `keys` for the caller to fetch).
+fn one_row_per_subject<'p>(
+    mapping: Option<&CompiledR2rmlMapping>,
+    keys: &TableKeyEvidence,
+    predicates: impl Iterator<Item = &'p str>,
+) -> bool {
+    let Some(mapping) = mapping else {
+        return false;
+    };
+    let predicates: Vec<&str> = predicates.collect();
+    let covering: Vec<&TriplesMap> = mapping
+        .triples_maps
+        .values()
+        .filter(|tm| {
+            predicates.iter().all(|p| {
+                tm.predicate_object_maps
+                    .iter()
+                    .any(|pom| pom.predicate_map.as_constant() == Some(*p))
+            })
+        })
+        .collect();
+    // Every covering map is asked, not just up to the first `false`, so one
+    // round of fetching learns every table the answer depends on.
+    let mut answer = true;
+    for tm in &covering {
+        if !keys.subject_unique(tm) {
+            answer = false;
+        }
+    }
+    answer
+        && covering.iter().enumerate().all(|(i, a)| {
+            covering[i + 1..].iter().all(|b| {
+                a.subjects_provably_disjoint(b)
+                    || (a.same_source_row(b) && predicates.iter().all(|p| a.mints_alike(b, p)))
+            })
+        })
+}
+
+/// Rewrite `patterns` for the R2RML graph source `graph_source_id`
+/// ([`rewrite_patterns_for_r2rml`]), fetching the table keys its fusion
+/// decisions ask about and rewriting again until they are all answered. The
+/// keys of a table no fusion asks about are never fetched. A source that
+/// refuses a table's declared keys refuses the query.
+pub async fn rewrite_patterns_for_r2rml_source(
+    ctx: &crate::context::ExecutionContext<'_>,
+    patterns: &[Pattern],
+    graph_source_id: &str,
+    mapping: Option<&CompiledR2rmlMapping>,
+    crawl_active: bool,
+) -> crate::error::Result<R2rmlRewriteResult> {
+    let as_of_t = if ctx.explicit_dataset().is_some() {
+        None
+    } else {
+        Some(ctx.to_t)
+    };
+    let mut keys = TableKeyEvidence::default();
+    loop {
+        let result = rewrite_patterns_for_r2rml(
+            patterns,
+            graph_source_id,
+            ctx.active_snapshot,
+            mapping,
+            &keys,
+            ctx.reasoning_active,
+            crawl_active,
+        );
+        let (Some(mapping), Some(provider)) = (mapping, ctx.r2rml_table_provider) else {
+            return Ok(result);
+        };
+        if !keys
+            .fetch_wanted(provider, mapping, graph_source_id, as_of_t)
+            .await?
+        {
+            return Ok(result);
+        }
+    }
+}
+
 /// same-subject star: variable subject, constant predicate, no class/TM filter,
 /// and either a fresh object var (distinct from the subject) or a constant-object
 /// equality. `None` (not eligible) for bound-subject patterns. Constant-object
@@ -1923,27 +2055,10 @@ fn wildcard_class_fusion_is_safe(mapping: &CompiledR2rmlMapping, class_iri: &str
     true
 }
 
-/// The constant prefix of an `rr:template` — everything before the first `{`
-/// placeholder (the whole string when there is no placeholder). Emitted verbatim
-/// by `expand_template`, so every IRI a template can produce starts with it —
-/// which is what makes the operator's bound-subject TriplesMap prune sound.
-pub(crate) fn constant_prefix(template: &str) -> &str {
-    match template.find('{') {
-        Some(i) => &template[..i],
-        None => template,
-    }
-}
-
-/// Whether two subject templates provably generate disjoint IRI sets: neither
-/// constant prefix is a string-prefix of the other, so every generated IRI of
-/// one differs from every generated IRI of the other within the constant region
-/// (before any placeholder value can matter). Equal prefixes are treated as
-/// overlapping (not disjoint) — conservative.
-fn templates_provably_disjoint(a: &str, b: &str) -> bool {
-    let pa = constant_prefix(a);
-    let pb = constant_prefix(b);
-    !pa.starts_with(pb) && !pb.starts_with(pa)
-}
+// The constant prefix of a template (every IRI it mints starts with it, which
+// makes the operator's bound-subject TriplesMap prune sound) and prefix
+// disjointness, shared with the uniqueness checks in `fluree_db_r2rml`.
+pub(crate) use fluree_db_r2rml::mapping::{constant_prefix, templates_provably_disjoint};
 
 /// Convert a triple pattern to an R2RML pattern.
 ///
@@ -2086,6 +2201,7 @@ mod tests {
     use crate::ir::triple::Ref;
     use crate::var_registry::VarId;
     use fluree_db_core::{is_rdf_type, Sid};
+    use fluree_db_r2rml::mapping::TableKeys;
     use fluree_vocab::namespaces::RDF;
 
     #[test]
@@ -2454,6 +2570,72 @@ mod tests {
         );
     }
 
+    // Two keyed maps that each cover a star over one subject template: each
+    // mints a subject from one row of its own table, but a subject both mint
+    // has a row in each, whose objects the graph pairs. The members stay
+    // separate scans unless the maps' subjects are provably apart or the maps
+    // read the same row and mint every member alike.
+    #[test]
+    fn star_two_covering_maps_fuse_only_when_apart_or_alike() {
+        const COUNTRY: &str = "http://example.org/country";
+        let covering = |iri: &str, table: &str, template: &str| {
+            TriplesMap::new(iri, table)
+                .with_subject_template(template)
+                .with_predicate_object(pom(PRED, "name"))
+                .with_predicate_object(pom(COUNTRY, "country"))
+        };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let scans = |maps: Vec<TriplesMap>| -> usize {
+            let mapping = CompiledR2rmlMapping::new(maps);
+            rewrite_patterns_for_r2rml(
+                &[star(PRED, 1), star(COUNTRY, 2)],
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::R2rml(_)))
+            .count()
+        };
+        let us = covering("#Us", "us", "http://example.org/person/{id}");
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Eu", "eu", "http://example.org/person/{id}")
+            ]),
+            2,
+            "a subject in both tables has a row in each: no fusion"
+        );
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Eu", "eu", "http://example.org/client/{id}")
+            ]),
+            1,
+            "subjects provably apart: each subject is one row's"
+        );
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Us2", "us", "http://example.org/person/{id}")
+            ]),
+            1,
+            "one row, every member minted alike: one set of triples"
+        );
+        assert_eq!(scans(vec![us]), 1, "one covering map still fuses");
+    }
+
     // F10: members split across maps sharing the subject template. No single
     // map covers the star, so fusing would materialize no row; the members stay
     // separate scans the engine joins on the subject.
@@ -2476,14 +2658,22 @@ mod tests {
             ))
         };
         let rewrite = |patterns: &[Pattern]| -> Vec<R2rmlPattern> {
-            rewrite_patterns_for_r2rml(patterns, "gs:main", &snapshot, Some(&mapping), false, false)
-                .patterns
-                .into_iter()
-                .filter_map(|p| match p {
-                    Pattern::R2rml(rp) => Some(rp),
-                    _ => None,
-                })
-                .collect()
+            rewrite_patterns_for_r2rml(
+                patterns,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
         };
         let split = rewrite(&[star(PRED, 1), star(COUNTRY, 2)]);
         assert_eq!(split.len(), 2, "one scan per map, joined on the subject");
@@ -2500,6 +2690,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             false,
         )
@@ -2546,6 +2737,7 @@ mod tests {
                 "gs:main",
                 &snapshot,
                 Some(mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(mapping),
                 false,
                 false,
             )
@@ -2925,6 +3117,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(mapping),
             reasoning_active,
             crawl_active,
         )
@@ -3005,6 +3198,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             true,
         )
@@ -3040,6 +3234,135 @@ mod tests {
                 .any(|p| p.predicate_filter.as_deref() == Some(KEY_PRED)),
             "the standalone orderLineKey scan must be folded away, not joined: {pats:?}"
         );
+    }
+
+    /// A fused star reads its members from one row, so over a map whose
+    /// subject spans rows (a history table's versions) it would pair only the
+    /// objects within each row. The rewrite fuses the members, a constant
+    /// member included, only once the table's keys show each subject is one
+    /// row's; until they are fetched it records the table and leaves the
+    /// members as separate scans, and a table fetched without a key stays so.
+    #[test]
+    fn a_star_fuses_only_over_maps_whose_subjects_are_one_rows() {
+        use fluree_db_core::FlakeValue;
+        const NAME: &str = "http://example.org/name";
+        const CITY: &str = "http://example.org/city";
+        let history = TriplesMap::new("#History", "history")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(NAME, "name"))
+            .with_predicate_object(pom(CITY, "city"));
+        let mapping = CompiledR2rmlMapping::new(vec![history]);
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let member = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let miami = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Iri(CITY.into()),
+            Term::Value(FlakeValue::String("Miami".into())),
+        ));
+        let rewrite = |patterns: &[Pattern], keys: &TableKeyEvidence| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(
+                patterns,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                keys,
+                false,
+                false,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+        };
+        let shapes = [
+            vec![member(NAME, 1), member(CITY, 2)],
+            vec![member(NAME, 1), miami.clone()],
+        ];
+        let unfetched = TableKeyEvidence::default();
+        let keyless = TableKeyEvidence::default().with_known("history", TableKeys::none());
+        let keyed = TableKeyEvidence::default().with_known("history", TableKeys::new([["id"]]));
+        for shape in &shapes {
+            for keys in [&unfetched, &keyless] {
+                let split = rewrite(shape, keys);
+                assert_eq!(split.len(), 2, "members stay separate scans: {split:?}");
+                assert!(split
+                    .iter()
+                    .all(|p| p.star_bindings.is_empty() && p.star_constraints.is_empty()));
+            }
+            let fused = rewrite(shape, &keyed);
+            assert_eq!(fused.len(), 1, "a keyed star fuses: {fused:?}");
+            assert_eq!(
+                fused[0].star_bindings.len() + fused[0].star_constraints.len(),
+                1
+            );
+        }
+        assert_eq!(unfetched.wanted_tables(), vec!["history".to_string()]);
+        assert!(keyless.wanted_tables().is_empty());
+        // A lone member reads one predicate from each row: it never asks.
+        let lone = TableKeyEvidence::default();
+        assert_eq!(rewrite(&[member(NAME, 1)], &lone).len(), 1);
+        assert!(lone.wanted_tables().is_empty());
+    }
+
+    /// The crawl's constant folded onto its wildcard keeps a wildcard row only
+    /// when that row holds the constant: over a map whose subject spans rows
+    /// the constant stays a separate scan the wildcard joins on the subject.
+    #[test]
+    fn a_crawl_constant_folds_only_over_maps_whose_subjects_are_one_rows() {
+        use fluree_db_core::FlakeValue;
+        const CITY: &str = "http://example.org/city";
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let history = TriplesMap::new("#History", "history")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(CITY, "city"));
+        let mapping = CompiledR2rmlMapping::new(vec![history]);
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(CITY.into()),
+                Term::Value(FlakeValue::String("Miami".into())),
+            )),
+        ];
+        let rewrite = |keys: &TableKeyEvidence| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(
+                &patterns,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                keys,
+                false,
+                true,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+        };
+        let keyless = TableKeyEvidence::default().with_known("history", TableKeys::none());
+        let split = rewrite(&keyless);
+        assert_eq!(split.len(), 2, "the constant stays its own scan: {split:?}");
+        assert!(split.iter().all(|p| p.star_constraints.is_empty()));
+        let keyed = TableKeyEvidence::default().with_known("history", TableKeys::new([["id"]]));
+        let folded = rewrite(&keyed);
+        assert_eq!(folded.len(), 1, "the constant folds: {folded:?}");
+        assert_eq!(folded[0].star_constraints.len(), 1);
     }
 
     // W4-1b: the crawl-wildcard finder tolerates an already-set class_filter /
@@ -3180,6 +3503,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             true,
         )
@@ -3238,6 +3562,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             false,
         );
@@ -3314,11 +3639,13 @@ mod tests {
 
     fn rewrite_scope(patterns: &[Pattern], crawl_active: bool) -> Vec<Pattern> {
         let snapshot = LedgerSnapshot::genesis("test:main");
+        let mapping = written_order_mapping();
         rewrite_patterns_for_r2rml(
             patterns,
             "gs:main",
             &snapshot,
-            Some(&written_order_mapping()),
+            Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             crawl_active,
         )
@@ -3643,6 +3970,7 @@ mod tests {
             "gs:main",
             &LedgerSnapshot::genesis("test:main"),
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             true,
         )
@@ -3673,7 +4001,15 @@ mod tests {
             PathModifier::OneOrMore,
             Ref::Var(VarId(1)),
         ));
-        let r = rewrite_patterns_for_r2rml(&[path], "gs:main", &snapshot, None, false, false);
+        let r = rewrite_patterns_for_r2rml(
+            &[path],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
         assert_eq!(r.unsupported, vec!["property path"]);
 
         // A property path nested inside an OPTIONAL is caught via recursion.
@@ -3683,7 +4019,15 @@ mod tests {
             PathModifier::ZeroOrMore,
             Ref::Var(VarId(1)),
         ))]);
-        let r = rewrite_patterns_for_r2rml(&[opt], "gs:main", &snapshot, None, false, false);
+        let r = rewrite_patterns_for_r2rml(
+            &[opt],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
         assert_eq!(
             r.unsupported,
             vec!["property path"],
@@ -3716,6 +4060,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -3743,6 +4088,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -3762,6 +4108,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -3779,6 +4126,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -3818,7 +4166,15 @@ mod tests {
                 Term::Var(VarId(2)),
             )),
         ];
-        let r = rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, None, false, false);
+        let r = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
         assert!(
             r.unsupported.is_empty(),
             "VALUES must not be flagged unsupported"
@@ -4020,6 +4376,7 @@ mod tests {
             "gs:main",
             &snapshot,
             None,
+            &TableKeyEvidence::default(),
             false,
             false,
         );
@@ -4137,9 +4494,9 @@ mod tests {
 
     #[test]
     fn filter_in_declines_over_cap() {
-        // Default cap is 64; 65 members decline (kept cheap — O(files × members)).
+        // One member past the cap declines the whole set.
         let mut args = vec![Expression::Var(VarId(0))];
-        for i in 0..65 {
+        for i in 0..=crate::r2rml::in_pushdown_max() as i64 {
             args.push(Expression::Const(FlakeValue::Long(i)));
         }
         let mut out = Vec::new();

@@ -97,6 +97,23 @@ async fn source(name: &str) -> (Fluree, String) {
     );
     assert_eq!(created.table_versions["in_commit_time"], 2);
     assert_eq!(created.table_versions["fact_order"], 4);
+    // A Delta table reports no key and the mapping declares none, so every
+    // map is named as one its queries deduplicate, with the declaration
+    // that would prove it (Delta has no identifier fields to set).
+    let advised: Vec<&str> = created
+        .diagnostics
+        .iter()
+        .map(|d| {
+            assert_eq!(d.code, fluree_db_r2rml::emit::DiagCode::KeylessMap, "{d:?}");
+            assert!(
+                d.message.contains("declare `f:key (") && !d.message.contains("identifier"),
+                "{}",
+                d.message
+            );
+            d.message.as_str()
+        })
+        .collect();
+    assert_eq!(advised.len(), 5, "{advised:#?}");
     (fluree, format!("{name}:main"))
 }
 

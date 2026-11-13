@@ -57,31 +57,12 @@ pub fn filter_batch(
     Ok(batch.filter_rows(&keep))
 }
 
-/// Check if an expression tree contains any `Expression::Exists` nodes.
+/// Whether the expression embeds a pattern list — EXISTS, NOT EXISTS or a
+/// pattern comprehension — which is resolved asynchronously per row.
 pub fn contains_exists(expr: &Expression) -> bool {
-    match expr {
-        Expression::Exists { .. } => true,
-        Expression::Call { args, .. } => args.iter().any(contains_exists),
-        Expression::Map(entries) => entries.iter().any(|(_, v)| contains_exists(v)),
-        Expression::ListComprehension {
-            list, filter, map, ..
-        } => {
-            contains_exists(list)
-                || filter.as_deref().is_some_and(contains_exists)
-                || map.as_deref().is_some_and(contains_exists)
-        }
-        Expression::Reduce {
-            init, list, body, ..
-        } => contains_exists(init) || contains_exists(list) || contains_exists(body),
-        Expression::ListPredicate {
-            list, predicate, ..
-        } => contains_exists(list) || contains_exists(predicate),
-        Expression::Member { target, .. } => contains_exists(target),
-        // A pattern comprehension is an async subquery resolved on the same
-        // per-row path as EXISTS, so it must trip this gate too.
-        Expression::PatternComprehension { .. } => true,
-        Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => false,
-    }
+    let mut found = false;
+    expr.for_each_embedded_patterns(&mut |_| found = true);
+    found
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

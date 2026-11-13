@@ -287,7 +287,12 @@ async fn a_mapping_is_validated_against_its_tables_and_nothing_is_registered() {
     assert_eq!(sound["triples_map_count"], 1);
     assert_eq!(sound["table_names"], json!(["in_commit_time"]));
     // `id` and `amount` may be null in the fixture, which is said of the key.
-    assert_eq!(codes(&sound), [("noSafeSubjectKey", Some("id"))]);
+    // The mapping declares no `f:key` and a Delta table reports none, so the
+    // map is also named as one its queries deduplicate (an advisory).
+    assert_eq!(
+        codes(&sound),
+        [("keylessMap", None), ("noSafeSubjectKey", Some("id"))]
+    );
     // Asked here, while a source registered from this mapping would answer.
     let (status, text) = amounts(&state, "validate:main").await;
     assert!(!status.is_success(), "validate registered a source: {text}");
@@ -307,6 +312,7 @@ async fn a_mapping_is_validated_against_its_tables_and_nothing_is_registered() {
         [
             ("casingMismatch", Some("Amount")),
             ("columnNotFound", Some("nope")),
+            ("keylessMap", None),
             ("noSafeSubjectKey", Some("id")),
         ]
     );
@@ -319,6 +325,7 @@ async fn a_mapping_is_validated_against_its_tables_and_nothing_is_registered() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{found}");
+    // A table that could not be read has unknown keys: no advisory.
     assert_eq!(codes(&found), [("tableNotFound", None)]);
 
     let (status, broken) = post(
