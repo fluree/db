@@ -36,6 +36,14 @@ Set up BM25 full-text search and vector similarity. Insert searchable data, writ
 
 Practical patterns for temporal queries: audit trails, point-in-time comparison, compliance snapshots, recovering deleted data, and transaction metadata.
 
+### [Expiring Data and Trimming History](cookbook-retention.md)
+
+Shorten a value's life without destroying it: sessions and leases that expire on their own (`@ttl`, `@expiresAt`), lifetimes for a whole transaction or predicate, `f:noHistory` for counters and other high-churn values, targeted removal of a value from everything the ledger serves, and how to check that expiry is running.
+
+### [Permanent Erasure](cookbook-erasure.md)
+
+Destroy data for good: install and check the prover, find what to erase, send the request, follow the job from `proving` to `purged`, and clean up clones, backups and peers. Includes erasing everything about a subject, signed ledgers, clusters, and a troubleshooting table.
+
 ### [Branching and Merging](cookbook-branching.md)
 
 Git-like workflows for data: safe experimentation, review-before-merge, multi-environment setups, feature branches, and rebase strategies.

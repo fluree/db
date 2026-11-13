@@ -545,10 +545,23 @@ History queries scan flakes within the specified time range:
 
 ### Storage Implications
 
-- **Full History**: All transaction history is preserved (immutable append-only)
+- **Full History**: All transaction history is preserved (immutable append-only), unless a ledger opts in to keeping less: see [Retention and erasure](#retention-and-erasure)
 - **Index Snapshots**: Periodic snapshots enable efficient historical queries without replaying all transactions. A historical query reads history from the current index, so superseded index versions are kept only while queries already running may still read them (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention))
 - **Commit Metadata**: Stored as queryable flakes (~8-9 flakes per commit)
 - **Transaction JSON**: Not stored by default. A transaction opts in with `TxnOpts::store_raw_txn` (Rust API) to keep its payload with the commit for audit trails, and a signed transaction always keeps its envelope
+
+## Retention and Erasure
+
+Every change is kept by default, and a ledger can opt in to keeping less. These features change what a read of the past returns:
+
+| Feature | Effect on a read of the past |
+|---|---|
+| [TTL](../transactions/ttl.md) | None. An expiry is an ordinary retraction: the value is visible at every `t` before it |
+| [`f:noHistory`](../transactions/history-retention.md#fnohistory) on a predicate | The read is answered, and sees only the predicate's current values, from the transaction that asserted each |
+| [Targeted removal](../transactions/history-retention.md#targeted-removal) | A read that could return a removed value fails with `410` `err:db/HistoryUnavailable` |
+| [Permanent erasure](../transactions/permanent-erasure.md) | The same refusal, and the commits themselves no longer hold the value |
+
+Ledgers that use none of them answer every historical read from complete history. See [Data lifecycle](data-lifecycle.md) for choosing between them.
 
 ## Practical Applications
 

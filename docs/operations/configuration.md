@@ -553,6 +553,18 @@ Config file equivalent:
 # reasoning_index_auto_refresh = false # refresh registered reasoning indexes after commits
 ```
 
+### Permanent erasure
+
+[Permanent erasure](../transactions/permanent-erasure.md) needs file storage and the `fluree-prover` binary; see [Running the erasure prover](erasure-prover.md) for installing and sizing it. These settings are flags and environment variables only, with no config-file keys. A server without a prover of its release runs normally and refuses erasure requests (`501`).
+
+| Flag | Env Var | Default | Description |
+| ---- | ------- | ------- | ----------- |
+| `--erasure-prover <path>` | `FLUREE_ERASURE_PROVER` | beside the server's binary, else on the `PATH` | The `fluree-prover` binary: a path, or a command name looked up on the `PATH`. The server refuses to start with it on memory storage, a connection config, proxy storage, or a query peer |
+| `--disable-erasure` | `FLUREE_DISABLE_ERASURE` | `false` | Refuse erasure requests even where a prover is installed |
+| `--erasure-scratch-dir <dir>` | `FLUREE_ERASURE_SCRATCH_DIR` | `<temp>/fluree-erasure` | The prover's temporary files, which hold the plaintext of commits being erased. Each step's directory is removed when the step ends |
+| `--erasure-prover-threads <n>` | `FLUREE_ERASURE_PROVER_THREADS` | every core | Proving threads. Fewer leave transactions their cores |
+| `--erasure-prover-timeout-secs <n>` | `FLUREE_ERASURE_PROVER_TIMEOUT_SECS` | `14400` | A proving step still running after this long is killed and retried. A request whose steps time out three times fails |
+
 ## Server Role Configuration
 
 ### Server Role

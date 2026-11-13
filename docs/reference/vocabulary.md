@@ -208,6 +208,17 @@ These predicates live in the ledger's `#config` named graph and declare which pr
 | `f:noHistory` | `https://ns.flur.ee/db#noHistory` | On an entry: keep the predicate's superseded values out of the index ([History retention](../transactions/history-retention.md)) |
 | `f:retentionControl` | `https://ns.flur.ee/db#retentionControl` | System txn-meta marker on a commit that carries retention input |
 
+### Erasure predicates
+
+A [permanent erasure](../transactions/permanent-erasure.md) request is authorized by a control commit, which carries these in its txn-meta. The system writes them; a transaction cannot set them. None records an erased value.
+
+| Term | IRI | Description |
+|------|-----|-------------|
+| `f:erasureRequest` | `https://ns.flur.ee/db#erasureRequest` | The request's id |
+| `f:erasureRequester` | `https://ns.flur.ee/db#erasureRequester` | The identity that requested the erasure |
+| `f:erasureManifest` | `https://ns.flur.ee/db#erasureManifest` | SHA-256 (hex) of the request's manifest: the occurrences it removes, by commit and slot |
+| `f:erasureSignatures` | `https://ns.flur.ee/db#erasureSignatures` | How the proofs treat the original commits' signatures: `verify` or `expose` ([Signatures](../transactions/permanent-erasure.md#signatures)). Absent means `verify` |
+
 ---
 
 ## Search query vocabulary
