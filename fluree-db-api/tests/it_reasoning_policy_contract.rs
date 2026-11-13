@@ -719,6 +719,51 @@ async fn a_graph_crawl_uses_reasoned_classes_under_a_view_policy() {
     }
 }
 
+/// A one-graph dataset's crawl is one result however it is formatted: the
+/// dataset formatter renders it from the state the query read, as the view
+/// formatter does, and not from the member as stored, where `ex:alice` is no
+/// `HighEarner` and a deny on the class would leave her salary visible.
+#[tokio::test]
+async fn a_one_graph_dataset_crawl_formats_alike_through_both_formatters() {
+    use fluree_db_api::format::{format_results_async_dataset, FormatterConfig};
+    use fluree_db_api::{DataSetDb, GovernanceOptions, GraphDb};
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/crawl-formatters-{storage:?}:main");
+        let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        let opts = GovernanceOptions {
+            policy: Some(denying_class(HIGH_EARNER)["policy"].clone()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let view = fluree
+            .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+            .await
+            .expect("policy view");
+        let dataset = DataSetDb::single(view.clone());
+        let config = FormatterConfig::jsonld();
+        for reasoning in ["datalog", "none"] {
+            let crawl = json!({"@context": context(), "select": {"ex:alice": ["*"]},
+                "reasoning": reasoning});
+            let result = fluree.query_dataset(&dataset, &crawl).await.expect("crawl");
+            let by_view = result
+                .format_async_for_view(&view, &config)
+                .await
+                .expect("view formatter");
+            let by_dataset =
+                format_results_async_dataset(&result, &result.context, &dataset, &config, None)
+                    .await
+                    .expect("dataset formatter");
+            assert_eq!(
+                by_view.to_string().contains("250000"),
+                reasoning == "none",
+                "{storage:?}/{reasoning}: {by_view}"
+            );
+            assert_eq!(by_dataset, by_view, "{storage:?}/{reasoning}");
+        }
+    }
+}
+
 /// Ledger reasoning defaults make a crawl that names no reasoning a
 /// reasoning query, so hydration must use derived class memberships too.
 #[tokio::test]

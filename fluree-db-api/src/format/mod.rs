@@ -690,7 +690,8 @@ pub async fn format_results_async(
 /// ledger's own policy (issue #1259). Non-hydration output (flat SELECT,
 /// CONSTRUCT, ASK) is dict-independent for cross-ledger IRIs — those carry
 /// `IriMatch.iri` — so it formats against the dataset's primary view exactly as
-/// before.
+/// before. A one-graph dataset formats as [`format_results_async`] does for
+/// its graph, from the state the query read.
 pub async fn format_results_async_dataset(
     result: &QueryResult,
     context: &ParsedContext,
@@ -714,6 +715,22 @@ pub async fn format_results_async_dataset(
             return Err(FormatError::InvalidBinding(
                 "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
             ));
+        }
+        // A one-graph dataset's query records the state it read, with the
+        // policy that judged its rows: its crawl renders from that state, as
+        // the single-view formatter does, not from the member as stored.
+        let one_graph =
+            dataset.default.len() == 1 && dataset.named.is_empty() && !dataset.is_history_mode();
+        if let (true, Some(_), Some(primary)) = (one_graph, &result.read_view, dataset.primary()) {
+            return format_results_async(
+                result,
+                context,
+                primary.as_graph_db_ref(),
+                config,
+                primary.policy(),
+                tracker,
+            )
+            .await;
         }
         let v = hydration::format_async_dataset(result, dataset, context, config, tracker).await?;
         return if result.output.is_select_one() {
