@@ -25,7 +25,7 @@ use fluree_db_iceberg::{
     },
     metadata::{SnapshotSelection, TableMetadata, WindowCap},
     scan::{
-        topk::{batch_sort_values, plan_topk_read, TopKBound},
+        topk::{batch_sort_values_where, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
     },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
@@ -4834,11 +4834,20 @@ impl FlureeR2rmlProvider<'_> {
             // top-k is always correct — the `SortOperator` above is authoritative).
             // The bounds must sort as the terms do: a string column's "9" bound
             // sits above its "100", an integer column's 10 above its 9.
+            // The bound counts only rows that yield a solution: a row with a
+            // NULL in a column the solution needs is dropped after the scan.
+            // A required column this table lacks declines the directive.
+            let required_ids: Option<Vec<i32>> = tk
+                .required_columns
+                .iter()
+                .map(|name| schema.field_by_name(name).map(|f| f.id))
+                .collect();
             let admitted = schema
                 .field_by_name(&tk.sort_column)
                 .filter(|field| !tk.ascending || field.required)
-                .filter(|field| bound_order(field.type_string()) == Some(tk.order));
-            if let Some(field) = admitted {
+                .filter(|field| bound_order(field.type_string()) == Some(tk.order))
+                .zip(required_ids);
+            if let Some((field, required_ids)) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
                 let order = plan_topk_read(
@@ -4888,15 +4897,18 @@ impl FlureeR2rmlProvider<'_> {
                         )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
-                    // rows this scan EMITS — which are the QUALIFYING result rows
-                    // (post any pushed row filter). The directive is declined
-                    // upstream (`resolve_topk_directive`) whenever a RESIDUAL filter
-                    // the operator enforces after this scan is present, because
-                    // feeding pre-filter values would ride the k-th bound too high
-                    // and prune files whose qualifying rows belong in the true
-                    // top-k. Never feed a superset of the qualifying rows here.
+                    // rows this scan EMITS that yield a result row, which must be
+                    // exactly the QUALIFYING result rows. Rows with a NULL in a
+                    // `required_columns` column mint no solution and are not fed.
+                    // The directive is declined upstream whenever a row could
+                    // still be dropped otherwise: a residual filter, a join with
+                    // the child on a shared variable, any pushed filter (which
+                    // this reader may apply only partly), or a star member no
+                    // column decides. Feeding
+                    // those rows would ride the k-th bound too high and prune
+                    // files whose qualifying rows belong in the true top-k.
                     for b in &batches {
-                        bound.observe_all(batch_sort_values(b, sort_field_id));
+                        bound.observe_all(batch_sort_values_where(b, sort_field_id, &required_ids));
                     }
                     collected.extend(batches);
                     reads += 1;

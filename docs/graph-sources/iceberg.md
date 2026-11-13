@@ -1340,17 +1340,38 @@ triples map a scan skipped because its predicates were hidden.
    deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
    See the switch below to override.
 5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
-   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
-   `shortestPath`, and subqueries need a native index to walk and cannot be
-   evaluated over an Iceberg source. A query using one is **refused** with HTTP
-   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`) and
+   `shortestPath` need a native index to walk and cannot be evaluated over an
+   Iceberg source. A query using one is **refused** with HTTP 400
+   `err:db/InvalidQuery` naming the pattern, rather than returning the empty
    result it would otherwise produce as a success. Fixed-length patterns (`p`,
    `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
    traversal to a known depth (see [Graph Sources Overview → Query Patterns a
    Graph Source Cannot
    Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
    [materialize a native twin](#materializing-a-native-twin), which evaluates
-   all of them.
+   all of them. Sub-selects scan the tables like any other pattern; see
+   [Sub-selects over a Graph
+   Source](overview.md#sub-selects-over-a-graph-source).
+6. **A sliced JSON-LD sub-select reads its tables once per outer row:** a
+   JSON-LD sub-select with a `limit` or `offset` that shares a variable with
+   the patterns before it runs once per outer row (a top-k per row, as on a
+   native ledger), and each run reads the tables its body scans in full. Under
+   10,000 outer rows that is 10,000 reads of each table. Pushing the outer
+   row's key into those reads is [#2310](https://github.com/fluree/db/issues/2310).
+   A SPARQL sub-select is evaluated once.
+   See [Cost: a sliced JSON-LD sub-select reads per outer
+   row](overview.md#cost-a-sliced-json-ld-sub-select-reads-per-outer-row).
+   A sub-select outside every `GRAPH` block whose body reads the default view
+   is refused; see [A sub-select outside every GRAPH
+   block](overview.md#a-sub-select-outside-every-graph-block).
+7. **An `EXISTS` after the `WHERE` clause is refused:** an `EXISTS` in the
+   query's own `HAVING` or `ORDER BY`, or in an expression evaluated after a
+   trailing `VALUES`, runs outside the source's scope and is refused with HTTP
+   400 `err:db/InvalidQuery`. Move the condition into the `WHERE` clause as a
+   `FILTER` or `BIND`; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source). An `EXISTS` inside the
+   `WHERE` clause, in a pattern or an expression, scans the tables normally.
 
 ### Environment switches
 
