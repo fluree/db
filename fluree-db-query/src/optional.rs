@@ -508,15 +508,16 @@ impl PatternOptionalBuilder {
         if let (Some(p_id), Some(branch)) = (p_id, branch) {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();
+            let ref_type = fluree_db_core::o_type::OType::IRI_REF.as_u16();
             let mut probe_ops = match &lane_plan {
-                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(Arc::clone(ops)),
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::for_type(ops, ref_type),
                 _ => None,
             };
             for_each_object_probe_match(
                 ctx,
                 &store,
                 branch,
-                (p_id, fluree_db_core::o_type::OType::IRI_REF.as_u16()),
+                (p_id, ref_type),
                 &objects,
                 probe_ops.as_mut(),
                 |obj_idx, s_id| {
@@ -524,7 +525,7 @@ impl PatternOptionalBuilder {
                         values[slot].push(Binding::encoded_sid(s_id));
                         matched += 1;
                     }
-                    Ok(())
+                    Ok(std::ops::ControlFlow::Continue(()))
                 },
             )?;
         }

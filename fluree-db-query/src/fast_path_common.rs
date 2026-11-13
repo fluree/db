@@ -2564,15 +2564,20 @@ impl ProbeOps {
     }
 }
 
-/// Per-flush reconciler for the bound-object probe lane.
+/// Per-flush reconciler for one object type of the bound-object probe lane.
 ///
 /// The lane scans one predicate's rows for a set of objects, each an exact
 /// `(o_type, o_key)`, so it reconciles against [`cached_object_probe_ops`]:
 /// the predicate's resolved ops on such objects in `(o_type, o_key, s_id, o_i)`
 /// order, object-major windows shared across flushes and (for eager callers)
-/// queries. Same case analysis and per-flush scope as [`ProbeOps`].
+/// queries. A probe walks one type at a time and an op of another type cannot
+/// touch its rows, so the reconciler holds that type's run of the ops alone.
+/// Same case analysis and per-flush scope as [`ProbeOps`].
 pub struct ObjectProbeOps {
     ops: SharedOverlayOps,
+    /// Where the probed type's ops start in `ops`; `consumed` has one flag
+    /// for each of them.
+    start: usize,
     consumed: Vec<bool>,
     /// Base rows suppressed by novelty retracts (diagnostics).
     pub dropped_rows: u64,
@@ -2582,11 +2587,9 @@ pub struct ObjectProbeOps {
 
 impl ObjectProbeOps {
     /// `ops` must come from [`cached_object_probe_ops`]. Returns `None` when
-    /// empty: no op can affect the lane, so callers run their unmodified scan.
-    pub fn new(ops: SharedOverlayOps) -> Option<Self> {
-        if ops.is_empty() {
-            return None;
-        }
+    /// none is on an object of `o_type`: no op can affect the probe, so
+    /// callers run their unmodified scan.
+    pub fn for_type(ops: &SharedOverlayOps, o_type: u16) -> Option<Self> {
         debug_assert!(
             ops.windows(2).all(|w| {
                 (w[0].o_type, w[0].o_key, w[0].s_id, w[0].o_i)
@@ -2594,22 +2597,32 @@ impl ObjectProbeOps {
             }),
             "ObjectProbeOps requires object-major sorted, resolved ops"
         );
-        let consumed = vec![false; ops.len()];
+        let start = ops.partition_point(|o| o.o_type < o_type);
+        let len = ops[start..].partition_point(|o| o.o_type == o_type);
+        if len == 0 {
+            return None;
+        }
         Some(Self {
-            ops,
-            consumed,
+            ops: Arc::clone(ops),
+            start,
+            consumed: vec![false; len],
             dropped_rows: 0,
             injected_rows: 0,
         })
     }
 
-    /// Index range of ops for the object `(o_type, o_key)`. Empty for objects
-    /// with no novelty — the common case, which keeps the per-row fate check
-    /// free for them.
-    pub fn object_window(&self, o_type: u16, o_key: u64) -> std::ops::Range<usize> {
-        let object = (o_type, o_key);
-        let start = self.ops.partition_point(|o| (o.o_type, o.o_key) < object);
-        let end = start + self.ops[start..].partition_point(|o| (o.o_type, o.o_key) == object);
+    /// The probed type's ops, in `(o_key, s_id, o_i)` order.
+    fn typed(&self) -> &[fluree_db_binary_index::read::types::OverlayOp] {
+        &self.ops[self.start..self.start + self.consumed.len()]
+    }
+
+    /// Index range, within the probed type's ops, of those for the object
+    /// `o_key`. Empty for objects with no novelty — the common case, which
+    /// keeps the per-row fate check free for them.
+    pub fn object_window(&self, o_key: u64) -> std::ops::Range<usize> {
+        let typed = self.typed();
+        let start = typed.partition_point(|o| o.o_key < o_key);
+        let end = start + typed[start..].partition_point(|o| o.o_key == o_key);
         start..end
     }
 
@@ -2625,14 +2638,15 @@ impl ObjectProbeOps {
         if window.is_empty() {
             return RowFate::Keep;
         }
-        let win = &self.ops[window.clone()];
+        let win = &self.typed()[window.clone()];
         let probe = (s_id, o_i);
         let pos = win.partition_point(|o| (o.s_id, o.o_i) < probe);
         if pos < win.len() {
             let op = &win[pos];
             if (op.s_id, op.o_i) == probe {
+                let assert = op.op;
                 self.consumed[window.start + pos] = true;
-                if op.op {
+                if assert {
                     return RowFate::Keep;
                 }
                 self.dropped_rows += 1;
@@ -2642,21 +2656,20 @@ impl ObjectProbeOps {
         RowFate::Keep
     }
 
-    /// Hand every not-yet-consumed assert for the object `(o_type, o_key)` to
-    /// `f` (as the asserting subject id) — novelty-only facts of probed objects
+    /// Hand every not-yet-consumed assert for the object `o_key` to `f` (as
+    /// the asserting subject id) — novelty-only facts of probed objects
     /// become new matches. Call once per probed object after the base scan.
     pub fn drain_asserts_for_object(
         &mut self,
-        o_type: u16,
         o_key: u64,
         mut f: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        let window = self.object_window(o_type, o_key);
-        for i in window {
-            if !self.consumed[i] && self.ops[i].op {
+        for i in self.object_window(o_key) {
+            let op = self.ops[self.start + i];
+            if !self.consumed[i] && op.op {
                 self.consumed[i] = true;
                 self.injected_rows += 1;
-                f(self.ops[i].s_id)?;
+                f(op.s_id)?;
             }
         }
         Ok(())

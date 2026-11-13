@@ -971,6 +971,163 @@ async fn batched_object_join_reads_string_terms() {
     check("reindexed, at the base t", view, at_base()).await;
 }
 
+/// A bound-object walk reconciles against the novelty of the type it probes.
+/// `ex:topic` holds refs and strings: string novelty on it is nothing to a ref
+/// probe, and ref novelty nothing to a string probe, so each phase says which
+/// of the two flushes merges the overlay and which reads the index as it is.
+#[tokio::test]
+async fn batched_object_join_merges_only_the_probed_types_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-object-typed-novelty:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+    // Enough `ex:topic` rows that the planner drives from `ex:alice`.
+    let many_refs: Vec<_> = (1..=14)
+        .map(|i| json!({"@id": format!("ex:r{i}")}))
+        .collect();
+    let base = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:knows": [{"@id": "ex:bob"}, {"@id": "ex:carol"}],
+                "ex:says": ["bob", "carol"]
+            },
+            {"@id": "ex:d1", "ex:topic": {"@id": "ex:bob"}},
+            {"@id": "ex:d2", "ex:topic": {"@id": "ex:carol"}},
+            {"@id": "ex:d3", "ex:topic": "bob"},
+            {"@id": "ex:d9", "ex:topic": many_refs}
+        ]
+    });
+    fluree.insert(ledger, &base).await.expect("base insert");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    let refs_jsonld = json!({
+        "@context": ctx(),
+        "select": ["?v", "?x"],
+        "where": [{"@id": "ex:alice", "ex:knows": "?v"}, {"@id": "?x", "ex:topic": "?v"}]
+    });
+    let strings_jsonld = json!({
+        "@context": ctx(),
+        "select": ["?v", "?x"],
+        "where": [{"@id": "ex:alice", "ex:says": "?v"}, {"@id": "?x", "ex:topic": "?v"}]
+    });
+    // Refs, refs, strings, strings.
+    let queries: [(&str, QueryInput<'_>); 4] = [
+        (
+            "refs-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:alice ex:knows ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        ("refs-jsonld", QueryInput::from(&refs_jsonld)),
+        (
+            "strings-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:alice ex:says ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        ("strings-jsonld", QueryInput::from(&strings_jsonld)),
+    ];
+    let rows = |rows: &[(&str, &str)]| -> Vec<serde_json::Value> {
+        normalize_rows(&json!(rows
+            .iter()
+            .map(|(v, x)| json!([v, format!("ex:{x}")]))
+            .collect::<Vec<_>>()))
+    };
+    // `(rows, whether the flush merges the overlay)` for refs and for strings.
+    type Expected = [(Vec<serde_json::Value>, bool); 2];
+    let check = |phase: &'static str, view: fluree_db_api::GraphDb, expected: Expected| {
+        let (fluree, queries) = (&fluree, &queries);
+        async move {
+            for (i, (name, query)) in queries.iter().enumerate() {
+                let (expected, merges) = &expected[i / 2];
+                let (spans, guard) = span_capture::init_test_tracing();
+                let got = run_input(fluree, &view, query).await;
+                drop(guard);
+                assert_eq!(&got, expected, "{phase}/{name}");
+                assert!(
+                    spans.has_span("join_flush_batched_object_binary"),
+                    "{phase}/{name}: bound-object lane should engage; spans: {:?}",
+                    spans.span_names()
+                );
+                assert_eq!(
+                    spans.has_event("join batched object flush merged novelty overlay"),
+                    *merges,
+                    "{phase}/{name}: flush merging the overlay"
+                );
+            }
+        }
+    };
+
+    let ref_rows = rows(&[("ex:bob", "d1"), ("ex:carol", "d2")]);
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    let indexed = [(ref_rows.clone(), false), (rows(&[("bob", "d3")]), false)];
+    check("indexed", view, indexed).await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:d3", "ex:topic": "bob"},
+                "insert": {"@id": "ex:d4", "ex:topic": "carol"}
+            }),
+        )
+        .await
+        .expect("string novelty");
+    let view = fluree.db(ledger_id).await.expect("string-novelty view");
+    let string_rows = rows(&[("carol", "d4")]);
+    let strings_only = [(ref_rows, false), (string_rows.clone(), true)];
+    check("string novelty", view, strings_only).await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex strings");
+    let ledger = fluree.ledger(ledger_id).await.expect("reindexed ledger");
+    let receipt = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:d1", "ex:topic": {"@id": "ex:bob"}},
+                "insert": {"@id": "ex:d5", "ex:topic": {"@id": "ex:carol"}}
+            }),
+        )
+        .await
+        .expect("ref novelty");
+    let view = fluree.db(ledger_id).await.expect("ref-novelty view");
+    let ref_rows = rows(&[("ex:carol", "d2"), ("ex:carol", "d5")]);
+    let refs_only = [(ref_rows.clone(), true), (string_rows, false)];
+    check("ref novelty", view, refs_only).await;
+
+    fluree
+        .insert(
+            receipt.ledger,
+            &json!({"@context": ctx(), "@graph": [{"@id": "ex:d6", "ex:topic": "bob"}]}),
+        )
+        .await
+        .expect("string novelty over ref novelty");
+    let view = fluree.db(ledger_id).await.expect("mixed-novelty view");
+    let string_rows = rows(&[("bob", "d6"), ("carol", "d4")]);
+    let both = |merges: bool| [(ref_rows.clone(), merges), (string_rows.clone(), merges)];
+    check("both", view, both(true)).await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex head");
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    check("reindexed", view, both(false)).await;
+}
+
 /// Decimal (NumBig arena) overlay translation: retracts and re-asserts of
 /// already-indexed `xsd:decimal` values resolve to their arena handles, so
 /// the batched lane stays live (previously ANY decimal in novelty declined

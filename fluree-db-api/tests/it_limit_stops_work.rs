@@ -8,7 +8,7 @@
 //! sizes its first coalesced seed to the budget.
 
 use crate::support::{genesis_ledger_for_fluree, span_capture};
-use fluree_db_api::{FlureeBuilder, LedgerState, QueryInput, ReindexOptions};
+use fluree_db_api::{FlureeBuilder, IndexerConfig, LedgerState, QueryInput, ReindexOptions};
 use serde_json::{json, Value as JsonValue};
 
 /// Enough typed subjects for three chunks (1024, 8192, rest).
@@ -912,4 +912,340 @@ async fn limit_still_pays_for_the_hub_it_read() {
         fuel[0],
         fuel[1]
     );
+}
+
+/// The matches the bound-object lane holds for one string object.
+const STRING_MATCH_BOUND: usize = 1 << 16;
+/// Subjects labelled `"common"` in the string-hub test: more than that bound.
+const STRING_HUB: usize = 76_000;
+const STRING_HUB_LEAFLET_ROWS: usize = 2000;
+/// Labels retracted to take the hub under that bound, then asserted to take
+/// it back over.
+const STRING_HUB_RETRACTED: usize = 10_500;
+const STRING_HUB_ADDED: usize = 40;
+
+const STRING_HUB_JOIN: &str = "?a ex:tag ?v . ?m ex:label ?v";
+
+fn string_hub_select(where_: &str, modifiers: &str) -> String {
+    format!("PREFIX ex: <http://example.org/ns/> SELECT ?a ?v ?m WHERE {{ {where_} }} {modifiers}")
+}
+
+fn labelled(prefix: &str, ids: std::ops::Range<usize>, label: &str) -> Vec<JsonValue> {
+    ids.map(|k| json!({"@id": format!("ex:{prefix}{k}"), "ex:label": label}))
+        .collect()
+}
+
+/// Small leaflets and leaves, so a long run of one label has whole ones past
+/// the lane's bound.
+async fn reindex_in_small_leaves(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let config = IndexerConfig::default()
+        .with_leaflet_rows(STRING_HUB_LEAFLET_ROWS)
+        .with_leaflets_per_leaf(2);
+    fluree
+        .reindex(
+            ledger_id,
+            ReindexOptions::default().with_indexer_config(config),
+        )
+        .await
+        .expect("reindex");
+}
+
+/// Matches the bound-object flushes held to build rows from, and objects they
+/// left to the per-row scan.
+fn object_probe_held_and_streamed(spans: &span_capture::SpanStore) -> (usize, usize) {
+    let events = spans.find_events("join batched object flush complete");
+    assert!(!events.is_empty(), "expected the bound-object lane");
+    let sum = |field: &str| -> usize {
+        events
+            .iter()
+            .map(|e| e.fields[field].parse::<usize>().expect("count"))
+            .sum()
+    };
+    (sum("matched_rows"), sum("streamed_objects"))
+}
+
+fn object_probe_leaflets_read(spans: &span_capture::SpanStore) -> usize {
+    spans
+        .find_events("join batched object flush complete")
+        .iter()
+        .map(|e| e.fields["leaflets_read"].parse::<usize>().expect("count"))
+        .sum()
+}
+
+/// A hub's indexed run is left where it passes the lane's bound: the leaflets
+/// wholly past that point are not read.
+fn assert_hub_run_left_at_the_bound(spans: &span_capture::SpanStore, surface: &str) {
+    let read = object_probe_leaflets_read(spans);
+    let to_the_bound = STRING_MATCH_BOUND / STRING_HUB_LEAFLET_ROWS + 2;
+    let whole_run = STRING_HUB / STRING_HUB_LEAFLET_ROWS;
+    assert!(
+        read <= to_the_bound && to_the_bound < whole_run,
+        "{surface}: read {read} leaflets of a {whole_run}-leaflet run"
+    );
+}
+
+/// The subjects carrying each label at one point of the string-hub test, and
+/// whether the hub is past the lane's bound there.
+struct StringHubPhase {
+    name: &'static str,
+    aaa: Vec<String>,
+    hub: Vec<String>,
+    zzz: Vec<String>,
+    streamed: bool,
+}
+
+/// Drain the string-hub join and check it against `phase`: the rows, the path
+/// the hub took, and that pages are slices of the drain. Returns the drain and
+/// the trace of a one-row read of the hub.
+async fn check_string_hub(
+    fluree: &fluree_db_api::Fluree,
+    view: &fluree_db_api::GraphDb,
+    phase: &StringHubPhase,
+) -> (Vec<JsonValue>, span_capture::SpanStore) {
+    let StringHubPhase {
+        name,
+        aaa,
+        hub,
+        zzz,
+        streamed,
+    } = phase;
+    for modifiers in ["", "LIMIT 5"] {
+        let query = string_hub_select(STRING_HUB_JOIN, modifiers);
+        let plan = fluree.explain_sparql(view, &query).await.expect("explain");
+        assert!(
+            plan["plan"]["physical"]
+                .to_string()
+                .contains("NestedLoopJoinOperator"),
+            "{name} {modifiers:?}: {plan}"
+        );
+    }
+
+    let (spans, guard) = span_capture::init_test_tracing();
+    let full = rows(fluree, view, &string_hub_select(STRING_HUB_JOIN, "")).await;
+    drop(guard);
+    // Two left rows share the hub; a held hub is counted for each.
+    let small = aaa.len() + zzz.len();
+    let held_and_streamed = if *streamed {
+        (small, 1)
+    } else {
+        (small + 2 * hub.len(), 0)
+    };
+    assert_eq!(
+        object_probe_held_and_streamed(&spans),
+        held_and_streamed,
+        "{name}"
+    );
+
+    let mut expected: Vec<JsonValue> = [
+        ("ex:seed1", "aaa-small", aaa),
+        ("ex:seed1", "common", hub),
+        ("ex:seed1", "zzz-small", zzz),
+        ("ex:seed2", "common", hub),
+    ]
+    .into_iter()
+    .flat_map(|(a, v, subjects)| subjects.iter().map(move |m| json!([a, v, m])))
+    .collect();
+    expected.sort_by_cached_key(ToString::to_string);
+    let mut sorted = full.clone();
+    sorted.sort_by_cached_key(ToString::to_string);
+    assert!(
+        sorted == expected,
+        "{name}: {} rows, expected {}",
+        sorted.len(),
+        expected.len()
+    );
+
+    // Each left row's matches come out together.
+    let left_row = |row: &JsonValue| (row[0].clone(), row[1].clone());
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, row) in full.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if left_row(&full[run.start]) == left_row(row) => run.end = i + 1,
+            _ => runs.push(i..i + 1),
+        }
+    }
+    let mut run_lens: Vec<usize> = runs.iter().map(ExactSizeIterator::len).collect();
+    run_lens.sort_unstable();
+    let mut left_row_matches = vec![aaa.len(), zzz.len(), hub.len(), hub.len()];
+    left_row_matches.sort_unstable();
+    assert_eq!(run_lens, left_row_matches, "{name}");
+
+    // Pages across each boundary between two left rows' matches, and across a
+    // batch boundary inside the hub's.
+    let mut pages = vec![(0, 1), (0, 5)];
+    for run in &runs {
+        if run.start > 0 {
+            pages.push((run.start - 2, 5));
+        }
+        if run.len() > 2000 {
+            pages.push((run.start + 990, 30));
+        }
+    }
+    for (offset, limit) in pages {
+        let query = string_hub_select(STRING_HUB_JOIN, &format!("OFFSET {offset} LIMIT {limit}"));
+        assert_eq!(
+            rows(fluree, view, &query).await,
+            full[offset..(offset + limit).min(full.len())],
+            "{name}: OFFSET {offset} LIMIT {limit}"
+        );
+    }
+
+    // Every left row on the hub: one row of it is asked for.
+    let hub_only = "PREFIX ex: <http://example.org/ns/> SELECT ?v ?m \
+                    WHERE { ex:seed2 ex:tag ?v . ?m ex:label ?v } LIMIT 1";
+    let (spans, guard) = span_capture::init_test_tracing();
+    let got = rows(fluree, view, hub_only).await;
+    drop(guard);
+    let first = runs
+        .iter()
+        .find(|run| full[run.start][0] == "ex:seed2")
+        .expect("seed2's matches")
+        .start;
+    assert_eq!(got, vec![json!([full[first][1], full[first][2]])], "{name}");
+    if *streamed {
+        assert_eq!(object_probe_held_and_streamed(&spans), (0, 1), "{name}");
+        assert_eq!(
+            object_probe_matched_and_built(&spans).1,
+            0,
+            "{name}: the per-row scan builds the hub's rows"
+        );
+    } else {
+        assert_eq!(
+            object_probe_held_and_streamed(&spans),
+            (hub.len(), 0),
+            "{name}"
+        );
+    }
+    (full, spans)
+}
+
+/// A string shared by more subjects than the bound-object lane holds for one
+/// object is left to the per-row scan, which streams: a `LIMIT` on a common
+/// label does not wait for the label's whole run to be collected. Which path
+/// an object takes follows from its live match count alone, so pages stay
+/// slices of the full drain while novelty takes the label under the bound and
+/// back over it.
+#[tokio::test]
+async fn a_common_string_object_streams_from_the_per_row_scan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/object-lane-string-hub:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut graph = vec![
+        json!({"@id": "ex:seed1", "ex:tag": ["aaa-small", "common", "zzz-small"]}),
+        json!({"@id": "ex:seed2", "ex:tag": "common"}),
+        json!({"@id": "ex:seed3", "ex:tag": "nowhere"}),
+    ];
+    graph.extend(labelled("a", 0..3, "aaa-small"));
+    graph.extend(labelled("m", 0..STRING_HUB, "common"));
+    graph.extend(labelled("z", 0..3, "zzz-small"));
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed");
+    reindex_in_small_leaves(&fluree, ledger_id).await;
+
+    let ids = |prefix: &str, ids: std::ops::Range<usize>| -> Vec<String> {
+        ids.map(|k| format!("ex:{prefix}{k}")).collect()
+    };
+    let mut phase = StringHubPhase {
+        name: "indexed",
+        aaa: ids("a", 0..3),
+        hub: ids("m", 0..STRING_HUB),
+        zzz: ids("z", 0..3),
+        streamed: true,
+    };
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    let (full, hub_read) = check_string_hub(&fluree, &view, &phase).await;
+    assert_hub_run_left_at_the_bound(&hub_read, "sparql");
+
+    // A filter reaches the hub's rows through the per-row scan and the other
+    // labels' through the lane.
+    let filtered = format!("{STRING_HUB_JOIN} FILTER(STRENDS(STR(?m), \"1\"))");
+    let kept: Vec<JsonValue> = full
+        .iter()
+        .filter(|row| row[2].as_str().expect("iri").ends_with('1'))
+        .cloned()
+        .collect();
+    assert_eq!(kept.len(), 2 * (STRING_HUB / 10) + 2);
+    let got = rows(&fluree, &view, &string_hub_select(&filtered, "")).await;
+    assert!(got == kept, "filtered: {} rows", got.len());
+    assert_eq!(
+        rows(&fluree, &view, &string_hub_select(&filtered, "LIMIT 5")).await,
+        kept[..5]
+    );
+
+    // The same joins through JSON-LD.
+    let jsonld = json!({
+        "@context": ctx(),
+        "select": ["?a", "?v", "?m"],
+        "where": [{"@id": "?a", "ex:tag": "?v"}, {"@id": "?m", "ex:label": "?v"}],
+        "limit": 5,
+    });
+    let result = fluree
+        .query(&view, QueryInput::JsonLd(&jsonld))
+        .await
+        .expect("query");
+    let got = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+    assert_eq!(got.as_array().expect("rows")[..], full[..5]);
+    let jsonld = json!({
+        "@context": ctx(),
+        "select": ["?v", "?m"],
+        "where": [{"@id": "ex:seed2", "ex:tag": "?v"}, {"@id": "?m", "ex:label": "?v"}],
+        "limit": 1,
+    });
+    let (spans, guard) = span_capture::init_test_tracing();
+    let result = fluree
+        .query(&view, QueryInput::JsonLd(&jsonld))
+        .await
+        .expect("query");
+    drop(guard);
+    let got = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+    assert_eq!(got.as_array().expect("rows").len(), 1);
+    assert_eq!(object_probe_held_and_streamed(&spans), (0, 1));
+    assert_hub_run_left_at_the_bound(&spans, "json-ld");
+
+    // Retractions take the hub under the bound: the lane holds what is left.
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    let receipt = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": labelled("m", 0..STRING_HUB_RETRACTED, "common")
+            }),
+        )
+        .await
+        .expect("retract hub labels");
+    phase.name = "retracted under the bound";
+    phase.hub = ids("m", STRING_HUB_RETRACTED..STRING_HUB);
+    phase.streamed = false;
+    let view = fluree.db(ledger_id).await.expect("retracted view");
+    check_string_hub(&fluree, &view, &phase).await;
+
+    // Asserts take it back over, past the last of its indexed rows.
+    let mut inserts = labelled("n", 0..STRING_HUB_ADDED, "common");
+    inserts.push(json!({"@id": "ex:fresh", "ex:label": "aaa-small"}));
+    fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:z0", "ex:label": "zzz-small"},
+                "insert": inserts
+            }),
+        )
+        .await
+        .expect("assert hub labels");
+    phase.name = "asserted over the bound";
+    phase.aaa.push("ex:fresh".to_string());
+    phase.hub.extend(ids("n", 0..STRING_HUB_ADDED));
+    phase.zzz.remove(0);
+    phase.streamed = true;
+    let view = fluree.db(ledger_id).await.expect("asserted view");
+    check_string_hub(&fluree, &view, &phase).await;
+
+    reindex_in_small_leaves(&fluree, ledger_id).await;
+    phase.name = "reindexed";
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    check_string_hub(&fluree, &view, &phase).await;
 }
