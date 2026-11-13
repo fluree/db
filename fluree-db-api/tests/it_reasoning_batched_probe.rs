@@ -745,6 +745,124 @@ ex:a ex:parent ex:b . ex:b ex:parent ex:c . ex:c ex:name "Cee" .
     );
 }
 
+/// A join step with both ends bound (the edge closing a triangle) has a
+/// batched pair lane, which is not among the lanes that decode for an eager
+/// caller. Under eager materialization it stays off and the step runs per
+/// row: a rule whose body closes a triangle derives from asserted and
+/// derived closing edges alike, and a reasoning query over the triangle
+/// reads both. The routing is pinned as well as the rows, so admitting the
+/// lane under reasoning has to come with a reason to change this test.
+#[tokio::test(flavor = "current_thread")]
+async fn a_closing_edge_under_reasoning_is_joined_per_row() {
+    const PAIR_LANE: &str = "join_flush_batched_pair_binary";
+    // Typed ends keep the cyclic-pattern operator off the triangle, so its
+    // closing edge is a join step.
+    const TRIANGLE: &str = "?x a ex:Student . ?y a ex:Faculty . ?z a ex:Course . \
+         ?x ex:advisor ?y . ?y ex:teacherOf ?z . ?x ex:takesCourse ?z";
+    let mut data = String::from("@prefix ex: <http://example.org/ns/> .\n");
+    for i in 0..40 {
+        // Each student takes their advisor's course; odd ones only audit it.
+        let takes = if i % 2 == 0 { "takesCourse" } else { "audits" };
+        data.push_str(&format!(
+            "ex:s{i} a ex:Student ; ex:advisor ex:f{f} ; ex:{takes} ex:c{f} ; ex:takesCourse ex:other{i} .\n",
+            f = i % 4
+        ));
+    }
+    for f in 0..4 {
+        data.push_str(&format!(
+            "ex:f{f} a ex:Faculty ; ex:teacherOf ex:c{f} . ex:c{f} a ex:Course .\n"
+        ));
+    }
+    let rules = [
+        (
+            "audited",
+            "CONSTRUCT { ?x ex:takesCourse ?z } WHERE { ?x ex:audits ?z }",
+        ),
+        (
+            "taughtByAdvisor",
+            "CONSTRUCT { ?x ex:taughtByAdvisor ?z } WHERE { ?x a ex:Student . ?y a ex:Faculty . ?z a ex:Course . ?x ex:advisor ?y . ?y ex:teacherOf ?z . ?x ex:takesCourse ?z }",
+        ),
+    ];
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-batched-pair:main";
+    let oracle_id = "it/reasoning-batched-pair-oracle:main";
+    for id in [ledger_id, oracle_id] {
+        let mut ledger = fluree
+            .stage_owned(genesis_ledger_for_fluree(&fluree, id).await)
+            .upsert_turtle(&data)
+            .execute()
+            .await
+            .expect("seed")
+            .ledger;
+        for (name, construct) in rules {
+            let rule = json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": format!("http://example.org/ns/rule/{name}"),
+                "f:rule": {"@type": "f:sparql", "@value": format!("{SPARQL_PREFIXES}{construct}")}
+            });
+            ledger = fluree.insert(ledger, &rule).await.expect("rule").ledger;
+        }
+    }
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let derived = format!(
+        "# PRAGMA reasoning: datalog\n{SPARQL_PREFIXES}\
+         SELECT ?s ?o WHERE {{ ?s ex:taughtByAdvisor ?o }}"
+    );
+    let triangle = format!(
+        "# PRAGMA reasoning: datalog\n{SPARQL_PREFIXES}\
+         SELECT ?x ?z WHERE {{ {TRIANGLE} }}"
+    );
+    let expected = sorted(
+        (0..40)
+            .map(|i| json!([format!("ex:s{i}"), format!("ex:c{}", i % 4)]))
+            .collect(),
+    );
+
+    let (store, guard) = init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let indexed = fluree.db(ledger_id).await.expect("indexed view");
+    for query in [&derived, &triangle] {
+        assert_eq!(
+            query_rows(&fluree, &indexed, QueryInput::Sparql(query)).await,
+            expected,
+            "over the index: {query}"
+        );
+    }
+    drop(guard);
+    assert!(
+        !store.has_span(PAIR_LANE),
+        "the pair lane ran under eager materialization; spans: {:?}",
+        store.span_names()
+    );
+
+    // The same triangle without reasoning takes the lane: the fixture
+    // reaches it, so its absence above is the guard's doing.
+    let plain = format!("{SPARQL_PREFIXES}SELECT ?x ?z WHERE {{ {TRIANGLE} }}");
+    let (store, guard) = init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let asserted = query_rows(&fluree, &indexed, QueryInput::Sparql(&plain)).await;
+    drop(guard);
+    assert_eq!(asserted.len(), 20, "asserted closing edges only");
+    assert!(
+        store.has_span(PAIR_LANE),
+        "the fixture should reach the pair lane; spans: {:?}",
+        store.span_names()
+    );
+
+    let oracle = fluree.db(oracle_id).await.expect("oracle view");
+    for query in [&derived, &triangle] {
+        assert_eq!(
+            query_rows(&fluree, &oracle, QueryInput::Sparql(query)).await,
+            expected,
+            "per row: {query}"
+        );
+    }
+}
+
 /// Two eager overlays over one state derive different `ex:friend` facts
 /// (OWL 2 RL symmetry, a datalog rule); a lane's translated ops for one are
 /// never served to the other. Stored filler edges outnumber the club in the
