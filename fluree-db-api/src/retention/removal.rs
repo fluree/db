@@ -427,13 +427,21 @@ impl Fluree {
         }))
     }
 
-    /// Give `target_id` the removals `source_id`'s journal holds, as a merge
-    /// or rebase brings the source's commits onto it: it then holds the
+    /// Give `target_id` the removals `source`'s journal holds, as a merge or
+    /// rebase brings the source's commits onto it: it then holds the
     /// history they were removed from. History rules are left to the
-    /// target's own configuration commits.
-    pub(crate) async fn take_removals(&self, source_id: &str, target_id: &str) -> Result<()> {
+    /// target's own configuration commits. A source whose record says it
+    /// has no configuration is not read.
+    pub(crate) async fn take_removals(
+        &self,
+        source: &fluree_db_nameservice::NsRecord,
+        target_id: &str,
+    ) -> Result<()> {
+        if source.config_version == Some(0) {
+            return Ok(());
+        }
         let ns = self.publisher()?;
-        let Some(source) = registry::read(ns, self.registry_objects(), source_id)
+        let Some(source) = registry::read(ns, self.registry_objects(), source.ledger_id.as_str())
             .await?
             .1
             .filter(|r| !r.journal.removals.is_empty())
@@ -463,19 +471,20 @@ impl Fluree {
         Ok(())
     }
 
-    /// Refuse a rebase of `branch_id` onto `onto` that would replay a commit
+    /// Refuse a rebase of `branch` onto `onto` that would replay a commit
     /// one of the branch's removals names. The replay writes the occurrence
     /// again in a commit of its own, which neither the journal nor an
     /// erasure of the original covers.
     pub(crate) async fn refuse_replaying_removed(
         &self,
-        branch_id: &str,
+        branch: &fluree_db_nameservice::NsRecord,
         onto: &str,
         replayed: &[ContentId],
     ) -> Result<()> {
-        if replayed.is_empty() {
+        if replayed.is_empty() || branch.config_version == Some(0) {
             return Ok(());
         }
+        let branch_id = branch.ledger_id.as_str();
         let Some(registration) =
             registry::read(self.publisher()?, self.registry_objects(), branch_id)
                 .await?

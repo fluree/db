@@ -397,7 +397,7 @@ impl crate::Fluree {
         };
         // The target holds the source's commits from here, and with them
         // what the source removed.
-        self.take_removals(&staged.source_id, &staged.target_id)
+        self.take_removals(&source_record, &staged.target_id)
             .await?;
         // Built from the source's view too: its generation is presented
         // with the target's.

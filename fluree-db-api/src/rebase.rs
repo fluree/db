@@ -384,14 +384,14 @@ impl crate::Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         let source_name_owned = source_name.to_string();
 
-        self.refuse_replaying_removed(&branch_id, source_name, &diff.source.commits)
+        self.refuse_replaying_removed(&branch_record, source_name, &diff.source.commits)
             .await?;
 
         // The branch takes on the source's history, with its lifetimes and
         // what it removed: it is registered for retention as the source is,
         // from the source's boundary where earlier, before it holds them.
         self.register_retention_as(&source_id, &branch_id).await?;
-        self.take_removals(&source_id, &branch_id).await?;
+        self.take_removals(&source_record, &branch_id).await?;
 
         // Fast-forward: the branch has no commits of its own to replay.
         let is_fast_forward = diff.source.commits.is_empty();
