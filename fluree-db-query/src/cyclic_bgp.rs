@@ -1102,6 +1102,14 @@ impl CyclicBgpOperator {
             self.log_fast_path_bail("context-unsupported", None);
             return Ok(false);
         }
+        // Every relation here binds encoded ids. An eager caller (a reasoning
+        // query, a datalog rule body) is owed decoded bindings, as from every
+        // other operator that emits encoded ones: a rule head built from an
+        // encoded binding derives nothing. The fallback chain decodes.
+        if ctx.eager_materialization {
+            self.log_fast_path_bail("eager-materialization", None);
+            return Ok(false);
+        }
 
         match self.join_mode {
             CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx),
@@ -1126,10 +1134,10 @@ impl CyclicBgpOperator {
     /// every edge). With novelty present, probing stays allowed when every
     /// edge's resolved ops are mergeable (empty → `None`, non-empty →
     /// `Some(ops)` merged per probed subject); any unmergeable edge
-    /// (translation failure, novelty-only predicate), or eager materialization,
-    /// disables probes for the cascade — full scans, which merge through the
-    /// overlay cursor, are unaffected. Historical snapshots keep probes off:
-    /// the seek reads latest base state with no replay.
+    /// (translation failure, novelty-only predicate) disables probes for the
+    /// cascade — full scans, which merge through the overlay cursor, are
+    /// unaffected. Historical snapshots keep probes off: the seek reads
+    /// latest base state with no replay.
     fn compute_probe_overlay_state(
         &self,
         ctx: &ExecutionContext<'_>,

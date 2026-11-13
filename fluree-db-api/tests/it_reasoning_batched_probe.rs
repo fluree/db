@@ -730,6 +730,142 @@ ex:a ex:parent ex:b . ex:b ex:parent ex:c . ex:c ex:name "Cee" .
     );
 }
 
+/// A pattern that is nothing but a cycle of edges has an operator of its own,
+/// which emits encoded bindings. A reasoning query and a datalog rule body
+/// are owed decoded ones: a rule head built from an encoded binding derives
+/// nothing, so a rule whose body is a triangle derived no facts once the
+/// ledger was indexed. Under reasoning the cycle is joined step by step
+/// instead: the rule derives from asserted and derived edges alike, and a
+/// query over the triangle reads both, with a derived fact joined after it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cycle_under_reasoning_is_joined_step_by_step() {
+    const CYCLIC: &str = "cyclic_enumerate";
+    const TRIANGLE: &str = "?x ex:advisor ?y . ?y ex:teacherOf ?z . ?x ex:takesCourse ?z";
+    let mut data = String::from("@prefix ex: <http://example.org/ns/> .\n");
+    for i in 0..40 {
+        // Each student takes their advisor's course; odd ones only audit it.
+        let takes = if i % 2 == 0 { "takesCourse" } else { "audits" };
+        data.push_str(&format!(
+            "ex:s{i} ex:advisor ex:f{f} ; ex:{takes} ex:c{f} ; ex:takesCourse ex:other{i} .\n",
+            f = i % 4
+        ));
+    }
+    for f in 0..4 {
+        data.push_str(&format!("ex:f{f} ex:teacherOf ex:c{f} .\n"));
+    }
+    let rules = [
+        (
+            "audited",
+            "CONSTRUCT { ?x ex:takesCourse ?z } WHERE { ?x ex:audits ?z }".to_string(),
+        ),
+        (
+            "auditorOf",
+            "CONSTRUCT { ?x ex:auditorOf ?z } WHERE { ?x ex:audits ?z }".to_string(),
+        ),
+        (
+            "taughtByAdvisor",
+            format!("CONSTRUCT {{ ?x ex:taughtByAdvisor ?z }} WHERE {{ {TRIANGLE} }}"),
+        ),
+    ];
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-cycle:main";
+    let oracle_id = "it/reasoning-cycle-oracle:main";
+    for id in [ledger_id, oracle_id] {
+        let mut ledger = fluree
+            .stage_owned(genesis_ledger_for_fluree(&fluree, id))
+            .upsert_turtle(&data)
+            .execute()
+            .await
+            .expect("seed")
+            .ledger;
+        for (name, construct) in &rules {
+            let rule = json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": format!("http://example.org/ns/rule/{name}"),
+                "f:rule": {"@type": "f:sparql", "@value": format!("{SPARQL_PREFIXES}{construct}")}
+            });
+            ledger = fluree.insert(ledger, &rule).await.expect("rule").ledger;
+        }
+    }
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let reasoned = |body: &str| format!("# PRAGMA reasoning: datalog\n{SPARQL_PREFIXES}{body}");
+    let student = |i: usize| json!(format!("ex:s{i}"));
+    let course = |i: usize| json!(format!("ex:c{}", i % 4));
+    let pairs = sorted((0..40).map(|i| json!([student(i), course(i)])).collect());
+    // Only the odd students audit, so only they have the derived fact.
+    let audited = sorted(
+        (0..40)
+            .map(|i| {
+                let auditor_of = if i % 2 == 1 { course(i) } else { Value::Null };
+                json!([student(i), course(i), auditor_of])
+            })
+            .collect(),
+    );
+    let cases = [
+        (
+            "a rule body that is a triangle",
+            reasoned("SELECT ?s ?o WHERE { ?s ex:taughtByAdvisor ?o }"),
+            pairs.clone(),
+        ),
+        (
+            "a triangle closed by derived edges",
+            reasoned(&format!("SELECT ?x ?z WHERE {{ {TRIANGLE} }}")),
+            pairs,
+        ),
+        (
+            "a derived fact joined after the triangle",
+            reasoned(&format!(
+                "SELECT ?x ?z ?w WHERE {{ {TRIANGLE} OPTIONAL {{ ?x ex:auditorOf ?w }} }}"
+            )),
+            audited,
+        ),
+    ];
+
+    let (store, guard) = init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let indexed = fluree.db(ledger_id).await.expect("indexed view");
+    for (name, query, expected) in &cases {
+        assert_eq!(
+            &query_rows(&fluree, &indexed, QueryInput::Sparql(query)).await,
+            expected,
+            "over the index: {name}"
+        );
+    }
+    drop(guard);
+    assert!(
+        !store.has_span(CYCLIC),
+        "the cycle operator ran under eager materialization; spans: {:?}",
+        store.span_names()
+    );
+
+    // The same triangle without reasoning takes the operator: the fixture
+    // reaches it, so its absence above is not the fixture's doing.
+    let plain = format!("{SPARQL_PREFIXES}SELECT ?x ?z WHERE {{ {TRIANGLE} }}");
+    let (store, guard) = init_test_tracing();
+    tracing::callsite::rebuild_interest_cache();
+    let asserted = query_rows(&fluree, &indexed, QueryInput::Sparql(&plain)).await;
+    drop(guard);
+    assert_eq!(asserted.len(), 20, "asserted closing edges only");
+    assert!(
+        store.has_span(CYCLIC),
+        "the fixture should reach the cycle operator; spans: {:?}",
+        store.span_names()
+    );
+
+    let oracle = fluree.db(oracle_id).await.expect("oracle view");
+    for (name, query, expected) in &cases {
+        assert_eq!(
+            &query_rows(&fluree, &oracle, QueryInput::Sparql(query)).await,
+            expected,
+            "per row: {name}"
+        );
+    }
+}
+
 /// Two eager overlays over one state derive different `ex:friend` facts
 /// (OWL 2 RL symmetry, a datalog rule); a lane's translated ops for one are
 /// never served to the other. Stored filler edges outnumber the club in the
