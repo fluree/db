@@ -846,8 +846,9 @@ pub struct NestedLoopJoinOperator {
     norm: Option<EqualityNorm>,
     /// Current state
     state: OperatorState,
-    /// Current left batch being processed
-    current_left_batch: Option<Batch>,
+    /// Current left batch being processed. Shared with `stored_left_batches`:
+    /// a scan batch is a leaflet of rows, and every flush window retains it.
+    current_left_batch: Option<Arc<Batch>>,
     /// Current row index in left batch
     current_left_row: usize,
     /// Pending output rows (batch_ref, left_row_idx, right_batch)
@@ -909,7 +910,7 @@ pub struct NestedLoopJoinOperator {
     /// budget would repeat that walk on a full drain.
     flush_schedule: FlushSchedule,
     /// Left batches retained for the batched flush
-    stored_left_batches: Vec<Batch>,
+    stored_left_batches: Vec<Arc<Batch>>,
     /// Pre-built output batches from the batched path, ready to emit
     batched_output: VecDeque<Batch>,
     /// Matches of a bound-object flush still to be built into rows. Drained
@@ -923,7 +924,7 @@ pub struct NestedLoopJoinOperator {
     grouped_count: Option<GroupedCountDrain>,
     /// Cached index into `stored_left_batches` for the currently active left batch.
     ///
-    /// This prevents storing/cloning the same `current_left_batch` repeatedly.
+    /// This prevents storing the same `current_left_batch` repeatedly.
     current_left_batch_stored_idx: Option<usize>,
     /// Inline operators evaluated on combined rows during the join.
     ///
@@ -1603,7 +1604,7 @@ impl Operator for NestedLoopJoinOperator {
                 ctx.check_cancelled()?;
                 match self.left.next_batch(ctx).await? {
                     Some(batch) => {
-                        self.current_left_batch = Some(batch);
+                        self.current_left_batch = Some(Arc::new(batch));
                         self.current_left_row = 0;
                         // New batch loaded: reset stored index cache.
                         self.current_left_batch_stored_idx = None;
@@ -1826,7 +1827,7 @@ impl NestedLoopJoinOperator {
     /// Resolve the left batch for a given `BatchRef`.
     fn resolve_left_batch<'a>(&'a self, batch_ref: &BatchRef) -> Option<&'a Batch> {
         match batch_ref {
-            BatchRef::Stored(idx) => self.stored_left_batches.get(*idx),
+            BatchRef::Stored(idx) => self.stored_left_batches.get(*idx).map(Arc::as_ref),
         }
     }
 
@@ -1933,7 +1934,7 @@ impl NestedLoopJoinOperator {
             return idx;
         }
 
-        let current = self.current_left_batch.as_ref().unwrap().clone();
+        let current = Arc::clone(self.current_left_batch.as_ref().unwrap());
         self.stored_left_batches.push(current);
         let idx = self.stored_left_batches.len() - 1;
         self.current_left_batch_stored_idx = Some(idx);
@@ -4817,7 +4818,7 @@ mod tests {
         )
         .unwrap();
 
-        join.stored_left_batches.push(left_batch);
+        join.stored_left_batches.push(Arc::new(left_batch));
         join.pending_output
             .push_back((BatchRef::Stored(0), 0, right_batch));
 
@@ -5204,7 +5205,7 @@ mod tests {
         )
         .unwrap();
 
-        join.stored_left_batches.push(left_batch);
+        join.stored_left_batches.push(Arc::new(left_batch));
         join.pending_output
             .push_back((BatchRef::Stored(0), 0, right_batch));
 
