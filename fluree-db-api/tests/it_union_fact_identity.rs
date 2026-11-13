@@ -44,7 +44,12 @@ const G1_G2: &str = "FROM <urn:g1> FROM <urn:g2>";
 
 /// The query's rows, each `var=value^^datatype` joined by `;`, sorted.
 async fn sparql_rows(fluree: &Fluree, body: &str, dataset: &str) -> Vec<String> {
-    let handle = fluree.ledger_cached(LEDGER).await.expect("ledger");
+    sparql_rows_in(fluree, LEDGER, body, dataset).await
+}
+
+/// [`sparql_rows`] over `ledger`.
+async fn sparql_rows_in(fluree: &Fluree, ledger: &str, body: &str, dataset: &str) -> Vec<String> {
+    let handle = fluree.ledger_cached(ledger).await.expect("ledger");
     let view = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
     let query = format!(
         "PREFIX ex: <http://example.org/>\n{}",
@@ -447,4 +452,73 @@ async fn cross_ledger_union_keys_a_fact_on_the_querys_datatype_codes() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+const STRING_LEDGER: &str = "it/union-string-object:main";
+
+/// s1 and s2 both hold `ex:b ex:alias "x"`: one fact of their union. `"y"@en`
+/// is another term than the plain `"y"`.
+const STRING_TRIG: &str = r#"
+@prefix ex: <http://example.org/> .
+GRAPH <urn:s1> {
+  ex:a ex:name "x" .
+  ex:b ex:alias "x" .
+  ex:e ex:name "y" .
+}
+GRAPH <urn:s2> {
+  ex:b ex:alias "x" .
+  ex:c ex:alias "x" .
+  ex:f ex:alias "y"@en .
+}
+"#;
+
+/// A string object bound by the left row, joined across a union. The
+/// bound-object lane keys string terms, but over a union it probes ref
+/// objects only and leaves a row on a string object to the per-row scan,
+/// which reads the union: the answer is the facts', before and after
+/// indexing, with fast paths on and off.
+#[tokio::test]
+async fn a_string_object_joins_across_a_union_once_per_fact() {
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    fluree
+        .create_ledger(STRING_LEDGER)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(STRING_LEDGER).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle(STRING_TRIG)
+        .execute()
+        .await
+        .expect("seed");
+    const QUERY: &str = "SELECT ?s ?y {ds} WHERE { ?s ex:name ?n . ?y ex:alias ?n }";
+    const UNION: &str = "FROM <urn:s1> FROM <urn:s2>";
+    let expected = want(&["s=a;y=b", "s=a;y=c"]);
+    let mut failures = Vec::new();
+    for state in ["novelty", "indexed"] {
+        if state == "indexed" {
+            fluree
+                .reindex(STRING_LEDGER, ReindexOptions::default())
+                .await
+                .expect("index");
+            fluree.disconnect_ledger(STRING_LEDGER).await;
+        }
+        for fast in [true, false] {
+            let rows = if fast {
+                let _on = crate::support::FAST_PATH_SWITCH.read().await;
+                sparql_rows_in(&fluree, STRING_LEDGER, QUERY, UNION).await
+            } else {
+                let _off = crate::support::FAST_PATH_SWITCH.write().await;
+                let _restore = FastPathsOff::set();
+                sparql_rows_in(&fluree, STRING_LEDGER, QUERY, UNION).await
+            };
+            if rows != expected {
+                failures.push(format!(
+                    "{state}, fast paths {}: {rows:?}, want {expected:?}",
+                    if fast { "on" } else { "off" }
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
