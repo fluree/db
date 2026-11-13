@@ -69,6 +69,8 @@ pub mod net;
 pub(crate) mod renew;
 pub mod scan;
 pub mod stats;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Read an on/off environment switch that defaults to **on** — only `0`, `false`,
 /// `off`, or `no` (trimmed, case-insensitive) disable it. This is the crate-local

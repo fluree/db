@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::TriplesMap;
@@ -15,8 +16,13 @@ use super::TriplesMap;
 /// indexes for efficient lookup during query execution.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompiledR2rmlMapping {
-    /// All TriplesMap definitions, keyed by IRI
-    pub triples_maps: HashMap<String, TriplesMap>,
+    /// All TriplesMap definitions, keyed by IRI, in mapping-document order.
+    ///
+    /// Ordered, not hashed: a pattern several maps can answer scans them in
+    /// this order (and keeps the first of two maps that mint alike), so one
+    /// query answers the same rows in the same order in every process. Remove
+    /// with `shift_remove` to keep the order.
+    pub triples_maps: IndexMap<String, TriplesMap>,
 
     /// Index: table name → TriplesMap IRIs that use it
     table_to_maps: HashMap<String, Vec<String>>,

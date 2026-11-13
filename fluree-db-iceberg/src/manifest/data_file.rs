@@ -115,6 +115,39 @@ impl DataFile {
         self.file_format.is_supported()
     }
 
+    /// Approximately how many bytes of memory this entry occupies: the struct
+    /// itself plus everything it owns (path, statistics maps and their byte
+    /// strings, partition values, split offsets).
+    ///
+    /// An estimate for weighing caches that hold file lists, not an exact
+    /// allocator count: a hash map is charged its capacity in `(key, value)`
+    /// slots plus one control byte per slot, which is how the standard map
+    /// lays them out, and allocator overhead is ignored. With bounds and
+    /// counts for 20 columns this comes to roughly 3 to 4 KiB.
+    pub fn approx_size_bytes(&self) -> usize {
+        fn map<V>(m: Option<&HashMap<i32, V>>, owned: impl Fn(&V) -> usize) -> usize {
+            m.map_or(0, |m| {
+                m.capacity() * (std::mem::size_of::<(i32, V)>() + 1)
+                    + m.values().map(owned).sum::<usize>()
+            })
+        }
+        std::mem::size_of::<Self>()
+            + self.file_path.capacity()
+            + map(Some(&self.partition.values), |v| {
+                v.as_ref().map_or(0, Vec::capacity)
+            })
+            + map(self.column_sizes.as_ref(), |_| 0)
+            + map(self.value_counts.as_ref(), |_| 0)
+            + map(self.null_value_counts.as_ref(), |_| 0)
+            + map(self.nan_value_counts.as_ref(), |_| 0)
+            + map(self.lower_bounds.as_ref(), Vec::capacity)
+            + map(self.upper_bounds.as_ref(), Vec::capacity)
+            + self
+                .split_offsets
+                .as_ref()
+                .map_or(0, |v| v.capacity() * std::mem::size_of::<i64>())
+    }
+
     /// Get lower bound for a column by field ID.
     pub fn lower_bound(&self, field_id: i32) -> Option<&[u8]> {
         self.lower_bounds
@@ -542,6 +575,48 @@ fn parse_field_id_map_bytes(value: Option<&AvroValue>) -> Option<HashMap<i32, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The estimate charges what the entry owns: a file carrying bounds and
+    /// counts for 20 columns weighs several KiB, a bare one little more than
+    /// the struct and its path.
+    #[test]
+    fn approx_size_counts_what_an_entry_owns() {
+        let bare = DataFile {
+            file_path: "s3://bucket/warehouse/db/t/data/part-00000.parquet".to_string(),
+            file_format: FileFormat::Parquet,
+            record_count: 1,
+            file_size_in_bytes: 1,
+            partition: PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        let counts: HashMap<i32, i64> = (1..=20).map(|id| (id, 100)).collect();
+        let bounds: HashMap<i32, Vec<u8>> = (1..=20).map(|id| (id, vec![0u8; 8])).collect();
+        let full = DataFile {
+            column_sizes: Some(counts.clone()),
+            value_counts: Some(counts.clone()),
+            null_value_counts: Some(counts),
+            lower_bounds: Some(bounds.clone()),
+            upper_bounds: Some(bounds),
+            split_offsets: Some(vec![4]),
+            ..bare.clone()
+        };
+
+        let bare_size = bare.approx_size_bytes();
+        assert!(bare_size >= std::mem::size_of::<DataFile>() + bare.file_path.len());
+        assert!(bare_size < 1024, "{bare_size}");
+        let full_size = full.approx_size_bytes();
+        assert!(
+            (3 * 1024..=5 * 1024).contains(&full_size),
+            "20 columns of bounds and counts weigh {full_size} bytes"
+        );
+    }
 
     #[test]
     fn test_file_format_parsing() {
