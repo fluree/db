@@ -142,7 +142,7 @@ async fn distinct_limit_stops_a_chain_after_one_small_probe() {
         .iter()
         .map(|e| e.fields["input_rows"].parse().unwrap())
         .collect();
-    assert_eq!(inputs, vec![1024, 8192, PEOPLE - 9216]);
+    assert_eq!(inputs, vec![4, 32, 256, 732, 8192, PEOPLE - 9216]);
 
     let sparse = chain.replace(
         "?f ex:knows ?fof }",
@@ -588,4 +588,328 @@ async fn optional_limit_coalesces_one_small_seed() {
             "{modifiers:?}: seeds {seeds:?}"
         );
     }
+}
+
+/// Left rows each batched object probe took, in order.
+fn object_probe_windows(spans: &span_capture::SpanStore) -> Vec<usize> {
+    assert!(
+        spans.has_event("join batched object flush complete"),
+        "expected the bound-object lane"
+    );
+    spans
+        .find_events("join batched probe input")
+        .iter()
+        .map(|e| e.fields["input_rows"].parse().expect("input rows"))
+        .collect()
+}
+
+/// A bound-object probe reads only the leaflets holding its objects, so a
+/// `LIMIT` sizes its first window directly. Holding back a 1,024-row window
+/// per join would drain far more of the driving scan than the rows asked for;
+/// the windows still end where that one did, so none reads past it.
+#[tokio::test]
+async fn limit_sizes_the_bound_object_lanes_first_window() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/object-lane-limit:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let graph: Vec<JsonValue> = (0..PEOPLE)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:p{i}"),
+                "ex:tag": format!("t{i}"),
+                "ex:label": format!("t{i}"),
+                "ex:likes": {"@id": format!("ex:c{i}")},
+                "ex:follows": {"@id": format!("ex:c{i}")},
+            })
+        })
+        .collect();
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let view = fluree.db(ledger_id).await.expect("view");
+
+    let strings = "?a ex:tag ?v . ?b ex:label ?v";
+    let refs = "?a ex:likes ?v . ?b ex:follows ?v";
+    let select = |where_: &str, modifiers: &str| {
+        format!("PREFIX ex: <http://example.org/ns/> SELECT ?a ?b WHERE {{ {where_} }} {modifiers}")
+    };
+    for where_ in [strings, refs] {
+        let query = select(where_, "LIMIT 5");
+        let plan = fluree.explain_sparql(&view, &query).await.expect("explain");
+        assert!(
+            plan["plan"]["physical"]
+                .to_string()
+                .contains("NestedLoopJoinOperator"),
+            "{plan}"
+        );
+        let (spans, guard) = span_capture::init_test_tracing();
+        let got = rows(&fluree, &view, &query).await;
+        drop(guard);
+        assert_eq!(got.len(), 5, "{where_}");
+        assert!(got.iter().all(|row| row[0] == row[1]), "{where_}: {got:?}");
+        assert_eq!(object_probe_windows(&spans), vec![5], "{where_}");
+    }
+
+    // The same join through JSON-LD.
+    let jsonld = json!({
+        "@context": ctx(),
+        "select": ["?a", "?b"],
+        "where": [{"@id": "?a", "ex:tag": "?v"}, {"@id": "?b", "ex:label": "?v"}],
+        "limit": 5,
+    });
+    let (spans, guard) = span_capture::init_test_tracing();
+    let result = fluree
+        .query(&view, QueryInput::JsonLd(&jsonld))
+        .await
+        .expect("query");
+    drop(guard);
+    let got = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+    assert_eq!(got.as_array().expect("rows").len(), 5);
+    assert_eq!(object_probe_windows(&spans), vec![5]);
+
+    // One left row in a hundred survives, so the windows grow until the
+    // `LIMIT` is met, within the first 1,024 rows, and the answer is the full
+    // drain's.
+    let sparse = format!("{strings} FILTER(STRENDS(STR(?b), \"50\"))");
+    let (spans, guard) = span_capture::init_test_tracing();
+    let got = rows(&fluree, &view, &select(&sparse, "LIMIT 2")).await;
+    drop(guard);
+    assert_eq!(object_probe_windows(&spans), vec![2, 16, 128, 878]);
+    let all = rows(&fluree, &view, &select(&sparse, "")).await;
+    assert_eq!(all.len(), PEOPLE / 100);
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|row| all.contains(row)), "{got:?}");
+}
+
+/// Members of each of the two hubs in [`seed_hubs`].
+const HUB_MEMBERS: usize = 3000;
+/// Pointers in [`seed_hubs`]; every `HUB_POINTER_EVERY`th one names a hub.
+const POINTERS: usize = 21_000;
+const HUB_POINTER_EVERY: usize = 2100;
+
+/// Ten pointers at two hubs of [`HUB_MEMBERS`] members each, among pointers
+/// at nothing and members of nothing pointed at. Sized so both the `LIMIT`
+/// and the full drain take the nested-loop join.
+async fn seed_hubs(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    let pointers: Vec<JsonValue> = (0..POINTERS)
+        .map(|i| {
+            let target = if i.is_multiple_of(HUB_POINTER_EVERY) {
+                format!("ex:hub{}", (i / HUB_POINTER_EVERY) % 2)
+            } else {
+                format!("ex:t{i}")
+            };
+            json!({"@id": format!("ex:a{i}"), "ex:pointsTo": {"@id": target}})
+        })
+        .collect();
+    let ledger = fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": pointers}))
+        .await
+        .expect("seed pointers")
+        .ledger;
+    let members: Vec<JsonValue> = (0..2 * HUB_MEMBERS)
+        .map(|k| json!({"@id": format!("ex:m{k}"), "ex:memberOf": {"@id": format!("ex:hub{}", k % 2)}}))
+        .chain((0..19_000).map(|k| {
+            json!({"@id": format!("ex:f{k}"), "ex:memberOf": {"@id": format!("ex:lonely{k}")}})
+        }))
+        .collect();
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": members}))
+        .await
+        .expect("seed members");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+}
+
+/// Rows the bound-object flushes matched, and rows built from those matches.
+fn object_probe_matched_and_built(spans: &span_capture::SpanStore) -> (usize, usize) {
+    let sum = |event: &str, field: &str| -> usize {
+        spans
+            .find_events(event)
+            .iter()
+            .map(|e| e.fields[field].parse::<usize>().expect("row count"))
+            .sum()
+    };
+    (
+        sum("join batched object flush complete", "matched_rows"),
+        sum("join batched object rows built", "rows"),
+    )
+}
+
+/// One bound object can match far more rows than a `LIMIT` reads. The lane
+/// builds its rows a batch at a time from the matches, so the consumer stops
+/// it after one batch, and the rows and their order stay those of the full
+/// drain however the windows and batches fall.
+#[tokio::test]
+async fn limit_builds_one_batch_of_a_hub_objects_matches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/object-lane-hub:main";
+    seed_hubs(&fluree, ledger_id).await;
+    let view = fluree.db(ledger_id).await.expect("view");
+
+    let join = "?a ex:pointsTo ?v . ?m ex:memberOf ?v";
+    let select = |where_: &str, modifiers: &str| {
+        format!("PREFIX ex: <http://example.org/ns/> SELECT ?a ?m WHERE {{ {where_} }} {modifiers}")
+    };
+    for modifiers in ["", "LIMIT 5"] {
+        let plan = fluree
+            .explain_sparql(&view, &select(join, modifiers))
+            .await
+            .expect("explain");
+        assert!(
+            plan["plan"]["physical"]
+                .to_string()
+                .contains("NestedLoopJoinOperator"),
+            "{modifiers:?}: {plan}"
+        );
+    }
+
+    let (spans, guard) = span_capture::init_test_tracing();
+    let full = rows(&fluree, &view, &select(join, "")).await;
+    drop(guard);
+    let hub_rows = (POINTERS / HUB_POINTER_EVERY) * HUB_MEMBERS;
+    assert_eq!(
+        object_probe_matched_and_built(&spans),
+        (hub_rows, hub_rows),
+        "a full drain builds every match"
+    );
+    let mut expected: Vec<JsonValue> = (0..POINTERS)
+        .step_by(HUB_POINTER_EVERY)
+        .flat_map(|i| {
+            let hub = (i / HUB_POINTER_EVERY) % 2;
+            (0..2 * HUB_MEMBERS)
+                .filter(move |k| k % 2 == hub)
+                .map(move |k| json!([format!("ex:a{i}"), format!("ex:m{k}")]))
+        })
+        .collect();
+    let mut sorted = full.clone();
+    sorted.sort_by_key(ToString::to_string);
+    expected.sort_by_key(ToString::to_string);
+    assert_eq!(sorted, expected);
+
+    // A hub pointer's flush matches a whole hub; five rows build one batch.
+    let (spans, guard) = span_capture::init_test_tracing();
+    let got = rows(&fluree, &view, &select(join, "LIMIT 5")).await;
+    drop(guard);
+    assert_eq!(got, full[..5]);
+    let (matched, built) = object_probe_matched_and_built(&spans);
+    assert!(matched >= HUB_MEMBERS, "matched {matched}");
+    assert!(built <= 1000, "built {built} of {matched} matched rows");
+
+    // Pages across a batch boundary and across two left rows' matches.
+    for (offset, limit) in [(0, 1024), (990, 30), (HUB_MEMBERS - 10, 20), (5995, 10)] {
+        assert_eq!(
+            rows(
+                &fluree,
+                &view,
+                &select(join, &format!("OFFSET {offset} LIMIT {limit}"))
+            )
+            .await,
+            full[offset..offset + limit],
+            "OFFSET {offset} LIMIT {limit}"
+        );
+    }
+
+    // Filters drop matches as their rows are built: one reads the matched
+    // subject alone, one the whole row.
+    fn last(value: &JsonValue) -> Option<char> {
+        value.as_str().expect("iri").chars().last()
+    }
+    type Keep = fn(&JsonValue) -> bool;
+    let filters: [(&str, Keep); 2] = [
+        ("FILTER(STRENDS(STR(?m), \"7\"))", |row| {
+            last(&row[1]) == Some('7')
+        }),
+        (
+            "FILTER(STRENDS(STR(?m), SUBSTR(STR(?a), STRLEN(STR(?a)))))",
+            |row| last(&row[0]) == last(&row[1]),
+        ),
+    ];
+    for (filter, keep) in filters {
+        let filtered = format!("{join} {filter}");
+        let kept: Vec<JsonValue> = full.iter().filter(|row| keep(row)).cloned().collect();
+        assert_eq!(kept.len(), hub_rows / 10, "{filter}");
+        assert_eq!(
+            rows(&fluree, &view, &select(&filtered, "")).await,
+            kept,
+            "{filter}"
+        );
+        let (spans, guard) = span_capture::init_test_tracing();
+        let got = rows(&fluree, &view, &select(&filtered, "LIMIT 5")).await;
+        drop(guard);
+        assert_eq!(got, kept[..5], "{filter}");
+        let (matched, built) = object_probe_matched_and_built(&spans);
+        assert!(matched >= HUB_MEMBERS, "{filter}: matched {matched}");
+        assert!(built <= 1000, "{filter}: built {built} of {matched}");
+    }
+
+    // The same join through JSON-LD.
+    let jsonld = json!({
+        "@context": ctx(),
+        "select": ["?a", "?m"],
+        "where": [{"@id": "?a", "ex:pointsTo": "?v"}, {"@id": "?m", "ex:memberOf": "?v"}],
+        "limit": 5,
+    });
+    let (spans, guard) = span_capture::init_test_tracing();
+    let result = fluree
+        .query(&view, QueryInput::JsonLd(&jsonld))
+        .await
+        .expect("query");
+    drop(guard);
+    let got = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+    assert_eq!(got.as_array().expect("rows")[..], full[..5]);
+    let (matched, built) = object_probe_matched_and_built(&spans);
+    assert!(matched >= HUB_MEMBERS, "matched {matched}");
+    assert!(built <= 1000, "built {built} of {matched} matched rows");
+}
+
+/// A flush is charged for the matches it read, not for the rows a `LIMIT`
+/// let it build from them: five rows of a hub cost the hub. Set against the
+/// same query on a pointer at nothing, which reads the same leaflets and
+/// matches no row.
+#[tokio::test]
+async fn limit_still_pays_for_the_hub_it_read() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/object-lane-hub-fuel:main";
+    seed_hubs(&fluree, ledger_id).await;
+    let view = fluree.db(ledger_id).await.expect("view");
+
+    let mut fuel = Vec::new();
+    for (pointer, matched) in [("a0", HUB_MEMBERS), ("a1", 0)] {
+        let sparql = format!(
+            "PREFIX ex: <http://example.org/ns/> SELECT ?m \
+             WHERE {{ ex:{pointer} ex:pointsTo ?v . ?m ex:memberOf ?v }} LIMIT 5"
+        );
+        let (spans, guard) = span_capture::init_test_tracing();
+        let tracked = view
+            .query(&fluree)
+            .sparql(&sparql)
+            .track_all()
+            .execute_tracked()
+            .await
+            .expect("tracked query");
+        drop(guard);
+        assert_eq!(tracked.status, 200);
+        let (read, built) = object_probe_matched_and_built(&spans);
+        assert_eq!(read, matched, "{pointer}");
+        assert!(built <= 1000, "{pointer}: built {built} of {read}");
+        fuel.push(tracked.fuel.expect("fuel"));
+    }
+
+    // Each match read costs a thousandth of a fuel. Charging the one batch
+    // of rows built instead would come to a third of this.
+    let read_fuel = HUB_MEMBERS as f64 / 1000.0;
+    assert!(
+        fuel[0] > fuel[1] + 0.8 * read_fuel,
+        "reading a {HUB_MEMBERS}-member hub charged {} fuel, {} with no match",
+        fuel[0],
+        fuel[1]
+    );
 }

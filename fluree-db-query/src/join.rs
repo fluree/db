@@ -10,7 +10,7 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    branch_or_none, object_probe_lane_plan, overlay_holds_ops, p_id_or_none,
+    branch_or_none, object_probe_covers, object_probe_lane_plan, overlay_holds_ops, p_id_or_none,
     subject_probe_lane_plan, LaneOutput, ObjectProbeOps, ProbeLanePlan, ProbeOps, RowFate,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
@@ -47,6 +47,10 @@ const BATCHED_KEY_MEMO_CAP: usize = 1 << 18;
 /// final flush with fewer rows than `extent / COLD_LANE_FLAKES_PER_ROW` runs
 /// per-row instead, where each row translates only its own matches.
 const COLD_LANE_FLAKES_PER_ROW: usize = 8;
+
+/// The `(o_type, o_key)` a batched lane keys a left row on. The subject lanes
+/// key a subject id as `(IRI_REF, s_id)`.
+type LaneKey = (u16, u64);
 
 fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
     count
@@ -678,7 +682,8 @@ fn is_batched_eligible(
 /// - no object bounds or datatype/language constraints
 ///
 /// This enables one batched probe of the predicate's POST rows for a set of
-/// bound ref objects rather than opening one scan per left row.
+/// bound objects (refs and string terms) rather than opening one scan per left
+/// row.
 fn is_batched_object_eligible(
     bind_instructions: &[BindInstruction],
     right_pattern: &TriplePattern,
@@ -748,6 +753,61 @@ fn is_batched_subject_exists_eligible(
 
     has_subject_bind && pred_fixed && obj_fixed && no_obj_bind && no_constraint
 }
+
+/// Matched subjects of one bound-object flush, one list per probed object.
+enum ObjectMatches {
+    /// Subject ids; a row binds one as `EncodedSid`.
+    Encoded(Vec<Vec<u64>>),
+    /// Decoded subjects, for eager callers: each match is resolved once,
+    /// however many left rows share its object.
+    Decoded(Vec<Vec<Binding>>),
+}
+
+impl ObjectMatches {
+    fn len(&self, list: usize) -> usize {
+        match self {
+            Self::Encoded(lists) => lists[list].len(),
+            Self::Decoded(lists) => lists[list].len(),
+        }
+    }
+
+    fn binding(&self, list: usize, at: usize) -> Binding {
+        match self {
+            Self::Encoded(lists) => Binding::encoded_sid(lists[list][at]),
+            Self::Decoded(lists) => lists[list][at].clone(),
+        }
+    }
+
+    fn extend_into(&self, list: usize, range: std::ops::Range<usize>, out: &mut Vec<Binding>) {
+        match self {
+            Self::Encoded(lists) => {
+                out.extend(lists[list][range].iter().map(|&s| Binding::encoded_sid(s)));
+            }
+            Self::Decoded(lists) => out.extend_from_slice(&lists[list][range]),
+        }
+    }
+}
+
+/// One object type's share of a bound-object flush: its distinct keys in
+/// order, and each key's list in [`ObjectMatches`].
+struct ObjectProbeGroup {
+    o_type: u16,
+    keys: Vec<u64>,
+    lists: Vec<u32>,
+}
+
+/// A bound-object flush's matches, not yet built into rows. A hub object can
+/// match far more rows than the consumer reads, so rows are built a batch at
+/// a time ([`NestedLoopJoinOperator::next_object_probe_batch`]).
+struct PendingObjectEmit {
+    matches: ObjectMatches,
+    /// Per accumulator entry, its object's list in `matches`.
+    entry_list: Vec<u32>,
+    /// The accumulator entry and the match within its list to build next.
+    next_entry: usize,
+    next_match: usize,
+}
+
 /// Bind-join operator for nested-loop join
 ///
 /// For each row from the left operator, substitutes bound variables into
@@ -826,9 +886,9 @@ pub struct NestedLoopJoinOperator {
     /// top of every `next_batch` call (cheap: the ops fetch hits the
     /// per-execution cache after the first call).
     batched_overlay_mode: ProbeLanePlan,
-    /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
-    /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
-    batched_accumulator: Vec<(usize, usize, u64)>,
+    /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, key).
+    /// Stores the raw key directly to avoid dictionary round-trips with encoded bindings.
+    batched_accumulator: Vec<(usize, usize, LaneKey)>,
     /// The overlay plan waits for the first flush ([`Self::defers_batched_overlay`]).
     batched_overlay_deferred: bool,
     /// `(stored batch, row)` left rows a flush handed to the per-row path;
@@ -844,14 +904,18 @@ pub struct NestedLoopJoinOperator {
     batched_keys_unresolved: bool,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
-    /// doesn't buffer ~100k left rows before producing anything. Each flush
-    /// probes the whole key range of its batch, so ramping without a budget
-    /// would repeat that walk on a full drain.
+    /// doesn't buffer ~100k left rows before producing anything. A subject
+    /// flush probes the whole key range of its batch, so ramping without a
+    /// budget would repeat that walk on a full drain.
     flush_schedule: FlushSchedule,
     /// Left batches retained for the batched flush
     stored_left_batches: Vec<Batch>,
     /// Pre-built output batches from the batched path, ready to emit
     batched_output: VecDeque<Batch>,
+    /// Matches of a bound-object flush still to be built into rows. Drained
+    /// before any further left row is read; the accumulator and its stored
+    /// batches stay until then.
+    pending_object_emit: Option<PendingObjectEmit>,
     /// Present only during `drain_count`: matches counted without constructing
     /// output batches. Runtime fallbacks still emit rows through `next_batch`.
     count_only: Option<u64>,
@@ -1100,6 +1164,7 @@ impl NestedLoopJoinOperator {
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
+            pending_object_emit: None,
             count_only: None,
             grouped_count: None,
             current_left_batch_stored_idx: None,
@@ -1328,7 +1393,15 @@ impl Operator for NestedLoopJoinOperator {
     /// to cap the batched accumulator's first flush, which lets backpressure
     /// stop the left scan once the top-level `LIMIT` is satisfied.
     fn set_row_budget(&mut self, budget: usize) {
-        self.flush_schedule = FlushSchedule::budgeted(budget, BATCHED_JOIN_SIZE);
+        // The bound-object probe reads only the leaflets holding its objects,
+        // so its first window can open at the budget itself. A chain of joins
+        // each holding back a whole `MIN_FLUSH` window drains far more of the
+        // driving scan than a small `LIMIT` needs.
+        self.flush_schedule = if self.batched_object_eligible {
+            FlushSchedule::budgeted_in_steps(budget, BATCHED_JOIN_SIZE)
+        } else {
+            FlushSchedule::budgeted(budget, BATCHED_JOIN_SIZE)
+        };
         tracing::debug!(
             budget,
             flush_threshold = self.flush_schedule.size(),
@@ -1365,6 +1438,7 @@ impl Operator for NestedLoopJoinOperator {
         self.batched_overlay_deferred = false;
         self.batched_keys_unresolved = false;
         self.per_row_backlog.clear();
+        self.pending_object_emit = None;
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1469,6 +1543,14 @@ impl Operator for NestedLoopJoinOperator {
                 return Ok(trim_batch(&self.out_schema, batch));
             }
 
+            // 1b. Rows of a bound-object flush still held as matches
+            if self.pending_object_emit.is_some() {
+                if let Some(batch) = self.next_object_probe_batch(ctx)? {
+                    return Ok(trim_batch(&self.out_schema, batch));
+                }
+                continue;
+            }
+
             // 2. Pending output from per-row path
             if !self.pending_output.is_empty() {
                 if let Some(batch) = self.build_output_batch(ctx).await? {
@@ -1565,23 +1647,22 @@ impl Operator for NestedLoopJoinOperator {
             if use_batched {
                 // Batched path: extract the bound key directly to avoid dictionary round-trips.
                 // - Subject-batched: key is subject s_id (bound to right subject).
-                // - Object-batched: key is object s_id (bound to right object).
+                // - Object-batched: key is the object's (o_type, o_key) (bound to right object).
                 let left_col = self.batched_left_col();
-                let resolved: Option<u64> = {
+                let object_lane = self.batched_object_eligible;
+                let resolved: Option<LaneKey> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
                     let binding = left_batch.get_by_col(left_row, left_col);
-                    if self.batched_overlay_deferred
-                        && matches!(binding, Binding::Sid { .. } | Binding::IriMatch { .. })
-                    {
+                    if self.batched_overlay_deferred && key_reads_dictionary(binding, object_lane) {
                         // The deferred plan may send these rows per-row,
                         // which never reads the id.
                         self.batched_keys_unresolved = true;
-                        Some(0)
+                        Some(UNRESOLVED_LANE_KEY)
                     } else {
                         let memo = ctx
                             .eager_materialization
                             .then_some(&mut self.batched_key_memo);
-                        resolve_left_key(ctx, memo, binding)
+                        resolve_lane_key(ctx, memo, binding, object_lane)
                     }
                 };
 
@@ -1729,6 +1810,7 @@ impl Operator for NestedLoopJoinOperator {
         self.per_row_backlog.clear();
         self.stored_left_batches.clear();
         self.batched_output.clear();
+        self.pending_object_emit = None;
         self.count_only = None;
         self.grouped_count = None;
         self.state = OperatorState::Closed;
@@ -1960,6 +2042,7 @@ impl NestedLoopJoinOperator {
     /// the per-row path, as they would have when accumulated.
     fn resolve_accumulated_keys(&mut self, ctx: &ExecutionContext<'_>) {
         let left_col = self.batched_left_col();
+        let object_lane = self.batched_object_eligible;
         let mut memo = ctx
             .eager_materialization
             .then_some(&mut self.batched_key_memo);
@@ -1968,9 +2051,9 @@ impl NestedLoopJoinOperator {
         self.batched_accumulator
             .retain_mut(|(batch_idx, left_row, key)| {
                 let binding = batches[*batch_idx].get_by_col(*left_row, left_col);
-                match resolve_left_key(ctx, memo.as_deref_mut(), binding) {
-                    Some(s_id) => {
-                        *key = s_id;
+                match resolve_lane_key(ctx, memo.as_deref_mut(), binding, object_lane) {
+                    Some(resolved) => {
+                        *key = resolved;
                         true
                     }
                     None => {
@@ -2078,8 +2161,8 @@ impl NestedLoopJoinOperator {
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
-    /// subject; the bound-object lane merges its `IRI_REF` subset per probed
-    /// object. Decline cases route to the overlay-correct per-row fallback
+    /// subject; the bound-object lane merges them per probed object. Decline
+    /// cases route to the overlay-correct per-row fallback
     /// before any accumulation, except for a plan deferred to the first flush
     /// ([`Self::defers_batched_overlay`]): that flush hands its rows to the
     /// per-row path when the plan declines.
@@ -2136,7 +2219,7 @@ impl NestedLoopJoinOperator {
         let mut s_id_to_accum: FxHashMap<u64, Vec<usize>> =
             FxHashMap::with_capacity_and_hasher(self.batched_accumulator.len(), FxBuildHasher);
         let mut unique_s_ids: Vec<u64> = Vec::with_capacity(self.batched_accumulator.len());
-        for (accum_idx, (_, _, s_id)) in self.batched_accumulator.iter().enumerate() {
+        for (accum_idx, (_, _, (_, s_id))) in self.batched_accumulator.iter().enumerate() {
             s_id_to_accum.entry(*s_id).or_default().push(accum_idx);
             unique_s_ids.push(*s_id);
         }
@@ -2145,25 +2228,54 @@ impl NestedLoopJoinOperator {
         (s_id_to_accum, unique_s_ids)
     }
 
-    /// Group accumulator entries by object ID.
+    /// Group accumulator entries by object. Returns, per object type, its
+    /// distinct keys in order with each key's match-list index, and per
+    /// accumulator entry its object's list.
     ///
-    /// Returns `(o_s_id → accumulator indices, (min_o, max_o))`.
-    fn group_accumulator_by_object(&self) -> (FxHashMap<u64, Vec<usize>>, u64, u64) {
-        let mut o_to_accum: FxHashMap<u64, Vec<usize>> =
-            FxHashMap::with_capacity_and_hasher(self.batched_accumulator.len(), FxBuildHasher);
-        let mut min_o: u64 = u64::MAX;
-        let mut max_o: u64 = 0;
-        for (accum_idx, (_, _, o_s_id)) in self.batched_accumulator.iter().enumerate() {
-            let o = *o_s_id;
-            o_to_accum.entry(o).or_default().push(accum_idx);
-            if o < min_o {
-                min_o = o;
+    /// One map per type keeps the keys plain `u64`s to hash and sort. A join
+    /// usually binds a single type, so only the first map is sized for the
+    /// whole window.
+    fn group_accumulator_by_object(&self) -> (Vec<ObjectProbeGroup>, Vec<u32>) {
+        let mut by_type: Vec<(u16, FxHashMap<u64, u32>)> = Vec::new();
+        let mut slot_of_type: FxHashMap<u16, usize> = FxHashMap::default();
+        let mut entry_list: Vec<u32> = Vec::with_capacity(self.batched_accumulator.len());
+        let mut lists = 0u32;
+        let mut slot = usize::MAX;
+        for (_, _, (o_type, o_key)) in &self.batched_accumulator {
+            if by_type.get(slot).is_none_or(|(t, _)| t != o_type) {
+                slot = *slot_of_type.entry(*o_type).or_insert_with(|| {
+                    let capacity = if by_type.is_empty() {
+                        self.batched_accumulator.len()
+                    } else {
+                        0
+                    };
+                    by_type.push((
+                        *o_type,
+                        FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher),
+                    ));
+                    by_type.len() - 1
+                });
             }
-            if o > max_o {
-                max_o = o;
-            }
+            let list = *by_type[slot].1.entry(*o_key).or_insert_with(|| {
+                lists += 1;
+                lists - 1
+            });
+            entry_list.push(list);
         }
-        (o_to_accum, min_o, max_o)
+        let groups = by_type
+            .into_iter()
+            .map(|(o_type, list_of_key)| {
+                let mut keyed: Vec<(u64, u32)> = list_of_key.into_iter().collect();
+                keyed.sort_unstable();
+                let (keys, lists) = keyed.into_iter().unzip();
+                ObjectProbeGroup {
+                    o_type,
+                    keys,
+                    lists,
+                }
+            })
+            .collect();
+        (groups, entry_list)
     }
 
     /// Phase 3: Compute the PSOT leaf range for a predicate + subject range.
@@ -2804,8 +2916,9 @@ impl NestedLoopJoinOperator {
 
     /// Binary-index batched scan for object-bound joins.
     ///
-    /// Probes POST for `(p_id=fixed, o_type=IRI_REF, o_key in accumulator set)`
-    /// and emits combined rows that bind the right pattern's new subject var.
+    /// Probes POST for `(p_id=fixed, (o_type, o_key) in accumulator set)` and
+    /// leaves the matched subjects pending; [`Self::next_object_probe_batch`]
+    /// builds the combined rows that bind the right pattern's new subject var.
     async fn flush_batched_object_accumulator_binary(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -2829,8 +2942,8 @@ impl NestedLoopJoinOperator {
         };
 
         // Group by object
-        let (o_to_accum, _min_o, _max_o) = self.group_accumulator_by_object();
-        if o_to_accum.is_empty() {
+        let (groups, entry_list) = self.group_accumulator_by_object();
+        if groups.is_empty() {
             self.clear_batched_state();
             return Ok(());
         }
@@ -2849,46 +2962,24 @@ impl NestedLoopJoinOperator {
             _ => None,
         };
 
-        let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
-        let mut matched_rows: u64 = 0;
-
-        let mut objs: Vec<u64> = o_to_accum.keys().copied().collect();
-        objs.sort_unstable();
-        objs.dedup();
-        if objs.is_empty() {
-            self.clear_batched_state();
-            return Ok(());
+        // One walk per object type: POST keeps each type's rows in one run.
+        // Base and injected matches land in the same lists.
+        let list_count: usize = groups.iter().map(|group| group.keys.len()).sum();
+        let mut subjects: Vec<Vec<u64>> = vec![Vec::new(); list_count];
+        for group in &groups {
+            for_each_object_probe_match(
+                ctx,
+                &store,
+                &branch,
+                (p_id, group.o_type),
+                &group.keys,
+                probe_ops.as_mut(),
+                |obj_idx, s_id| {
+                    subjects[group.lists[obj_idx] as usize].push(s_id);
+                    Ok(())
+                },
+            )?;
         }
-        let accums: Vec<&[usize]> = objs.iter().map(|o| o_to_accum[o].as_slice()).collect();
-        let eager_dicts = if ctx.eager_materialization {
-            make_dict_overlay(ctx, &store)
-        } else {
-            None
-        };
-
-        let this = &*self;
-        for_each_object_probe_match(
-            ctx,
-            &store,
-            &branch,
-            p_id,
-            &objs,
-            probe_ops.as_mut(),
-            |obj_idx, s_id| {
-                let subject = if ctx.eager_materialization {
-                    Binding::sid(probe_subject_sid(&store, eager_dicts.as_ref(), s_id)?)
-                } else {
-                    Binding::encoded_sid(s_id)
-                };
-                this.emit_object_probe_match(
-                    ctx,
-                    &subject,
-                    accums[obj_idx],
-                    &mut scatter,
-                    &mut matched_rows,
-                )
-            },
-        )?;
         if let Some(probe) = &probe_ops {
             tracing::debug!(
                 dropped_rows = probe.dropped_rows,
@@ -2897,65 +2988,132 @@ impl NestedLoopJoinOperator {
             );
         }
 
-        self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+        let matched_rows: u64 = entry_list
+            .iter()
+            .map(|&list| subjects[list as usize].len() as u64)
+            .sum();
+        // This lane reads its own leaflets rather than going through
+        // `scan_matches`, so the matches it read are charged here, whether or
+        // not a `LIMIT` lets them all be built into rows.
+        charge_probe_rows(ctx, matched_rows as usize)?;
+        let matches = if ctx.eager_materialization {
+            let dicts = make_dict_overlay(ctx, &store);
+            let decode =
+                |s_id: &u64| probe_subject_sid(&store, dicts.as_ref(), *s_id).map(Binding::sid);
+            ObjectMatches::Decoded(
+                subjects
+                    .iter()
+                    .map(|ids| ids.iter().map(decode).collect())
+                    .collect::<Result<_>>()?,
+            )
+        } else {
+            ObjectMatches::Encoded(subjects)
+        };
         tracing::debug!(
             total_ms = (overall_start.elapsed().as_secs_f64() * 1000.0) as u64,
             matched_rows,
             "join batched object flush complete"
         );
 
-        // The object-driven (POST) lane reads its own leaflets rather than
-        // going through `scan_matches`, so its rows need their own charge at
-        // this boundary — `matched_rows` is already tallied for the debug
-        // line above.
-        charge_probe_rows(ctx, matched_rows as usize)?;
-
+        if matched_rows == 0 {
+            self.clear_batched_state();
+        } else {
+            self.pending_object_emit = Some(PendingObjectEmit {
+                matches,
+                entry_list,
+                next_entry: 0,
+                next_match: 0,
+            });
+        }
         Ok(())
     }
 
-    /// Emit one matched (subject, left-row group) of the bound-object lane:
-    /// build the combined row per accumulator slot through the same inline-op
-    /// stages for base and injected matches.
-    fn emit_object_probe_match(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        subject: &Binding,
-        accum_idxs: &[usize],
-        scatter: &mut [Vec<Vec<Binding>>],
-        matched_rows: &mut u64,
-    ) -> Result<()> {
-        for &accum_idx in accum_idxs {
-            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+    /// The next output batch of a bound-object flush, built from its pending
+    /// matches in left-row order through the same inline-op stages for base
+    /// and injected matches. `None` when the matches left build no row; the
+    /// flush's state is cleared once they are spent.
+    fn next_object_probe_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        let Some(mut pending) = self.pending_object_emit.take() else {
+            return Ok(None);
+        };
+        let batch_size = ctx.batch_size.max(1);
+        let num_cols = self.combined_schema.len();
+        let left_len = self.left_schema.len();
+        let right_width = self.right_new_vars.len();
+        // With no inline op to run, a left row's matches fill the columns
+        // directly.
+        let plain = self.inline_ops.is_empty() && self.right_scan_inline_ops.is_empty();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols)
+            .map(|_| Vec::with_capacity(batch_size))
+            .collect();
+        let mut rows = 0usize;
+        let mut row: Vec<Binding> = Vec::new();
+        let mut right: Vec<Binding> = Vec::new();
+
+        while rows < batch_size && pending.next_entry < pending.entry_list.len() {
+            let list = pending.entry_list[pending.next_entry] as usize;
+            let remaining = pending.matches.len(list) - pending.next_match;
+            if remaining == 0 {
+                pending.next_entry += 1;
+                pending.next_match = 0;
+                continue;
+            }
+            let (batch_idx, row_idx, _) = self.batched_accumulator[pending.next_entry];
             let left_batch = self.stored_left_batches.get(batch_idx).ok_or_else(|| {
                 QueryError::Internal("batched object join: left batch missing".into())
             })?;
-            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-            for _ in &self.right_new_vars {
-                right_bindings.push(subject.clone());
-            }
-            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+
+            if plain {
+                let take = remaining.min(batch_size - rows);
+                let from = pending.next_match;
+                for (col, out) in columns.iter_mut().enumerate() {
+                    if col < left_len {
+                        let binding = left_batch.get_by_col(row_idx, col);
+                        out.extend(std::iter::repeat_n(binding, take).cloned());
+                    } else {
+                        pending.matches.extend_into(list, from..from + take, out);
+                    }
+                }
+                pending.next_match += take;
+                rows += take;
                 continue;
             }
 
-            let mut combined: Vec<Binding> = Vec::with_capacity(self.combined_schema.len());
-            for col in 0..self.left_schema.len() {
-                combined.push(left_batch.get_by_col(row_idx, col).clone());
-            }
-            combined.extend(right_bindings);
-
-            if !apply_inline(
-                &self.inline_ops,
-                &self.combined_schema,
-                &mut combined,
-                Some(ctx),
-            )? {
+            let subject = pending.matches.binding(list, pending.next_match);
+            pending.next_match += 1;
+            right.clear();
+            right.extend(std::iter::repeat_n(subject, right_width));
+            if !self.apply_right_scan_inline_ops(ctx, &mut right)? {
                 continue;
             }
-
-            scatter[accum_idx].push(combined);
-            *matched_rows += 1;
+            row.clear();
+            row.extend((0..left_len).map(|col| left_batch.get_by_col(row_idx, col).clone()));
+            row.append(&mut right);
+            if !apply_inline(&self.inline_ops, &self.combined_schema, &mut row, Some(ctx))? {
+                continue;
+            }
+            for (out, value) in columns.iter_mut().zip(row.drain(..)) {
+                out.push(value);
+            }
+            rows += 1;
         }
-        Ok(())
+
+        if pending.next_entry < pending.entry_list.len() {
+            self.pending_object_emit = Some(pending);
+        } else {
+            self.clear_batched_state();
+        }
+        if rows == 0 {
+            return Ok(None);
+        }
+
+        tracing::debug!(rows, "join batched object rows built");
+        let batch = if num_cols == 0 {
+            Batch::empty_schema_with_len(rows)
+        } else {
+            Batch::new(self.combined_schema.clone(), columns)?
+        };
+        Ok(Some(batch))
     }
 
     /// Binary-index batched existence scan for subject-bound joins with fixed objects.
@@ -3089,7 +3247,6 @@ fn resolve_left_key(
         Binding::EncodedSid { s_id, .. } => return Some(*s_id),
         Binding::Sid { sid, .. } => sid,
         Binding::IriMatch { primary_sid, .. } => primary_sid,
-        // Object-lane non-ref objects have no subject id.
         _ => return None,
     };
     let lookup = || {
@@ -3110,6 +3267,81 @@ fn resolve_left_key(
     }
     memo.insert(sid.clone(), s_id);
     s_id
+}
+
+/// Placeholder for a key accumulated before its lane is planned.
+const UNRESOLVED_LANE_KEY: LaneKey = (0, 0);
+
+/// Whether resolving `binding`'s lane key reads a reverse dictionary.
+fn key_reads_dictionary(binding: &Binding, object_lane: bool) -> bool {
+    match binding {
+        Binding::Sid { .. } | Binding::IriMatch { .. } => true,
+        Binding::Lit { .. } => object_lane && crate::binding::is_string_dict_term(binding),
+        _ => false,
+    }
+}
+
+/// The key a batched lane probes for a left binding, or `None` for a row the
+/// per-row scan must answer.
+///
+/// A ref keys its subject id. The bound-object lane also keys a string term —
+/// `"abc"`, `"abc"@en`, `"abc"^^ex:custom` — on the exact `(o_type, o_key)` the
+/// per-row scan seeks for it, so the two read the same rows. Every other
+/// literal matches across datatypes there (`1` joins `1.0`) and has no single
+/// key.
+fn resolve_lane_key(
+    ctx: &ExecutionContext<'_>,
+    memo: Option<&mut FxHashMap<Sid, Option<u64>>>,
+    binding: &Binding,
+    object_lane: bool,
+) -> Option<LaneKey> {
+    use fluree_db_core::o_type::OType;
+    match binding {
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            dt_id,
+            lang_id,
+            ..
+        } if object_lane => {
+            if *o_kind != fluree_db_core::value_id::ObjKind::LEX_ID.as_u8() {
+                return None;
+            }
+            // The three datatypes an encoded string can carry
+            // (`late_materialized_object_binding`).
+            let dt = DatatypeDictId::from_u16(*dt_id);
+            let o_type = if dt == DatatypeDictId::STRING {
+                OType::XSD_STRING
+            } else if dt == DatatypeDictId::LANG_STRING {
+                OType::lang_string(*lang_id)
+            } else if dt == DatatypeDictId::FULL_TEXT {
+                OType::FULLTEXT
+            } else {
+                return None;
+            };
+            Some((o_type.as_u16(), *o_key))
+        }
+        Binding::Lit { val, dtc, .. } if object_lane => {
+            if !crate::binding::is_string_dict_term(binding) {
+                return None;
+            }
+            // The per-row scan's own encoding, and the one overlay ops are
+            // translated with. A term it cannot encode stays per-row.
+            let store = ctx.binary_store.as_deref()?;
+            crate::binary_scan::value_to_otype_okey(
+                val,
+                dtc.datatype(),
+                dtc.lang_tag(),
+                store,
+                ctx.dict_novelty.as_ref(),
+                None,
+            )
+            .ok()
+            .map(|(o_type, o_key)| (o_type.as_u16(), o_key))
+            .filter(|&(o_type, _)| object_probe_covers(o_type))
+        }
+        _ => resolve_left_key(ctx, memo, binding).map(|s_id| (OType::IRI_REF.as_u16(), s_id)),
+    }
 }
 
 /// Object binding for a row of the subject-probe lane. Refs stay raw
@@ -3297,7 +3529,7 @@ fn post_rows_of(
     start..partition(start, &|row| key(row) == want)
 }
 
-/// Walk `p_id`'s POST partition for the `IRI_REF` rows whose object is one of
+/// Walk the POST rows of `want = (p_id, o_type)` whose object key is one of
 /// `objs` (sorted, deduplicated), calling `visit(obj_idx, s_id)` — `obj_idx`
 /// indexes `objs` — for each live row: base rows the overlay does not retract,
 /// then each novelty-only assert when `probe_ops` merges one.
@@ -3313,7 +3545,7 @@ pub(crate) fn for_each_object_probe_match(
     ctx: &ExecutionContext<'_>,
     store: &BinaryIndexStore,
     branch: &fluree_db_binary_index::BranchManifest,
-    p_id: u32,
+    want: (u32, u16),
     objs: &[u64],
     mut probe_ops: Option<&mut ObjectProbeOps>,
     mut visit: impl FnMut(usize, u64) -> Result<()>,
@@ -3323,13 +3555,11 @@ pub(crate) fn for_each_object_probe_match(
     };
     use fluree_db_binary_index::read::column_types::{ColumnData, ColumnProjection, ColumnSet};
     use fluree_db_binary_index::RunSortOrder;
-    use fluree_db_core::o_type::OType;
 
     let (Some(&first_obj), Some(&last_obj)) = (objs.first(), objs.last()) else {
         return Ok(());
     };
-    let iri_ref = OType::IRI_REF.as_u16();
-    let want = (p_id, iri_ref);
+    let (p_id, o_type) = want;
     let cmp = cmp_v2_for_order(RunSortOrder::Post);
     let key = |o_key: u64, o_i: u32, s_id: u64| RunRecordV2 {
         s_id: SubjectId(s_id),
@@ -3337,7 +3567,7 @@ pub(crate) fn for_each_object_probe_match(
         p_id,
         t: 0,
         o_i,
-        o_type: iri_ref,
+        o_type,
         g_id: ctx.binary_g_id,
     };
     let leaves = branch.find_leaves_in_range(
@@ -3404,13 +3634,13 @@ pub(crate) fn for_each_object_probe_match(
                 continue;
             }
             // `o_type_const` and the leaflet's own keys describe its live
-            // rows; a replay can bring back a retracted ref they do not cover
-            // (a mixed-type predicate whose last ref in the leaflet is gone),
-            // so only the leaf's routing bounds it then.
+            // rows; a replay can bring back a retracted row they do not cover
+            // (a mixed-type predicate whose last row of that type in the
+            // leaflet is gone), so only the leaf's routing bounds it then.
             let in_leaflet = if needs_history_replay {
                 in_leaf.clone()
             } else {
-                if entry.o_type_const.is_some_and(|ot| ot != iri_ref) {
+                if entry.o_type_const.is_some_and(|ot| ot != o_type) {
                     continue;
                 }
                 let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
@@ -3434,7 +3664,7 @@ pub(crate) fn for_each_object_probe_match(
             let mut emit = |obj_idx: usize, run: std::ops::Range<usize>| -> Result<()> {
                 let window = probe_ops
                     .as_ref()
-                    .map(|probe| probe.object_window(objs[obj_idx]))
+                    .map(|probe| probe.object_window(o_type, objs[obj_idx]))
                     .filter(|window| !window.is_empty());
                 for row in run {
                     let s_id = batch.s_id.get_or(row, 0);
@@ -3492,7 +3722,7 @@ pub(crate) fn for_each_object_probe_match(
     if let Some(probe) = probe_ops {
         for (obj_idx, &o_key) in objs.iter().enumerate() {
             let mut injected: Vec<u64> = Vec::new();
-            probe.drain_asserts_for_object(o_key, |s_id| {
+            probe.drain_asserts_for_object(o_type, o_key, |s_id| {
                 injected.push(s_id);
                 Ok(())
             })?;

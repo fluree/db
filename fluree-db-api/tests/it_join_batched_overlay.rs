@@ -760,6 +760,217 @@ async fn batched_object_join_reads_refs_among_literals() {
     check("reindexed, at the base t", view, at_base()).await;
 }
 
+/// The bound-object lane keys a string term on its exact `(o_type, o_key)`:
+/// `"bob"`, `"bob"@en`, `"zed"^^xsd:anyURI` and `"zed"^^ex:code` share a string
+/// id with a term they must not join. Each case counts the left rows the lane
+/// took, so a term cannot pass by falling back to the per-row scan — nor a
+/// number (`7`), which matches across datatypes, by riding the lane.
+#[tokio::test]
+async fn batched_object_join_reads_string_terms() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-object-strings:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+    let context = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+    let lang = |value: &str, language: &str| json!({"@value": value, "@language": language});
+    let typed = |value: &str, datatype: &str| json!({"@value": value, "@type": datatype});
+    // Enough `ex:tag` rows that the planner drives from `ex:says`.
+    let many_refs: Vec<_> = (1..=14)
+        .map(|i| json!({"@id": format!("ex:r{i}")}))
+        .collect();
+    let base = json!({
+        "@context": context,
+        "@graph": [
+            {"@id": "ex:alice", "ex:says": [
+                "bob", "nobody", "erin", lang("carol", "en"), lang("dave", "fr"),
+                typed("zed", "xsd:anyURI"), typed("zed", "ex:code"), 7
+            ]},
+            {"@id": "ex:mix", "ex:says": [{"@id": "ex:bob"}, "bob", lang("bob", "en")]},
+            {"@id": "ex:d1", "ex:topic": "bob"},
+            {"@id": "ex:d2", "ex:topic": lang("bob", "en")},
+            {"@id": "ex:d3", "ex:topic": lang("carol", "en")},
+            {"@id": "ex:d4", "ex:topic": "carol"},
+            {"@id": "ex:d5", "ex:topic": lang("carol", "fr")},
+            {"@id": "ex:d6", "ex:topic": lang("dave", "fr")},
+            {"@id": "ex:d7", "ex:topic": {"@id": "ex:bob"}},
+            {"@id": "ex:d8", "ex:topic": 7},
+            {"@id": "ex:d9", "ex:topic": ["bob", typed("zed", "xsd:anyURI")]},
+            {"@id": "ex:d10", "ex:topic": "zed"},
+            {"@id": "ex:d11", "ex:topic": "erin"},
+            {"@id": "ex:d18", "ex:topic": typed("zed", "ex:code")},
+            {"@id": "ex:d20", "ex:tag": "bob"},
+            {"@id": "ex:d21", "ex:tag": "erin"},
+            {"@id": "ex:d22", "ex:tag": {"@id": "ex:bob"}},
+            {"@id": "ex:d23", "ex:tag": {"@id": "ex:carol"}},
+            {"@id": "ex:d24", "ex:tag": many_refs}
+        ]
+    });
+    let receipt = fluree.insert(ledger, &base).await.expect("base insert");
+    let base_t = receipt.ledger.t();
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    let topic_jsonld = json!({
+        "@context": context,
+        "select": ["?v", "?x"],
+        "where": [{"@id": "ex:alice", "ex:says": "?v"}, {"@id": "?x", "ex:topic": "?v"}]
+    });
+    let queries: [(&str, QueryInput<'_>); 4] = [
+        (
+            "topic-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                  SELECT ?v ?x WHERE { ex:alice ex:says ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        ("topic-jsonld", QueryInput::from(&topic_jsonld)),
+        // Refs and strings in one flush.
+        (
+            "mixed-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:mix ex:says ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        // `ex:tag` loses its strings after the first index, so at the earlier
+        // `t` the lane needs rows its leaflet's type constant does not describe.
+        (
+            "tag-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:alice ex:says ?v . ?x ex:tag ?v }",
+            ),
+        ),
+    ];
+    let rows = |rows: &[(serde_json::Value, &str)]| -> Vec<serde_json::Value> {
+        normalize_rows(&json!(rows
+            .iter()
+            .map(|(v, x)| json!([v, format!("ex:{x}")]))
+            .collect::<Vec<_>>()))
+    };
+    // `(rows, left rows on the lane)` per query.
+    type Expected = [(Vec<serde_json::Value>, usize); 4];
+    let check = |phase: &'static str, view: fluree_db_api::GraphDb, expected: Expected| {
+        let (fluree, queries) = (&fluree, &queries);
+        async move {
+            for ((name, query), (expected, lane_rows)) in queries.iter().zip(expected) {
+                let (spans, guard) = span_capture::init_test_tracing();
+                let got = run_input(fluree, &view, query).await;
+                drop(guard);
+                assert_eq!(got, expected, "{phase}/{name}");
+                let on_lane: usize = spans
+                    .find_spans("join_flush_batched_object_binary")
+                    .iter()
+                    .map(|span| span.fields["accum_len"].parse::<usize>().unwrap())
+                    .sum();
+                assert_eq!(
+                    on_lane,
+                    lane_rows,
+                    "{phase}/{name}: left rows on the bound-object lane; spans: {:?}",
+                    spans.span_names()
+                );
+            }
+        }
+    };
+
+    let (uri, code) = (typed("zed", "xsd:anyURI"), typed("zed", "ex:code"));
+    let at_base = || -> Expected {
+        let topic = rows(&[
+            (json!("bob"), "d1"),
+            (json!("bob"), "d9"),
+            (json!("erin"), "d11"),
+            (lang("carol", "en"), "d3"),
+            (lang("dave", "fr"), "d6"),
+            (uri.clone(), "d9"),
+            (code.clone(), "d18"),
+            (json!(7), "d8"),
+        ]);
+        let mixed = rows(&[
+            (json!("ex:bob"), "d7"),
+            (json!("bob"), "d1"),
+            (json!("bob"), "d9"),
+            (lang("bob", "en"), "d2"),
+        ]);
+        let tag = rows(&[(json!("bob"), "d20"), (json!("erin"), "d21")]);
+        // Every value of `ex:alice ex:says` but `7`.
+        [(topic.clone(), 7), (topic, 7), (mixed, 3), (tag, 7)]
+    };
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    check("indexed", view, at_base()).await;
+
+    // Novelty retracts and asserts string rows, one of them a string the index
+    // has never seen. `"hola"@es` brings a language tag the index has no id
+    // for: that row has no key until the reindex.
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    let receipt = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": context,
+                "delete": [
+                    {"@id": "ex:d1", "ex:topic": "bob"},
+                    {"@id": "ex:d3", "ex:topic": lang("carol", "en")},
+                    {"@id": "ex:d20", "ex:tag": "bob"},
+                    {"@id": "ex:d21", "ex:tag": "erin"}
+                ],
+                "insert": [
+                    {"@id": "ex:alice", "ex:says": ["fresh", lang("hola", "es")]},
+                    {"@id": "ex:d12", "ex:topic": "bob"},
+                    {"@id": "ex:d13", "ex:topic": lang("bob", "en")},
+                    {"@id": "ex:d14", "ex:topic": lang("dave", "fr")},
+                    {"@id": "ex:d15", "ex:topic": "fresh"},
+                    {"@id": "ex:d17", "ex:topic": "hola"}
+                ]
+            }),
+        )
+        .await
+        .expect("novelty update");
+    assert!(receipt.ledger.t() > base_t);
+    let at_head = |keyed: usize| -> Expected {
+        let topic = rows(&[
+            (json!("bob"), "d9"),
+            (json!("bob"), "d12"),
+            (json!("erin"), "d11"),
+            (lang("dave", "fr"), "d6"),
+            (lang("dave", "fr"), "d14"),
+            (uri.clone(), "d9"),
+            (code.clone(), "d18"),
+            (json!(7), "d8"),
+            (json!("fresh"), "d15"),
+        ]);
+        let mixed = rows(&[
+            (json!("ex:bob"), "d7"),
+            (json!("bob"), "d9"),
+            (json!("bob"), "d12"),
+            (lang("bob", "en"), "d2"),
+            (lang("bob", "en"), "d13"),
+        ]);
+        [
+            (topic.clone(), keyed),
+            (topic, keyed),
+            (mixed, 3),
+            (rows(&[]), keyed),
+        ]
+    };
+    let view = fluree.db(ledger_id).await.expect("novelty view");
+    check("novelty", view, at_head(8)).await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex head");
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    check("reindexed", view, at_head(9)).await;
+    let view = fluree.db_at_t(ledger_id, base_t).await.expect("base view");
+    check("reindexed, at the base t", view, at_base()).await;
+}
+
 /// Decimal (NumBig arena) overlay translation: retracts and re-asserts of
 /// already-indexed `xsd:decimal` values resolve to their arena handles, so
 /// the batched lane stays live (previously ANY decimal in novelty declined

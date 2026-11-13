@@ -516,7 +516,7 @@ impl PatternOptionalBuilder {
                 ctx,
                 &store,
                 branch,
-                p_id,
+                (p_id, fluree_db_core::o_type::OType::IRI_REF.as_u16()),
                 &objects,
                 probe_ops.as_mut(),
                 |obj_idx, s_id| {
