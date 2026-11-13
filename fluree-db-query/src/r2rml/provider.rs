@@ -78,10 +78,10 @@ pub enum ScanValue {
     /// skipped for field types not yet supported. The R2RML operator still enforces
     /// the subject equality, so a skipped or imperfect push is never wrong.
     TemplateKey(String),
-    /// A bounded set of scalar values for a [`ScanCmpOp::In`] membership filter
-    /// (from a `FILTER … IN` or single-var `VALUES`). Every member is one of the
-    /// scalar variants above — never a nested `Set`, never a `TemplateKey`. Only
-    /// ever produced by the set-lowering emit path; it is never wrapped in an
+    /// A bounded set of values for a [`ScanCmpOp::In`] membership filter: from
+    /// a `FILTER … IN` or single-var `VALUES` (scalar members), or from subject
+    /// IRIs reversed through a subject template (`TemplateKey` members, one set
+    /// per key column). Never a nested `Set`. It is never wrapped in an
     /// [`ObjectConstant`] (a constant object is a single scalar term), so the
     /// scalar-only match sites treat it defensively as "not a scalar constant".
     Set(Vec<ScanValue>),
@@ -134,6 +134,16 @@ pub struct ScanFilter {
     pub value: ScanValue,
 }
 
+/// The data files a scan with some filters would read and skip, from its scan
+/// plan alone ([`R2rmlTableProvider::scan_file_counts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanFileCounts {
+    /// Files the scan would read.
+    pub selected: u64,
+    /// Files the filters let it skip.
+    pub pruned: u64,
+}
+
 /// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
 /// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
 /// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
@@ -162,6 +172,12 @@ pub struct ScanTopK {
     /// does, and an `xsd:integer` over a string column's `"9"` bound sits above
     /// its `"100"`.
     pub order: TermOrder,
+    /// The columns a row must hold non-null to yield a solution (the
+    /// subject's, and each same-subject star member's). A row with a NULL in
+    /// one is dropped after the scan, so the bound counts only rows non-null
+    /// in all of them; a provider that cannot check one of them must not
+    /// prune.
+    pub required_columns: Vec<String>,
 }
 
 /// The order the engine sorts an object map's terms in, from its datatype. A
@@ -327,6 +343,24 @@ pub struct TableWatermark {
     pub sequence_number: Option<i64>,
 }
 
+/// The row order a table scan owes the query above it.
+///
+/// A query with no ORDER BY may return its rows in any order, but a client
+/// paging it with LIMIT/OFFSET needs every execution to return them in the same
+/// order, or the pages skip and repeat rows. A scan therefore emits a fixed
+/// order unless the planner has shown that no slice in the query can observe
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanOrder {
+    /// The same rows in the same order on every execution over one snapshot.
+    /// The default: whatever cannot prove otherwise asks for this.
+    #[default]
+    Deterministic,
+    /// Any order, e.g. as the table's file reads finish. Chosen only for a query
+    /// with no LIMIT or OFFSET anywhere in it.
+    Any,
+}
+
 /// Provider for scanning Iceberg tables underlying R2RML graph sources.
 ///
 /// This trait is separated from `R2rmlProvider` to allow different
@@ -372,6 +406,33 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
 
+    /// [`Self::scan_table`] under an explicit [`ScanOrder`]. `scan_table` owes
+    /// [`ScanOrder::Deterministic`]; a provider that can stream faster in
+    /// [`ScanOrder::Any`] overrides this, and the default ignores the order and
+    /// scans deterministically.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> Result<ColumnBatchStream> {
+        let _ = order;
+        self.scan_table(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+        .await
+    }
+
     /// The table's exact live row count from Iceberg manifest metadata — **when,
     /// and only when, it provably equals a full-scan count** of the rows a bare
     /// `COUNT(*)` would produce. Lets the fused-aggregate COUNT shortcut answer
@@ -395,6 +456,35 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<Option<u64>> {
         let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
+        Ok(None)
+    }
+
+    /// The table's row count when the provider already holds it (a cached scan
+    /// plan, say), without reading anything to learn it. A caller deciding
+    /// whether a table is small enough to cache whole asks first. `Ok(None)`
+    /// when the provider does not know (the default).
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
+    /// How many data files a scan of `table_name` with `filters` would read and
+    /// skip, from its scan plan alone: no data file is read. A caller pushing
+    /// keys asks before paying for a keyed read whether it skips anything.
+    /// `Ok(None)` when the provider cannot tell (the default).
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<ScanFileCounts>> {
+        let _ = (graph_source_id, table_name, filters, as_of_t);
         Ok(None)
     }
 
