@@ -1357,8 +1357,13 @@ impl<'a> HydrationFormatter<'a> {
                 _ => Arc::new(self.fetch_subject_properties(sid, predicate_filter).await?),
             };
 
-            // Group flakes by predicate
-            let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
+            // Group flakes by predicate, in predicate order. The order the
+            // predicates are formatted in decides which path reaches a shared
+            // node first, and so what its cached rendering holds (the cycle
+            // cut at `visited` depends on the path): a std map, seeded at
+            // random per instance, rendered the same subject differently from
+            // run to run.
+            let mut by_pred: BTreeMap<Sid, Vec<&Flake>> = BTreeMap::new();
             for flake in flakes.iter() {
                 by_pred.entry(flake.p.clone()).or_default().push(flake);
             }
@@ -1480,8 +1485,10 @@ impl<'a> HydrationFormatter<'a> {
                 }
             }
 
-            // Format reverse properties
-            for (rev_pred, rev_nested_opt) in level.reverse() {
+            // Format reverse properties, in predicate order (as `by_pred`).
+            let mut reverse: Vec<_> = level.reverse().iter().collect();
+            reverse.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (rev_pred, rev_nested_opt) in reverse {
                 let rev_flakes = self.fetch_reverse_properties(sid, rev_pred).await?;
                 if !rev_flakes.is_empty() {
                     let values = self

@@ -33,7 +33,7 @@ use fluree_db_r2rml::emit::{
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{
     preview_iceberg_table_in, ColumnInfo, ColumnStats, SnapshotRef, StatsTier, TableIdentifier,
-    TablePreview,
+    TablePreview, TableSchema,
 };
 use crate::Result;
 
@@ -316,11 +316,22 @@ fn assemble_generate_response(
         .ok_or_else(|| crate::ApiError::config("generate_r2rml requires at least one table"))?;
 
     let output = emit_from_previews(previews, req);
+    let schemas: HashMap<String, TableSchema> = previews
+        .iter()
+        .map(|(id, preview)| (id.qualified(), preview.schema.clone()))
+        .collect();
+    let mut diagnostics = output.diagnostics;
+    diagnostics.extend(super::iceberg_validate::keyless_generated_maps(
+        &output.turtle,
+        |compiled| super::iceberg_validate::preview_table_keys(compiled, &schemas),
+        super::iceberg_validate::QueryTables::FromTable,
+        super::iceberg_validate::KeyRemedy::DeclareOrIdentifierFields,
+    ));
 
     Ok(GenerateR2rmlResponse {
         turtle: output.turtle,
         structured: output.structured,
-        diagnostics: output.diagnostics,
+        diagnostics,
         snapshot_id,
     })
 }

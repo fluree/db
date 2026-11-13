@@ -604,6 +604,40 @@ pub async fn upload_dicts_from_disk(
     .await
 }
 
+/// Refuse to publish a build of `built` whose head is no longer on the
+/// branch's line: a rebase moved the branch while it was built. Published,
+/// the index would serve the replaced line under the new head, and when the
+/// rebase left the head at the index's `t`, no later build would replace it.
+/// Walks the commits the branch gained during the build, usually none.
+pub async fn refuse_build_off_the_line(
+    nameservice: &dyn NameServiceLookup,
+    cs: &dyn ContentStore,
+    built: &fluree_db_nameservice::NsRecord,
+) -> Result<()> {
+    let Some(built_head) = built.commit_head_id.as_ref() else {
+        return Ok(());
+    };
+    let current = nameservice
+        .lookup(built.ledger_id.as_str())
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))?;
+    let Some(current_head) = current.as_ref().and_then(|r| r.commit_head_id.as_ref()) else {
+        return Ok(());
+    };
+    if current_head == built_head {
+        return Ok(());
+    }
+    let line =
+        fluree_db_core::collect_first_parent_cids(cs, current_head, built.commit_t - 1).await?;
+    match line.last() {
+        Some((t, cid)) if *t == built.commit_t && cid == built_head => Ok(()),
+        _ => Err(IndexerError::Other(format!(
+            "the branch moved off the built head {built_head} at t={} during the build",
+            built.commit_t
+        ))),
+    }
+}
+
 /// Publish index result to nameservice. Takes the narrower
 /// [`IndexPublisher`] surface because the index head is the only
 /// nameservice write the indexer ever makes — that way embedders

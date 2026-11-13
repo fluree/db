@@ -2894,6 +2894,22 @@ impl LedgerManager {
                         self.reload(&input.ledger_id).await?;
                         return Ok(NotifyResult::Reloaded);
                     }
+                    // The walk stops at the cached `t`, not the cached head: after
+                    // a rebase the new line's commits sit on another commit at
+                    // that `t`, and applying them would mix the two lines.
+                    if let Some(cached_head) = write_guard.state().head_commit_id.as_ref() {
+                        let oldest_parent = commits.first().and_then(|c| c.parent_ids().next());
+                        if oldest_parent != Some(cached_head) {
+                            tracing::debug!(
+                                alias = %input.ledger_id,
+                                local_t,
+                                "incremental catch-up: commits are not on the cached line, falling back to reload"
+                            );
+                            drop(write_guard);
+                            self.reload(&input.ledger_id).await?;
+                            return Ok(NotifyResult::Reloaded);
+                        }
+                    }
                     // Detach the range provider before the commit loop. A
                     // BinaryRangeProvider owns Arc clones of dict_novelty /
                     // runtime_small_dicts; while attached, each `apply_single_commit`'s

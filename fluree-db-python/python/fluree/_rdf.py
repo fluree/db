@@ -45,6 +45,7 @@ def parse(
     *,
     base: str | None = None,
     literals: _Literal["value", "lexical"] = "value",
+    blank_prefix: str | None = None,
 ) -> Quads:
     """The quads of an RDF document: Turtle, TriG, N-Triples, N-Quads or
     JSON-LD, in the order the document writes them, as a :class:`Quads`
@@ -69,9 +70,18 @@ def parse(
     spelling is not kept (``"01"`` reads as ``1``); with
     ``literals="lexical"`` every typed literal but a plain string is a
     :class:`Literal` with its lexical form, and :func:`serialize` writes it
-    back as it was. Blank nodes keep the document's labels; an anonymous one
-    (``[]``, a collection, an annotation) gets a fresh label. Malformed input
-    raises :class:`InvalidRequestError` naming the line and column.
+    back as it was. A JSON-LD number takes the datatype JSON-LD gives it, by
+    its value: ``xsd:double`` with a fractional part (or from 10^21),
+    ``xsd:integer`` otherwise, so ``1.0`` reads as the integer ``1``; give it
+    a ``@type`` to say otherwise.
+
+    Blank nodes keep the document's labels; an anonymous one (``[]``, a
+    collection, an annotation, a JSON-LD node with no ``@id``) is labeled
+    ``b1``, ``b2``, … in every parse. To put the quads of two parses together
+    without two anonymous nodes becoming one, give each parse its own
+    ``blank_prefix``: the labels are then ``{blank_prefix}1``,
+    ``{blank_prefix}2``, …. Malformed input raises
+    :class:`InvalidRequestError` naming the line and column.
     """
     if isinstance(data, (bytes, bytearray, memoryview)):
         try:
@@ -102,7 +112,7 @@ def parse(
             return trusted_triple(term[1], term[2], value(term[3]))
         return literal(term)
 
-    quads, prefixes = native.parse_rdf(data, format, base)
+    quads, prefixes = native.parse_rdf(data, format, base, blank_prefix)
     return Quads((trusted_quad(s, p, value(o), g) for s, p, o, g in quads), dict(prefixes))
 
 
@@ -124,12 +134,13 @@ def serialize(
     makes them its ``@context``. A quad ``(r, rdf:reifies, Triple(...))`` is
     written as an annotation where the format has one.
 
-    The quads' order is kept: graphs come in the order the quads first name
-    them, the default graph among them, and in Turtle and TriG each subject's
-    statements are written together, with ``;`` and ``,``, subjects in the
-    order they first appear. ``expanded=True`` writes JSON-LD in expanded
-    form (the ``json-ld#expanded`` profile): full IRIs, no context, every
-    value in an array.
+    The quads' order is kept. N-Triples and N-Quads write one line per quad,
+    in the order given. In the other formats graphs come in the order the
+    quads first name them, the default graph among them, and in Turtle and
+    TriG each subject's statements are written together, with ``;`` and
+    ``,``, subjects in the order they first appear. ``expanded=True`` writes
+    JSON-LD in expanded form (the ``json-ld#expanded`` profile): full IRIs,
+    no context, every value in an array.
     """
     items = [q if type(q) is Quad else _quad(q) for q in quads]
     return native.serialize_rdf(items, format, prefixes, expanded)

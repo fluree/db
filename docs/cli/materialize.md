@@ -28,7 +28,7 @@ fluree materialize <GRAPH_SOURCE> [OPTIONS]
 | `--verify <MODE>` | Depth of the parity gate run before the twin is announced: `quick` (default) or `full`. See [Verification](#verification). A failed gate **drops the twin** and exits non-zero. |
 | `--max-performance` | Own-the-box: auto-size memory/parallelism to the host (~80% RAM). Only on a cleared machine — the default is deliberately conservative to stay co-resident-safe. |
 | `--allow-mor-deletes` | Proceed even if a source table carries Iceberg merge-on-read delete files (sets `FLUREE_ICEBERG_ALLOW_MOR_DELETES`). The twin is then a point-in-time snapshot that **may include rows a MoR-aware reader would hide** — documented staleness. Default: fail closed. See [Iceberg merge-on-read](../graph-sources/iceberg.md#limitations). |
-| `--allow-duplicate-parent-keys` | Proceed even if a foreign-key parent join key maps to **more than one parent row**. Default: fail closed. See [Duplicate parent keys](#duplicate-parent-keys). |
+| `--allow-duplicate-parent-keys` | No effect; accepted so existing scripts keep working. See [Duplicate parent keys](#duplicate-parent-keys). |
 | `--home <PATH>` | Fluree home directory (overrides `$FLUREE_HOME` / the platform data dir). Where the twin ledger and its storage live. |
 | `--tmp-dir <PATH>` | Scratch directory for `--verify full`'s on-disk spool + external-sort runs. Defaults to a subdirectory of the twin's `.fluree` storage area. See [Machine-safety posture](#machine-safety-posture). |
 
@@ -67,9 +67,9 @@ For a production cutover, run `--verify full` and, ideally, an independent nativ
 
 ### Duplicate parent keys
 
-An R2RML `RefObjectMap` join resolves each child row's foreign key to a **parent subject**. If a parent join key maps to more than one parent row (a non-unique join column paired with a subject template keyed on other columns), the correct RDF output is a *fan-out* — one edge per matching parent. The builder does not yet emit that fan-out; it keeps a single parent per key. Baking that into a permanent twin would silently drop the other edges, so `fluree materialize` **refuses such a source by default**, with an error naming the parent table, its join column(s), and the ambiguous-key count.
+An R2RML `RefObjectMap` joins each child row to the parent rows whose join columns equal the child's. When a parent join key is not unique, the twin gets one edge per **distinct parent subject** those rows mint, as R2RML defines the graph: a key whose rows mint different subjects (a non-unique join column paired with a subject template keyed on other columns) gives an edge to each, and a key whose rows all mint the same subject (the versions of a history table, say) gives one. The virtual query path answers the same.
 
-Which parent is kept is **deterministic**: the lexicographically smallest parent subject IRI wins (the same rule the virtual query path now uses), so a rebuild from the same pinned snapshots is reproducible rather than a race between data files. Pass `--allow-duplicate-parent-keys` to build anyway; the twin then records the per-parent ambiguous-key counts in its completion stamp, so an overridden twin self-documents the anomaly it baked. The true fan-out is a tracked follow-up — once it lands, re-materialization heals existing twins.
+Earlier builders kept one parent per key and refused such a source unless `--allow-duplicate-parent-keys` was passed; the flag now has no effect. A twin built with that override records the keys it resolved to a single parent under `dupParentKeys` in its completion stamp; rebuilding it restores the edges it dropped. Twins built now never record `dupParentKeys`.
 
 ### Machine-safety posture
 

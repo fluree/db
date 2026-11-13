@@ -1326,21 +1326,13 @@ impl IcebergCreateConfig {
             CatalogMode::Rest(_) | CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
                 self.table_identifier.clone()
             }
-            CatalogMode::Direct { table_location } => {
-                let path = table_location
-                    .trim_start_matches("s3://")
-                    .trim_start_matches("s3a://");
-                let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-                if segments.len() >= 3 {
-                    format!(
-                        "{}.{}",
-                        segments[segments.len() - 2],
-                        segments[segments.len() - 1]
-                    )
-                } else {
-                    table_location.clone()
-                }
-            }
+            // The engine's own derivation, so `iceberg map` prints the
+            // identifier a query uses.
+            CatalogMode::Direct { table_location } => self
+                .to_iceberg_gs_config()
+                .table_identifier()
+                .map(|t| t.to_canonical())
+                .unwrap_or_else(|_| table_location.clone()),
         }
     }
 
@@ -1826,6 +1818,29 @@ impl R2rmlCreateConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_direct_source_displays_the_identifier_a_query_uses() {
+        for (location, shown) in [
+            ("s3://bucket/warehouse/ns/table", "ns.table"),
+            ("s3://bucket/lake", "bucket.lake"),
+            ("s3://bucket", "default.bucket"),
+            ("gs://bucket/warehouse/ns/table", "ns.table"),
+        ] {
+            let config = IcebergCreateConfig::new_direct("gs", location);
+            assert_eq!(config.table_identifier_display(), shown, "{location}");
+            assert_eq!(
+                config
+                    .to_iceberg_gs_config()
+                    .table_identifier()
+                    .unwrap()
+                    .to_canonical(),
+                shown,
+                "{location}"
+            );
+        }
+    }
 
     #[test]
     fn test_bm25_config_defaults() {

@@ -41,11 +41,28 @@ The Rust `RdfFormat` also accepts common aliases such as `ttl`, `n-quads` and
   `"1"^^xsd:integer`. `literals="lexical"` keeps each typed literal as a
   `fluree.Literal` with its spelling and datatype, so a document read and
   written back keeps its literals exactly.
+- **JSON-LD numbers** take the datatype JSON-LD's conversion to RDF gives
+  them ([JSON-LD 1.1 API § 8.2.2](https://www.w3.org/TR/json-ld11-api/#object-to-rdf-conversion)),
+  which goes by the number's value and not its spelling: a number with a
+  fractional part, or of 10^21 and more, is an `xsd:double`, and any other an
+  `xsd:integer`. So `1.0` and `1e3` read as the integers `1` and `1000`, as
+  JSON itself makes no difference between `1.0` and `1`. For a double, give
+  the value its type: `{"@value": 1.0, "@type": "xsd:double"}`, or a term
+  whose `@type` is `xsd:double`. A number keeps every digit it is written
+  with, up to the precision of a double. A ledger write reads numbers
+  the same way.
 - **Blank nodes** keep the document's labels. An anonymous blank node (`[]`, a
-  collection, an annotation) is labeled `bN`, avoiding any label the document
-  uses. Every parsed document can therefore be written in any format. A JSON-LD
-  label that starts with `-`, which no other syntax allows, gets one more `-`:
-  `_:-b1` is read as `--b1`.
+  collection, an annotation, a JSON-LD node with no `@id`) is labeled `bN`,
+  avoiding any label the document uses. Every parsed document can therefore be
+  written in any format. A JSON-LD label that starts with `-`, which no other
+  syntax allows, gets one more `-`: `_:-b1` is read as `--b1`.
+- **Putting two documents together:** every parse numbers its anonymous blank
+  nodes from `b1`, so two parsed documents share those labels, and their
+  statements put together would make one node of two. Give each parse its own
+  prefix (`ParseOptions::blank_prefix` with `rdf::parse_document_with`; in
+  Python, `fluree.parse(…, blank_prefix="a")`), and its anonymous nodes are
+  labeled `a1`, `a2`, … instead. Labels a document writes itself are kept
+  either way, so a label two documents both write still names one node.
 - **Order:** statements come in the order the document writes them
   (`rdf::parse_document` in Rust; `fluree.parse` in Python). A TriG or
   N-Quads document's graphs interleave as written, an annotation stands where
@@ -118,11 +135,17 @@ object is a triple term into a reification.
   Writing a named graph in either is an error; use TriG, N-Quads or JSON-LD.
 - **Prefixes:** Turtle and TriG declare the prefixes you pass and shorten IRIs
   with them. JSON-LD uses them as its `@context` and compacts IRIs with them.
-- **Order:** `rdf::serialize_ordered` (and `fluree.serialize`) writes the
-  graphs in the order given, the default graph among them, and in Turtle and
-  TriG gathers each subject's statements under one subject, with `;` and `,`,
-  subjects in the order they first appear. `rdf::serialize` writes the default
-  graph first and the named graphs by name.
+- **Order:** `rdf::serialize_document` (and `fluree.serialize`) keeps the
+  statements' order. N-Triples and N-Quads are written one line per statement,
+  in order, so the statements of several graphs interleave as given, and an
+  N-Quads document that is read and written back is the same lines. The other
+  formats write the graphs in the order the statements first name them, the
+  default graph among them, and Turtle and TriG gather each subject's
+  statements under one subject, with `;` and `,`, subjects in the order they
+  first appear. `rdf::serialize_ordered` takes a dataset and the order of its
+  graphs, and writes each graph's statements together in every format.
+  `rdf::serialize` writes the default graph first and the named graphs by
+  name.
 - **Expanded JSON-LD:** `rdf::serialize_expanded_jsonld` (in Python,
   `fluree.serialize(quads, "jsonld", expanded=True)`) writes the
   `json-ld#expanded` profile: an array of node objects with full IRIs, no
@@ -133,6 +156,14 @@ object is a triple term into a reification.
   `@reifies`.
 - **Literals:** each literal is written in its lexical form. A Python `float`
   is written in its shortest form (`0.9957`, not `9.957E-1`).
+- **JSON-LD numbers and booleans:** a literal that holds a number or a
+  boolean, as one read from a JSON-LD number does, is written as a bare JSON
+  value only where JSON-LD reads the same literal back. An `xsd:double` with
+  no fractional part is written
+  `{"@value": 1.0, "@type": "http://www.w3.org/2001/XMLSchema#double"}`, since
+  a bare `1.0` is an integer in JSON-LD, and a number or boolean under another
+  datatype (`xsd:long`, a datatype of your own) is written with its `@type`.
+  Python writes every `float` as a typed value.
 - **Collections:** Turtle and TriG write a collection as `( … )` when its
   nodes are blank nodes used nowhere else and its `rdf:rest` chain ends in
   `rdf:nil`. Otherwise its `rdf:first` and `rdf:rest` triples are written as
@@ -153,11 +184,6 @@ object is a triple term into a reification.
   tag (`ar` and `rtl` read as `"…"@ar--rtl`), and the writer gives it back as
   `@language` and `@direction`. A default `@direction` in a `@context` is not
   read, and a direction with no language is dropped.
-- **A JSON number can lose its declared datatype in Rust.** A number typed
-  anything but `xsd:integer` or `xsd:double`, such as
-  `{"@value": 5, "@type": "xsd:long"}`, is written back by `rdf::serialize`
-  as a bare `5`, which reads as `xsd:integer`. From Python,
-  `literals="lexical"` keeps the datatype.
 - **No framing:** output is compacted only with the prefixes you pass.
 
 ## Canonicalization

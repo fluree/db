@@ -1535,13 +1535,9 @@ pub enum Commands {
         #[arg(long)]
         allow_mor_deletes: bool,
 
-        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
-        /// parent row. By default the build is refused: the twin would bake one
-        /// deterministically-chosen parent per key (the lexicographically smallest)
-        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
-        /// does not yet emit. With this flag the twin builds anyway and records the
-        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
-        /// Default: fail closed.
+        /// No effect; accepted for compatibility. A foreign-key parent join key
+        /// that matches more than one parent row gives one edge per distinct
+        /// parent subject, as R2RML specifies, so no source is refused for it.
         #[arg(long)]
         allow_duplicate_parent_keys: bool,
 
@@ -4245,8 +4241,9 @@ pub struct SqlMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Accept subject keys the registration probe finds non-unique (the
-    /// probe still warns; the pushdown lane then runs over them)
+    /// Skip the duplicate-subject probe: no table is refused, and queries
+    /// answer with set semantics wherever no declared key proves a map's
+    /// subjects unique
     #[arg(long)]
     pub allow_duplicate_subjects: bool,
 }
@@ -4292,7 +4289,11 @@ pub struct IcebergMapArgs {
     /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
     /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
     /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
-    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// on the name. A root holding a directory per namespace
+    /// (`<root>/<namespace>/<table>`, or Hive/Glue's `<namespace>.db/`) is
+    /// searched there and only there, so a table missing from its namespace
+    /// directory is an error; a root with no such directory ignores the
+    /// namespace. Warehouse mode is auto-detected when the
     /// location's leaf directory does not name the requested table; a bare
     /// single-table location resolves as before. (A table named exactly after its
     /// parent directory would read as single-table.) No catalog/OAuth flags are
@@ -4699,16 +4700,19 @@ pub enum DocAction {
     ///
     /// Parses the file as `fluree doc parse` does, sends its text and
     /// structure with the ontology and catalog to the HTTP reader that
-    /// serves `--model` (`[doc.reader]`), and prints what it read: mentions
-    /// linked to catalog records, entities, and claims, each anchored to the
-    /// text's offsets. Needs no project; where there is one (or a global
-    /// config), its `[doc]` settings and caches are used. What the read was
-    /// billed goes to stderr.
+    /// serves `--model` (`[doc.reader]`), and prints its reading: a Fluree DB
+    /// transaction holding the run, the facts in the ontology's terms, the
+    /// claims behind them and the mentions (`--include`), each mention
+    /// anchored to the text's offsets. Needs no project; where there is one
+    /// (or a global config), its `[doc]` settings and caches are used. What
+    /// the read was billed, and each call's run, release and request ID, go
+    /// to stderr.
     ///
     /// Examples:
     ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
     ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
     ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    ///   fluree doc read memo.md --ontology onto.ttl --include none > facts.jsonld
     #[command(verbatim_doc_comment)]
     Read(DocReadArgs),
 
@@ -4788,6 +4792,13 @@ pub struct DocIngestArgs {
     #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
+    /// What a reader's answer holds besides the facts, which it always
+    /// holds: `claims` (the claim behind each fact), `mentions` (each
+    /// occurrence in the text and the record it links to), both, or `none`.
+    /// Default: `claims,mentions`
+    #[arg(long, value_name = "claims,mentions|claims|mentions|none")]
+    pub include: Option<String>,
+
     /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
     /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
     /// ledger, a graph source mapped over a table (`fluree iceberg|sql|delta
@@ -4798,7 +4809,8 @@ pub struct DocIngestArgs {
 
     /// What becomes of the relations the language model reports: `direct`
     /// writes an edge for every predicate the model admits, `reified` keeps
-    /// them as review nodes only, `off` extracts entities alone
+    /// them as review nodes only, `off` extracts entities alone. A reader's
+    /// facts always come with its reading (see `--include`)
     #[arg(long, value_enum, default_value_t = DocRelationMode::Direct)]
     pub relations: DocRelationMode,
 
@@ -4908,12 +4920,27 @@ pub struct DocReadArgs {
     #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
-    /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the
-    /// structure graph and the reading, each in a named graph
+    /// What the reading holds besides the facts, which it always holds:
+    /// `claims` (the claim behind each fact), `mentions` (each occurrence
+    /// in the text and the record it links to), both, or `none`
+    #[arg(
+        long,
+        value_name = "claims,mentions|claims|mentions|none",
+        default_value = "claims,mentions"
+    )]
+    pub include: String,
+
+    /// `jsonld` prints the reading as the reader wrote it, a Fluree DB
+    /// transaction (`fluree insert -f` takes it). A document read in
+    /// several calls is a transaction per call, so as `jsonld` it needs
+    /// `-o`, and each call goes to a file of its own. `trig` is the same as
+    /// TriG, the run in `<#txn-meta>`; `turtle` its statements without the
+    /// run
     #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
     pub format: DocReadFormat,
 
-    /// Write to this file instead of stdout
+    /// Write to this file instead of stdout. A JSON-LD reading of several
+    /// calls goes to a file per call named after it: `FILE-1.jsonld`, …
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 

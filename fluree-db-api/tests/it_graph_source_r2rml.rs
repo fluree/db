@@ -15,7 +15,7 @@ use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, 
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
     convert_triple_to_r2rml, ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
-    ScanTopK, ScanValue,
+    ScanOrder, ScanTopK, ScanValue,
 };
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
@@ -60,6 +60,8 @@ struct MockR2rmlProvider {
     mapping: Arc<CompiledR2rmlMapping>,
     /// Pre-built column batches to return from scan_table
     batches: Vec<ColumnBatch>,
+    /// The row order each scan asked for; `None` for a plain `scan_table`.
+    orders: Mutex<Vec<Option<ScanOrder>>>,
 }
 
 impl MockR2rmlProvider {
@@ -67,6 +69,7 @@ impl MockR2rmlProvider {
         Self {
             mapping: Arc::new(mapping),
             batches,
+            orders: Mutex::new(Vec::new()),
         }
     }
 }
@@ -97,6 +100,21 @@ impl R2rmlTableProvider for MockR2rmlProvider {
         _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
+        self.orders.lock().unwrap().push(None);
+        Ok(vec_batch_stream(self.batches.clone()))
+    }
+
+    async fn scan_table_ordered(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders.lock().unwrap().push(Some(order));
         Ok(vec_batch_stream(self.batches.clone()))
     }
 }
@@ -1517,6 +1535,58 @@ async fn engine_e2e_wildcard_over_a_ledger_holding_a_list() {
             Ref::Var(p),
             Term::Var(o),
         ))],
+    }];
+    parsed.output = QueryOutput::select_all(vec![s, p, o]);
+    parsed.rdf_list_view = true;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &*ledger.novelty, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("R2RML scan should execute");
+    let rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(rows, 12, "3 airlines x (3 predicates + rdf:type)");
+}
+
+/// The same wildcard inside a sub-select inside `GRAPH <source>`: the list
+/// view wraps the pattern in the sub-select's body too, and the source reads
+/// that body without it, so the sub-select scans the source rather than
+/// answering from the ledger's lists.
+#[tokio::test]
+async fn engine_e2e_wildcard_sub_select_over_a_ledger_holding_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "r2rml-wild-lists-sub:main").await;
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\nex:config ex:order (1 2) .",
+        )
+        .await
+        .expect("insert a list")
+        .ledger;
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Subquery(
+            fluree_db_query::ir::SubqueryPattern::new(
+                vec![s, p, o],
+                vec![Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Var(p),
+                    Term::Var(o),
+                ))],
+            ),
+        )],
     }];
     parsed.output = QueryOutput::select_all(vec![s, p, o]);
     parsed.rdf_list_view = true;
@@ -3308,15 +3378,17 @@ async fn temporal_values_compare_equal_by_value() {
 // (Store and Employee) — the predicate fan-out that caused unrelated dimension
 // tables to be scanned — and Store has a RefObjectMap to Geography, so we can
 // assert parents are pruned for unreferenced predicates yet kept for referenced
-// ones (R2RML dangling-FK semantics are not weakened).
+// ones (R2RML dangling-FK semantics are not weakened). Each table declares its
+// surrogate key, so each subject is one row's and the star may fuse.
 
 const EDW_GUARD_MAPPING_TTL: &str = r#"
 @prefix rr: <http://www.w3.org/ns/r2rml#> .
 @prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix f: <https://ns.flur.ee/db#> .
 
 <http://example.org/mapping#Store> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:logicalTable [ rr:tableName "dw.store" ; f:key ( "store_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
     rr:predicateObjectMap [ rr:predicate ex:storeId ; rr:objectMap [ rr:column "store_id" ] ] ;
     rr:predicateObjectMap [ rr:predicate ex:storeKey ; rr:objectMap [ rr:column "store_key" ; rr:datatype xsd:integer ] ] ;
@@ -3330,13 +3402,13 @@ const EDW_GUARD_MAPPING_TTL: &str = r#"
     ] .
 
 <http://example.org/mapping#Geography> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.geography" ] ;
+    rr:logicalTable [ rr:tableName "dw.geography" ; f:key ( "geo_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Geography ] ;
     rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
     rr:predicateObjectMap [ rr:predicate ex:region ; rr:objectMap [ rr:column "region" ] ] .
 
 <http://example.org/mapping#Employee> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.employee" ] ;
+    rr:logicalTable [ rr:tableName "dw.employee" ; f:key ( "emp_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Employee ] ;
     rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
 "#;
@@ -3410,6 +3482,9 @@ struct CountingProvider {
     batches_by_table: HashMap<String, Vec<ColumnBatch>>,
     /// Every scan as `(table_name, sorted projection columns)`, in call order.
     scans: Mutex<Vec<(String, Vec<String>)>>,
+    /// Every scan's requested row order and whether it carried a top-k, in
+    /// call order. `None`: a plain `scan_table` call (a parent lookup).
+    orders: Mutex<Vec<(String, Option<ScanOrder>, bool)>>,
 }
 
 impl CountingProvider {
@@ -3428,6 +3503,7 @@ impl CountingProvider {
             mapping: Arc::new(edw_guard_mapping()),
             batches_by_table,
             scans: Mutex::new(Vec::new()),
+            orders: Mutex::new(Vec::new()),
         }
     }
 
@@ -3496,7 +3572,56 @@ impl R2rmlProvider for CountingProvider {
 
 #[async_trait]
 impl R2rmlTableProvider for CountingProvider {
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), Some(order), topk.is_some()));
+        self.scan(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+    }
+
     async fn scan_table(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), None, topk.is_some()));
+        self.scan(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+    }
+}
+
+impl CountingProvider {
+    fn scan(
         &self,
         _graph_source_id: &str,
         table_name: &str,
@@ -3580,7 +3705,7 @@ async fn run_edw_guard(
 /// but declaring different class sets. The alike-provider dedupe keeps one
 /// of them for `ex:name` (the graph holds the triple once), but a projected
 /// `?s a ?t` must still see both maps' classes: `{Store, Shop}`, whichever
-/// map the mapping's `HashMap` yields first.
+/// map the dedupe keeps (the first in document order).
 #[tokio::test]
 async fn projected_type_keeps_every_class_over_alike_maps() {
     const TTL: &str = r#"
@@ -3645,6 +3770,98 @@ async fn projected_type_keeps_every_class_over_alike_maps() {
         ],
         "a projected type must not depend on which alike map the dedupe keeps"
     );
+}
+
+/// A class several maps produce is scanned map by map in MAPPING-DOCUMENT
+/// order, so an unordered query over it answers the same rows in the same
+/// order in every process (a client paging it with LIMIT/OFFSET sees the pages
+/// partition the answer). The maps are written in an order that is neither
+/// their IRI order nor their table order, and the query runs over freshly
+/// compiled mappings: a hashed map of TriplesMaps iterates in a different order
+/// per instance, so it would almost surely miss in one of the runs.
+#[tokio::test]
+async fn a_class_over_several_maps_scans_them_in_document_order() {
+    const TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Thing ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+
+<http://example.org/mapping#Geo> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.geography" ] ;
+    rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Thing ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "city" ] ] .
+
+<http://example.org/mapping#Emp> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.employee" ] ;
+    rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Thing ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
+"#;
+    let expected: Vec<String> = [
+        "store/1", "store/2", "geo/10", "geo/20", "emp/100", "emp/200",
+    ]
+    .iter()
+    .map(|s| format!("http://example.org/{s}"))
+    .collect();
+    for run in 0..8 {
+        let provider = CountingProvider::edw_with_mapping(TTL);
+        let (_fluree, ledger) = edw_guard_ledger();
+        let mut vars = VarRegistry::new();
+        let s = vars.get_or_insert("?s");
+        let n = vars.get_or_insert("?n");
+        let inner = vec![
+            type_triple(s, "http://example.org/Thing"),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Iri("http://example.org/name".into()),
+                Term::Var(n),
+            )),
+        ];
+        let graph = Pattern::Graph {
+            name: GraphName::Iri("edw-gs:main".into()),
+            patterns: inner,
+        };
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = vec![graph];
+        parsed.output = QueryOutput::select_all(vec![s, n]);
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        let batches = execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .expect("query should execute");
+        let subjects: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.len()).map(move |r| {
+                    b.get(r, s)
+                        .and_then(|v| v.get_iri())
+                        .expect("?s is an IRI")
+                        .to_string()
+                })
+            })
+            .collect();
+        assert_eq!(subjects, expected, "run {run}: rows in document order");
+        let tables: Vec<String> = provider
+            .scans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(
+            tables,
+            ["dw.store", "dw.geography", "dw.employee"],
+            "run {run}: one scan per map, in document order"
+        );
+    }
 }
 
 /// `?s a ex:Store ; ex:storeId ?id ; ex:name ?name` must scan ONLY dw.store,
@@ -4590,6 +4807,7 @@ fn f20_refprune_provider() -> CountingProvider {
         mapping: Arc::new(mapping),
         batches_by_table,
         scans: Mutex::new(Vec::new()),
+        orders: Mutex::new(Vec::new()),
     }
 }
 
@@ -5630,8 +5848,8 @@ async fn verify_twin_full_passes_on_multi_chunk_twin() {
 /// A parent whose SUBJECT is keyed on `c_id` but is JOINED on `region` (non-unique):
 /// two customers in the same region mint DIFFERENT subjects for the same join key, so
 /// key `["EU"]` maps to both `customer/1` and `customer/2` — the duplicate-parent-key
-/// fan-out shape. The two customers are split across two scan BATCHES (the cross-file
-/// race the deterministic keep-min tie-break repairs); `reverse` flips their order.
+/// fan-out shape. The two customers are split across two scan BATCHES (two data
+/// files, read in either order); `reverse` flips their order.
 #[cfg(feature = "native")]
 fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock> {
     use fluree_db_r2rml::mapping::{
@@ -5712,68 +5930,35 @@ fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock
     Arc::new(MultiTableMock { mapping, tables })
 }
 
-/// DUP-KEY DECLINE (dupkey-adjudication.md ruling C2): a source whose FK parent join
-/// key maps to more than one parent must be REFUSED by default, with an error that
-/// names the anomaly and points at the override.
+/// FAN-OUT (#1583): a source whose FK parent join key matches two parent subjects
+/// builds, and the order joins BOTH, whichever batch is scanned first; the twin's
+/// stamp records no ambiguous keys. The old override is accepted and changes nothing.
 #[cfg(feature = "native")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialize_declines_duplicate_parent_keys_by_default() {
-    const LEDGER: &str = "test/dupkey-decline:main";
-    let provider = dup_parent_key_provider(false);
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-        .build()
-        .expect("build Fluree");
-    let err = fluree
-        .create(LEDGER)
-        .import_r2rml(Arc::clone(&provider), "gs:main")
-        .threads(2)
-        .memory_budget_mb(256)
-        .execute()
-        .await
-        .expect_err("a source with duplicate parent join keys must be declined by default");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("duplicate parent join keys"),
-        "the error must name the anomaly; got: {msg}"
-    );
-    assert!(
-        msg.contains("--allow-duplicate-parent-keys"),
-        "the error must point at the override; got: {msg}"
-    );
-}
-
-/// DUP-KEY OVERRIDE + DETERMINISM + STAMP: with `--allow-duplicate-parent-keys` the
-/// twin builds; the FK resolves to the SAME deterministic winner (keep-min =
-/// `customer/1`) regardless of scan-batch order; and the completion stamp records the
-/// ambiguous-key count so the overridden twin self-documents its anomaly.
-#[cfg(feature = "native")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialize_override_builds_deterministic_twin_and_records_stamp() {
-    for reverse in [false, true] {
-        let ledger = if reverse {
-            "test/dupkey-ovr-rev:main"
-        } else {
-            "test/dupkey-ovr:main"
-        };
+async fn materialize_emits_an_edge_to_every_parent_a_duplicate_key_matches() {
+    for (reverse, flag) in [(false, false), (true, false), (false, true)] {
+        let ledger = format!("test/dupkey-fanout-{reverse}-{flag}:main");
         let provider = dup_parent_key_provider(reverse);
         let dir = tempfile::tempdir().expect("tmpdir");
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
             .build()
             .expect("build Fluree");
-        fluree
-            .create(ledger)
+        let mut builder = fluree
+            .create(&ledger)
             .import_r2rml(Arc::clone(&provider), "gs:main")
             .threads(2)
-            .memory_budget_mb(256)
-            .allow_duplicate_parent_keys(true)
+            .memory_budget_mb(256);
+        if flag {
+            #[allow(deprecated)]
+            let with_flag = builder.allow_duplicate_parent_keys(true);
+            builder = with_flag;
+        }
+        builder
             .execute()
             .await
-            .expect("override builds the twin");
-        let loaded = fluree.ledger(ledger).await.expect("load twin");
+            .expect("a duplicate parent key builds the twin");
+        let loaded = fluree.ledger(&ledger).await.expect("load twin");
 
-        // Deterministic winner: order/100 -> customer/1 (the lexicographically smaller
-        // of {customer/1, customer/2}), independent of which batch was scanned first.
         let json = support::query_sparql(
             &fluree,
             &loaded,
@@ -5783,22 +5968,23 @@ async fn materialize_override_builds_deterministic_twin_and_records_stamp() {
         .expect("query")
         .to_sparql_json(&loaded.snapshot)
         .expect("sparql json");
+        let mut customers: Vec<&str> = json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .map(|b| b["c"]["value"].as_str().expect("an IRI"))
+            .collect();
+        customers.sort_unstable();
         assert_eq!(
-            json["results"]["bindings"][0]["c"]["value"],
-            "http://ex.org/customer/1",
-            "keep-min must resolve the FK to customer/1 regardless of batch order (reverse={reverse})"
+            customers,
+            ["http://ex.org/customer/1", "http://ex.org/customer/2"],
+            "the order joins both customers of its region (reverse={reverse}, flag={flag})"
         );
 
-        // The stamp self-documents the anomaly (exactly one ambiguous key: region=EU).
-        let stamp = read_head_stamp(&fluree, ledger).await;
+        let stamp = read_head_stamp(&fluree, &ledger).await;
         assert!(
-            !stamp.dup_parent_keys.is_empty(),
-            "an override-built twin must record dup_parent_keys in its stamp (reverse={reverse})"
-        );
-        let total: u64 = stamp.dup_parent_keys.values().sum();
-        assert_eq!(
-            total, 1,
-            "exactly one ambiguous parent key (region=EU) regardless of order (reverse={reverse})"
+            stamp.dup_parent_keys.is_empty(),
+            "a twin that holds every edge records no ambiguous keys (reverse={reverse}, flag={flag})"
         );
     }
 }
@@ -6103,4 +6289,237 @@ async fn materialize_on_current_thread_runtime_fails_loud() {
         format!("{err}").contains("multi-thread"),
         "expected a typed multi-thread-runtime error, got: {err}"
     );
+}
+
+/// The row order each query shape asks of its graph-source table scan: only a
+/// query that takes no prefix of an answer (no LIMIT or OFFSET anywhere, no
+/// `selectOne`) may take `ScanOrder::Any` (rows as file reads finish); any
+/// slice, including one under a FILTER (which a row budget does not pass) or
+/// inside a sub-SELECT, keeps the scan deterministic so a client's pages
+/// partition the answer. An `ORDER BY … LIMIT` still takes
+/// the scan-side top-k.
+#[tokio::test]
+async fn a_scan_is_deterministic_unless_no_slice_can_observe_its_order() {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let k = vars.get_or_insert("?k");
+    let count = vars.get_or_insert("?count");
+    let store_keys = || {
+        vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri("http://example.org/storeKey".into()),
+            Term::Var(k),
+        ))]
+    };
+    let graph = |inner: Vec<Pattern>| Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let query = |patterns: Vec<Pattern>| {
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = patterns;
+        parsed.output = QueryOutput::select_all(vec![s, k]);
+        parsed
+    };
+    let positive = || Expression::gt(Expression::Var(k), Expression::Const(FlakeValue::Long(0)));
+
+    let mut cases: Vec<(&str, Query, ScanOrder, bool)> = Vec::new();
+    cases.push((
+        "no slice",
+        query(vec![graph(store_keys())]),
+        ScanOrder::Any,
+        false,
+    ));
+    let mut q = query(vec![graph(store_keys())]);
+    q.limit = Some(1);
+    cases.push(("LIMIT", q, ScanOrder::Deterministic, false));
+    let mut q = query(vec![graph(store_keys())]);
+    q.offset = Some(1);
+    cases.push(("OFFSET", q, ScanOrder::Deterministic, false));
+    // `selectOne` keeps the first row when the result is formatted: a prefix
+    // of the answer, as a LIMIT 1 is.
+    let mut q = query(vec![graph(store_keys())]);
+    q.output = QueryOutput::select_one(vec![s, k]);
+    cases.push(("selectOne", q, ScanOrder::Deterministic, false));
+    let mut with_filter = store_keys();
+    with_filter.push(Pattern::Filter(positive()));
+    let mut q = query(vec![graph(with_filter)]);
+    q.limit = Some(1);
+    q.offset = Some(1);
+    cases.push(("FILTER under a slice", q, ScanOrder::Deterministic, false));
+    let mut q = query(vec![graph(store_keys())]);
+    q.output = QueryOutput::select_all(vec![count]);
+    q.grouping = Grouping::assemble(
+        vec![],
+        vec![AggregateSpec {
+            function: AggregateFn::Count(k),
+            output_var: count,
+        }],
+        vec![],
+        None,
+    )
+    .expect("valid grouping");
+    cases.push(("COUNT, no slice", q, ScanOrder::Any, false));
+    let mut q = query(vec![graph(store_keys())]);
+    q.ordering = vec![fluree_db_query::SortSpec::desc(k)];
+    q.limit = Some(1);
+    cases.push(("ORDER BY … LIMIT", q, ScanOrder::Deterministic, true));
+    let sub = fluree_db_query::SubqueryPattern::new(vec![s, k], vec![graph(store_keys())])
+        .with_uncorrelated()
+        .with_limit(1);
+    cases.push((
+        "LIMIT in a sub-SELECT",
+        query(vec![Pattern::Subquery(sub)]),
+        ScanOrder::Deterministic,
+        false,
+    ));
+    let mut exists_slice = store_keys();
+    exists_slice.push(Pattern::Filter(Expression::Exists {
+        patterns: vec![Pattern::Subquery(
+            fluree_db_query::SubqueryPattern::new(vec![s], vec![graph(store_keys())])
+                .with_uncorrelated()
+                .with_offset(1),
+        )],
+        negated: false,
+    }));
+    cases.push((
+        "OFFSET in a sub-SELECT under FILTER EXISTS",
+        query(vec![graph(exists_slice)]),
+        ScanOrder::Deterministic,
+        false,
+    ));
+
+    for (name, parsed, want, want_topk) in cases {
+        let provider = CountingProvider::edw();
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let orders = provider.orders.lock().unwrap().clone();
+        let main: Vec<_> = orders.iter().filter(|(t, _, _)| t == "dw.store").collect();
+        assert!(!main.is_empty(), "{name}: dw.store was scanned: {orders:?}");
+        for (_, order, topk) in &main {
+            assert_eq!(*order, Some(want), "{name}: scan order ({orders:?})");
+            assert_eq!(*topk, want_topk, "{name}: top-k ({orders:?})");
+        }
+    }
+}
+
+/// The fused aggregate folds its table through a scan of its own, which owes
+/// the query the same order as the generic one: `Any` for an aggregate with no
+/// slice, deterministic when a LIMIT sits over it. Two shapes, because the
+/// fused operator is built at two sites: a plain COUNT reaches it as the
+/// SQL-lane detector's fallback; a SUM over a top-level BIND, which that
+/// detector declines (its block must be the whole WHERE), reaches the fused
+/// operator directly.
+#[tokio::test]
+async fn a_fused_aggregate_scan_follows_the_query_slice() {
+    for with_bind in [false, true] {
+        for (limit, want) in [(None, ScanOrder::Any), (Some(1), ScanOrder::Deterministic)] {
+            let label = format!("bind={with_bind} limit={limit:?}");
+            let fluree = FlureeBuilder::memory().build_memory();
+            let mut ledger = genesis_ledger(&fluree, "fa:main").await;
+            Arc::make_mut(&mut ledger.snapshot)
+                .insert_namespace_code(9_999, "http://example.org/".to_string())
+                .unwrap();
+            let (datatype, batch) = if with_bind {
+                (
+                    "xsd:decimal",
+                    id_val_batch(
+                        vec![Some(1), Some(2), Some(3)],
+                        Column::Decimal {
+                            values: vec![Some(1000), Some(2000), Some(3000)],
+                            precision: 10,
+                            scale: 2,
+                        },
+                        FieldType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
+                    ),
+                )
+            } else {
+                (
+                    "xsd:integer",
+                    id_val_batch(
+                        vec![Some(1), Some(2), Some(3)],
+                        Column::Int64(vec![Some(10), Some(20), Some(30)]),
+                        FieldType::Int64,
+                    ),
+                )
+            };
+            let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+                .unwrap()
+                .compile()
+                .unwrap();
+            let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+            let mut vars = VarRegistry::new();
+            let s = vars.get_or_insert("?s");
+            let o = vars.get_or_insert("?o");
+            let e = vars.get_or_insert("?e");
+            let out = vars.get_or_insert("?agg");
+            let pred = ledger
+                .snapshot
+                .encode_iri("http://example.org/val")
+                .expect("example.org namespace registered");
+            let mut parsed = Query::new(ParsedContext::default());
+            parsed.patterns = vec![Pattern::Graph {
+                name: GraphName::Iri("fa-gs:main".into()),
+                patterns: vec![Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(pred),
+                    Term::Var(o),
+                ))],
+            }];
+            let function = if with_bind {
+                parsed.patterns.push(Pattern::Bind {
+                    var: e,
+                    expr: Expression::Call {
+                        func: Function::Mul,
+                        args: vec![Expression::Var(o), Expression::Const(FlakeValue::Long(2))],
+                    },
+                });
+                AggregateFn::Sum(e, InputSemantics::List)
+            } else {
+                AggregateFn::Count(o)
+            };
+            parsed.output = QueryOutput::select_all(vec![out]);
+            parsed.grouping = Grouping::assemble(
+                vec![],
+                vec![AggregateSpec {
+                    function,
+                    output_var: out,
+                }],
+                vec![],
+                None,
+            )
+            .expect("valid grouping");
+            parsed.limit = limit;
+            let executable = ExecutableQuery::simple(parsed);
+            let tracker = Tracker::disabled();
+            let result = execute(
+                GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+                &vars,
+                &executable,
+                r2rml_test_config(&tracker, &provider),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+            let value = result
+                .iter()
+                .find_map(|b| (!b.is_empty()).then(|| format!("{:?}", b.get(0, out))))
+                .expect("one row");
+            let expected = if with_bind { "120" } else { "3" };
+            assert!(value.contains(expected), "{label}: {value}");
+            let orders = provider.orders.lock().unwrap().clone();
+            assert_eq!(orders, vec![Some(want)], "{label}: the one scan's order");
+        }
+    }
 }

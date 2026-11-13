@@ -106,7 +106,9 @@ async with fluree.aio.connect("./data") as conn:
 HTTP, exactly as [`fluree doc read`](../cli/doc.md#fluree-doc-read) does: it
 parses the file (PDF, Word, PowerPoint, HTML, Markdown, text, spreadsheets,
 transcripts, email), sends its text and structure with your ontology and
-catalog, and returns the reading, which inserts into a ledger as it is:
+catalog, and returns the reading: a Fluree DB transaction holding the run,
+the facts in your ontology's terms, the claims behind them and the mentions,
+which inserts into a ledger as it is (the run becomes the commit's metadata):
 
 ```python
 import fluree
@@ -114,8 +116,10 @@ import fluree
 reading = fluree.doc.read("invoice.pdf", ontology="invoices.ttl",
                           catalog="suppliers.ttl", model="reader-small")
 print(reading.usage.note)                  # 1,032 tokens
-for m in reading.mentions():               # text, begin, end, entity, element
+for m in reading.mentions():               # text, begin, end, class, entity, confidence, element
     print(m["text"], "->", m["entity"])
+for c in reading.claims():                 # subject, predicate, object, status, score, asserted
+    print(c["predicate"], c["score"])
 
 with fluree.connect("./data") as conn:
     conn.create("invoices").insert(reading.to_jsonld())
@@ -123,11 +127,15 @@ with fluree.connect("./data") as conn:
 
 `text=` reads a string instead of a file, under an IRI derived from its
 content unless `doc_iri=` names one; `catalog` takes a list of files, each
-optionally `(file, class IRI)`; `to_turtle()` and `claims()` give the reading
-as Turtle and as rows. Offsets index the parser's text (what
-`fluree doc parse --format text` prints), not the file's bytes. The rows read
-NIF offsets and the pipeline's `doc:` terms; a reader writing terms of its own
-keeps them, as written, in `reading.nodes` and `to_jsonld()`.
+optionally `(file, class IRI)`; `include=` says what comes with the facts
+(`"claims"`, `"mentions"`, both by default, or `"none"`); `to_trig()` and
+`to_turtle()` give the reading as TriG and Turtle. Offsets index the parser's
+text (what `fluree doc parse --format text` prints), not the file's bytes.
+The reading is kept as the reader wrote it, in the extraction vocabulary
+(`xt:`, `https://ns.flur.ee/extract#`): `reading.transactions` holds one
+transaction per call (a long document takes several, each its own run, and
+`to_jsonld()` asks you to insert each), and `reading.runs` each call's run,
+release and request ID.
 
 The credential: `api_key` with `auth_header` is sent as is to `url`;
 `api_key` alone is traded for an hour's token when it is a Fluree.ai API key

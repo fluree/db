@@ -834,7 +834,7 @@ async fn poll_for_token(
             }
             "expired_token" => {
                 return Err(CliError::Remote(
-                    "device code expired. Run `fluree auth login` to try again.".into(),
+                    "the device code expired before the sign-in was approved; run the same login command again".into(),
                 ));
             }
             "access_denied" => {

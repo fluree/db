@@ -443,6 +443,9 @@ pub struct GraphCollectorSink {
     terms: Vec<Term>,
     /// Counter for generating blank node IDs
     blank_counter: u32,
+    /// What an anonymous blank node's final label starts with (see
+    /// [`Self::with_blank_prefix`]).
+    blank_prefix: String,
     /// Cache for blank node labels to TermId mapping
     blank_labels: HashMap<String, TermId>,
     /// Slots in `terms` that hold literals, in mint order.
@@ -503,6 +506,7 @@ impl GraphCollectorSink {
             named_marks: Vec::new(),
             terms: Vec::new(),
             blank_counter: 0,
+            blank_prefix: "b".to_string(),
             blank_labels: HashMap::new(),
             literal_slots: Vec::new(),
             literal_cursor: 0,
@@ -522,6 +526,7 @@ impl GraphCollectorSink {
             named_marks: Vec::new(),
             terms: Vec::new(),
             blank_counter: 0,
+            blank_prefix: "b".to_string(),
             blank_labels: HashMap::new(),
             literal_slots: Vec::new(),
             literal_cursor: 0,
@@ -540,6 +545,16 @@ impl GraphCollectorSink {
             named: Some(BTreeMap::new()),
             ..Self::new()
         }
+    }
+
+    /// Label anonymous blank nodes `{prefix}N` rather than `bN`. Two
+    /// documents read with different prefixes then share no minted label, so
+    /// their statements can be put together without two anonymous nodes
+    /// becoming one. `prefix` followed by a number must be a blank node
+    /// label; labels the document writes itself are kept as written.
+    pub fn with_blank_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.blank_prefix = prefix.into();
+        self
     }
 
     /// Consume the sink and return the collected graph.
@@ -591,11 +606,12 @@ impl GraphCollectorSink {
         }
         let names: Vec<BlankId> = (1..=self.blank_counter)
             .map(|n| {
-                let mut name = format!("b{n}");
+                let prefix = &self.blank_prefix;
+                let mut name = format!("{prefix}{n}");
                 let mut k = 0;
                 while self.blank_labels.contains_key(&name) {
                     k += 1;
-                    name = format!("b{n}_{k}");
+                    name = format!("{prefix}{n}_{k}");
                 }
                 BlankId::new(name)
             })
@@ -1474,6 +1490,33 @@ mod tests {
         assert_eq!(dataset.default.reifications()[0].triple.o, blank("b1_1"));
         let named = &dataset.named[&blank("b3")];
         assert_eq!(named.iter().next().unwrap().s, blank("b2"));
+    }
+
+    /// A blank prefix names the mints, still apart from the document's own
+    /// labels, which stay as written.
+    #[test]
+    fn a_blank_prefix_names_the_mints() {
+        let mut sink = GraphCollectorSink::new().with_blank_prefix("doc");
+        let p = sink.term_iri("http://ex/p");
+        let (written, m1, m2) = (
+            sink.term_blank(Some("doc2")),
+            sink.term_blank(None),
+            sink.term_blank(None),
+        );
+        sink.emit_triple(m1, p, written).unwrap();
+        sink.emit_triple(m2, p, m1).unwrap();
+        sink.end_statement();
+
+        let graph = sink.into_dataset().default;
+        let labels: Vec<_> = graph.iter().map(|t| (t.s.clone(), t.o.clone())).collect();
+        let blank = Term::blank;
+        assert_eq!(
+            labels,
+            [
+                (blank("doc1"), blank("doc2")),
+                (blank("doc2_1"), blank("doc1"))
+            ]
+        );
     }
 
     // =====================================================================

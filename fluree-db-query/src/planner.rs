@@ -1426,8 +1426,35 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
 /// parent scope and available inside each branch, so only the UNION-specific
 /// variables need the intersection check.
 ///
-/// For Graph and Service the deferred pattern is nested unconditionally.
+/// For Graph and Service the deferred pattern is nested only when it reads
+/// nothing but its row ([`Pattern::reads_dataset`]): the body runs against
+/// another graph or endpoint, and a pattern nested there would read that one
+/// instead of its own group's. A pattern that reads the graph or endpoint
+/// variable of a `GRAPH ?g` / `SERVICE ?e` stays outside too: that variable
+/// is bound only outside the body.
 fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool {
+    if matches!(compound, Pattern::Graph { .. } | Pattern::Service(_))
+        && deferred.pattern.reads_dataset()
+    {
+        return false;
+    }
+    // The graph or endpoint variable is not in scope inside its own body: the
+    // operator joins it at merge time, so a pattern that reads it stays
+    // outside, where it is bound.
+    let scoped_var = match compound {
+        Pattern::Graph {
+            name: crate::ir::GraphName::Var(g),
+            ..
+        } => Some(*g),
+        Pattern::Service(sp) => match &sp.endpoint {
+            crate::ir::ServiceEndpoint::Var(e) => Some(*e),
+            crate::ir::ServiceEndpoint::Iri(_) => None,
+        },
+        _ => None,
+    };
+    if scoped_var.is_some_and(|v| deferred.pattern.referenced_vars().contains(&v)) {
+        return false;
+    }
     match compound {
         Pattern::Union(branches) => {
             let produced_in_every_branch = branches
@@ -6156,6 +6183,105 @@ mod tests {
                 sp.patterns.iter().any(is_filter),
                 "Service inner patterns should contain the filter"
             );
+        }
+    }
+
+    #[test]
+    fn graph_reading_patterns_stay_outside_a_preceding_graph_or_service() {
+        use crate::ir::{ServiceEndpoint, ServicePattern};
+
+        // Every pattern reads only variables the body binds, so each is
+        // ready as soon as the container is placed and the nesting decision
+        // is what keeps it outside.
+        let (s, o, age) = (VarId(0), VarId(1), VarId(2));
+        let reads_a_graph = [
+            Pattern::NotExists(vec![Pattern::Triple(make_pattern(s, "knows", age))]),
+            Pattern::Exists(vec![Pattern::Triple(make_pattern(s, "knows", age))]),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(s, "knows", age))]),
+            Pattern::Filter(Expression::Exists {
+                patterns: vec![Pattern::Triple(make_pattern(s, "knows", age))],
+                negated: true,
+            }),
+            Pattern::Filter(Expression::gt(
+                Expression::call(
+                    Function::Fulltext,
+                    vec![
+                        Expression::Var(age),
+                        Expression::Const(FlakeValue::String("rust".into())),
+                    ],
+                ),
+                Expression::Const(FlakeValue::Long(0)),
+            )),
+            Pattern::Bind {
+                var: o,
+                expr: Expression::call(Function::Labels, vec![Expression::Var(s)]),
+            },
+        ];
+        let body = || vec![Pattern::Triple(make_pattern(s, "age", age))];
+        let containers = [
+            Pattern::Graph {
+                name: GraphName::Iri(Arc::from("http://example.org/g")),
+                patterns: body(),
+            },
+            Pattern::Service(ServicePattern::new(
+                false,
+                ServiceEndpoint::Iri(Arc::from("fluree:ledger:mydb:main")),
+                body(),
+            )),
+        ];
+
+        for container in &containers {
+            for pattern in &reads_a_graph {
+                let reordered =
+                    reorder_patterns(&[container.clone(), pattern.clone()], None, &HashSet::new());
+                assert_eq!(reordered.len(), 2, "{reordered:?}");
+                let inner = match &reordered[0] {
+                    Pattern::Graph { patterns, .. } => patterns,
+                    Pattern::Service(sp) => &sp.patterns,
+                    other => panic!("container should stay first: {other:?}"),
+                };
+                assert_eq!(inner.len(), 1, "nested into the container: {reordered:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_reads_the_graph_variable_stays_outside_its_block() {
+        use crate::ir::{ServiceEndpoint, ServicePattern};
+
+        let (s, age, g, out) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let reads_g = [
+            Pattern::Filter(Expression::eq(
+                Expression::Var(g),
+                Expression::Const(FlakeValue::String("http://example.org/g".into())),
+            )),
+            Pattern::Bind {
+                var: out,
+                expr: Expression::call(Function::Str, vec![Expression::Var(g)]),
+            },
+            Pattern::Filter(Expression::call(Function::Bound, vec![Expression::Var(g)])),
+        ];
+        let body = || vec![Pattern::Triple(make_pattern(s, "age", age))];
+        let containers = [
+            Pattern::Graph {
+                name: GraphName::Var(g),
+                patterns: body(),
+            },
+            Pattern::Service(ServicePattern::new(false, ServiceEndpoint::Var(g), body())),
+        ];
+        for container in &containers {
+            for pattern in &reads_g {
+                let reordered =
+                    reorder_patterns(&[container.clone(), pattern.clone()], None, &HashSet::new());
+                assert_eq!(reordered.len(), 2, "{reordered:?}");
+            }
+            // A pattern that reads only the body's variables still nests.
+            let plain = Pattern::Filter(Expression::gt(
+                Expression::Var(age),
+                Expression::Const(FlakeValue::Long(25)),
+            ));
+            let reordered = reorder_patterns(&[container.clone(), plain], None, &HashSet::new());
+            assert_eq!(reordered.len(), 1, "{reordered:?}");
         }
     }
 

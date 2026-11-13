@@ -47,7 +47,9 @@ pub struct SqlMapRequest {
     pub model: Option<String>,
     /// `default-allow` for governed requests that match no policy.
     pub default_allow: Option<bool>,
-    /// Accept subject keys the registration probe finds non-unique.
+    /// Skip the duplicate-subject probe: no table is refused, and queries
+    /// answer with set semantics wherever no declared key proves a map's
+    /// subjects unique.
     #[serde(default)]
     pub allow_duplicate_subjects: Option<bool>,
     /// The endpoint's auth: the structured `auth` (exactly the stored
@@ -77,6 +79,10 @@ pub struct SqlMapResponse {
     pub model_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapping_warnings: Vec<String>,
+    /// Advisories about the mapping as queries will read it: a `keylessMap`
+    /// for each map no key proves subject-unique, which queries deduplicate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_api::Diagnostic>,
 }
 
 /// Map a SQL endpoint as a graph source
@@ -133,6 +139,7 @@ async fn sql_map_local(state: Arc<AppState>, request: Request) -> Result<impl In
             Json(SqlMapResponse {
                 model_warnings: result.model_warnings,
                 mapping_warnings: result.mapping_warnings,
+                diagnostics: result.diagnostics,
                 graph_source_id: result.graph_source_id,
                 endpoint: result.endpoint,
                 connection_tested: result.connection_tested,

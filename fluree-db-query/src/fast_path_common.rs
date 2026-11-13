@@ -458,10 +458,16 @@ pub(crate) fn driver_subject_boundaries(
 /// (`DictOverlay::assign_numbig_handle`), a novelty value reuses a base arena
 /// handle only when the predicate's base arena is non-empty (already reported
 /// here), and novelty *list* rows need a row-level check in the overlay lane.
+///
+/// `replay_to` is the read's `t` when it is below the index's. The flags and
+/// the type constant describe a leaflet's live rows; history newer than the
+/// read can hold list rows or arena handles, so a leaflet the read replays is
+/// unsafe.
 pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    replay_to: Option<i64>,
 ) -> Result<bool> {
     use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
@@ -470,10 +476,11 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
             .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            let replays = entry.replays_history(replay_to);
+            if (entry.row_count == 0 && !replays) || entry.p_const != Some(p_id) {
                 continue;
             }
-            if entry.flags & HAS_O_I != 0 {
+            if replays || entry.flags & HAS_O_I != 0 {
                 return Ok(true);
             }
             match entry.o_type_const {
@@ -2336,39 +2343,41 @@ pub fn cached_overlay_ops(
     })
 }
 
-/// The predicate's `IRI_REF` ops sorted by `(o_key, s_id, o_i)`, the order
-/// the OPST object lane reconciles in. Derived from the PSOT ops once and
-/// cached beside them under the OPST key.
+/// Whether the bound-object lane can probe objects of `o_type`: refs, string
+/// terms and triple-term handles, whose `(o_type, o_key)` is their whole
+/// identity. Other literals match across datatypes and are left to the
+/// per-row scan.
+pub(crate) fn object_probe_covers(o_type: u16) -> bool {
+    use fluree_db_core::o_type::DecodeKind;
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::IriRef | DecodeKind::StringDict | DecodeKind::TripleTermDict
+    )
+}
+
+/// The predicate's ops on the objects the bound-object lane probes
+/// ([`object_probe_covers`]), sorted by `(o_type, o_key, s_id, o_i)`, the order
+/// it reconciles in. Derived from the PSOT ops once and cached beside them
+/// under the OPST key: no scan reads OPST ops, while the POST key holds a POST
+/// scan's own.
 pub(crate) fn cached_object_probe_ops(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<Option<SharedOverlayOps>> {
-    object_probe_ops(ctx, store, pred_sid, OType::IRI_REF.as_u16())
-}
-
-/// The predicate's `o_type` ops in object-lane order. Only the `IRI_REF`
-/// subset is cached; a term-handle flush is rare enough to derive its own.
-pub(crate) fn object_probe_ops(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
-    pred_sid: &Sid,
-    o_type: u16,
-) -> Result<Option<SharedOverlayOps>> {
     let g_id = ctx.binary_g_id;
-    let subset = || -> Result<Option<SharedOverlayOps>> {
+    cached_ops_entry(ctx, store, g_id, RunSortOrder::Opst, pred_sid, || {
         let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? else {
             return Ok(None);
         };
-        let mut subset: Vec<_> = ops.iter().filter(|o| o.o_type == o_type).copied().collect();
-        subset.sort_unstable_by_key(|o| (o.o_key, o.s_id, o.o_i));
+        let mut subset: Vec<_> = ops
+            .iter()
+            .filter(|o| object_probe_covers(o.o_type))
+            .copied()
+            .collect();
+        subset.sort_unstable_by_key(|o| (o.o_type, o.o_key, o.s_id, o.o_i));
         Ok(Some(subset.into()))
-    };
-    if o_type == OType::IRI_REF.as_u16() {
-        cached_ops_entry(ctx, store, g_id, RunSortOrder::Opst, pred_sid, subset)
-    } else {
-        subset()
-    }
+    })
 }
 
 /// Whether the ops for `(g_id, order, pred_sid)` are already translated,
@@ -2572,15 +2581,20 @@ impl ProbeOps {
     }
 }
 
-/// Per-flush reconciler for the OPST bound-object probe lane.
+/// Per-flush reconciler for one object type of the bound-object probe lane.
 ///
-/// The lane scans only `IRI_REF` rows of one predicate, keyed by object id,
-/// so it reconciles against [`cached_object_probe_ops`]: that subset of the
-/// predicate's resolved ops in `(o_key, s_id, o_i)` order, object-major
-/// windows shared across flushes and (for eager callers) queries. Same case
-/// analysis and per-flush scope as [`ProbeOps`].
+/// The lane scans one predicate's rows for a set of objects, each an exact
+/// `(o_type, o_key)`, so it reconciles against [`cached_object_probe_ops`]:
+/// the predicate's resolved ops on such objects in `(o_type, o_key, s_id, o_i)`
+/// order, object-major windows shared across flushes and (for eager callers)
+/// queries. A probe walks one type at a time and an op of another type cannot
+/// touch its rows, so the reconciler holds that type's run of the ops alone.
+/// Same case analysis and per-flush scope as [`ProbeOps`].
 pub struct ObjectProbeOps {
     ops: SharedOverlayOps,
+    /// Where the probed type's ops start in `ops`; `consumed` has one flag
+    /// for each of them.
+    start: usize,
     consumed: Vec<bool>,
     /// Base rows suppressed by novelty retracts (diagnostics).
     pub dropped_rows: u64,
@@ -2590,36 +2604,48 @@ pub struct ObjectProbeOps {
 
 impl ObjectProbeOps {
     /// `ops` must come from [`cached_object_probe_ops`]. Returns `None` when
-    /// empty: no op can affect the lane, so callers run their unmodified scan.
-    pub fn new(ops: SharedOverlayOps) -> Option<Self> {
-        if ops.is_empty() {
-            return None;
-        }
+    /// none is on an object of `o_type`: no op can affect the probe, so
+    /// callers run their unmodified scan.
+    pub fn for_type(ops: &SharedOverlayOps, o_type: u16) -> Option<Self> {
         debug_assert!(
-            ops.windows(2)
-                .all(|w| (w[0].o_key, w[0].s_id, w[0].o_i) < (w[1].o_key, w[1].s_id, w[1].o_i)),
+            ops.windows(2).all(|w| {
+                (w[0].o_type, w[0].o_key, w[0].s_id, w[0].o_i)
+                    < (w[1].o_type, w[1].o_key, w[1].s_id, w[1].o_i)
+            }),
             "ObjectProbeOps requires object-major sorted, resolved ops"
         );
-        let consumed = vec![false; ops.len()];
+        let start = ops.partition_point(|o| o.o_type < o_type);
+        let len = ops[start..].partition_point(|o| o.o_type == o_type);
+        if len == 0 {
+            return None;
+        }
         Some(Self {
-            ops,
-            consumed,
+            ops: Arc::clone(ops),
+            start,
+            consumed: vec![false; len],
             dropped_rows: 0,
             injected_rows: 0,
         })
     }
 
-    /// Index range of ops for `o_key`. Empty for objects with no novelty —
-    /// the common case, which keeps the per-row fate check free for them.
+    /// The probed type's ops, in `(o_key, s_id, o_i)` order.
+    fn typed(&self) -> &[fluree_db_binary_index::read::types::OverlayOp] {
+        &self.ops[self.start..self.start + self.consumed.len()]
+    }
+
+    /// Index range, within the probed type's ops, of those for the object
+    /// `o_key`. Empty for objects with no novelty — the common case, which
+    /// keeps the per-row fate check free for them.
     pub fn object_window(&self, o_key: u64) -> std::ops::Range<usize> {
-        let start = self.ops.partition_point(|o| o.o_key < o_key);
-        let end = start + self.ops[start..].partition_point(|o| o.o_key == o_key);
+        let typed = self.typed();
+        let start = typed.partition_point(|o| o.o_key < o_key);
+        let end = start + typed[start..].partition_point(|o| o.o_key == o_key);
         start..end
     }
 
     /// Reconcile one base row of `window`'s object against the ops, marking a
     /// matching op consumed. `window` must come from
-    /// [`Self::object_window`] for the row's object key.
+    /// [`Self::object_window`] for the row's object.
     pub fn base_row_fate(
         &mut self,
         window: &std::ops::Range<usize>,
@@ -2629,14 +2655,15 @@ impl ObjectProbeOps {
         if window.is_empty() {
             return RowFate::Keep;
         }
-        let win = &self.ops[window.clone()];
+        let win = &self.typed()[window.clone()];
         let probe = (s_id, o_i);
         let pos = win.partition_point(|o| (o.s_id, o.o_i) < probe);
         if pos < win.len() {
             let op = &win[pos];
             if (op.s_id, op.o_i) == probe {
+                let assert = op.op;
                 self.consumed[window.start + pos] = true;
-                if op.op {
+                if assert {
                     return RowFate::Keep;
                 }
                 self.dropped_rows += 1;
@@ -2646,20 +2673,20 @@ impl ObjectProbeOps {
         RowFate::Keep
     }
 
-    /// Hand every not-yet-consumed assert for `o_key` to `f` (as the
-    /// asserting subject id) — novelty-only facts of probed objects become
-    /// new matches. Call once per probed object after the base scan.
+    /// Hand every not-yet-consumed assert for the object `o_key` to `f` (as
+    /// the asserting subject id) — novelty-only facts of probed objects
+    /// become new matches. Call once per probed object after the base scan.
     pub fn drain_asserts_for_object(
         &mut self,
         o_key: u64,
         mut f: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        let window = self.object_window(o_key);
-        for i in window {
-            if !self.consumed[i] && self.ops[i].op {
+        for i in self.object_window(o_key) {
+            let op = self.ops[self.start + i];
+            if !self.consumed[i] && op.op {
                 self.consumed[i] = true;
                 self.injected_rows += 1;
-                f(self.ops[i].s_id)?;
+                f(op.s_id)?;
             }
         }
         Ok(())
@@ -2802,8 +2829,7 @@ pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneOutput {
     /// Encoded bindings. Eager callers are owed decoded ones (a datalog rule
-    /// head built from an encoded binding derives nothing), so admission
-    /// declines them.
+    /// head rejects an encoded binding), so admission declines them.
     Encoded,
     /// Decoded bindings under eager materialization, as the per-row scan
     /// emits, or no bindings at all.
@@ -2928,10 +2954,10 @@ pub fn subject_probe_lane_plan(
     Ok(ProbeLanePlan::Merge(ops))
 }
 
-/// Plan an OPST bound-object probe under the active overlay.
+/// Plan a bound-object probe under the active overlay.
 ///
-/// Gates on the predicate's PSOT ops and the OPST branch the scan reads, and
-/// merges the ops' `IRI_REF` subset ([`cached_object_probe_ops`]).
+/// Gates on the predicate's PSOT ops and the POST branch the probe reads, and
+/// merges the ops on probeable objects ([`cached_object_probe_ops`]).
 pub fn object_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -2957,16 +2983,16 @@ pub fn object_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Opst)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Post)
         .is_none()
     {
-        tracing::debug!("object probe: OPST branch absent with novelty present; declining");
+        tracing::debug!("object probe: POST branch absent with novelty present; declining");
         return Ok(ProbeLanePlan::Decline);
     }
-    let Some(ref_ops) = cached_object_probe_ops(ctx, store, pred_sid)? else {
+    let Some(object_ops) = cached_object_probe_ops(ctx, store, pred_sid)? else {
         return Ok(ProbeLanePlan::Decline);
     };
-    Ok(ProbeLanePlan::Merge(ref_ops))
+    Ok(ProbeLanePlan::Merge(object_ops))
 }
 
 /// Plan a multi-predicate SPOT star probe under the active overlay.
@@ -4754,7 +4780,7 @@ mod tests {
     #[test]
     fn branch_or_none_refuses_a_merge_over_a_graph_with_no_branch() {
         let store = BinaryIndexStore::empty();
-        for order in [RunSortOrder::Psot, RunSortOrder::Opst, RunSortOrder::Spot] {
+        for order in [RunSortOrder::Psot, RunSortOrder::Post, RunSortOrder::Spot] {
             assert!(
                 matches!(branch_or_none(&store, 3, order, false), Ok(None)),
                 "{order:?}: no merge, no branch: nothing to read"

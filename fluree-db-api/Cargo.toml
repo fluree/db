@@ -232,6 +232,21 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# A triples map narrowed by a restricted rr:sqlQuery over the local Iceberg
+# fixtures, against a native oracle. Own binary: it flips the fast-path switch
+# and reads span-capture routing stamps.
+[[test]]
+name = "it_iceberg_filtered_logical_table"
+path = "tests/it_iceberg_filtered_logical_table.rs"
+required-features = ["iceberg", "native"]
+
+# Sub-selects over a local two-table Iceberg graph source, checked against a
+# native twin of the same rows. Own binary: it sets FLUREE_ICEBERG_LOCAL_ROOTS.
+[[test]]
+name = "it_iceberg_subselect"
+path = "tests/it_iceberg_subselect.rs"
+required-features = ["iceberg", "native"]
+
 # Routing canary for the fused R2RML aggregate on the local Iceberg fixture.
 # Own binary: it asserts the absence of a span-capture event.
 [[test]]
@@ -239,11 +254,29 @@ name = "it_fused_aggregate_routing"
 path = "tests/it_fused_aggregate_routing.rs"
 required-features = ["iceberg", "native"]
 
+# A referencing object map over a non-unique parent key, on every lane and the
+# twin builder, checked against a native ledger holding the same triples.
+# Own binary: it flips the process-wide fast-path switch, sets
+# FLUREE_ICEBERG_LOCAL_ROOTS, and asserts routing stamps.
+[[test]]
+name = "it_r2rml_ref_fanout"
+path = "tests/it_r2rml_ref_fanout.rs"
+required-features = ["iceberg", "native"]
+
 # View-policy enforcement on R2RML / Iceberg graph sources, checked against a
 # native twin of the same fixture as the oracle.
 [[test]]
 name = "it_iceberg_policy"
 path = "tests/it_iceberg_policy.rs"
+required-features = ["iceberg", "native"]
+
+# Patterns over tables whose rows mint the same triple more than once answer
+# over the set of triples, checked against a native ledger holding them. Own
+# binary: it flips the process-wide fast-path switch, sets
+# FLUREE_ICEBERG_LOCAL_ROOTS, and asserts routing stamps.
+[[test]]
+name = "it_r2rml_set_scan"
+path = "tests/it_r2rml_set_scan.rs"
 required-features = ["iceberg", "native"]
 
 # Standalone: re-executes itself so the child reads the host-identity policy
@@ -302,6 +335,15 @@ required-features = ["sql", "native"]
 [[test]]
 name = "it_r2rml_untyped_columns"
 path = "tests/it_r2rml_untyped_columns.rs"
+required-features = ["sql", "native"]
+
+# Set semantics on the SQL lane: tables that repeat triples, answered against
+# a native ledger holding the triples, with the per-scan and Iceberg lanes over
+# the same rows (the local `sets.*` fixture). Own binary: it flips the
+# process-wide fast-path switch and sets `FLUREE_ICEBERG_LOCAL_ROOTS`.
+[[test]]
+name = "it_sql_set_semantics"
+path = "tests/it_sql_set_semantics.rs"
 required-features = ["sql", "native"]
 
 [[test]]

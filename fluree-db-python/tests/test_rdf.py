@@ -470,9 +470,80 @@ def test_serialize_keeps_graph_order_and_gathers_subjects():
     trig = fluree.serialize(quads, "trig", prefixes={"ex": EX})
     assert trig.index("GRAPH ex:g2") < trig.index("ex:z ex:p ex:y") < trig.index("GRAPH ex:g1")
     assert "ex:a ex:p ex:b, ex:h ;\n        ex:q ex:e ." in trig
-    nquads = fluree.serialize(quads, "nquads").splitlines()
-    assert [line.split()[-2] for line in nquads] == [f"<{EX}g2>"] * 3 + ["<http://example.org/y>", f"<{EX}g1>"]
     assert set(fluree.parse(trig, "trig")) == set(quads)
+
+
+def test_n_quads_are_written_a_line_per_quad_in_the_order_given():
+    quads = [
+        Quad(ex("a"), ex("p"), ex("b"), ex("g2")),
+        Quad(ex("z"), ex("p"), ex("y")),
+        Quad(ex("r"), REIFIES, Triple(ex("a"), ex("p"), ex("b")), ex("g1")),
+        Quad(ex("a"), ex("q"), "x", ex("g2")),
+        Quad(ex("c"), ex("p"), ex("d"), ex("g1")),
+    ]
+    text = fluree.serialize(quads, "nquads")
+    assert text == (
+        f"<{EX}a> <{EX}p> <{EX}b> <{EX}g2> .\n"
+        f"<{EX}z> <{EX}p> <{EX}y> .\n"
+        f"<{EX}r> <{REIFIES}> <<( <{EX}a> <{EX}p> <{EX}b> )>> <{EX}g1> .\n"
+        f'<{EX}a> <{EX}q> "x" <{EX}g2> .\n'
+        f"<{EX}c> <{EX}p> <{EX}d> <{EX}g1> .\n"
+    )
+    # Read and written again, the document is the same text.
+    assert list(fluree.parse(text, "nquads")) == quads
+    assert fluree.serialize(fluree.parse(text, "nquads"), "nquads") == text
+    triples = [Quad(ex("b"), ex("p"), 2), Quad(ex("a"), ex("p"), 1), Quad(ex("b"), ex("q"), 3)]
+    assert [line.split()[0] for line in fluree.serialize(triples, "ntriples").splitlines()] == [
+        f"<{EX}b>",
+        f"<{EX}a>",
+        f"<{EX}b>",
+    ]
+
+
+def test_a_json_ld_number_is_read_by_its_value():
+    doc = f'{{"@id": "{EX}s", "{EX}p": [1, 1.0, 1e3, 2.5, {{"@value": 2, "@type": "{XSD}double"}}]}}'
+    values = [q.object for q in fluree.parse(doc, "jsonld")]
+    assert values == [1, 1, 1000, 2.5, 2.0]
+    assert [type(v) for v in values] == [int, int, int, float, float]
+    lexical = [q.object for q in fluree.parse(doc, "jsonld", literals="lexical")]
+    assert lexical == [
+        Literal("1", XSD + "integer"),
+        Literal("1", XSD + "integer"),
+        Literal("1000", XSD + "integer"),
+        Literal("2.5E0", XSD + "double"),
+        Literal("2.0E0", XSD + "double"),
+    ]
+    # A dict is the JSON-LD it serializes to, so a Python 1.0 is the integer too.
+    (quad,) = fluree.parse({"@id": EX + "s", EX + "p": 1.0}, "jsonld")
+    assert quad.object == 1 and type(quad.object) is int
+    # Every digit of a fraction is kept.
+    (quad,) = fluree.parse(f'{{"@id": "{EX}s", "{EX}p": 0.9452706955539223}}', "jsonld")
+    assert quad.object == 0.9452706955539223
+
+
+def test_a_whole_float_written_as_json_ld_reads_back_a_float():
+    quads = [Quad(ex("s"), ex("p"), 1.0), Quad(ex("s"), ex("p"), 2.5), Quad(ex("s"), ex("p"), 3)]
+    for expanded in (False, True):
+        text = fluree.serialize(quads, "jsonld", expanded=expanded)
+        again = fluree.parse(text, "jsonld")
+        assert sorted((q.object, type(q.object).__name__) for q in again) == [(1.0, "float"), (2.5, "float"), (3, "int")]
+
+
+def test_a_blank_prefix_keeps_two_parses_apart():
+    doc = {"@id": EX + "s", EX + "p": {EX + "q": {"@list": [1]}}, EX + "r": {"@id": "_:mine"}}
+
+    def blank_nodes(quads):
+        return {t for q in quads for t in (q.subject, q.object) if isinstance(t, BlankNode)}
+
+    one, other = fluree.parse(doc, "jsonld"), fluree.parse(doc, "jsonld")
+    assert blank_nodes(one) == blank_nodes(other) == {BlankNode("b1"), BlankNode("b2"), BlankNode("mine")}
+    first, second = fluree.parse(doc, "jsonld", blank_prefix="a"), fluree.parse(doc, "jsonld", blank_prefix="z")
+    assert blank_nodes(first) == {BlankNode("a1"), BlankNode("a2"), BlankNode("mine")}
+    assert blank_nodes(first) & blank_nodes(second) == {BlankNode("mine")}
+    turtle = fluree.parse(PREFIXES + "[] ex:p [ ex:q ex:r ] .", "turtle", blank_prefix="t")
+    assert blank_nodes(turtle) == {BlankNode("t1"), BlankNode("t2")}
+    with pytest.raises(InvalidRequestError, match="cannot begin a blank node label"):
+        fluree.parse(doc, "jsonld", blank_prefix="-")
 
 
 def test_serialize_writes_expanded_json_ld():

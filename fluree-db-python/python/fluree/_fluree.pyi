@@ -197,7 +197,7 @@ class Transaction:
 
 def sparql_form(sparql: str) -> str | None: ...
 def parse_rdf(
-    text: str, format: str, base: str | None = None
+    text: str, format: str, base: str | None = None, blank_prefix: str | None = None
 ) -> tuple[
     list[tuple[IRI | BlankNode, IRI, IRI | BlankNode | Term, IRI | BlankNode | None]],
     list[tuple[str, str]],
@@ -218,12 +218,12 @@ def read_document(
     api_key: str | None = ...,
     auth_header: str | None = ...,
     cache: str | None = ...,
+    include: str = ...,
     doc_iri: str | None = ...,
     base_iri: str = ...,
     cache_dir: str | None = ...,
 ) -> dict[str, Any]: ...
-def reading_turtle(nodes: str) -> str: ...
-def reading_context() -> str: ...
+def reading_text(transactions: str, format: str) -> str: ...
 
 class Canceller:
     def __init__(self) -> None: ...

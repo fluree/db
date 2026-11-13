@@ -621,6 +621,38 @@ impl Pattern {
         }
     }
 
+    /// Whether this pattern reads the dataset rather than its row alone. One
+    /// that does answers for the graph it runs in, so it cannot move into a
+    /// GRAPH or SERVICE body written beside it.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Pattern::Filter(expr) | Pattern::Bind { expr, .. } => expr.reads_dataset(),
+            Pattern::Unwind { list, .. } => list.reads_dataset(),
+            Pattern::Values { .. } => false,
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Optional(_)
+            | Pattern::Union(_)
+            | Pattern::Minus(_)
+            | Pattern::Exists(_)
+            | Pattern::NotExists(_)
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
+            | Pattern::Subquery(_)
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::DefaultGraphSource { .. }
+            | Pattern::EdgeAnnotation { .. }
+            // Reads the term dictionary of the graph it runs in.
+            | Pattern::TermComponents(_) => true,
+        }
+    }
+
     /// Apply `f` once to every immediate nested pattern list inside this
     /// pattern, reconstructing the surrounding container around the result.
     ///

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use fluree_db_nameservice::{
-    CasResult, NameServiceError, NameServiceEvent, NsRecord, RefKind, RefValue,
+    CasResult, NameServiceError, NameServiceEvent, NsRecord, NsRecordSnapshot, RefKind, RefValue,
 };
 use fluree_db_nameservice_sync::watch::{RemoteEvent, RemoteWatch};
 use fluree_db_nameservice_sync::{SnapshotNames, SnapshotTracker, SseRemoteWatch};
@@ -254,62 +254,18 @@ impl PeerSyncTask {
                 // the record repeats it (an index publish, a reconnect).
                 Ok(CasResult::Conflict { actual }) if actual.as_ref() == Some(&commit_head) => {}
                 Ok(CasResult::Conflict { actual }) => {
-                    // Local diverged — server is authoritative in Mode B, force-follow.
+                    // Local diverged — server is authoritative in Mode B, so
+                    // the peer takes its record whole. A rebase can move a
+                    // branch's head to a lower or equal `t`, which no
+                    // compare-and-set of the head can follow.
                     tracing::warn!(
                         alias = %record.ledger_id,
                         ?actual,
                         remote_t = record.commit_t,
                         "Local commit diverged from server, force-following"
                     );
-                    self.fluree.disconnect_ledger(&record.ledger_id).await;
-                    if let Some(ref cur) = actual {
-                        if cur.t > record.commit_t {
-                            // This should never happen in peer Mode B (writes are forwarded),
-                            // but if it does, we cannot "force-follow" due to the strict
-                            // monotonic guard for commit refs (new.t must be > current.t).
-                            tracing::error!(
-                                alias = %record.ledger_id,
-                                local_t = cur.t,
-                                remote_t = record.commit_t,
-                                "Local commit_t is ahead of remote; refusing to force-follow"
-                            );
-                            return;
-                        }
-                    }
-                    let force_result = ns
-                        .compare_and_set_ref_fenced(
-                            &record.ledger_id,
-                            fluree_db_nameservice::WriteBasis::fenced(fence),
-                            RefKind::CommitHead,
-                            actual.as_ref(),
-                            &commit_head,
-                        )
-                        .await;
-
-                    match force_result {
-                        Ok(CasResult::Updated) => {
-                            tracing::info!(
-                                alias = %record.ledger_id,
-                                commit_t = record.commit_t,
-                                "Force-follow CAS updated local commit head"
-                            );
-                        }
-                        Ok(CasResult::Conflict { actual: new_actual }) => {
-                            tracing::warn!(
-                                alias = %record.ledger_id,
-                                ?new_actual,
-                                remote_t = record.commit_t,
-                                "Force-follow CAS still conflicted (local may remain divergent)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                alias = %record.ledger_id,
-                                error = %e,
-                                "Force-follow CAS failed"
-                            );
-                        }
-                    }
+                    self.follow_record(record, fence).await;
+                    return;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -323,16 +279,24 @@ impl PeerSyncTask {
         }
 
         // 3. Update index head — read current first, NOT expected=None
-        if record.index_head_id.is_some() {
+        let current = ns
+            .get_ref(&record.ledger_id, RefKind::IndexHead)
+            .await
+            .ok()
+            .flatten();
+        let local_head = ns
+            .get_ref(&record.ledger_id, RefKind::CommitHead)
+            .await
+            .ok()
+            .flatten();
+        if remote_lowered_index(record, current.as_ref(), local_head.as_ref()) {
+            self.follow_record(record, fence).await;
+            return;
+        } else if record.index_head_id.is_some() {
             let index_head = RefValue {
                 id: record.index_head_id.clone(),
                 t: record.index_t,
             };
-            let current = ns
-                .get_ref(&record.ledger_id, RefKind::IndexHead)
-                .await
-                .ok()
-                .flatten();
             let index_result = ns
                 .compare_and_set_ref_fenced(
                     &record.ledger_id,
@@ -397,6 +361,59 @@ impl PeerSyncTask {
         }
     }
 
+    /// Take the server's record whole: head, index and watermark. A rebase
+    /// replaces a branch's line, can move its head to a lower `t`, and
+    /// resets its index to the source's or to none, none of which the
+    /// monotonic refs can follow. The cached ledger is dropped so the next
+    /// read loads the record.
+    async fn follow_record(&self, record: &NsRecord, fence: Option<fluree_db_nameservice::Fence>) {
+        let Some(admin) = self.fluree.nameservice_mode().branch_admin() else {
+            return;
+        };
+        let snapshot = NsRecordSnapshot {
+            commit_head_id: record.commit_head_id.clone(),
+            commit_t: record.commit_t,
+            index_head_id: record.index_head_id.clone(),
+            index_t: record.index_t,
+        };
+        match admin
+            .reset_head_fenced(
+                record.ledger_id.as_str(),
+                fluree_db_nameservice::WriteBasis::fenced(fence),
+                snapshot,
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    alias = %record.ledger_id,
+                    commit_t = record.commit_t,
+                    index_t = record.index_t,
+                    "Local nameservice reset to the remote's record"
+                );
+                self.fluree.disconnect_ledger(&record.ledger_id).await;
+                self.peer_state
+                    .reset_ledger(
+                        &record.ledger_id,
+                        record.commit_t,
+                        record.index_t,
+                        record.commit_head_id.as_ref().map(ToString::to_string),
+                        record.index_head_id.as_ref().map(ToString::to_string),
+                        record.instance(),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    alias = %record.ledger_id,
+                    error = %e,
+                    "Failed to reset the local nameservice to the remote's record"
+                );
+            }
+        }
+        self.fluree.observe_nameservice_record(record);
+    }
+
     /// Remove the local copy of a branch the origin dropped and clear its
     /// in-memory watermarks. Cache eviction follows from the retraction
     /// event the notifying nameservice emits. Given the `instance` the
@@ -458,6 +475,24 @@ impl PeerSyncTask {
 ///
 /// Uses SHA-256 truncated to 8 hex chars (4 bytes) to match the server's graph source SSE
 /// event ID format. Same algorithm as `GraphSourceRecord::config_hash()` in `fluree-db-peer`.
+/// Whether `record` lowers the index this peer holds: the local index is
+/// newer than the record's, or the record has none. Only a record for the
+/// head the peer now holds counts, so a stale record replayed out of order
+/// never lowers it.
+fn remote_lowered_index(
+    record: &NsRecord,
+    local_index: Option<&RefValue>,
+    local_head: Option<&RefValue>,
+) -> bool {
+    let Some(local_index) = local_index.filter(|r| r.id.is_some()) else {
+        return false;
+    };
+    let record_is_current = local_head.is_some_and(|head| {
+        head.id.is_some() && head.id == record.commit_head_id && head.t == record.commit_t
+    });
+    record_is_current && (record.index_head_id.is_none() || local_index.t > record.index_t)
+}
+
 fn graph_source_config_hash(config: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -468,7 +503,7 @@ fn graph_source_config_hash(config: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_api::{FlureeBuilder, LedgerId};
+    use fluree_db_api::{FlureeBuilder, LedgerId, ReindexOptions};
     use fluree_db_nameservice::SubscriptionScope;
     use serde_json::json;
 
@@ -540,5 +575,151 @@ mod tests {
         assert!(events.contains(&NameServiceEvent::GraphSourceRetracted {
             graph_source_id: gone_source
         }));
+    }
+
+    async fn indexed(fluree: &fluree_db_api::Fluree, ledger_id: &str, commits: usize) -> NsRecord {
+        let mut ledger = fluree.create_ledger(ledger_id).await.expect("create");
+        for i in 0..commits {
+            ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@id": format!("ex:s{i}"), "ex:p": i}),
+                )
+                .await
+                .expect("insert")
+                .ledger;
+        }
+        fluree
+            .reindex(ledger_id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+        fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .expect("lookup")
+            .expect("record")
+    }
+
+    async fn local(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> NsRecord {
+        fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .expect("lookup")
+            .expect("record")
+    }
+
+    fn reference(id: &Option<fluree_db_core::ContentId>, t: i64) -> RefValue {
+        RefValue { id: id.clone(), t }
+    }
+
+    #[test]
+    fn only_a_current_record_lowers_the_index() {
+        let head = Some(fluree_db_core::ContentId::new(
+            fluree_db_core::ContentKind::Commit,
+            b"head",
+        ));
+        let older = Some(fluree_db_core::ContentId::new(
+            fluree_db_core::ContentKind::Commit,
+            b"older",
+        ));
+        let index = Some(fluree_db_core::ContentId::new(
+            fluree_db_core::ContentKind::IndexRoot,
+            b"index",
+        ));
+        let record = |commit: &Option<fluree_db_core::ContentId>, commit_t, index_t| NsRecord {
+            commit_head_id: commit.clone(),
+            commit_t,
+            index_head_id: None,
+            index_t,
+            ..NsRecord::new("peer:main")
+        };
+        let local_index = reference(&index, 3);
+        let local_head = reference(&head, 5);
+        // The record for the held head with no index lowers it.
+        assert!(remote_lowered_index(
+            &record(&head, 5, 0),
+            Some(&local_index),
+            Some(&local_head)
+        ));
+        // A record of another head is not the current one.
+        assert!(!remote_lowered_index(
+            &record(&older, 4, 0),
+            Some(&local_index),
+            Some(&local_head)
+        ));
+        // Nothing to lower without a local index.
+        assert!(!remote_lowered_index(
+            &record(&head, 5, 0),
+            None,
+            Some(&local_head)
+        ));
+        // A record whose index is at least the local one does not lower it.
+        let mut same = record(&head, 5, 3);
+        same.index_head_id = index.clone();
+        assert!(!remote_lowered_index(
+            &same,
+            Some(&local_index),
+            Some(&local_head)
+        ));
+    }
+
+    /// A rebase resets the branch's index to the source's or to none, under a
+    /// head the peer already holds: the peer lowers its index to match.
+    #[tokio::test]
+    async fn a_record_that_lowers_the_index_is_followed() {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let before = indexed(&fluree, "peer:main", 2).await;
+        assert!(before.index_head_id.is_some(), "indexed");
+
+        let rebased = NsRecord {
+            index_head_id: None,
+            index_t: 0,
+            ..before.clone()
+        };
+        task(&fluree, &[]).handle_ledger_updated(&rebased).await;
+
+        let after = local(&fluree, "peer:main").await;
+        assert_eq!(after.index_head_id, None, "the index follows the record");
+        assert_eq!(after.commit_head_id, before.commit_head_id);
+        assert_eq!(after.commit_t, before.commit_t);
+    }
+
+    /// A rebase can move the head to a lower `t` on another line, which the
+    /// monotonic head ref cannot follow: the peer takes the record whole.
+    #[tokio::test]
+    async fn a_record_that_moves_the_head_back_is_followed() {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let before = indexed(&fluree, "peer:main", 3).await;
+        let other = indexed(&fluree, "other:main", 1).await;
+
+        let rebased = NsRecord {
+            commit_head_id: other.commit_head_id.clone(),
+            commit_t: other.commit_t,
+            index_head_id: other.index_head_id.clone(),
+            index_t: other.index_t,
+            ..before.clone()
+        };
+        assert!(rebased.commit_t < before.commit_t, "the head moves back");
+        task(&fluree, &[]).handle_ledger_updated(&rebased).await;
+
+        let after = local(&fluree, "peer:main").await;
+        assert_eq!(after.commit_head_id, other.commit_head_id);
+        assert_eq!(after.commit_t, other.commit_t);
+        assert_eq!(after.index_head_id, other.index_head_id);
+        assert_eq!(after.index_t, other.index_t);
+    }
+
+    /// The record the peer already holds changes nothing.
+    #[tokio::test]
+    async fn the_held_record_is_left_alone() {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let before = indexed(&fluree, "peer:main", 2).await;
+        task(&fluree, &[]).handle_ledger_updated(&before).await;
+        let after = local(&fluree, "peer:main").await;
+        assert_eq!(after.commit_head_id, before.commit_head_id);
+        assert_eq!(after.index_head_id, before.index_head_id);
+        assert_eq!(after.index_t, before.index_t);
     }
 }

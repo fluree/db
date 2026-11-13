@@ -120,9 +120,25 @@ where
         basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
+        let head = snapshot
+            .commit_head_id
+            .clone()
+            .map(|id| (id, snapshot.commit_t));
         self.inner
             .reset_head_fenced(ledger_id, basis, snapshot)
-            .await
+            .await?;
+        // A reset moves the head (a rebase, or a rollback), and its index
+        // with it. Subscribers re-read the whole record on a commit event,
+        // so query peers follow the index too.
+        if let Some((commit_id, commit_t)) = head {
+            self.event_bus
+                .notify(NameServiceEvent::LedgerCommitPublished {
+                    ledger_id: LedgerId::parse_persisted(ledger_id)?,
+                    commit_id,
+                    commit_t,
+                });
+        }
+        Ok(())
     }
 
     // Pass-through wrapper: delegate so the inner backend's commit-CID index
@@ -844,5 +860,38 @@ mod tests {
             lifecycle::BranchDrop::Deferred { already: false }
         ));
         assert_eq!(drain(&mut sub), vec![retracted("mydb:dev", &instance)]);
+    }
+
+    /// A reset moves the head and the index together; subscribers (query
+    /// peers among them) hear of it as a commit and re-read the record.
+    #[tokio::test]
+    async fn a_reset_is_announced_as_a_commit() {
+        use crate::testing::CurrentFence as _;
+        use fluree_db_core::ContentKind;
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let ns = NotifyingNameService::new(MemoryNameService::new(), Arc::clone(&bus));
+        let id = LedgerId::parse("reset:main").unwrap();
+        lifecycle::create_ledger(&ns, &id).await.expect("create");
+        let mut sub = bus.subscribe(SubscriptionScope::all());
+        let head = ContentId::new(ContentKind::Commit, b"rebased-head");
+        ns.reset_head(
+            id.as_str(),
+            NsRecordSnapshot {
+                commit_head_id: Some(head.clone()),
+                commit_t: 2,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .expect("reset");
+        assert_eq!(
+            drain(&mut sub),
+            vec![NameServiceEvent::LedgerCommitPublished {
+                ledger_id: id,
+                commit_id: head,
+                commit_t: 2,
+            }]
+        );
     }
 }

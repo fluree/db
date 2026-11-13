@@ -994,6 +994,10 @@ impl crate::BranchLifecycle for FileNameService {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
         let index = snapshot_index(&snapshot);
+        let head = snapshot
+            .commit_head_id
+            .as_ref()
+            .map(|id| (snapshot.commit_t, id.to_string()));
 
         let outcome = self
             .storage
@@ -1030,6 +1034,19 @@ impl crate::BranchLifecycle for FileNameService {
                 Ok(CasAction::Write(serialize_json(&file)?))
             })
             .await?;
+
+        // As `publish_commit` does: the commit-CID index lists the head, so a
+        // build over it keeps its fast path. Entries the reset replaced stay
+        // below it; a build checks their linkage before using them.
+        if let Some((commit_t, cid)) = head {
+            if let Err(e) = self
+                .append_commit_index_entry(&ledger_name, &branch, commit_t, &cid)
+                .await
+            {
+                tracing::debug!(error = %e, ledger_id, commit_t, "commit-index append failed (non-fatal)");
+            }
+        }
+
         Ok(())
     }
 

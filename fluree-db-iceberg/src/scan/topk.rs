@@ -217,6 +217,32 @@ pub fn plan_topk_read<'a>(
     order
 }
 
+/// [`batch_sort_values`] over only the rows non-null in every column of
+/// `required` (field ids): the rows that yield a result row once the scan's
+/// consumer maps them. A required column missing from the batch keeps no
+/// row, so the bound stays loose and nothing is pruned on its account.
+pub fn batch_sort_values_where(
+    batch: &ColumnBatch,
+    field_id: i32,
+    required: &[i32],
+) -> Vec<TypedValue> {
+    if required.is_empty() {
+        return batch_sort_values(batch, field_id);
+    }
+    let required: Option<Vec<&Column>> =
+        required.iter().map(|id| batch.column_by_id(*id)).collect();
+    let Some(required) = required else {
+        return Vec::new();
+    };
+    let keep: Vec<usize> = (0..batch.num_rows)
+        .filter(|&row| required.iter().all(|col| !col.is_null(row)))
+        .collect();
+    if keep.len() == batch.num_rows {
+        return batch_sort_values(batch, field_id);
+    }
+    batch_sort_values(&batch.filter_by_indices(&keep), field_id)
+}
+
 /// The non-null values of column `field_id` in a batch, as `TypedValue`s, to fold
 /// into a [`TopKBound`]. NULLs are skipped (they never form the DESC bound; they
 /// sort last and only matter when the heap can't fill). `Bytes` is not an ordered
@@ -405,6 +431,47 @@ mod tests {
         // DESC by upper_bound: 30(1), 20(3), 10(0); the no-bound file (2) LAST.
         assert_eq!(idxs, vec![1, 3, 0, 2]);
         assert_eq!(order.last().unwrap().1, None, "all-null file has no bound");
+    }
+
+    #[test]
+    fn values_where_keep_only_rows_non_null_in_every_required_column() {
+        use crate::io::batch::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Arc;
+        let field = |name: &str, id: i32| FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: id,
+        };
+        let schema = Arc::new(BatchSchema::new(vec![
+            field("v", 1),
+            field("s", 2),
+            field("m", 3),
+        ]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Int64(vec![Some(10), Some(20), Some(30), None]),
+                Column::Int64(vec![Some(1), None, Some(3), Some(4)]),
+                Column::Int64(vec![Some(1), Some(2), None, Some(4)]),
+            ],
+        )
+        .unwrap();
+        let ints = |vals: Vec<TypedValue>| -> Vec<i64> {
+            vals.into_iter()
+                .map(|v| match v {
+                    TypedValue::Int64(n) => n,
+                    other => panic!("not a long: {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(ints(batch_sort_values_where(&batch, 1, &[])), [10, 20, 30]);
+        assert_eq!(ints(batch_sort_values_where(&batch, 1, &[2])), [10, 30]);
+        assert_eq!(ints(batch_sort_values_where(&batch, 1, &[2, 3])), [10]);
+        assert!(
+            batch_sort_values_where(&batch, 1, &[9]).is_empty(),
+            "a required column the batch lacks keeps no row"
+        );
     }
 
     #[test]

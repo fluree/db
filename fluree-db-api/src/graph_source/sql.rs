@@ -157,6 +157,12 @@ pub struct SqlCreateResult {
     /// or a probe that could not run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapping_warnings: Vec<String>,
+    /// Advisories about the mapping as the source's queries will read it: a
+    /// `keylessMap` for each map no key (`f:key`, or the key the probe
+    /// verified) proves subject-unique, which queries deduplicate. Empty when
+    /// the endpoint could not be reached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 /// Result of `fluree sql check`: the re-run uniqueness probe.
@@ -167,6 +173,9 @@ pub struct SqlCheckResult {
     pub allow_duplicate_subjects: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapping_warnings: Vec<String>,
+    /// As [`SqlCreateResult::diagnostics`], under the key this check verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 /// The key columns per table whose uniqueness the mapping assumes: every
@@ -212,10 +221,30 @@ fn duplicate_probe_keys(mapping: &CompiledR2rmlMapping) -> Vec<(String, Vec<Stri
     out
 }
 
+/// What a duplicate-subject probe found: tables whose keys repeat, tables it
+/// could not probe, warnings, and the key it verified for every other table.
+struct ProbeFindings {
+    flagged: Vec<String>,
+    unverified: Vec<String>,
+    warnings: Vec<String>,
+    verified: BTreeMap<String, Vec<String>>,
+}
+
+impl ProbeFindings {
+    /// Store the findings on `config`: what the lane refuses, and what it
+    /// may trust as a table key.
+    fn record(self, config: &mut SqlGsConfig) -> Vec<String> {
+        config.duplicate_subject_tables = self.flagged;
+        config.unverified_subject_tables = self.unverified;
+        config.verified_subject_keys = Some(self.verified);
+        self.warnings
+    }
+}
+
 /// Probe every table's subject keys for duplicates.
 ///
 /// Returns the tables found non-unique, the tables whose probe could not run,
-/// and human-readable warnings. A probe that errors used to warn and leave the
+/// human-readable warnings, and the key verified for each other table. A probe that errors used to warn and leave the
 /// table unflagged, so the lane then ran statements over a table whose
 /// uniqueness was unknown — the one thing the lane's contract does not allow.
 /// Those tables come back separately: the lane refuses them too, with advice
@@ -229,12 +258,18 @@ async fn probe_duplicate_subjects(
     client: &TrinoClient,
     mapping: &CompiledR2rmlMapping,
     allow_duplicate_subjects: bool,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+) -> ProbeFindings {
     let mut flagged = Vec::new();
     let mut unverified = Vec::new();
     let mut warnings = Vec::new();
+    let mut verified = BTreeMap::new();
     if allow_duplicate_subjects {
-        return (flagged, unverified, warnings);
+        return ProbeFindings {
+            flagged,
+            unverified,
+            warnings,
+            verified,
+        };
     }
     for (table, keys) in duplicate_probe_keys(mapping) {
         let source = match mapping.sql_query_for_table(&table) {
@@ -246,10 +281,31 @@ async fn probe_duplicate_subjects(
             Ok((_, batches)) => {
                 if batches.iter().any(|b| b.num_rows > 0) {
                     warnings.push(format!(
-                        "table '{table}': subject key ({}) is not unique; a star over a repeated                          subject returns duplicate rows and the pushdown lane refuses statements                          over it (register with allow_duplicate_subjects to proceed anyway)",
+                        "table '{table}': subject key ({}) is not unique; the pushdown lane \
+                         refuses statements over it (register with allow_duplicate_subjects to \
+                         answer over it with set semantics)",
                         keys.join(", ")
                     ));
                     flagged.push(table);
+                    continue;
+                }
+                // Unique under the database's equality; recorded only where
+                // that is the equality of the terms the key's columns render.
+                match client.schema(&source).await {
+                    Ok(schema) => match keys.iter().find(|c| !usable_key_column(&schema, c)) {
+                        None => {
+                            verified.insert(table, keys);
+                        }
+                        Some(column) => warnings.push(format!(
+                            "table '{table}': subject key column '{column}' cannot identify a \
+                             term (floating point, or a timestamp finer than the microsecond its \
+                             values are read to); queries over the table remove repeated solutions"
+                        )),
+                    },
+                    Err(e) => warnings.push(format!(
+                        "table '{table}': could not read its schema to vet the subject key: {e}; \
+                         queries over the table remove repeated solutions until a `check` succeeds"
+                    )),
                 }
             }
             Err(e) => {
@@ -262,7 +318,52 @@ async fn probe_duplicate_subjects(
             }
         }
     }
-    (flagged, unverified, warnings)
+    ProbeFindings {
+        flagged,
+        unverified,
+        warnings,
+        verified,
+    }
+}
+
+/// A key the duplicate-subject probe found unique on a table.
+enum ProbedKey {
+    /// Recorded by a probe that also vetted its columns' types.
+    Vetted(Vec<String>),
+    /// Inferred for a source registered before the probe recorded its
+    /// findings; its columns are vetted when it is reported.
+    Legacy(Vec<String>),
+}
+
+/// Whether `name` is a timestamp the source reports finer than the
+/// microsecond a value is read to, or without its precision: two values the
+/// database keeps apart can then render one term.
+fn lossy_timestamp(schema: &BatchSchema, name: &str) -> bool {
+    schema.field_by_name(name).is_some_and(|f| {
+        matches!(
+            f.field_type,
+            fluree_db_tabular::FieldType::Timestamp | fluree_db_tabular::FieldType::TimestampTz
+        ) && !schema.fractional_digits(name).is_some_and(|d| d <= 6)
+    })
+}
+
+/// How a relation holds a column a key names, for the shared key rules
+/// ([`fluree_db_r2rml::mapping::usable_in_key`]): a lossy timestamp
+/// ([`lossy_timestamp`]) counts as a type values are not read from exactly.
+fn key_column(schema: &BatchSchema, name: &str) -> fluree_db_r2rml::mapping::KeyColumn {
+    use fluree_db_r2rml::mapping::KeyColumn;
+    match schema.field_by_name(name) {
+        None => KeyColumn::Absent,
+        Some(_) if lossy_timestamp(schema, name) => KeyColumn::Typed(None),
+        Some(field) => KeyColumn::Typed(Some(field.field_type)),
+    }
+}
+
+/// Whether column `name` can be part of a key ([`key_column`]).
+fn usable_key_column(schema: &BatchSchema, name: &str) -> bool {
+    matches!(key_column(schema, name),
+        fluree_db_r2rml::mapping::KeyColumn::Typed(t)
+            if fluree_db_r2rml::mapping::usable_in_key(t.as_ref()))
 }
 
 impl crate::Fluree {
@@ -283,7 +384,7 @@ impl crate::Fluree {
                 &graph_source_id,
                 &config.mapping,
                 config.mapping_media_type.as_deref(),
-                true,
+                super::r2rml::SqlQueryPolicy::Execute,
             )
             .await?;
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
@@ -297,15 +398,13 @@ impl crate::Fluree {
             Ok(client) => match client.execute_collect("SELECT 1").await {
                 Ok(_) => {
                     if let Some(mapping) = &compiled_for_probe {
-                        let (flagged, unverified, warnings) = probe_duplicate_subjects(
+                        mapping_warnings = probe_duplicate_subjects(
                             &client,
                             mapping,
                             gs_config.allow_duplicate_subjects,
                         )
-                        .await;
-                        gs_config.duplicate_subject_tables = flagged;
-                        gs_config.unverified_subject_tables = unverified;
-                        mapping_warnings = warnings;
+                        .await
+                        .record(&mut gs_config);
                     }
                     true
                 }
@@ -320,8 +419,11 @@ impl crate::Fluree {
             }
         };
         if !connection_tested {
+            // Nothing was probed, so no table's key is verified.
+            gs_config.verified_subject_keys = Some(BTreeMap::new());
             mapping_warnings.push(
-                "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql check`                  once it is"
+                "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql \
+                 check` once it is"
                     .to_string(),
             );
         }
@@ -339,10 +441,18 @@ impl crate::Fluree {
             )
             .await?;
 
+        let diagnostics = match &compiled_for_probe {
+            Some(compiled) if connection_tested => {
+                self.keyless_sql_maps(&graph_source_id, compiled).await
+            }
+            _ => Vec::new(),
+        };
+
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created SQL graph source");
         Ok(SqlCreateResult {
             model_warnings,
             mapping_warnings,
+            diagnostics,
             graph_source_id,
             endpoint: gs_config.endpoint,
             mapping_source: mapping_address,
@@ -406,10 +516,11 @@ impl crate::Fluree {
         let client = build_sql_client(&config, self.identity_context())
             .await
             .map_err(sql_api_error)?;
-        let (flagged, unverified, mapping_warnings) =
-            probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects).await;
-        config.duplicate_subject_tables = flagged.clone();
-        config.unverified_subject_tables = unverified;
+        let mapping_warnings =
+            probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects)
+                .await
+                .record(&mut config);
+        let flagged = config.duplicate_subject_tables.clone();
         let (name, branch) = graph_source_id
             .rsplit_once(':')
             .unwrap_or((graph_source_id, "main"));
@@ -424,12 +535,34 @@ impl crate::Fluree {
                 &[],
             )
             .await?;
+        let diagnostics = self
+            .keyless_sql_maps(graph_source_id.as_ref(), &compiled)
+            .await;
         Ok(SqlCheckResult {
             graph_source_id: graph_source_id.to_string(),
             duplicate_subject_tables: flagged,
             allow_duplicate_subjects: config.allow_duplicate_subjects,
             mapping_warnings,
+            diagnostics,
         })
+    }
+
+    /// The `keylessMap` advisories for a published SQL source: each map no
+    /// key proves subject-unique, under the key its last probe verified
+    /// and the mapping's `f:key`, as its queries read them.
+    async fn keyless_sql_maps(
+        &self,
+        graph_source_id: &str,
+        compiled: &CompiledR2rmlMapping,
+    ) -> Vec<fluree_db_r2rml::emit::Diagnostic> {
+        super::r2rml::registered_keyless_maps(
+            &super::r2rml::FlureeR2rmlProvider::new(self),
+            graph_source_id,
+            compiled,
+            super::iceberg_validate::QueryTables::Alias,
+            super::iceberg_validate::KeyRemedy::Declare,
+        )
+        .await
     }
 
     /// `SELECT 1` against the endpoint with the configured credentials.
@@ -511,6 +644,93 @@ impl SqlSource {
             config,
             client,
         })
+    }
+
+    /// The keys this source reports for `table_name`
+    /// (`R2rmlTableProvider::table_keys`): the key the duplicate-subject probe
+    /// verified, as long as nothing refuses the table. A source registered
+    /// with `allow_duplicate_subjects` probed nothing and reports none.
+    ///
+    /// Refuses the query when a key the mapping declares on the table
+    /// (`f:key`) names a column the relation lacks or one whose values cannot
+    /// identify a row, so no lane trusts a key the table cannot hold.
+    pub(crate) async fn table_keys(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+    ) -> QueryResult<Option<Vec<Vec<String>>>> {
+        let declared = mapping.declared_keys(table_name);
+        let probed = self.probed_subject_key(mapping, table_name);
+        // A key the probe recorded was vetted against the schema when it ran.
+        if declared.is_empty() {
+            match probed {
+                None => return Ok(None),
+                Some(ProbedKey::Vetted(key)) => return Ok(Some(vec![key])),
+                Some(ProbedKey::Legacy(_)) => {}
+            }
+        }
+        let source = match mapping.sql_query_for_table(table_name) {
+            Some(sql) => RelSource::Query(sql.to_string()),
+            None => RelSource::Table(table_name.to_string()),
+        };
+        let schema = self.source_schema(session, mapping, &source).await?;
+        let refuse = |message: String| {
+            QueryError::InvalidQuery(format!(
+                "Graph source '{}': {message}",
+                self.graph_source_id
+            ))
+        };
+        if let Some(name) = declared
+            .iter()
+            .flatten()
+            .find(|c| lossy_timestamp(&schema, c))
+        {
+            return Err(refuse(format!(
+                "f:key on the logical table \"{table_name}\" names column \"{name}\", a \
+                 timestamp finer than the microsecond its values are read to (or of unreported \
+                 precision), so two of its values can render one term"
+            )));
+        }
+        declared
+            .check_columns(table_name, |c| key_column(&schema, c))
+            .map_err(|e| refuse(e.to_string()))?;
+        Ok(match probed {
+            None => None,
+            Some(ProbedKey::Vetted(key)) => Some(vec![key]),
+            Some(ProbedKey::Legacy(key)) => {
+                let reported = fluree_db_r2rml::TableKeys::new([key])
+                    .retain_usable(|c| key_column(&schema, c));
+                (!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect())
+            }
+        })
+    }
+
+    /// The composite key the duplicate-subject probe verified for
+    /// `table_name`, when the lane does not refuse the table. A source
+    /// registered before the probe recorded what it verified keeps the trust
+    /// the lane always gave it: every table neither flagged nor unverified,
+    /// on the key the probe checks.
+    fn probed_subject_key(
+        &self,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+    ) -> Option<ProbedKey> {
+        let config = &self.config;
+        let named = |tables: &[String]| tables.iter().any(|t| t == table_name);
+        if config.allow_duplicate_subjects
+            || named(&config.duplicate_subject_tables)
+            || named(&config.unverified_subject_tables)
+        {
+            return None;
+        }
+        match &config.verified_subject_keys {
+            Some(verified) => verified.get(table_name).cloned().map(ProbedKey::Vetted),
+            None => duplicate_probe_keys(mapping)
+                .into_iter()
+                .find(|(t, _)| t == table_name)
+                .map(|(_, keys)| ProbedKey::Legacy(keys)),
+        }
     }
 
     /// A table name, or the `rr:sqlQuery` text behind a query alias.

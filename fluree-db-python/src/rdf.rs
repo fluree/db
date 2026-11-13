@@ -6,9 +6,11 @@
 //! reification travels as the quad `(reifier, rdf:reifies, triple term,
 //! graph)`, as RDF 1.2 defines it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use fluree_db_api::rdf::{self, Dataset, PrefixMap, RdfError, RdfFormat, Statement, Term};
+use fluree_db_api::rdf::{
+    self, Dataset, Document, PrefixMap, RdfError, RdfFormat, Statement, Term,
+};
 use fluree_vocab::rdf::REIFIES;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -24,7 +26,8 @@ type ParsedDocument<'py> = (Bound<'py, PyList>, Vec<(String, String)>);
 /// The quads of `text`, read as `format`: `"turtle"`, `"trig"`,
 /// `"ntriples"` or `"nquads"`, in the order the document writes them, and
 /// the prefixes it declares, as `(prefix, iri)` pairs in order. Turtle and
-/// TriG resolve relative IRIs against `base`.
+/// TriG resolve relative IRIs against `base`. An anonymous blank node is
+/// labeled `{blank_prefix}N`, or `bN` with no prefix given.
 ///
 /// Each quad is `(subject, predicate, object, graph)`. An IRI or blank node
 /// is a ready `fluree.IRI` or `fluree.BlankNode`, one object for every use of
@@ -32,16 +35,18 @@ type ParsedDocument<'py> = (Bound<'py, PyList>, Vec<(String, String)>);
 /// triple term a `("triple", subject, predicate, object)` cell whose parts
 /// follow the same rule.
 #[pyfunction]
-#[pyo3(signature = (text, format, base = None))]
+#[pyo3(signature = (text, format, base = None, blank_prefix = None))]
 pub(crate) fn parse_rdf<'py>(
     py: Python<'py>,
     text: &str,
     format: &str,
     base: Option<&str>,
+    blank_prefix: Option<&str>,
 ) -> PyResult<ParsedDocument<'py>> {
     let format: RdfFormat = format.parse().map_err(rdf_error)?;
+    let options = rdf::ParseOptions { base, blank_prefix };
     let document = py
-        .detach(|| rdf::parse_document(text, format, base))
+        .detach(|| rdf::parse_document_with(text, format, options))
         .map_err(rdf_error)?;
     let mut terms = Terms::new(py);
     let reifies = terms.iri(REIFIES)?;
@@ -141,9 +146,11 @@ impl<'py> Terms<'py> {
 }
 
 /// `quads`, each a `fluree.Quad`, written as `format`: `"turtle"`, `"trig"`,
-/// `"ntriples"` or `"nquads"`, keeping their order: graphs in the order the
-/// quads first name them, and in Turtle and TriG each subject's statements
-/// together, subjects in the order they first appear. Turtle and TriG
+/// `"ntriples"` or `"nquads"`, keeping their order. N-Triples and N-Quads
+/// write one line per quad, in the order given. The other formats write the
+/// graphs in the order the quads first name them, and in Turtle and TriG each
+/// subject's statements together, subjects in the order they first appear.
+/// Turtle and TriG
 /// declare `prefixes` and write with them. A quad `(r, rdf:reifies, triple
 /// term)` is written as an annotation where the format has one. `expanded`
 /// writes JSON-LD in expanded form.
@@ -163,20 +170,12 @@ pub(crate) fn serialize_rdf<'py>(
         )));
     }
     let mut nodes = Nodes::default();
-    let mut dataset = Dataset::new();
-    let mut graph_order: Vec<Option<Term>> = Vec::new();
-    let mut named: HashSet<Term> = HashSet::new();
-    let mut default_seen = false;
+    let mut document = Document::new();
     for quad in quads.try_iter()? {
         let quad = quad?;
         let graph = quad.getattr(intern!(py, "graph"))?;
         let graph = (!graph.is_none()).then(|| nodes.term(graph)).transpose()?;
-        match &graph {
-            None if !std::mem::replace(&mut default_seen, true) => graph_order.push(None),
-            Some(name) if named.insert(name.clone()) => graph_order.push(Some(name.clone())),
-            _ => {}
-        }
-        dataset.add_quad(
+        document.add_quad(
             nodes.term(quad.getattr(intern!(py, "subject"))?)?,
             nodes.term(quad.getattr(intern!(py, "predicate"))?)?,
             nodes.object(quad.getattr(intern!(py, "object"))?)?,
@@ -186,9 +185,9 @@ pub(crate) fn serialize_rdf<'py>(
     let prefixes = PrefixMap::from_map(prefixes.unwrap_or_default());
     py.detach(|| {
         if expanded {
-            rdf::serialize_expanded_jsonld(&dataset, &graph_order)
+            rdf::serialize_expanded_jsonld(&document.dataset, &document.graph_order())
         } else {
-            rdf::serialize_ordered(dataset, &graph_order, format, &prefixes)
+            rdf::serialize_document(document, format, &prefixes)
         }
     })
     .map_err(rdf_error)
