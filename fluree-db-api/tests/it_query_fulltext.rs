@@ -2401,6 +2401,24 @@ async fn assert_hidden_document_is_not_a_hit(surface: fn() -> Surface, ledger_id
             let hits = graph_hits(&fluree, &ledger, property, surface(), joined, true).await;
             let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
             assert_eq!(ids, ["ex:doc1"], "{property} joined={joined}: {hits:?}");
+            // Scores come from statistics over every document of the
+            // property, the hidden one included, so the reader's score is the
+            // unrestricted one. Scoping them to what a policy shows would be
+            // a deliberate change to this assertion.
+            let unrestricted =
+                graph_hits(&fluree, &ledger, property, surface(), joined, false).await;
+            let doc1 = unrestricted
+                .iter()
+                .find(|(id, _)| id == "ex:doc1")
+                .unwrap_or_else(|| panic!("{property}: ex:doc1 unrestricted: {unrestricted:?}"));
+            assert!(
+                unrestricted.iter().any(|(id, _)| id == "ex:doc3"),
+                "{property}: the hidden document matches the term: {unrestricted:?}"
+            );
+            assert_eq!(
+                hits[0].1, doc1.1,
+                "{property} joined={joined}: ex:doc1's score"
+            );
         }
     }
 }

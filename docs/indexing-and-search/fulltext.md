@@ -526,6 +526,10 @@ score(q,d) = SUM( IDF(t) * TF_norm(t) )  for each query term t
 
 - **Corpus-wide average document length** (`avgdl`) -- Anchors the length normalization across the entire collection.
 
+### Scoring under a policy
+
+The corpus statistics (*N*, *df*, *avgdl*) cover every document of the property, including documents a [policy](../security/policy-in-queries.md) hides from the identity running the query. Hidden documents are never returned as hits, and a visible document scores the same for a policy-scoped reader as for an unrestricted request. Because the statistics include hidden documents, though, a reader can tell from their scores when hidden documents containing a term are added or removed. The BM25 graph source behaves the same way: it scores against the whole index, then drops hits the identity cannot see.
+
 ### Text analysis pipeline
 
 Both documents and queries go through the same analysis pipeline, and the index and query sides always use the same analyzer for a given arena — so query stems match document stems:
