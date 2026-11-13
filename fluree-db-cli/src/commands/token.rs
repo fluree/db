@@ -104,6 +104,8 @@ fn run_create(
         && !permissions.write_all
         && permissions.write_ledgers.is_empty()
         && permissions.graph_sources.is_empty()
+        && !permissions.audit_all
+        && permissions.audit_ledgers.is_empty()
     {
         return Err(CliError::Usage(
             "no permissions granted; use --all, --events-ledger, --storage-ledger, --read-ledger/--read-all, --write-ledger/--write-all, or --graph-source".into(),
@@ -957,23 +959,26 @@ mod tests {
     #[test]
     fn an_audit_grant_without_data_access_is_refused_at_mint() {
         let ledger = ["mydb:main".to_string()];
-        let err = run_create(
-            "0x0101010101010101010101010101010101010101010101010101010101010101",
-            "1h",
-            TokenClaims {
-                subject: None,
-                audiences: &[],
-                identity: None,
-            },
-            TokenPermissions {
-                events_ledgers: &ledger,
-                ..permissions(&[], &ledger)
-            },
-            TokenOutputFormat::Token,
-            false,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("adds to data access"), "{err}");
+        // Alone, or beside a grant that gives no data access.
+        for events in [&[][..], &ledger[..]] {
+            let err = run_create(
+                "0x0101010101010101010101010101010101010101010101010101010101010101",
+                "1h",
+                TokenClaims {
+                    subject: None,
+                    audiences: &[],
+                    identity: None,
+                },
+                TokenPermissions {
+                    events_ledgers: events,
+                    ..permissions(&[], &ledger)
+                },
+                TokenOutputFormat::Token,
+                false,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("adds to data access"), "{err}");
+        }
     }
 
     #[test]
