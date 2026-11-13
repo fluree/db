@@ -1147,10 +1147,11 @@ async fn a_build_from_the_commit_index_reads_the_rebased_line() {
     assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
 }
 
-/// A `Skip` rebase that skips every commit leaves the branch where it was:
-/// on its own line, with its own index, and writable at its own head.
+/// A `Skip` rebase that skips every commit makes the branch the source: its
+/// head and index move to the source's together, so it reads the source's
+/// line and writes on top of the source's head.
 #[tokio::test]
-async fn a_rebase_that_skips_every_commit_leaves_the_branch_as_it_was() {
+async fn a_rebase_that_skips_every_commit_makes_the_branch_the_source() {
     let dir = tempfile::tempdir().unwrap();
     let fluree = file_fluree(&dir);
     let name = |s: &str, n: &str| {
@@ -1176,12 +1177,6 @@ async fn a_rebase_that_skips_every_commit_leaves_the_branch_as_it_was() {
         .ledger;
     fluree.insert(main, &name("dave", "dave")).await.unwrap();
     support::rebuild_and_publish_index(&fluree, "rb:main").await;
-    let before = fluree
-        .nameservice()
-        .lookup("rb:dev")
-        .await
-        .unwrap()
-        .unwrap();
 
     let report = fluree
         .rebase_branch("rb", "dev", ConflictStrategy::Skip)
@@ -1189,29 +1184,28 @@ async fn a_rebase_that_skips_every_commit_leaves_the_branch_as_it_was() {
         .unwrap();
     assert_eq!((report.replayed, report.skipped), (0, 1));
 
-    let after = fluree
-        .nameservice()
-        .lookup("rb:dev")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (after.commit_head_id, after.index_head_id),
-        (before.commit_head_id, before.index_head_id)
+    let lookup = |id: &'static str| fluree.nameservice().lookup(id);
+    let (source, branch) = (
+        lookup("rb:main").await.unwrap().unwrap(),
+        lookup("rb:dev").await.unwrap().unwrap(),
     );
-    let own_line = ["alice", "alice-dev"];
-    assert_eq!(query_all_names(&fluree, "rb:dev").await, own_line);
+    assert_eq!(
+        (branch.commit_head_id, branch.commit_t, branch.index_t),
+        (source.commit_head_id, source.commit_t, source.index_t)
+    );
+    let source_line = ["alice", "alice-main", "dave"];
+    assert_eq!(query_all_names(&fluree, "rb:dev").await, source_line);
     let dev = fluree.ledger("rb:dev").await.unwrap();
     fluree
         .insert(dev, &name("erin", "erin"))
         .await
-        .expect("the branch writes at its own head");
+        .expect("the branch writes on the source's head");
     drop(fluree);
 
     let fresh = file_fluree(&dir);
     assert_eq!(
         query_all_names(&fresh, "rb:dev").await,
-        ["alice", "alice-dev", "erin"]
+        ["alice", "alice-main", "dave", "erin"]
     );
 }
 
