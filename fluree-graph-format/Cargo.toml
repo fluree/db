@@ -8,6 +8,7 @@ description = "RDF graph formatters for JSON-LD, Turtle, and other formats"
 
 [dependencies]
 fluree-graph-ir = { path = "../fluree-graph-ir" }
+hashbrown = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

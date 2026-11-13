@@ -2676,10 +2676,16 @@ pub fn build_where_operators_seeded_with_needed(
     // operator. Triples/VALUES/BIND can build their own empty seed on demand via
     // `get_or_empty_seed(...)`, and pre-inserting an EmptyOperator would incorrectly
     // block PropertyJoinOperator selection (because `operator.is_none()` would be false).
+    // A list-view triple is planned as its triple, in the same block.
     let needs_empty_seed = seed.is_none()
         && !matches!(
             patterns.first(),
-            Some(Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. })
+            Some(
+                Pattern::Triple(_)
+                    | Pattern::ListView(_)
+                    | Pattern::Values { .. }
+                    | Pattern::Bind { .. }
+            )
         );
 
     // Start with provided seed, else start with empty operator if needed
@@ -4704,6 +4710,27 @@ mod tests {
             p.ndv_values = 0;
         }
         assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+    }
+
+    /// A WHERE that opens on a list-view triple, like the Graph Store `GET`'s
+    /// `?s ?p ?o` over a ledger holding lists, is planned from that triple's
+    /// own scan, with no empty seed joined under it.
+    #[test]
+    fn a_where_opening_on_a_list_view_triple_plans_its_scan_first() {
+        let view = crate::list_view::ListView::of_predicates([Sid::new(100, "items")]);
+        let triple =
+            TriplePattern::new(Ref::Var(VarId(0)), Ref::Var(VarId(1)), Term::Var(VarId(2)));
+        let patterns = vec![Pattern::ListView(crate::list_view::ListViewPattern {
+            triple,
+            view,
+        })];
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        assert_eq!(
+            plan_ops(&plan),
+            vec!["ListAugmentOperator", "DatasetOperator"],
+            "the list-view triple must open the plan with its scan"
+        );
     }
 
     #[test]
