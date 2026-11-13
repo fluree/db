@@ -147,7 +147,7 @@ A relative lifetime starts when the write arrived: the commit's receive time (`d
 | `@expiresAt: "2026-10-21T12:00:00Z"` | Absolute deadline | RFC 3339 with `Z` or a numeric offset, normalized to UTC, at most microsecond precision |
 | `f:expiresAt` typed `xsd:dateTime`, `fluree.expiresAt(v, datetime(...))` | Absolute deadline | The same rules |
 
-These are refused, not guessed at: negative or fractional lifetimes; calendar durations such as `P1M` or `P1Y`; weeks; numeric strings such as `"3600"`; booleans and `null`; date-only values; date-times with no offset or with `-00:00`; and both a lifetime and a deadline on one value. A deadline already in the past is valid: the value expires at the next pass.
+These are refused, not guessed at: negative or fractional lifetimes; calendar durations such as `P1M` or `P1Y`; weeks; numeric strings such as `"3600"`; booleans and `null`; date-only values; date-times with no offset or with `-00:00`; and both a lifetime and a deadline on one value. One exception: an `f:expiresAt` written as a typed `xsd:dateTime` literal in SPARQL, Turtle or an `@annotation` is read as any `xsd:dateTime` is, so one with no offset is taken as UTC, not refused. Write the offset. A deadline already in the past is valid: the value expires at the next pass.
 
 A TTL instruction must sit on an annotation of exactly one triple. `f:ttl` written on an ordinary node is refused, as are two TTL instructions for the same value in one transaction.
 
