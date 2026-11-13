@@ -853,7 +853,11 @@ impl BinaryScanOperator {
                     } else {
                         None
                     },
-                    p_id: None,
+                    // `fulltext()` finds a value's arena by its predicate.
+                    p_id: self
+                        .store
+                        .as_ref()
+                        .and_then(|store| store.predicate_id_for_sid(&flake.p)),
                 }
             }
         }
