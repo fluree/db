@@ -28,6 +28,7 @@ use crate::binding::Binding;
 use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
+use crate::r2rml::set_semantics::TableKeyEvidence;
 use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
@@ -46,8 +47,10 @@ pub struct R2rmlRewriteResult {
     pub unconverted_count: usize,
     /// Non-lowered sub-scope patterns that would evaluate against the R2RML
     /// graph source's (empty) native index and **silently return no rows** —
-    /// property paths, shortest paths, and subqueries, whose bodies traverse or
-    /// scan the enclosing graph. The caller MUST error (via
+    /// property paths and shortest paths, which traverse the enclosing graph.
+    /// Collected from every nested body the rewrite descends into, a
+    /// sub-select's included (its body is lowered like any other scope). The
+    /// caller MUST error (via
     /// [`unsupported_subscope_error`]) when this is non-empty rather than hand
     /// back a silently-wrong empty result. Holds each SPARQL kind name for the
     /// error message. Deliberately excludes the search patterns
@@ -86,25 +89,59 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
         .map(|iri| format!("'{iri}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    // Only the out-of-scope guard reports a sub-select (inside a graph scope
+    // the rewrite lowers its body), so its advice is to move it into one.
+    let paths = unique
+        .iter()
+        .any(|kind| *kind != "subquery" && *kind != MODIFIER_EXISTS);
+    let mut advice = Vec::with_capacity(2);
+    if paths {
+        advice.push(
+            "Rewrite paths as fixed-length steps between nodes, or run them against a \
+             native ledger.",
+        );
+    }
+    if unique.contains(&"subquery") {
+        advice.push(
+            "A sub-select reads a graph source only from inside that source's graph \
+             block; move it there, or drop the explicit graph block so the whole query \
+             is scoped to the graph source.",
+        );
+    }
+    if unique.contains(&MODIFIER_EXISTS) {
+        advice.push(
+            "HAVING, ORDER BY, and the expressions a query evaluates after a trailing \
+             VALUES run outside the graph source's scope; move the condition into \
+             WHERE as a FILTER, or BIND it to a variable there and use that variable.",
+        );
+    }
     crate::error::QueryError::InvalidQuery(format!(
         "{subject} {names} {verb} pattern(s) that cannot be evaluated over a \
          virtual dataset (a graph source has no native index, so these would silently \
-         return no rows): {}. Rewrite them as fixed-length steps between nodes, or run \
-         them against a native ledger.",
-        unique.join(", ")
+         return no rows): {}. {}",
+        unique.join(", "),
+        advice.join(" ")
     ))
 }
 
 /// The kinds of pattern a graph source cannot evaluate, collected from the
 /// patterns that sit **outside** every `GRAPH` scope.
 ///
-/// [`rewrite_patterns_for_r2rml`] records the same three kinds for the patterns
+/// [`rewrite_patterns_for_r2rml`] records the path kinds for the patterns
 /// *inside* one graph-source scope, and `GraphOperator` refuses on them. But a
 /// query addressed to a graph source can carry them at the top level too, where
 /// no `GRAPH` scope — and so no rewrite, and no refusal — ever sees them. There
 /// they evaluate against the graph source's view, which is a zero-flake genesis
 /// snapshot, and return silently-wrong results: `p+` nothing at all, `p*`/`p?`
-/// the zero-length identity match only. The API layer calls this before
+/// the zero-length identity match only.
+///
+/// A sub-select is refused here too when its body reads this view (a triple or
+/// list pattern outside every `GRAPH` scope of its own), although the rewrite
+/// lowers one inside a graph scope: out here nothing lowers that body, so it
+/// would read the same empty snapshot (an ungrouped `COUNT` answering 0). A
+/// sub-select whose body reads only through its own `GRAPH` blocks, or reads
+/// nothing (only `VALUES` or `BIND`), is evaluated like any other, and the
+/// paths inside its body are still collected. The API layer calls this before
 /// execution and refuses with [`unsupported_subscope_error`], so the refusal
 /// does not depend on whether the query happens to contain a `GRAPH` block.
 ///
@@ -113,46 +150,65 @@ pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate:
 /// - `GRAPH` is its own scope — already covered by the rewrite guard;
 /// - `SERVICE` targets another ledger or endpoint, which may have a native
 ///   index, so refusing on its body would reject a query that works;
-/// - the RDF-star `EdgeAnnotation` bodies are left untouched
-///   here exactly as the rewriter leaves them (RDF-star over a graph source is
-///   undefined rather than confirmed silently-empty).
+/// - the RDF-star `EdgeAnnotation` patterns are left untouched here as the
+///   rewriter leaves them, and do not count as reading this view: a mapping
+///   produces no annotation, so they match nothing over a graph source, which
+///   is the answer a ledger holding the mapping's triples gives too. Refusing
+///   a sub-select whose body is only annotations would refuse a correct answer.
 pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static str> {
     let mut kinds = Vec::new();
     collect_unsupported_outside_graph_scopes(patterns, &mut kinds);
     kinds
 }
 
-fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Vec<&'static str>) {
+/// Collect into `kinds`; returns whether `patterns` read this view through a
+/// triple or list pattern outside every `GRAPH` scope.
+fn collect_unsupported_outside_graph_scopes(
+    patterns: &[Pattern],
+    kinds: &mut Vec<&'static str>,
+) -> bool {
+    let mut reads_view = false;
     for pattern in patterns {
         match pattern {
-            // The three kinds the rewriter flags, named identically so one
+            // The path kinds the rewriter flags, named identically so one
             // query reads the same whichever guard refuses it.
             Pattern::PropertyPath(_) => kinds.push("property path"),
             Pattern::TermComponents(_) => kinds.push("triple-term components"),
             Pattern::ShortestPath(_) => kinds.push("shortest path"),
-            Pattern::Subquery(_) => kinds.push("subquery"),
+            // A sub-select whose body, or HAVING / ORDER BY, reads this view,
+            // which no rewrite reaches out here (see above).
+            Pattern::Subquery(sq) => {
+                let body = collect_unsupported_outside_graph_scopes(&sq.patterns, kinds);
+                if body | collect_embedded_outside_graph_scopes(pattern, kinds) {
+                    kinds.push("subquery");
+                    reads_view = true;
+                }
+            }
+            // An EXISTS (or other pattern) embedded in an expression evaluates
+            // against this view, as an `EXISTS` pattern's body does.
+            Pattern::Filter(_) | Pattern::Bind { .. } | Pattern::Unwind { .. } => {
+                reads_view |= collect_embedded_outside_graph_scopes(pattern, kinds);
+            }
+            // The leaves that read this view's index.
+            Pattern::Triple(_) | Pattern::ListView(_) => reads_view = true,
             // Containers whose bodies evaluate against this view.
             Pattern::Optional(inner)
             | Pattern::Minus(inner)
             | Pattern::Exists(inner)
             | Pattern::NotExists(inner)
             | Pattern::DefaultGraphSource { patterns: inner } => {
-                collect_unsupported_outside_graph_scopes(inner, kinds);
+                reads_view |= collect_unsupported_outside_graph_scopes(inner, kinds);
             }
             Pattern::Union(branches) => {
                 for branch in branches {
-                    collect_unsupported_outside_graph_scopes(branch, kinds);
+                    reads_view |= collect_unsupported_outside_graph_scopes(branch, kinds);
                 }
             }
-            // Everything else is either a leaf, routed elsewhere, or its own
-            // scope — see the doc comment. Listed exhaustively so a new pattern
-            // variant that reads this view's index forces a decision here.
-            Pattern::Triple(_)
-            | Pattern::ListView(_)
-            | Pattern::Filter(_)
-            | Pattern::Bind { .. }
-            | Pattern::Unwind { .. }
-            | Pattern::Values { .. }
+            // Everything else is either a leaf that reads no index, routed
+            // elsewhere, or its own scope — see the doc comment. Listed
+            // exhaustively so a new pattern variant that reads this view's
+            // index forces a decision here.
+            Pattern::Values { .. }
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
             | Pattern::R2rml(_)
@@ -162,6 +218,110 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             | Pattern::Service(_)
             | Pattern::EdgeAnnotation { .. } => {}
         }
+    }
+    reads_view
+}
+
+/// [`collect_unsupported_outside_graph_scopes`] over the patterns embedded in
+/// `pattern`'s own expressions (see [`for_each_own_expression`]); returns
+/// whether any of them reads this view.
+fn collect_embedded_outside_graph_scopes(pattern: &Pattern, kinds: &mut Vec<&'static str>) -> bool {
+    let mut reads_view = false;
+    for_each_own_expression(pattern, &mut |expr| {
+        expr.for_each_embedded_patterns(&mut |inner| {
+            reads_view |= collect_unsupported_outside_graph_scopes(inner, kinds);
+        });
+    });
+    reads_view
+}
+
+/// The kind [`unsupported_query_modifiers`] reports, named in the refusal.
+const MODIFIER_EXISTS: &str = "EXISTS outside the WHERE clause";
+
+/// The kinds of pattern a graph source cannot evaluate in a query's own
+/// `HAVING`, per-group binds and `ORDER BY` expressions, and in the binds it
+/// evaluates after a trailing `VALUES` (`then`: GROUP BY expressions,
+/// aggregate inputs and SELECT expressions, which a trailing `VALUES` moves
+/// out of the `WHERE`), on a query whose default view is a graph source: an
+/// `EXISTS` or other embedded pattern.
+///
+/// Those expressions run after the `WHERE`, outside the graph scope the API
+/// layer wraps the `WHERE` in, so an embedded pattern there reads the graph
+/// source's empty native index whether or not the query wrote a `GRAPH` block
+/// of its own: an `EXISTS` is always false, a `NOT EXISTS` always true. One
+/// that reads the default view is refused, as a sub-select's body is; one that
+/// reads only through a `GRAPH` block of its own, or reads no index, is left
+/// alone, and the paths inside any of them are collected.
+pub fn unsupported_query_modifiers(
+    grouping: Option<&crate::ir::Grouping>,
+    order_binds: &[(VarId, Expression)],
+    then: &[(VarId, Expression)],
+) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    let mut reads_view = false;
+    let mut visit = |expr: &Expression| {
+        expr.for_each_embedded_patterns(&mut |inner| {
+            reads_view |= collect_unsupported_outside_graph_scopes(inner, &mut kinds);
+        });
+    };
+    if let Some(grouping) = grouping {
+        grouping.having().into_iter().for_each(&mut visit);
+        grouping.binds().for_each(|(_, expr)| visit(expr));
+    }
+    order_binds
+        .iter()
+        .chain(then)
+        .for_each(|(_, expr)| visit(expr));
+    if reads_view {
+        kinds.push(MODIFIER_EXISTS);
+    }
+    kinds
+}
+
+/// Visit the expressions `pattern` evaluates itself: a `FILTER`'s, a
+/// `BIND`'s, an `UNWIND`'s list, and a sub-select's `HAVING`, per-group binds
+/// and `ORDER BY` expressions. Not those of the patterns nested inside it; a
+/// caller that walks nested patterns reaches theirs on its own.
+fn for_each_own_expression(pattern: &Pattern, f: &mut dyn FnMut(&Expression)) {
+    match pattern {
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            f(expr);
+        }
+        Pattern::Subquery(sq) => {
+            if let Some(grouping) = &sq.grouping {
+                grouping.having().into_iter().for_each(&mut *f);
+                grouping.binds().for_each(|(_, expr)| f(expr));
+            }
+            sq.order_binds.iter().for_each(|(_, expr)| f(expr));
+        }
+        _ => {}
+    }
+}
+
+/// Replace each pattern list embedded in `pattern`'s own expressions with
+/// `rewrite`'s result for it.
+fn rewrite_embedded_patterns(
+    pattern: &mut Pattern,
+    rewrite: &mut dyn FnMut(&[Pattern]) -> Vec<Pattern>,
+) {
+    for_each_own_expression_mut(pattern, &mut |expr| {
+        expr.for_each_embedded_patterns_mut(&mut |inner| *inner = rewrite(inner));
+    });
+}
+
+/// [`for_each_own_expression`], with each expression given to `f` to change.
+fn for_each_own_expression_mut(pattern: &mut Pattern, f: &mut dyn FnMut(&mut Expression)) {
+    match pattern {
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            f(expr);
+        }
+        Pattern::Subquery(sq) => {
+            if let Some(grouping) = &mut sq.grouping {
+                grouping.for_each_expression_mut(f);
+            }
+            sq.order_binds.iter_mut().for_each(|(_, expr)| f(expr));
+        }
+        _ => {}
     }
 }
 
@@ -198,9 +358,15 @@ pub fn r2rml_unsupported_pattern_error(graph_iri: &str, count: usize) -> crate::
 /// * `snapshot` - Database for Sid-to-IRI conversion
 /// * `mapping` - The compiled R2RML mapping, when available. Used to decide
 ///   whether a same-subject `rdf:type` may be safely fused into a star scan
-///   (see [`class_fusion_is_safe`]). `None` disables class fusion — always
-///   correct, just less optimal — so callers that can cheaply load the mapping
-///   should pass it.
+///   (see [`class_fusion_is_safe`]). `None` disables class fusion and the
+///   fusion of a star's members — always correct, just less optimal — so
+///   callers that can cheaply load the mapping should pass it.
+/// * `keys` - What is known about the keys of the mapping's tables. Fusing a
+///   star's members, or a constant member onto a crawl wildcard, reads them
+///   from one row, which answers over the graph only when each subject is one
+///   row's ([`one_row_per_subject`]); an unanswered question is recorded in
+///   `keys` for the caller to fetch and rewrite again
+///   ([`rewrite_patterns_for_r2rml_source`] does).
 /// * `crawl_active` - Whether this rewrite serves a graph-source subgraph "browse"
 ///   crawl (sourced from `ExecutionContext::trust_fk_refs`, which only the crawl
 ///   sets). When `true`, a lone projected type-var (`?s a ?type`) co-located with
@@ -225,6 +391,7 @@ pub fn rewrite_patterns_for_r2rml(
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
     mapping: Option<&CompiledR2rmlMapping>,
+    keys: &TableKeyEvidence,
     reasoning_active: bool,
     crawl_active: bool,
 ) -> R2rmlRewriteResult {
@@ -247,8 +414,9 @@ pub fn rewrite_patterns_for_r2rml(
     let mut origins: Vec<usize> = Vec::with_capacity(patterns.len());
     let mut star_origin: HashMap<VarId, usize> = HashMap::new();
     let mut class_origin: HashMap<VarId, usize> = HashMap::new();
-    // Variables of each positional pattern (OPTIONAL, MINUS) seen so far, by
-    // input position.
+    // Variables each pattern that holds its written place (OPTIONAL, MINUS, a
+    // correlated sub-select; see `written_order_reads`) reads, by input
+    // position.
     let mut barrier_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
 
     for (i, pattern) in patterns.iter().enumerate() {
@@ -304,23 +472,59 @@ pub fn rewrite_patterns_for_r2rml(
                 }
             }
             // Recurse into structural containers (except Graph, which this
-            // rewriter is graph-source-bounded and treats as a leaf, and
-            // Subquery, which is its own scope).
+            // rewriter is graph-source-bounded and treats as a leaf). Each body
+            // is rewritten as its own scope, so nothing fuses across the
+            // boundary. A sub-select's body scans this same graph source, so
+            // it is lowered here too: `SubqueryOperator` then builds R2RML
+            // scans from it under the enclosing graph context, and anything
+            // its body cannot lower still lands in `unconverted`/`unsupported`
+            // and refuses the whole scope rather than reading the source's
+            // empty native index.
             Pattern::Optional(_)
             | Pattern::Union(_)
             | Pattern::Minus(_)
             | Pattern::Exists(_)
             | Pattern::NotExists(_)
-            | Pattern::Service(_) => {
-                if pattern.order_role().is_positional() {
-                    barrier_vars.push((i, pattern.referenced_vars().into_iter().collect()));
+            | Pattern::Service(_)
+            | Pattern::Subquery(_) => {
+                if let Some(reads) = written_order_reads(pattern) {
+                    barrier_vars.push((i, reads));
                 }
-                let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
+                let mut nested = |inner: &[Pattern]| {
                     let r = rewrite_patterns_for_r2rml(
-                        &inner,
+                        inner,
                         graph_source_id,
                         snapshot,
                         mapping,
+                        keys,
+                        reasoning_active,
+                        crawl_active,
+                    );
+                    converted += r.converted_count;
+                    unconverted += r.unconverted_count;
+                    unsupported.extend(r.unsupported);
+                    r.patterns
+                };
+                let mut rewritten = pattern.clone().map_subpatterns(&mut |inner| nested(&inner));
+                // A sub-select's HAVING and ORDER BY can embed an EXISTS.
+                rewrite_embedded_patterns(&mut rewritten, &mut nested);
+                result_patterns.push(rewritten);
+                origins.push(i);
+            }
+            // An EXISTS (or other pattern) embedded in an expression reads
+            // this graph source like an `EXISTS` pattern's body, so it is
+            // lowered as its own scope too; left alone it would read the
+            // source's empty native index (an `EXISTS` always false). An
+            // expression that embeds no pattern is passed through unchanged.
+            Pattern::Filter(_) | Pattern::Bind { .. } | Pattern::Unwind { .. } => {
+                let mut rewritten = pattern.clone();
+                rewrite_embedded_patterns(&mut rewritten, &mut |inner| {
+                    let r = rewrite_patterns_for_r2rml(
+                        inner,
+                        graph_source_id,
+                        snapshot,
+                        mapping,
+                        keys,
                         reasoning_active,
                         crawl_active,
                     );
@@ -336,8 +540,7 @@ pub fn rewrite_patterns_for_r2rml(
             // graph source's (empty) native index, so if left unconverted they
             // return no rows *silently* (fluree/db virtual-dataset findings
             // F1/F2). Record them so the caller errors loudly instead. A
-            // property/shortest path traverses the graph; a subquery's WHERE
-            // scans it. Sequence paths (`a/b`) never reach here — SPARQL
+            // property/shortest path traverses the graph. Sequence paths (`a/b`) never reach here — SPARQL
             // lowering decomposes them into triples upstream — so a residual
             // `PropertyPath` is a transitive/complex path. We do NOT attempt to
             // lower these (out of scope); we only convert silent-wrong into a
@@ -357,24 +560,19 @@ pub fn rewrite_patterns_for_r2rml(
                 result_patterns.push(pattern.clone());
                 origins.push(i);
             }
-            Pattern::Subquery(_) => {
-                unsupported.push("subquery");
-                result_patterns.push(pattern.clone());
-                origins.push(i);
-            }
             // Preserve the rest as-is. These do NOT hydrate this graph's index:
-            // Filter/Bind/Unwind/Values transform already-bound solutions;
+            // Values binds constants;
             // IndexSearch/VectorSearch/GeoSearch/S2Search carry their own
             // `graph_source_id` and route independently; `R2rml` is already
             // converted; nested `Graph`/`DefaultGraphSource` re-enter routing
-            // for their own target; the RDF-star `EdgeAnnotation` is
-            // expanded during planning (RDF-star over
-            // R2RML is undefined — left untouched here, not silently-empty in
-            // the confirmed sense).
-            Pattern::Filter(_)
-            | Pattern::ListView(_)
-            | Pattern::Bind { .. }
-            | Pattern::Unwind { .. }
+            // for their own target; the RDF-star `EdgeAnnotation` is expanded
+            // during planning and matches nothing here, which is correct: a
+            // mapping produces no annotation, and a ledger holding its triples
+            // holds none either. A `ListView` never reaches here from a
+            // graph-source scope: the callers strip the list view first
+            // (`list_view::without_list_view`), since a mapping holds no list
+            // values.
+            Pattern::ListView(_)
             | Pattern::Values { .. }
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
@@ -528,6 +726,31 @@ pub fn rewrite_patterns_for_r2rml(
                 }
                 continue;
             }
+        }
+
+        // A fused star reads all its members from one row. Where several rows
+        // mint one subject, the graph pairs each object of one member with
+        // each object of another across those rows, and matches a constant
+        // member on any of them; the fused scan pairs and matches within each
+        // row alone, and misses solutions. Members fuse only when every map
+        // the star reads mints each subject from one row; otherwise they run
+        // as separate scans, which the engine joins on the subject.
+        let fuses_members = var_members.len() > 1 || !const_members.is_empty();
+        if fuses_members
+            && !one_row_per_subject(
+                mapping,
+                keys,
+                var_members
+                    .iter()
+                    .chain(&const_members)
+                    .filter_map(|p| p.predicate_filter.as_deref()),
+            )
+        {
+            for m in var_members.into_iter().chain(const_members) {
+                result_patterns.push(Pattern::R2rml(m));
+                origins.push(origin);
+            }
+            continue;
         }
 
         let star_constraints: Vec<(String, ObjectConstant)> = const_members
@@ -696,8 +919,18 @@ pub fn rewrite_patterns_for_r2rml(
             ),
             _ => false,
         });
+        // A folded constant keeps a wildcard row only when that ROW holds it,
+        // while the graph keeps every triple of a subject holding it on any of
+        // its rows: fold only where each subject is one row's.
+        let per_subject = one_row_per_subject(
+            mapping,
+            keys,
+            const_members
+                .iter()
+                .filter_map(|m| m.predicate_filter.as_deref()),
+        );
         match wildcard {
-            Some(idx) if !cannot_rise => {
+            Some(idx) if !cannot_rise && per_subject => {
                 origins[idx] = origins[idx].min(written);
                 if let Pattern::R2rml(rp) = &mut result_patterns[idx] {
                     for m in const_members {
@@ -716,10 +949,10 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
-    // An OPTIONAL or a MINUS is evaluated over what is written before it, so
-    // restore written order around it: the grouped scans above were emitted
-    // after the loop, below every positional pattern.
-    if patterns.iter().any(|p| p.order_role().is_positional()) {
+    // An OPTIONAL, a MINUS or a correlated sub-select is evaluated over what is
+    // written before it, so restore written order around it: the grouped scans
+    // above were emitted after the loop, below every such pattern.
+    if patterns.iter().any(|p| written_order_reads(p).is_some()) {
         assert_eq!(origins.len(), result_patterns.len());
         let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
         ordered.sort_by_key(|(origin, _)| *origin);
@@ -1097,9 +1330,30 @@ fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> 
     Some(ScanValue::Decimal { unscaled, scale })
 }
 
+/// The variables a pattern that holds its written place reads from the patterns
+/// written before it, or `None` when the planner may move it freely.
+///
+/// An OPTIONAL or a MINUS (see [`crate::ir::OrderRole::is_positional`]) reads
+/// every variable it references. A correlated sub-select (JSON-LD's, seeded
+/// per outer row) reads its SELECT list: the planner takes its correlation
+/// inputs from the siblings written before it (`subquery_correlation_vars`),
+/// so the grouped scans this rewrite emits after its loop must be ordered back
+/// above it. Left below, `[?c ex:name ?n, sub-select]` became
+/// `[sub-select, star(?c)]`, and the sub-select ran once, uncorrelated: its
+/// `LIMIT` kept the top rows overall instead of per `?c`. A SPARQL sub-select
+/// is evaluated independently of where it is written, so it moves freely.
+fn written_order_reads(pattern: &Pattern) -> Option<HashSet<VarId>> {
+    match pattern {
+        Pattern::Subquery(sq) if !sq.uncorrelated => Some(sq.select.iter().copied().collect()),
+        p if p.order_role().is_positional() => Some(p.referenced_vars().into_iter().collect()),
+        _ => None,
+    }
+}
+
 /// Whether lifting a scan written at slot `from` up to slot `to` (`to < from`)
-/// carries it past a positional pattern (an OPTIONAL or a MINUS, see
-/// [`crate::ir::OrderRole::is_positional`]) that reads one of `vars`.
+/// carries it past a pattern that holds its written place (an OPTIONAL, a
+/// MINUS, a correlated sub-select: [`written_order_reads`]) that reads one of
+/// `vars`.
 ///
 /// Every fusion here merges scans written at different slots into one, and the
 /// written-order restore places the fused scan at a single slot. That slot must
@@ -1134,6 +1388,93 @@ fn bound_besides_subject(p: &R2rmlPattern) -> impl Iterator<Item = VarId> + '_ {
 }
 
 /// The subject var of a regular-predicate R2RML pattern that can join a
+/// Whether every subject a same-subject star over `predicates` can match is
+/// minted from one row, so a scan reading the star's members from one row
+/// sees all of a subject's objects. A map providing all of them (a map
+/// missing one yields no star row) must mint each of its subjects from one
+/// row, and no two such maps may mint one subject from rows of their own: a
+/// subject both mint has a row in each, and the graph pairs one row's objects
+/// with the other's. Two covering maps pass when their subjects are provably
+/// disjoint, or when they read the same row and mint every member alike (one
+/// set of triples, held once). `false` without a mapping, or while a map's
+/// table keys are unknown (recorded in `keys` for the caller to fetch).
+fn one_row_per_subject<'p>(
+    mapping: Option<&CompiledR2rmlMapping>,
+    keys: &TableKeyEvidence,
+    predicates: impl Iterator<Item = &'p str>,
+) -> bool {
+    let Some(mapping) = mapping else {
+        return false;
+    };
+    let predicates: Vec<&str> = predicates.collect();
+    let covering: Vec<&TriplesMap> = mapping
+        .triples_maps
+        .values()
+        .filter(|tm| {
+            predicates.iter().all(|p| {
+                tm.predicate_object_maps
+                    .iter()
+                    .any(|pom| pom.predicate_map.as_constant() == Some(*p))
+            })
+        })
+        .collect();
+    // Every covering map is asked, not just up to the first `false`, so one
+    // round of fetching learns every table the answer depends on.
+    let mut answer = true;
+    for tm in &covering {
+        if !keys.subject_unique(tm) {
+            answer = false;
+        }
+    }
+    answer
+        && covering.iter().enumerate().all(|(i, a)| {
+            covering[i + 1..].iter().all(|b| {
+                a.subjects_provably_disjoint(b)
+                    || (a.same_source_row(b) && predicates.iter().all(|p| a.mints_alike(b, p)))
+            })
+        })
+}
+
+/// Rewrite `patterns` for the R2RML graph source `graph_source_id`
+/// ([`rewrite_patterns_for_r2rml`]), fetching the table keys its fusion
+/// decisions ask about and rewriting again until they are all answered. The
+/// keys of a table no fusion asks about are never fetched. A source that
+/// refuses a table's declared keys refuses the query.
+pub async fn rewrite_patterns_for_r2rml_source(
+    ctx: &crate::context::ExecutionContext<'_>,
+    patterns: &[Pattern],
+    graph_source_id: &str,
+    mapping: Option<&CompiledR2rmlMapping>,
+    crawl_active: bool,
+) -> crate::error::Result<R2rmlRewriteResult> {
+    let as_of_t = if ctx.explicit_dataset().is_some() {
+        None
+    } else {
+        Some(ctx.to_t)
+    };
+    let mut keys = TableKeyEvidence::default();
+    loop {
+        let result = rewrite_patterns_for_r2rml(
+            patterns,
+            graph_source_id,
+            ctx.active_snapshot,
+            mapping,
+            &keys,
+            ctx.reasoning_active,
+            crawl_active,
+        );
+        let (Some(mapping), Some(provider)) = (mapping, ctx.r2rml_table_provider) else {
+            return Ok(result);
+        };
+        if !keys
+            .fetch_wanted(provider, mapping, graph_source_id, as_of_t)
+            .await?
+        {
+            return Ok(result);
+        }
+    }
+}
+
 /// same-subject star: variable subject, constant predicate, no class/TM filter,
 /// and either a fresh object var (distinct from the subject) or a constant-object
 /// equality. `None` (not eligible) for bound-subject patterns. Constant-object
@@ -1717,27 +2058,10 @@ fn wildcard_class_fusion_is_safe(mapping: &CompiledR2rmlMapping, class_iri: &str
     true
 }
 
-/// The constant prefix of an `rr:template` — everything before the first `{`
-/// placeholder (the whole string when there is no placeholder). Emitted verbatim
-/// by `expand_template`, so every IRI a template can produce starts with it —
-/// which is what makes the operator's bound-subject TriplesMap prune sound.
-pub(crate) fn constant_prefix(template: &str) -> &str {
-    match template.find('{') {
-        Some(i) => &template[..i],
-        None => template,
-    }
-}
-
-/// Whether two subject templates provably generate disjoint IRI sets: neither
-/// constant prefix is a string-prefix of the other, so every generated IRI of
-/// one differs from every generated IRI of the other within the constant region
-/// (before any placeholder value can matter). Equal prefixes are treated as
-/// overlapping (not disjoint) — conservative.
-fn templates_provably_disjoint(a: &str, b: &str) -> bool {
-    let pa = constant_prefix(a);
-    let pb = constant_prefix(b);
-    !pa.starts_with(pb) && !pb.starts_with(pa)
-}
+// The constant prefix of a template (every IRI it mints starts with it, which
+// makes the operator's bound-subject TriplesMap prune sound) and prefix
+// disjointness, shared with the uniqueness checks in `fluree_db_r2rml`.
+pub(crate) use fluree_db_r2rml::mapping::{constant_prefix, templates_provably_disjoint};
 
 /// Convert a triple pattern to an R2RML pattern.
 ///
@@ -1880,6 +2204,7 @@ mod tests {
     use crate::ir::triple::Ref;
     use crate::var_registry::VarId;
     use fluree_db_core::{is_rdf_type, Sid};
+    use fluree_db_r2rml::mapping::TableKeys;
     use fluree_vocab::namespaces::RDF;
 
     #[test]
@@ -2248,6 +2573,72 @@ mod tests {
         );
     }
 
+    // Two keyed maps that each cover a star over one subject template: each
+    // mints a subject from one row of its own table, but a subject both mint
+    // has a row in each, whose objects the graph pairs. The members stay
+    // separate scans unless the maps' subjects are provably apart or the maps
+    // read the same row and mint every member alike.
+    #[test]
+    fn star_two_covering_maps_fuse_only_when_apart_or_alike() {
+        const COUNTRY: &str = "http://example.org/country";
+        let covering = |iri: &str, table: &str, template: &str| {
+            TriplesMap::new(iri, table)
+                .with_subject_template(template)
+                .with_predicate_object(pom(PRED, "name"))
+                .with_predicate_object(pom(COUNTRY, "country"))
+        };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let scans = |maps: Vec<TriplesMap>| -> usize {
+            let mapping = CompiledR2rmlMapping::new(maps);
+            rewrite_patterns_for_r2rml(
+                &[star(PRED, 1), star(COUNTRY, 2)],
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::R2rml(_)))
+            .count()
+        };
+        let us = covering("#Us", "us", "http://example.org/person/{id}");
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Eu", "eu", "http://example.org/person/{id}")
+            ]),
+            2,
+            "a subject in both tables has a row in each: no fusion"
+        );
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Eu", "eu", "http://example.org/client/{id}")
+            ]),
+            1,
+            "subjects provably apart: each subject is one row's"
+        );
+        assert_eq!(
+            scans(vec![
+                us.clone(),
+                covering("#Us2", "us", "http://example.org/person/{id}")
+            ]),
+            1,
+            "one row, every member minted alike: one set of triples"
+        );
+        assert_eq!(scans(vec![us]), 1, "one covering map still fuses");
+    }
+
     // F10: members split across maps sharing the subject template. No single
     // map covers the star, so fusing would materialize no row; the members stay
     // separate scans the engine joins on the subject.
@@ -2270,14 +2661,22 @@ mod tests {
             ))
         };
         let rewrite = |patterns: &[Pattern]| -> Vec<R2rmlPattern> {
-            rewrite_patterns_for_r2rml(patterns, "gs:main", &snapshot, Some(&mapping), false, false)
-                .patterns
-                .into_iter()
-                .filter_map(|p| match p {
-                    Pattern::R2rml(rp) => Some(rp),
-                    _ => None,
-                })
-                .collect()
+            rewrite_patterns_for_r2rml(
+                patterns,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
         };
         let split = rewrite(&[star(PRED, 1), star(COUNTRY, 2)]);
         assert_eq!(split.len(), 2, "one scan per map, joined on the subject");
@@ -2294,6 +2693,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             false,
         )
@@ -2340,6 +2740,7 @@ mod tests {
                 "gs:main",
                 &snapshot,
                 Some(mapping),
+                &TableKeyEvidence::assume_keyed_by_subjects(mapping),
                 false,
                 false,
             )
@@ -2719,6 +3120,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(mapping),
             reasoning_active,
             crawl_active,
         )
@@ -2799,6 +3201,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             true,
         )
@@ -2834,6 +3237,135 @@ mod tests {
                 .any(|p| p.predicate_filter.as_deref() == Some(KEY_PRED)),
             "the standalone orderLineKey scan must be folded away, not joined: {pats:?}"
         );
+    }
+
+    /// A fused star reads its members from one row, so over a map whose
+    /// subject spans rows (a history table's versions) it would pair only the
+    /// objects within each row. The rewrite fuses the members, a constant
+    /// member included, only once the table's keys show each subject is one
+    /// row's; until they are fetched it records the table and leaves the
+    /// members as separate scans, and a table fetched without a key stays so.
+    #[test]
+    fn a_star_fuses_only_over_maps_whose_subjects_are_one_rows() {
+        use fluree_db_core::FlakeValue;
+        const NAME: &str = "http://example.org/name";
+        const CITY: &str = "http://example.org/city";
+        let history = TriplesMap::new("#History", "history")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(NAME, "name"))
+            .with_predicate_object(pom(CITY, "city"));
+        let mapping = CompiledR2rmlMapping::new(vec![history]);
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let member = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let miami = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Iri(CITY.into()),
+            Term::Value(FlakeValue::String("Miami".into())),
+        ));
+        let rewrite = |patterns: &[Pattern], keys: &TableKeyEvidence| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(
+                patterns,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                keys,
+                false,
+                false,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+        };
+        let shapes = [
+            vec![member(NAME, 1), member(CITY, 2)],
+            vec![member(NAME, 1), miami.clone()],
+        ];
+        let unfetched = TableKeyEvidence::default();
+        let keyless = TableKeyEvidence::default().with_known("history", TableKeys::none());
+        let keyed = TableKeyEvidence::default().with_known("history", TableKeys::new([["id"]]));
+        for shape in &shapes {
+            for keys in [&unfetched, &keyless] {
+                let split = rewrite(shape, keys);
+                assert_eq!(split.len(), 2, "members stay separate scans: {split:?}");
+                assert!(split
+                    .iter()
+                    .all(|p| p.star_bindings.is_empty() && p.star_constraints.is_empty()));
+            }
+            let fused = rewrite(shape, &keyed);
+            assert_eq!(fused.len(), 1, "a keyed star fuses: {fused:?}");
+            assert_eq!(
+                fused[0].star_bindings.len() + fused[0].star_constraints.len(),
+                1
+            );
+        }
+        assert_eq!(unfetched.wanted_tables(), vec!["history".to_string()]);
+        assert!(keyless.wanted_tables().is_empty());
+        // A lone member reads one predicate from each row: it never asks.
+        let lone = TableKeyEvidence::default();
+        assert_eq!(rewrite(&[member(NAME, 1)], &lone).len(), 1);
+        assert!(lone.wanted_tables().is_empty());
+    }
+
+    /// The crawl's constant folded onto its wildcard keeps a wildcard row only
+    /// when that row holds the constant: over a map whose subject spans rows
+    /// the constant stays a separate scan the wildcard joins on the subject.
+    #[test]
+    fn a_crawl_constant_folds_only_over_maps_whose_subjects_are_one_rows() {
+        use fluree_db_core::FlakeValue;
+        const CITY: &str = "http://example.org/city";
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let history = TriplesMap::new("#History", "history")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(CITY, "city"));
+        let mapping = CompiledR2rmlMapping::new(vec![history]);
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(CITY.into()),
+                Term::Value(FlakeValue::String("Miami".into())),
+            )),
+        ];
+        let rewrite = |keys: &TableKeyEvidence| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(
+                &patterns,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                keys,
+                false,
+                true,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+        };
+        let keyless = TableKeyEvidence::default().with_known("history", TableKeys::none());
+        let split = rewrite(&keyless);
+        assert_eq!(split.len(), 2, "the constant stays its own scan: {split:?}");
+        assert!(split.iter().all(|p| p.star_constraints.is_empty()));
+        let keyed = TableKeyEvidence::default().with_known("history", TableKeys::new([["id"]]));
+        let folded = rewrite(&keyed);
+        assert_eq!(folded.len(), 1, "the constant folds: {folded:?}");
+        assert_eq!(folded[0].star_constraints.len(), 1);
     }
 
     // W4-1b: the crawl-wildcard finder tolerates an already-set class_filter /
@@ -2974,6 +3506,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             true,
         )
@@ -3032,6 +3565,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             false,
         );
@@ -3108,11 +3642,13 @@ mod tests {
 
     fn rewrite_scope(patterns: &[Pattern], crawl_active: bool) -> Vec<Pattern> {
         let snapshot = LedgerSnapshot::genesis("test:main");
+        let mapping = written_order_mapping();
         rewrite_patterns_for_r2rml(
             patterns,
             "gs:main",
             &snapshot,
-            Some(&written_order_mapping()),
+            Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             crawl_active,
         )
@@ -3329,6 +3865,57 @@ mod tests {
         assert!(star < minus, "{out:?}");
     }
 
+    /// `?s name ?n {sub-select ?s ?k} ?s nick ?k`. A JSON-LD sub-select is
+    /// correlated with what is written before it (the planner seeds it from
+    /// those siblings only), so the star written above it stays above it:
+    /// emitted after the loop it ran below, and the sub-select ran once,
+    /// uncorrelated. And the `nick` member, which binds one of its SELECT
+    /// variables, is not lifted into that star above it, where `?k` would
+    /// become a correlation input. A SPARQL sub-select is evaluated
+    /// independently, so it holds no place and the member fuses.
+    #[test]
+    fn a_correlated_sub_select_keeps_its_written_order() {
+        use crate::ir::pattern::SubqueryPattern;
+        for uncorrelated in [false, true] {
+            let mut sq = SubqueryPattern::new(
+                vec![VarId(0), VarId(2)],
+                vec![triple(0, SCORE_PRED, Term::Var(VarId(2)))],
+            );
+            sq.uncorrelated = uncorrelated;
+            let out = rewrite_scope(
+                &[
+                    triple(0, PRED, Term::Var(VarId(1))),
+                    Pattern::Subquery(sq),
+                    triple(0, OTHER_PRED, Term::Var(VarId(2))),
+                ],
+                false,
+            );
+            let at = |pred: &str| {
+                out.iter().position(|p| {
+                    matches!(p, Pattern::R2rml(rp) if rp.predicate_filter.as_deref() == Some(pred))
+                })
+            };
+            let sub = out
+                .iter()
+                .position(|p| matches!(p, Pattern::Subquery(_)))
+                .expect("the sub-select stays a scope");
+            let star = at(PRED).expect("the name star");
+            if uncorrelated {
+                let Pattern::R2rml(rp) = &out[star] else {
+                    unreachable!()
+                };
+                assert!(
+                    rp.star_bindings.iter().any(|(p, _)| p == OTHER_PRED),
+                    "SPARQL: nick fuses into the star: {out:?}"
+                );
+            } else {
+                assert!(star < sub, "the star stays above: {out:?}");
+                let nick = at(OTHER_PRED).expect("nick is a scan of its own");
+                assert!(sub < nick, "nick stays below: {out:?}");
+            }
+        }
+    }
+
     /// `?s a C ; name ?n . ?s ?p ?o`: the class fuses into the `name` star, so
     /// the crawl wildcard beside it is hinted to C's maps. Unhinted it resolves
     /// every map, and when the star's subjects are few its LIMIT budget is never
@@ -3386,6 +3973,7 @@ mod tests {
             "gs:main",
             &LedgerSnapshot::genesis("test:main"),
             Some(&mapping),
+            &TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             true,
         )
@@ -3401,13 +3989,12 @@ mod tests {
     }
 
     /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML
-    /// source's empty native index (property/shortest path, subquery) is
-    /// recorded in `unsupported` so the caller errors loudly instead of
-    /// returning a silently-empty result (fluree/db virtual-dataset F1/F2).
+    /// source's empty native index (property/shortest path) is recorded in
+    /// `unsupported` so the caller errors loudly instead of returning a
+    /// silently-empty result (fluree/db virtual-dataset F1/F2).
     #[test]
     fn non_lowered_subscopes_are_flagged_unsupported() {
         use crate::ir::path::{PathModifier, PropertyPathPattern};
-        use crate::ir::pattern::SubqueryPattern;
         let snapshot = LedgerSnapshot::genesis("test:main");
 
         // Transitive property path.
@@ -3417,13 +4004,16 @@ mod tests {
             PathModifier::OneOrMore,
             Ref::Var(VarId(1)),
         ));
-        let r = rewrite_patterns_for_r2rml(&[path], "gs:main", &snapshot, None, false, false);
+        let r = rewrite_patterns_for_r2rml(
+            &[path],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
         assert_eq!(r.unsupported, vec!["property path"]);
-
-        // Subquery.
-        let sub = Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], vec![]));
-        let r = rewrite_patterns_for_r2rml(&[sub], "gs:main", &snapshot, None, false, false);
-        assert_eq!(r.unsupported, vec!["subquery"]);
 
         // A property path nested inside an OPTIONAL is caught via recursion.
         let opt = Pattern::Optional(vec![Pattern::PropertyPath(PropertyPathPattern::new(
@@ -3432,12 +4022,134 @@ mod tests {
             PathModifier::ZeroOrMore,
             Ref::Var(VarId(1)),
         ))]);
-        let r = rewrite_patterns_for_r2rml(&[opt], "gs:main", &snapshot, None, false, false);
+        let r = rewrite_patterns_for_r2rml(
+            &[opt],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
         assert_eq!(
             r.unsupported,
             vec!["property path"],
             "recursion into OPTIONAL must catch a nested path"
         );
+    }
+
+    /// A sub-select's body scans the enclosing graph source, so the rewrite
+    /// lowers it as its own scope: its triples become R2RML scans (counted in
+    /// `converted_count`), its projection and modifiers are untouched, and
+    /// nothing is flagged. What its body cannot lower still refuses: a path
+    /// inside it lands in `unsupported`, a variable predicate with a bound
+    /// object in `unconverted_count`, exactly as at the top of the scope.
+    #[test]
+    fn a_sub_select_body_is_lowered_as_its_own_scope() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let wildcard = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Var(VarId(1)),
+            Term::Var(VarId(2)),
+        ));
+
+        let mut sq = SubqueryPattern::new(vec![VarId(0)], vec![wildcard.clone()]);
+        sq.distinct = true;
+        sq.limit = Some(3);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(sq)],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
+        assert!(r.unsupported.is_empty(), "{:?}", r.unsupported);
+        assert_eq!((r.converted_count, r.unconverted_count), (1, 0));
+        let [Pattern::Subquery(out)] = r.patterns.as_slice() else {
+            panic!("the sub-select stays a sub-select: {:?}", r.patterns);
+        };
+        assert!(
+            matches!(out.patterns.as_slice(), [Pattern::R2rml(rp)] if rp.graph_source_id == "gs:main"),
+            "its body is an R2RML scan of the enclosing source: {:?}",
+            out.patterns
+        );
+        assert_eq!(
+            (out.select.as_slice(), out.distinct, out.limit),
+            ([VarId(0)].as_slice(), true, Some(3)),
+            "projection and modifiers are carried over"
+        );
+
+        // Nested one level deeper, the inner body is lowered too.
+        let inner = SubqueryPattern::new(vec![VarId(0)], vec![wildcard.clone()]);
+        let outer = SubqueryPattern::new(vec![VarId(0)], vec![Pattern::Subquery(inner)]);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(outer)],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
+        assert!(r.unsupported.is_empty());
+        assert_eq!(r.converted_count, 1);
+
+        // A path inside the body still refuses the scope.
+        let path = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "knows"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        ));
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![wildcard, path]);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(sq)],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
+        assert_eq!(r.unsupported, vec!["property path"]);
+
+        // So does an unconvertible triple (variable predicate, bound object).
+        let bound_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Var(VarId(1)),
+            Term::Value(FlakeValue::String("x".to_string())),
+        ));
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![bound_object]);
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Subquery(sq)],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
+        assert_eq!(r.unconverted_count, 1);
+    }
+
+    /// The out-of-scope guard reports a sub-select with advice that fits it:
+    /// move it into the source's graph block. Paths keep their own advice.
+    #[test]
+    fn a_stranded_sub_select_is_told_where_to_go() {
+        let msg = unsupported_subscope_error(&["gs:main"], &["subquery"]).to_string();
+        assert!(msg.contains("subquery"), "{msg}");
+        assert!(
+            msg.contains("from inside that source's graph block"),
+            "{msg}"
+        );
+        assert!(!msg.contains("fixed-length"), "{msg}");
+        let msg = unsupported_subscope_error(&["gs:main"], &["property path"]).to_string();
+        assert!(msg.contains("fixed-length"), "{msg}");
+        assert!(!msg.contains("sub-select"), "{msg}");
     }
 
     /// PR-0/0a negative case: patterns that only transform already-bound
@@ -3457,7 +4169,15 @@ mod tests {
                 Term::Var(VarId(2)),
             )),
         ];
-        let r = rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, None, false, false);
+        let r = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
         assert!(
             r.unsupported.is_empty(),
             "VALUES must not be flagged unsupported"
@@ -3540,6 +4260,175 @@ mod tests {
         );
     }
 
+    /// A sub-select outside every graph scope is refused only when its body
+    /// reads this view: a body that reads through its own `GRAPH` block is
+    /// lowered there, and one that reads nothing (`VALUES`, `BIND`) needs no
+    /// index. Paths inside a body are still flagged.
+    #[test]
+    fn out_of_scope_scan_flags_a_sub_select_only_when_its_body_reads_this_view() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        use crate::ir::GraphName;
+
+        let sub = |patterns: Vec<Pattern>| {
+            Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], patterns))
+        };
+        let reads = || triple(0, PRED, Term::Var(VarId(1)));
+        let in_graph = |patterns: Vec<Pattern>| Pattern::Graph {
+            name: GraphName::Iri("gs:main".into()),
+            patterns,
+        };
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![reads()])]),
+            vec!["subquery"]
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![Pattern::Optional(vec![reads()])])]),
+            vec!["subquery"],
+            "an OPTIONAL in the body reads this view too"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![sub(vec![reads()])])])
+                .contains(&"subquery"),
+            "a nested body that reads this view"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![in_graph(vec![reads()])])]).is_empty(),
+            "a body that reads only through its own graph block"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![])]).is_empty(),
+            "a body that reads no index"
+        );
+        let path = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "edge"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        ));
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![path, in_graph(vec![reads()])])]),
+            vec!["property path"],
+            "a path in the body is still flagged"
+        );
+    }
+
+    /// A pattern embedded in an expression (an `EXISTS`) reads the scope it
+    /// sits in. Inside a graph-source scope the rewrite lowers it with the
+    /// rest; outside every graph scope the guard counts it as reading this
+    /// view (so a sub-select carrying one refuses), flags the paths in it,
+    /// and refuses one in the query's own HAVING / ORDER BY.
+    #[test]
+    fn a_pattern_embedded_in_an_expression_reads_its_scope() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        use crate::ir::GraphName;
+
+        let reads = || triple(0, PRED, Term::Var(VarId(1)));
+        let exists = |patterns: Vec<Pattern>| Expression::Exists {
+            patterns,
+            negated: false,
+        };
+        let in_graph = |patterns: Vec<Pattern>| Pattern::Graph {
+            name: GraphName::Iri("gs:main".into()),
+            patterns,
+        };
+        let path = || {
+            Pattern::PropertyPath(PropertyPathPattern::new(
+                Ref::Var(VarId(0)),
+                Sid::new(100, "edge"),
+                PathModifier::OneOrMore,
+                Ref::Var(VarId(1)),
+            ))
+        };
+        let sub = |patterns: Vec<Pattern>| {
+            Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], patterns))
+        };
+        let bind = |expr| Pattern::Bind {
+            var: VarId(2),
+            expr,
+        };
+
+        // Inside a graph-source scope: lowered, in a FILTER, a BIND and a
+        // sub-select's ORDER BY alike.
+        let lowered = |p: &Pattern| {
+            let mut found = Vec::new();
+            for_each_own_expression(p, &mut |expr| {
+                expr.for_each_embedded_patterns(&mut |inner| {
+                    found.push(inner.iter().all(|q| matches!(q, Pattern::R2rml(_))));
+                });
+            });
+            assert!(!found.is_empty(), "no embedded patterns in {p:?}");
+            found.into_iter().all(|x| x)
+        };
+        let mut ordered = SubqueryPattern::new(vec![VarId(0)], vec![reads()]);
+        ordered.order_binds = vec![(VarId(3), exists(vec![reads()]))];
+        for p in [
+            Pattern::Filter(exists(vec![reads()])),
+            bind(exists(vec![reads()])),
+            Pattern::Subquery(ordered.clone()),
+        ] {
+            let out = rewrite_scope(std::slice::from_ref(&p), false);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(lowered(&out[0]), "{out:?}");
+        }
+        // A path in one still refuses the scope.
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let r = rewrite_patterns_for_r2rml(
+            &[Pattern::Filter(exists(vec![path()]))],
+            "gs:main",
+            &snapshot,
+            None,
+            &TableKeyEvidence::default(),
+            false,
+            false,
+        );
+        assert_eq!(r.unsupported, vec!["property path"]);
+
+        // Outside every graph scope.
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[sub(vec![Pattern::Filter(exists(vec![reads()]))])]),
+            vec!["subquery"],
+            "a sub-select whose FILTER EXISTS reads this view"
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[Pattern::Subquery(ordered)]),
+            vec!["subquery"],
+            "a sub-select whose ORDER BY reads this view"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[sub(vec![bind(exists(vec![in_graph(vec![
+                reads()
+            ])]))])])
+            .is_empty(),
+            "an EXISTS that reads only through its own graph block"
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[bind(exists(vec![path()]))]),
+            vec!["property path"],
+            "a path in an embedded EXISTS"
+        );
+
+        // The query's own HAVING / ORDER BY.
+        assert_eq!(
+            unsupported_query_modifiers(None, &[], &[(VarId(3), exists(vec![reads()]))]),
+            vec![MODIFIER_EXISTS]
+        );
+        assert!(
+            unsupported_query_modifiers(
+                None,
+                &[(VarId(3), exists(vec![in_graph(vec![reads()])]))],
+                &[]
+            )
+            .is_empty(),
+            "an EXISTS that reads only through its own graph block"
+        );
+        assert!(
+            unsupported_query_modifiers(None, &[(VarId(3), Expression::Var(VarId(0)))], &[])
+                .is_empty()
+        );
+    }
+
     #[test]
     fn bigdecimal_decomposes_scale_insensitively() {
         use std::str::FromStr;
@@ -3608,9 +4497,9 @@ mod tests {
 
     #[test]
     fn filter_in_declines_over_cap() {
-        // Default cap is 64; 65 members decline (kept cheap — O(files × members)).
+        // One member past the cap declines the whole set.
         let mut args = vec![Expression::Var(VarId(0))];
-        for i in 0..65 {
+        for i in 0..=crate::r2rml::in_pushdown_max() as i64 {
             args.push(Expression::Const(FlakeValue::Long(i)));
         }
         let mut out = Vec::new();

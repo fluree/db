@@ -32,7 +32,7 @@ pub(super) fn eligible(
 
 pub(super) struct WildcardJoin {
     cursor: BatchedWildcardCursor,
-    left_batches: Vec<Batch>,
+    left_batches: Vec<Arc<Batch>>,
     /// A lookup key can drive several rows, including exact duplicate rows.
     left_rows: FxHashMap<u64, Vec<(usize, usize)>>,
     matches: Option<WildcardMatches>,
@@ -44,7 +44,8 @@ pub(super) struct WildcardJoin {
 impl WildcardJoin {
     pub(super) fn new(join: &mut NestedLoopJoinOperator, ctx: &ExecutionContext<'_>) -> Self {
         let mut left_rows: FxHashMap<u64, Vec<(usize, usize)>> = FxHashMap::default();
-        for (batch, row, key) in join.batched_accumulator.drain(..) {
+        // Wildcard keys are refs (`object_lane_keys`): the subject id.
+        for (batch, row, (_, key)) in join.batched_accumulator.drain(..) {
             left_rows.entry(key).or_default().push((batch, row));
         }
         let keys: Vec<u64> = left_rows.keys().copied().collect();

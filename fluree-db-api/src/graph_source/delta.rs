@@ -241,6 +241,10 @@ pub struct DeltaCreateResult {
     /// registering process may lack the credentials the query process has.
     pub table_warnings: Vec<String>,
     pub model_warnings: Vec<String>,
+    /// Advisories about the mapping as the source's queries will read it: a
+    /// `keylessMap` for each map no `f:key` proves subject-unique, which
+    /// queries deduplicate (a Delta table reports no key of its own).
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 impl crate::Fluree {
@@ -261,7 +265,7 @@ impl crate::Fluree {
                 &graph_source_id,
                 &config.mapping,
                 config.mapping_media_type.as_deref(),
-                false,
+                super::r2rml::SqlQueryPolicy::Refuse,
             )
             .await?;
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
@@ -351,6 +355,22 @@ impl crate::Fluree {
             )
             .await?;
 
+        // A Delta table reports no key, so this reads no table: a map's keys
+        // are what the mapping declares, whether its table loaded or not.
+        let diagnostics = match &registered.compiled {
+            Some(compiled) => {
+                super::r2rml::registered_keyless_maps(
+                    &super::r2rml::FlureeR2rmlProvider::new(self),
+                    &graph_source_id,
+                    compiled,
+                    super::iceberg_validate::QueryTables::Alias,
+                    super::iceberg_validate::KeyRemedy::Declare,
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
+
         info!(graph_source_id = %graph_source_id, mapping_address = %registered.address, "Created Delta graph source");
         Ok(DeltaCreateResult {
             graph_source_id,
@@ -361,6 +381,7 @@ impl crate::Fluree {
             table_versions,
             table_warnings,
             model_warnings,
+            diagnostics,
         })
     }
 
@@ -510,8 +531,8 @@ impl DeltaSource {
     ) -> QueryResult<(Placement, DeltaTable, DeltaSnapshot)> {
         if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
             return Err(QueryError::InvalidQuery(format!(
-                "Graph source '{}': rr:sqlQuery logical tables are only supported by SQL \
-                 graph sources",
+                "Graph source '{}': rr:sqlQuery logical tables are not supported by Delta \
+                 graph sources; use rr:tableName",
                 self.graph_source_id
             )));
         }

@@ -20,6 +20,7 @@
 
 use crate::support::{genesis_ledger_for_fluree, normalize_rows, span_capture};
 use fluree_db_api::{FlureeBuilder, QueryInput, ReindexOptions};
+use fluree_db_indexer::IndexerConfig;
 use serde_json::json;
 
 fn ctx() -> serde_json::Value {
@@ -634,6 +635,522 @@ async fn batched_object_join_merges_novelty() {
             "{name}: novelty-merged object join != reindexed ground truth"
         );
     }
+}
+
+/// The bound-object lane reads a predicate's POST rows, where its refs share
+/// a leaflet with its literals, and only the ref rows may answer. `ex:topic`
+/// puts literals on both sides of the refs (numbers and strings sort below,
+/// language-tagged strings above), so the leaflet's object keys are not
+/// ordered as a whole. `ex:tag` loses every ref after the first index, which
+/// leaves its leaflet holding strings alone: a query at the earlier `t` needs
+/// rows that neither the leaflet's type constant nor its keys describe.
+#[tokio::test]
+async fn batched_object_join_reads_refs_among_literals() {
+    refs_among_literals("it/join-batched-object-mixed:main", ReindexOptions::default).await;
+}
+
+/// The same shapes over an index of two-row leaflets, two to a leaf, so an
+/// object's run spans leaflets and leaves and the walk jumps between leaves.
+#[tokio::test]
+async fn batched_object_join_reads_refs_among_literals_across_small_leaflets() {
+    refs_among_literals("it/join-batched-object-mixed-small:main", || {
+        ReindexOptions::default().with_indexer_config(
+            IndexerConfig::default()
+                .with_leaflet_rows(2)
+                .with_leaf_rows(4),
+        )
+    })
+    .await;
+}
+
+async fn refs_among_literals(ledger_id: &str, reindex_opts: fn() -> ReindexOptions) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+
+    let lang = |value: &str, language: &str| json!({"@value": value, "@language": language});
+    let base = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": [
+                {"@id": "ex:bob"}, {"@id": "ex:carol"}, {"@id": "ex:erin"}
+            ]},
+            {"@id": "ex:d1", "ex:topic": {"@id": "ex:bob"}, "ex:tag": {"@id": "ex:bob"}},
+            {"@id": "ex:d2", "ex:topic": {"@id": "ex:carol"}, "ex:tag": {"@id": "ex:carol"}},
+            {"@id": "ex:d3", "ex:topic": [{"@id": "ex:bob"}, 7, "bob"]},
+            {"@id": "ex:d4", "ex:topic": [1, 2, "carol"], "ex:tag": [
+                "bob", "carol", "erin", "dave", "frank", "grace"
+            ]},
+            {"@id": "ex:d5", "ex:topic": [
+                lang("bob", "en"), lang("carol", "en"), lang("erin", "en"), lang("dave", "en"),
+                lang("bob", "fr"), lang("carol", "fr"), lang("erin", "fr"), lang("dave", "fr")
+            ]}
+        ]
+    });
+    let receipt = fluree.insert(ledger, &base).await.expect("base insert");
+    let base_t = receipt.ledger.t();
+    fluree
+        .reindex(ledger_id, reindex_opts())
+        .await
+        .expect("reindex base");
+
+    let topic_jsonld = json!({
+        "@context": ctx(),
+        "select": ["?b", "?x"],
+        "where": [{"@id": "ex:alice", "ex:knows": "?b"}, {"@id": "?x", "ex:topic": "?b"}]
+    });
+    let queries: [(&str, QueryInput<'_>); 3] = [
+        (
+            "topic-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?b ?x WHERE { ex:alice ex:knows ?b . ?x ex:topic ?b }",
+            ),
+        ),
+        ("topic-jsonld", QueryInput::from(&topic_jsonld)),
+        (
+            "tag-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?b ?x WHERE { ex:alice ex:knows ?b . ?x ex:tag ?b }",
+            ),
+        ),
+    ];
+    let pairs = |rows: &[(&str, &str)]| -> Vec<serde_json::Value> {
+        normalize_rows(&json!(rows
+            .iter()
+            .map(|(b, x)| json!([format!("ex:{b}"), format!("ex:{x}")]))
+            .collect::<Vec<_>>()))
+    };
+    // Every phase must answer through the lane, or it proves nothing about it.
+    let check = |phase: &'static str, view: fluree_db_api::GraphDb, expected: [Vec<_>; 3]| {
+        let (fluree, queries) = (&fluree, &queries);
+        async move {
+            for ((name, query), expected) in queries.iter().zip(expected) {
+                let (spans, guard) = span_capture::init_test_tracing();
+                let rows = run_input(fluree, &view, query).await;
+                drop(guard);
+                assert_eq!(rows, expected, "{phase}/{name}");
+                assert!(
+                    spans.has_span("join_flush_batched_object_binary"),
+                    "{phase}/{name}: bound-object lane should engage; spans: {:?}",
+                    spans.span_names()
+                );
+            }
+        }
+    };
+
+    let at_base = || {
+        let topic = pairs(&[("bob", "d1"), ("bob", "d3"), ("carol", "d2")]);
+        [
+            topic.clone(),
+            topic,
+            pairs(&[("bob", "d1"), ("carol", "d2")]),
+        ]
+    };
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    check("indexed", view, at_base()).await;
+
+    // Novelty: `ex:tag` loses both refs; `ex:topic` loses one and gains one.
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    let receipt = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": [
+                    {"@id": "ex:d1", "ex:tag": {"@id": "ex:bob"}},
+                    {"@id": "ex:d2", "ex:tag": {"@id": "ex:carol"}},
+                    {"@id": "ex:d3", "ex:topic": {"@id": "ex:bob"}}
+                ],
+                "insert": {"@id": "ex:d6", "ex:topic": {"@id": "ex:carol"}}
+            }),
+        )
+        .await
+        .expect("novelty update");
+    assert!(receipt.ledger.t() > base_t);
+    let at_head = || {
+        let topic = pairs(&[("bob", "d1"), ("carol", "d2"), ("carol", "d6")]);
+        [topic.clone(), topic, pairs(&[])]
+    };
+    let view = fluree.db(ledger_id).await.expect("novelty view");
+    check("novelty", view, at_head()).await;
+
+    fluree
+        .reindex(ledger_id, reindex_opts())
+        .await
+        .expect("reindex head");
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    check("reindexed", view, at_head()).await;
+    let view = fluree.db_at_t(ledger_id, base_t).await.expect("base view");
+    check("reindexed, at the base t", view, at_base()).await;
+}
+
+/// The bound-object lane keys a string term on its exact `(o_type, o_key)`:
+/// `"bob"`, `"bob"@en`, `"zed"^^xsd:anyURI` and `"zed"^^ex:code` share a string
+/// id with a term they must not join. Each case counts the left rows the lane
+/// took, so a term cannot pass by falling back to the per-row scan — nor a
+/// number (`7`), which matches across datatypes, by riding the lane.
+#[tokio::test]
+async fn batched_object_join_reads_string_terms() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-object-strings:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+
+    let context = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+    let lang = |value: &str, language: &str| json!({"@value": value, "@language": language});
+    let typed = |value: &str, datatype: &str| json!({"@value": value, "@type": datatype});
+    // Enough `ex:tag` rows that the planner drives from `ex:says`.
+    let many_refs: Vec<_> = (1..=14)
+        .map(|i| json!({"@id": format!("ex:r{i}")}))
+        .collect();
+    let base = json!({
+        "@context": context,
+        "@graph": [
+            {"@id": "ex:alice", "ex:says": [
+                "bob", "nobody", "erin", lang("carol", "en"), lang("dave", "fr"),
+                typed("zed", "xsd:anyURI"), typed("zed", "ex:code"), 7
+            ]},
+            {"@id": "ex:mix", "ex:says": [{"@id": "ex:bob"}, "bob", lang("bob", "en")]},
+            {"@id": "ex:d1", "ex:topic": "bob"},
+            {"@id": "ex:d2", "ex:topic": lang("bob", "en")},
+            {"@id": "ex:d3", "ex:topic": lang("carol", "en")},
+            {"@id": "ex:d4", "ex:topic": "carol"},
+            {"@id": "ex:d5", "ex:topic": lang("carol", "fr")},
+            {"@id": "ex:d6", "ex:topic": lang("dave", "fr")},
+            {"@id": "ex:d7", "ex:topic": {"@id": "ex:bob"}},
+            {"@id": "ex:d8", "ex:topic": 7},
+            {"@id": "ex:d9", "ex:topic": ["bob", typed("zed", "xsd:anyURI")]},
+            {"@id": "ex:d10", "ex:topic": "zed"},
+            {"@id": "ex:d11", "ex:topic": "erin"},
+            {"@id": "ex:d18", "ex:topic": typed("zed", "ex:code")},
+            {"@id": "ex:d20", "ex:tag": "bob"},
+            {"@id": "ex:d21", "ex:tag": "erin"},
+            {"@id": "ex:d22", "ex:tag": {"@id": "ex:bob"}},
+            {"@id": "ex:d23", "ex:tag": {"@id": "ex:carol"}},
+            {"@id": "ex:d24", "ex:tag": many_refs}
+        ]
+    });
+    let receipt = fluree.insert(ledger, &base).await.expect("base insert");
+    let base_t = receipt.ledger.t();
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    let topic_jsonld = json!({
+        "@context": context,
+        "select": ["?v", "?x"],
+        "where": [{"@id": "ex:alice", "ex:says": "?v"}, {"@id": "?x", "ex:topic": "?v"}]
+    });
+    let queries: [(&str, QueryInput<'_>); 4] = [
+        (
+            "topic-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                  SELECT ?v ?x WHERE { ex:alice ex:says ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        ("topic-jsonld", QueryInput::from(&topic_jsonld)),
+        // Refs and strings in one flush.
+        (
+            "mixed-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:mix ex:says ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        // `ex:tag` loses its strings after the first index, so at the earlier
+        // `t` the lane needs rows its leaflet's type constant does not describe.
+        (
+            "tag-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:alice ex:says ?v . ?x ex:tag ?v }",
+            ),
+        ),
+    ];
+    let rows = |rows: &[(serde_json::Value, &str)]| -> Vec<serde_json::Value> {
+        normalize_rows(&json!(rows
+            .iter()
+            .map(|(v, x)| json!([v, format!("ex:{x}")]))
+            .collect::<Vec<_>>()))
+    };
+    // `(rows, left rows on the lane)` per query.
+    type Expected = [(Vec<serde_json::Value>, usize); 4];
+    let check = |phase: &'static str, view: fluree_db_api::GraphDb, expected: Expected| {
+        let (fluree, queries) = (&fluree, &queries);
+        async move {
+            for ((name, query), (expected, lane_rows)) in queries.iter().zip(expected) {
+                let (spans, guard) = span_capture::init_test_tracing();
+                let got = run_input(fluree, &view, query).await;
+                drop(guard);
+                assert_eq!(got, expected, "{phase}/{name}");
+                let on_lane: usize = spans
+                    .find_spans("join_flush_batched_object_binary")
+                    .iter()
+                    .map(|span| span.fields["accum_len"].parse::<usize>().unwrap())
+                    .sum();
+                assert_eq!(
+                    on_lane,
+                    lane_rows,
+                    "{phase}/{name}: left rows on the bound-object lane; spans: {:?}",
+                    spans.span_names()
+                );
+            }
+        }
+    };
+
+    let (uri, code) = (typed("zed", "xsd:anyURI"), typed("zed", "ex:code"));
+    let at_base = || -> Expected {
+        let topic = rows(&[
+            (json!("bob"), "d1"),
+            (json!("bob"), "d9"),
+            (json!("erin"), "d11"),
+            (lang("carol", "en"), "d3"),
+            (lang("dave", "fr"), "d6"),
+            (uri.clone(), "d9"),
+            (code.clone(), "d18"),
+            (json!(7), "d8"),
+        ]);
+        let mixed = rows(&[
+            (json!("ex:bob"), "d7"),
+            (json!("bob"), "d1"),
+            (json!("bob"), "d9"),
+            (lang("bob", "en"), "d2"),
+        ]);
+        let tag = rows(&[(json!("bob"), "d20"), (json!("erin"), "d21")]);
+        // Every value of `ex:alice ex:says` but `7`.
+        [(topic.clone(), 7), (topic, 7), (mixed, 3), (tag, 7)]
+    };
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    check("indexed", view, at_base()).await;
+
+    // Novelty retracts and asserts string rows, one of them a string the index
+    // has never seen. `"hola"@es` brings a language tag the index has no id
+    // for: that row has no key until the reindex.
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    let receipt = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": context,
+                "delete": [
+                    {"@id": "ex:d1", "ex:topic": "bob"},
+                    {"@id": "ex:d3", "ex:topic": lang("carol", "en")},
+                    {"@id": "ex:d20", "ex:tag": "bob"},
+                    {"@id": "ex:d21", "ex:tag": "erin"}
+                ],
+                "insert": [
+                    {"@id": "ex:alice", "ex:says": ["fresh", lang("hola", "es")]},
+                    {"@id": "ex:d12", "ex:topic": "bob"},
+                    {"@id": "ex:d13", "ex:topic": lang("bob", "en")},
+                    {"@id": "ex:d14", "ex:topic": lang("dave", "fr")},
+                    {"@id": "ex:d15", "ex:topic": "fresh"},
+                    {"@id": "ex:d17", "ex:topic": "hola"}
+                ]
+            }),
+        )
+        .await
+        .expect("novelty update");
+    assert!(receipt.ledger.t() > base_t);
+    let at_head = |keyed: usize| -> Expected {
+        let topic = rows(&[
+            (json!("bob"), "d9"),
+            (json!("bob"), "d12"),
+            (json!("erin"), "d11"),
+            (lang("dave", "fr"), "d6"),
+            (lang("dave", "fr"), "d14"),
+            (uri.clone(), "d9"),
+            (code.clone(), "d18"),
+            (json!(7), "d8"),
+            (json!("fresh"), "d15"),
+        ]);
+        let mixed = rows(&[
+            (json!("ex:bob"), "d7"),
+            (json!("bob"), "d9"),
+            (json!("bob"), "d12"),
+            (lang("bob", "en"), "d2"),
+            (lang("bob", "en"), "d13"),
+        ]);
+        [
+            (topic.clone(), keyed),
+            (topic, keyed),
+            (mixed, 3),
+            (rows(&[]), keyed),
+        ]
+    };
+    let view = fluree.db(ledger_id).await.expect("novelty view");
+    check("novelty", view, at_head(8)).await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex head");
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    check("reindexed", view, at_head(9)).await;
+    let view = fluree.db_at_t(ledger_id, base_t).await.expect("base view");
+    check("reindexed, at the base t", view, at_base()).await;
+}
+
+/// A bound-object walk reconciles against the novelty of the type it probes.
+/// `ex:topic` holds refs and strings: string novelty on it is nothing to a ref
+/// probe, and ref novelty nothing to a string probe, so each phase says which
+/// of the two flushes merges the overlay and which reads the index as it is.
+#[tokio::test]
+async fn batched_object_join_merges_only_the_probed_types_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-object-typed-novelty:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+
+    // Enough `ex:topic` rows that the planner drives from `ex:alice`.
+    let many_refs: Vec<_> = (1..=14)
+        .map(|i| json!({"@id": format!("ex:r{i}")}))
+        .collect();
+    let base = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:knows": [{"@id": "ex:bob"}, {"@id": "ex:carol"}],
+                "ex:says": ["bob", "carol"]
+            },
+            {"@id": "ex:d1", "ex:topic": {"@id": "ex:bob"}},
+            {"@id": "ex:d2", "ex:topic": {"@id": "ex:carol"}},
+            {"@id": "ex:d3", "ex:topic": "bob"},
+            {"@id": "ex:d9", "ex:topic": many_refs}
+        ]
+    });
+    fluree.insert(ledger, &base).await.expect("base insert");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    let refs_jsonld = json!({
+        "@context": ctx(),
+        "select": ["?v", "?x"],
+        "where": [{"@id": "ex:alice", "ex:knows": "?v"}, {"@id": "?x", "ex:topic": "?v"}]
+    });
+    let strings_jsonld = json!({
+        "@context": ctx(),
+        "select": ["?v", "?x"],
+        "where": [{"@id": "ex:alice", "ex:says": "?v"}, {"@id": "?x", "ex:topic": "?v"}]
+    });
+    // Refs, refs, strings, strings.
+    let queries: [(&str, QueryInput<'_>); 4] = [
+        (
+            "refs-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:alice ex:knows ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        ("refs-jsonld", QueryInput::from(&refs_jsonld)),
+        (
+            "strings-sparql",
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT ?v ?x WHERE { ex:alice ex:says ?v . ?x ex:topic ?v }",
+            ),
+        ),
+        ("strings-jsonld", QueryInput::from(&strings_jsonld)),
+    ];
+    let rows = |rows: &[(&str, &str)]| -> Vec<serde_json::Value> {
+        normalize_rows(&json!(rows
+            .iter()
+            .map(|(v, x)| json!([v, format!("ex:{x}")]))
+            .collect::<Vec<_>>()))
+    };
+    // `(rows, whether the flush merges the overlay)` for refs and for strings.
+    type Expected = [(Vec<serde_json::Value>, bool); 2];
+    let check = |phase: &'static str, view: fluree_db_api::GraphDb, expected: Expected| {
+        let (fluree, queries) = (&fluree, &queries);
+        async move {
+            for (i, (name, query)) in queries.iter().enumerate() {
+                let (expected, merges) = &expected[i / 2];
+                let (spans, guard) = span_capture::init_test_tracing();
+                let got = run_input(fluree, &view, query).await;
+                drop(guard);
+                assert_eq!(&got, expected, "{phase}/{name}");
+                assert!(
+                    spans.has_span("join_flush_batched_object_binary"),
+                    "{phase}/{name}: bound-object lane should engage; spans: {:?}",
+                    spans.span_names()
+                );
+                assert_eq!(
+                    spans.has_event("join batched object flush merged novelty overlay"),
+                    *merges,
+                    "{phase}/{name}: flush merging the overlay"
+                );
+            }
+        }
+    };
+
+    let ref_rows = rows(&[("ex:bob", "d1"), ("ex:carol", "d2")]);
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    let indexed = [(ref_rows.clone(), false), (rows(&[("bob", "d3")]), false)];
+    check("indexed", view, indexed).await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:d3", "ex:topic": "bob"},
+                "insert": {"@id": "ex:d4", "ex:topic": "carol"}
+            }),
+        )
+        .await
+        .expect("string novelty");
+    let view = fluree.db(ledger_id).await.expect("string-novelty view");
+    let string_rows = rows(&[("carol", "d4")]);
+    let strings_only = [(ref_rows, false), (string_rows.clone(), true)];
+    check("string novelty", view, strings_only).await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex strings");
+    let ledger = fluree.ledger(ledger_id).await.expect("reindexed ledger");
+    let receipt = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:d1", "ex:topic": {"@id": "ex:bob"}},
+                "insert": {"@id": "ex:d5", "ex:topic": {"@id": "ex:carol"}}
+            }),
+        )
+        .await
+        .expect("ref novelty");
+    let view = fluree.db(ledger_id).await.expect("ref-novelty view");
+    let ref_rows = rows(&[("ex:carol", "d2"), ("ex:carol", "d5")]);
+    let refs_only = [(ref_rows.clone(), true), (string_rows, false)];
+    check("ref novelty", view, refs_only).await;
+
+    fluree
+        .insert(
+            receipt.ledger,
+            &json!({"@context": ctx(), "@graph": [{"@id": "ex:d6", "ex:topic": "bob"}]}),
+        )
+        .await
+        .expect("string novelty over ref novelty");
+    let view = fluree.db(ledger_id).await.expect("mixed-novelty view");
+    let string_rows = rows(&[("bob", "d6"), ("carol", "d4")]);
+    let both = |merges: bool| [(ref_rows.clone(), merges), (string_rows.clone(), merges)];
+    check("both", view, both(true)).await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex head");
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    check("reindexed", view, both(false)).await;
 }
 
 /// Decimal (NumBig arena) overlay translation: retracts and re-asserts of

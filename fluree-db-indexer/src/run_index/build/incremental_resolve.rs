@@ -1778,6 +1778,22 @@ fn refuse_base_off_the_line(
     }
 }
 
+/// Whether each commit's first parent is the commit before it. The
+/// commit-CID index can hold entries a rebase replaced below its new head, so
+/// a range that covers every `t` up to the head is not yet the head's line.
+fn first_parent_linked(walked: &[WalkedCommit]) -> Result<bool, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    for pair in walked.windows(2) {
+        let envelope = read_commit_envelope(&pair[1].bytes).map_err(|e| {
+            IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", pair[1].cid))
+        })?;
+        if envelope.parents.first() != Some(&pair[0].cid) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 async fn walk_commit_chain_since(
     cs: &dyn ContentStore,
     config: &IncrementalResolveConfig,
@@ -1847,7 +1863,14 @@ async fn walk_commit_chain_since(
                 elapsed_ms = walk_started.elapsed().as_millis() as u64,
                 "V6 incremental resolve: commit-chain walk complete (fast path: commit-index)"
             );
-            return Ok(commits);
+            if first_parent_linked(&commits)? {
+                return Ok(commits);
+            }
+            tracing::debug!(
+                from_t,
+                head = %head_id,
+                "commit-index entries are not one first-parent line; falling back to serial DAG walk"
+            );
         }
 
         tracing::debug!(

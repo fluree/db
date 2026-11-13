@@ -244,6 +244,12 @@ pub struct R2rmlCreateResult {
     /// Warnings about the `model` reference (policies a virtual source cannot
     /// evaluate). Empty when no model is set or nothing is amiss.
     pub model_warnings: Vec<String>,
+
+    /// Advisories about the mapping as the source's queries will read it: a
+    /// `keylessMap` for each map no key of its table proves subject-unique,
+    /// which queries deduplicate. Empty when the tables did not load
+    /// (`connection_check` says why).
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 /// What loading a new Iceberg source's tables at registration found. Only

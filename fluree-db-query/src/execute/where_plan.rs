@@ -291,11 +291,10 @@ fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pat
 ///   wrapper does not make, and cannot cross an `OPTIONAL`'s left-join
 ///   boundary — an `OPTIONAL` nested in the chain produces its variables
 ///   through a sub-pattern, not a top-level triple, so it never passes.
-/// - The expression contains no `EXISTS` / pattern comprehension
-///   ([`contains_exists`]). Those resolve asynchronously against the execution
-///   context, and inside the wrapper that context is switched to one source at
-///   a time — an `EXISTS` moved inside would see one source where it used to
-///   see the whole default graph.
+/// - The expression reads nothing but its row ([`Expression::reads_dataset`]).
+///   Inside the wrapper the execution context is switched to one source at a
+///   time — an `EXISTS` or a fact-reading function moved inside would see one
+///   source where it used to see the whole default graph.
 ///
 /// A filter failing either test stays exactly where it was, and a list with no
 /// wrapper in it returns after one scan, so no unannotated query pays for this.
@@ -338,7 +337,7 @@ fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
     let mut moves: Vec<(usize, usize, bool)> = Vec::new();
     for (i, p) in patterns.iter().enumerate() {
         let Pattern::Filter(expr) = p else { continue };
-        if contains_exists(expr) {
+        if expr.reads_dataset() {
             continue;
         }
         let vars = expr.referenced_vars();
@@ -3430,10 +3429,10 @@ pub fn build_where_operators_seeded_with_needed(
             Pattern::R2rml(r2rml_pattern) => {
                 // R2RML scan against an Iceberg graph source
                 let child = require_child(operator, "R2RML pattern")?;
-                operator = Some(Box::new(crate::r2rml::R2rmlScanOperator::new(
-                    child,
-                    r2rml_pattern.clone(),
-                )));
+                operator = Some(Box::new(
+                    crate::r2rml::R2rmlScanOperator::new(child, r2rml_pattern.clone())
+                        .with_scan_order(planning.scan_order),
+                ));
                 i += 1;
             }
 
@@ -6992,6 +6991,29 @@ mod tests {
         let patterns = vec![annotated_hop(0, 1, 2, 3), exists];
         let expanded = expand_edge_annotation_patterns(&patterns);
         assert_eq!(filter_count(&expanded), 1, "EXISTS filter stays outside");
+        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[0])), 0);
+    }
+
+    #[test]
+    fn sink_declines_a_filter_that_looks_facts_up() {
+        // `fulltext()` scores against the active graph's arena, with no
+        // embedded pattern to give it away.
+        let scored = Pattern::Filter(Expression::call(
+            crate::ir::Function::Gt,
+            vec![
+                Expression::call(
+                    crate::ir::Function::Fulltext,
+                    vec![
+                        Expression::Var(VarId(3)),
+                        Expression::Const(FlakeValue::String("rust".into())),
+                    ],
+                ),
+                Expression::Const(FlakeValue::Double(0.0)),
+            ],
+        ));
+        let patterns = vec![annotated_hop(0, 1, 2, 3), scored];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(filter_count(&expanded), 1, "fulltext filter stays outside");
         assert_eq!(filter_count(unwrap_default_graph_source(&expanded[0])), 0);
     }
 

@@ -78,10 +78,10 @@ pub enum ScanValue {
     /// skipped for field types not yet supported. The R2RML operator still enforces
     /// the subject equality, so a skipped or imperfect push is never wrong.
     TemplateKey(String),
-    /// A bounded set of scalar values for a [`ScanCmpOp::In`] membership filter
-    /// (from a `FILTER … IN` or single-var `VALUES`). Every member is one of the
-    /// scalar variants above — never a nested `Set`, never a `TemplateKey`. Only
-    /// ever produced by the set-lowering emit path; it is never wrapped in an
+    /// A bounded set of values for a [`ScanCmpOp::In`] membership filter: from
+    /// a `FILTER … IN` or single-var `VALUES` (scalar members), or from subject
+    /// IRIs reversed through a subject template (`TemplateKey` members, one set
+    /// per key column). Never a nested `Set`. It is never wrapped in an
     /// [`ObjectConstant`] (a constant object is a single scalar term), so the
     /// scalar-only match sites treat it defensively as "not a scalar constant".
     Set(Vec<ScanValue>),
@@ -134,6 +134,16 @@ pub struct ScanFilter {
     pub value: ScanValue,
 }
 
+/// The data files a scan with some filters would read and skip, from its scan
+/// plan alone ([`R2rmlTableProvider::scan_file_counts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanFileCounts {
+    /// Files the scan would read.
+    pub selected: u64,
+    /// Files the filters let it skip.
+    pub pruned: u64,
+}
+
 /// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
 /// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
 /// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
@@ -162,6 +172,12 @@ pub struct ScanTopK {
     /// does, and an `xsd:integer` over a string column's `"9"` bound sits above
     /// its `"100"`.
     pub order: TermOrder,
+    /// The columns a row must hold non-null to yield a solution (the
+    /// subject's, and each same-subject star member's). A row with a NULL in
+    /// one is dropped after the scan, so the bound counts only rows non-null
+    /// in all of them; a provider that cannot check one of them must not
+    /// prune.
+    pub required_columns: Vec<String>,
 }
 
 /// The order the engine sorts an object map's terms in, from its datatype. A
@@ -327,6 +343,24 @@ pub struct TableWatermark {
     pub sequence_number: Option<i64>,
 }
 
+/// The row order a table scan owes the query above it.
+///
+/// A query with no ORDER BY may return its rows in any order, but a client
+/// paging it with LIMIT/OFFSET needs every execution to return them in the same
+/// order, or the pages skip and repeat rows. A scan therefore emits a fixed
+/// order unless the planner has shown that no slice in the query can observe
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanOrder {
+    /// The same rows in the same order on every execution over one snapshot.
+    /// The default: whatever cannot prove otherwise asks for this.
+    #[default]
+    Deterministic,
+    /// Any order, e.g. as the table's file reads finish. Chosen only for a query
+    /// with no LIMIT or OFFSET anywhere in it.
+    Any,
+}
+
 /// Provider for scanning Iceberg tables underlying R2RML graph sources.
 ///
 /// This trait is separated from `R2rmlProvider` to allow different
@@ -372,6 +406,33 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
 
+    /// [`Self::scan_table`] under an explicit [`ScanOrder`]. `scan_table` owes
+    /// [`ScanOrder::Deterministic`]; a provider that can stream faster in
+    /// [`ScanOrder::Any`] overrides this, and the default ignores the order and
+    /// scans deterministically.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+        order: ScanOrder,
+    ) -> Result<ColumnBatchStream> {
+        let _ = order;
+        self.scan_table(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+        .await
+    }
+
     /// The table's exact live row count from Iceberg manifest metadata — **when,
     /// and only when, it provably equals a full-scan count** of the rows a bare
     /// `COUNT(*)` would produce. Lets the fused-aggregate COUNT shortcut answer
@@ -395,6 +456,58 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<Option<u64>> {
         let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
+        Ok(None)
+    }
+
+    /// The keys the source itself reports for `table_name`: each a list of
+    /// column names, by their current names, no two of the table's live rows
+    /// agree on (rows with a NULL in any of them aside). A caller unites them
+    /// with the keys the mapping declares
+    /// ([`fluree_db_r2rml::TableKeys::with_reported`]) to decide whether a
+    /// map's subjects are unique and its rows can skip deduplication
+    /// ([`fluree_db_r2rml::TriplesMap::subject_unique_under`]).
+    ///
+    /// Report only what the source guarantees for the snapshot `as_of_t`
+    /// selects; a key that may not hold makes queries return duplicate
+    /// solutions. `Ok(None)` reports none (the default): every map over the
+    /// table is then deduplicated unless the mapping declares a key, which is
+    /// always correct.
+    async fn table_keys(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<Vec<Vec<String>>>> {
+        let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
+    /// The table's row count when the provider already holds it (a cached scan
+    /// plan, say), without reading anything to learn it. A caller deciding
+    /// whether a table is small enough to cache whole asks first. `Ok(None)`
+    /// when the provider does not know (the default).
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
+    /// How many data files a scan of `table_name` with `filters` would read and
+    /// skip, from its scan plan alone: no data file is read. A caller pushing
+    /// keys asks before paying for a keyed read whether it skips anything.
+    /// `Ok(None)` when the provider cannot tell (the default).
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<ScanFileCounts>> {
+        let _ = (graph_source_id, table_name, filters, as_of_t);
         Ok(None)
     }
 
@@ -516,5 +629,119 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
             "R2RML table scanning not available for graph source '{graph_source_id}'. \
              This Fluree instance does not support graph source operations."
         )))
+    }
+}
+
+/// The keys that decide whether a map over `table_name` can skip removing
+/// duplicate solutions: what the mapping declares on the table (`f:key`),
+/// united with what the source reports ([`R2rmlTableProvider::table_keys`]).
+/// Pass the result to [`fluree_db_r2rml::TriplesMap::subject_unique_under`].
+///
+/// **The only way a lane obtains table keys for a uniqueness decision.** Never
+/// read [`CompiledR2rmlMapping::declared_keys`] directly for one: the
+/// provider's `table_keys` is also where a declared key is checked against the
+/// table's schema (a column the table lacks, a floating-point or nested
+/// column) and the query refused, so a lane that read the declaration itself
+/// would trust a key the table cannot hold.
+pub async fn effective_table_keys(
+    provider: &dyn R2rmlTableProvider,
+    mapping: &CompiledR2rmlMapping,
+    graph_source_id: &str,
+    table_name: &str,
+    as_of_t: Option<i64>,
+) -> Result<fluree_db_r2rml::TableKeys> {
+    let reported = provider
+        .table_keys(graph_source_id, table_name, as_of_t)
+        .await?;
+    Ok(mapping.declared_keys(table_name).with_reported(reported))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_r2rml::{TableKeys, TriplesMap};
+
+    /// Reports `reported` for every table, or refuses when it is `Err`.
+    #[derive(Debug)]
+    struct KeyedProvider {
+        reported: std::result::Result<Option<Vec<Vec<String>>>, String>,
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for KeyedProvider {
+        async fn scan_table(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
+            _as_of_t: Option<i64>,
+        ) -> Result<ColumnBatchStream> {
+            unreachable!("keys are not read from rows")
+        }
+
+        async fn table_keys(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _as_of_t: Option<i64>,
+        ) -> Result<Option<Vec<Vec<String>>>> {
+            self.reported
+                .clone()
+                .map_err(crate::error::QueryError::InvalidQuery)
+        }
+    }
+
+    fn mapping() -> CompiledR2rmlMapping {
+        CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("<#Current>", "sets.customers_current")
+                .with_subject_template("http://example.org/customer/{customer_id}")
+                .with_declared_key(["customer_id"]),
+            TriplesMap::new("<#History>", "sets.customers_history")
+                .with_subject_template("http://example.org/customer/{customer_id}"),
+        ])
+    }
+
+    async fn keys(provider: &KeyedProvider, table: &str) -> Result<TableKeys> {
+        effective_table_keys(provider, &mapping(), "gs", table, None).await
+    }
+
+    #[tokio::test]
+    async fn effective_keys_unite_declared_and_reported() {
+        let none = KeyedProvider { reported: Ok(None) };
+        assert_eq!(
+            keys(&none, "sets.customers_current").await.unwrap(),
+            TableKeys::new([["customer_id"]])
+        );
+        assert!(keys(&none, "sets.customers_history")
+            .await
+            .unwrap()
+            .is_empty());
+
+        let reported = KeyedProvider {
+            reported: Ok(Some(vec![vec!["row_id".to_string()]])),
+        };
+        assert_eq!(
+            keys(&reported, "sets.customers_current").await.unwrap(),
+            TableKeys::new([["customer_id"], ["row_id"]])
+        );
+        assert_eq!(
+            keys(&reported, "sets.customers_history").await.unwrap(),
+            TableKeys::new([["row_id"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_refusal_is_the_lane_s_refusal() {
+        // A declared key the provider finds unusable refuses the query; the
+        // declaration alone is never handed back in its place.
+        let refusing = KeyedProvider {
+            reported: Err("a key names column \"score\" of type Float64".to_string()),
+        };
+        let err = keys(&refusing, "sets.customers_current")
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains("Float64"), "{err}");
     }
 }

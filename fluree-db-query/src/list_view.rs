@@ -37,7 +37,7 @@ use fluree_db_core::{
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// A list, named by the graph, subject and predicate that own it and which
@@ -49,7 +49,12 @@ type List = (Owner, Vec<Flake>);
 
 /// A ledger a [`ListView`] reads, with the predicates holding list members
 /// there in its own namespace table (`None`: any may).
-type LedgerLists = (LedgerId, Option<HashSet<Sid>>);
+///
+/// Ordered: a read with an open predicate reads them in this order, which is
+/// the order its lists are answered in and their cells are labelled in. A std
+/// set seeded each view at random, so the same query answered its lists in a
+/// different order on each execution.
+type LedgerLists = (LedgerId, Option<BTreeSet<Sid>>);
 
 /// Which predicates hold list members, and the cells one request has named.
 #[derive(Debug)]
@@ -145,8 +150,8 @@ fn list_predicates(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     store: Option<&Arc<BinaryIndexStore>>,
-) -> Result<Option<HashSet<Sid>>> {
-    let mut predicates: Option<HashSet<Sid>> = Some(HashSet::new());
+) -> Result<Option<BTreeSet<Sid>>> {
+    let mut predicates: Option<BTreeSet<Sid>> = Some(BTreeSet::new());
     if snapshot.has_list_meta != Some(false) {
         predicates = match store {
             Some(store) => {
@@ -167,7 +172,7 @@ fn list_predicates(
 }
 
 /// `known` with the predicates `found` in another graph of its ledger.
-fn merge_predicates(known: &mut Option<HashSet<Sid>>, found: Option<HashSet<Sid>>) {
+fn merge_predicates(known: &mut Option<BTreeSet<Sid>>, found: Option<BTreeSet<Sid>>) {
     match (known.as_mut(), found) {
         (Some(known), Some(found)) => known.extend(found),
         (_, None) => *known = None,
@@ -260,7 +265,7 @@ impl ListView {
     }
 
     /// The predicates holding list members in ledger `l`, when known.
-    fn ledger_predicates(&self, l: usize) -> Option<&HashSet<Sid>> {
+    fn ledger_predicates(&self, l: usize) -> Option<&BTreeSet<Sid>> {
         match l {
             0 => self.primary.1.as_ref(),
             l => self.others.get(l - 1).and_then(|(_, ps)| ps.as_ref()),
@@ -324,7 +329,7 @@ impl ListView {
     /// The predicates holding list members, in the namespace table the
     /// query was lowered against; `None` when that is not known, or the
     /// request reads several ledgers, and any may.
-    pub(crate) fn predicates(&self) -> Option<&HashSet<Sid>> {
+    pub(crate) fn predicates(&self) -> Option<&BTreeSet<Sid>> {
         match self.others.is_empty() {
             true => self.primary.1.as_ref(),
             false => None,

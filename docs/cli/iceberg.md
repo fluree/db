@@ -254,7 +254,14 @@ Mapped Iceberg table as R2RML graph source 'airlines:main'
   TriplesMaps: 3
   Connection:  verified
   Mapping:     validated
+advisory: openflights.airlines: TriplesMap <http://example.org/mapping#Airline>: no key of its logical table 'openflights.airlines' lies within its subject's columns (airline_id), and it has no known key, so queries over it remove repeated solutions as they run. …
 ```
+
+An `advisory:` line on standard error names each triples map that neither an
+`f:key` nor the table's identifier fields prove subject-unique, and the
+`f:key` that would. The source is registered and answers correctly, but
+`COUNT`s, same-subject stars and `ORDER BY … LIMIT` over such a map cost more;
+see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade). Advisories are reported only when every table loaded.
 
 ### After Mapping
 

@@ -413,14 +413,7 @@ pub const SPARQL12_VERSION: &[&str] = &[
     // parser rejects valid input (3)
 ];
 
-// Not path-cardinality defects: pp34/pp35 are graph-cluster tests mis-filed
-// under property-path (`GRAPH <ng-01.ttl> { ?s :p1* ?t }` — constant GRAPH IRI
-// base-expansion vs exact-key registry miss, and `?g` bound as a literal).
-// Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
-// already produces the expected `[a,b,b]` bag once the GRAPH block matches
-// (residual-eval.md §2.2).
-pub const SPARQL11_PROPERTY_PATH: &[&str] =
-    &["http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35"];
+pub const SPARQL11_PROPERTY_PATH: &[&str] = &[];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
 // test environment cannot provide. Revisit with an in-process mock endpoint

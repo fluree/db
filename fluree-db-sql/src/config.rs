@@ -121,9 +121,23 @@ pub struct SqlGsConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unverified_subject_tables: Vec<String>,
 
-    /// Accept duplicate subject keys: the probe still warns, queries proceed.
+    /// Skip the duplicate-subject probe and refuse no table: every query
+    /// over the source answers over the set of triples its mapping defines,
+    /// removing repeated solutions wherever no key declared in the mapping
+    /// (`f:key`) proves a map's subjects unique.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_duplicate_subjects: bool,
+
+    /// Per table, the key columns the last registration or `check` probe
+    /// found unique: the subject columns of every map over the table, plus
+    /// the parent columns of every reference into one, as one composite key.
+    /// A table missing from it was not probed (the endpoint was unreachable,
+    /// or the probe was skipped) and proves nothing. `None` on a source
+    /// registered before the probe recorded what it verified, which keeps
+    /// the trust such a source always had: every table neither flagged nor
+    /// unverified counts as probed; `fluree sql check` records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_subject_keys: Option<BTreeMap<String, Vec<String>>>,
 }
 
 impl SqlGsConfig {
@@ -145,6 +159,7 @@ impl SqlGsConfig {
             duplicate_subject_tables: Vec::new(),
             unverified_subject_tables: Vec::new(),
             allow_duplicate_subjects: false,
+            verified_subject_keys: None,
         }
     }
 

@@ -313,22 +313,31 @@ async fn a_filter_skips_files_and_a_bare_count_reads_none() {
     std::fs::remove_dir_all(lake_root.join("partitioned/region=north")).unwrap();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mapping = r#"
+    // `holed` declares the table's key, so a count of its rows is a count of
+    // its subjects; `holed-bag` declares none, so its rows may repeat a triple.
+    let mapping = |key: &str| {
+        format!(
+            r#"
         @prefix rr: <http://www.w3.org/ns/r2rml#> .
         @prefix ex: <http://example.org/> .
         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        @prefix f: <https://ns.flur.ee/db#> .
         <http://example.org/mapping#Sale> a rr:TriplesMap ;
-            rr:logicalTable [ rr:tableName "partitioned" ] ;
-            rr:subjectMap [ rr:template "http://example.org/sale/{id}" ; rr:class ex:Sale ] ;
+            rr:logicalTable [ rr:tableName "partitioned" {key}] ;
+            rr:subjectMap [ rr:template "http://example.org/sale/{{id}}" ; rr:class ex:Sale ] ;
             rr:predicateObjectMap [ rr:predicate ex:saleId ; rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ] ] ;
             rr:predicateObjectMap [ rr:predicate ex:region ; rr:objectMap [ rr:column "region" ] ] .
-    "#;
-    let mut config = DeltaCreateConfig::new("holed", lake_root.to_str().unwrap(), mapping);
-    config.mapping_media_type = Some("text/turtle".to_string());
-    fluree
-        .create_delta_graph_source(config)
-        .await
-        .expect("registration reads the log, not the data");
+    "#
+        )
+    };
+    for (alias, key) in [("holed", r#"; f:key ( "id" ) "#), ("holed-bag", "")] {
+        let mut config = DeltaCreateConfig::new(alias, lake_root.to_str().unwrap(), mapping(key));
+        config.mapping_media_type = Some("text/turtle".to_string());
+        fluree
+            .create_delta_graph_source(config)
+            .await
+            .expect("registration reads the log, not the data");
+    }
 
     let run = |body: &'static str| {
         let fluree = fluree.clone();
@@ -442,6 +451,18 @@ async fn a_filter_skips_files_and_a_bare_count_reads_none() {
         count["results"]["bindings"][0]["n"]["value"], "24",
         "{count}"
     );
+
+    // Without a key the log counts rows, not triples: the count reads them.
+    let err = fluree
+        .query_from()
+        .sparql(
+            "PREFIX ex: <http://example.org/> \
+             SELECT (COUNT(?s) AS ?n) FROM <holed-bag:main> WHERE { ?s a ex:Sale }",
+        )
+        .execute_formatted()
+        .await
+        .expect_err("a keyless count reads every row");
+    assert!(err.to_string().contains("can no longer be read"), "{err}");
 }
 
 /// Queries share one handle per table, which remembers the last version it
