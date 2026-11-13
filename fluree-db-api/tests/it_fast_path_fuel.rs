@@ -37,6 +37,9 @@ const N: usize = 300;
 const LEAFLET_GAP: f64 = 0.3;
 /// The same for a lane that reads a third of a predicate's leaflets.
 const LEAFLET_GAP_SPARSE: f64 = 0.1;
+/// A join whose probe reads a predicate's 100 leaflets after its left scan
+/// read another's: the left scan's leaflets alone make a gap of about 1.
+const PROBE_GAP: f64 = 1.5;
 
 fn turtle() -> String {
     let mut ttl = String::from(
@@ -347,6 +350,48 @@ fn cases() -> Vec<Case> {
                     .collect::<Vec<_>>(),
             ),
             fuel: Fuel::Gap(LEAFLET_GAP),
+        },
+        Case {
+            name: "join, batched subject probe",
+            ledgers: Ledgers::Committed,
+            query: Query::Sparql(
+                "PREFIX ex: <http://example.org/> \
+                 SELECT ?s ?o ?n WHERE { ?s ex:next ?o . ?o ex:name ?n }",
+            ),
+            site: Some("nested-loop-batched"),
+            expected: sparql_rows(
+                &(0..N - 1)
+                    .map(|i| {
+                        json!({
+                            "s": format!("http://example.org/s{i}"),
+                            "o": format!("http://example.org/s{}", i + 1),
+                            "n": format!("name{:03}", i + 1),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            fuel: Fuel::Gap(PROBE_GAP),
+        },
+        Case {
+            name: "join, bound-object probe",
+            ledgers: Ledgers::Committed,
+            query: Query::Sparql(
+                "PREFIX ex: <http://example.org/> \
+                 SELECT ?s ?o ?y WHERE { ?s ex:next ?o . ?y ex:next ?o }",
+            ),
+            site: Some("nested-loop-batched"),
+            expected: sparql_rows(
+                &(0..N)
+                    .map(|i| {
+                        json!({
+                            "s": format!("http://example.org/s{i}"),
+                            "o": format!("http://example.org/s{}", i + 1),
+                            "y": format!("http://example.org/s{i}"),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            fuel: Fuel::Gap(PROBE_GAP),
         },
         Case {
             name: "one-or-more path count",

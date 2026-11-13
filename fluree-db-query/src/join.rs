@@ -182,16 +182,20 @@ impl LeafScan {
     /// Load one leaflet's `proj` columns, through the store's leaflet cache
     /// when it has one, and replay it to `replay_to` on a historical read. An
     /// empty-after-retract leaflet starts empty so the replay can rebuild it.
+    /// Charges `tracker` one index touch for the read, as the cursor does.
     pub(crate) fn load_leaflet(
         &self,
         store: &BinaryIndexStore,
         leaflet_idx: usize,
         proj: &fluree_db_binary_index::ColumnProjection,
         replay_to: Option<i64>,
+        tracker: &fluree_db_core::Tracker,
     ) -> Result<fluree_db_binary_index::ColumnBatch> {
         use fluree_db_binary_index::read::column_loader::{
             load_leaflet_columns, load_leaflet_columns_cached, LeafletDecodeSpec,
         };
+
+        crate::fast_path_common::charge_leaflet(tracker)?;
 
         let entry = &self.dir.entries[leaflet_idx];
         let batch = if entry.row_count == 0 {
@@ -2805,7 +2809,8 @@ impl NestedLoopJoinOperator {
                     continue;
                 }
 
-                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+                let batch =
+                    leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
                 // Rows restored by replay keep their own types, which the
                 // constant, taken over the live rows, does not describe.
                 let o_type_const = entry.o_type_const_for(needs_history_replay);
@@ -4360,7 +4365,7 @@ pub(crate) fn for_each_object_probe_match(
             }
 
             ctx.check_cancelled()?;
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             leaflets_read += 1;
             let rows = post_rows_of(&batch, want);
             if rows.is_empty() {
@@ -4588,7 +4593,7 @@ fn for_each_object_probe_match_by_fact(
             };
             // The cache keys on the decoded column set, so this narrow
             // entry never collides with a wider one.
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             ctx.check_cancelled()?;
 
             // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
@@ -4892,7 +4897,7 @@ fn batched_subject_probe_binary_uncharged(
                 }
             }
 
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             let o_type_const = entry.o_type_const_for(needs_history_replay);
             ctx.check_cancelled()?;
 
@@ -5191,7 +5196,7 @@ fn batched_subject_star_spot_uncharged(
             leaflets_read += 1;
             leaflets_replayed += u64::from(needs_history_replay);
 
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             let o_type_const = entry.o_type_const_for(needs_history_replay);
 
             let row_count = batch.row_count;

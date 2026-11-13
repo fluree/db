@@ -711,7 +711,7 @@ impl RangeSemiJoinOperator {
                     output: if key_range.is_some() { narrow } else { mixed },
                     internal: ColumnSet::EMPTY,
                 };
-                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None, &ctx.tracker)?;
 
                 let keyed = match key_range {
                     Some((ot, lo, hi)) => {
