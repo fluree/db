@@ -238,10 +238,11 @@ pushable. In that statement:
   pattern binding it too is declined as it would be inside one block. A
   sub-select with another `HAVING`, an `OFFSET`, a `BIND`, a nested
   sub-select, a filter the statement cannot evaluate exactly, or one that
-  hides an inner variable the enclosing block also uses is not admitted. There is
-  no other lane for a sub-select over a graph source (the engine's
-  subquery operator has no native index to run against), so one the lane
-  does not take still refuses the query, as it did before;
+  hides an inner variable the enclosing block also uses is not admitted. One
+  the lane does not take runs on the per-scan lane below, which evaluates
+  the sub-select's body over its own table reads (see [Sub-selects over a
+  Graph Source](overview.md#sub-selects-over-a-graph-source), including the
+  cost of a sliced JSON-LD sub-select there);
 - an entity whose members come from **several triples maps sharing its
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,
@@ -495,6 +496,16 @@ Register with `allow_duplicate_subjects` to skip the probe: no table is
 refused, and every map without a declared key answers with set semantics.
 A source registered before the probe recorded the keys it verified keeps
 trusting every table it did not flag; run `fluree sql check` to record them.
+
+Registration and `fluree sql check` name each map no key proves
+subject-unique: the response's `diagnostics` holds a `keylessMap` advisory
+per map (`fluree sql map` and `check` print them), with the `f:key` that
+would prove it. Statements over such a map carry `DISTINCT`, or decline to
+the per-scan lane, so a `COUNT` or a star over it costs more than over a
+keyed map. If an upgrade made such queries slower, see
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade).
+An endpoint unreachable at registration gets no advisories; `check` reports
+them once it succeeds.
 
 **Not pushed** in the per-scan lane: `ORDER BY … LIMIT` (a NULL in a key or
 required column would consume `LIMIT` slots for rows the mapping drops) and

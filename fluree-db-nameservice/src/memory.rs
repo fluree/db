@@ -150,7 +150,7 @@ impl crate::BranchLifecycle for MemoryNameService {
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         let mut records = self.records.write();
 
         // Refuse a branch that still has children (see the guard in
@@ -216,7 +216,7 @@ impl LedgerLifecycle for MemoryNameService {
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let key = LedgerId::parse(ledger_id)?;
+        let key = LedgerId::parse_persisted(ledger_id)?;
         let mut records = self.records.write();
         let mut did_update = false;
 

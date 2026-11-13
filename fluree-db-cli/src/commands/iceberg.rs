@@ -336,6 +336,7 @@ async fn run_iceberg_map_remote(
     );
 
     print_model_warnings(&model_warnings_of(&result));
+    report_diagnostics(&result);
     Ok(())
 }
 
@@ -392,6 +393,45 @@ pub(crate) fn infer_mapping_media_type(path: &std::path::Path) -> Option<String>
 pub(crate) fn print_model_warnings(warnings: &[String]) {
     for w in warnings {
         eprintln!("warning: {w}");
+    }
+}
+
+/// Print a response's mapping `diagnostics` on standard error, one per line
+/// (`advisory: sales.orders: TriplesMap <#Orders>: ...`). Returns whether
+/// any is an error. Every command that reports on a mapping (map, `sql
+/// check`, `delta generate` and `validate`) prints them here, so an advisory
+/// such as `keylessMap` reads the same everywhere.
+pub(crate) fn report_diagnostics(response: &serde_json::Value) -> bool {
+    let text = |d: &serde_json::Value, key: &str| -> String {
+        d.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut any_error = false;
+    for d in response
+        .get("diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let severity = text(d, "severity");
+        any_error |= severity == "error";
+        let place = match (text(d, "table").as_str(), text(d, "column").as_str()) {
+            ("", _) => String::new(),
+            (table, "") => format!(" {table}:"),
+            (table, column) => format!(" {table}.{column}:"),
+        };
+        eprintln!("{severity}:{place} {}", text(d, "message"));
+    }
+    any_error
+}
+
+/// [`report_diagnostics`] for diagnostics in hand rather than in a response.
+#[cfg(feature = "iceberg")]
+pub(crate) fn print_diagnostics<D: serde::Serialize>(diagnostics: &[D]) {
+    if let Ok(diagnostics) = serde_json::to_value(diagnostics) {
+        report_diagnostics(&serde_json::json!({ "diagnostics": diagnostics }));
     }
 }
 
@@ -792,6 +832,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             "not validated (check mapping source)"
         }
     );
+    print_diagnostics(&result.diagnostics);
 
     Ok(())
 }

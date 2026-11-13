@@ -157,6 +157,12 @@ pub struct SqlCreateResult {
     /// or a probe that could not run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapping_warnings: Vec<String>,
+    /// Advisories about the mapping as the source's queries will read it: a
+    /// `keylessMap` for each map no key (`f:key`, or the key the probe
+    /// verified) proves subject-unique, which queries deduplicate. Empty when
+    /// the endpoint could not be reached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 /// Result of `fluree sql check`: the re-run uniqueness probe.
@@ -167,6 +173,9 @@ pub struct SqlCheckResult {
     pub allow_duplicate_subjects: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapping_warnings: Vec<String>,
+    /// As [`SqlCreateResult::diagnostics`], under the key this check verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 /// The key columns per table whose uniqueness the mapping assumes: every
@@ -416,7 +425,8 @@ impl crate::Fluree {
             // Nothing was probed, so no table's key is verified.
             gs_config.verified_subject_keys = Some(BTreeMap::new());
             mapping_warnings.push(
-                "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql check`                  once it is"
+                "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql \
+                 check` once it is"
                     .to_string(),
             );
         }
@@ -434,10 +444,18 @@ impl crate::Fluree {
             )
             .await?;
 
+        let diagnostics = match &compiled_for_probe {
+            Some(compiled) if connection_tested => {
+                self.keyless_sql_maps(&graph_source_id, compiled).await
+            }
+            _ => Vec::new(),
+        };
+
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created SQL graph source");
         Ok(SqlCreateResult {
             model_warnings,
             mapping_warnings,
+            diagnostics,
             graph_source_id,
             endpoint: gs_config.endpoint,
             mapping_source: mapping_address,
@@ -519,12 +537,34 @@ impl crate::Fluree {
                 &[],
             )
             .await?;
+        let diagnostics = self
+            .keyless_sql_maps(graph_source_id.as_ref(), &compiled)
+            .await;
         Ok(SqlCheckResult {
             graph_source_id: graph_source_id.to_string(),
             duplicate_subject_tables: flagged,
             allow_duplicate_subjects: config.allow_duplicate_subjects,
             mapping_warnings,
+            diagnostics,
         })
+    }
+
+    /// The `keylessMap` advisories for a published SQL source: each map no
+    /// key proves subject-unique, under the key its last probe verified
+    /// and the mapping's `f:key`, as its queries read them.
+    async fn keyless_sql_maps(
+        &self,
+        graph_source_id: &str,
+        compiled: &CompiledR2rmlMapping,
+    ) -> Vec<fluree_db_r2rml::emit::Diagnostic> {
+        super::r2rml::registered_keyless_maps(
+            &super::r2rml::FlureeR2rmlProvider::new(self),
+            graph_source_id,
+            compiled,
+            super::iceberg_validate::QueryTables::Alias,
+            super::iceberg_validate::KeyRemedy::Declare,
+        )
+        .await
     }
 
     /// `SELECT 1` against the endpoint with the configured credentials.

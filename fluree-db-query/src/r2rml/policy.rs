@@ -329,9 +329,9 @@ impl R2rmlPolicyGate {
                     .is_some_and(|source| source != graph_source_id);
                 if in_graph_scope && other_policy {
                     return Err(QueryError::InvalidQuery(format!(
-                        "Graph source '{graph_source_id}' is reached through a GRAPH scope whose \
-                         graph is bound from data, outside the query's dataset, where the view \
-                         policy in force is not the source's own. Name it in from-named \
+                        "Graph source '{graph_source_id}' is reached through a graph scope but \
+                         is not in the query's dataset, so the view policy in force is not the \
+                         source's own. Name it in from-named \
                          (SPARQL: FROM NAMED <{graph_source_id}>) and use GRAPH \
                          <{graph_source_id}> or VALUES ?g {{ <{graph_source_id}> }}."
                     )));

@@ -30,7 +30,7 @@ use crate::{
     StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{
     CasAction, CasOutcome, ContentId, Error as CoreError, LedgerId, StorageCas, StorageList,
     StorageRead, StorageWrite,
@@ -710,7 +710,7 @@ where
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
 
         // Read the record to find the parent before purging
         let record = self
@@ -760,6 +760,8 @@ where
     async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
+        let index_key = self.index_key(&ledger_name, &branch);
+        let index = crate::ns_format::snapshot_index_file(&snapshot);
 
         let outcome = self
             .storage
@@ -778,7 +780,12 @@ where
             return Err(NameServiceError::not_found(ledger_id));
         }
 
-        Ok(())
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        self.cas_update::<NsIndexFileV2, _>(&index_key, move |existing| {
+            existing.map(|_| index.clone())
+        })
+        .await
     }
 }
 
@@ -851,7 +858,7 @@ where
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
         self.cas_update::<NsFileV2, _>(&key, |existing| {
@@ -2064,6 +2071,32 @@ mod tests {
     /// Create a dummy ContentId for tests (hashes the label as Commit kind).
     fn dummy_cid(label: &str) -> ContentId {
         ContentId::new(fluree_db_core::ContentKind::Commit, label.as_bytes())
+    }
+
+    /// A reset moves the index back, even below one in the separate index
+    /// file, which otherwise wins at an equal or higher `t`.
+    #[tokio::test]
+    async fn reset_head_moves_the_index_back() {
+        let ns = make_storage_ns();
+        publish_commit(&ns, "mydb:main", 3, &dummy_cid("commit-3")).await;
+        ns.publish_index("mydb:main", 3, &dummy_cid("index-3"))
+            .await
+            .unwrap();
+        for (index, t) in [(Some(dummy_cid("index-1")), 1), (None, 0)] {
+            ns.reset_head(
+                "mydb:main",
+                crate::NsRecordSnapshot {
+                    commit_head_id: Some(dummy_cid("commit-3")),
+                    commit_t: 3,
+                    index_head_id: index.clone(),
+                    index_t: t,
+                },
+            )
+            .await
+            .unwrap();
+            let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+            assert_eq!((record.index_head_id, record.index_t), (index, t));
+        }
     }
 
     // =========================================================================

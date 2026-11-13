@@ -80,6 +80,8 @@ Once mapped, graph sources appear in `fluree list`, can be inspected with `flure
 
 A class or property `count` for a graph source means one thing: the exact number, as a native ledger loaded with the mapping's triples would report it. Where the metadata cannot prove the number, `count` is `null`, and `count-upper-bound` beside it gives the most it can be when that is provable. A class count is exact when every triples map minting the class reads its whole table (no [row filter](#row-filters-rrsqlquery)) under a row count that is not a merge-on-read bound, mints one distinct subject per row (its subject is built from a [key](r2rml.md#declaring-a-tables-keys-fkey) of the table, and no subject column can be null), and the maps provably mint different subjects (of any two subject templates, neither one's text before its first placeholder begins the other's). A property count is exact under the same conditions, when also no row mints one value of the property twice and the object column can never be null. "Can never be null" means the column is `required` in the table's schema, for format version 2 or older tables (from version 3 a required column can be added with a default that older files do not store). Otherwise the bound is the sum of the contributing tables' row counts, absent when one of them is unknown. A reference (`rr:parentTriplesMap`) is never counted exactly, because a child key may match no parent row: it is bounded by the child's rows when one join key value can match at most one parent subject (the parent's subject is built from the join columns, or they hold a key of the parent's table), and has no bound when one value can match several parents. Its `ref-classes` entries are `null`, with the bound under `ref-classes-upper-bound`. Per-datatype counts are the exact count or `null`.
 
+**Reading a virtual count.** Earlier releases reported the contributing tables' row counts as `count`. Now most classes and properties of a mapping that declares no key have `count: null`, since a count is exact only for maps whose subjects a key proves unique. A client that displays a count shows `count` when it is a number, else `count-upper-bound` as "at most N", else "not counted"; it never reads a `null` as 0. A `ref-classes` entry reads the same way, with its bound under `ref-classes-upper-bound`. Fluree's own MCP data-model summary does this. Declaring the tables' keys ([`f:key`](r2rml.md#declaring-a-tables-keys-fkey)) makes the counts of maps over unfiltered tables exact again.
+
 #### Warehouse-root `--table-location` (multi-table, catalog-less)
 
 `--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name (the namespace prefix stripped). Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
@@ -560,8 +562,8 @@ FROM <table>
 <literal>   := an integer | a decimal | 'a string' ('' escapes a quote) | TRUE | FALSE
 ```
 
-- The table resolves the way an `rr:tableName` does (`namespace.table`).
-- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive; quote a column whose name is a keyword.
+- The table resolves the way an `rr:tableName` does (`namespace.table`). As there, a table name may not begin with `sqlQuery:`, which is reserved for the aliases of `rr:sqlQuery` logical tables.
+- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive. Quote a column or table whose name is a keyword or one of the refused words below (`top`, `left`, `on`, `all`, ...): `WHERE "top" = 1`.
 - A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
 - The select list is the logical table's columns, as in R2RML. Every column the map reads (its term maps, and the parent columns of a join into it) must be in the list, or registration refuses the map. A column the list names must exist. `SELECT *` selects every column.
 - Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
@@ -579,7 +581,7 @@ Each literal is checked against the column's type in the schema of the snapshot 
 | boolean | `TRUE` or `FALSE` |
 | date, timestamp, time, binary, uuid, and other types | `IS [NOT] NULL` only (comparisons may be accepted by a later version) |
 
-A column the table does not have, or a literal that does not fit its column, fails the read with an error naming the column and its type. Nothing is approximated.
+A column the table does not have (or spells in another case), or a literal that does not fit its column, is refused with an error naming the map, the column and its type. Registration loads the tables the mapping reads and refuses such a mapping with HTTP `400`; [`r2rml/validate`](#schema-mismatch) reports the same message as an error before you save. A read checks again against the schema of the snapshot it reads, so a table changed after registration, or a table registration could not load, fails the read with that error instead. An empty table refuses such a filter too. Nothing is approximated.
 
 What else changes for a filtered map:
 
@@ -660,6 +662,13 @@ an Iceberg graph source:
   subjects the same way.
 - A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
   its row order can differ from one run to the next. The rows are the same.
+- The fixed order has a cost where the data files differ widely in size: the
+  reads still overlap, but rows are taken in file order, not as each read
+  finishes. It shows most on a query that must read the whole table before its
+  `LIMIT` applies, such as a grouped one: over a table with uneven files, a
+  grouped query with a `LIMIT` measured about 13% slower than reading in
+  completion order. Any `LIMIT` or `OFFSET` takes the fixed order, with or
+  without an `ORDER BY`.
 - Pages hold together only while the table does: an append or compaction between
   two page requests changes the snapshot, and with it the order. For paging that
   must survive table changes, order by a unique key (`ORDER BY ?id`).
@@ -1297,15 +1306,14 @@ native twin of the same data):
 
 A source read through a graph scope is filtered by its own policy (the
 request's and the source's model), whatever governs the graph the query
-reads by default. That holds for a dataset's named graph (`from-named` /
-`FROM NAMED`, including an unbound `GRAPH ?g` ranging over them), and for a
-JSON-LD query over one ledger that names the source in a `graph` pattern or
-gives it to the pattern's graph variable as a `values` or `bind` constant:
-the query reads the source as a named graph the same way. A graph variable
-bound to a source's name from data, outside the query's dataset, is refused
-with `400` `err:db/InvalidQuery`, governed source or not: name the source in
-`from-named` (SPARQL: `FROM NAMED <iri>`) and use `GRAPH <iri>` or
-`VALUES ?g { <iri> }`.
+reads by default. A graph scope reads a source only as a named graph of the
+query's dataset: name it in `from-named` (SPARQL: `FROM NAMED <iri>`) and use
+`GRAPH <iri>`, `VALUES ?g { <iri> }`, or an unbound `GRAPH ?g` ranging over
+the named graphs. A query over one ledger that reaches a source through a
+graph scope without naming it in the dataset does not read it, governed
+source or not: JSON-LD answers `400` `err:db/InvalidQuery` with that remedy,
+and a SPARQL query with `FROM` and no `FROM NAMED` answers no rows, as for
+any graph outside its dataset.
 
 Not supported: **`f:query`** policies. A virtual source has no graph to run the
 policy query against, so a targeted `f:query` evaluates as "no rows" and
@@ -1418,17 +1426,38 @@ triples map a scan skipped because its predicates were hidden.
    deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
    See the switch below to override.
 5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
-   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
-   `shortestPath`, and subqueries need a native index to walk and cannot be
-   evaluated over an Iceberg source. A query using one is **refused** with HTTP
-   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`) and
+   `shortestPath` need a native index to walk and cannot be evaluated over an
+   Iceberg source. A query using one is **refused** with HTTP 400
+   `err:db/InvalidQuery` naming the pattern, rather than returning the empty
    result it would otherwise produce as a success. Fixed-length patterns (`p`,
    `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
    traversal to a known depth (see [Graph Sources Overview → Query Patterns a
    Graph Source Cannot
    Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
    [materialize a native twin](#materializing-a-native-twin), which evaluates
-   all of them.
+   all of them. Sub-selects scan the tables like any other pattern; see
+   [Sub-selects over a Graph
+   Source](overview.md#sub-selects-over-a-graph-source).
+6. **A sliced JSON-LD sub-select reads its tables once per outer row:** a
+   JSON-LD sub-select with a `limit` or `offset` that shares a variable with
+   the patterns before it runs once per outer row (a top-k per row, as on a
+   native ledger), and each run reads the tables its body scans in full. Under
+   10,000 outer rows that is 10,000 reads of each table. Pushing the outer
+   row's key into those reads is [#2310](https://github.com/fluree/db/issues/2310).
+   A SPARQL sub-select is evaluated once.
+   See [Cost: a sliced JSON-LD sub-select reads per outer
+   row](overview.md#cost-a-sliced-json-ld-sub-select-reads-per-outer-row).
+   A sub-select outside every `GRAPH` block whose body reads the default view
+   is refused; see [A sub-select outside every GRAPH
+   block](overview.md#a-sub-select-outside-every-graph-block).
+7. **An `EXISTS` after the `WHERE` clause is refused:** an `EXISTS` in the
+   query's own `HAVING` or `ORDER BY`, or in an expression evaluated after a
+   trailing `VALUES`, runs outside the source's scope and is refused with HTTP
+   400 `err:db/InvalidQuery`. Move the condition into the `WHERE` clause as a
+   `FILTER` or `BIND`; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source). An `EXISTS` inside the
+   `WHERE` clause, in a pattern or an expression, scans the tables normally.
 
 ### Environment switches
 
@@ -1463,19 +1492,20 @@ To try the Glue mode without an AWS account, `scripts/glue-local/` in the reposi
 
 ### Schema Mismatch
 
-Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
+Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables, except an [`rr:sqlQuery` row filter](#row-filters-rrsqlquery)'s, which it refuses when a table it loads does not accept it. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
 
 | `code` | `severity` | `message` |
 |---|---|---|
-| `compileError` | `error` | `R2RML mapping failed to compile: …` |
+| `compileError` | `error` | `R2RML mapping failed to compile: …`, or, for an [`rr:sqlQuery` row filter](#row-filters-rrsqlquery) registration would refuse, its refusal: ``triples map <…>: rr:sqlQuery condition `valid_from > '2024-01-01'`: column 'valid_from' is date; …`` |
 | `tableNotFound` | `error` | `Table 'sales.orders' referenced by TriplesMap <…> was not found in the live catalog schema.` When the catalog could not load the table, its reason follows in parentheses. |
-| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` |
+| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` A row filter naming a column the table does not have, or spells in another case, gets registration's message: `triples map <…>: rr:sqlQuery names column 'region', which table 'crm.customers_history' does not have` |
 | `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
 | `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
 | `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
 | `columnNotFound` | `error` | `f:key on 'sales.orders' names column 'order_key', which the table does not have.` A declared key's column, checked as a query checks it (see [R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)). |
 | `casingMismatch` | `error` | `f:key on 'sales.orders' names column 'ORDER_ID', which the schema spells 'order_id'; a key column must match exactly.` |
 | `nonKeyTypeSkipped` | `error` | `f:key on 'sales.orders' names column 'score' of type Float64; a floating-point value cannot identify a row (NaN is unequal to itself).` Also for a nested column. |
+| `keylessMap` | `advisory` | `TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, so queries over it remove repeated solutions as they run. …` One per map that neither an `f:key` nor the table's identifier fields prove subject-unique; it names the `f:key` that would. Informational: queries answer correctly, but more slowly (see [R2RML → Slow Queries](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Registration (`POST /iceberg/map`, `fluree iceberg map`) reports the same advisories in its `diagnostics`. |
 
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 
@@ -1486,6 +1516,15 @@ At query time a column the table does not have is read like a NULL: the triples 
 Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
+
+**After an upgrade, a `COUNT`, a same-subject star or an `ORDER BY … LIMIT`
+got slower, or a query now fails with `MemoryBudgetExceeded`.** The most
+likely cause is a map with no key: neither an `f:key` nor the table's
+identifier fields prove its subjects unique, so its queries remove repeated
+solutions as they read. Registration and `POST /iceberg/r2rml/validate` name
+each such map (`keylessMap`). See
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)
+for how to confirm it per query and how to declare the key.
 
 **Causes:**
 - Large result sets

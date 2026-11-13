@@ -1233,6 +1233,115 @@ async fn the_lane_trusts_only_what_the_probe_verified() {
     assert_eq!(checked_rows, rows);
 }
 
+/// The maps a `keylessMap` advisory names, in order, each with its message.
+fn keyless_maps(diagnostics: &[fluree_db_api::Diagnostic]) -> Vec<(String, String)> {
+    use fluree_db_r2rml::emit::{DiagCode, Severity};
+    diagnostics
+        .iter()
+        .map(|d| {
+            assert_eq!(
+                (d.code, d.severity),
+                (DiagCode::KeylessMap, Severity::Advisory),
+                "{d:?}"
+            );
+            let iri = d
+                .message
+                .strip_prefix("TriplesMap <")
+                .and_then(|m| m.split_once('>'))
+                .map(|(iri, _)| iri.to_string())
+                .unwrap_or_else(|| panic!("a message naming its map: {}", d.message));
+            (iri, d.message.clone())
+        })
+        .collect()
+}
+
+/// Registration, and `check`, tell the operator which maps no key proves
+/// subject-unique, so the lane deduplicates them: one advisory per map, with
+/// the `f:key` that would prove it. A key the probe verified, or a declared
+/// one, proves it; a source registered with `allow_duplicate_subjects`
+/// probed nothing. An endpoint unreachable at registration verifies nothing
+/// and is reported by its warning, not by advisories.
+#[tokio::test(flavor = "current_thread")]
+async fn registration_names_each_map_the_lane_deduplicates() {
+    let _lock = KILL_SWITCH.lock().await;
+    let server = sets_tables().mount().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let create = |name: &'static str, mapping: String, probe: bool| {
+        let fluree = &fluree;
+        let uri = server.uri();
+        async move {
+            let mut config = SqlCreateConfig::new(name, uri, mapping);
+            config.allow_duplicate_subjects = !probe;
+            let created = fluree
+                .create_sql_graph_source(config)
+                .await
+                .unwrap_or_else(|e| panic!("create {name}: {e}"));
+            assert!(created.connection_tested, "{name}");
+            keyless_maps(&created.diagnostics)
+        }
+    };
+
+    // Proven by the probe, or by a declaration: nothing to say.
+    assert_eq!(create("adv-probed", current_mapping(false), true).await, []);
+    assert_eq!(create("adv-keyed", current_mapping(true), false).await, []);
+
+    // Probed nothing, declared nothing: the map is named, with its remedy.
+    let bare = create("adv-bare", current_mapping(false), false).await;
+    assert_eq!(bare.len(), 1, "{bare:?}");
+    let (map, message) = &bare[0];
+    assert_eq!(map, "http://example.org/mapping#Current");
+    assert!(
+        message.contains("'sets.customers_current'")
+            && message.ends_with(r#"declare `f:key ( "customer_id" )` on its logical table."#),
+        "{message}"
+    );
+
+    // Every map of the history mapping (the orders too); the version map's
+    // template runs its values together, so no key could prove it.
+    let hist = create("adv-hist", HIST_R2RML.to_string(), false).await;
+    let maps: Vec<&str> = hist.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        maps,
+        [
+            "http://example.org/mapping#History",
+            "http://example.org/mapping#Neighbor",
+            "http://example.org/mapping#Order",
+            "http://example.org/mapping#Version",
+        ],
+        "{hist:?}"
+    );
+    assert!(
+        hist[3].1.contains("can run two values together"),
+        "{hist:?}"
+    );
+
+    // `check` reports under the key it verified: none left once it proves
+    // the table's subjects, as on a source the endpoint could not reach at
+    // registration.
+    let unreachable = MockServer::start().await;
+    let created = fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "adv-late",
+            unreachable.uri(),
+            current_mapping(false),
+        ))
+        .await
+        .expect("registers despite the unreachable endpoint");
+    assert!(!created.connection_tested);
+    assert_eq!(keyless_maps(&created.diagnostics), []);
+    sets_tables().mount_on(&unreachable).await;
+    let checked = fluree
+        .check_sql_graph_source("adv-late:main")
+        .await
+        .expect("check");
+    assert_eq!(keyless_maps(&checked.diagnostics), []);
+    let checked = fluree
+        .check_sql_graph_source("adv-bare:main")
+        .await
+        .expect("check");
+    assert_eq!(keyless_maps(&checked.diagnostics).len(), 1, "{checked:?}");
+}
+
 /// A key the mapping declares must name columns the SQL table holds, of a
 /// type that can identify a row: the query refuses on both surfaces rather
 /// than trust a key the table cannot hold.

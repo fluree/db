@@ -10,7 +10,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey,
-    fast_path_store, normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan,
+    fast_path_store, normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan, LaneOutput,
     ProbeLanePlan, ProbeOps, PsotSubjectSeek, RowFate, SharedOverlayOps,
 };
 use crate::ir::triple::{Ref, TriplePattern};
@@ -385,11 +385,21 @@ impl EncObj {
     /// `Sid`, built by the same `materialized_object_binding` the fallback
     /// scan uses for these rows. The decode runs once per row that
     /// *survives* the join, not per row scanned.
-    fn to_binding(self, view: Option<&BinaryGraphView>) -> Result<Binding> {
-        if let Some(binding) =
-            late_materialized_object_binding(self.o_type, self.o_key, self.p_id, 0, u32::MAX, None)
-        {
-            return Ok(binding);
+    ///
+    /// `decoded` is the eager-materialization form, which is always the
+    /// decoded binding.
+    fn to_binding(self, view: Option<&BinaryGraphView>, decoded: bool) -> Result<Binding> {
+        if !decoded {
+            if let Some(binding) = late_materialized_object_binding(
+                self.o_type,
+                self.o_key,
+                self.p_id,
+                0,
+                u32::MAX,
+                None,
+            ) {
+                return Ok(binding);
+            }
         }
         let Some(view) = view else {
             return Err(QueryError::Internal(
@@ -579,10 +589,12 @@ pub(crate) struct CyclicBgpOperator {
     used_fast_path: bool,
     raw_relation_rows: usize,
     pruned_relation_rows: usize,
-    /// Emit-side decoder for non-reserved string-dictionary objects
-    /// (novelty-aware). Set when the encoded fast path opens; `None` in
-    /// RefOnly mode and on the fallback path.
+    /// Emit-side decoder (novelty-aware). Set when the fast path opens;
+    /// `None` on the fallback path.
     emit_view: Option<BinaryGraphView>,
+    /// The context asked for eager materialization: emit decoded bindings,
+    /// as the scan does.
+    emit_decoded: bool,
 }
 
 impl CyclicBgpOperator {
@@ -640,6 +652,7 @@ impl CyclicBgpOperator {
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
             emit_view: None,
+            emit_decoded: false,
         }
     }
 
@@ -1103,20 +1116,19 @@ impl CyclicBgpOperator {
             return Ok(false);
         }
 
+        // Same view construction as `ExecutionContext::graph_view`, against
+        // the one `(store, g_id)` pair the relation scans below read.
+        self.emit_view = ctx.binary_store.as_ref().map(|store| {
+            store
+                .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
+                .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                .with_tracker(ctx.tracker.clone())
+        });
+        self.emit_decoded = ctx.eager_materialization;
+
         match self.join_mode {
             CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx),
-            CyclicJoinMode::EncodedObject => {
-                // Emit-side decoder for string-dictionary objects: same view
-                // construction as `ExecutionContext::graph_view`, against the
-                // one `(store, g_id)` pair the relation scans below read.
-                self.emit_view = ctx.binary_store.as_ref().map(|store| {
-                    store
-                        .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
-                        .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-                        .with_tracker(ctx.tracker.clone())
-                });
-                self.open_encoded_fast_path(ctx)
-            }
+            CyclicJoinMode::EncodedObject => self.open_encoded_fast_path(ctx),
         }
     }
 
@@ -1126,9 +1138,10 @@ impl CyclicBgpOperator {
     /// every edge). With novelty present, probing stays allowed when every
     /// edge's resolved ops are mergeable (empty → `None`, non-empty →
     /// `Some(ops)` merged per probed subject); any unmergeable edge
-    /// (translation failure, novelty-only predicate, eager materialization)
-    /// disables probes for the cascade — full scans, which merge through the
-    /// overlay cursor, are unaffected. Historical snapshots keep probes off:
+    /// (translation failure, novelty-only predicate) disables probes for the
+    /// cascade — full scans, which merge through the overlay cursor, are
+    /// unaffected. An eager caller is admitted like any other: every row the
+    /// operator emits is decoded for it at emit. Historical snapshots keep probes off:
     /// the seek reads latest base state with no replay.
     fn compute_probe_overlay_state(
         &self,
@@ -1147,7 +1160,7 @@ impl CyclicBgpOperator {
         let mut ops_per_edge = Vec::with_capacity(n);
         for edge in self.plan.edges.iter() {
             let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-            match subject_probe_lane_plan(ctx, store, &pred_sid)? {
+            match subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::DecodesForEager)? {
                 ProbeLanePlan::Clean => ops_per_edge.push(None),
                 ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
                 ProbeLanePlan::Decline => {
@@ -2207,7 +2220,8 @@ impl CyclicBgpOperator {
     /// Materialize one fully-assigned row into the output columns. Vars that
     /// appear in subject position bind as plain `EncodedSid` (matching the
     /// scan path); object-only vars rebuild the late-materialized binding
-    /// (decoding non-reserved string-dict values through `emit_view`).
+    /// (decoding non-reserved string-dict values through `emit_view`). Under
+    /// eager materialization every var binds decoded.
     fn assignment_to_columns(
         &self,
         assignment: &[EncObj],
@@ -2217,13 +2231,13 @@ impl CyclicBgpOperator {
             let var = self.plan.vars[var_idx];
             let value = assignment[var_idx];
             let binding = if self.var_is_subject(var) {
-                Binding::encoded_sid(
+                self.ref_binding(
                     value
                         .ref_s_id()
                         .expect("subject-positioned cyclic vars only bind refs"),
-                )
+                )?
             } else {
-                value.to_binding(self.emit_view.as_ref())?
+                value.to_binding(self.emit_view.as_ref(), self.emit_decoded)?
             };
             cols[out_idx].push(binding);
         }
@@ -2355,10 +2369,29 @@ impl CyclicBgpOperator {
             .map_err(|e| QueryError::Internal(format!("cyclic bgp square wedge batch: {e}")))
     }
 
-    fn ref_assignment_to_columns(&self, assignment: &[u64], cols: &mut [Vec<Binding>]) {
+    fn ref_assignment_to_columns(
+        &self,
+        assignment: &[u64],
+        cols: &mut [Vec<Binding>],
+    ) -> Result<()> {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
-            cols[out_idx].push(Binding::encoded_sid(assignment[var_idx]));
+            cols[out_idx].push(self.ref_binding(assignment[var_idx])?);
         }
+        Ok(())
+    }
+
+    fn ref_binding(&self, s_id: u64) -> Result<Binding> {
+        if !self.emit_decoded {
+            return Ok(Binding::encoded_sid(s_id));
+        }
+        let Some(view) = self.emit_view.as_ref() else {
+            return Err(QueryError::Internal(
+                "cyclic bgp emit: a decoded ref binding requires a graph view".into(),
+            ));
+        };
+        view.resolve_subject_sid(s_id)
+            .map(Binding::sid)
+            .map_err(|e| QueryError::from_io("cyclic bgp emit: resolve_subject_sid", e))
     }
 
     fn next_ref_batch(&mut self) -> Result<Option<Batch>> {
@@ -2375,7 +2408,7 @@ impl CyclicBgpOperator {
                 if cols.is_empty() {
                     produced += 1;
                 } else {
-                    self.ref_assignment_to_columns(&assignment, &mut cols);
+                    self.ref_assignment_to_columns(&assignment, &mut cols)?;
                     produced += 1;
                 }
                 continue;
@@ -2596,6 +2629,7 @@ impl Operator for CyclicBgpOperator {
         self.square_wedge = None;
         self.probed_edges = 0;
         self.emit_view = None;
+        self.emit_decoded = false;
         self.state = OperatorState::Closed;
     }
 }
@@ -2657,7 +2691,7 @@ mod tests {
         assert!(matches!(object.id, EncIdentity::Lit { o_key: 42, .. }));
         assert!(matches!(
             object
-                .to_binding(None)
+                .to_binding(None, false)
                 .expect("reserved string-dict o_types need no view"),
             Binding::EncodedLit { o_key: 42, .. }
         ));
@@ -2687,7 +2721,7 @@ mod tests {
         assert!(matches!(object.id, EncIdentity::Lit { o_key: 12_345, .. }));
         assert!(matches!(
             object
-                .to_binding(None)
+                .to_binding(None, false)
                 .expect("encoded temporal o_types need no view"),
             Binding::EncodedLit { o_key: 12_345, .. }
         ));
@@ -2737,8 +2771,8 @@ mod tests {
         assert_ne!(any_uri, encode(OType::XSD_ANY_URI, 43).unwrap());
 
         // Emit needs the store: there is no encoded binding to rebuild.
-        assert!(any_uri.to_binding(None).is_err());
-        assert!(customer.to_binding(None).is_err());
+        assert!(any_uri.to_binding(None, false).is_err());
+        assert!(customer.to_binding(None, false).is_err());
     }
 
     /// `EncIdentity::Lit` keys on `o_type` where `Binding::eq` on `EncodedLit`

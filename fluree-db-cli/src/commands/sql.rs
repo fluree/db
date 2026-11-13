@@ -195,6 +195,7 @@ async fn run_sql_map_remote(
     );
     super::iceberg::print_model_warnings(&super::iceberg::model_warnings_of(&result));
     print_mapping_warnings(&string_list_of(&result, "mapping_warnings"));
+    super::iceberg::report_diagnostics(&result);
     Ok(())
 }
 
@@ -245,6 +246,7 @@ async fn run_sql_check_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
         );
     }
     print_mapping_warnings(&result.mapping_warnings);
+    super::iceberg::print_diagnostics(&result.diagnostics);
     Ok(())
 }
 
@@ -310,6 +312,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
     );
     super::iceberg::print_model_warnings(&result.model_warnings);
     print_mapping_warnings(&result.mapping_warnings);
+    super::iceberg::print_diagnostics(&result.diagnostics);
     Ok(())
 }
 

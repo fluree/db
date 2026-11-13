@@ -57,6 +57,12 @@
 - `sets.customers_us`, `sets.customers_eu`: two tables, each keyed by `id`,
   minting customers with one template; customer 7 has a row in each, so a
   same-subject star over the two pairs each name with each city.
+- `silver.tombstones`: two snapshots for a materialize with a delete
+  convention and no ordering column. The first is a large file of 200,000
+  live revisions of subjects 1..=10 (`op` = "u"); the second a one-row file
+  holding subject 7's tombstone (`op` = "d"). Read in commit order the
+  tombstone comes last and retracts subject 7; read as the reads finish, the
+  small file tends to come first, and a later live row resurrects it.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -611,3 +617,26 @@ versions.append(pa.table({
 }, schema=versions_schema))
 versions = catalog.load_table("silver.versions")
 print("versions table_location:", versions.location())
+
+# ---------------------------------------------------------------------------
+# silver.tombstones: a tombstone committed after a large file of live rows.
+# ---------------------------------------------------------------------------
+tombstones_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("op", pa.string()),
+])
+tombstones = catalog.create_table("silver.tombstones", schema=tombstones_schema)
+live = 200_000
+tombstones.append(pa.table({
+    "id": pa.array([i % 10 + 1 for i in range(live)], pa.int64()),
+    "name": pa.array([f"name-{i % 1000}" for i in range(live)]),
+    "op": pa.array(["u"] * live),
+}, schema=tombstones_schema))
+tombstones.append(pa.table({
+    "id": pa.array([7], pa.int64()),
+    "name": pa.array([None], pa.string()),
+    "op": pa.array(["d"]),
+}, schema=tombstones_schema))
+tombstones = catalog.load_table("silver.tombstones")
+print("tombstones table_location:", tombstones.location())

@@ -111,13 +111,29 @@ where
         // their per-branch state. Without this notification the new
         // whole-ledger drop path would leave stale caches behind.
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
         });
         Ok(remaining)
     }
 
     async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        self.inner.reset_head(ledger_id, snapshot).await
+        let head = snapshot
+            .commit_head_id
+            .clone()
+            .map(|id| (id, snapshot.commit_t));
+        self.inner.reset_head(ledger_id, snapshot).await?;
+        // A reset moves the head (a rebase, or a rollback), and its index
+        // with it. Subscribers re-read the whole record on a commit event,
+        // so query peers follow the index too.
+        if let Some((commit_id, commit_t)) = head {
+            self.event_bus
+                .notify(NameServiceEvent::LedgerCommitPublished {
+                    ledger_id: LedgerId::parse_persisted(ledger_id)?,
+                    commit_id,
+                    commit_t,
+                });
+        }
+        Ok(())
     }
 
     // Pass-through wrapper: delegate so the inner backend's commit-CID index
@@ -153,7 +169,7 @@ where
     async fn retract(&self, ledger_id: &str) -> Result<()> {
         self.inner.retract(ledger_id).await?;
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: LedgerId::parse(ledger_id)?,
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
         });
         Ok(())
     }
@@ -460,5 +476,46 @@ where
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
         self.inner.push_config(ledger_id, expected, new).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryNameService;
+    use fluree_db_core::ContentKind;
+
+    /// A reset moves the head and the index together; subscribers (query
+    /// peers among them) hear of it as a commit and re-read the record.
+    #[tokio::test]
+    async fn a_reset_is_announced_as_a_commit() {
+        let ns =
+            NotifyingNameService::new(MemoryNameService::new(), Arc::new(LedgerEventBus::new(16)));
+        ns.init("reset:main").await.expect("init");
+        let mut events = ns.subscribe(SubscriptionScope::All).receiver;
+        let head = ContentId::new(ContentKind::Commit, b"rebased-head");
+        ns.reset_head(
+            "reset:main",
+            NsRecordSnapshot {
+                commit_head_id: Some(head.clone()),
+                commit_t: 2,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .expect("reset");
+        match events.try_recv().expect("an event") {
+            NameServiceEvent::LedgerCommitPublished {
+                ledger_id,
+                commit_id,
+                commit_t,
+            } => {
+                assert_eq!(ledger_id.as_str(), "reset:main");
+                assert_eq!(commit_id, head);
+                assert_eq!(commit_t, 2);
+            }
+            other => panic!("expected a commit event, got {other:?}"),
+        }
     }
 }

@@ -2838,6 +2838,27 @@ Returns comprehensive ledger metadata including namespace codes, property stats,
 }
 ```
 
+For a graph source (Iceberg, Delta, SQL), a class or property `count` is the exact number a native ledger loaded with the mapping's triples would report, or `null` where table metadata cannot prove it. A `null` count carries `count-upper-bound` when a bound is provable, and a `null` entry of `ref-classes` carries its bound under `ref-classes-upper-bound`:
+
+```json
+"classes": {
+  "ex:Customer": {
+    "count": null,
+    "count-upper-bound": 9000000,
+    "properties": {
+      "ex:placedBy": {
+        "count": null,
+        "count-upper-bound": 6000000,
+        "ref-classes": { "ex:Customer": null },
+        "ref-classes-upper-bound": { "ex:Customer": 6000000 }
+      }
+    }
+  }
+}
+```
+
+Earlier releases put the tables' row counts in `count`. A client that displays a count reads `count`, falls back to `count-upper-bound` ("at most N"), and shows a count with neither as unknown, never as 0. Most counts of a map with no declared key are `null`; see [Iceberg → `info`](../graph-sources/iceberg.md) for when a count is exact.
+
 When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
 
 **Response (proxy storage mode):**
@@ -3228,6 +3249,8 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 
 `connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
 
+`diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map whose subjects neither an `f:key` nor the table's identifier fields prove unique, so its queries remove repeated solutions as they read: `{"severity": "advisory", "code": "keylessMap", "table": "sales.orders", "message": "TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, … If order_id identifies a row, declare `f:key ( \"order_id\" )` on its logical table, or make it the table's identifier field."}`. It is informational: the source is registered and answers correctly, but more slowly than a keyed map (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). It is reported only when every table loaded (`connection_check` `verified`).
+
 `connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
 
 | `outcome` | Meaning | Other fields |
@@ -3533,7 +3556,7 @@ The catalog and storage fields may instead be given structured, as the stored co
 }
 ```
 
-`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate.
+`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate. `diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map no `f:key` proves subject-unique (a Delta table reports no key of its own), naming the map and the `f:key` that would prove it; queries over such a map remove repeated solutions as they read (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)).
 
 See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
 
@@ -3589,7 +3612,7 @@ So that one body can be sent to each route in turn, each Delta route ignores the
 }
 ```
 
-An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
+An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns. A generated mapping declares no `f:key`, and a Delta table reports no key of its own, so `generate` and `validate` give a `keylessMap` advisory for each triples map no declared key proves subject-unique: its queries remove repeated solutions as they read. Add the `f:key` the advisory names where the subject's columns identify a row (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). `iceberg/r2rml/generate` does the same, counting the tables' identifier fields as keys.
 
 **Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
@@ -3658,7 +3681,7 @@ POST {api_base_url}/sql/map
 }
 ```
 
-`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration. `mapping_warnings` (omitted when empty) lists the findings of the subject-key uniqueness probe.
+`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration. `mapping_warnings` (omitted when empty) lists the findings of the subject-key uniqueness probe. `diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map that neither the key the probe verified nor an `f:key` proves subject-unique, so its statements carry `DISTINCT` or decline to the per-scan lane (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Nothing is reported when the endpoint was unreachable.
 
 **Status Codes:**
 - `201 Created` — graph source created

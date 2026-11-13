@@ -27,6 +27,7 @@ use crate::{
     TrackedErrorResponse, TrackedQueryResponse, TrackingOptions,
 };
 
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
 // ============================================================================
@@ -56,7 +57,8 @@ pub(crate) struct QueryCore<'a> {
     pub(crate) tracking: Option<TrackingOptions>,
     pub(crate) format: Option<FormatterConfig>,
     pub(crate) graph_sources: GraphSourceMode,
-    pub(crate) execution: QueryExecutionOptions,
+    /// Read through [`Self::execution`], which adds what the format owes.
+    execution: QueryExecutionOptions,
     pub(crate) r2rml: Option<(
         Arc<dyn R2rmlProvider + 'a>,
         Arc<dyn R2rmlTableProvider + 'a>,
@@ -122,6 +124,31 @@ impl<'a> QueryCore<'a> {
 
     pub(crate) fn set_execution_options(&mut self, options: QueryExecutionOptions) {
         self.execution = options;
+    }
+
+    /// The options to execute with: the caller's, plus deterministic
+    /// graph-source scans when the format answers with a prefix of the rows
+    /// that a client continues with OFFSET (a byte-budgeted AgentJson
+    /// response; see [`FormatterConfig::pages_rows`]). That page is cut after
+    /// the query runs, where the planner cannot see it, and the page after it
+    /// carries an OFFSET, so both must read the rows in one order. Read here,
+    /// at execution, so the order of `.format()` and `.execution_options()`
+    /// on the builder does not matter.
+    pub(crate) fn execution(&self) -> QueryExecutionOptions {
+        let mut execution = self.execution.clone();
+        if self
+            .format
+            .as_ref()
+            .is_some_and(FormatterConfig::pages_rows)
+        {
+            execution.deterministic_scans = true;
+        }
+        execution
+    }
+
+    /// The server-verified identity the caller attached, if any.
+    pub(crate) fn server_identity(&self) -> Option<&VerifiedIdentity> {
+        self.execution.server_identity.as_ref()
     }
 
     pub(crate) fn set_params(&mut self, params: fluree_db_sparql::ParamMap) {
@@ -284,7 +311,7 @@ impl<'a> ViewQueryBuilder<'a> {
 
         let mut core = self.core;
         let r2rml = core.r2rml.take();
-        let execution = core.execution.clone();
+        let execution = core.execution();
         let input = core.input.take().unwrap(); // safe: validated
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
@@ -317,7 +344,7 @@ impl<'a> ViewQueryBuilder<'a> {
         }
 
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -359,7 +386,7 @@ impl<'a> ViewQueryBuilder<'a> {
         }
 
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -414,7 +441,7 @@ impl<'a> ViewQueryBuilder<'a> {
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
@@ -563,7 +590,7 @@ impl<'a> DatasetQueryBuilder<'a> {
 
         let mut core = self.core;
         let r2rml = core.r2rml.take();
-        let execution = core.execution.clone();
+        let execution = core.execution();
         let input = core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
@@ -595,7 +622,7 @@ impl<'a> DatasetQueryBuilder<'a> {
         }
 
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -643,7 +670,7 @@ impl<'a> DatasetQueryBuilder<'a> {
         }
 
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -702,7 +729,7 @@ impl<'a> DatasetQueryBuilder<'a> {
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
@@ -1000,7 +1027,7 @@ impl<'a> FromQueryBuilder<'a> {
         if let Some(QueryInput::Sparql(sparql)) = self.core.input {
             let mut opts = GovernanceOptions::from_sparql(sparql);
             if opts.has_any_policy_inputs() {
-                opts.server_identity = self.core.execution.server_identity.clone();
+                opts.server_identity = self.core.server_identity().cloned();
                 self.connection_opts = Some(opts);
             }
         }
@@ -1031,7 +1058,7 @@ impl<'a> FromQueryBuilder<'a> {
         let authorized_json = self.prepare_authorization()?;
         let mut core = self.core;
         let r2rml = core.r2rml.take();
-        let execution = core.execution.clone();
+        let execution = core.execution();
         let input = core.input.take().unwrap();
         let input = authorized_json
             .as_ref()
@@ -1152,7 +1179,7 @@ impl<'a> FromQueryBuilder<'a> {
 
         let authorized_json = self.prepare_authorization()?;
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -1327,7 +1354,7 @@ impl<'a> FromQueryBuilder<'a> {
 
         let authorized_json = self.prepare_authorization()?;
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -1511,7 +1538,7 @@ impl<'a> FromQueryBuilder<'a> {
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
         let input = authorized_json
             .as_ref()
@@ -1726,6 +1753,45 @@ mod tests {
     use super::*;
     use crate::FlureeBuilder;
     use serde_json::json;
+
+    /// A format that answers with a page of the rows, which the client
+    /// continues with OFFSET (AgentJson under a byte budget), makes the query
+    /// read graph-source tables in one order, however the builder was called:
+    /// `.format()` before or after `.execution_options()`. Other formats, and
+    /// AgentJson without a budget, leave the caller's options as they are.
+    #[test]
+    fn a_paged_format_executes_with_deterministic_scans() {
+        let paged = || FormatterConfig::agent_json().with_max_bytes(1_000);
+        let caller = || QueryExecutionOptions::default().with_trust_fk_refs(true);
+
+        let mut format_first = QueryCore::new();
+        format_first.set_format(paged());
+        format_first.set_execution_options(caller());
+        let mut options_first = QueryCore::new();
+        options_first.set_execution_options(caller());
+        options_first.set_format(paged());
+        for core in [&format_first, &options_first] {
+            let execution = core.execution();
+            assert!(execution.deterministic_scans);
+            assert!(execution.trust_fk_refs, "the caller's options are kept");
+        }
+
+        for format in [
+            None,
+            Some(FormatterConfig::agent_json()),
+            Some(FormatterConfig::jsonld().with_max_bytes(1_000)),
+        ] {
+            let mut core = QueryCore::new();
+            if let Some(format) = format.clone() {
+                core.set_format(format);
+            }
+            assert!(
+                !core.execution().deterministic_scans,
+                "{:?}",
+                format.map(|f| f.format)
+            );
+        }
+    }
 
     // ========================================================================
     // Validation tests

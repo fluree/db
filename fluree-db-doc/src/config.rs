@@ -144,9 +144,15 @@ impl ModelEndpoint {
 /// auth_header = "X-Api-Key"        # default: Authorization: Bearer <key>
 /// models = ["reader-small", "reader-large"]
 /// ```
+///
+/// With `account = true` the credential is this machine's `fluree login`
+/// instead of `api_key` (a reader with both is refused), and `url`
+/// defaults to the account's own reader (`<api base>/grounding`).
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ReaderEndpoint {
-    /// The URL a request is POSTed to.
+    /// The URL a request is POSTed to. May be left out with `account`,
+    /// whose API supplies it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
     /// The credential. A value starting with `$` names an environment
     /// variable holding it.
@@ -170,6 +176,24 @@ pub struct ReaderEndpoint {
     /// (`ontology`, `catalog`), sent as `X-Fluree-Cache`; `--cache` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<String>,
+    /// Use the signed-in account (`fluree login`) as the credential, and
+    /// its API as the default `url`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account: bool,
+}
+
+/// A yes-or-no environment variable: `1`, `true` or `yes`, or `0`, `false`
+/// or `no`, in any case. Anything else is an error rather than a quiet
+/// `false`, since a value overrides the file: a typo would turn off what
+/// the file turned on.
+fn env_flag(name: &str, value: &str) -> crate::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(crate::DocError::Config(format!(
+            "{name}={value:?}: expected 1, true or yes, or 0, false or no"
+        ))),
+    }
 }
 
 /// `["a", "b"]` or `"a, b"`, as a list of trimmed, non-empty ids.
@@ -202,6 +226,7 @@ impl std::fmt::Debug for ReaderEndpoint {
             .field("auth_header", &self.auth_header)
             .field("models", &self.models)
             .field("cache", &self.cache)
+            .field("account", &self.account)
             .finish()
     }
 }
@@ -224,7 +249,7 @@ impl ReaderEndpoint {
         self.models.iter().any(|m| m.eq_ignore_ascii_case(model))
     }
 
-    fn apply_env(&mut self) {
+    fn apply_env(&mut self) -> crate::Result<()> {
         let var = |field: &str| std::env::var(format!("FLUREE_DOC_READER_{field}")).ok();
         if let Some(v) = var("URL") {
             self.url = v;
@@ -246,10 +271,14 @@ impl ReaderEndpoint {
         if let Some(v) = var("CACHE") {
             self.cache = Some(v);
         }
+        if let Some(v) = var("ACCOUNT") {
+            self.account = env_flag("FLUREE_DOC_READER_ACCOUNT", &v)?;
+        }
+        Ok(())
     }
 
     fn is_usable(&self) -> bool {
-        !self.url.trim().is_empty()
+        !self.url.trim().is_empty() || self.account
     }
 }
 
@@ -304,8 +333,8 @@ pub struct DocConfig {
 impl DocConfig {
     /// Layer `FLUREE_DOC_*` environment variables over the file values. A
     /// slot absent from the file is created when the environment names its
-    /// URL and model.
-    pub fn with_env(mut self) -> Self {
+    /// URL and model. A value that can't be read is an error.
+    pub fn with_env(mut self) -> crate::Result<Self> {
         for (slot, field) in [
             ("EMBEDDING", &mut self.embedding),
             ("LLM", &mut self.llm),
@@ -316,12 +345,12 @@ impl DocConfig {
             *field = ep.is_usable().then_some(ep);
         }
         let mut reader = self.reader.take().unwrap_or_default();
-        reader.apply_env();
+        reader.apply_env()?;
         self.reader = reader.is_usable().then_some(reader);
         if let Ok(model) = std::env::var("FLUREE_DOC_MODEL") {
             self.model = Some(model).filter(|m| !m.trim().is_empty());
         }
-        self
+        Ok(self)
     }
 
     /// The reader for document crops: `vlm`, or `llm` when no separate
@@ -444,6 +473,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A yes-or-no variable takes three spellings of each, in any case, and
+    /// refuses anything else (`on`, a typo) rather than read it as no.
+    #[test]
+    fn a_flag_variable_is_yes_no_or_an_error() {
+        for v in ["1", "true", "YES", " True "] {
+            assert!(env_flag("X", v).unwrap(), "{v}");
+        }
+        for v in ["0", "false", "No", "FALSE"] {
+            assert!(!env_flag("X", v).unwrap(), "{v}");
+        }
+        for v in ["on", "off", "ture", "", "2"] {
+            let err = env_flag("FLUREE_DOC_READER_ACCOUNT", v).unwrap_err();
+            assert!(
+                err.to_string().contains("FLUREE_DOC_READER_ACCOUNT="),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_reader_needs_no_url() {
+        // `[doc.reader] account = true` as the docs show it, with no `url`.
+        let cfg: DocConfig = serde_json::from_value(serde_json::json!({
+            "reader": { "account": true, "models": ["reader-small"] }
+        }))
+        .unwrap();
+        let reader = cfg.reader.unwrap();
+        assert!(reader.account && reader.url.is_empty());
+        assert!(!serde_json::to_value(&reader).unwrap()["url"].is_string());
     }
 
     #[test]

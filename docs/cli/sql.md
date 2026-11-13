@@ -113,6 +113,10 @@ still registered and the first query reports the underlying error.
 
 A `Warning:` line per finding of the subject-key uniqueness probe follows
 (a table whose subject key repeats, or a table that could not be probed).
+Then an `advisory:` line on standard error for each triples map that neither
+the key the probe verified nor an `f:key` proves subject-unique, naming the
+`f:key` that would: the lane deduplicates such a map (see
+[R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)).
 
 ## fluree sql check
 
@@ -124,7 +128,8 @@ Re-runs the subject-key uniqueness probe against the live tables and stores
 the result on the source: the tables whose keys repeat, and the key verified
 for every other table, which the pushdown lane then trusts. Run it after the
 endpoint was unreachable at registration, or after the tables change.
-Local only (no `--remote`).
+It prints the probe's findings and the `advisory:` lines `map` prints, under
+the keys it verified. Local only (no `--remote`).
 
 ## fluree sql list / info / drop
 

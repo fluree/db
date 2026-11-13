@@ -181,6 +181,21 @@ pub fn usable_in_key(field_type: Option<&FieldType>) -> bool {
     matches!(field_type, Some(t) if !matches!(t, FieldType::Float32 | FieldType::Float64))
 }
 
+/// What can prove that no two rows of a map mint the same subject
+/// ([`TriplesMap::subject_key_proof`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectKeyProof {
+    /// A key of the logical table that lies wholly within these columns (an
+    /// `rr:column` subject's column, or an injective template's columns).
+    KeyWithin(Vec<String>),
+    /// No key: the subject is an `rr:template` whose expansion can run two
+    /// values together (no separator the IRI escape always encodes between
+    /// two placeholders), so distinct rows can expand to one subject.
+    RunTogether,
+    /// No key: the subject is a constant, a literal, or has no value source.
+    NotFromColumns,
+}
+
 /// Where a subject map's term comes from, in the precedence the materializer
 /// applies (`materialize_subject_from_batch`): a constant wins over a column,
 /// a column over a template.
@@ -234,20 +249,35 @@ impl TriplesMap {
     /// mints no subject at all. A constant subject (every row mints the same
     /// one) and a subject map with no value source are never unique.
     pub fn subject_unique_under(&self, keys: &TableKeys) -> bool {
+        match self.subject_key_proof() {
+            SubjectKeyProof::KeyWithin(columns) => {
+                keys.has_key_within(columns.iter().map(String::as_str))
+            }
+            SubjectKeyProof::RunTogether | SubjectKeyProof::NotFromColumns => false,
+        }
+    }
+
+    /// What a key of this map's logical table has to be for
+    /// [`Self::subject_unique_under`] to hold: one within the columns the
+    /// subject reads, or none can be (see [`SubjectKeyProof`]). The one
+    /// reading of a subject map both the lanes and the operator-facing
+    /// diagnostics take.
+    pub fn subject_key_proof(&self) -> SubjectKeyProof {
         let sm = &self.subject_map;
         if sm.term_type == TermType::Literal {
-            return false;
+            return SubjectKeyProof::NotFromColumns;
         }
         match sm.source() {
-            SubjectSource::Column(column) => keys.has_key_within([column]),
-            SubjectSource::Template(template) => {
+            SubjectSource::Column(column) => SubjectKeyProof::KeyWithin(vec![column.to_string()]),
+            SubjectSource::Template(template) if template_is_injective(template) => {
                 // The columns the expansion actually reads, from the template
                 // itself rather than the cached list beside it.
-                let columns = super::extract_template_columns(template);
-                template_is_injective(template)
-                    && keys.has_key_within(columns.iter().map(String::as_str))
+                SubjectKeyProof::KeyWithin(super::extract_template_columns(template))
             }
-            SubjectSource::Constant(_) | SubjectSource::Unspecified => false,
+            SubjectSource::Template(_) => SubjectKeyProof::RunTogether,
+            SubjectSource::Constant(_) | SubjectSource::Unspecified => {
+                SubjectKeyProof::NotFromColumns
+            }
         }
     }
 
@@ -590,6 +620,28 @@ mod tests {
         let mut tm = map("http://example.org/customer/{customer_id}");
         tm.subject_map.term_type = TermType::Literal;
         assert!(!tm.subject_unique_under(&keys(&[&["customer_id"]])));
+    }
+
+    /// What a subject needs of a key, as the operator is told it.
+    #[test]
+    fn the_proof_a_subject_needs_names_its_columns_or_why_none_exists() {
+        assert_eq!(
+            map("http://example.org/order/{region}/{order_id}").subject_key_proof(),
+            SubjectKeyProof::KeyWithin(vec!["region".into(), "order_id".into()])
+        );
+        let mut tm = map("unused");
+        tm.subject_map = SubjectMap::column("customer_iri");
+        assert_eq!(
+            tm.subject_key_proof(),
+            SubjectKeyProof::KeyWithin(vec!["customer_iri".into()])
+        );
+        assert_eq!(
+            map("http://example.org/x/{a}-{b}").subject_key_proof(),
+            SubjectKeyProof::RunTogether
+        );
+        let mut tm = map("http://example.org/customer/{customer_id}");
+        tm.subject_map.constant = Some("http://example.org/the-one".into());
+        assert_eq!(tm.subject_key_proof(), SubjectKeyProof::NotFromColumns);
     }
 
     #[test]

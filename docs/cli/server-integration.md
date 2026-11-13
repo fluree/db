@@ -2521,6 +2521,7 @@ A stored mapping implies its connection, and `table` defaults to its first table
 | `table_count` | integer | Always | Number of distinct tables the mapping reads |
 | `table_names` | string[] | Always | Those tables, sorted |
 | `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |
+| `diagnostics` | object[] | When non-empty | Advisories about the mapping, each `{severity, code, table?, column?, message}`: a `keylessMap` per triples map no key proves subject-unique (see [`POST /iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap)). The CLI prints each on standard error |
 
 **Error responses:**
 - `400 Bad Request` — validation failures (missing fields, `r2rml` among them; invalid mode, bad table identifier, an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap`)

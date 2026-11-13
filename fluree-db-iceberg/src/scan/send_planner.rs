@@ -1173,7 +1173,7 @@ mod plan_from_files_tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = fluree_test_support::scoped_default(subscriber);
 
         let (md, storage) = table();
         let snap = md.current_snapshot().unwrap();
