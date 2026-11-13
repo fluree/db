@@ -127,7 +127,7 @@ Ledger lists hold ledger IDs, parsed when the token is verified. A bare name mea
 
 On a ledger with a [targeted removal](../transactions/history-retention.md#audit-access), the commit log still holds what its history no longer serves. Commit show, commit export, pack, storage-proxy reads of commits, transactions and history-index blobs, vended storage credentials, and merge-preview change details then need an audit scope as well as their usual one. Read, write and storage scopes do not imply it. On other ledgers it is not checked. [`fluree token create`](../cli/token.md) grants it with `--audit-all` or `--audit-ledger`.
 
-A server that runs without data authentication keeps audit data behind this scope too. It reads a presented token for its audit grant alone, and only from an issuer it trusts (`--data-auth-trusted-issuer`).
+A server that runs without data authentication keeps audit data behind this scope too. It reads a presented token for its audit grant alone, and only from an issuer it trusts (`--data-auth-trusted-issuer`). Under `--data-auth-insecure-accept-any-issuer` it trusts every issuer, so any self-signed token with an audit claim reads the audit data.
 
 #### Populating `fluree.storage.ledgers` (multi-tenant hint)
 
