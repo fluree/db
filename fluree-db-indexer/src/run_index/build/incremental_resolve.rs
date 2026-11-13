@@ -695,6 +695,23 @@ pub async fn resolve_incremental_commits_v6(
     };
     let t_remap_fulltext_ms = t0.elapsed().as_millis() as u64;
 
+    // 8b. Remap spatial hook entries' chunk-local subject ids.
+    if let Some(ref mut spatial) = shared.spatial_hook {
+        spatial.retain_mut(|entry| {
+            let local_s = entry.subject_id as usize;
+            match reconcile.subject_remap.get(local_s) {
+                Some(&global_s) => {
+                    entry.subject_id = global_s;
+                    true
+                }
+                None => {
+                    tracing::warn!(local_s, "spatial entry subject_id remap miss; skipping");
+                    false
+                }
+            }
+        });
+    }
+
     // 9. Remap all V1 records in-place, then convert to V2.
     let t0 = Instant::now();
     let mut v1_records = chunk.records;

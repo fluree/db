@@ -30,7 +30,7 @@ use crate::{
     StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{
     CasAction, CasOutcome, ContentId, Error as CoreError, LedgerId, StorageCas, StorageList,
     StorageRead, StorageWrite,
@@ -710,7 +710,7 @@ where
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
 
         // Read the record to find the parent before purging
         let record = self
@@ -858,7 +858,7 @@ where
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
         self.cas_update::<NsFileV2, _>(&key, |existing| {

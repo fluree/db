@@ -14,6 +14,7 @@
 //! reason is surfaced as a violation when the owning shape fires on a focus
 //! node, keeping the failure scoped to that shape's targets.
 
+use crate::data_view::DataView;
 use crate::error::{Result, ShaclError};
 use crate::predicates;
 use fluree_db_core::{
@@ -366,8 +367,8 @@ pub(crate) fn with_subproperties(p: &Sid, hierarchy: Option<&SchemaHierarchy>) -
 /// Evaluate a property path from `focus`, returning the reached value nodes as
 /// `(value, datatype, language)` tuples — the direct analogue of the objects
 /// of a single `SPOT` scan for a simple predicate.
-pub fn eval_path<'a>(
-    db: GraphDbRef<'a>,
+pub(crate) fn eval_path<'a>(
+    db: DataView<'a>,
     focus: &'a Sid,
     path: &'a PropertyPath,
     hierarchy: Option<&'a SchemaHierarchy>,
@@ -407,7 +408,7 @@ pub fn eval_path<'a>(
 /// Forward single-predicate step: objects of `(focus, p, ?)`, unioned over
 /// `p` and its RDFS subproperties.
 async fn forward_step(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     focus: &Sid,
     p: &Sid,
     hierarchy: Option<&SchemaHierarchy>,
@@ -435,7 +436,7 @@ async fn forward_step(
 /// Inverse single-predicate step: subjects of `(?, p, focus)`, unioned over
 /// `p` and its RDFS subproperties.
 async fn inverse_step(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     focus: &Sid,
     p: &Sid,
     hierarchy: Option<&SchemaHierarchy>,
@@ -461,7 +462,7 @@ async fn inverse_step(
 /// Evaluate a sequence path: chain each step, carrying `(value, dt)` only for
 /// the final step. Intermediate steps must reach reference nodes to continue.
 async fn eval_sequence(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     focus: &Sid,
     steps: &[PropertyPath],
     hierarchy: Option<&SchemaHierarchy>,
@@ -498,7 +499,7 @@ async fn eval_sequence(
 /// Transitive closure of `inner` from `focus` (one or more steps), BFS over the
 /// reference nodes reached. Non-reference values are terminal value nodes.
 async fn closure(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     focus: &Sid,
     inner: &PropertyPath,
     hierarchy: Option<&SchemaHierarchy>,

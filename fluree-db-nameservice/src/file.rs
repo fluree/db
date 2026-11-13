@@ -36,7 +36,7 @@ use crate::{
     StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{CasAction, CasOutcome, ContentId, FileStorage, LedgerId, StorageCas};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -690,7 +690,7 @@ impl crate::BranchLifecycle for FileNameService {
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
 
         // Read the record to find the parent before purging
         let record = self
@@ -912,7 +912,7 @@ impl LedgerLifecycle for FileNameService {
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
         self.storage
@@ -2044,12 +2044,13 @@ mod tests {
         assert!(ns.branch_records("../beside").await.is_err());
     }
 
-    /// A branch whose name begins with `/` is no ledger address: publishing,
-    /// looking up and dropping it are refused, and nothing is written for it.
-    /// A record an older version wrote for one stays under the ledger's
-    /// directory, untouched.
+    /// A branch whose name begins with `/` is no ledger address: publishing
+    /// and looking it up are refused, and nothing is written for it. A record
+    /// an older version wrote for one stays under the ledger's directory
+    /// until it is retracted or dropped, which a whole-ledger drop does from
+    /// the listed record's own id.
     #[tokio::test]
-    async fn a_branch_beginning_with_a_slash_is_refused_and_its_record_kept() {
+    async fn a_branch_beginning_with_a_slash_is_refused_but_its_record_can_be_dropped() {
         let (temp, ns) = setup().await;
         // Rooted in this test's directory, so the name stays inside it however
         // it is read.
@@ -2079,9 +2080,15 @@ mod tests {
 
         let lookup = ns.lookup(&ledger_id).await;
         assert!(matches!(lookup, Err(NameServiceError::InvalidId(_))));
-        let dropped = ns.drop_branch(&ledger_id).await;
-        assert!(matches!(dropped, Err(NameServiceError::InvalidId(_))));
         assert_eq!(std::fs::read_to_string(&record).unwrap(), json);
+
+        ns.retract(&ledger_id).await.unwrap();
+        assert!(std::fs::read_to_string(&record)
+            .unwrap()
+            .contains("retracted"));
+        ns.drop_branch(&ledger_id).await.unwrap();
+        assert!(!record.exists());
+        assert!(ns.all_records().await.unwrap().is_empty());
     }
 
     // ========== Graph Source Tests ==========

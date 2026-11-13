@@ -472,6 +472,15 @@ pub fn split_ledger_id(ledger_id: &str) -> Result<(String, String), LedgerIdPars
     Ok((id.name().to_string(), id.branch().to_string()))
 }
 
+/// [`split_ledger_id`] for an id read from a stored record, under
+/// [`LedgerId::parse_persisted`]'s grammar. For the operations that remove a
+/// record, which must reach one an earlier release wrote under a name no
+/// request can address.
+pub fn split_persisted_ledger_id(ledger_id: &str) -> Result<(String, String), LedgerIdParseError> {
+    let id = LedgerId::parse_persisted(ledger_id)?;
+    Ok((id.name().to_string(), id.branch().to_string()))
+}
+
 /// Normalize a ledger ID to `name:branch` form using the default branch.
 pub fn normalize_ledger_id(ledger_id: &str) -> Result<String, LedgerIdParseError> {
     Ok(LedgerId::parse(ledger_id)?.to_string())
