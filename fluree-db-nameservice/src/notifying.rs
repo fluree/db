@@ -489,10 +489,8 @@ mod tests {
     /// peers among them) hear of it as a commit and re-read the record.
     #[tokio::test]
     async fn a_reset_is_announced_as_a_commit() {
-        let ns = NotifyingNameService::new(
-            MemoryNameService::new(),
-            Arc::new(LedgerEventBus::new(16)),
-        );
+        let ns =
+            NotifyingNameService::new(MemoryNameService::new(), Arc::new(LedgerEventBus::new(16)));
         ns.init("reset:main").await.expect("init");
         let mut events = ns.subscribe(SubscriptionScope::All).receiver;
         let head = ContentId::new(ContentKind::Commit, b"rebased-head");
