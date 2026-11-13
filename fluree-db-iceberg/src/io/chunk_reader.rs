@@ -932,11 +932,13 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let in_memory = crate::io::arrow_reader::decode_batches_arrow(
                 file,
                 &[1, 2],
+                None,
                 None,
                 None,
                 None,

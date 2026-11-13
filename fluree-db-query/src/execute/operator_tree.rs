@@ -2292,9 +2292,23 @@ pub fn build_operator_tree(
         crate::planner::estimate_projected_distinct_rows(&query.patterns, &vars, stats)
             .is_none_or(|rows| rows >= goal as f64)
     });
+    // A graph-source scan may emit rows in any order (as its file reads finish)
+    // only when nothing in the query takes a prefix of an answer: a page cut
+    // from an unordered answer must hold the same rows on every execution.
+    // Decided once, here at the root, and fail closed: a prefix taken at any
+    // depth, or any path that plans without passing through here, keeps every
+    // scan deterministic. A prefix taken by the caller after the query (the
+    // browse crawl's subject pages, a byte-budgeted response a client resumes
+    // with OFFSET) sets `ExecutionContext::deterministic_scans` instead.
+    let scan_order = if query_takes_prefix(query) {
+        crate::r2rml::ScanOrder::Deterministic
+    } else {
+        crate::r2rml::ScanOrder::Any
+    };
     let planning = &planning
         .with_unmatched_optional(query.unmatched_optional)
-        .with_row_goal(row_goal);
+        .with_row_goal(row_goal)
+        .with_scan_order(scan_order);
     // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
     // same-group filter into required triples (well-formed left-join
     // simplification), so equality/range pushdown and selectivity estimation
@@ -2308,6 +2322,76 @@ pub fn build_operator_tree(
         return build_operator_tree_folds(&simplified, stats, planning);
     }
     build_operator_tree_folds(query, stats, planning)
+}
+
+/// Whether `query` answers with a prefix of some unordered answer, so the
+/// order its scans emit rows in decides which rows it answers: a LIMIT or
+/// OFFSET anywhere ([`query_has_slice`]), or a `selectOne`, which keeps the
+/// first row when the result is formatted.
+pub(crate) fn query_takes_prefix(query: &Query) -> bool {
+    query_has_slice(query) || query.output.is_select_one()
+}
+
+/// Whether a LIMIT or OFFSET appears anywhere in `query`: on the query itself,
+/// or on a sub-SELECT at any depth, including inside an `EXISTS` in a filter,
+/// bind or modifier expression.
+pub(crate) fn query_has_slice(query: &Query) -> bool {
+    query.limit.is_some()
+        || query.offset.is_some()
+        || patterns_have_slice(&query.patterns)
+        || modifiers_have_slice(&query.grouping, &query.order_binds)
+}
+
+fn modifiers_have_slice(grouping: &Option<Grouping>, order_binds: &[(VarId, Expression)]) -> bool {
+    order_binds.iter().any(|(_, e)| expression_has_slice(e))
+        || grouping.as_ref().is_some_and(|g| {
+            g.having().is_some_and(expression_has_slice)
+                || g.binds().any(|(_, e)| expression_has_slice(e))
+        })
+}
+
+fn expression_has_slice(expr: &Expression) -> bool {
+    let mut found = false;
+    expr.for_each_embedded_patterns(&mut |patterns| found |= patterns_have_slice(patterns));
+    found
+}
+
+/// Exhaustive over `Pattern`, so a new container variant must decide here
+/// whether it can hold a slice.
+fn patterns_have_slice(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::Subquery(sq) => {
+            sq.limit.is_some()
+                || sq.offset.is_some()
+                || patterns_have_slice(&sq.patterns)
+                || modifiers_have_slice(&sq.grouping, &sq.order_binds)
+        }
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            expression_has_slice(expr)
+        }
+        Pattern::Optional(inner)
+        | Pattern::Minus(inner)
+        | Pattern::Exists(inner)
+        | Pattern::NotExists(inner) => patterns_have_slice(inner),
+        Pattern::Union(branches) => branches.iter().any(|b| patterns_have_slice(b)),
+        Pattern::Graph { patterns, .. } | Pattern::DefaultGraphSource { patterns } => {
+            patterns_have_slice(patterns)
+        }
+        Pattern::Service(sp) => patterns_have_slice(&sp.patterns),
+        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+            patterns_have_slice(body)
+        }
+        Pattern::Triple(_)
+        | Pattern::ListView(_)
+        | Pattern::PropertyPath(_)
+        | Pattern::ShortestPath(_)
+        | Pattern::Values { .. }
+        | Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::R2rml(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => false,
+    })
 }
 
 fn build_operator_tree_folds(
@@ -2698,9 +2782,10 @@ fn build_operator_tree_inner(
             let generic =
                 build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
             let fallback: BoxedOperator = match crate::r2rml::detect_fused_r2rml_aggregate(query) {
-                Some(fused) => Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
-                    fused, generic,
-                )),
+                Some(fused) => Box::new(
+                    crate::r2rml::FusedR2rmlAggregateOperator::new(fused, generic)
+                        .with_scan_order(planning.scan_order),
+                ),
                 None => generic,
             };
             let mut op: BoxedOperator = Box::new(
@@ -2743,9 +2828,10 @@ fn build_operator_tree_inner(
             fallback_query.offset = None;
             let fallback =
                 build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
-            let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
-                plan, fallback,
-            ));
+            let mut op: BoxedOperator = Box::new(
+                crate::r2rml::FusedR2rmlAggregateOperator::new(plan, fallback)
+                    .with_scan_order(planning.scan_order),
+            );
             // PR-6: HAVING filters the grouped rows before ORDER BY (SPARQL order:
             // WHERE → GROUP → HAVING → ORDER → LIMIT). The fused op emits exactly
             // the projected group + aggregate vars (detect's projection check
