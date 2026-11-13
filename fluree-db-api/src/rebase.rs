@@ -645,13 +645,17 @@ impl crate::Fluree {
                         })?;
                 }
             }
-            self.publisher()?
-                .publish_commit(&branch_id, new_head_t, last_head_id)
-                .await?;
-            if !fast_forward {
-                // The copy above published the source's index only if it
-                // was newer than the branch's own; the branch's own indexes
-                // the replaced line, so it goes whatever its `t`.
+            if fast_forward {
+                // The branch's own index is on the source's line already.
+                self.publisher()?
+                    .publish_commit(&branch_id, new_head_t, last_head_id)
+                    .await?;
+            } else {
+                // The new head and the index move in one write, so no reader
+                // sees the new head over the replaced line's index. The copy
+                // above published the source's index only if it was newer
+                // than the branch's own; the branch's own indexes the
+                // replaced line, so it goes whatever its `t`.
                 let (index_head_id, index_t) =
                     source_index.map_or((None, 0), |(id, t)| (Some(id), t));
                 self.branch_admin()?
