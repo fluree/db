@@ -1106,6 +1106,15 @@ impl LeafletDirEntryV3 {
             self.o_type_const
         }
     }
+
+    /// Whether the leaflet's history segment holds any entry. A writer widens
+    /// routing keys only over history, so a v4 leaflet with none has the keys
+    /// of its own first and last rows (v4 writers never drop history, which
+    /// would leave widened keys behind with no history to show for them).
+    #[inline]
+    pub fn holds_history(&self) -> bool {
+        self.history_len > super::history_sidecar::EMPTY_HISTORY_SEGMENT_LEN
+    }
 }
 
 /// Decode a V3 leaf header. Validates magic bytes.
