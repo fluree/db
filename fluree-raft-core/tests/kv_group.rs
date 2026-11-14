@@ -24,16 +24,22 @@ mod cluster;
 mod leases;
 
 use async_trait::async_trait;
-use cluster::{eventually, form_cluster, leader, start_node, Node};
+use cluster::{eventually, form_cluster, leader, start_node, start_node_in, Node};
 use fluree_raft_core::admin::{AdminError, NodeAddrs};
+use fluree_raft_core::compaction::CompactionError;
 use fluree_raft_core::group::GroupId;
 use fluree_raft_core::kv::sweep::{run_sweep, sweep_once, SweepConfig, SweepTarget};
 use fluree_raft_core::kv::{Expect, KvCommand, KvResponse};
 use fluree_raft_core::runtime::{RaftGroup, RaftGroupConfig};
 use fluree_raft_core::state_machine::NoObserver;
-use fluree_raft_core::storage::fs::FsRaftStorage;
+use fluree_raft_core::storage::fs::{FsRaftLogStore, FsRaftSnapshotStore, FsRaftStorage};
+use fluree_raft_core::storage::{
+    LogEntry, LogId, LogState, RaftLogStore, RaftSnapshotStore, RaftStorage, SnapshotId,
+    SnapshotMeta, StorageError, Vote,
+};
 use leases::{acquire, evict, renew, LeaseCommand, Leases, Tenant};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -72,11 +78,12 @@ fn max_command_bytes() -> u64 {
     p.max_key_bytes + p.max_value_bytes + 4096
 }
 
+fn tune(config: &mut RaftGroupConfig) {
+    config.max_command_bytes = Some(max_command_bytes());
+}
+
 async fn cluster(name: &str) -> Vec<Node<Leases>> {
     let group_id = GroupId::new(name).expect("valid group id");
-    let tune = |config: &mut fluree_raft_core::runtime::RaftGroupConfig| {
-        config.max_command_bytes = Some(max_command_bytes());
-    };
     let nodes = vec![
         start_node(1, &group_id, tune).await,
         start_node(2, &group_id, tune).await,
@@ -456,6 +463,30 @@ async fn write(group: &RaftGroup<Leases>, command: LeaseCommand) -> KvResponse {
         .kv()
 }
 
+/// The log index `command` committed at.
+async fn write_index(group: &RaftGroup<Leases>, command: LeaseCommand) -> u64 {
+    group
+        .raft
+        .client_write(command)
+        .await
+        .expect("client_write")
+        .log_id
+        .index
+}
+
+/// Delete `key`, which must be present, returning the delete's index:
+/// the `covering` a compaction that must remove the value is given.
+async fn delete(group: &RaftGroup<Leases>, key: &str) -> u64 {
+    let response = group
+        .raft
+        .client_write(delete_config(key))
+        .await
+        .expect("client_write");
+    let index = response.log_id.index;
+    assert_eq!(response.data.kv(), KvResponse::Deleted { removed: true });
+    index
+}
+
 async fn read_config(group: &RaftGroup<Leases>, key: &str) -> Option<Vec<u8>> {
     let state = group.state.read().await;
     state
@@ -464,17 +495,52 @@ async fn read_config(group: &RaftGroup<Leases>, key: &str) -> Option<Vec<u8>> {
         .map(|record| record.value.to_vec())
 }
 
+/// Snapshot everything applied so far, returning the index covered.
+async fn snapshot(group: &RaftGroup<Leases>) -> u64 {
+    let applied = group
+        .raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .as_ref()
+        .expect("entries applied")
+        .index;
+    group
+        .raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("trigger snapshot");
+    group
+        .raft
+        .wait(Some(COMPACTION_TIMEOUT))
+        .metrics(
+            move |m| m.snapshot.as_ref().is_some_and(|id| id.index >= applied),
+            "a snapshot",
+        )
+        .await
+        .expect("snapshot");
+    applied
+}
+
+fn settings_config(root: &Path) -> RaftGroupConfig {
+    RaftGroupConfig::new(GroupId::new("settings").expect("valid group id"), 1, root)
+}
+
 /// A one-node group on the filesystem backend under `root`, leading.
-/// Built here rather than by `start_node`, which keeps its storage
-/// directory private: these tests read the files.
 async fn single_node_group(root: &Path) -> Arc<RaftGroup<Leases>> {
-    let config = RaftGroupConfig::new(GroupId::new("settings").expect("valid group id"), 1, root);
-    let storage = Arc::new(
-        FsRaftStorage::open(config.group_storage_root())
-            .await
-            .expect("storage opens"),
-    );
-    let group = RaftGroup::<Leases>::bootstrap(config, storage, NoObserver::default())
+    let config = settings_config(root);
+    let storage = FsRaftStorage::open(config.group_storage_root())
+        .await
+        .expect("storage opens");
+    lone_node(config, storage).await
+}
+
+/// A one-node group over `storage`, initialized and leading. Built here
+/// rather than by `start_node`, which serves RPCs a lone voter never
+/// sends and always opens the filesystem backend.
+async fn lone_node<S: RaftStorage>(config: RaftGroupConfig, storage: S) -> Arc<RaftGroup<Leases>> {
+    let group = RaftGroup::<Leases>::bootstrap(config, Arc::new(storage), NoObserver::default())
         .await
         .expect("group bootstraps");
     // Never dialed: a lone voter sends no RPCs.
@@ -526,30 +592,7 @@ async fn snapshot_and_purge_alone_leave_a_deleted_value_on_disk() {
     let group = single_node_group(dir.path()).await;
     write(&group, put_config("credential", SECRET)).await;
     write(&group, delete_config("credential")).await;
-    let applied = group
-        .raft
-        .metrics()
-        .borrow()
-        .last_applied
-        .as_ref()
-        .expect("entries applied")
-        .index;
-
-    group
-        .raft
-        .trigger()
-        .snapshot()
-        .await
-        .expect("trigger snapshot");
-    group
-        .raft
-        .wait(Some(COMPACTION_TIMEOUT))
-        .metrics(
-            |m| m.snapshot.as_ref().is_some_and(|id| id.index >= applied),
-            "a snapshot covering the delete",
-        )
-        .await
-        .expect("snapshot");
+    let applied = snapshot(&group).await;
     write(&group, put_config("unrelated", b"later")).await;
     group
         .raft
@@ -574,9 +617,10 @@ async fn snapshot_and_purge_alone_leave_a_deleted_value_on_disk() {
     );
 }
 
-/// The same deleted value, with writes landing throughout compaction:
-/// afterwards no file holds it, and the group restarts from what is
-/// left with every surviving write intact.
+/// The same deleted value, held in a snapshot as well as the log, with
+/// writes landing throughout compaction: afterwards no file holds it,
+/// and the group restarts from what is left with every surviving write
+/// intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compact_log_removes_a_deleted_value_from_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -587,10 +631,14 @@ async fn compact_log_removes_a_deleted_value_from_disk() {
         put_config("credential", &[SECRET, b"-refreshed"].concat()),
     )
     .await;
-    assert_eq!(
-        write(&group, delete_config("credential")).await,
-        KvResponse::Deleted { removed: true }
+    snapshot(&group).await;
+    assert!(
+        files_holding(dir.path(), SECRET)
+            .iter()
+            .any(|path| path.parent().is_some_and(|p| p.ends_with("snapshots"))),
+        "a snapshot must hold the value before it is deleted",
     );
+    let deleted = delete(&group, "credential").await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let writer = tokio::spawn({
@@ -606,7 +654,7 @@ async fn compact_log_removes_a_deleted_value_from_disk() {
         }
     });
     let through = group
-        .compact_log(COMPACTION_TIMEOUT)
+        .compact_log(Some(deleted), COMPACTION_TIMEOUT)
         .await
         .expect("compacts")
         .expect("the log held entries");
@@ -614,6 +662,7 @@ async fn compact_log_removes_a_deleted_value_from_disk() {
     let concurrent_writes = writer.await.expect("writer");
     assert!(concurrent_writes > 0, "the writer must have run");
 
+    assert!(through >= deleted);
     assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
     write(&group, put_config("after", b"compaction")).await;
     let counter = read_config(&group, "counter").await;
@@ -643,23 +692,181 @@ async fn compact_log_removes_a_deleted_value_from_disk() {
     );
 }
 
-/// Compaction is per node. On the leader the purge waits out
-/// replication; afterwards the group still replicates to every node.
+/// A node that has not yet applied the delete would compact short of
+/// it and keep the value. Given the delete's index, compaction waits
+/// for it — here, for a delete not yet proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_waits_to_apply_the_write_it_covers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let group = single_node_group(dir.path()).await;
+    let put = write_index(&group, put_config("credential", SECRET)).await;
+
+    let mut compaction = tokio::spawn({
+        let group = Arc::clone(&group);
+        async move { group.compact_log(Some(put + 1), COMPACTION_TIMEOUT).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut compaction)
+            .await
+            .is_err(),
+        "compaction must wait for the delete",
+    );
+    assert_eq!(delete(&group, "credential").await, put + 1);
+    let through = compaction
+        .await
+        .expect("compaction task")
+        .expect("compacts")
+        .expect("the log held entries");
+
+    assert!(through > put);
+    assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
+}
+
+/// Delegates what a log store must implement and keeps every default.
+struct DefaultsLog(FsRaftLogStore);
+
+#[async_trait]
+impl RaftLogStore for DefaultsLog {
+    async fn append(&self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        self.0.append(entries).await
+    }
+    async fn read_range(&self, range: Range<u64>) -> Result<Vec<LogEntry>, StorageError> {
+        self.0.read_range(range).await
+    }
+    async fn truncate_from(&self, from_index: u64) -> Result<(), StorageError> {
+        self.0.truncate_from(from_index).await
+    }
+    async fn purge_through(&self, log_id: LogId) -> Result<(), StorageError> {
+        self.0.purge_through(log_id).await
+    }
+    async fn log_state(&self) -> Result<LogState, StorageError> {
+        self.0.log_state().await
+    }
+    async fn save_vote(&self, vote: &Vote) -> Result<(), StorageError> {
+        self.0.save_vote(vote).await
+    }
+    async fn read_vote(&self) -> Result<Option<Vote>, StorageError> {
+        self.0.read_vote().await
+    }
+    async fn save_committed(&self, log_id: Option<LogId>) -> Result<(), StorageError> {
+        self.0.save_committed(log_id).await
+    }
+    async fn read_committed(&self) -> Result<Option<LogId>, StorageError> {
+        self.0.read_committed().await
+    }
+}
+
+/// Delegates what a snapshot store must implement and keeps every
+/// default.
+struct DefaultsSnapshots(FsRaftSnapshotStore);
+
+#[async_trait]
+impl RaftSnapshotStore for DefaultsSnapshots {
+    async fn write(&self, meta: &SnapshotMeta, data: Vec<u8>) -> Result<(), StorageError> {
+        self.0.write(meta, data).await
+    }
+    async fn read(&self, id: &SnapshotId) -> Result<Option<Vec<u8>>, StorageError> {
+        self.0.read(id).await
+    }
+    async fn current(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, StorageError> {
+        self.0.current().await
+    }
+}
+
+struct Composed<L, S> {
+    log: L,
+    snapshots: S,
+}
+
+impl<L: RaftLogStore, S: RaftSnapshotStore> RaftStorage for Composed<L, S> {
+    type LogStore = L;
+    type SnapshotStore = S;
+
+    fn log(&self) -> &L {
+        &self.log
+    }
+
+    fn snapshots(&self) -> &S {
+        &self.snapshots
+    }
+}
+
+/// A store on the defaults cannot confirm removal, so compaction
+/// refuses before it snapshots or purges: on a leader, a purge can push
+/// a lagging follower onto a snapshot install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_on_the_defaults_refuses_before_any_step() {
+    for log_on_defaults in [true, false] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = settings_config(dir.path());
+        let root = config.group_storage_root();
+        let log = FsRaftLogStore::open(&root).await.expect("log opens");
+        let snapshots = FsRaftSnapshotStore::open(&root)
+            .await
+            .expect("snapshots open");
+        let group = if log_on_defaults {
+            let log = DefaultsLog(log);
+            lone_node(config, Composed { log, snapshots }).await
+        } else {
+            let snapshots = DefaultsSnapshots(snapshots);
+            lone_node(config, Composed { log, snapshots }).await
+        };
+        write(&group, put_config("credential", SECRET)).await;
+
+        let err = group
+            .compact_log(None, COMPACTION_TIMEOUT)
+            .await
+            .expect_err("storage on the defaults refuses");
+        assert!(matches!(err, CompactionError::Storage(_)), "got {err:?}");
+        let metrics = group.raft.metrics().borrow().clone();
+        assert_eq!(
+            (metrics.snapshot, metrics.purged),
+            (None, None),
+            "log store on the defaults: {log_on_defaults}",
+        );
+    }
+}
+
+/// Compaction is per node, and each node waits to apply the delete it
+/// is given. On the leader the purge waits out replication; afterwards
+/// no node's files hold the value and the group still replicates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_node_compacts_and_the_group_keeps_replicating() {
-    let nodes = cluster("compaction").await;
+    let group_id = GroupId::new("compaction").expect("valid group id");
+    let mut nodes = Vec::new();
+    let mut roots = Vec::new();
+    for id in 1..=3 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        roots.push(dir.path().to_path_buf());
+        nodes.push(start_node_in(id, &group_id, dir, tune).await);
+    }
+    form_cluster(&nodes).await;
     let leader = leader(&nodes).await;
     for i in 0..5u8 {
         fence(propose(leader, put_config(&format!("key-{i}"), &[i])).await);
     }
+    fence(propose(leader, put_config("credential", SECRET)).await);
+    let deleted = delete(&leader.group, "credential").await;
 
     for node in &nodes {
         let through = node
             .group
-            .compact_log(COMPACTION_TIMEOUT)
+            .compact_log(Some(deleted), COMPACTION_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("node {} compacts: {e}", node.id));
-        assert!(through.is_some(), "node {} held entries", node.id);
+        assert!(
+            through >= Some(deleted),
+            "node {} compacted through {through:?}, short of the delete at {deleted}",
+            node.id,
+        );
+    }
+    for (node, root) in nodes.iter().zip(&roots) {
+        assert_eq!(
+            files_holding(root, SECRET),
+            Vec::<PathBuf>::new(),
+            "node {}",
+            node.id,
+        );
     }
 
     fence(propose(leader, put_config("after", b"compaction")).await);

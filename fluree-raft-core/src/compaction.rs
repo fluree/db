@@ -34,8 +34,8 @@ pub enum CompactionError {
     Stopped(String),
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
-    /// The steps completed, yet entries at or below `through` are still
-    /// held. Running compaction again normally clears it.
+    /// The steps completed, yet storage still holds entries at or below
+    /// `through`.
     #[error("log entries from index {first} are still on disk after compacting through {through}")]
     Retained { through: u64, first: u64 },
 }
@@ -70,17 +70,39 @@ impl<A: AppStateMachine> RaftGroup<A> {
     /// those entries produced in a fresh snapshot. Returns the index
     /// compacted through; `None` when the log held no entries.
     ///
-    /// Succeeds only once storage confirms no entry at or below that
-    /// index remains. Entries appended meanwhile are kept.
+    /// `covering` names the write whose effect has to leave the disk,
+    /// such as a delete's `client_write(..).log_id.index`. Compaction
+    /// waits until this node has applied it, so the index compacted
+    /// through is at or past it; without it, a node that has not yet
+    /// applied the delete compacts short of it and keeps the value.
+    ///
+    /// Succeeds only once storage confirms no entry at or below the
+    /// returned index remains. Entries appended meanwhile are kept. On
+    /// storage that cannot confirm that, it refuses before any step.
     ///
     /// Each node holds its own log, so a cluster runs this on every
-    /// node. On a leader openraft delays the purge while a replication
-    /// task still reads those entries, so `timeout` should allow for a
-    /// lagging follower; a follower that falls behind the purge catches
-    /// up from the snapshot instead. Nothing persists between calls: if
-    /// the process stops before this returns, call it again.
-    pub async fn compact_log(&self, timeout: Duration) -> Result<Option<u64>, CompactionError> {
+    /// node with the same `covering`. On a leader openraft delays the
+    /// purge while a replication task still reads those entries, so
+    /// `timeout` should allow for a lagging follower; a follower that
+    /// falls behind the purge catches up from the snapshot instead.
+    /// Nothing persists between calls: if the process stops before this
+    /// returns, call it again.
+    pub async fn compact_log(
+        &self,
+        covering: Option<u64>,
+        timeout: Duration,
+    ) -> Result<Option<u64>, CompactionError> {
         let deadline = Instant::now() + timeout;
+        self.storage.first_retained_index().await?;
+        self.storage.discard_superseded_snapshots().await?;
+        if let Some(index) = covering {
+            self.wait_until(
+                deadline,
+                "this node to apply the write to compact past",
+                applied(index),
+            )
+            .await?;
+        }
         let Some(through) = self.storage.seal_log().await? else {
             self.storage.discard_superseded_snapshots().await?;
             return Ok(None);
@@ -89,11 +111,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
         self.wait_until(
             deadline,
             "entries through the sealed tail to apply",
-            move |m| {
-                m.last_applied
-                    .as_ref()
-                    .is_some_and(|id| id.index >= through)
-            },
+            applied(through),
         )
         .await?;
         self.snapshot_through(through, deadline).await?;
@@ -159,6 +177,10 @@ impl<A: AppStateMachine> RaftGroup<A> {
             .map(|_| ())
             .map_err(|e| wait_error(e, what))
     }
+}
+
+fn applied(index: u64) -> impl Fn(&RaftMetrics<NodeId, ClusterNode>) -> bool + Send {
+    move |m| m.last_applied.as_ref().is_some_and(|id| id.index >= index)
 }
 
 fn wait_error(e: WaitError, what: &'static str) -> CompactionError {
