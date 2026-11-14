@@ -41,6 +41,13 @@ Guide to the manifest-driven W3C compliance test suite:
 - Using Claude Code for compliance work
 - Architecture overview
 
+### [W3C JSON-LD Compliance Suite](jsonld-compliance.md)
+
+The W3C json-ld-api expand and toRdf suites:
+- Running one test with its full output
+- What a pass compares, and what it does not
+- The skip register and its two-way check
+
 ## How to Contribute
 
 ### Ways to Contribute

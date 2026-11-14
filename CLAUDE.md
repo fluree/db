@@ -26,10 +26,10 @@ Full detail: `docs/contributing/issue-linking.md`.
 
 CI is the source of truth (`.github/workflows/ci.yml`). Two things catch people out:
 
-- CI runs **two** fmt/clippy pairs — one over the workspace, and a second with
-  `working-directory: testsuite-sparql`, which is *excluded* from the workspace. A root
-  `cargo fmt --all` never reaches it. If you touched `testsuite-sparql/`, format and lint there
-  separately.
+- CI runs **three** fmt/clippy pairs — one over the workspace, and one each with
+  `working-directory: testsuite-sparql` and `testsuite-jsonld`, which are *excluded* from the
+  workspace. A root `cargo fmt --all` never reaches them. If you touched either, format and lint
+  there separately.
 - Run `cargo fmt --all` **after** your last edit. A post-clippy touch-up is the usual way a PR
   arrives with a red fmt gate.
 

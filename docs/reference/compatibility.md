@@ -87,12 +87,18 @@ Fluree supports JSON-LD 1.1:
 Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
 
 Deviations from the JSON-LD 1.1 expansion algorithm:
+- **Plain names, by design.** A key or `@type` value the context maps to no IRI is stored as written, as a plain name: with no `@vocab` (and no `@base` standing in for one), `{"@type": "Person", "name": "Ann"}` writes the class `Person` and the property `name`. The algorithm drops such a key, and resolves such a type against the base. Fluree keeps both because Cypher reads and writes the same plain names (as a Cypher import does by default), so a JSON-LD write and a Cypher query meet on one ledger. A term defined only in a property-scoped context, used outside it, is a plain name the same way. A misspelled key is stored under its misspelling; a SHACL shape with `sh:closed` refuses properties a class does not declare.
+- A string starting with `?` is a variable, not a relative IRI reference, as a key, an `@id` or a `@type` (see [Relative IRIs](../concepts/iri-and-context.md#relative-iris)).
 - Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
 - A node with several types applies their scoped contexts in the order written rather than in lexicographic order. `@propagate` is honored on a type's scoped context only.
-- A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 - A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
 - `@container` values `@id`, `@type` and `@graph` are refused. A property-valued `@index` is refused where an index map uses it.
 - A string `@value` on a value object typed `@json` is read as a serialized JSON document: `{"@value": "{\"a\": 1}", "@type": "@json"}` is the object, not a string. A string under a term typed `@json` is the JSON string itself.
+- A top-level object with an `@graph`, other properties and no `@id` is a transaction envelope: the other properties are the commit's metadata (see [Commit metadata](../transactions/overview.md#commit-metadata)). JSON-LD reads it as a node whose `@graph` is a graph named by a blank node.
+- There is no JSON-LD 1.0 processing mode: every document is read as JSON-LD 1.1.
+- The `rdfDirection` option of JSON-LD's conversion to RDF is not offered: a `@direction` is kept in the language tag (see base-direction tags above).
+
+The W3C json-ld-api expand and toRdf suites run in CI. `testsuite-jsonld/tests/registers/mod.rs` lists each test Fluree fails, with its cause: one of the deviations above, or an open issue (see [the JSON-LD compliance suite](../contributing/jsonld-compliance.md)).
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
