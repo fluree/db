@@ -168,6 +168,10 @@ pub trait RaftLogStore: Send + Sync + 'static {
     /// Remove all entries with index `<= log_id.index` and record
     /// `log_id` as the new `last_purged`. Idempotent — no-op when the
     /// log's current `last_purged` already covers this id.
+    ///
+    /// A backend may keep their bytes until [`Self::seal`] closes what
+    /// holds them; [`Self::first_retained_index`] reports what is still
+    /// held.
     async fn purge_through(&self, log_id: LogId) -> Result<(), StorageError>;
 
     /// Summarize the log's current extent.

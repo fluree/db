@@ -347,6 +347,9 @@ impl Inner {
         };
         inner.migrate_legacy_entries()?;
         inner.scan_segments()?;
+        // A crash inside `purge_through` leaves segments the marker has
+        // passed, and a purge to the same index never runs again.
+        inner.unlink_purged_segments()?;
         inner.load_committed()?;
         Ok(inner)
     }
@@ -842,37 +845,42 @@ impl Inner {
         if self.last_purged.is_some_and(|p| p.index >= log_id.index) {
             return Ok(());
         }
-        // The marker first: a crash after it leaves entries the scan
-        // ignores, never a hole below a stale marker.
+        // The marker first: a crash after it leaves segments the next open
+        // unlinks, never a hole below a stale marker.
         let bytes = postcard::to_allocvec(&log_id).map_err(|e| ser_err("encode last_purged", e))?;
         atomic_write_blocking(&self.root.join("last_purged"), &bytes)?;
         self.last_purged = Some(log_id);
         self.index = self.index.split_off(&(log_id.index + 1));
-        self.active = None;
-        // Oldest first, each unlink durable before the next, so the segments
-        // on the device are a contiguous suffix at every crash point. A newer
-        // unlink outliving an older one would leave a hole the scan refuses,
-        // even below the marker.
-        let mut kept = Vec::with_capacity(self.segments.len());
-        for seg in self.segments.drain(..) {
-            // Whole segments at or below the marker go, and so does an empty
-            // one whose first index the marker has passed.
-            let obsolete = match seg.last_index {
-                Some(last) => last <= log_id.index,
-                None => seg.first_index <= log_id.index,
+        self.unlink_purged_segments()
+    }
+
+    /// Unlink every whole segment at or below the purge marker, and an
+    /// empty one whose first index the marker has passed. Oldest first,
+    /// each unlink durable before the next, so the segments on the device
+    /// are a contiguous suffix at every crash point: a newer unlink
+    /// outliving an older one would leave a hole the scan refuses, even
+    /// below the marker.
+    fn unlink_purged_segments(&mut self) -> Result<(), StorageError> {
+        let Some(cutoff) = self.cutoff() else {
+            return Ok(());
+        };
+        while let Some(seg) = self.segments.first() {
+            let purged = match seg.last_index {
+                Some(last) => last <= cutoff,
+                None => seg.first_index <= cutoff,
             };
-            if obsolete {
-                std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
-                #[cfg(test)]
-                self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
-                fsync_dir_blocking(&self.log_dir)?;
-                #[cfg(test)]
-                self.device_trace.push(DeviceStep::DirFsync);
-            } else {
-                kept.push(seg);
+            if !purged {
+                break;
             }
+            self.active = None;
+            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+            #[cfg(test)]
+            self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
+            fsync_dir_blocking(&self.log_dir)?;
+            #[cfg(test)]
+            self.device_trace.push(DeviceStep::DirFsync);
+            self.segments.remove(0);
         }
-        self.segments = kept;
         Ok(())
     }
 
@@ -1273,6 +1281,7 @@ impl RaftStorage for FsRaftStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
 
     fn entry(term: u64, index: u64) -> LogEntry {
@@ -1474,6 +1483,29 @@ mod tests {
             live.iter().map(|e| e.log_id).collect::<Vec<_>>(),
             [LogId::new(2, 3)]
         );
+    }
+
+    /// A crash between `purge_through`'s marker and its unlinks leaves
+    /// segments the marker has passed. A retry purges to the same index
+    /// and does nothing, so the open finishes the purge.
+    #[tokio::test]
+    async fn the_open_finishes_an_interrupted_purge() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[secret_entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        let marker = postcard::to_allocvec(&LogId::new(1, 2)).unwrap();
+        atomic_write(&store.last_purged_path(), &marker)
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = reopen(&dir).await;
+        assert_eq!(store.first_retained_index().await.unwrap(), None);
+        assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
+        store.append(&[entry(1, 3)]).await.unwrap();
+        assert_eq!(live_indexes(&store).await, [3]);
     }
 
     /// Simulates a crash mid-`truncate_from` across segments: the later
@@ -2136,6 +2168,41 @@ mod tests {
 
         assert_eq!(snapshot_dir_names(&dir), Vec::<String>::new());
         assert!(store.current().await.unwrap().is_none());
+    }
+
+    /// A discard never sees a snapshot a write has staged but not yet
+    /// named current: unserialized, it removes the write's staged files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discard_superseded_waits_out_a_write_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(
+            FsRaftSnapshotStore::open(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let discarder = tokio::spawn({
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    store.discard_superseded().await.unwrap();
+                }
+            }
+        });
+        for i in 0..50 {
+            store
+                .write(&snapshot_meta(&format!("snap-{i}")), vec![7; 4096])
+                .await
+                .unwrap_or_else(|e| panic!("write {i}: {e}"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        discarder.await.unwrap();
+
+        assert_eq!(
+            store.current().await.unwrap().unwrap().0.id,
+            SnapshotId::new("snap-49")
+        );
     }
 
     /// A removal that fails fails `discard_superseded`, but only warns
