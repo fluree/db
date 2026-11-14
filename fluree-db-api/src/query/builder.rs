@@ -256,11 +256,16 @@ impl<'a> ViewQueryBuilder<'a> {
     /// request opted in, as `execute` runs it otherwise.
     async fn formatted_answer(
         &mut self,
-        format: &FormatterConfig,
         rendering: Rendering,
-    ) -> Result<(ViewAnswer, Option<CacheRun<'a>>)> {
+    ) -> Result<(FormatterConfig, ViewAnswer, Option<CacheRun<'a>>)> {
         let r2rml = self.core.r2rml.take();
+        // Before the format is taken: a paging format makes scans deterministic.
         let execution = self.core.execution();
+        let format = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().expect("validated");
         let opted_in = match (self.result_cache, input) {
             (Some(outcome), _) => Some(Some(outcome)),
@@ -287,21 +292,21 @@ impl<'a> ViewQueryBuilder<'a> {
                     outcome,
                     status: ResultCacheStatus::Bypass("graph source"),
                 });
-                Ok((fresh(result), run))
+                Ok((format, fresh(result), run))
             }
             (None, Some(outcome)) => {
                 let (answer, status) = self
                     .fluree
-                    .query_view_for_cache(self.view, input, execution, format, rendering)
+                    .query_view_for_cache(self.view, input, execution, &format, rendering)
                     .await?;
-                Ok((answer, Some(CacheRun { outcome, status })))
+                Ok((format, answer, Some(CacheRun { outcome, status })))
             }
             (None, None) => {
                 let result = self
                     .fluree
                     .query_with_options(self.view, input, execution)
                     .await?;
-                Ok((fresh(result), None))
+                Ok((format, fresh(result), None))
             }
         }
     }
@@ -421,14 +426,7 @@ impl<'a> ViewQueryBuilder<'a> {
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
-        let format_config = self
-            .core
-            .format
-            .take()
-            .unwrap_or_else(|| self.core.default_format());
-        let (answer, run) = self
-            .formatted_answer(&format_config, Rendering::JsonDom)
-            .await?;
+        let (format_config, answer, run) = self.formatted_answer(Rendering::JsonDom).await?;
         match answer {
             ViewAnswer::Cached(bytes) => {
                 finish_cache_run(self.fluree, run, None, &[]);
@@ -455,14 +453,7 @@ impl<'a> ViewQueryBuilder<'a> {
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
-        let format_config = self
-            .core
-            .format
-            .take()
-            .unwrap_or_else(|| self.core.default_format());
-        let (answer, run) = self
-            .formatted_answer(&format_config, Rendering::JsonDom)
-            .await?;
+        let (format_config, answer, run) = self.formatted_answer(Rendering::JsonDom).await?;
         match answer {
             ViewAnswer::Cached(bytes) => {
                 finish_cache_run(self.fluree, run, None, &[]);
@@ -489,14 +480,7 @@ impl<'a> ViewQueryBuilder<'a> {
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
-        let format_config = self
-            .core
-            .format
-            .take()
-            .unwrap_or_else(|| self.core.default_format());
-        let (answer, run) = self
-            .formatted_answer(&format_config, Rendering::Text)
-            .await?;
+        let (format_config, answer, run) = self.formatted_answer(Rendering::Text).await?;
         match answer {
             ViewAnswer::Cached(bytes) => {
                 finish_cache_run(self.fluree, run, None, &[]);
