@@ -33,6 +33,61 @@ pub mod flags {
     pub const HAS_O_TYPE_COL: u32 = 1 << 1;
 }
 
+/// Longest [`LiveGroup`] of any order: POST's `p_id`, `o_type` and `o_key`.
+pub const LIVE_GROUP_MAX_LEN: usize = 14;
+
+/// Length of the group [`compute_lead_group_count`] counts, as a prefix of
+/// `order`'s ordered key: the subject in SPOT, predicate and subject in PSOT,
+/// predicate and object in POST, the object in OPST, and graph and subject in
+/// GSPO. A pooled order's trailing graph is not part of it.
+#[inline]
+pub fn live_group_len(order: RunSortOrder) -> usize {
+    match order {
+        RunSortOrder::Gspo => 12,
+        o => match o.base() {
+            RunSortOrder::Spot => 8,
+            RunSortOrder::Psot => 12,
+            RunSortOrder::Post => 14,
+            _ => 10,
+        },
+    }
+}
+
+/// The group of a leaflet's first or last live row: the leading
+/// [`live_group_len`] bytes of that row's ordered key.
+///
+/// A leaflet's routing keys can reach past its rows over the history it holds,
+/// so they name a group only as a bound. These name the rows themselves.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct LiveGroup {
+    len: u8,
+    bytes: [u8; LIVE_GROUP_MAX_LEN],
+}
+
+impl LiveGroup {
+    /// The group of the row whose ordered key of `order` is `key`.
+    #[inline]
+    pub fn of_key(order: RunSortOrder, key: &[u8]) -> Self {
+        Self::from_bytes(&key[..live_group_len(order)])
+    }
+
+    /// A group stored as `bytes`, at most [`LIVE_GROUP_MAX_LEN`] long.
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut out = [0u8; LIVE_GROUP_MAX_LEN];
+        out[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            len: bytes.len() as u8,
+            bytes: out,
+        }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 /// Result of encoding a single leaflet's column blocks.
 pub struct EncodedLeaflet {
     /// Number of rows in this leaflet.
@@ -43,6 +98,9 @@ pub struct EncodedLeaflet {
     pub first_key: [u8; ORDERED_KEY_V2_SIZE],
     /// Routing key for the last row (order-specific, 26 bytes).
     pub last_key: [u8; ORDERED_KEY_V2_SIZE],
+    /// Groups of the first and last row, `None` for a leaflet with no rows.
+    /// Unlike the routing keys, nothing widens these over history.
+    pub live_edges: Option<(LiveGroup, LiveGroup)>,
     /// Constant `p_id` for POST/PSOT leaflets (always `Some` for those orders).
     pub p_const: Option<u32>,
     /// Constant `o_type` when all rows share the same type. Set for:
@@ -98,6 +156,10 @@ pub fn encode_leaflet(
     let mut last_key = [0u8; ORDERED_KEY_V2_SIZE];
     write_ordered_key_v2(order, first, &mut first_key);
     write_ordered_key_v2(order, records.last().unwrap(), &mut last_key);
+    let live_edges = Some((
+        LiveGroup::of_key(order, &first_key),
+        LiveGroup::of_key(order, &last_key),
+    ));
 
     // Determine constants and flags.
     let p_const = match order.base() {
@@ -338,6 +400,7 @@ pub fn encode_leaflet(
         lead_group_count,
         first_key,
         last_key,
+        live_edges,
         p_const,
         o_type_const,
         flags: fl,

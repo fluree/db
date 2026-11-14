@@ -45,6 +45,9 @@ const SIDECAR_VERSION_NARROW: u8 = 1;
 /// Header size (magic + version + padding).
 pub const SIDECAR_HEADER_SIZE: usize = 8;
 
+/// Length of a segment that holds no entries: its zero entry count.
+pub const EMPTY_HISTORY_SEGMENT_LEN: u32 = 4;
+
 /// Wire size of a single `HistEntryV2` record.
 ///
 /// Layout (36 bytes):
@@ -305,7 +308,7 @@ impl HistSidecarBuilder {
                 out.extend_from_slice(&0u32.to_le_bytes());
                 segment_refs.push(HistorySegmentRef {
                     offset,
-                    len: 4,
+                    len: EMPTY_HISTORY_SEGMENT_LEN,
                     min_t: 0,
                     max_t: 0,
                 });
