@@ -106,6 +106,7 @@ where
 
     let map = |start: usize, chunk: &[LeafEntry]| -> Result<Option<Partial>> {
         let mut partial = Partial::new();
+        let mut memo: RowGroupMemo = None;
         for (offset, leaf) in chunk.iter().enumerate() {
             let leaf_idx = start + offset;
             let dir = store
@@ -142,7 +143,7 @@ where
                 };
                 partial.count = partial.count.saturating_add(count);
                 if let Some(prev) = partial.last {
-                    if seam_shares_group(store, order, leaves, prev, first)? {
+                    if seam_shares_group(store, order, leaves, &mut memo, prev, first)? {
                         partial.count = partial.count.saturating_sub(1);
                     }
                 }
@@ -182,8 +183,9 @@ where
     let Some(mut partial) = parallel_leaf_chunk_reduce_at(leaves, parallel, map, combine)? else {
         return Ok(None);
     };
+    let mut memo: RowGroupMemo = None;
     for (last, first) in std::mem::take(&mut partial.pending) {
-        if seam_shares_group(store, order, leaves, last, first)? {
+        if seam_shares_group(store, order, leaves, &mut memo, last, first)? {
             partial.count = partial.count.saturating_sub(1);
         }
     }
@@ -236,25 +238,47 @@ fn seam_shares_group(
     store: &BinaryIndexStore,
     order: RunSortOrder,
     leaves: &[LeafEntry],
+    memo: &mut RowGroupMemo,
     last: Edge,
     first: Edge,
 ) -> Result<bool> {
     if last.group != first.group {
         return Ok(false);
     }
+    let mut read = |(leaf, idx, end): (usize, usize, End)| -> Result<LiveGroup> {
+        let groups = match *memo {
+            Some((at, groups)) if at == (leaf, idx) => groups,
+            _ => {
+                let groups = read_row_groups(store, order, &leaves[leaf], idx)?;
+                *memo = Some(((leaf, idx), groups));
+                groups
+            }
+        };
+        Ok(if end == End::First {
+            groups.0
+        } else {
+            groups.1
+        })
+    };
     let right = match first.unproven {
-        Some((leaf, idx, end)) => read_row_group(store, order, &leaves[leaf], idx, end)?,
+        Some(at) => read(at)?,
         None => first.group,
     };
     if right != first.group {
         return Ok(false);
     }
     let left = match last.unproven {
-        Some((leaf, idx, end)) => read_row_group(store, order, &leaves[leaf], idx, end)?,
+        Some(at) => read(at)?,
         None => last.group,
     };
     Ok(left == right)
 }
+
+/// The last v4 leaflet whose rows' groups a walk read, as `(leaf, leaflet)`
+/// and its first and last groups. A walk goes left to right, so the leaflet
+/// whose first group one boundary read is the one whose last group the next
+/// boundary needs.
+type RowGroupMemo = Option<((usize, usize), (LiveGroup, LiveGroup))>;
 
 /// The group of a leaflet's first row, or its last when `last`: stored in a
 /// v5 leaflet; a v4 leaflet's routing key gives it where the leaflet holds no
@@ -267,7 +291,6 @@ pub(crate) fn leaflet_row_group(
     entry: &LeafletDirEntryV3,
     last: bool,
 ) -> Result<Option<LiveGroup>> {
-    let end = if last { End::Last } else { End::First };
     match entry.live_edges {
         LiveEdges::Exact { first, last: l } => Ok(Some(if last { l } else { first })),
         LiveEdges::Empty => Ok(None),
@@ -280,7 +303,8 @@ pub(crate) fn leaflet_row_group(
                 &entry.first_key
             },
         ))),
-        LiveEdges::Legacy => read_row_group(store, order, leaf, idx, end).map(Some),
+        LiveEdges::Legacy => read_row_groups(store, order, leaf, idx)
+            .map(|(first, l)| Some(if last { l } else { first })),
     }
 }
 
@@ -293,14 +317,15 @@ pub(crate) fn post_group_object(group: &LiveGroup) -> (u16, u64) {
     )
 }
 
-/// The group of a v4 leaflet's first or last row, read from its lead column.
-fn read_row_group(
+/// The groups of a v4 leaflet's first and last rows, read from its lead
+/// column: one decode of the columns [`group_projection`] names, through the
+/// leaf handle the cursor would open.
+fn read_row_groups(
     store: &BinaryIndexStore,
     order: RunSortOrder,
     leaf: &LeafEntry,
     idx: usize,
-    end: End,
-) -> Result<LiveGroup> {
+) -> Result<(LiveGroup, LiveGroup)> {
     let dir = store
         .open_leaf_dir(&leaf.leaf_cid)
         .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
@@ -314,16 +339,15 @@ fn read_row_group(
     let batch = handle
         .load_columns(idx, &group_projection(order), order)
         .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
-    let row = match end {
-        _ if batch.row_count == 0 => {
-            return Err(QueryError::Internal(
-                "a leaflet with rows decoded to none".to_string(),
-            ))
-        }
-        End::First => 0,
-        End::Last => batch.row_count - 1,
-    };
-    Ok(group_of_row(order, entry, &batch, row))
+    if batch.row_count == 0 {
+        return Err(QueryError::Internal(
+            "a leaflet with rows decoded to none".to_string(),
+        ));
+    }
+    Ok((
+        group_of_row(order, entry, &batch, 0),
+        group_of_row(order, entry, &batch, batch.row_count - 1),
+    ))
 }
 
 /// The group of `row` in `batch`, a leaflet's columns loaded with
