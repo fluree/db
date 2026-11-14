@@ -1,11 +1,10 @@
-//! A value object under a term whose context coerces values to IRIs.
+//! A value object under a term whose context coerces values.
 //!
-//! A context term with `"@type": "@id"` (or `"@vocab"`) turns a string value
-//! into an IRI. JSON-LD 1.1 applies that coercion only to strings (Value
-//! Expansion); a value object such as `{"@value": "TWD"}` is a literal. The
-//! expander used to read it as the relative IRI `<TWD>`, so an insert or
-//! upsert of such a document stored a reference where the same data in
-//! Turtle or TriG stores the string "TWD".
+//! JSON-LD 1.1 applies a term's `@type` and `@language`, and the default
+//! language, only to bare values (Value Expansion); a value object such as
+//! `{"@value": "TWD"}` is taken as written. The expander used to read it
+//! under an `@id` or `@vocab` term as the relative IRI `<TWD>`, and to give
+//! it the default language and its term's datatype.
 
 use crate::support;
 use crate::support::normalize_rows;
@@ -114,5 +113,72 @@ async fn a_value_object_typed_id_with_a_non_string_value_is_refused() {
             err.to_string().contains("@value must be a string"),
             "{value}: {err}"
         );
+    }
+}
+
+/// The default language and a term's datatype reach a bare value, not a
+/// value object, and a `where` written with the document's context matches
+/// what it stored.
+#[tokio::test]
+async fn value_object_takes_neither_the_default_language_nor_its_terms_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = json!({
+        "ex": "http://example.org/",
+        "@language": "en",
+        "n": {"@id": "ex:n", "@type": "http://www.w3.org/2001/XMLSchema#integer"}
+    });
+    let ledger = fluree
+        .create_ledger("tx/value-object-as-written:main")
+        .await
+        .expect("genesis");
+    let document = json!({
+        "@context": context,
+        "@id": "ex:s",
+        "ex:t": ["plain", {"@value": "obj"}],
+        "n": [{"@value": "5"}, "6"]
+    });
+    let ledger = fluree
+        .insert(ledger, &document)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let query = r"PREFIX ex: <http://example.org/>
+        SELECT ?v (STR(DATATYPE(?o)) AS ?dt) (LANG(?o) AS ?lang)
+        WHERE { VALUES ?p { ex:t ex:n } ex:s ?p ?o BIND(STR(?o) AS ?v) }
+        ORDER BY ?v";
+    let out = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("sparql query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let lang_string = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+    assert_eq!(
+        normalize_rows(&out),
+        vec![
+            json!(["5", format!("{xsd}string"), ""]),
+            json!(["6", format!("{xsd}integer"), ""]),
+            json!(["obj", format!("{xsd}string"), ""]),
+            json!(["plain", lang_string, "en"]),
+        ]
+    );
+
+    for (property, value) in [
+        ("n", json!({"@value": "5"})),
+        ("n", json!("6")),
+        ("ex:t", json!({"@value": "obj"})),
+    ] {
+        let query = json!({
+            "@context": context,
+            "select": "?s",
+            "where": {"@id": "?s", property: value}
+        });
+        let rows = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("jsonld query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(rows, json!(["ex:s"]), "{property}: {value}");
     }
 }

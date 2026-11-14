@@ -2108,6 +2108,35 @@ mod tests {
         );
     }
 
+    /// A constant value object is taken as written, as a transaction writes
+    /// it: its term's `@type` does not reach it. A variable `@value` keeps the
+    /// term's datatype, as a bare variable does.
+    #[test]
+    fn value_object_takes_no_datatype_from_its_term_in_where() {
+        let dtc_of = |value: JsonValue| {
+            let json = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "age": {"@id": "ex:age", "@type": "http://www.w3.org/2001/XMLSchema#integer"}
+                },
+                "select": ["?s"],
+                "where": {"@id": "?s", "age": value}
+            });
+            let (ast, _) = parse_query_ast(&json, None).unwrap();
+            triple(&ast.patterns[0])
+                .dtc
+                .as_ref()
+                .map(|dtc| dtc.datatype_iri().to_string())
+        };
+        let integer = Some("http://www.w3.org/2001/XMLSchema#integer".to_string());
+
+        assert_eq!(dtc_of(json!({"@value": "5"})), None);
+        assert_eq!(dtc_of(json!({"@value": 5})), None);
+        assert_eq!(dtc_of(json!("5")), integer);
+        assert_eq!(dtc_of(json!({"@value": "?age"})), integer);
+        assert_eq!(dtc_of(json!("?age")), integer);
+    }
+
     /// A value object's `@direction` joins its language tag, as a
     /// transaction stores it.
     #[test]
