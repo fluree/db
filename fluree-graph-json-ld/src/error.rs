@@ -9,6 +9,9 @@ pub enum JsonLdError {
     #[error("Invalid IRI: {iri}")]
     InvalidIri { iri: String },
 
+    #[error("JSON-LD keyword {value:?} is not supported as a node reference")]
+    KeywordAsNodeReference { value: String },
+
     #[error("Invalid IRI mapping for term '{term}'")]
     InvalidIriMapping { term: String, context: JsonValue },
 

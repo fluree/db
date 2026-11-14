@@ -87,7 +87,7 @@ Fluree supports JSON-LD 1.1:
 Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
 
 Deviations from the JSON-LD 1.1 expansion algorithm:
-- Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
+- Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. So is a key starting with `@` inside `@reverse`, and a string in keyword form where an `@id` goes (`{"@id": "@ignoreMe"}`, or a value a term coerces to an `@id`), which the algorithm ignores. A refusal names the key or the value, so the document can drop it or rename it.
 - A node with several types applies their scoped contexts in the order written rather than in lexicographic order. `@propagate` is honored on a type's scoped context only.
 - A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 - A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
@@ -399,6 +399,14 @@ A relative `@base` or `@vocab` resolves against the base already in effect. A re
 Query results change the same way. An `@id` under a base ending in `#` is written `#alice`, where it was `alice`. Under any other base, an id whose remainder starts with `/`, has a `:` in its first segment or holds a `.` or `..` segment is written as the full IRI, since the shortened form would resolve to something else.
 
 A type's scoped context applies to the typed node's own properties, and no longer to the node objects nested in it: JSON-LD 1.1's default. Mark it `"@propagate": true` to keep it in force for them. A property's scoped context now applies to each node object in an array value, as it did to a single one.
+
+#### A JSON-LD scoped context's term takes the vocabulary in effect (breaking)
+
+A term that a property- or type-scoped context defines with no `@id`, or with one that has no `:`, is now the vocabulary in effect joined to the term, as a term of the enclosing context is: the scoped context's own `@vocab`, else the enclosing one. It used to be the term itself, a plain name. Under `{"@vocab": "http://example.org/", "foo": {"@context": {"bar": {"@type": "@id"}}}}`, `bar` inside `foo` wrote the property `bar`. It now writes `http://example.org/bar`. A JSON-LD query under the same context already read `bar` through the enclosing `@vocab`, so it did not find what such an insert stored; now it does. With no vocabulary in effect, the term is still a plain name.
+
+Data an earlier release wrote this way keeps the plain name, so a `where` pattern, a delete or an upsert under the same context no longer reaches it. Nothing reports an error.
+
+A string in keyword form where an `@id` goes is now refused, in a transaction and in a bulk import alike: `{"@id": "@ignoreMe"}`, or `"@ignoreMe"` under a term typed `@id`. It used to be stored as the IRI `@ignoreMe`. A bulk import and `rdf::parse` also refuse a key starting with `@` inside `@reverse`, as a transaction already did; they used to write it as a predicate.
 
 #### A JSON-LD number is typed by its value (breaking)
 

@@ -157,6 +157,18 @@ pub fn iri_checked(compact_iri: &str, context: &ParsedContext, vocab: bool) -> R
 
 // ── Internal dispatch: strict=true → checked, strict=false → unchecked ──
 
+/// A string that names a node: an `@id`, or a value coerced to one. One in
+/// keyword form (`"@ignoreMe"`) names none: JSON-LD drops it, and Fluree
+/// refuses it, as it refuses such a key on a node.
+fn node_reference(s: &str, ctx: &ParsedContext, strict: bool) -> Result<String> {
+    if crate::is_keyword_form(s) {
+        return Err(JsonLdError::KeywordAsNodeReference {
+            value: s.to_string(),
+        });
+    }
+    iri_dispatch(s, ctx, false, strict)
+}
+
 fn iri_dispatch(s: &str, ctx: &ParsedContext, vocab: bool, strict: bool) -> Result<String> {
     if strict {
         iri_checked(s, ctx, vocab)
@@ -184,8 +196,11 @@ fn details_dispatch(
 fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
     match details(s, ctx, true) {
         (_, Some(entry)) if entry.null_mapping => Ok(None),
+        (expanded, Some(_)) if crate::is_keyword_form(&expanded) => {
+            Err(JsonLdError::KeywordAsNodeReference { value: expanded })
+        }
         (expanded, Some(_)) => Ok(Some(expanded)),
-        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
+        (_, None) => node_reference(s, ctx, strict).map(Some),
     }
 }
 
@@ -271,7 +286,10 @@ fn parse_node_value(
 
         JsonValue::String(s) => {
             // Check for @id or @type expansion
-            if id_val == Some("@id") || id_val == Some("@type") {
+            if id_val == Some("@id") {
+                return Ok(vec![json!(node_reference(s, context, strict)?)]);
+            }
+            if id_val == Some("@type") {
                 return Ok(vec![json!(iri_dispatch(s, context, false, strict)?)]);
             }
 
@@ -280,7 +298,7 @@ fn parse_node_value(
                 let mut obj = Map::new();
                 obj.insert(
                     "@id".to_string(),
-                    json!(iri_dispatch(s, context, false, strict)?),
+                    json!(node_reference(s, context, strict)?),
                 );
                 return Ok(vec![JsonValue::Object(obj)]);
             }
@@ -568,7 +586,7 @@ fn parse_value_object(
                 reason: "a value object typed @id names an IRI, so its @value must be a string",
             });
         };
-        let iri_val = iri_dispatch(iri, context, false, strict)?;
+        let iri_val = node_reference(iri, context, strict)?;
         obj.insert("@id".to_string(), json!(iri_val));
     } else {
         obj.insert("@value".to_string(), val.clone());
@@ -670,15 +688,26 @@ fn parse_type<'c>(
 /// Apply a scoped (property- or type-scoped) context's terms to the active
 /// context. A scoped context is parsed on its own, when its term is defined,
 /// so a term IRI it writes as a compact IRI over a prefix it does not define
-/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there. It
-/// is expanded here, against the active context the scoped context applies
-/// to, before the scoped terms take effect; left compact, it would expand a
-/// key to the compact string and store that as an IRI.
+/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there, and
+/// one with no `:` (a relative `@id`, or none, so the term itself) has not
+/// met an outer `@vocab`. Both are expanded here, against the active context
+/// the scoped context applies to, before the scoped terms take effect, as a
+/// term of that context would be: left as they are, a key would expand to the
+/// compact string, or to a plain name under a context that declares a
+/// vocabulary.
 fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
+    let vocab = scoped.vocab.as_deref().or(active.vocab.as_deref());
     let resolve = |iri: &str| -> Option<String> {
-        let (prefix, suffix) = iri::parse_prefix(iri)?;
-        let prefix_iri = active.get(&prefix)?.id.as_deref()?;
-        (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+        match iri::parse_prefix(iri) {
+            Some((prefix, suffix)) => {
+                let prefix_iri = active.get(&prefix)?.id.as_deref()?;
+                (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+            }
+            None if !iri.starts_with('@') && !iri::any_iri(iri) => {
+                vocab.map(|vocab| format!("{vocab}{iri}"))
+            }
+            None => None,
+        }
     };
     let resolved: Vec<(String, ContextEntry)> = scoped
         .terms
@@ -925,7 +954,7 @@ fn expand_node_entries(
                 JsonValue::String(s) => {
                     result.insert(
                         "@id".to_string(),
-                        json!(iri_dispatch(s, context, false, strict)?),
+                        json!(node_reference(s, context, strict)?),
                     );
                 }
                 // A triple term, `{"@id": {"@id": s, p: o}}`: the embedded
@@ -2215,5 +2244,67 @@ mod tests {
                 json!([{"@value": document, "@type": "@json"}])
             );
         }
+    }
+
+    /// A term a scoped context defines with no `@id` joins the vocabulary in
+    /// effect where the context applies, as a term of the enclosing context
+    /// does; with no vocabulary it stays a plain name.
+    #[test]
+    fn a_scoped_term_takes_the_vocabulary_in_effect() {
+        let doc = |context: JsonValue| {
+            crate::expand(&json!({"@context": context, "foo": {"bar": "v"}})).unwrap()
+        };
+        let scoped =
+            json!({"foo": {"@id": "http://example/foo", "@context": {"bar": {"@language": "en"}}}});
+        let mut with_vocab = scoped.clone();
+        with_vocab["@vocab"] = json!("http://example/");
+        assert_eq!(
+            doc(with_vocab),
+            json!({"http://example/foo": [{"http://example/bar": [{"@value": "v", "@language": "en"}]}]})
+        );
+        // The scoped context's own `@vocab` wins.
+        assert_eq!(
+            doc(
+                json!({"@vocab": "http://example/", "foo": {"@context": {"@vocab": "http://inner/", "bar": {"@language": "en"}}}})
+            ),
+            json!({"http://example/foo": [{"http://inner/bar": [{"@value": "v", "@language": "en"}]}]})
+        );
+        assert_eq!(
+            doc(scoped),
+            json!({"http://example/foo": [{"bar": [{"@value": "v", "@language": "en"}]}]})
+        );
+        // A type-scoped context's terms do too.
+        let typed = crate::expand(&json!({
+            "@context": {"@vocab": "http://example/", "T": {"@context": {"baz": {"@type": "@vocab"}}}},
+            "@type": "T",
+            "baz": "buzz"
+        }))
+        .unwrap();
+        assert_eq!(
+            typed["http://example/baz"],
+            json!([{"@id": "http://example/buzz"}])
+        );
+    }
+
+    /// A string in keyword form names no node, so where one would become an
+    /// `@id` it is refused, as such a key on a node is.
+    #[test]
+    fn a_keyword_form_node_reference_is_refused() {
+        let ctx = json!({"@vocab": EX, "r": {"@type": "@id"}, "v": {"@type": "@vocab"}, "k": "@ignoreMe"});
+        for doc in [
+            json!({"@context": ctx, "@id": "@ignoreMe", "p": 1}),
+            json!({"@context": ctx, "p": {"@id": "@ignoreMe"}}),
+            json!({"@context": ctx, "r": "@ignoreMe"}),
+            json!({"@context": ctx, "v": "k"}),
+            json!({"@context": ctx, "p": {"@value": "@ignoreMe", "@type": "@id"}}),
+        ] {
+            let err = crate::expand(&doc).expect_err(&doc.to_string());
+            assert!(
+                matches!(err, JsonLdError::KeywordAsNodeReference { ref value } if value == "@ignoreMe"),
+                "{doc}: {err}"
+            );
+        }
+        // `@` and `@foo.bar` are not in keyword form.
+        crate::expand(&json!({"@context": ctx, "p": [{"@id": "@"}, {"@id": "@foo.bar"}]})).unwrap();
     }
 }

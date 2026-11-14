@@ -424,6 +424,12 @@ where
                         ));
                     };
                     for (property, values) in properties {
+                        // As the transaction parser refuses it.
+                        if property.starts_with('@') {
+                            return Err(AdapterError::Unsupported(format!(
+                                "@reverse may hold only property IRIs, not {property:?}"
+                            )));
+                        }
                         let predicate_id = self.sink.term_iri(property);
                         for node in node_items(values, "a reverse property's value")? {
                             let mut nested = Vec::new();
@@ -1798,6 +1804,25 @@ mod tests {
         assert!(graph
             .iter()
             .any(|t| iri(&t.s) == "http://example.org/other"));
+    }
+
+    /// A key starting with `@` inside `@reverse` is refused, as the
+    /// transaction parser refuses it; it used to be written as a predicate.
+    #[test]
+    fn an_at_key_in_reverse_is_refused() {
+        for key in ["@ignoreMe", "@foo.bar"] {
+            let expanded = json!([{
+                "@id": "http://example.org/s",
+                "@reverse": {key: [{"@id": "http://example.org/o"}]}
+            }]);
+            let err = to_graph_events(&expanded, &mut GraphCollectorSink::new())
+                .expect_err(key)
+                .to_string();
+            assert!(
+                err.contains("@reverse may hold only property IRIs"),
+                "{key}: {err}"
+            );
+        }
     }
 
     /// Records each statement as `graph s p o` (`s p o [i]` for a list
