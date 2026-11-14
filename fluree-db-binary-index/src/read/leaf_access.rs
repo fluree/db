@@ -25,7 +25,7 @@ use crate::format::column_block::{ColumnBlockRef, ColumnId, COLUMN_BLOCK_REF_SIZ
 use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
 use crate::format::leaf::{
     decode_leaf_dir_v3_with_base, decode_leaf_header_v3, leaf_header_size, leaflet_dir_fixed_size,
-    DecodedLeafDirV3, LeafletDirEntryV3, LEAFLET_DIR_HISTORY_SIZE,
+    leaflet_dir_trailer_size, DecodedLeafDirV3, LeafletDirEntryV3,
 };
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record::{widen_list_index, LIST_INDEX_NONE};
@@ -678,11 +678,11 @@ impl LeafHandle for RangeReadLeafHandle {
 pub(crate) const SPECULATIVE_HEADER_DIR_BYTES: u64 = 64 * 1024;
 
 /// Largest directory entry for `order`: its fixed fields, a ref per column,
-/// and the history ref.
+/// the history ref and the live groups.
 fn max_dir_entry_bytes(order: RunSortOrder) -> u64 {
     (leaflet_dir_fixed_size(order)
         + ColumnId::COUNT * COLUMN_BLOCK_REF_SIZE
-        + LEAFLET_DIR_HISTORY_SIZE) as u64
+        + leaflet_dir_trailer_size(order)) as u64
 }
 
 /// Fetch enough of a V3 leaf blob to decode the header and full directory.

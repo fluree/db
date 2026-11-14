@@ -766,6 +766,7 @@ mod tests {
             lead_group_count: 0,
             first_key: [0u8; crate::format::run_record_v2::ORDERED_KEY_V2_SIZE],
             last_key: [0u8; crate::format::run_record_v2::ORDERED_KEY_V2_SIZE],
+            live_edges: crate::format::leaf::LiveEdges::Empty,
             p_const: Some(1),
             o_type_const: None,
             flags: 0,

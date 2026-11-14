@@ -24,7 +24,7 @@ use fluree_db_binary_index::format::history_sidecar::{
 };
 use fluree_db_binary_index::format::leaf::{
     build_leaf_blob_raw_keys, compute_cid_leaf, compute_cid_sidecar, decode_leaf_dir_v3_with_base,
-    decode_leaf_header_v3, DecodedLeafDirV3, LeafInfo, LeafletDirEntryV3,
+    decode_leaf_header_v3, DecodedLeafDirV3, LeafInfo, LeafletDirEntryV3, LiveEdges,
 };
 use fluree_db_binary_index::format::leaflet::encode_leaflet;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
@@ -764,7 +764,7 @@ fn assemble_output_leaves(
     for p in processed {
         let (encoded, was_re_encoded) = match p.encoded {
             EncodedLeafletInfo::Passthrough { dir_entry, payload } => {
-                (reconstruct_encoded_leaflet(dir_entry, payload), false)
+                (reconstruct_encoded_leaflet(dir_entry, payload)?, false)
             }
             EncodedLeafletInfo::Encoded(e) => (e, true),
         };
@@ -957,21 +957,36 @@ fn zeroed_record() -> RunRecordV2 {
 }
 
 /// Reconstruct an `EncodedLeaflet` from a passthrough directory entry + payload.
+///
+/// Its rows are copied as they are, so their live groups carry over. A v4
+/// leaflet has none to carry, and a v5 build never copies one (its first build
+/// of a v4 ledger is a full rebuild).
 fn reconstruct_encoded_leaflet(
     entry: LeafletDirEntryV3,
     payload: Vec<u8>,
-) -> fluree_db_binary_index::format::leaflet::EncodedLeaflet {
-    fluree_db_binary_index::format::leaflet::EncodedLeaflet {
+) -> io::Result<fluree_db_binary_index::format::leaflet::EncodedLeaflet> {
+    let live_edges = match entry.live_edges {
+        LiveEdges::Exact { first, last } => Some((first, last)),
+        LiveEdges::Empty => None,
+        LiveEdges::Legacy => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a v4 leaflet cannot be copied into a v5 leaf",
+            ))
+        }
+    };
+    Ok(fluree_db_binary_index::format::leaflet::EncodedLeaflet {
         row_count: entry.row_count,
         lead_group_count: entry.lead_group_count,
         first_key: entry.first_key,
         last_key: entry.last_key,
+        live_edges,
         p_const: entry.p_const,
         o_type_const: entry.o_type_const,
         flags: entry.flags,
         column_refs: entry.column_refs,
         payload,
-    }
+    })
 }
 
 /// Clone a `LeafletDirEntryV3`.
@@ -981,6 +996,7 @@ fn clone_dir_entry(entry: &LeafletDirEntryV3) -> LeafletDirEntryV3 {
         lead_group_count: entry.lead_group_count,
         first_key: entry.first_key,
         last_key: entry.last_key,
+        live_edges: entry.live_edges,
         p_const: entry.p_const,
         o_type_const: entry.o_type_const,
         flags: entry.flags,
@@ -1004,6 +1020,7 @@ fn empty_encoded_leaflet_with_keys(
         lead_group_count: 0,
         first_key: entry.first_key,
         last_key: entry.last_key,
+        live_edges: None,
         p_const: entry.p_const,
         o_type_const: entry.o_type_const,
         flags: 0,
@@ -1714,6 +1731,93 @@ mod tests {
             SubjectId(200),
             "the incremental re-derives the header from leaflet keys, so the \
              leaflet must span the history or the bound is lost"
+        );
+    }
+
+    /// Each leaflet with rows names its own first and last rows' groups in its
+    /// live edges.
+    fn assert_live_edges_name_rows(leaf_bytes: &[u8]) {
+        use fluree_db_binary_index::format::leaflet::LiveGroup;
+        let header = decode_leaf_header_v3(leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).unwrap();
+        for e in &dir.entries {
+            if e.row_count == 0 {
+                assert_eq!(e.live_edges, LiveEdges::Empty);
+                continue;
+            }
+            let rows = batch_rows(
+                &load_leaflet_columns(
+                    leaf_bytes,
+                    e,
+                    dir.payload_base,
+                    &ColumnProjection::all(),
+                    header.order,
+                )
+                .unwrap(),
+            );
+            let group = |s: u64| LiveGroup::from_bytes(&s.to_be_bytes());
+            assert_eq!(
+                e.live_edges,
+                LiveEdges::Exact {
+                    first: group(rows[0].0),
+                    last: group(rows[rows.len() - 1].0),
+                }
+            );
+        }
+    }
+
+    /// An incremental build that retracts a leaflet's last subject widens that
+    /// leaflet's routing key over the retraction, to a subject the next
+    /// leaflet holds a row of. The live edges keep the rows' own groups, so a
+    /// reader does not take the two leaflets to share that subject.
+    #[test]
+    fn incremental_live_edges_name_the_rows_past_widened_keys() {
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 2, 10000, 1);
+        writer.set_skip_history(true);
+        for rec in [
+            rec2(1, 1, 10, 1),
+            rec2(2, 1, 20, 1),
+            rec2(2, 2, 21, 1),
+            rec2(3, 1, 30, 1),
+        ] {
+            writer.push_record(rec).unwrap();
+        }
+        let leaves = writer.finish().unwrap();
+        let base = &leaves[0];
+
+        let novelty = vec![rec2(2, 1, 20, 5)];
+        let ops = vec![0u8];
+        let input = LeafUpdateInput {
+            pool: Default::default(),
+            leaf_bytes: &base.leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 2,
+            leaf_target_rows: 10000,
+            sidecar_bytes: base.sidecar_bytes.as_deref(),
+            history_drop: None,
+            rewrite_history: false,
+        };
+        let out = update_leaf(&input).unwrap();
+        assert_eq!(out.leaves.len(), 1);
+        let bytes = &out.leaves[0].info.leaf_bytes;
+        assert_live_edges_name_rows(bytes);
+
+        let header = decode_leaf_header_v3(bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(bytes, &header).unwrap();
+        assert_eq!(
+            fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2(
+                RunSortOrder::Spot,
+                &dir.entries[0].last_key
+            )
+            .s_id,
+            SubjectId(2),
+            "the retraction widens the re-encoded leaflet's routing key to subject 2"
         );
     }
 

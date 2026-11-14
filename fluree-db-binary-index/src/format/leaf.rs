@@ -38,7 +38,7 @@ use fluree_db_core::ContentId;
 
 use super::column_block::{ColumnBlockRef, COLUMN_BLOCK_REF_SIZE};
 use super::history_sidecar::{HistEntryV2, HistSidecarBuilder, HistorySegmentRef};
-use super::leaflet::{encode_leaflet, EncodedLeaflet};
+use super::leaflet::{encode_leaflet, live_group_len, EncodedLeaflet, LiveGroup};
 use super::run_record::RunSortOrder;
 use super::run_record_v2::{
     cmp_v2_for_order, ordered_key_from_stored, ordered_key_len, ordered_key_stored_len,
@@ -90,8 +90,21 @@ fn leaflet_dir_fixed_size_for(order: RunSortOrder, narrow: bool) -> usize {
     28 + 2 * ordered_key_stored_len(order, narrow)
 }
 
-/// Bytes of a leaflet directory entry after its column refs (history ref).
+/// Bytes of a leaflet directory entry's history ref, after its column refs.
 pub const LEAFLET_DIR_HISTORY_SIZE: usize = 20;
+
+/// Bytes of a leaflet directory entry after its column refs: the history ref,
+/// then the groups of the leaflet's first and last live rows (a v4 leaf, when
+/// `narrow`, stores no groups).
+#[inline]
+pub fn leaflet_dir_trailer_size(order: RunSortOrder) -> usize {
+    leaflet_dir_trailer_size_for(order, false)
+}
+
+#[inline]
+fn leaflet_dir_trailer_size_for(order: RunSortOrder, narrow: bool) -> usize {
+    LEAFLET_DIR_HISTORY_SIZE + if narrow { 0 } else { 2 * live_group_len(order) }
+}
 
 // ── Output types ───────────────────────────────────────────────────────
 
@@ -645,6 +658,7 @@ impl LeafWriter {
             lead_group_count: 0,
             first_key,
             last_key,
+            live_edges: None,
             p_const: match self.order.base() {
                 RunSortOrder::Post | RunSortOrder::Psot => Some(first.p_id),
                 _ => None,
@@ -902,6 +916,9 @@ pub fn build_leaf_blob_raw_keys(
         // history_len: u32 (4)
         // history_min_t: u32 (4)
         // history_max_t: u32 (4)
+        // live_first: [u8; live_group_len(order)] — group of the first row
+        // live_last:  [u8; live_group_len(order)] — group of the last row
+        //   (both zero for a leaflet with no rows)
 
         buf.extend_from_slice(&leaflet.row_count.to_le_bytes());
         buf.extend_from_slice(&leaflet.lead_group_count.to_le_bytes());
@@ -935,6 +952,16 @@ pub fn build_leaf_blob_raw_keys(
         buf.extend_from_slice(&h_min_t.to_le_bytes());
         buf.extend_from_slice(&h_max_t.to_le_bytes());
 
+        let group_len = live_group_len(order);
+        match &leaflet.live_edges {
+            Some((first, last)) => {
+                debug_assert_eq!(first.as_bytes().len(), group_len);
+                buf.extend_from_slice(first.as_bytes());
+                buf.extend_from_slice(last.as_bytes());
+            }
+            None => buf.resize(buf.len() + 2 * group_len, 0),
+        }
+
         cumulative_payload_offset += leaflet.payload.len() as u32;
     }
 
@@ -950,9 +977,10 @@ pub fn build_leaf_blob_raw_keys(
 
 pub fn compute_directory_size(order: RunSortOrder, leaflets: &[EncodedLeaflet]) -> usize {
     let fixed = leaflet_dir_fixed_size(order);
+    let trailer = leaflet_dir_trailer_size(order);
     leaflets
         .iter()
-        .map(|l| fixed + l.column_refs.len() * COLUMN_BLOCK_REF_SIZE + LEAFLET_DIR_HISTORY_SIZE)
+        .map(|l| fixed + l.column_refs.len() * COLUMN_BLOCK_REF_SIZE + trailer)
         .sum()
 }
 
@@ -969,13 +997,29 @@ pub struct LeafHeaderV3 {
     pub last_key: [u8; ORDERED_KEY_V2_SIZE],
 }
 
+/// What a leaflet's directory entry says of its first and last live rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveEdges {
+    /// A v4 leaf's entry: its writer stored no live groups, and its routing
+    /// keys reach past its rows over any history it holds.
+    Legacy,
+    /// The leaflet holds no rows.
+    Empty,
+    /// The groups of the leaflet's first and last rows.
+    Exact { first: LiveGroup, last: LiveGroup },
+}
+
 /// Parsed V3 leaflet directory entry.
 #[derive(Debug, Clone)]
 pub struct LeafletDirEntryV3 {
     pub row_count: u32,
     pub lead_group_count: u32,
+    /// Routing keys: they bound the leaflet's rows and the history it holds,
+    /// so they can lie past its first and last rows. [`Self::live_edges`]
+    /// names the rows themselves.
     pub first_key: [u8; ORDERED_KEY_V2_SIZE],
     pub last_key: [u8; ORDERED_KEY_V2_SIZE],
+    pub live_edges: LiveEdges,
     pub p_const: Option<u32>,
     pub o_type_const: Option<u16>,
     pub flags: u32,
@@ -1219,11 +1263,34 @@ pub fn decode_leaf_dir_v3_with_base(
         let history_max_t = u32::from_le_bytes(data[pos + 16..pos + 20].try_into().unwrap());
         pos += 20;
 
+        let live_edges = if narrow {
+            LiveEdges::Legacy
+        } else {
+            let g = live_group_len(order);
+            if pos + 2 * g > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "live groups truncated",
+                ));
+            }
+            let edges = if row_count == 0 {
+                LiveEdges::Empty
+            } else {
+                LiveEdges::Exact {
+                    first: LiveGroup::from_bytes(&data[pos..pos + g]),
+                    last: LiveGroup::from_bytes(&data[pos + g..pos + 2 * g]),
+                }
+            };
+            pos += 2 * g;
+            edges
+        };
+
         entries.push(LeafletDirEntryV3 {
             row_count,
             lead_group_count,
             first_key,
             last_key,
+            live_edges,
             p_const,
             o_type_const,
             flags,
@@ -1275,6 +1342,10 @@ mod tests {
             lead_group_count: 0,
             first_key: key(&first),
             last_key: key(&last),
+            live_edges: LiveEdges::Exact {
+                first: LiveGroup::of_key(order, &key(&first)),
+                last: LiveGroup::of_key(order, &key(&last)),
+            },
             p_const: None,
             o_type_const: None,
             flags: 0,
@@ -1339,7 +1410,7 @@ mod tests {
                 .map(|e| {
                     leaflet_dir_fixed_size(order)
                         + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE
-                        + LEAFLET_DIR_HISTORY_SIZE
+                        + leaflet_dir_trailer_size(order)
                 })
                 .sum();
             assert_eq!(dir.payload_base, leaf_header_size(order) + dir_size);
@@ -1406,7 +1477,11 @@ mod tests {
         let entry = &dir.entries[0];
         assert_eq!(
             dir.payload_base,
-            LEAF_V3_HEADER_SIZE + 88 + entry.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20
+            LEAF_V3_HEADER_SIZE
+                + 88
+                + entry.column_refs.len() * COLUMN_BLOCK_REF_SIZE
+                + 20
+                + 2 * 14
         );
         assert!(entry
             .column_refs
@@ -1661,7 +1736,8 @@ mod tests {
 
         // The column offsets are relative to the leaflet payload within the leaf.
         // The absolute payload start in the leaf blob:
-        let payload_section_start = LEAF_V3_HEADER_SIZE + compute_directory_size_from_dir(&dir);
+        let payload_section_start =
+            LEAF_V3_HEADER_SIZE + compute_directory_size_from_dir(header.order, &dir);
         let leaflet_payload_start = payload_section_start + entry.payload_offset as usize;
 
         // We need to adjust the block_ref offset to be absolute within leaf_bytes.
@@ -1671,9 +1747,11 @@ mod tests {
         assert_eq!(o_keys, vec![42, 43]);
     }
 
-    fn compute_directory_size_from_dir(dir: &[LeafletDirEntryV3]) -> usize {
+    fn compute_directory_size_from_dir(order: RunSortOrder, dir: &[LeafletDirEntryV3]) -> usize {
         dir.iter()
-            .map(|e| 88 + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20)
+            .map(|e| {
+                88 + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE + leaflet_dir_trailer_size(order)
+            })
             .sum()
     }
 
@@ -1752,6 +1830,7 @@ mod tests {
             "the fully-retracted predicate must still have a partition"
         );
         assert_eq!(dir[1].row_count, 0, "and it must carry no live rows");
+        assert_eq!(dir[1].live_edges, LiveEdges::Empty);
         assert!(
             dir[1].history_len > 0 && dir[1].history_max_t == 2,
             "the zero-row leaflet must carry its own history segment"
@@ -1825,6 +1904,49 @@ mod tests {
         );
     }
 
+    /// A subject whose last fact in sort order is retracted, at a leaflet that
+    /// filled on its last row: that history lands in the next leaflet and
+    /// widens its first routing key to the subject, which the next leaflet
+    /// holds no row of. Its live groups still name its own rows.
+    #[test]
+    fn history_widens_routing_keys_but_not_live_groups() {
+        let s = OType::XSD_STRING.as_u16();
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 2, 1000, 1);
+        for o in [10, 11] {
+            writer.push_history_entry(hist(1, 1, o, 1, 1));
+            writer.push_record(make_rec(1, 1, s, o, 1)).unwrap();
+        }
+        writer.push_history_entry(hist(1, 1, 19, 1, 1));
+        writer.push_history_entry(hist(1, 1, 19, 2, 0));
+        writer.push_history_entry(hist(2, 1, 20, 1, 1));
+        writer.push_record(make_rec(2, 1, s, 20, 1)).unwrap();
+
+        let leaves = writer.finish().unwrap();
+        let header = decode_leaf_header_v3(&leaves[0].leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3(&leaves[0].leaf_bytes, &header).unwrap();
+        assert_eq!(dir.len(), 2);
+        assert_eq!(
+            read_ordered_key_v2(RunSortOrder::Spot, &dir[1].first_key).s_id,
+            SubjectId(1),
+            "the retracted fact widens the next leaflet's routing key"
+        );
+        let group = |s_id: u64| LiveGroup::from_bytes(&s_id.to_be_bytes());
+        assert_eq!(
+            dir[0].live_edges,
+            LiveEdges::Exact {
+                first: group(1),
+                last: group(1)
+            }
+        );
+        assert_eq!(
+            dir[1].live_edges,
+            LiveEdges::Exact {
+                first: group(2),
+                last: group(2)
+            }
+        );
+    }
+
     /// SPOT is unsegmented, so a fully-retracted subject rides along in the
     /// leaflet holding the next subject's rows — except at the tail, where
     /// there is no next subject. Pin that the tail case keeps its history.
@@ -1858,7 +1980,8 @@ mod tests {
     }
 
     /// `bytes`, a leaf of a dedicated `order`, in a v4 leaf's layout: header
-    /// version 1, and every key with its `o_i` as a 32-bit position.
+    /// version 1, every key with its `o_i` as a 32-bit position, and no live
+    /// groups.
     fn narrow_leaf(order: RunSortOrder, bytes: &[u8]) -> Vec<u8> {
         let at = match order {
             RunSortOrder::Spot | RunSortOrder::Psot => 22,
@@ -1887,7 +2010,7 @@ mod tests {
             let columns = u16::from_le_bytes(bytes[pos + 86..pos + 88].try_into().unwrap());
             let end = pos + 88 + usize::from(columns) * COLUMN_BLOCK_REF_SIZE + 20;
             out.extend_from_slice(&bytes[pos + 68..end]);
-            pos = end;
+            pos = end + 2 * live_group_len(order);
         }
         out.extend_from_slice(&bytes[pos..]);
         out
@@ -1912,9 +2035,9 @@ mod tests {
             let wide = &infos[0].leaf_bytes;
             let narrow = narrow_leaf(order, wide);
             assert_eq!(
-                narrow.len() + 8 + 8 * 3,
+                narrow.len() + 8 + (8 + 2 * live_group_len(order)) * 3,
                 wide.len(),
-                "{order:?}: 4 fewer bytes a key"
+                "{order:?}: 4 fewer bytes a key, and no live groups"
             );
 
             let (wh, nh) = (
@@ -1935,6 +2058,8 @@ mod tests {
                     "{order:?}"
                 );
                 assert_eq!(n.column_refs, w.column_refs);
+                assert_eq!(n.live_edges, LiveEdges::Legacy);
+                assert!(matches!(w.live_edges, LiveEdges::Exact { .. }));
             }
             assert_eq!(narrow[nd.payload_base..], wide[wd.payload_base..]);
         }
