@@ -225,9 +225,6 @@ enum CacheKey {
     ///
     /// Key = xxh3_128 of a canonical ledger-info cache key string.
     LedgerInfo(u128),
-    /// A query's formatted answer. Key = xxh3_128 over the request and the
-    /// state of every ledger it read; see `fluree-db-api`'s `result_cache`.
-    QueryResult(u128),
     /// V3 (FLI3) decoded column batch, one per leaflet whatever its columns.
     /// Content-addressed via `leaf_id` (derived from leaf CID) — immutable,
     /// self-invalidating on rewrite. `leaflet_idx` selects which leaflet
@@ -425,7 +422,6 @@ enum CachedEntry {
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
-    QueryResult(Arc<[u8]>),
     /// V3 decoded column batch (base columns, no overlay/replay applied).
     V3Batch(CachedV3Batch),
     /// Translated overlay ops for one novelty segment.
@@ -452,7 +448,7 @@ impl CachedEntry {
                 std::mem::size_of::<crate::arena::vector::VectorShard>()
                     + shard.values.capacity() * std::mem::size_of::<f32>()
             }
-            CachedEntry::LedgerInfo(bytes) | CachedEntry::QueryResult(bytes) => bytes.len(),
+            CachedEntry::LedgerInfo(bytes) => bytes.len(),
             CachedEntry::V3Batch(entry) => entry.batch.byte_size(),
             CachedEntry::SegmentOps(seg) => seg.byte_size(),
         }
@@ -904,40 +900,6 @@ impl LeafletCache {
     pub fn insert_ledger_info(&self, key: u128, bytes: Arc<[u8]>) {
         self.inner
             .insert(CacheKey::LedgerInfo(key), CachedEntry::LedgerInfo(bytes));
-    }
-
-    // ========================================================================
-    // Query-result cache (formatted answer bytes)
-    // ========================================================================
-
-    /// A cached query answer, if present.
-    pub fn get_query_result(&self, key: u128) -> Option<Arc<[u8]>> {
-        match self.inner.get(&CacheKey::QueryResult(key)) {
-            Some(CachedEntry::QueryResult(bytes)) => Some(bytes),
-            _ => None,
-        }
-    }
-
-    /// Cache a query answer. One larger than [`Self::max_query_result_bytes`]
-    /// is not kept: it would evict that much of the decoded index.
-    pub fn insert_query_result(&self, key: u128, bytes: Arc<[u8]>) -> bool {
-        if bytes.len() as u64 > self.max_query_result_bytes() {
-            return false;
-        }
-        self.inner
-            .insert(CacheKey::QueryResult(key), CachedEntry::QueryResult(bytes));
-        true
-    }
-
-    /// Drop a cached query answer.
-    pub fn invalidate_query_result(&self, key: u128) {
-        self.inner.invalidate(&CacheKey::QueryResult(key));
-    }
-
-    /// The largest answer [`Self::insert_query_result`] keeps: 1/32 of the
-    /// pool.
-    pub fn max_query_result_bytes(&self) -> u64 {
-        self.inner.policy().max_capacity().unwrap_or(0) / 32
     }
 
     // ========================================================================

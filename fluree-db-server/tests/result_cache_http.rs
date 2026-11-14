@@ -13,11 +13,16 @@ use tower::ServiceExt;
 const LEDGER: &str = "resultcache:main";
 
 async fn app() -> (TempDir, axum::Router) {
+    app_with(None).await
+}
+
+async fn app_with(query_result_cache_max_mb: Option<usize>) -> (TempDir, axum::Router) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {
         cors_enabled: false,
         indexing_enabled: false,
         storage_path: Some(tmp.path().to_path_buf()),
+        query_result_cache_max_mb,
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
@@ -211,4 +216,23 @@ async fn volatile_sparql_reports_its_bypass() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(cache.as_deref(), Some("bypass; reason=\"NOW()\""));
+}
+
+#[tokio::test]
+async fn a_zero_budget_reports_the_cache_disabled() {
+    let (_tmp, app) = app_with(Some(0)).await;
+    let (status, cache, _) = send(
+        &app,
+        &format!("/v1/fluree/query/{LEDGER}"),
+        "application/sparql-query",
+        Some("application/sparql-results+json"),
+        "PREFIX ex: <http://example.org/>\nSELECT ?n WHERE { ?s ex:name ?n }".to_string(),
+        &[("fluree-cache", "true")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        cache.as_deref(),
+        Some("bypass; reason=\"result cache disabled\"")
+    );
 }

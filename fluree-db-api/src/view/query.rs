@@ -39,6 +39,27 @@ pub(crate) struct LoweredView {
     parse_ms: f64,
 }
 
+/// A lowered query's run: executed, or answered by the check that runs once
+/// its executable is built.
+pub(crate) enum ViewRun<E, T> {
+    Executed(E),
+    Answered(T),
+}
+
+/// A `before_execute` check that never answers: the query executes.
+pub(crate) fn always_execute(_: &ExecutableQuery) -> Option<std::convert::Infallible> {
+    None
+}
+
+impl<E> ViewRun<E, std::convert::Infallible> {
+    pub(crate) fn into_executed(self) -> E {
+        match self {
+            Self::Executed(executed) => executed,
+            Self::Answered(never) => match never {},
+        }
+    }
+}
+
 fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
     if view.is_root() {
         return result;
@@ -428,9 +449,10 @@ impl Fluree {
                 self.query_dataset_with_prepared_ast(&dataset, input, options, *ast)
                     .await
             }
-            LoweredViewQuery::View(lowered) => {
-                self.run_lowered_view_query(db, *lowered, &options).await
-            }
+            LoweredViewQuery::View(lowered) => Ok(self
+                .run_lowered_view_query(db, *lowered, &options, always_execute)
+                .await?
+                .into_executed()),
         }
     }
 
@@ -514,12 +536,20 @@ impl Fluree {
     }
 
     /// Plan and execute a query [`Self::lower_view_query`] lowered for `db`.
-    pub(crate) async fn run_lowered_view_query(
+    ///
+    /// `before_execute` sees each round's executable before it executes;
+    /// `Some` answers the query instead.
+    pub(crate) async fn run_lowered_view_query<T, F>(
         &self,
         db: &GraphDb,
         lowered: LoweredView,
         options: &QueryExecutionOptions,
-    ) -> Result<QueryResult> {
+        mut before_execute: F,
+    ) -> Result<ViewRun<QueryResult, T>>
+    where
+        F: FnMut(&ExecutableQuery) -> Option<T> + Send,
+        T: Send,
+    {
         let LoweredView {
             vars,
             parsed,
@@ -544,7 +574,7 @@ impl Fluree {
         // execution completes, so it cannot be re-run transparently and is
         // excluded on residency-mode peers.
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-        let (batches, plan_ms, exec_ms) = {
+        let run = {
             let _ = &tracker;
             let residency_cs = residency_content_store(db);
             let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
@@ -553,7 +583,14 @@ impl Fluree {
                 let round_tracker = limits_tracker(fuel_limit);
                 charge_query_floor(&round_tracker).map_err(fluree_db_query::QueryError::from)?;
                 let round = self
-                    .plan_and_execute_round(db, &vars, &parsed, &round_tracker, options)
+                    .plan_and_execute_round(
+                        db,
+                        &vars,
+                        &parsed,
+                        &round_tracker,
+                        options,
+                        &mut before_execute,
+                    )
                     .await;
                 match round {
                     Ok(v) => break v,
@@ -586,10 +623,14 @@ impl Fluree {
             }
         };
         #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
-        let (batches, plan_ms, exec_ms) = {
+        let run = {
             let _ = fuel_limit;
-            self.plan_and_execute_round(db, &vars, &parsed, &tracker, options)
+            self.plan_and_execute_round(db, &vars, &parsed, &tracker, options, &mut before_execute)
                 .await?
+        };
+        let (batches, plan_ms, exec_ms) = match run {
+            ViewRun::Executed(executed) => executed,
+            ViewRun::Answered(answer) => return Ok(ViewRun::Answered(answer)),
         };
 
         tracing::info!(
@@ -600,14 +641,14 @@ impl Fluree {
         );
 
         // 5. Build result
-        Ok(build_query_result(
+        Ok(ViewRun::Executed(build_query_result(
             vars,
             parsed,
             batches,
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        ))
+        )))
     }
 
     /// Execute a Cypher (openCypher 9 subset) query against a GraphDb.
@@ -1610,29 +1651,33 @@ impl Fluree {
     /// mean nothing in the api suite exercised what ships.
     ///
     /// Once per query, not per row, so the extra call is not on any hot path.
-    async fn plan_and_execute_round(
+    async fn plan_and_execute_round<T>(
         &self,
         db: &GraphDb,
         vars: &crate::VarRegistry,
         parsed: &fluree_db_query::ir::Query,
         tracker: &Tracker,
         options: &QueryExecutionOptions,
-    ) -> Result<(Vec<crate::Batch>, f64, f64)> {
+        before_execute: &mut (impl FnMut(&ExecutableQuery) -> Option<T> + Send),
+    ) -> Result<ViewRun<(Vec<crate::Batch>, f64, f64), T>> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self
             .build_executable_for_view(db, parsed, options.server_identity.as_ref())
             .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(answer) = before_execute(&executable) {
+            return Ok(ViewRun::Answered(answer));
+        }
 
         let exec_start = fluree_db_core::clock::Instant::now();
         let batches = self
             .execute_view_internal(db, vars, &executable, tracker, options)
             .await?;
-        Ok((
+        Ok(ViewRun::Executed((
             batches,
             plan_ms,
             exec_start.elapsed().as_secs_f64() * 1000.0,
-        ))
+        )))
     }
 
     /// Build an executable for a single view.

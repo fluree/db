@@ -218,17 +218,6 @@ impl<K: Hash + Eq, V: Clone> Cache<K, V> {
         }
     }
 
-    pub fn invalidate<Q>(&self, key: &Q)
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let mut inner = self.shared.inner.lock();
-        if let Some((_, weight)) = inner.map.pop(key) {
-            inner.weighted -= u64::from(weight);
-        }
-    }
-
     pub fn invalidate_all(&self) {
         let mut inner = self.shared.inner.lock();
         inner.map.clear();

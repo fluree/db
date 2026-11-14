@@ -50,7 +50,9 @@ These queries always execute and report `bypass`:
 - Agent JSON output (`application/vnd.fluree.agent+json`), whose envelope includes the time it
   was written.
 - SPARQL `FROM` / `FROM NAMED`.
-- Answers too large to cache. The limit is 1/32 of the cache budget.
+- Answers too large to cache. One answer may take at most 1/16 of the
+  [result-cache budget](#memory).
+- Any request, when the result cache is disabled (`query_result_cache_max_mb = 0`).
 
 Tracked requests (`fluree-track-*`, `opts.meta`) and CSV/TSV output are not served from the cache.
 Neither are connection-scoped queries (`/v1/fluree/query` without a ledger in the path),
@@ -58,7 +60,34 @@ multi-query, GraphQL or Cypher. Those requests get no `x-fdb-cache` header.
 
 ## Memory
 
-Cached answers share the server's cache budget (`--cache-max-mb`) with decoded index data. Answers
-for a ledger state that later queries no longer read are dropped once newer states replace them.
+Cached answers have a budget of their own, `query_result_cache_max_mb`. It is separate from the
+index cache budget (`cache_max_mb`) and in addition to it, so caching answers never shrinks the
+cache that ordinary queries read index data from.
+
+The budget is a ceiling, not a reservation. The pool that holds answers is created by the first
+request that opts in, and it grows only as answers are stored. A server where no request ever
+opts in allocates nothing for it, whatever the budget is set to.
+
+The default is 10% of `cache_max_mb`. When sizing a server against a memory limit, count both:
+the process can hold up to `cache_max_mb` of index data plus `query_result_cache_max_mb` of
+answers. Set the budget to `0` to turn result caching off; requests that ask for it then report
+`bypass; reason="result cache disabled"`.
+
+When the pool is full, the least recently used answers are dropped first. An answer for a ledger
+state that queries no longer read is never looked up again, so it is among the first to go.
+
+| Where | Setting |
+|-------|---------|
+| Server flag | `--query-result-cache-max-mb 200` |
+| Environment | `FLUREE_QUERY_RESULT_CACHE_MAX_MB=200` |
+| Config file (`[server]`) | `query_result_cache_max_mb = 200` |
+| JSON-LD connection config | `"queryResultCacheMaxMb": 200` on the `Connection` node (accepts `ConfigurationValue`) |
+| Rust | `FlureeBuilder::query_result_cache_max_mb(200)` |
+
+Server flags, environment variables and the config file override the connection config, as they
+do for `cache_max_mb`. See [Configuration](../operations/configuration.md#cache-size).
+
+Once a request has opted in, the server's once-a-minute cache stats log gains a
+`Query result cache stats` line with the entry count, the bytes held and the budget.
 
 A hit does no work, so `max-fuel` is not charged for it.

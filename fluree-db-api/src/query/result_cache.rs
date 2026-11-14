@@ -1,34 +1,89 @@
 //! Query-result cache.
 //!
-//! A query's formatted answer, kept in the shared cache pool under a key that
-//! covers the request and the state of the ledger it read. A request opts in.
+//! A query's formatted answer, kept under a key that covers the request and
+//! the state of the ledger it read. A request opts in.
 //!
 //! A hit is the answer an uncached run against the same state produces, so it
 //! is never staler than running the query again: a commit, an index build or
-//! anything else that changes what the view reads changes the key. Entries for
-//! a superseded state are only dropped to free the pool, never for
-//! correctness.
+//! anything else that changes what the view reads changes the key. Answers
+//! for a state no longer read are never looked up again and age out.
+//!
+//! Answers live in a pool of their own with its own ceiling, beside the
+//! leaflet cache's budget rather than inside it, and the pool is built on the
+//! first request that asks: a process that never opts in keeps no answers and
+//! loses no index cache to them.
 
 use crate::format::FormatterConfig;
-use crate::view::query::LoweredViewQuery;
+use crate::view::query::{always_execute, LoweredViewQuery, ViewRun};
 use crate::view::{GraphDb, QueryInput};
 use crate::{Fluree, QueryExecutionOptions, QueryResult, Result};
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache;
 use fluree_db_query::ir::result_cache::result_cache_bypass;
+#[cfg(not(target_arch = "wasm32"))]
+use moka::sync::Cache;
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use xxhash_rust::xxh3::Xxh3;
 
 /// Bumped when what the key covers changes.
 const KEY_VERSION: u32 = 1;
 
-/// States of one ledger whose entries are tracked; an older state's entries
-/// are dropped from the pool when a new one arrives.
-const LIVE_STATES_PER_LEDGER: usize = 4;
+/// One answer may take at most this fraction of the pool, so a single large
+/// answer cannot flush the rest.
+const MAX_ENTRY_DIVISOR: u64 = 16;
 
-/// Entries tracked per state. Untracked ones still age out of the pool.
-const KEYS_PER_STATE: usize = 4096;
+/// Estimated bytes per entry beyond the answer itself (key, `Arc` header,
+/// the pool's own node), charged so small answers are not counted as free.
+const ENTRY_OVERHEAD_BYTES: u64 = 128;
+
+/// The pool of opted-in answers.
+pub(crate) struct ResultCache {
+    max_bytes: u64,
+    pool: OnceLock<Cache<u128, Arc<[u8]>>>,
+}
+
+impl ResultCache {
+    /// A pool with a ceiling of `mb`; `0` disables result caching.
+    pub(crate) fn with_max_mb(mb: usize) -> Self {
+        Self {
+            max_bytes: (mb as u64).saturating_mul(1024 * 1024),
+            pool: OnceLock::new(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.max_bytes > 0
+    }
+
+    fn max_entry_bytes(&self) -> u64 {
+        (self.max_bytes / MAX_ENTRY_DIVISOR).min(u64::from(u32::MAX) - ENTRY_OVERHEAD_BYTES)
+    }
+
+    /// The pool, built on first use.
+    fn pool(&self) -> &Cache<u128, Arc<[u8]>> {
+        self.pool.get_or_init(|| {
+            let builder = Cache::builder()
+                .weigher(|_key: &u128, bytes: &Arc<[u8]>| {
+                    (bytes.len() as u64 + ENTRY_OVERHEAD_BYTES) as u32
+                })
+                .max_capacity(self.max_bytes);
+            // An answer for a superseded state is never read again, so
+            // recency alone retires it. The wasm32 stand-in is LRU already.
+            #[cfg(not(target_arch = "wasm32"))]
+            let builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
+            builder.build()
+        })
+    }
+
+    /// Entries and weighted bytes; `None` until a query has opted in.
+    pub(crate) fn usage(&self) -> Option<(u64, u64)> {
+        self.pool
+            .get()
+            .map(|pool| (pool.entry_count(), pool.weighted_size()))
+    }
+}
 
 /// What the cache did for one query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +159,6 @@ pub(crate) enum Rendering {
 /// Where a fresh answer goes once the terminal has formatted it.
 pub(crate) struct PendingInsert {
     key: u128,
-    ledger_id: Arc<str>,
-    state: u128,
 }
 
 pub(crate) enum ViewAnswer {
@@ -116,58 +169,16 @@ pub(crate) enum ViewAnswer {
     },
 }
 
-/// A ledger's recent states, oldest first, each with the keys it inserted.
-type LedgerStates = VecDeque<(u128, Vec<u128>)>;
-
-/// Per-ledger record of which entries each recent state put in the pool.
-#[derive(Default)]
-pub(crate) struct ResultCacheIndex {
-    ledgers: Mutex<HashMap<Arc<str>, LedgerStates>>,
-}
-
-impl ResultCacheIndex {
-    /// Note that `state` of `ledger_id` is in use, and that it put `key` in
-    /// the pool. Returns the keys of the states this pushes out.
-    fn observe(&self, ledger_id: &Arc<str>, state: u128, key: Option<u128>) -> Vec<u128> {
-        let mut ledgers = self
-            .ledgers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let states = ledgers.entry(Arc::clone(ledger_id)).or_default();
-        let mut dropped = Vec::new();
-        let at = match states.iter().position(|(s, _)| *s == state) {
-            Some(at) => at,
-            None => {
-                states.push_back((state, Vec::new()));
-                while states.len() > LIVE_STATES_PER_LEDGER {
-                    if let Some((_, keys)) = states.pop_front() {
-                        dropped.extend(keys);
-                    }
-                }
-                states.len() - 1
-            }
-        };
-        if let Some(key) = key {
-            let keys = &mut states[at].1;
-            if keys.len() < KEYS_PER_STATE {
-                keys.push(key);
-            }
-        }
-        dropped
-    }
-}
-
 /// Everything about `db` that decides what a query sees. `Err` names what
 /// the cache cannot key.
-fn hash_view<H: Hasher>(db: &GraphDb, h: &mut H) -> std::result::Result<u128, &'static str> {
+fn hash_view<H: Hasher>(db: &GraphDb, h: &mut H) -> std::result::Result<(), &'static str> {
     if db.graph_source_id.is_some() || db.over_graph_source {
         return Err("graph source");
     }
     if !db.cross_ledger_resolved_heads.is_empty() {
         return Err("cross-ledger governance");
     }
-    let state = view_state(db)?;
-    state.hash(h);
+    view_state(db)?.hash(h);
     db.graph_id.hash(h);
     db.union_default_graph.hash(h);
     match &db.default_context {
@@ -188,7 +199,7 @@ fn hash_view<H: Hasher>(db: &GraphDb, h: &mut H) -> std::result::Result<u128, &'
             }
         }
     }
-    Ok(state)
+    Ok(())
 }
 
 /// The ledger state `db` reads. A new commit or index build changes it: the
@@ -239,8 +250,9 @@ fn hash_input<H: Hasher>(
 impl Fluree {
     /// Run `input` against `db` through the result cache.
     ///
-    /// The executable is built before the lookup, so every per-request check
-    /// it makes runs on a hit too.
+    /// The lookup runs once the executable is built, inside the same round
+    /// as execution: every per-request check the build makes runs on a hit
+    /// too, and a miss executes the executable the lookup was keyed on.
     pub(crate) async fn query_view_for_cache(
         &self,
         db: &GraphDb,
@@ -256,17 +268,18 @@ impl Fluree {
         let mut h = Xxh3::new();
         KEY_VERSION.hash(&mut h);
         std::mem::discriminant(&rendering).hash(&mut h);
-        let keyed = hash_input(&input, &mut h)
-            .and_then(|()| options.hash_for_result_cache(&mut h))
-            .and_then(|()| format.hash_for_result_cache(&mut h))
-            .and_then(|()| hash_view(db, &mut h));
-        let state = match keyed {
-            Ok(state) => state,
-            Err(reason) => {
-                let result = self.query_with_options(db, input, options).await?;
-                return Ok((fresh(result), ResultCacheStatus::Bypass(reason)));
-            }
+        let keyed = if self.result_cache.enabled() {
+            hash_input(&input, &mut h)
+                .and_then(|()| options.hash_for_result_cache(&mut h))
+                .and_then(|()| format.hash_for_result_cache(&mut h))
+                .and_then(|()| hash_view(db, &mut h))
+        } else {
+            Err("result cache disabled")
         };
+        if let Err(reason) = keyed {
+            let result = self.query_with_options(db, input, options).await?;
+            return Ok((fresh(result), ResultCacheStatus::Bypass(reason)));
+        }
 
         let lowered = match self.lower_view_query(db, input, &options)? {
             LoweredViewQuery::Dataset { dataset, ast } => {
@@ -277,67 +290,63 @@ impl Fluree {
             }
             LoweredViewQuery::View(lowered) => *lowered,
         };
-        let bypass = match result_cache_bypass(&lowered.parsed) {
-            Some(reason) => Some(reason),
-            None => {
-                let executable = self
-                    .build_executable_for_view(
-                        db,
-                        &lowered.parsed,
-                        options.server_identity.as_ref(),
-                    )
-                    .await?;
-                if executable.reasoning.modes.has_any_enabled() {
-                    Some("reasoning")
-                } else {
-                    executable.query.union_default_graph.hash(&mut h);
-                    None
-                }
-            }
-        };
-        if let Some(reason) = bypass {
-            let result = self.run_lowered_view_query(db, lowered, &options).await?;
+        if let Some(reason) = result_cache_bypass(&lowered.parsed) {
+            let result = self
+                .run_lowered_view_query(db, lowered, &options, always_execute)
+                .await?
+                .into_executed();
             return Ok((fresh(result), ResultCacheStatus::Bypass(reason)));
         }
 
-        let key = h.digest128();
-        let pool = self.leaflet_cache();
-        for superseded in self.result_cache_index.observe(&db.ledger_id, state, None) {
-            pool.invalidate_query_result(superseded);
-        }
-        if let Some(bytes) = pool.get_query_result(key) {
-            return Ok((ViewAnswer::Cached(bytes), ResultCacheStatus::Hit));
-        }
-        let result = self.run_lowered_view_query(db, lowered, &options).await?;
-        let insert = PendingInsert {
-            key,
-            ledger_id: Arc::clone(&db.ledger_id),
-            state,
-        };
-        Ok((
-            ViewAnswer::Fresh {
-                result: Box::new(result),
-                insert: Some(insert),
-            },
-            ResultCacheStatus::Miss,
-        ))
+        let pool = self.result_cache.pool();
+        let mut reasoning = false;
+        let mut key = 0;
+        let run = self
+            .run_lowered_view_query(db, lowered, &options, |executable| {
+                reasoning = executable.reasoning.modes.has_any_enabled();
+                if reasoning {
+                    return None;
+                }
+                let mut h = h.clone();
+                executable.query.union_default_graph.hash(&mut h);
+                key = h.digest128();
+                pool.get(&key)
+            })
+            .await?;
+        Ok(match run {
+            ViewRun::Answered(bytes) => {
+                // As execution's first checkpoint would have.
+                if let Some(reason) = options
+                    .cancellation
+                    .as_ref()
+                    .and_then(fluree_db_core::QueryCancellation::reason)
+                {
+                    return Err(fluree_db_query::QueryError::Cancelled { reason }.into());
+                }
+                (ViewAnswer::Cached(bytes), ResultCacheStatus::Hit)
+            }
+            ViewRun::Executed(result) if reasoning => {
+                (fresh(result), ResultCacheStatus::Bypass("reasoning"))
+            }
+            ViewRun::Executed(result) => (
+                ViewAnswer::Fresh {
+                    result: Box::new(result),
+                    insert: Some(PendingInsert { key }),
+                },
+                ResultCacheStatus::Miss,
+            ),
+        })
     }
 
     /// Keep a fresh answer the terminal has formatted. Returns `false` when
-    /// it is too large for the pool.
+    /// it is too large for one entry.
     pub(crate) fn insert_result_cache(&self, pending: PendingInsert, bytes: &[u8]) -> bool {
-        let pool = self.leaflet_cache();
-        if bytes.len() as u64 > pool.max_query_result_bytes()
-            || !pool.insert_query_result(pending.key, Arc::from(bytes))
-        {
+        if bytes.len() as u64 > self.result_cache.max_entry_bytes() {
             return false;
         }
-        for superseded in
-            self.result_cache_index
-                .observe(&pending.ledger_id, pending.state, Some(pending.key))
-        {
-            pool.invalidate_query_result(superseded);
-        }
+        self.result_cache
+            .pool()
+            .insert(pending.key, Arc::from(bytes));
         true
     }
 }

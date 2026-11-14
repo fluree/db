@@ -2223,7 +2223,18 @@ impl FlureeBuilder {
     /// By default, cache size is calculated automatically based on 50% of
     /// available system memory. Use this method to override with a specific MB limit.
     pub fn cache_max_mb(mut self, max_mb: usize) -> Self {
-        self.config.cache = fluree_db_connection::CacheConfig::with_max_mb(max_mb);
+        self.config.cache.max_mb = max_mb;
+        self
+    }
+
+    /// Set the query-result cache ceiling in MB.
+    ///
+    /// Opted-in answers are kept in a pool of their own, in addition to the
+    /// [`cache_max_mb`](Self::cache_max_mb) budget, and nothing is allocated
+    /// until a query opts in. Defaults to 10% of `cache_max_mb`; `0` disables
+    /// result caching.
+    pub fn query_result_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.cache.query_result_max_mb = Some(max_mb);
         self
     }
 
@@ -3373,6 +3384,9 @@ impl FlureeBuilder {
         } = parts;
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let leaflet_cache = make_leaflet_cache(&config);
+        let result_cache = std::sync::Arc::new(query::result_cache::ResultCache::with_max_mb(
+            config.cache.query_result_mb(),
+        ));
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
         // Register SPARQL lowering hooks for f:sparql policy queries and
@@ -3409,7 +3423,7 @@ impl FlureeBuilder {
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache,
-            result_cache_index: std::sync::Arc::default(),
+            result_cache,
             indexing_mode,
             index_config,
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -3744,9 +3758,9 @@ pub struct Fluree {
     /// this instance that references the same model graph at the
     /// same model head commit.
     governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
-    /// Which recent ledger states put which query-result cache entries in
-    /// the shared pool; see `query::result_cache`.
-    result_cache_index: std::sync::Arc<query::result_cache::ResultCacheIndex>,
+    /// Opted-in query answers, in a pool of their own beside the leaflet
+    /// cache's budget; see `query::result_cache`.
+    result_cache: std::sync::Arc<query::result_cache::ResultCache>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,
     /// Novelty backpressure thresholds used by commits and soft-trigger logic.
@@ -3819,13 +3833,16 @@ impl Fluree {
         nameservice: NameServiceMode,
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config);
+        let result_cache = std::sync::Arc::new(query::result_cache::ResultCache::with_max_mb(
+            config.cache.query_result_mb(),
+        ));
         Self {
             config,
             backend,
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
-            result_cache_index: std::sync::Arc::default(),
+            result_cache,
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -3848,13 +3865,16 @@ impl Fluree {
         indexing_mode: tx::IndexingMode,
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config);
+        let result_cache = std::sync::Arc::new(query::result_cache::ResultCache::with_max_mb(
+            config.cache.query_result_mb(),
+        ));
         Self {
             config,
             backend: StorageBackend::Managed(Arc::new(storage)),
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
-            result_cache_index: std::sync::Arc::default(),
+            result_cache,
             indexing_mode,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -4226,6 +4246,17 @@ impl Fluree {
     /// Global cache budget in MB.
     pub fn cache_budget_mb(&self) -> usize {
         self.config().cache.max_mb
+    }
+
+    /// Query-result cache ceiling in MB (in addition to [`Self::cache_budget_mb`]).
+    pub fn result_cache_budget_mb(&self) -> usize {
+        self.config().cache.query_result_mb()
+    }
+
+    /// Entries and weighted bytes in the query-result cache; `None` until a
+    /// query has opted in.
+    pub fn result_cache_usage(&self) -> Option<(u64, u64)> {
+        self.result_cache.usage()
     }
 
     /// Check if ledger caching is enabled (true by default).

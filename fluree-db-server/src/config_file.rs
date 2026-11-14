@@ -67,6 +67,7 @@ pub struct ServerFileConfig {
     pub graphql_max_complexity: Option<usize>,
     pub cache_max_mb: Option<usize>,
     pub disk_cache_max_mb: Option<usize>,
+    pub query_result_cache_max_mb: Option<usize>,
 
     /// Colon-separated absolute directories under which catalog-less Iceberg
     /// tables may be read from the local filesystem. Absent disables them.
@@ -439,6 +440,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "query_refresh_ttl_ms",
     "cache_max_mb",
     "disk_cache_max_mb",
+    "query_result_cache_max_mb",
     "iceberg_local_roots",
     "indexing_enabled",
     "bm25_auto_sync",
@@ -579,6 +581,11 @@ pub fn apply_to_server_config(
     if is_default("disk_cache_max_mb") {
         if let Some(v) = file.disk_cache_max_mb {
             config.disk_cache_max_mb = Some(v);
+        }
+    }
+    if is_default("query_result_cache_max_mb") {
+        if let Some(v) = file.query_result_cache_max_mb {
+            config.query_result_cache_max_mb = Some(v);
         }
     }
     if is_default("iceberg_local_roots") {

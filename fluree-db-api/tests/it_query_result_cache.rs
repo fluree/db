@@ -366,3 +366,107 @@ async fn reads_beyond_the_ledger_state_bypass() {
         Some(ResultCacheStatus::Bypass("agent JSON"))
     );
 }
+
+#[tokio::test]
+async fn answers_take_no_memory_until_a_query_opts_in() {
+    let fluree = FlureeBuilder::memory().cache_max_mb(1000).build_memory();
+    assert_eq!(
+        fluree.result_cache_budget_mb(),
+        100,
+        "10% of the cache budget"
+    );
+    assert_eq!(
+        fluree.cache_budget_mb(),
+        1000,
+        "the index cache keeps its budget"
+    );
+    let ledger = seeded(
+        &fluree,
+        "cache/lazy:main",
+        &people(&[("alice", "Alice", 30)]),
+    )
+    .await;
+    let db = graphdb_from_ledger(&ledger);
+    let select = "SELECT ?name WHERE { ?s schema:name ?name }";
+
+    uncached(&fluree, &db, select).await;
+    assert_eq!(
+        fluree.result_cache_usage(),
+        None,
+        "no pool without an opt-in"
+    );
+
+    assert_eq!(
+        cached(&fluree, &db, select).await.1,
+        ResultCacheStatus::Miss
+    );
+    let (entries, bytes) = fluree
+        .result_cache_usage()
+        .expect("the opt-in built the pool");
+    assert!(
+        entries <= 1 && bytes <= 100 << 20,
+        "{entries} entries, {bytes} bytes"
+    );
+    assert_eq!(cached(&fluree, &db, select).await.1, ResultCacheStatus::Hit);
+}
+
+#[tokio::test]
+async fn a_zero_budget_disables_result_caching() {
+    let fluree = FlureeBuilder::memory()
+        .query_result_cache_max_mb(0)
+        .build_memory();
+    let ledger = seeded(
+        &fluree,
+        "cache/off:main",
+        &people(&[("alice", "Alice", 30)]),
+    )
+    .await;
+    let db = graphdb_from_ledger(&ledger);
+    let select = "SELECT ?name WHERE { ?s schema:name ?name }";
+
+    let expected = uncached(&fluree, &db, select).await;
+    for _ in 0..2 {
+        let (text, status) = cached(&fluree, &db, select).await;
+        assert_eq!(text, expected);
+        assert_eq!(status, ResultCacheStatus::Bypass("result cache disabled"));
+    }
+    assert_eq!(fluree.result_cache_usage(), None);
+}
+
+#[tokio::test]
+async fn a_cancelled_request_is_not_answered_from_the_cache() {
+    use fluree_db_api::{ApiError, QueryCancellation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seeded(
+        &fluree,
+        "cache/cancel:main",
+        &people(&[("alice", "Alice", 30)]),
+    )
+    .await;
+    let db = graphdb_from_ledger(&ledger);
+    let select = "SELECT ?name WHERE { ?s schema:name ?name }";
+    assert_eq!(
+        cached(&fluree, &db, select).await.1,
+        ResultCacheStatus::Miss
+    );
+
+    let cancelled = QueryCancellation::new();
+    cancelled.cancel();
+    let outcome = ResultCacheOutcome::new();
+    let err = db
+        .query(&fluree)
+        .sparql(&format!("{PREFIX}{select}"))
+        .cancellation(cancelled)
+        .result_cache(&outcome)
+        .execute_formatted_string()
+        .await
+        .expect_err("a cancelled request fails as it would uncached");
+    assert!(
+        matches!(
+            err,
+            ApiError::Query(fluree_db_query::QueryError::Cancelled { .. })
+        ),
+        "{err}"
+    );
+    assert_eq!(cached(&fluree, &db, select).await.1, ResultCacheStatus::Hit);
+}
