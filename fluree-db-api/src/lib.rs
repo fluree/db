@@ -227,6 +227,9 @@ pub use query::builder::{
 };
 pub use query::helpers::sparql_pragma_tracking;
 pub use query::nameservice_builder::NameserviceQueryBuilder;
+pub use query::result_cache::{
+    jsonld_requests_result_cache, ResultCacheOutcome, ResultCacheStatus,
+};
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{
     ConflictStrategy, PendingReplay, RebaseConflict, RebaseFailure, RebaseReport, StagedRebase,
@@ -3406,6 +3409,7 @@ impl FlureeBuilder {
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache,
+            result_cache_index: std::sync::Arc::default(),
             indexing_mode,
             index_config,
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -3740,6 +3744,9 @@ pub struct Fluree {
     /// this instance that references the same model graph at the
     /// same model head commit.
     governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
+    /// Which recent ledger states put which query-result cache entries in
+    /// the shared pool; see `query::result_cache`.
+    result_cache_index: std::sync::Arc<query::result_cache::ResultCacheIndex>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,
     /// Novelty backpressure thresholds used by commits and soft-trigger logic.
@@ -3818,6 +3825,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
+            result_cache_index: std::sync::Arc::default(),
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -3846,6 +3854,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
+            result_cache_index: std::sync::Arc::default(),
             indexing_mode,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),

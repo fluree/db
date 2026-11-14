@@ -63,6 +63,8 @@ mod it_query_post_order_limit;
 mod it_query_property;
 #[path = "it_query_rdf_list_parity.rs"]
 mod it_query_rdf_list_parity;
+#[path = "it_query_result_cache.rs"]
+mod it_query_result_cache;
 #[path = "it_query_reverse.rs"]
 mod it_query_reverse;
 #[path = "it_query_self_loop_star_join.rs"]

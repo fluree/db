@@ -21,6 +21,10 @@ use crate::format::FormatterConfig;
 use crate::query::connection::FormatTarget;
 #[cfg(feature = "iceberg")]
 use crate::query::helpers::parse_dataset_spec;
+use crate::query::result_cache::{
+    jsonld_requests_result_cache, PendingInsert, Rendering, ResultCacheOutcome, ResultCacheStatus,
+    ViewAnswer,
+};
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
     ApiError, Fluree, GovernanceOptions, PolicyContext, QueryExecutionOptions, QueryResult, Result,
@@ -215,6 +219,14 @@ pub struct ViewQueryBuilder<'a> {
     fluree: &'a Fluree,
     view: &'a GraphDb,
     core: QueryCore<'a>,
+    result_cache: Option<&'a ResultCacheOutcome>,
+}
+
+/// What the result cache did for a formatted terminal's query, and where to
+/// report it.
+struct CacheRun<'a> {
+    outcome: Option<&'a ResultCacheOutcome>,
+    status: ResultCacheStatus,
 }
 
 impl<'a> ViewQueryBuilder<'a> {
@@ -224,6 +236,73 @@ impl<'a> ViewQueryBuilder<'a> {
             fluree,
             view,
             core: QueryCore::new(),
+            result_cache: None,
+        }
+    }
+
+    /// Answer from the query-result cache when a stored answer matches this
+    /// request and the view's ledger state, and store the answer otherwise.
+    /// `outcome` reports which happened. A JSON-LD query can opt in with
+    /// `"opts": {"cache": true}` instead.
+    ///
+    /// Applies to `execute_formatted`, `execute_formatted_string` and
+    /// `execute_formatted_json_bytes`.
+    pub fn result_cache(mut self, outcome: &'a ResultCacheOutcome) -> Self {
+        self.result_cache = Some(outcome);
+        self
+    }
+
+    /// The answer for a formatted terminal: through the result cache when the
+    /// request opted in, as `execute` runs it otherwise.
+    async fn formatted_answer(
+        &mut self,
+        format: &FormatterConfig,
+        rendering: Rendering,
+    ) -> Result<(ViewAnswer, Option<CacheRun<'a>>)> {
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let input = self.core.input.take().expect("validated");
+        let opted_in = match (self.result_cache, input) {
+            (Some(outcome), _) => Some(Some(outcome)),
+            (None, QueryInput::JsonLd(json)) if jsonld_requests_result_cache(json) => Some(None),
+            (None, _) => None,
+        };
+        let fresh = |result| ViewAnswer::Fresh {
+            result: Box::new(result),
+            insert: None,
+        };
+        match (r2rml.as_ref(), opted_in) {
+            (Some((provider, table_provider)), opted_in) => {
+                let result = self
+                    .fluree
+                    .query_view_with_r2rml_options(
+                        self.view,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
+                    .await?;
+                let run = opted_in.map(|outcome| CacheRun {
+                    outcome,
+                    status: ResultCacheStatus::Bypass("graph source"),
+                });
+                Ok((fresh(result), run))
+            }
+            (None, Some(outcome)) => {
+                let (answer, status) = self
+                    .fluree
+                    .query_view_for_cache(self.view, input, execution, format, rendering)
+                    .await?;
+                Ok((answer, Some(CacheRun { outcome, status })))
+            }
+            (None, None) => {
+                let result = self
+                    .fluree
+                    .query_with_options(self.view, input, execution)
+                    .await?;
+                Ok((fresh(result), None))
+            }
         }
     }
 
@@ -342,36 +421,62 @@ impl<'a> ViewQueryBuilder<'a> {
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
-
-        let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution();
         let format_config = self
             .core
             .format
             .take()
             .unwrap_or_else(|| self.core.default_format());
-        let input = self.core.input.take().unwrap();
-        let result = match r2rml.as_ref() {
-            Some((provider, table_provider)) => {
-                self.fluree
-                    .query_view_with_r2rml_options(
-                        self.view,
-                        input,
-                        provider.as_ref(),
-                        table_provider.as_ref(),
-                        execution,
-                    )
-                    .await?
+        let (answer, run) = self
+            .formatted_answer(&format_config, Rendering::JsonDom)
+            .await?;
+        match answer {
+            ViewAnswer::Cached(bytes) => {
+                finish_cache_run(self.fluree, run, None, &[]);
+                Ok(serde_json::from_slice(&bytes)?)
             }
-            None => {
-                self.fluree
-                    .query_with_options(self.view, input, execution)
-                    .await?
+            ViewAnswer::Fresh { result, insert } => {
+                let value = result
+                    .format_async_for_view(self.view, &format_config)
+                    .await?;
+                let bytes = match &insert {
+                    Some(_) => serde_json::to_vec(&value)?,
+                    None => Vec::new(),
+                };
+                finish_cache_run(self.fluree, run, insert, &bytes);
+                Ok(value)
             }
-        };
-        Ok(result
-            .format_async_for_view(self.view, &format_config)
-            .await?)
+        }
+    }
+
+    /// [`Self::execute_formatted`], serialized: the bytes `serde_json` writes
+    /// for its value.
+    pub async fn execute_formatted_json_bytes(mut self) -> Result<Vec<u8>> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+        let format_config = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
+        let (answer, run) = self
+            .formatted_answer(&format_config, Rendering::JsonDom)
+            .await?;
+        match answer {
+            ViewAnswer::Cached(bytes) => {
+                finish_cache_run(self.fluree, run, None, &[]);
+                Ok(bytes.to_vec())
+            }
+            ViewAnswer::Fresh { result, insert } => {
+                let value = result
+                    .format_async_for_view(self.view, &format_config)
+                    .await?;
+                let bytes = serde_json::to_vec(&value)?;
+                finish_cache_run(self.fluree, run, insert, &bytes);
+                Ok(bytes)
+            }
+        }
     }
 
     /// Execute and return formatted string output.
@@ -384,42 +489,34 @@ impl<'a> ViewQueryBuilder<'a> {
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
-
-        let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution();
         let format_config = self
             .core
             .format
             .take()
             .unwrap_or_else(|| self.core.default_format());
-        let input = self.core.input.take().unwrap();
-        let result = match r2rml.as_ref() {
-            Some((provider, table_provider)) => {
-                self.fluree
-                    .query_view_with_r2rml_options(
-                        self.view,
-                        input,
-                        provider.as_ref(),
-                        table_provider.as_ref(),
-                        execution,
-                    )
-                    .await?
+        let (answer, run) = self
+            .formatted_answer(&format_config, Rendering::Text)
+            .await?;
+        match answer {
+            ViewAnswer::Cached(bytes) => {
+                finish_cache_run(self.fluree, run, None, &[]);
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|e| ApiError::internal(format!("cached query answer: {e}")))
             }
-            None => {
-                self.fluree
-                    .query_with_options(self.view, input, execution)
-                    .await?
+            ViewAnswer::Fresh { result, insert } => {
+                let text = crate::format::format_results_string_async(
+                    &result,
+                    &result.context,
+                    self.view.as_graph_db_ref(),
+                    &format_config,
+                    self.view.policy(),
+                )
+                .await
+                .map_err(ApiError::from)?;
+                finish_cache_run(self.fluree, run, insert, text.as_bytes());
+                Ok(text)
             }
-        };
-        crate::format::format_results_string_async(
-            &result,
-            &result.context,
-            self.view.as_graph_db_ref(),
-            &format_config,
-            self.view.policy(),
-        )
-        .await
-        .map_err(ApiError::from)
+        }
     }
 
     /// Execute with tracking (fuel, time, policy stats).
@@ -471,6 +568,25 @@ impl<'a> ViewQueryBuilder<'a> {
                     .await
             }
         }
+    }
+}
+
+/// Store a fresh answer's `bytes` and report what the cache did.
+fn finish_cache_run(
+    fluree: &Fluree,
+    run: Option<CacheRun<'_>>,
+    insert: Option<PendingInsert>,
+    bytes: &[u8],
+) {
+    let Some(run) = run else { return };
+    let mut status = run.status;
+    if let Some(pending) = insert {
+        if !fluree.insert_result_cache(pending, bytes) {
+            status = ResultCacheStatus::Bypass("answer larger than a cache entry");
+        }
+    }
+    if let Some(outcome) = run.outcome {
+        outcome.set(status);
     }
 }
 

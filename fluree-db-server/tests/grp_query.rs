@@ -19,6 +19,8 @@ mod multi_query_auth_integration;
 mod multi_query_integration;
 #[path = "query_path_time_pin.rs"]
 mod query_path_time_pin;
+#[path = "result_cache_http.rs"]
+mod result_cache_http;
 #[path = "sparql_construct_jsonld_accept.rs"]
 mod sparql_construct_jsonld_accept;
 #[path = "sparql_dataset_semantics.rs"]

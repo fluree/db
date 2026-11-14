@@ -559,6 +559,21 @@ pub(crate) fn inject_headers_into_query(query: &mut JsonValue, headers: &FlureeH
     }
 }
 
+/// `x-fdb-cache` on a response the result cache was asked to serve.
+fn with_result_cache_header(
+    mut response: Response,
+    outcome: Option<&fluree_db_api::ResultCacheOutcome>,
+) -> Response {
+    if let Some(status) = outcome.and_then(fluree_db_api::ResultCacheOutcome::status) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&status.header_value()) {
+            response
+                .headers_mut()
+                .insert(axum::http::HeaderName::from_static("x-fdb-cache"), value);
+        }
+    }
+    response
+}
+
 fn jsonld_query_has_context(query: &JsonValue) -> bool {
     query.get("@context").is_some() || query.get("context").is_some()
 }
@@ -3035,6 +3050,30 @@ async fn execute_query(
         return Ok(delimited_response(bytes, fmt));
     }
 
+    if fluree_db_api::jsonld_requests_result_cache(query_json) {
+        let outcome = fluree_db_api::ResultCacheOutcome::new();
+        let body = graph
+            .query(fluree.as_ref())
+            .jsonld(query_json)
+            .execution_options(query_execution_options(state))
+            .result_cache(&outcome)
+            .execute_formatted_json_bytes()
+            .await
+            .map_err(|e| {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:InvalidQuery");
+                tracing::error!(error = %server_error, "query execution failed");
+                server_error
+            })?;
+        tracing::info!(status = "success", tracked = false, cache = ?outcome.status());
+        let response = (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response();
+        return Ok(with_result_cache_header(response, Some(&outcome)));
+    }
+
     // Execute query via builder - formatted JSON-LD output
     let result = match graph
         .query(fluree.as_ref())
@@ -4034,6 +4073,9 @@ async fn execute_sparql_ledger(
         .await?;
         let graph = state.fluree.wrap_policy_defaults(graph).await?;
         let fluree = &state.fluree;
+        let result_cache = headers
+            .wants_result_cache()
+            .then(fluree_db_api::ResultCacheOutcome::new);
 
         // Tracked SPARQL: if tracking headers are present, use tracked execution path
         if headers.has_tracking() {
@@ -4151,11 +4193,16 @@ async fn execute_sparql_ledger(
                         .to_string(),
                 ));
             }
-            let xml = graph
+            let builder = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fluree_db_api::FormatterConfig::sparql_xml())
-                .execution_options(execution())
+                .execution_options(execution());
+            let builder = match &result_cache {
+                Some(outcome) => builder.result_cache(outcome),
+                None => builder,
+            };
+            let xml = builder
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
@@ -4163,31 +4210,38 @@ async fn execute_sparql_ledger(
                 })
                 .map_err(ServerError::Api)?;
             let content_type = "application/sparql-results+xml; charset=utf-8";
-            return Ok((
+            let response = (
                 [(axum::http::header::CONTENT_TYPE, content_type)],
                 xml.into_bytes(),
             )
-                .into_response());
+                .into_response();
+            return Ok(with_result_cache_header(response, result_cache.as_ref()));
         }
 
         // Turtle / N-Triples / RDF/XML: a CONSTRUCT/DESCRIBE graph
         if let Some(fmt) = graph_format {
-            let body = graph
+            let builder = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fmt.formatter())
-                .execution_options(execution())
+                .execution_options(execution());
+            let builder = match &result_cache {
+                Some(outcome) => builder.result_cache(outcome),
+                None => builder,
+            };
+            let body = builder
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })
                 .map_err(ServerError::Api)?;
-            return Ok((
+            let response = (
                 [(axum::http::header::CONTENT_TYPE, fmt.content_type())],
                 body.into_bytes(),
             )
-                .into_response());
+                .into_response();
+            return Ok(with_result_cache_header(response, result_cache.as_ref()));
         }
 
         // AgentJson: execute with agent-optimized envelope format
@@ -4229,6 +4283,23 @@ async fn execute_sparql_ledger(
                 Json(result),
             )
                 .into_response());
+        }
+
+        if let Some(outcome) = &result_cache {
+            let body = graph
+                .query(fluree.as_ref())
+                .sparql(sparql)
+                .format(json_fmt_config)
+                .execution_options(execution())
+                .result_cache(outcome)
+                .execute_formatted_json_bytes()
+                .await
+                .inspect_err(|_| {
+                    set_span_error_code(&span, "error:QueryFailed");
+                })?;
+            let response =
+                ([(axum::http::header::CONTENT_TYPE, json_content_type)], body).into_response();
+            return Ok(with_result_cache_header(response, Some(outcome)));
         }
 
         // Execute SPARQL query via builder - formatted JSON output
