@@ -59,7 +59,7 @@ members = [
     "fluree-db-wasm",
     "fluree-db-python",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge", "fluree-prover"]
+exclude = ["testsuite-sparql", "testsuite-shacl", "testsuite-jsonld", "scripts/local/load", "fluree-sql-bridge", "fluree-prover"]
 
 [workspace.package]
 version = "5.0.0-alpha.3"

@@ -93,6 +93,11 @@ Deviations from the JSON-LD 1.1 expansion algorithm:
 - A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
 - `@container` values `@id`, `@type` and `@graph` are refused. A property-valued `@index` is refused where an index map uses it.
 - A string `@value` on a value object typed `@json` is read as a serialized JSON document: `{"@value": "{\"a\": 1}", "@type": "@json"}` is the object, not a string. A string under a term typed `@json` is the JSON string itself.
+- A top-level object with an `@graph`, other properties and no `@id` is a transaction envelope: the other properties are the commit's metadata (see [Commit metadata](../transactions/overview.md#commit-metadata)). JSON-LD reads it as a node whose `@graph` is a graph named by a blank node.
+- There is no JSON-LD 1.0 processing mode: every document is read as JSON-LD 1.1.
+- The `rdfDirection` option of JSON-LD's conversion to RDF is not offered: a `@direction` is kept in the language tag (see base-direction tags above).
+
+The W3C json-ld-api expand and toRdf suites run in CI. `testsuite-jsonld/tests/registers/mod.rs` lists each test Fluree fails, with its cause: one of the deviations above, or an open issue (see [the JSON-LD compliance suite](../contributing/jsonld-compliance.md)).
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 

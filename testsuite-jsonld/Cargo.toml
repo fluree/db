@@ -1,0 +1,22 @@
+[package]
+name = "testsuite-jsonld"
+version = "5.0.0-alpha.3"
+edition = "2021"
+publish = false
+
+# Standalone package, as testsuite-sparql is: the root Cargo.toml excludes it
+# by path, and this marker keeps cargo from walking up to an enclosing
+# workspace root when the repo is checked out as a nested worktree.
+[workspace]
+
+[dependencies]
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+
+anyhow = "1"
+serde_json = "1"
+
+# Mirrors the root workspace's [profile.dev]; see testsuite-sparql/Cargo.toml.
+[profile.dev]
+split-debuginfo = "unpacked"
