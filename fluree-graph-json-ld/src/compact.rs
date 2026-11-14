@@ -214,10 +214,11 @@ fn reverse_context(
 }
 
 /// Extract namespace IRIs (ending in `/` or `#`) and sort longest-first.
+/// `@vocab` joins as written, so it shortens whatever it ends in.
 fn sorted_prefix_iris(flipped: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = flipped
         .iter()
-        .filter(|(iri, _)| iri.ends_with('/') || iri.ends_with('#'))
+        .filter(|(iri, name)| iri.ends_with('/') || iri.ends_with('#') || *name == ":vocab")
         .map(|(iri, prefix)| (iri.clone(), prefix.clone()))
         .collect();
     pairs.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
@@ -303,6 +304,14 @@ mod tests {
         let ctx = ParsedContext::parse(None, &json!("https://schema.org")).unwrap();
 
         assert_eq!(compact("https://schema.org/name", &ctx), "name");
+    }
+
+    #[test]
+    fn a_vocab_ending_in_neither_slash_nor_hash_compacts() {
+        let ctx = ParsedContext::parse(None, &json!({"@vocab": "urn:ex:", "p": "urn:p:"})).unwrap();
+        assert_eq!(compact("urn:ex:name", &ctx), "name");
+        // A prefix still needs to end in `/` or `#`.
+        assert_eq!(compact("urn:p:x", &ctx), "urn:p:x");
     }
 
     #[test]

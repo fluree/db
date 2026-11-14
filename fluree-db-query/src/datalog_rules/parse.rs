@@ -12,8 +12,8 @@ use crate::lang_support::SparqlRuleParts;
 use crate::parse::ast::UnresolvedQuery;
 use crate::parse::policy::resolve_parse_policy;
 use crate::parse::{
-    extract_path_aliases, lower_query, normalize_context_value, parse_where_with_counters,
-    IriEncoder, JsonLdParseCtx, SelectMode,
+    extract_path_aliases, lower_query, parse_where_with_counters, IriEncoder, JsonLdParseCtx,
+    SelectMode,
 };
 use crate::var_registry::VarRegistry;
 use fluree_db_core::edge::id_datatype_sid;
@@ -127,7 +127,7 @@ pub(super) fn parse_jsonld_rule(
         .or_else(|| obj.get("context"))
         .cloned()
         .unwrap_or(JsonValue::Null);
-    let context = parse_context(&normalize_context_value(&context_val))
+    let context = parse_context(&fluree_graph_json_ld::with_base_as_vocab(&context_val))
         .map_err(|e| invalid(&label, format!("invalid @context: {e}")))?;
     let policy = resolve_parse_policy(None, obj);
     let path_aliases = extract_path_aliases(&context_val, &context, policy)
