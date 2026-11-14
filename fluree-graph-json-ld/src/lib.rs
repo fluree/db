@@ -90,6 +90,29 @@ pub fn parse_context(context: &JsonValue) -> Result<ParsedContext> {
     ParsedContext::parse(None, context)
 }
 
+/// A context object with Fluree's `@base` fallback applied, as JSON-LD
+/// transactions and queries read their contexts: with an `@base` and no
+/// `@vocab`, the base is the vocabulary too, with a `/` added to an absolute
+/// base that ends in neither `/` nor `#`. An explicit `@vocab` is taken as
+/// written.
+pub fn with_base_as_vocab(context: &JsonValue) -> JsonValue {
+    let JsonValue::Object(map) = context else {
+        return context.clone();
+    };
+    let Some(base) = map.get("@base").filter(|_| !map.contains_key("@vocab")) else {
+        return context.clone();
+    };
+    let vocab = match base {
+        JsonValue::String(b) if iri::is_absolute(b) => {
+            JsonValue::String(iri::add_trailing_slash(b))
+        }
+        other => other.clone(),
+    };
+    let mut out = map.clone();
+    out.insert("@vocab".to_string(), vocab);
+    JsonValue::Object(out)
+}
+
 /// Parse a context with a base context.
 ///
 /// # Arguments

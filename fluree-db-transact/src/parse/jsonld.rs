@@ -1390,7 +1390,9 @@ fn parse_update_templates_with_ctx(
 /// Extract and parse the @context from a JSON-LD document
 fn extract_context(json: &Value) -> Result<ParsedContext> {
     if let Some(ctx_val) = json.get("@context") {
-        Ok(parse_context(&normalize_context_value(ctx_val))?)
+        Ok(parse_context(&fluree_graph_json_ld::with_base_as_vocab(
+            ctx_val,
+        ))?)
     } else {
         Ok(ParsedContext::new())
     }
@@ -1501,19 +1503,6 @@ fn expand_datatype_iri_with_policy(
 
 fn expand_builtin_xsd_datatype(local: &str) -> Option<&'static str> {
     fluree_vocab::datatype::KnownDatatype::from_xsd_local(local).map(|dt| dt.canonical_form())
-}
-
-fn normalize_context_value(context_val: &Value) -> Value {
-    if let Value::Object(map) = context_val {
-        if let Some(base) = map.get("@base") {
-            if !map.contains_key("@vocab") {
-                let mut out = map.clone();
-                out.insert("@vocab".to_string(), base.clone());
-                return Value::Object(out);
-            }
-        }
-    }
-    context_val.clone()
 }
 
 /// Validate that any `@type` fields are strings (IRI) or arrays of strings.

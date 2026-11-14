@@ -295,21 +295,21 @@ impl ParsedContext {
     }
 }
 
-/// Compute @vocab value, handling empty string and relative IRIs
-fn compute_vocab(document_base: Option<&str>, value: &JsonValue) -> Result<Option<String>> {
+/// The vocabulary mapping a `@vocab` value sets, expanded as JSON-LD 1.1
+/// expands it (Context Processing 5.8.3): a term or compact IRI expands, a
+/// relative IRI joins the vocabulary already in effect or, with none,
+/// resolves against the base, and an absolute IRI is taken as written.
+/// `active` is the context before this one's term definitions.
+fn compute_vocab(active: &ParsedContext, value: &JsonValue) -> Result<Option<String>> {
     match value {
         JsonValue::String(s) => {
-            if s.is_empty() {
-                // Empty string means use @base as @vocab
-                Ok(document_base.map(iri::add_trailing_slash))
-            } else if !iri::is_absolute(s) {
-                match document_base {
-                    Some(base) => Ok(Some(resolve_iri(base, s))),
-                    None => Ok(Some(iri::add_trailing_slash(s))),
-                }
-            } else {
-                Ok(Some(iri::add_trailing_slash(s)))
-            }
+            let expanded = crate::expand::iri(s, active, true);
+            let relative = !iri::is_absolute(&expanded) && !expanded.starts_with("_:");
+            Ok(match active.base.as_deref() {
+                Some(base) if relative => Some(resolve_iri(base, &expanded)),
+                _ if expanded.is_empty() => None,
+                _ => Some(expanded),
+            })
         }
         JsonValue::Null => Ok(None),
         _ => Err(JsonLdError::InvalidContext {
@@ -352,7 +352,7 @@ fn parse_context_map(
         if let Some(keyword) = key.strip_prefix('@') {
             match keyword {
                 "vocab" => {
-                    result.vocab = compute_vocab(result.base.as_deref(), value)?;
+                    result.vocab = compute_vocab(&result, value)?;
                 }
                 "language" => {
                     result.language = value.as_str().map(std::string::ToString::to_string);
@@ -830,6 +830,77 @@ mod tests {
         assert_eq!(
             ctx.vocab,
             Some("https://hub.flur.ee/some/ledger/".to_string())
+        );
+    }
+
+    fn vocab_of(context: JsonValue) -> Option<String> {
+        ParsedContext::parse(None, &context).unwrap().vocab
+    }
+
+    #[test]
+    fn an_absolute_vocab_is_taken_as_written() {
+        for vocab in [
+            "urn:ex:",
+            "http://example.org/ns",
+            "ex:",
+            "http://example.org/ns#",
+        ] {
+            assert_eq!(
+                vocab_of(json!({"@vocab": vocab})).as_deref(),
+                Some(vocab),
+                "{vocab}"
+            );
+        }
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.org/doc", "@vocab": ""})).as_deref(),
+            Some("http://example.org/doc")
+        );
+    }
+
+    #[test]
+    fn a_vocab_expands_as_a_vocabulary_relative_iri() {
+        let prefix = json!({"ex": {"@id": "http://example.org/", "@prefix": true}});
+        // A compact IRI and a term expand against the context before it.
+        assert_eq!(
+            vocab_of(json!([prefix, {"@vocab": "ex:ns/"}])).as_deref(),
+            Some("http://example.org/ns/")
+        );
+        assert_eq!(
+            vocab_of(json!([prefix, {"@vocab": "ex"}])).as_deref(),
+            Some("http://example.org/")
+        );
+        // A relative IRI joins the vocabulary in effect, and with none
+        // resolves against the base.
+        assert_eq!(
+            vocab_of(json!([{"@vocab": "http://example.com/vocabulary/"}, {"@vocab": "./rel2#"}]))
+                .as_deref(),
+            Some("http://example.com/vocabulary/./rel2#")
+        );
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.com/a/b/", "@vocab": "/relative"})).as_deref(),
+            Some("http://example.com/relative")
+        );
+    }
+
+    #[test]
+    fn a_string_context_and_a_base_standing_in_for_vocab_keep_their_slash() {
+        assert_eq!(
+            vocab_of(json!("https://schema.org")).as_deref(),
+            Some("https://schema.org/")
+        );
+        let fallback = |base: &str| vocab_of(crate::with_base_as_vocab(&json!({"@base": base})));
+        assert_eq!(fallback("urn:ex:").as_deref(), Some("urn:ex:/"));
+        assert_eq!(
+            fallback("http://example.org/ns#").as_deref(),
+            Some("http://example.org/ns#")
+        );
+        // An explicit @vocab beside the base wins, as written.
+        assert_eq!(
+            vocab_of(crate::with_base_as_vocab(
+                &json!({"@base": "http://example.org/", "@vocab": "urn:ex:"})
+            ))
+            .as_deref(),
+            Some("urn:ex:")
         );
     }
 
