@@ -116,19 +116,40 @@ every 5,000 entries, purges keeping 1,000) a value deleted from the state machin
 can stay readable under `log/` for months.
 
 `RaftGroup::compact_log` is for an application that needs such a value gone, for
-example before the storage directory is copied:
+example before the storage directory is copied. Given `covering`, the index of
+the write whose effect must go (a delete's `client_write(..).log_id.index`), it:
 
-1. seal the tail segment, so later appends start a new one, and take its last
+1. waits until this node has applied `covering`;
+2. seals the tail segment, so later appends start a new one, and takes its last
    index N;
-2. wait until entries through N are applied, then snapshot until a snapshot
+3. waits until entries through N are applied, then snapshots until a snapshot
    covers N;
-3. purge through N and wait for the purge to finish;
-4. remove every superseded snapshot, failing if any removal fails;
-5. fail with `CompactionError::Retained` unless the oldest entry still on disk
+4. purges through N and waits for the purge to finish;
+5. removes every superseded snapshot, failing if any removal fails;
+6. fails with `CompactionError::Retained` unless the oldest entry still on disk
    is above N.
 
-Each node holds its own log, so a cluster runs it on every node. A seal lives in
-memory only: if the process stops before `compact_log` returns, run it again.
+A backend that cannot report which entries it retains, or cannot discard
+superseded snapshots, makes it refuse before step 1. Each node holds its own log,
+so a cluster runs it on every node, each with the same `covering`. A seal lives
+in memory only: if the process stops before `compact_log` returns, run it again.
+The filesystem log finishes a purge a crash interrupted when it next opens.
+
+What `compact_log` does not cover:
+
+- **A delete it was not given.** Without `covering`, a node that has not yet
+  applied the delete seals short of it, snapshots a state that still holds the
+  value, and reports success.
+- **A value that expired rather than was deleted.** kv keeps an expired record in
+  its fragment, and so in every snapshot, until the sweep's `Evict` or the next
+  write to that key reclaims it. Evict before compacting.
+- **Values removed after it returns.** It removes what the log held when it
+  sealed. Nothing records a pending compaction or re-runs one after a restart, so
+  call it right before the directory is copied rather than right after the
+  delete.
+- **The device's freed blocks.** Unlinking keeps the value out of a file-level
+  copy made afterwards, but a block-level image of the volume can still hold the
+  freed blocks. Encryption at rest covers that case.
 
 Sealing, rather than rewriting the straddling segment's suffix into a new file,
 keeps `purge_through`'s crash ordering as it was: whole segments only, oldest
