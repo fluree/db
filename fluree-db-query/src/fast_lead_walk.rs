@@ -13,7 +13,9 @@
 //! neighbour's, this walk reads the group from its lead column.
 
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{parallel_dir_walk_min_leaves, parallel_leaf_chunk_reduce_at};
+use crate::fast_path_common::{
+    load_leaflet_projection, parallel_dir_walk_min_leaves, parallel_leaf_chunk_reduce_at,
+};
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::leaf::{LeafletDirEntryV3, LiveEdges};
@@ -50,30 +52,42 @@ pub(crate) struct LeadWalk {
     pub tally: u64,
 }
 
-/// One end of a counted run of leaflets.
+/// Where a leaflet is: its leaf's index in the walk's leaves, and its index in
+/// that leaf.
+type At = (usize, usize);
+
+/// The first and last groups of a counted leaflet.
 #[derive(Clone, Copy)]
-struct Edge {
-    group: LiveGroup,
-    /// For a v4 leaflet whose routing keys may be widened: where its row is
-    /// (leaf index in the walk's leaves, leaflet index, which end). `group` is
-    /// then a bound, not a row's group.
-    unproven: Option<(usize, usize, End)>,
+struct Edges {
+    first: LiveGroup,
+    last: LiveGroup,
+    at: At,
+    /// Whether `first` and `last` are its rows' groups. A v4 leaflet that
+    /// holds history has only its routing keys' groups, bounds of its rows'
+    /// groups, until a boundary reads its rows.
+    exact: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum End {
-    First,
-    Last,
+impl Edges {
+    /// Makes `first` and `last` the rows' groups, reading them if they are
+    /// not. A leaflet is read at most once: the walk keeps the proven edges.
+    fn prove(&mut self, read: &mut impl FnMut(At) -> Result<(LiveGroup, LiveGroup)>) -> Result<()> {
+        if !self.exact {
+            (self.first, self.last) = read(self.at)?;
+            self.exact = true;
+        }
+        Ok(())
+    }
 }
 
 struct Partial {
     count: u64,
     tally: u64,
-    first: Option<Edge>,
-    last: Option<Edge>,
-    /// Chunk seams whose routing groups meet but whose rows' groups were not
-    /// read yet: resolved after the reduce, so `combine` stays free of I/O.
-    pending: Vec<(Edge, Edge)>,
+    first: Option<Edges>,
+    last: Option<Edges>,
+    /// Chunk seams whose routing groups meet but where a side was not proven
+    /// yet: settled after the reduce, so `join` stays free of I/O.
+    pending: Vec<(Edges, Edges)>,
 }
 
 impl Partial {
@@ -85,6 +99,77 @@ impl Partial {
             last: None,
             pending: Vec::new(),
         }
+    }
+
+    /// Adds the next counted leaflet in key order: its `count` groups, less
+    /// one where it starts with the group the previous leaflet ends with.
+    fn push(
+        &mut self,
+        count: u64,
+        mut edges: Edges,
+        read: &mut impl FnMut(At) -> Result<(LiveGroup, LiveGroup)>,
+    ) -> Result<()> {
+        self.count = self.count.saturating_add(count);
+        let Some(mut prev) = self.last.take() else {
+            self.first = Some(edges);
+            self.last = Some(edges);
+            return Ok(());
+        };
+        if seam_shares_group(&mut prev, &mut edges, read)? {
+            self.count = self.count.saturating_sub(1);
+        }
+        // What this seam proved of the first leaflet serves its chunk seam.
+        if self.first.is_some_and(|first| first.at == prev.at) {
+            self.first = Some(prev);
+        }
+        self.last = Some(edges);
+        Ok(())
+    }
+
+    /// `self` followed by the partial of the leaves after it.
+    fn join(mut self, right: Partial) -> Self {
+        self.count = self.count.saturating_add(right.count);
+        self.tally = self.tally.saturating_add(right.tally);
+        if let (Some(last), Some(first)) = (self.last, right.first) {
+            if last.last == first.first {
+                if last.exact && first.exact {
+                    self.count = self.count.saturating_sub(1);
+                } else {
+                    self.pending.push((last, first));
+                }
+            }
+        }
+        self.pending.extend(right.pending);
+        if self.first.is_none() {
+            self.first = right.first;
+        }
+        if right.last.is_some() {
+            self.last = right.last;
+        }
+        self
+    }
+
+    /// Settles the pending seams, in key order. A chunk with one counted
+    /// leaflet puts that leaflet on two seams, so what one seam proved of its
+    /// right side serves the next seam's left.
+    fn settle(
+        mut self,
+        read: &mut impl FnMut(At) -> Result<(LiveGroup, LiveGroup)>,
+    ) -> Result<LeadWalk> {
+        let mut proved: Option<Edges> = None;
+        for (mut last, mut first) in std::mem::take(&mut self.pending) {
+            if let Some(edges) = proved.filter(|edges| edges.at == last.at) {
+                last = edges;
+            }
+            if seam_shares_group(&mut last, &mut first, read)? {
+                self.count = self.count.saturating_sub(1);
+            }
+            proved = Some(first);
+        }
+        Ok(LeadWalk {
+            count: self.count,
+            tally: self.tally,
+        })
     }
 }
 
@@ -104,16 +189,18 @@ where
         return Ok(Some(LeadWalk { count: 0, tally: 0 }));
     }
 
+    let read = |(leaf, idx): At| read_row_groups(store, order, &leaves[leaf], idx);
     let map = |start: usize, chunk: &[LeafEntry]| -> Result<Option<Partial>> {
         let mut partial = Partial::new();
-        let mut memo: RowGroupMemo = None;
+        let mut read = read;
         for (offset, leaf) in chunk.iter().enumerate() {
             let leaf_idx = start + offset;
             let dir = store
                 .open_leaf_dir(&leaf.leaf_cid)
                 .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
             for (idx, entry) in dir.entries.iter().enumerate() {
-                let (count, first, last) = match role(leaf, idx, entry)? {
+                let at = (leaf_idx, idx);
+                let (count, edges) = match role(leaf, idx, entry)? {
                     Role::Skip => continue,
                     Role::Tally(rows) => {
                         partial.tally = partial.tally.saturating_add(rows);
@@ -121,13 +208,11 @@ where
                     }
                     Role::Run { count, first, last } => (
                         count,
-                        Edge {
-                            group: first,
-                            unproven: None,
-                        },
-                        Edge {
-                            group: last,
-                            unproven: None,
+                        Edges {
+                            first,
+                            last,
+                            at,
+                            exact: true,
                         },
                     ),
                     Role::Groups => {
@@ -137,148 +222,68 @@ where
                         if entry.lead_group_count == 0 {
                             return Ok(None);
                         }
-                        let (first, last) = leaflet_edges(order, leaf_idx, idx, entry);
-                        (u64::from(entry.lead_group_count), first, last)
+                        (
+                            u64::from(entry.lead_group_count),
+                            leaflet_edges(order, at, entry),
+                        )
                     }
                 };
-                partial.count = partial.count.saturating_add(count);
-                if let Some(prev) = partial.last {
-                    if seam_shares_group(store, order, leaves, &mut memo, prev, first)? {
-                        partial.count = partial.count.saturating_sub(1);
-                    }
-                }
-                partial.first.get_or_insert(first);
-                partial.last = Some(last);
+                partial.push(count, edges, &mut read)?;
             }
         }
         Ok(Some(partial))
     };
 
-    let combine = |mut left: Partial, right: Partial| -> Partial {
-        left.tally = left.tally.saturating_add(right.tally);
-        left.pending.extend(right.pending);
-        let (Some(last), Some(first)) = (left.last, right.first) else {
-            if left.first.is_none() {
-                left.first = right.first;
-            }
-            if right.last.is_some() {
-                left.last = right.last;
-            }
-            left.count = left.count.saturating_add(right.count);
-            return left;
-        };
-        left.count = left.count.saturating_add(right.count);
-        if last.group == first.group {
-            if last.unproven.is_none() && first.unproven.is_none() {
-                left.count = left.count.saturating_sub(1);
-            } else {
-                left.pending.push((last, first));
-            }
-        }
-        left.last = right.last;
-        left
-    };
-
     let parallel = leaves.len() >= parallel_dir_walk_min_leaves();
-    let Some(mut partial) = parallel_leaf_chunk_reduce_at(leaves, parallel, map, combine)? else {
+    let Some(partial) = parallel_leaf_chunk_reduce_at(leaves, parallel, map, Partial::join)? else {
         return Ok(None);
     };
-    let mut memo: RowGroupMemo = None;
-    for (last, first) in std::mem::take(&mut partial.pending) {
-        if seam_shares_group(store, order, leaves, &mut memo, last, first)? {
-            partial.count = partial.count.saturating_sub(1);
-        }
-    }
-    Ok(Some(LeadWalk {
-        count: partial.count,
-        tally: partial.tally,
-    }))
+    let mut read = read;
+    partial.settle(&mut read).map(Some)
 }
 
-/// The first and last edges of a leaflet with rows.
-fn leaflet_edges(
-    order: RunSortOrder,
-    leaf: usize,
-    idx: usize,
-    entry: &LeafletDirEntryV3,
-) -> (Edge, Edge) {
+/// The edges of a leaflet with rows.
+fn leaflet_edges(order: RunSortOrder, at: At, entry: &LeafletDirEntryV3) -> Edges {
     match entry.live_edges {
-        LiveEdges::Exact { first, last } => (
-            Edge {
-                group: first,
-                unproven: None,
-            },
-            Edge {
-                group: last,
-                unproven: None,
-            },
-        ),
-        LiveEdges::Empty | LiveEdges::Legacy => {
-            let widened = entry.holds_history();
-            let edge = |key: &[u8; ORDERED_KEY_V2_SIZE], end| Edge {
-                group: LiveGroup::of_key(order, key),
-                unproven: widened.then_some((leaf, idx, end)),
-            };
-            (
-                edge(&entry.first_key, End::First),
-                edge(&entry.last_key, End::Last),
-            )
-        }
+        LiveEdges::Exact { first, last } => Edges {
+            first,
+            last,
+            at,
+            exact: true,
+        },
+        LiveEdges::Empty | LiveEdges::Legacy => Edges {
+            first: LiveGroup::of_key(order, &entry.first_key),
+            last: LiveGroup::of_key(order, &entry.last_key),
+            at,
+            exact: !entry.holds_history(),
+        },
     }
 }
 
-/// Whether the leaflet ending in `last` and the one starting at `first` share
-/// a group, so that the walk counted it twice.
+/// Whether the leaflet `left` ends with the group the leaflet `right` starts
+/// with, so that the walk counted it twice. Proves a side it needs to read.
 ///
-/// Routing groups that differ settle it: a leaflet's routing keys bound its
-/// rows, and neighbouring leaflets' routing ranges do not overlap, so rows of
-/// one group on both sides put both routing groups at that group. Only when
-/// they meet does an unproven side need its row's group read.
+/// Groups that differ settle it, even where one side is a routing group: a
+/// leaflet's routing keys bound its rows, and neighbouring leaflets' routing
+/// ranges do not overlap, so rows of one group on both sides put both sides'
+/// groups at that group. Only when they meet is an unproven side read: the
+/// right one first, whose last group the next seam needs.
 fn seam_shares_group(
-    store: &BinaryIndexStore,
-    order: RunSortOrder,
-    leaves: &[LeafEntry],
-    memo: &mut RowGroupMemo,
-    last: Edge,
-    first: Edge,
+    left: &mut Edges,
+    right: &mut Edges,
+    read: &mut impl FnMut(At) -> Result<(LiveGroup, LiveGroup)>,
 ) -> Result<bool> {
-    if last.group != first.group {
+    let group = left.last;
+    if group != right.first {
         return Ok(false);
     }
-    let mut read = |(leaf, idx, end): (usize, usize, End)| -> Result<LiveGroup> {
-        let groups = match *memo {
-            Some((at, groups)) if at == (leaf, idx) => groups,
-            _ => {
-                let groups = read_row_groups(store, order, &leaves[leaf], idx)?;
-                *memo = Some(((leaf, idx), groups));
-                groups
-            }
-        };
-        Ok(if end == End::First {
-            groups.0
-        } else {
-            groups.1
-        })
-    };
-    let right = match first.unproven {
-        Some(at) => read(at)?,
-        None => first.group,
-    };
-    if right != first.group {
+    right.prove(read)?;
+    if right.first != group {
         return Ok(false);
     }
-    let left = match last.unproven {
-        Some(at) => read(at)?,
-        None => last.group,
-    };
-    Ok(left == right)
+    left.prove(read)?;
+    Ok(left.last == group)
 }
-
-/// The last v4 leaflet whose rows' groups a walk read, as `(leaf, leaflet)`
-/// and its first and last groups. A walk goes left to right, so the leaflet
-/// whose first group one boundary read is the one whose last group the next
-/// boundary needs.
-type RowGroupMemo = Option<((usize, usize), (LiveGroup, LiveGroup))>;
 
 /// The group of a leaflet's first row, or its last when `last`: stored in a
 /// v5 leaflet; a v4 leaflet's routing key gives it where the leaflet holds no
@@ -318,27 +323,25 @@ pub(crate) fn post_group_object(group: &LiveGroup) -> (u16, u64) {
 }
 
 /// The groups of a v4 leaflet's first and last rows, read from its lead
-/// column: one decode of the columns [`group_projection`] names, through the
-/// leaf handle the cursor would open.
+/// column: the columns [`group_projection`] names, through the leaflet cache.
+/// A remote leaf is range-read, as the store's other walks that read a few
+/// leaflets of many leaves do.
 fn read_row_groups(
     store: &BinaryIndexStore,
     order: RunSortOrder,
     leaf: &LeafEntry,
     idx: usize,
 ) -> Result<(LiveGroup, LiveGroup)> {
-    let dir = store
-        .open_leaf_dir(&leaf.leaf_cid)
-        .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
-    let entry = dir
+    let handle = store
+        .open_leaf_handle_ranged(&leaf.leaf_cid)
+        .map_err(|e| QueryError::from_io("leaf open", e))?;
+    let entry = handle
+        .dir()
         .entries
         .get(idx)
         .ok_or_else(|| QueryError::Internal(format!("leaflet {idx} not in its leaf")))?;
-    let handle = store
-        .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-        .map_err(|e| QueryError::from_io("leaf open", e))?;
-    let batch = handle
-        .load_columns(idx, &group_projection(order), order)
-        .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+    let batch =
+        load_leaflet_projection(store, handle.as_ref(), idx, &group_projection(order), order)?;
     if batch.row_count == 0 {
         return Err(QueryError::Internal(
             "a leaflet with rows decoded to none".to_string(),
@@ -499,18 +502,132 @@ mod tests {
             history_min_t: 0,
             history_max_t: 0,
         };
-        let unproven = |e: &LeafletDirEntryV3| {
-            let (first, last) = leaflet_edges(RunSortOrder::Spot, 0, 0, e);
-            (first.unproven.is_some(), last.unproven.is_some())
-        };
-        assert_eq!(unproven(&entry(LiveEdges::Legacy, 0)), (false, false));
-        assert_eq!(unproven(&entry(LiveEdges::Legacy, 4)), (false, false));
-        assert_eq!(unproven(&entry(LiveEdges::Legacy, 40)), (true, true));
+        let exact = |e: &LeafletDirEntryV3| leaflet_edges(RunSortOrder::Spot, (0, 0), e).exact;
+        assert!(exact(&entry(LiveEdges::Legacy, 0)));
+        assert!(exact(&entry(LiveEdges::Legacy, 4)));
+        assert!(!exact(&entry(LiveEdges::Legacy, 40)));
         let group = LiveGroup::of_key(RunSortOrder::Spot, &key);
-        let exact = LiveEdges::Exact {
+        let stored = LiveEdges::Exact {
             first: group,
             last: group,
         };
-        assert_eq!(unproven(&entry(exact, 40)), (false, false));
+        assert!(exact(&entry(stored, 40)));
+    }
+
+    fn group(s_id: u64) -> LiveGroup {
+        let mut key = [0u8; ORDERED_KEY_V2_SIZE];
+        write_ordered_key_v2(RunSortOrder::Spot, &rec(0, s_id, 1, 0, 0), &mut key);
+        LiveGroup::of_key(RunSortOrder::Spot, &key)
+    }
+
+    /// A leaflet the walk sees: its group count, its routing groups and its
+    /// rows' groups, all as subject ids.
+    struct Seen {
+        count: u64,
+        routing: (u64, u64),
+        rows: (u64, u64),
+    }
+
+    /// Walks `leaflets`, all v4 leaflets holding history, cut into chunks of
+    /// `sizes` and joined as the parallel reduce joins them, reading rows'
+    /// groups through a loader that counts reads per leaflet.
+    fn walk(leaflets: &[Seen], sizes: &[usize]) -> (u64, Vec<usize>) {
+        let reads = std::cell::RefCell::new(vec![0; leaflets.len()]);
+        let mut read = |(i, _): At| {
+            reads.borrow_mut()[i] += 1;
+            let (first, last) = leaflets[i].rows;
+            Ok((group(first), group(last)))
+        };
+        let mut start = 0;
+        let mut partials = Vec::new();
+        for &size in sizes {
+            let mut partial = Partial::new();
+            for (i, seen) in leaflets.iter().enumerate().skip(start).take(size) {
+                let edges = Edges {
+                    first: group(seen.routing.0),
+                    last: group(seen.routing.1),
+                    at: (i, 0),
+                    exact: false,
+                };
+                partial.push(seen.count, edges, &mut read).unwrap();
+            }
+            partials.push(partial);
+            start += size;
+        }
+        let joined = partials.into_iter().reduce(Partial::join).unwrap();
+        let count = joined.settle(&mut read).unwrap().count;
+        (count, reads.into_inner())
+    }
+
+    /// Every way to cut `n` leaflets into chunks of one or more.
+    fn cuts(n: usize) -> Vec<Vec<usize>> {
+        (0..1u32 << (n - 1))
+            .map(|mask| {
+                let mut sizes = vec![1];
+                for i in 0..n - 1 {
+                    if mask & (1 << i) == 0 {
+                        *sizes.last_mut().unwrap() += 1;
+                    } else {
+                        sizes.push(1);
+                    }
+                }
+                sizes
+            })
+            .collect()
+    }
+
+    /// Where every boundary of a v4 run needs its rows read, the walk reads
+    /// each leaflet once, serially and however the leaves are cut into
+    /// chunks, and counts the group the run shares once.
+    #[test]
+    fn a_v4_walk_reads_each_leaflet_once_however_it_is_chunked() {
+        let one_group: Vec<Seen> = (0..5)
+            .map(|_| Seen {
+                count: 1,
+                routing: (7, 7),
+                rows: (7, 7),
+            })
+            .collect();
+        for sizes in cuts(one_group.len()) {
+            let (count, reads) = walk(&one_group, &sizes);
+            assert_eq!(count, 1, "{sizes:?}");
+            assert_eq!(reads, vec![1; 5], "{sizes:?}: reads per leaflet");
+        }
+    }
+
+    /// Routing groups that meet where the rows' groups do not: the walk reads
+    /// the rows and subtracts only where they share a group, and reads no
+    /// leaflet twice. Groups 1 to 5 in all.
+    #[test]
+    fn a_v4_walk_subtracts_only_where_rows_share_a_group() {
+        let leaflets = [
+            // Widened over history up to group 3.
+            Seen {
+                count: 2,
+                routing: (1, 3),
+                rows: (1, 2),
+            },
+            Seen {
+                count: 1,
+                routing: (3, 3),
+                rows: (3, 3),
+            },
+            // Widened over history up to group 5.
+            Seen {
+                count: 2,
+                routing: (3, 5),
+                rows: (3, 4),
+            },
+            Seen {
+                count: 1,
+                routing: (5, 5),
+                rows: (5, 5),
+            },
+        ];
+        for sizes in cuts(leaflets.len()) {
+            let (count, reads) = walk(&leaflets, &sizes);
+            assert_eq!(count, 5, "{sizes:?}");
+            assert!(reads.iter().all(|&n| n <= 1), "{sizes:?}: reads {reads:?}");
+        }
     }
 }
