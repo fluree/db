@@ -20,6 +20,7 @@
 
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
+use crate::fast_lead_walk::{leaflet_row_group, post_group_object};
 use crate::fast_path_common::{
     cursor_fast_path_for_predicate, fast_path_store_policy_cleared, leaf_entries_for_predicate,
     normalize_pred_sid, projection_otype_okey, FastPathOperator, PredicateFastPath,
@@ -28,7 +29,6 @@ use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -188,11 +188,21 @@ pub(crate) fn minmax_string_dict_post(
                 continue;
             }
             if entry.o_type_const.is_some() {
-                let rr = match mode {
-                    MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
-                    MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
+                // The leaflet's own first or last row, not its routing key,
+                // which history can widen past its rows.
+                let Some(group) = leaflet_row_group(
+                    store,
+                    RunSortOrder::Post,
+                    leaf_entry,
+                    leaflet_idx,
+                    entry,
+                    matches!(mode, MinMaxMode::Max),
+                )?
+                else {
+                    continue;
                 };
-                if !consider_string_candidate(&mut best, rr.o_type, rr.o_key, p_id, mode) {
+                let (o_type, o_key) = post_group_object(&group);
+                if !consider_string_candidate(&mut best, o_type, o_key, p_id, mode) {
                     return Ok(None);
                 }
             } else {
@@ -262,55 +272,71 @@ pub(crate) fn minmax_numeric_post(
     mode: MinMaxMode,
 ) -> Result<Option<Binding>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-    let mut best: Option<(u16, u64)> = None;
+    let mut o_type: Option<u16> = None;
+    // `(leaf, leaflet)` of the first and the last leaflet holding the
+    // predicate's rows: one o_type throughout, so POST orders them by value
+    // and the minimum is the first's first row, the maximum the last's last.
+    let mut ends: Option<((usize, usize), (usize, usize))> = None;
 
-    for leaf_entry in leaves {
-        // Directory-only prefix read (cached); this path never loads columns.
+    for (leaf_idx, leaf_entry) in leaves.iter().enumerate() {
+        // Directory-only prefix read (cached).
         let dir = store
             .open_leaf_dir(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
-        for entry in &dir.entries {
+        for (idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
             // A heterogeneous leaflet can hide another o_type's extreme
-            // mid-leaflet where boundary keys never surface it; the numeric
-            // path only supports a single o_type anyway, so decline.
-            if entry.o_type_const.is_none() {
+            // mid-leaflet; the numeric path only supports a single o_type
+            // anyway, so decline. The constant is taken over the rows, so it
+            // holds whatever the routing keys span.
+            let Some(ot) = entry.o_type_const else {
                 return Ok(None);
-            }
-            let rr = match mode {
-                MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
-                MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
             };
-            let ot = OType::from_u16(rr.o_type);
-            // Numeric kinds plus order-preserving inline decimals: their boundary
-            // o_key is the min/max value. (The single-o_type checks below ensure a
-            // predicate mixing inline and arena decimals declines.)
-            if !ot.is_numeric() && ot != OType::XSD_DECIMAL_INLINE {
+            // Numeric kinds plus order-preserving inline decimals: their o_key
+            // orders by value. A predicate mixing inline and arena decimals
+            // declines below.
+            let kind = OType::from_u16(ot);
+            if !kind.is_numeric() && kind != OType::XSD_DECIMAL_INLINE {
                 return Ok(None);
             }
-
-            match best {
-                None => best = Some((rr.o_type, rr.o_key)),
-                Some((best_ot, best_key)) => {
-                    if best_ot != rr.o_type {
-                        return Ok(None);
-                    }
-                    let better = match mode {
-                        MinMaxMode::Min => rr.o_key < best_key,
-                        MinMaxMode::Max => rr.o_key > best_key,
-                    };
-                    if better {
-                        best = Some((rr.o_type, rr.o_key));
-                    }
-                }
+            if *o_type.get_or_insert(ot) != ot {
+                return Ok(None);
             }
+            let at = (leaf_idx, idx);
+            ends = Some(match ends {
+                None => (at, at),
+                Some((first, _)) => (first, at),
+            });
         }
     }
 
-    Ok(best.map(|(o_type, o_key)| numeric_binding_from_otype_okey(store, o_type, o_key)))
+    let Some((first, last)) = ends else {
+        return Ok(None);
+    };
+    let ((leaf_idx, idx), is_last) = match mode {
+        MinMaxMode::Min => (first, false),
+        MinMaxMode::Max => (last, true),
+    };
+    let leaf_entry = &leaves[leaf_idx];
+    let dir = store
+        .open_leaf_dir(&leaf_entry.leaf_cid)
+        .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+    let Some(group) = leaflet_row_group(
+        store,
+        RunSortOrder::Post,
+        leaf_entry,
+        idx,
+        &dir.entries[idx],
+        is_last,
+    )?
+    else {
+        return Ok(None);
+    };
+    let (o_type, o_key) = post_group_object(&group);
+    Ok(Some(numeric_binding_from_otype_okey(store, o_type, o_key)))
 }
 
 pub(crate) fn numeric_binding_from_otype_okey(
