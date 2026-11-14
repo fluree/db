@@ -370,6 +370,42 @@ mod tests {
         assert!(set.by_property.contains_key(&rdf_type_property()));
     }
 
+    /// The reasoned variant selects the class policy by subject, on every
+    /// property, and leaves property policies where they were.
+    #[test]
+    fn a_reasoned_view_selects_class_policies_by_subject() {
+        let person = make_sid(100, "Person");
+        let name = make_sid(100, "name");
+        let stats = make_stats_with_class(person.clone(), vec![name.clone()]);
+        let restrictions = vec![
+            make_class_restriction("c1", person.clone()),
+            make_prop_restriction("p1", name.clone()),
+        ];
+        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View, None);
+        let reasoned = set
+            .selecting_classes_by_subject()
+            .expect("has a class policy");
+
+        assert_eq!(reasoned.by_class.get(&person), Some(&vec![0]));
+        let on_name: Vec<usize> = reasoned.by_property[&name].iter().map(|e| e.idx).collect();
+        assert_eq!(on_name, vec![1]);
+        assert!(!reasoned.by_property.contains_key(&rdf_type_property()));
+        let salary = make_sid(100, "salary");
+        assert!(!set.covers_predicate(&salary));
+        assert!(reasoned.covers_predicate(&salary));
+        let entries =
+            reasoned.policy_entries_for_flake(&make_sid(100, "alice"), &salary, &[person]);
+        assert_eq!(entries.iter().map(|e| e.idx).collect::<Vec<_>>(), vec![0]);
+
+        let property_only = build_policy_set(
+            vec![make_prop_restriction("p1", name)],
+            Some(&stats),
+            PolicyAction::View,
+            None,
+        );
+        assert!(property_only.selecting_classes_by_subject().is_none());
+    }
+
     #[test]
     fn test_build_policy_set_class_index_modify_uses_by_class() {
         let person_class = make_sid(100, "Person");

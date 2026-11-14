@@ -103,26 +103,43 @@ pub async fn populate_class_cache(
     db: GraphDbRef<'_>,
     policy_ctx: &crate::evaluate::PolicyContext,
 ) -> Result<()> {
+    populate_class_cache_in(
+        crate::evaluate::ClassState::of(db),
+        subjects,
+        db,
+        policy_ctx,
+    )
+    .await
+}
+
+/// [`populate_class_cache`] under `state`, the state the caller then reads
+/// with: a state of an overlay with no content version answers only for the
+/// value it was taken as.
+pub async fn populate_class_cache_in(
+    state: crate::evaluate::ClassState,
+    subjects: &[Sid],
+    db: GraphDbRef<'_>,
+    policy_ctx: &crate::evaluate::PolicyContext,
+) -> Result<()> {
     // Skip if no class policies need checking
     if !policy_ctx.wrapper().has_class_policies() {
         return Ok(());
     }
 
-    // Key on the graph this ref reads, so classes resolved in one graph are never
-    // consulted for a decision about another.
-    let g_id = db.g_id;
+    // Keyed on the state this ref reads, so classes resolved there are never
+    // consulted for a decision about another graph, time or overlay.
     // Only resolve subjects this context has not already cached: the scan
     // operator populates per batch and hydration re-asks per subject fetch, so
     // without this every subject pays the index lookup (a leaflet decode) at
     // least twice.
-    let uncached = policy_ctx.retain_uncached(g_id, db.t, subjects);
+    let uncached = policy_ctx.retain_uncached(state, subjects);
     if uncached.is_empty() {
         return Ok(());
     }
     let class_map = lookup_subject_classes(&uncached, db).await?;
 
     for (subject, classes) in class_map {
-        policy_ctx.cache_subject_classes(g_id, db.t, subject, classes);
+        policy_ctx.cache_subject_classes(state, subject, classes);
     }
 
     Ok(())
