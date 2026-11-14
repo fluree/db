@@ -599,7 +599,7 @@ async fn one_view_judges_classes_by_each_query_s_reasoning() {
 
 /// A class deny under reasoning reaches an aggregate's fast path, a join and
 /// SPARQL alike: `ex:alice`, a `HighEarner` only by rule, is hidden; `ex:bob`
-/// is not. A graph crawl is `a_derived_class_deny_reaches_a_graph_crawl`.
+/// is not.
 #[tokio::test]
 async fn a_derived_class_deny_reaches_every_row_shape() {
     use fluree_db_api::{GovernanceOptions, GraphDb};
@@ -652,6 +652,105 @@ async fn a_derived_class_deny_reaches_every_row_shape() {
         assert_eq!(
             normalize_rows(&result.to_jsonld(&view.snapshot).expect("to_jsonld")),
             vec![json!(["ex:bob", 90000])],
+            "{storage:?}/sparql"
+        );
+    }
+}
+
+/// Documents typed `ex:Private` are readable only by an owner. Under OWL 2 RL,
+/// `ex:body rdfs:subPropertyOf ex:text` gives each document an `ex:text` the
+/// class statistics never list for `ex:Private`; the class policy covers it.
+fn private_documents() -> Value {
+    json!({
+        "@context": context(),
+        "@graph": [
+            {"@id": "ex:body", "rdfs:subPropertyOf": {"@id": "ex:text"}},
+            {"@id": "ex:doc1", "@type": "ex:Private", "ex:body": "private text"},
+            {"@id": "ex:doc2", "@type": "ex:Public", "ex:body": "public text"},
+            {"@id": "ex:owner", "ex:role": "owner", "f:policyClass": [{"@id": "ex:Policy"}]},
+            {"@id": "ex:reader", "ex:role": "reader", "f:policyClass": [{"@id": "ex:Policy"}]},
+            {
+                "@id": "ex:ownersReadPrivate",
+                "@type": ["f:AccessPolicy", "ex:Policy"],
+                "f:required": true,
+                "f:onClass": [{"@id": "ex:Private"}],
+                "f:action": [{"@id": "f:view"}],
+                "f:query": serde_json::to_string(&json!({
+                    "where": {"@id": "?$identity", "http://example.org/role": "owner"}
+                }))
+                .unwrap()
+            },
+            {
+                "@id": "ex:readAll",
+                "@type": ["f:AccessPolicy", "ex:Policy"],
+                "f:action": [{"@id": "f:view"}],
+                "f:allow": true
+            }
+        ]
+    })
+}
+
+fn as_identity(query: &Value, who: &str) -> Value {
+    let mut query = query.clone();
+    query["opts"] = json!({
+        "identity": format!("http://example.org/{who}"),
+        "default-allow": false
+    });
+    query
+}
+
+#[tokio::test]
+async fn a_class_policy_covers_what_owl2rl_derives_for_its_members() {
+    use fluree_db_api::{GovernanceOptions, GraphDb};
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-owl2rl-{storage:?}:main");
+        let fluree = seeded_reader(&ledger_id, &private_documents(), storage).await;
+        let doc1 = query(
+            &ledger_id,
+            json!(["?p", "?o"]),
+            json!({"@id": "ex:doc1", "?p": "?o"}),
+            "owl2rl",
+        );
+        let texts = query(
+            &ledger_id,
+            json!(["?s", "?o"]),
+            json!({"@id": "?s", "ex:text": "?o"}),
+            "owl2rl",
+        );
+
+        assert!(
+            rows(&fluree, &as_identity(&doc1, "owner"))
+                .await
+                .contains(&json!(["ex:text", "private text"])),
+            "{storage:?}: the owner sees the derived ex:text"
+        );
+        assert_eq!(
+            rows(&fluree, &as_identity(&doc1, "reader")).await,
+            Vec::<Value>::new(),
+            "{storage:?}: a reader sees nothing of ex:doc1"
+        );
+        assert_eq!(
+            rows(&fluree, &as_identity(&texts, "reader")).await,
+            vec![json!(["ex:doc2", "public text"])],
+            "{storage:?}: a reader's ex:text"
+        );
+
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        let opts = GovernanceOptions {
+            identity: Some("http://example.org/reader".to_string()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        let view = fluree
+            .wrap_policy(GraphDb::from_ledger_state(&ledger), &opts)
+            .await
+            .expect("policy view");
+        let sparql = "# PRAGMA reasoning: owl2rl\nPREFIX ex: <http://example.org/>\n\
+                      SELECT ?s ?o WHERE { ?s ex:text ?o }";
+        let result = fluree.query(&view, sparql).await.expect("sparql");
+        assert_eq!(
+            normalize_rows(&result.to_jsonld(&view.snapshot).expect("to_jsonld")),
+            vec![json!(["ex:doc2", "public text"])],
             "{storage:?}/sparql"
         );
     }
