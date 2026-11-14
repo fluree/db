@@ -3438,6 +3438,25 @@ async fn edgekey_roundtrip_for_literal(
     literal_value: JsonValue,
     test_label: &str,
 ) {
+    edgekey_roundtrip_in(
+        ctx(),
+        predicate_compact,
+        predicate_full,
+        literal_value,
+        test_label,
+    )
+    .await;
+}
+
+/// [`edgekey_roundtrip_for_literal`] under `context`; returns the base
+/// edge's key.
+async fn edgekey_roundtrip_in(
+    context: JsonValue,
+    predicate_compact: &str,
+    predicate_full: &str,
+    literal_value: JsonValue,
+    test_label: &str,
+) -> fluree_db_core::edge::EdgeKey {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
@@ -3455,7 +3474,7 @@ async fn edgekey_roundtrip_for_literal(
         json!({ "ex:source": "hr-system" }),
     );
     let txn = json!({
-        "@context": ctx(),
+        "@context": context,
         "@id": "ex:alice",
         predicate_compact: JsonValue::Object(literal_with_ann),
     });
@@ -3509,6 +3528,7 @@ async fn edgekey_roundtrip_for_literal(
         "[{test_label}] decoded EdgeKey diverges from base-edge EdgeKey; \
          base_flake: {base_flake:?}, bundle: {bundle:#?}"
     );
+    base_edge_key
 }
 
 #[tokio::test]
@@ -3546,6 +3566,34 @@ async fn edgekey_roundtrip_language_tagged_literal_annotation() {
         "lang-tagged",
     )
     .await;
+}
+
+/// An annotated value object is taken as written under a typed term or a
+/// default language, as an unannotated one is: the edge holds a plain string
+/// and its annotation names that edge.
+#[tokio::test]
+async fn edgekey_roundtrip_value_object_under_term_coercion() {
+    let typed = json!({
+        "ex": "http://example.org/",
+        "joinedAt": {"@id": "ex:joinedAt", "@type": "http://www.w3.org/2001/XMLSchema#date"}
+    });
+    let tagged = json!({"ex": "http://example.org/", "@language": "fr", "joinedAt": "ex:joinedAt"});
+    for (label, context) in [("typed-term", typed), ("default-language", tagged)] {
+        let key = edgekey_roundtrip_in(
+            context,
+            "joinedAt",
+            "http://example.org/joinedAt",
+            json!({"@value": "2024-01-01"}),
+            label,
+        )
+        .await;
+        assert_eq!(
+            key.dt,
+            fluree_db_core::edge::xsd_string_datatype_sid(),
+            "[{label}]"
+        );
+        assert_eq!(key.lang, None, "[{label}]");
+    }
 }
 
 // =====================================================================

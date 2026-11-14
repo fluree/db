@@ -74,7 +74,7 @@ Fluree supports JSON-LD 1.1:
 - @reverse, @included and @nest
 - @value and @type for literals
 - @language for language tags
-- Term definitions that coerce values with `@type` (`@id`, `@vocab`, `@json` or a datatype) or set `@language` (`null` included), and terms defined as `null`, whose properties are dropped
+- Term definitions that coerce values with `@type` (`@id`, `@vocab`, `@json` or a datatype) or set `@language` (`null` included), and terms defined as `null`, whose properties are dropped. A term's `@type` and `@language`, and the default `@language`, apply to a bare value; a value object (`{"@value": ...}`) takes only its own
 - `@container` values `@list`, `@set`, `@language` and `@index`
 - Nested objects
 - Arrays
@@ -417,6 +417,30 @@ JSON-LD output from CONSTRUCT, `rdf::serialize` and the ontology writer writes a
 
 A number of 16 or 17 significant digits now reads as the nearest double. About one in ten used to read as its neighbour (`0.9452706955539223` as `0.9452706955539224`). A value stored by an earlier release keeps the double it was given.
 
+#### A JSON-LD value object is taken as written (breaking)
+
+A value object (`{"@value": ...}`) takes only the `@type` or `@language` it names itself, as JSON-LD 1.1 defines. Earlier releases also gave it the context's default `@language` and the datatype of the term it sits under, as they do a bare value:
+
+- Under `"@language": "en"`, `{"@value": "obj"}` is the plain string `"obj"`. It was `"obj"@en`, so the JSON-LD way to keep one string out of the default language had no effect.
+- Under a term typed `xsd:integer`, `{"@value": "5"}` is the string `"5"`. It was the integer `5`. A number takes its datatype from its value: `{"@value": 5}` under a term typed `xsd:decimal` is the integer `5`.
+- A bare value is unchanged: `"plain"` takes the default language, and `"5"` under the term is the integer.
+
+This applies to every JSON-LD reader: a transaction, a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes. A JSON-LD `where` reads a constant value object the same way, so a pattern written like the insert matches what it stored. A variable written as a value object (`{"@value": "?v", "@t": "?t"}`) keeps its term's datatype, as `"?v"` does.
+
+Two documents that were refused are accepted, and one that was accepted is refused:
+
+- An annotated value object (`@annotation`) under a typed term or a default language annotates the value as written. It was refused unless it named its own `@type` or `@language`.
+- `{"@value": [...]}` under a term typed `@vector` needs its own `"@type": "@vector"`, and is refused without it. A bare array under the term is unchanged.
+
+**Check documents that write value objects under a default `@language` or a typed term.** To keep the values they wrote, give each value object the language or datatype it used to take (`{"@value": "obj", "@language": "en"}`), or write the value bare. Data already written stays as it is, so on a ledger that holds `"obj"@en` from `{"@value": "obj"}`:
+
+- Inserting the same document again adds `"obj"` beside the stored `"obj"@en`.
+- An upsert of the document retracts `"obj"@en` and asserts `"obj"`.
+- A delete written with the same value object no longer removes the stored value.
+- A `where` pattern written with the same value object no longer finds a value stored under a typed term: `{"@value": "5"}` looks for the string. A `where` string with no language matches a stored string in any language, so it still finds `"obj"@en`.
+
+To make the stored values match, see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
+
 #### Python RDF terms compare as RDF terms (breaking)
 
 In the Python binding, `fluree.IRI`, `fluree.BlankNode` and `fluree.LangString` are still `str` subclasses, and print, slice and pass as their text. They no longer equal a plain string with that text: `row.s == "http://example.org/alice"` is now `False`, and so is a `dict` or `set` lookup by the plain string. An `IRI` equals only an `IRI`, a `BlankNode` only a `BlankNode`, and a `LangString` only a `LangString` with the same language and direction. Compare with `fluree.IRI("http://example.org/alice")`, or with `str(row.s)` for the text alone.
@@ -504,6 +528,7 @@ No stored format changes. These kinds of earlier data behave differently after t
 - **Values written through a `@vocab`, `@json` or `@index` term** (see [JSON-LD term definitions coerce values as JSON-LD 1.1 defines](#json-ld-term-definitions-coerce-values-as-json-ld-11-defines)). They keep the shape the earlier release stored, and the same context now reads and writes the new one, so a `where` pattern, a delete or an upsert written through the term no longer reaches them. A string stored through a `@vocab` term becomes the IRI with one update, here for terms relative to `http://example.org/`: `DELETE { ?s ex:status ?old } INSERT { ?s ex:status ?new } WHERE { ?s ex:status ?old FILTER(isLiteral(?old)) BIND(IRI(CONCAT("http://example.org/", STR(?old))) AS ?new) }`. Values stored through a `@json` or an `@index` term have no general rewrite (a split array does not record which values it held together): delete them by the property's full IRI and write the documents again.
 - **Facts an update stored under a fallback namespace code.** A `where` constant in a namespace the ledger had not seen yet was stored under a fallback code, so once the namespace got its own code, a lookup by the IRI missed those facts. Every IRI an update writes is now stored under its canonical code. Facts already stored the fallback way stay split from the IRI's other facts; there is no migration.
 - **Whole doubles written by a client that keeps the `.0`** (see [A JSON-LD number is typed by its value](#a-json-ld-number-is-typed-by-its-value-breaking)). The same client now writes integers for those values, so the property holds both. To make the stored values integers as well, convert them once, here for `ex:price`: `DELETE { ?s ex:price ?old } INSERT { ?s ex:price ?new } WHERE { ?s ex:price ?old FILTER(DATATYPE(?old) = xsd:double && ?old = FLOOR(?old) && ABS(?old) < 1e21) BIND(xsd:integer(?old) AS ?new) }`. A whole double becomes the integer (merging with an equal integer already stored), and `2.5` stays a double. To keep the property's values doubles instead, type them `xsd:double` in the client's context.
+- **Values written as value objects under a default `@language` or a typed term** (see [A JSON-LD value object is taken as written](#a-json-ld-value-object-is-taken-as-written-breaking)). They hold the language or datatype the earlier release gave them, which the same document no longer writes. A stored value does not record whether it came from a value object or a bare value, so there is no general rewrite: convert a property only where every value it holds in that language or datatype was written as a value object. Here for `ex:t`, written under `"@language": "en"`: `DELETE { ?s ex:t ?old } INSERT { ?s ex:t ?new } WHERE { ?s ex:t ?old FILTER(LANG(?old) = "en") BIND(STR(?old) AS ?new) }`. For `ex:n`, written under a term typed `xsd:integer`, the same update on `ex:n` with `FILTER(DATATYPE(?old) = xsd:integer)` in place of the `LANG` test. To keep the stored values instead, give the value objects their language or datatype.
 - **Vectors of more than one length on one property.** An earlier release could store vectors of several lengths on one property in one graph. Writes to such a property refuse any further length (see [A property keeps one vector length per graph](#a-property-keeps-one-vector-length-per-graph)). To fix it, export the ledger and import it into a new one, keeping one length per property or moving the others to another property.
 
 `@annotation` on a value of a reverse property (inside `@reverse`, or under a reverse-defined term) now annotates the edge in the direction it is stored.

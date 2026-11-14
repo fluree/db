@@ -198,84 +198,33 @@ pub(crate) fn reject_deferred_object_wrappers(map: &Map<String, Value>) -> Resul
     Ok(())
 }
 
-/// Reject annotated literal value-objects whose effective datatype or
-/// language is determined by JSON-LD context coercion rather than by
-/// explicit `@type` / `@language` on the value object.
+/// Reject an annotated literal value object under a term typed `@json`
+/// that does not name its own `@type`.
 ///
-/// Why: the JSON-LD expander applies a predicate's term-coerced
-/// `@type` (a datatype or `@json`; `@id` and `@vocab` coerce only strings,
-/// never a value object) and the active default `@language` to bare
-/// `{"@value": ...}` objects, so the base flake's `EdgeKey` ends up with
-/// the coerced datatype / language. The reified bundle synthesized by this module,
-/// however, only copies *explicit* `@type` / `@language` from the
-/// value object. Without rejection, the two EdgeKeys would silently
-/// diverge — exactly the failure mode the gate tests in
-/// `it_edge_annotations.rs` (`edgekey_roundtrip_*`) guard against.
+/// A value object is otherwise taken as written, so the base flake and the
+/// reified bundle (which copies the object's explicit `@type` / `@language`)
+/// agree. A `@json` term is the exception: JSON-LD makes its whole value,
+/// value object included, one JSON literal, while the bundle would carry the
+/// plain `@value`, and the two `EdgeKey`s would diverge.
 ///
-/// Resolution path for users: write `@type` and/or `@language`
-/// explicitly on the annotated value object. The non-annotated form
-/// of the same triple continues to use context coercion normally; the
-/// stricter rule applies only when `@annotation` / `@edge` is present.
-///
-/// Implementation: this helper is called *after* `@annotation` is
-/// stripped from the map but *before* `classify_reified_object`. It
-/// has no effect on the Ref / `@id` branch.
+/// Called after `@annotation` is stripped from the map and before
+/// `classify_reified_object`; it has no effect on the Ref / `@id` branch.
 pub(crate) fn reject_context_coercion_on_annotated_literal(
     map: &Map<String, Value>,
     predicate: &str,
     context: &ParsedContext,
 ) -> Result<()> {
-    let entry = context.get(predicate);
-
-    // Datatype coercion: a predicate-level datatype or `@json` without an
-    // explicit `@type` on the value object means the expander applies the
-    // coercion, while the synthesized `f:reifiesObject` would carry no such
-    // datatype. `@id` and `@vocab` coerce only strings, never a value
-    // object, so they leave both sides a plain literal.
-    if let Some(e) = entry {
-        if !map.contains_key("@type") {
-            let coerced = match e.type_.as_ref() {
-                Some(TypeValue::Iri(t)) => Some(t.clone()),
-                Some(TypeValue::Json) => Some("@json".to_string()),
-                Some(TypeValue::Id | TypeValue::Vocab) | None => None,
-            };
-            if let Some(coerced) = coerced {
-                return Err(TransactError::Parse(format!(
-                    "annotated literal on '{predicate}' relies on @context term coercion \
-                     (@type='{coerced}'); annotated literals must carry an explicit @type so the \
-                     reified f:reifiesObject bundle matches the base edge's EdgeKey. \
-                     Add @type to the value object."
-                )));
-            }
-        }
+    let json_term = context
+        .get(predicate)
+        .is_some_and(|e| e.type_ == Some(TypeValue::Json));
+    if json_term && !map.contains_key("@type") {
+        return Err(TransactError::Parse(format!(
+            "annotated literal on '{predicate}' relies on @context term coercion \
+             (@type='@json'); annotated literals must carry an explicit @type so the \
+             reified f:reifiesObject bundle matches the base edge's EdgeKey. \
+             Add @type to the value object."
+        )));
     }
-
-    // Language coercion: the JSON-LD value-object expander in
-    // `parse_value_object` reads `context.language` (the document
-    // default) regardless of any per-term `@language` setting, then
-    // applies it whenever no `@type` is present on the value object.
-    // So the guard mirrors that behavior — checking only the document
-    // default — even if a per-term entry technically declares (or
-    // clears) a language. Without this, a value-object expander that
-    // tags the base flake with the default language would diverge
-    // from a reified bundle that thinks the per-term clear suppressed
-    // the tag.
-    //
-    // (Bare-scalar strings under a per-term language entry DO get
-    // term-language tags at expansion time, but the value-object
-    // form is the only shape edge annotations accept.)
-    let value_is_string = matches!(map.get("@value"), Some(Value::String(_)));
-    if value_is_string && !map.contains_key("@language") {
-        if let Some(lang) = context.language.as_deref() {
-            return Err(TransactError::Parse(format!(
-                "annotated string literal on '{predicate}' relies on @context language coercion \
-                 (@language='{lang}'); annotated literals must carry an explicit @language so \
-                 the reified f:reifiesLang flake matches the base edge's EdgeKey. \
-                 Add @language to the value object."
-            )));
-        }
-    }
-
     Ok(())
 }
 
@@ -2667,37 +2616,38 @@ mod tests {
         );
     }
 
+    /// An annotated value object is taken as written, as an unannotated one
+    /// is: neither its term's datatype or language nor the default language
+    /// reaches it, so the reified bundle names the same literal as the edge.
     #[test]
-    fn rejects_term_coerced_datatype_on_annotated_literal() {
-        // `joinedAt` term coerces `@type` to xsd:date via @context.
-        // Without the rejection, the synthesized f:reifiesObject would
-        // be `{"@value": "2024-01-01"}` (xsd:string) while the base
-        // flake would be xsd:date — EdgeKey mismatch.
-        let doc = json!({
-            "@context": {
-                "ex": "http://example.org/",
-                "xsd": "http://www.w3.org/2001/XMLSchema#",
-                "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
-            },
-            "@id": "ex:alice",
-            "joinedAt": {
-                "@value": "2024-01-01",
-                "@annotation": { "ex:source": "hr" }
-            }
-        });
-        let err = lower(doc).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("@context term coercion") && msg.contains("XMLSchema#date"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("Add @type"));
+    fn annotated_literal_is_taken_as_written() {
+        let contexts = [
+            json!({"ex": "http://example.org/", "label": {"@id": "ex:label", "@type": "http://www.w3.org/2001/XMLSchema#date"}}),
+            json!({"ex": "http://example.org/", "@language": "fr", "label": "ex:label"}),
+            json!({"ex": "http://example.org/", "@language": "fr", "label": {"@id": "ex:label", "@language": null}}),
+            json!({"ex": "http://example.org/", "@language": "fr", "label": {"@id": "ex:label", "@language": "de"}}),
+            json!({"ex": "http://example.org/", "@language": "fr", "label": {"@id": "ex:label", "@type": "@id"}}),
+            json!({"ex": "http://example.org/", "@language": "fr", "label": {"@id": "ex:label", "@type": "@vocab"}}),
+        ];
+        for ctx in contexts {
+            let doc = json!({
+                "@context": ctx,
+                "@id": "ex:alice",
+                "label": {"@value": "2024-01-01", "@annotation": {"ex:source": "hr"}}
+            });
+            let result = lower(doc).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+            let sibling = &included(&result)[0];
+            assert_eq!(
+                sibling.get(reifies_iris::OBJECT).unwrap(),
+                &json!({"@value": "2024-01-01"}),
+                "{ctx}"
+            );
+            assert!(sibling.get(reifies_iris::LANG).is_none(), "{ctx}");
+        }
     }
 
     #[test]
     fn accepts_term_coerced_datatype_when_value_object_is_explicit() {
-        // Same shape as above but with explicit @type on the value
-        // object → no mismatch, no rejection.
         let doc = json!({
             "@context": {
                 "ex": "http://example.org/",
@@ -2719,148 +2669,54 @@ mod tests {
         );
     }
 
+    /// A `@json` term makes the whole value one JSON literal, so an
+    /// annotated value object under it must name its own `@type`.
     #[test]
-    fn rejects_default_language_on_annotated_string() {
-        let doc = json!({
-            "@context": { "@language": "fr", "ex": "http://example.org/" },
-            "@id": "ex:alice",
-            "ex:label": {
-                "@value": "chat",
-                "@annotation": { "ex:source": "lexicon" }
-            }
-        });
-        let err = lower(doc).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("@context language coercion (@language='fr')"),
-            "got: {err}"
-        );
-        assert!(err.to_string().contains("Add @language"));
-    }
-
-    #[test]
-    fn per_term_language_does_not_suppress_default_language_rejection() {
-        // The value-object expander in fluree-graph-json-ld reads
-        // `context.language` directly and ignores per-term language
-        // overrides (including `Some(None)` clears). The guard mirrors
-        // that behavior: a default `@language` triggers rejection
-        // even when the predicate's term entry would conceptually
-        // override it. Otherwise the guard would pass but the
-        // expander would still tag the base flake with `fr`, breaking
-        // the EdgeKey round-trip.
+    fn rejects_json_term_coercion_on_annotated_literal() {
         let doc = json!({
             "@context": {
-                "@language": "fr",
                 "ex": "http://example.org/",
-                "code": { "@id": "ex:code", "@language": null }
+                "doc": { "@id": "ex:doc", "@type": "@json" }
             },
             "@id": "ex:alice",
-            "code": {
-                "@value": "ALPHA",
-                "@annotation": { "ex:source": "internal" }
+            "doc": {
+                "@value": "x",
+                "@annotation": { "ex:source": "hr" }
             }
         });
-        let err = lower(doc).unwrap_err();
+        let msg = lower(doc).unwrap_err().to_string();
         assert!(
-            err.to_string()
-                .contains("@context language coercion (@language='fr')"),
-            "got: {err}"
+            msg.contains("@context term coercion (@type='@json')"),
+            "got: {msg}"
         );
+        assert!(msg.contains("Add @type"));
     }
 
     #[test]
     fn rejects_node_local_context_term_coercion_on_annotated_literal() {
         // Envelope @context holds prefixes; the inner @graph node
-        // introduces its own @context defining `joinedAt` with
-        // `@type: xsd:date`. The lowering walker must merge the inner
-        // context into the parent's so the coercion guard fires.
-        // (Two separate `@context` keys on the same JSON object would
-        // collapse via JSON parsing, so the envelope form is the only
-        // way to express true per-node context merging in input JSON.)
+        // introduces its own @context defining `doc` with `@type: @json`.
+        // The lowering walker must merge the inner context into the
+        // parent's so the coercion guard fires. (Two separate `@context`
+        // keys on the same JSON object would collapse via JSON parsing, so
+        // the envelope form is the only way to express true per-node
+        // context merging in input JSON.)
         let doc = json!({
-            "@context": {
-                "ex": "http://example.org/",
-                "xsd": "http://www.w3.org/2001/XMLSchema#"
-            },
+            "@context": { "ex": "http://example.org/" },
             "@graph": [{
                 "@context": {
-                    "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+                    "doc": { "@id": "ex:doc", "@type": "@json" }
                 },
                 "@id": "ex:alice",
-                "joinedAt": {
-                    "@value": "2024-01-01",
+                "doc": {
+                    "@value": "x",
                     "@annotation": { "ex:source": "hr" }
                 }
             }]
         });
-        let err = lower(doc).unwrap_err();
-        let msg = err.to_string();
+        let msg = lower(doc).unwrap_err().to_string();
         assert!(
-            msg.contains("@context term coercion")
-                && (msg.contains("XMLSchema#date") || msg.contains("xsd:date")),
-            "got: {msg}"
-        );
-    }
-
-    /// A term typed `@id` or `@vocab` leaves an annotated value object a
-    /// plain literal, so the default language still reaches it and is still
-    /// refused, as under an untyped term.
-    #[test]
-    fn rejects_default_language_on_annotated_string_under_an_id_or_vocab_term() {
-        for coercion in ["@id", "@vocab"] {
-            let doc = json!({
-                "@context": {
-                    "ex": "http://example.org/",
-                    "@language": "fr",
-                    "label": { "@id": "ex:label", "@type": coercion }
-                },
-                "@id": "ex:alice",
-                "label": {
-                    "@value": "chat",
-                    "@annotation": { "ex:source": "lex" }
-                }
-            });
-            let msg = lower(doc).unwrap_err().to_string();
-            assert!(
-                msg.contains("@context language coercion (@language='fr')"),
-                "{coercion}: {msg}"
-            );
-
-            // With its own language the same literal is annotated.
-            let explicit = json!({
-                "@context": {
-                    "ex": "http://example.org/",
-                    "@language": "fr",
-                    "label": { "@id": "ex:label", "@type": coercion }
-                },
-                "@id": "ex:alice",
-                "label": {
-                    "@value": "chat",
-                    "@language": "en",
-                    "@annotation": { "ex:source": "lex" }
-                }
-            });
-            assert!(lower(explicit).is_ok(), "{coercion}: explicit language");
-        }
-    }
-
-    #[test]
-    fn rejects_node_local_default_language_on_annotated_string() {
-        let doc = json!({
-            "@context": { "ex": "http://example.org/" },
-            "@graph": [{
-                "@context": { "@language": "de" },
-                "@id": "ex:alice",
-                "ex:label": {
-                    "@value": "Buch",
-                    "@annotation": { "ex:source": "lex" }
-                }
-            }]
-        });
-        let err = lower(doc).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("@context language coercion") && msg.contains("'de'"),
+            msg.contains("@context term coercion (@type='@json')"),
             "got: {msg}"
         );
     }
@@ -2871,26 +2727,23 @@ mod tests {
         // `@context` inside a delete-clause node must merge into the
         // effective context before the coercion guard runs.
         let mut doc = json!({
-            "@context": {
-                "ex": "http://example.org/",
-                "xsd": "http://www.w3.org/2001/XMLSchema#"
-            },
+            "@context": { "ex": "http://example.org/" },
             "delete": [{
                 "@context": {
-                    "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+                    "doc": { "@id": "ex:doc", "@type": "@json" }
                 },
                 "@id": "ex:alice",
-                "joinedAt": {
-                    "@value": "2024-01-01",
+                "doc": {
+                    "@value": "x",
                     "@annotation": { "@id": "ex:ann-stale" }
                 }
             }]
         });
-        let err = lower_delete_annotation_blocks(&mut doc).unwrap_err();
-        let msg = err.to_string();
+        let msg = lower_delete_annotation_blocks(&mut doc)
+            .unwrap_err()
+            .to_string();
         assert!(
-            msg.contains("@context term coercion")
-                && (msg.contains("XMLSchema#date") || msg.contains("xsd:date")),
+            msg.contains("@context term coercion (@type='@json')"),
             "got: {msg}"
         );
     }
