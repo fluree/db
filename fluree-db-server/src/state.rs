@@ -131,6 +131,7 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
             interval.tick().await;
             let used = cache.weighted_size_bytes();
             let entries = cache.entry_count();
+            let shards = cache.shard_count();
 
             let used_gib = (used as f64) / (1024.0 * 1024.0 * 1024.0);
             let budget_gib = (budget_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
@@ -142,6 +143,7 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
 
             tracing::info!(
                 cache_entries = entries,
+                cache_shards = shards,
                 cache_weighted_bytes = used,
                 cache_weighted_gib = used_gib,
                 cache_budget_mb = budget_mb,
