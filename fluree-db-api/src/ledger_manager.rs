@@ -483,7 +483,7 @@ impl LedgerHandle {
                 config_cache: RwLock::new(ConfigCacheEntry::default()),
                 recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
                 committed_t: std::sync::atomic::AtomicI64::new(0),
-                line: AtomicU64::new(0),
+                line: AtomicU64::new(Line::fresh()),
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
                 exclusion_gate: parking_lot::Mutex::new(None),
@@ -1018,9 +1018,20 @@ impl LedgerHandle {
 }
 
 /// A ledger handle's line, as [`LedgerHandle::line`] reads it: an index
-/// install planned on one line is not made on another.
+/// install planned on one line is not made on another. Lines are unique
+/// across handles, so one taken from a handle since evicted matches none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Line(u64);
+
+impl Line {
+    /// The line of a ledger not cached when it was taken.
+    pub(crate) const UNCACHED: Line = Line(u64::MAX);
+
+    fn fresh() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 // ============================================================================
 // Freshness Types
@@ -2231,7 +2242,7 @@ impl LedgerManager {
                             {
                                 let mut bs_guard = handle.inner.binary_store.write().await;
                                 write_guard.replace(new_state);
-                                handle.inner.line.fetch_add(1, Ordering::AcqRel);
+                                handle.inner.line.store(Line::fresh(), Ordering::Release);
                                 *bs_guard = new_binary_store;
                                 // Out-of-band swap: any resolved-config entry may
                                 // have been cached against a state this swap just
@@ -2665,6 +2676,18 @@ impl LedgerManager {
     /// - CommitCatchUp: load 1-5 commits, merge into novelty (incremental)
     /// - Reload: full reload from storage (large gaps)
     pub async fn notify(&self, input: NsNotify) -> Result<NotifyResult> {
+        self.notify_planned(input, None).await
+    }
+
+    /// [`Self::notify`] for a record its caller read after taking
+    /// `planned_on` from [`Self::line_of`]: an index install is not made if a
+    /// reload replaced the cached state since. Without one, the line is taken
+    /// here, before this call reads the record.
+    pub(crate) async fn notify_planned(
+        &self,
+        input: NsNotify,
+        planned_on: Option<Line>,
+    ) -> Result<NotifyResult> {
         // Check if ledger is cached
         let handle = {
             let entries = self.entries.read().await;
@@ -2674,6 +2697,7 @@ impl LedgerManager {
                 _ => return Ok(NotifyResult::NotLoaded),
             }
         };
+        let planned_on = planned_on.unwrap_or_else(|| handle.line());
 
         // Get fresh record from nameservice if not provided
         let ns_record = match input.record {
@@ -2690,7 +2714,6 @@ impl LedgerManager {
         };
 
         // Get local state metrics for planning
-        let planned_on = handle.line();
         let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;
 
         // Plan the update action
@@ -2958,15 +2981,16 @@ impl LedgerManager {
 
     async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
+        let planned_on = handle.line();
         if CachedHead::of(handle).await.advanced_or_named_by(&record) {
-            return self.notify_with(record).await;
+            return self.notify_with(record, planned_on).await;
         }
         let Some(current) = self.current_record(&ledger_id).await? else {
             return Ok(NotifyResult::Current);
         };
         if !CachedHead::of(handle).await.replaced_by(&current) {
             // A record the cache has passed.
-            return self.notify_with(current).await;
+            return self.notify_with(current, planned_on).await;
         }
         tracing::info!(
             alias = %ledger_id,
@@ -2985,16 +3009,28 @@ impl LedgerManager {
         Ok(NotifyResult::Reloaded)
     }
 
-    async fn notify_with(&self, record: NsRecord) -> Result<NotifyResult> {
-        self.notify(NsNotify {
-            ledger_id: record.ledger_id.clone(),
-            record: Some(record),
-        })
+    async fn notify_with(&self, record: NsRecord, planned_on: Line) -> Result<NotifyResult> {
+        self.notify_planned(
+            NsNotify {
+                ledger_id: record.ledger_id.clone(),
+                record: Some(record),
+            },
+            Some(planned_on),
+        )
         .await
     }
 
     async fn current_record(&self, ledger_id: &LedgerId) -> Result<Option<NsRecord>> {
         Ok(self.nameservice_mode.reader().lookup(ledger_id).await?)
+    }
+
+    /// The line of the cached ledger, for a record its caller is about to
+    /// read and pass to [`Self::notify_planned`]. A ledger not cached now has
+    /// a line no handle has.
+    pub(crate) async fn line_of(&self, ledger_id: &LedgerId) -> Line {
+        self.get_loaded_handle(ledger_id)
+            .await
+            .map_or(Line::UNCACHED, |handle| handle.line())
     }
 
     /// Returns the cached ledger's current `t`, or `None` if not cached.

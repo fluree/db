@@ -127,11 +127,9 @@ struct LedgerUpdates {
 
 enum LedgerUpdate {
     /// A record received in connection `epoch` (see [`PeerState::epoch`]).
-    Record {
-        epoch: u64,
-        record: Box<NsRecord>,
-    },
-    Retracted,
+    Record { epoch: u64, record: Box<NsRecord> },
+    /// A retraction received in connection `epoch`.
+    Retracted { epoch: u64 },
 }
 
 impl PeerEventSink {
@@ -215,11 +213,12 @@ async fn apply_ledger_updates(
         let _permit = updates.permits.acquire().await.expect("never closed");
         let (epoch, record) = match update {
             LedgerUpdate::Record { epoch, record } => (epoch, record),
-            LedgerUpdate::Retracted => {
-                peer_state.remove_ledger(&ledger_id).await;
-                tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
+            LedgerUpdate::Retracted { epoch } => {
                 // Evict any cached state for the ledger (no-op if not cached).
-                fluree.disconnect_ledger(&ledger_id).await;
+                let evict = fluree.disconnect_ledger(&ledger_id);
+                if peer_state.retract_ledger_in(epoch, &ledger_id, evict).await {
+                    tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
+                }
                 continue;
             }
         };
@@ -324,7 +323,8 @@ impl HeadSink for PeerEventSink {
             }
             // Applied after any update to the ledger already in flight.
             RemoteEvent::LedgerRetracted { ledger_id } => {
-                self.queue(ledger_id, LedgerUpdate::Retracted);
+                let epoch = self.peer_state.epoch();
+                self.queue(ledger_id, LedgerUpdate::Retracted { epoch });
             }
             RemoteEvent::GraphSourceRetracted { graph_source_id } => {
                 self.peer_state.remove_graph_source(&graph_source_id).await;
@@ -684,7 +684,7 @@ mod tests {
                 .get(&LedgerId::parse("a:main").unwrap())
                 .map(|next| match next {
                     Some(LedgerUpdate::Record { record, .. }) => Some(record.commit_t),
-                    Some(LedgerUpdate::Retracted) => Some(-1),
+                    Some(LedgerUpdate::Retracted { .. }) => Some(-1),
                     None => None,
                 })
         }
@@ -819,5 +819,33 @@ mod tests {
         load.await.unwrap();
         settled(&root.sink).await;
         assert_eq!(watermark_t(&root.sink, "a:main").await, None);
+    }
+
+    /// A retraction from before a reconnect is not applied after it: the new
+    /// connection's records say whether the ledger exists, and a load of it
+    /// begun since is not evicted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retraction_from_before_a_reconnect_is_not_applied() {
+        let root = TwoLedgers::new().await;
+        let load = root.stall_a().await;
+        let record = root.commit("a:main", 1).await;
+        root.sink.on_event(RemoteEvent::LedgerUpdated(record)).await;
+        for _ in 0..200 {
+            if root.waiting_for_a() == Some(None) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        root.sink
+            .on_event(RemoteEvent::LedgerRetracted {
+                ledger_id: LedgerId::parse("a:main").unwrap(),
+            })
+            .await;
+        root.sink.on_event(RemoteEvent::Connected).await;
+
+        root.slow.release.notify_one();
+        load.await.unwrap();
+        settled(&root.sink).await;
+        assert!(root.cached_t("a:main").await.is_some(), "still cached");
     }
 }

@@ -191,6 +191,26 @@ impl PeerState {
         self.ledgers.write().await.remove(ledger_id);
     }
 
+    /// Apply a retraction received in connection `epoch`: remove the
+    /// ledger's watermark and run `evict`, holding the watermarks throughout
+    /// so a reconnect cannot clear them in between. Once they were cleared
+    /// for a later connection, nothing is done: that connection's records
+    /// say whether the ledger exists. Returns whether it was applied.
+    pub async fn retract_ledger_in(
+        &self,
+        epoch: u64,
+        ledger_id: &LedgerId,
+        evict: impl std::future::Future<Output = ()>,
+    ) -> bool {
+        let mut ledgers = self.ledgers.write().await;
+        if self.epoch() != epoch {
+            return false;
+        }
+        ledgers.remove(ledger_id);
+        evict.await;
+        true
+    }
+
     /// Update graph source watermark from SSE event (returns true if changed)
     pub async fn update_graph_source(
         &self,

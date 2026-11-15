@@ -5360,7 +5360,9 @@ impl Fluree {
             }
         }
 
-        // Step B: Lookup nameservice record
+        // Step B: Lookup nameservice record. The cached line is taken first:
+        // an index this record names is not installed over a reload since.
+        let planned_on = mgr.line_of(&ledger_id).await;
         let ns_record = match self.nameservice().lookup(&ledger_id).await? {
             Some(record) => record,
             None => return Ok(None), // Ledger doesn't exist in nameservice
@@ -5370,10 +5372,13 @@ impl Fluree {
 
         // Step D: Delegate to notify with the fresh record
         let action = mgr
-            .notify(NsNotify {
-                ledger_id: canonical_alias.clone(),
-                record: Some(ns_record),
-            })
+            .notify_planned(
+                NsNotify {
+                    ledger_id: canonical_alias.clone(),
+                    record: Some(ns_record),
+                },
+                Some(planned_on),
+            )
             .await?;
 
         // Step E: Read resulting t from the cached state

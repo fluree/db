@@ -1699,6 +1699,68 @@ async fn a_rebase_outlasts_an_index_install_refresh_started() {
     a_rebase_outlasts_an_index_install_in_flight(true).await;
 }
 
+/// A refresh that read the branch's record before a rebase, and goes on
+/// after the rebase was followed, does not install that record's index of
+/// the old line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebase_outlasts_a_refresh_that_read_the_record_before_it() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+
+    let storage = || {
+        fluree_db_core::FileStorage::new(dir.path())
+            .with_durability(fluree_db_core::Durability::Sync)
+            .without_wal_replay()
+    };
+    let lookup = Arc::new(PausedLookup {
+        inner: Arc::new(fluree_db_nameservice::file::FileNameService::with_storage(
+            storage(),
+        )),
+        ledger_id: "rb:dev",
+        armed: false.into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let peer = FlureeBuilder::memory().build_with(
+        storage(),
+        fluree_db_api::NameServiceMode::ReadOnly(Arc::clone(&lookup) as _),
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    lookup
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let refresh = {
+        let peer = peer.clone();
+        tokio::spawn(async move { peer.refresh("rb:dev", Default::default()).await })
+    };
+    lookup.entered.notified().await;
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    assert_eq!(
+        follow(&peer, rebased).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    lookup.release.notify_one();
+    refresh.await.unwrap().unwrap();
+
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
 /// A rebase published while a peer loads the branch, after the load read the
 /// nameservice: the peer follows the record once the load lands, rather than
 /// serving the replaced line until the next event.
