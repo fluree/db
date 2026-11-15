@@ -1513,6 +1513,9 @@ pub struct LedgerManager {
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
+    /// One [`Self::follow`] at a time per ledger: a record that installs an
+    /// index must not land on a line a later record has replaced.
+    follow_locks: std::sync::Mutex<HashMap<LedgerId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LedgerManager {
@@ -1535,6 +1538,7 @@ impl LedgerManager {
             shutdown: AtomicBool::new(false),
             load_generation: AtomicU64::new(0),
             head_watermarks: std::sync::RwLock::new(HashMap::new()),
+            follow_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2905,8 +2909,9 @@ impl LedgerManager {
     /// state until the reload lands.
     ///
     /// A record for a ledger that is still loading is followed once the load
-    /// lands, since the load may have read the nameservice before it.
-    pub async fn follow(self: &Arc<Self>, record: NsRecord) -> Result<NotifyResult> {
+    /// lands, since the load may have read the nameservice before it. Records
+    /// for one ledger are followed one at a time.
+    pub async fn follow(&self, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
         let cached = match self.entries.read().await.get(&ledger_id) {
             Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
@@ -2915,28 +2920,24 @@ impl LedgerManager {
             Some(LoadState::Loading { .. }) => None,
             Some(LoadState::Failed { .. }) | None => return Ok(NotifyResult::NotLoaded),
         };
-        if let Some(handle) = cached {
-            return self.follow_cached(&handle, record).await;
-        }
-        let manager = Arc::clone(self);
-        crate::wasm_compat::spawn_detached(async move {
+        let handle = match cached {
+            Some(handle) => handle,
             // Joins the load in flight.
-            let Ok(handle) = manager.get_or_load(&ledger_id).await else {
-                return;
-            };
-            if let Err(e) = manager.follow_cached(&handle, record).await {
-                tracing::warn!(
-                    alias = %ledger_id,
-                    error = %e,
-                    "failed to follow a record sent while the ledger loaded"
-                );
-            }
-        });
-        Ok(NotifyResult::NotLoaded)
+            None => self.get_or_load(&ledger_id).await?,
+        };
+        self.follow_cached(&handle, record).await
     }
 
     async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
+        let lock = Arc::clone(
+            self.follow_locks
+                .lock()
+                .expect("follow lock map never poisoned: no panics inside critical section")
+                .entry(ledger_id.clone())
+                .or_default(),
+        );
+        let _following = lock.lock().await;
         if CachedHead::of(handle).await.advanced_or_named_by(&record) {
             return self.notify_with(record).await;
         }

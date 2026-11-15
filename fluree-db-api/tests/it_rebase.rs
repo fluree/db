@@ -1619,6 +1619,76 @@ mod paused_lookup {
     }
 }
 
+/// An index update for the branch's old line, still installing when a
+/// rebase arrives, lands before the rebase is followed rather than after:
+/// the peer ends on the new line, not on the old line's index.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_follows_a_rebase_after_an_index_update_in_flight() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+
+    let storage = || {
+        fluree_db_core::FileStorage::new(dir.path())
+            .with_durability(fluree_db_core::Durability::Sync)
+            .without_wal_replay()
+    };
+    // Building the branch's store for the index looks up its source branch.
+    let lookup = Arc::new(PausedLookup {
+        inner: Arc::new(fluree_db_nameservice::file::FileNameService::with_storage(
+            storage(),
+        )),
+        ledger_id: "rb:main",
+        armed: false.into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let peer = FlureeBuilder::memory().build_with(
+        storage(),
+        fluree_db_api::NameServiceMode::ReadOnly(Arc::clone(&lookup) as _),
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let indexed = dev_record(&writer).await;
+    lookup
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let index_update = {
+        let peer = peer.clone();
+        tokio::spawn(async move { follow(&peer, indexed).await })
+    };
+    lookup.entered.notified().await;
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    let mut rebase = {
+        let peer = peer.clone();
+        tokio::spawn(async move { follow(&peer, rebased).await })
+    };
+    // Unserialized, the rebase is followed in full meanwhile.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut rebase).await;
+    lookup.release.notify_one();
+    index_update.await.unwrap();
+    match early {
+        Ok(followed) => drop(followed.unwrap()),
+        Err(_) => drop(rebase.await.unwrap()),
+    }
+
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
 /// A rebase published while a peer loads the branch, after the load read the
 /// nameservice: the peer follows the record once the load lands, rather than
 /// serving the replaced line until the next event.
@@ -1659,19 +1729,19 @@ async fn a_peer_follows_a_rebase_sent_while_it_loads_the_branch() {
         .await
         .unwrap();
     let rebased = dev_record(&writer).await;
-    assert_eq!(
-        follow(&peer, rebased).await,
-        fluree_db_api::NotifyResult::NotLoaded
-    );
+    let following = {
+        let peer = peer.clone();
+        tokio::spawn(async move { follow(&peer, rebased).await })
+    };
     lookup.release.notify_one();
     loading.await.unwrap().unwrap();
 
-    let source_line = ["alice", "alice-main", "dave"];
-    for _ in 0..250 {
-        if query_cached_names(&peer, "rb:dev").await == source_line {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert_eq!(query_cached_names(&peer, "rb:dev").await, source_line);
+    assert_eq!(
+        following.await.unwrap(),
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
 }
